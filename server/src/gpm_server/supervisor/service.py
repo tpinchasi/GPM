@@ -18,11 +18,10 @@ import os
 import socket
 import time
 import uuid
+from pathlib import Path
 from typing import Optional
 
 import httpx
-
-from pathlib import Path
 
 from ..catalog import ResolvedVariant, variants_for_host
 from ..config import ConfigError, HostConfig, PoolConfig, load_config
@@ -33,7 +32,7 @@ from ..ledger import EventLog, LeaseStore, SpendLedger
 from ..models import HostState
 from ..providers.base import get_provider
 from ..transports import SshTunnel, build_client
-from .renting import Fleet, RentedHost
+from .renting import Fleet
 
 log = logging.getLogger("gpm.supervisor")
 

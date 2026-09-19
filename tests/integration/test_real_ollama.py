@@ -16,7 +16,7 @@ import time
 
 import httpx
 import pytest
-from fakes.harness import APP_KEY, PoolHarness
+from fakes.harness import PoolHarness
 
 pytestmark = [pytest.mark.integration, pytest.mark.timeout(900)]
 

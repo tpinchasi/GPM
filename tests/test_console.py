@@ -6,7 +6,6 @@ criterion: every console action is possible from the CLI, a mistyped ceiling is 
 before apply, and the app key is refused.
 """
 
-import json
 import textwrap
 import time
 from pathlib import Path
@@ -14,8 +13,8 @@ from pathlib import Path
 import httpx
 import pytest
 from fakes.harness import BackgroundLoop, ServerHandle
-from gpm_server.config import PoolConfig, load_config
-from gpm_server.configplan import ConfigStore, RentedNow, StaleVersion, plan_changes
+from gpm_server.config import load_config
+from gpm_server.configplan import ConfigStore, RentedNow, plan_changes
 from gpm_server.db import Database
 from gpm_server.supervisor import Supervisor
 from gpm_server.supervisor.control import create_control_app

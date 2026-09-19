@@ -7,7 +7,6 @@ silent, and does not while work is happening" is checked rather than assumed.
 
 import re
 import subprocess
-import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -164,7 +163,8 @@ def test_inference_is_detected_from_the_raw_tcp_table_without_ss_or_netstat():
     assert "/proc/net/tcp" in script
     assert "printf '%04X'" in script  # 11434 -> 2CAA, as the kernel prints it
     # The awk program: established (01) and the local port suffix matches.
-    import re, subprocess
+    import re
+    import subprocess
     program = re.search(r"awk -v p=\":\$HEXPORT\" '([^']+)'", script).group(1)
     sample = (
         "  sl  local_address rem_address   st\n"

@@ -6,7 +6,6 @@ functions behind it would never notice.
 
 import json
 
-import httpx
 import pytest
 from fakes.harness import BackgroundLoop, ServerHandle
 from gpm_server.cli import main

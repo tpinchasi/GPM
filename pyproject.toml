@@ -17,3 +17,18 @@ markers = [
 addopts = "-m 'not integration'"
 # Every test here drives real servers over real sockets; a hang must fail loudly, not stall.
 timeout = 120
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# The rules that catch real problems, not house style: pyflakes (unused and undefined names),
+# import order, and the bugbear checks for things that behave differently than they read.
+select = ["E4", "E7", "E9", "F", "I", "B"]
+# Asserts carry meaning in the tests, and a bare `except Exception` in a control loop is
+# deliberate — a bad pass must never take the supervisor down.
+ignore = ["B011", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B017"]

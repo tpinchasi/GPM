@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, Optional
+from typing import Any
 
 from starlette.applications import Starlette
 from starlette.requests import Request

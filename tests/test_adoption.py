@@ -6,11 +6,10 @@ a gap on the first live run — a restarted supervisor knew nothing, so its firs
 have destroyed a perfectly good host that was still billing.
 """
 
-import time
 
 import pytest
-from fakes.harness import BackgroundLoop, ServerHandle, stub_ssh_command
 from fakes.fake_ollama import FakeOllama
+from fakes.harness import BackgroundLoop, ServerHandle, stub_ssh_command
 from gpm_server.config import PoolConfig
 from gpm_server.db import Database, HostTable
 from gpm_server.providers import FakeProvider

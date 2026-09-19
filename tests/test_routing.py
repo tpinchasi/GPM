@@ -1,10 +1,8 @@
 """Strict priority tiers, readiness, failover-once, and the machine-readable answers."""
 
 import concurrent.futures
-import json
 
-import pytest
-from fakes.harness import APP_KEY, EngineSpec, pool_harness
+from fakes.harness import EngineSpec, pool_harness
 
 MODEL = "m1"
 

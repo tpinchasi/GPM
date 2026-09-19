@@ -207,15 +207,27 @@ class ProviderNotFound(Exception):
     """Configuration named a provider that is not installed."""
 
 
-def get_provider(name: str, settings: dict[str, Any]) -> Provider:
-    """Nothing is loaded that configuration does not name."""
-    from .fake import FakeProvider
-    from .vast import VastProvider
+#: The group third-party providers register under. The ones shipped here use it too: there is
+#: no privileged path for first-party plug-ins.
+ENTRY_POINT_GROUP = "gpm.providers"
 
-    providers = {FakeProvider.name: FakeProvider, VastProvider.name: VastProvider}
-    try:
-        return providers[name](**settings)
-    except KeyError as exc:
+
+def available_providers() -> dict[str, Any]:
+    from importlib.metadata import entry_points
+
+    return {point.name: point for point in entry_points(group=ENTRY_POINT_GROUP)}
+
+
+def get_provider(name: str, settings: dict[str, Any]) -> Provider:
+    """Nothing is loaded that configuration does not name.
+
+    A plug-in runs inside the supervisor with its full authority, including the account
+    credential, so installing one is a trust decision equal to installing the framework
+    (threat model T14).
+    """
+    found = available_providers()
+    if name not in found:
         raise ProviderNotFound(
-            f"unknown provider {name!r}; available: {sorted(providers)}"
-        ) from exc
+            f"unknown provider {name!r}; installed: {sorted(found) or 'none'}"
+        )
+    return found[name].load()(**settings)

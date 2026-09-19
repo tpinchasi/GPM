@@ -22,7 +22,7 @@ FAST_RETRY = dict(backoff_initial_s=0.05, backoff_max_s=0.1)
 BOUNDED = RetryPolicy(max_wait_s=20, **FAST_RETRY)
 
 
-def one_host(resident={MODEL}, **kwargs):
+def one_host(resident=(MODEL,), **kwargs):
     return pool_harness([EngineSpec(id="local-1", resident=set(resident), workers=1, **kwargs)], model_set=[MODEL])
 
 

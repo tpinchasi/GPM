@@ -66,23 +66,33 @@ companies from adopting a component that sits in their serving path.
 - [x] **Two packages**, because apps must be able to depend on the client without installing
       the server: `gpm-client` (one runtime dependency, `httpx`) and `gpm-server` (router,
       supervisor, CLI, console, first-party plug-ins).
-- [ ] First-party provider and engine plug-ins load through the same entry-point mechanism as
-      third-party ones — no privileged path.
-- [ ] Semantic versioning for both packages. The app contract, the control API and each plug-in
-      interface carry their own version numbers, reported at runtime.
-- [ ] Pinned, reproducible builds; a published changelog.
+- [x] First-party provider and engine plug-ins load through the same entry-point mechanism as
+      third-party ones — no privileged path. Groups: `gpm.providers`, `gpm.engines`.
+- [x] Semantic versioning for both packages. The app contract (`X-GPM-Contract` and
+      `GET /pool/status`), the control API and each plug-in interface (`interface_version`)
+      carry their own version numbers, reported at runtime. Stated in `CHANGELOG.md`.
+- [x] Pinned, reproducible builds (`uv.lock`, committed); `CHANGELOG.md` published.
 
 ### 2.2 Safe defaults, verified against the implementation
 
-- [ ] Fresh install binds loopback only; refuses a non-loopback listener without TLS.
-- [ ] No request is served without the app key; no control call without the admin key; the two
-      are never interchangeable.
-- [ ] Nothing rents without a lease; a lease that can rent cannot be created without a dollar cap.
-- [ ] Plain-`http` public hosts without auth are refused unless explicitly allowed per host.
-- [ ] Only catalogued models are ever resolved; no request can trigger a pull or a model load.
-- [ ] Key files, secret-bearing configuration and the database are owner-readable only, and the
-      pool refuses to start otherwise.
-- [ ] The account credential appears in no log, no event, no API response, no rented host.
+Each line was re-checked against the code on 2026-09-19; the test that holds it in place is in
+[threat-model.md](threat-model.md) §6.
+
+- [x] Fresh install binds loopback only; refuses a non-loopback listener without TLS — for the
+      router and the control API alike (T4).
+- [x] No request is served without the app key; no control call without the admin key; the two
+      are never interchangeable, and the control API says so by name when given the app key
+      (T2, T3).
+- [x] Nothing rents without a lease; a lease that can rent cannot be created without a dollar
+      cap (T11).
+- [x] Plain-`http` public hosts without auth are refused unless explicitly allowed per host —
+      and switching that on is a change the plan makes you retype (T17).
+- [x] Only catalogued models are ever resolved; the request path cannot even reach `pull` or
+      `load_and_pin`, which is enforced structurally (T9, T10).
+- [x] Key files and the database are created owner-readable only, and a key file others can
+      read is refused (T19).
+- [x] The account credential appears in no log, no event, no API response and on no rented
+      host; only the provider's instance-scoped credential goes there (T5, T6).
 
 ### 2.3 Tests
 
@@ -98,22 +108,24 @@ companies from adopting a component that sits in their serving path.
 
 - [x] A quick start that stands up a pool over one local and one remote host **without renting
       anything** — [quickstart.md](quickstart.md).
-- [ ] A second guide that adds a rented provider, written around leases and caps first.
-- [ ] Plug-in author guides for provider, engine and strategy, each with the interface's
-      guarantees and the fake provider as the worked example.
-- [ ] The **deliberate non-goals** from [threat-model.md](threat-model.md) stated in user-facing
-      docs — above all that a rented marketplace host's operator can read everything sent to it.
-- [ ] [decisions.md](decisions.md) published: it answers most "why doesn't it just…" questions.
+- [x] A second guide that adds a rented provider, written around leases and caps first —
+      [quickstart-renting.md](quickstart-renting.md).
+- [x] Plug-in author guides for provider, engine and strategy —
+      [writing-a-plugin.md](writing-a-plugin.md), with the fake provider as the worked example.
+- [x] The **deliberate non-goals** stated in user-facing docs — `SECURITY.md` and the renting
+      guide, enforced by `test_threat_model.py::test_the_deliberate_non_goals_are_in_user_facing_documentation`.
+- [x] [decisions.md](decisions.md) published: it answers most "why doesn't it just…" questions.
 
 ### 2.5 Project hygiene
 
 - [x] `SECURITY.md` with a private reporting channel and a statement of what counts as critical.
-- [x] `CONTRIBUTING.md` with the DCO. A code of conduct and issue/PR templates are still to do.
-- [x] CI: tests on three Python versions, a secret scan, a dependency audit, and a job that
-      fails if anything able to reach a real provider enters the default suite. Lint and
-      type-check are still to add.
-- [ ] The threat model re-read line by line against the implementation, with each mitigation
-      pointed at the code or test that provides it.
+- [x] `CONTRIBUTING.md` with the DCO, `CODE_OF_CONDUCT.md`, and issue and pull-request templates.
+- [x] CI: tests on three Python versions, **ruff** (the rules that catch problems, not house
+      style), a secret scan, a dependency audit, and a job that fails if anything able to reach
+      a real provider enters the default suite. A type-check is still to add.
+- [x] The threat model re-read line by line against the implementation, with each mitigation
+      pointed at the code or test that provides it — [threat-model.md](threat-model.md) §6, and
+      `tests/test_threat_model.py` for the invariants a refactor could silently lose.
 
 ## 3. Deliberately not promised at first release
 

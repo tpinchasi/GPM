@@ -6,10 +6,11 @@
 
 ## Current state — 2026-09-17
 
-**Phases 1–3 are complete** — the router and SDK, the supervisor with leases and renting
-(proven on a real marketplace for $0.008), and the operator console. **Phase 4 (Release) is
-part-done**: the identifiers are renamed to `gpm`, the licence is Apache-2.0, and the project
-hygiene files and CI are in. **Nothing is committed yet** — the docs and code are working-tree files waiting for the owner to
+**Phases 1–4 are effectively complete.** The router and SDK, the supervisor with leases and
+renting (proven on a real marketplace for $0.008), the operator console, and the release work:
+renamed to `gpm`, Apache-2.0, documented, linted, CI, and the threat model verified against the
+code. **Only two checklist items remain open, and both are the adopter-file decision the owner
+deferred.** The first commit was made on 2026-09-19 (`100dedf`); nothing has been pushed — the docs and code are working-tree files waiting for the owner to
 review and commit.
 
 The design was drafted, extended through ten rounds of owner requirements, put through a
@@ -116,11 +117,14 @@ follow it (host went `ready`, the router served a request), and rollback restore
 | CI: tests on 3.11–3.13, gitleaks, `pip-audit`, and a job that fails if anything able to reach a real provider enters the default suite | **done** |
 | Secret scan before the first commit | **done** — only test fixtures matched; the account key is in no tracked file |
 | Two packages, `gpm-client` (one dependency) and `gpm-server` | **done** |
-| Code of conduct, issue/PR templates, lint and type-check in CI | to do |
+| Code of conduct, issue and PR templates | **done** |
+| Lint (ruff) in CI, and the code clean under it | **done** — a type-check is still to add |
 | Quick start over hosts you already own, renting nothing | **done** — `docs/quickstart.md` |
-| The rented-provider guide; plug-in author guides | to do |
+| The rented-provider guide (`docs/quickstart-renting.md`) and the plug-in author guide (`docs/writing-a-plugin.md`) | **done** |
+| First-party plug-ins load by entry point, with no privileged path; `CHANGELOG.md`; versions reported at runtime | **done** |
 | The three adopter-internal files | **deferred by the owner**: commit now, decide before going public — which then means publishing from a fresh history |
-| Threat model re-read line by line against the implementation | to do |
+| Threat model re-read line by line against the implementation | **done** — `threat-model.md` §6 maps all 19 threats to the code and test that hold them, and `tests/test_threat_model.py` pins the invariants a refactor could silently lose |
+| §2.2 safe defaults re-checked against the code | **done** — all seven ticked, each pointing at its threat-model row |
 
 ### Not built yet, on purpose
 
@@ -147,8 +151,9 @@ Read [docs/overview.md](docs/overview.md) first, then [docs/decisions.md](docs/d
 
 ## Next actions, in order
 
-1. **Owner: review the docs and the code, and make the first commit** (see "Before anything here
-   becomes public" below — the repo is private, so committing everything is safe for now).
+1. **Owner: review, and decide about pushing.** Nothing has left this machine. Note that the
+   adopter-internal files are now in history, so making this repository public later means
+   publishing from a fresh one (the owner's decision of 2026-09-19).
 3. **Owner decisions still open** — the first two block phase 4, not phase 1:
    - **Name of the identifiers.** The repository is `GPM`, but the docs still use working-title
      identifiers: CLI `pool`, SDK package `gpm_client`, env prefix `GPM_*`, header
@@ -204,7 +209,8 @@ Read [docs/overview.md](docs/overview.md) first, then [docs/decisions.md](docs/d
 | D34 | A bid the ceilings push below the floor is a refusal, not a bid |
 | D35 | Configuration is versioned by content hash; stale writes refused; reload in place, except the listener |
 | D36 | Identifiers: CLI `gpm`, packages `gpm-client` / `gpm-server`, `GPM_*`, `X-GPM-*`, label `gpm/<pool>/<host>` |
-| D37 | Apache-2.0, copyright held by a company, DCO rather than a CLA |
+| D37 | Apache-2.0, copyright ClearViews, DCO rather than a CLA |
+| D38 | First-party plug-ins load by entry point, with no privileged path |
 
 ## Before anything here becomes public
 
@@ -252,6 +258,7 @@ In `~/workspace/Aletheia`: backlog entries `GPU-POOL-01` and `GPU-CLOUD-01` in
 | 2026-09-17 | Architecture review written (18 findings). Decided one by one with the owner: F1 record-and-measure; F2 two processes; F3 time budget; F4 pool API key as the isolation unit; F5 deferred; F6 v1 cut line with three owner musts; F7 phase re-order; F9 catalog-only resolution; F11 whole model set resident + FCFS; F13 spend reconciliation + provider API. Owner added: public-framework intent; current scripts are not design inputs; prepare-a-host from the console. Verified: the first provider's per-instance restricted key makes the dead-man timer possible without the account key. |
 | 2026-09-17 | F14–F18 delegated and done: docs split into generic core + adopter guide; plug-in interfaces; capability-keyed variants; threat model; release checklist. Owner created this repository (GPM, private); docs moved here; this file, the README and `CLAUDE.md` written for handoff. **Not committed.** |
 | 2026-09-17 | **Phase 1 built.** `uv` workspace with `client/` and `server/`; config and its refusals; engine interface + Ollama adapter; dispatch with tiers, FCFS queue and failover-once; the request path with passthrough, cancel-on-disconnect and the time budget; readiness probe; SQLite request log; the SDK's transport and `PoolClient`; `gpm serve` / `gpm status`. 104 fake-engine tests plus 9 against a real local Ollama, all green; `gpm serve` driven by hand against that Ollama as well. Two decisions the build forced: **D28** (three dialect additions) and **D29** (three-valued `enforces_schema`) — both recorded in the decision log and in the spec. **Still not committed.** |
+| 2026-09-19 | **Phase 4 (Release) finished, bar the adopter-file decision.** The renting guide, the plug-in author guide and `CHANGELOG.md` written; `CODE_OF_CONDUCT.md` and issue/PR templates added; ruff configured to the rules that catch problems (not house style) and the code made clean under it — it found 14 genuinely unused imports; lint added to CI. **The threat model was re-read line by line**: all 19 threats now name the code and the test that hold them, the deliberate non-goals moved into user-facing docs where someone will actually meet them, and `tests/test_threat_model.py` pins the structural invariants — that the request path cannot reach a pull, that strategies do no I/O, that every bid passes the supervisor's clamp. That re-read also caught **D38**: first-party plug-ins were still loading from a table rather than the entry points third parties use, so "no privileged path" was not true until now. 320 tests green. |
 | 2026-09-19 | **Phase 4 (Release) started.** Identifiers renamed to `gpm` throughout — 36 files, zero occurrences of the old ones left, `gpm --help` and `import gpm_client` both verified. Two things were checked rather than assumed: the PyPI name `gpm` is taken by an abandoned 2019 package (so the distributions are `gpm-client` / `gpm-server`, both free), and `gpm` is also the Linux mouse daemon. Rented instances now carry a `gpm/<pool>/` label, because the live run found another tool renting on the same account. Apache-2.0 added with `NOTICE`, `SECURITY.md`, `CONTRIBUTING.md` with a DCO, and CI that runs the suite on three Pythons, scans for secrets, audits dependencies and **fails if anything able to reach a real provider enters the default suite**. All 15 runtime dependencies checked as licence-compatible. A secret scan before the first commit found only test fixtures. **D36** and **D37** recorded. 306 tests green after the rename. |
 | 2026-09-19 | **Phase 3 (Console) built.** A static page at `/ui` served by the supervisor — no framework, no build step — over the same control API the CLI uses: Overview with hosts by tier and lease burn-down, Hosts with test-connection, Rented capacity with the live market preview and Prepare a host, Models, Leases, Decisions with the numbers behind each one, and Configuration with validate → plan → apply, history and rollback. Live updates over server-sent events read with `fetch`, because the key travels as a header and never in a URL; the key is held in page memory and the page is asserted to touch no storage and no cookie. New underneath it: `configplan.py` (the plan diff as a pure function, and the version store) and `hostcheck.py` (test connection with the concurrency check). **D35** recorded. 303 tests green, and the whole flow driven live against the local Ollama. |
 | 2026-09-19 | **`reports_charges` earned for Vast.ai.** Found the real charges endpoint (`/api/v0/charges/`, learned from the official CLI's source) and read the run's rows: the pool's RTX 3090 host reported $0.007 against the pool's estimate of $0.008. The plug-in now sums an instance's daily rows, fetched once per pass for all hosts and paginated; an instance with no row yet reports *nothing*, not zero, so the cap margin narrows to 10% only once a real figure has arrived — and since caps take the higher of estimate and report, a lagging daily row can never loosen one. Verified fact updated. |

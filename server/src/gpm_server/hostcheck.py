@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import time
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Mapping, Sequence
 
 import httpx
 

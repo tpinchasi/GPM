@@ -1,3 +1,3 @@
-from .service import Supervisor, SupervisedHost, run
+from .service import SupervisedHost, Supervisor, run
 
 __all__ = ["SupervisedHost", "Supervisor", "run"]

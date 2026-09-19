@@ -11,7 +11,7 @@ The router passes requests through in the engine's own API and never translates 
 from __future__ import annotations
 
 import dataclasses
-from typing import ClassVar, Optional, Protocol, runtime_checkable
+from typing import Any, ClassVar, Optional, Protocol, runtime_checkable
 
 import httpx
 
@@ -83,12 +83,19 @@ class EngineNotFound(Exception):
     """The configuration named an engine that is not installed."""
 
 
-def get_engine(name: str) -> Engine:
-    """Resolve an engine adapter by name. v1 ships one."""
-    from .ollama import OllamaEngine
+#: The group third-party engines register under — the same one the shipped adapter uses.
+ENTRY_POINT_GROUP = "gpm.engines"
 
-    engines = {OllamaEngine.name: OllamaEngine}
-    try:
-        return engines[name]()
-    except KeyError as exc:
-        raise EngineNotFound(f"unknown engine {name!r}; available: {sorted(engines)}") from exc
+
+def available_engines() -> dict[str, Any]:
+    from importlib.metadata import entry_points
+
+    return {point.name: point for point in entry_points(group=ENTRY_POINT_GROUP)}
+
+
+def get_engine(name: str) -> Engine:
+    """Resolve an engine adapter by name. Nothing loads that configuration does not name."""
+    found = available_engines()
+    if name not in found:
+        raise EngineNotFound(f"unknown engine {name!r}; installed: {sorted(found) or 'none'}")
+    return found[name].load()()

@@ -16,8 +16,9 @@ import time
 import uuid
 from typing import Optional
 
-from ..config import BiddingConfig, OfferPolicy, PoolConfig, RentedConfig
+from ..config import BiddingConfig, OfferPolicy, PoolConfig, RentedConfig, TransportConfig
 from ..deadman import heartbeat_command, onstart_script
+from ..engines import get_engine
 from ..ledger import EventLog, Lease, LeaseRefused, LeaseStore, SpendLedger
 from ..providers.base import (
     BidLost,
@@ -31,20 +32,18 @@ from ..providers.base import (
     Provider,
     ProviderError,
 )
-from ..config import TransportConfig
-from ..engines import get_engine
-from ..transports import SshTunnel, build_ssh_exec_command, run_command
 from ..strategies import (
     Demand,
-    filter_name,
     HostView,
     LeaseView,
     decide_eviction,
     decide_rent,
     decide_teardown,
+    filter_name,
     price_bid,
     rank_offers,
 )
+from ..transports import SshTunnel, build_ssh_exec_command, run_command
 
 log = logging.getLogger("gpm.renting")
 
@@ -398,7 +397,7 @@ class Fleet:
                 }
             )
 
-        lease = next((l for l in open_leases if l.allow_rent), None)
+        lease = next((lease for lease in open_leases if lease.allow_rent), None)
         rented_workers = sum(
             self.rented.workers for h in self.hosts.values() if not h.released and h.state == "ready"
         )
@@ -853,7 +852,7 @@ class Fleet:
     # --- acquire what is missing ---
 
     async def acquire(self, open_leases: list[Lease], ready_workers_higher_tiers: int) -> None:
-        lease = next((l for l in open_leases if l.allow_rent), None)
+        lease = next((lease for lease in open_leases if lease.allow_rent), None)
         rented_workers = sum(
             self.rented.workers for h in self.hosts.values() if not h.released and h.state == "ready"
         )
@@ -1045,7 +1044,7 @@ class Fleet:
         if not live:
             self.overflow_gone_since = None
             return
-        lease = next((l for l in open_leases if l.allow_rent), None)
+        lease = next((lease for lease in open_leases if lease.allow_rent), None)
         now = time.time()
 
         # A host that is not ready yet is neither idle nor surplus: it is capacity on its

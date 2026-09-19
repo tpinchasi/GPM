@@ -1,8 +1,9 @@
 # Threat Model
 
-> Written against the design, before any code. It must be re-checked against the implementation
-> in the Release phase ([roadmap.md](roadmap.md) phase 4). Scope: one pool, one operator or a
-> small team, the supervisor typically on a workstation or small server.
+> Written against the design, before any code; **re-checked line by line against the
+> implementation on 2026-09-19** — §6 maps every threat to the code and the test that provide
+> its mitigation. Scope: one pool, one operator or a small team, the supervisor typically on a
+> workstation or small server.
 
 ## 1. What is worth protecting
 
@@ -72,7 +73,41 @@ The rented host is **outside** the trust boundary even though the pool created i
 
 Each is stated in user-facing documentation, not only here.
 
-## 6. Reporting
+## 6. Each mitigation, and what provides it
+
+Checked against the implementation on 2026-09-19. Where a row says a test, that test fails if
+the mitigation is removed — which is the point of listing it rather than the code alone.
+
+| # | Provided by | Held in place by |
+|---|---|---|
+| **T1** | Admin key required on every control call; `Origin` checked against the configured host | `supervisor/control.py` `authorised()` · `test_console.py::test_the_page_cannot_read_anything_without_the_key`, `test_control_api.py::test_a_request_from_another_site_is_refused` |
+| **T2** | App key required on every request, loopback included | `router/app.py` `_authorised()` · `test_routing.py::test_the_app_key_is_required_even_on_loopback` |
+| **T3** | The control API refuses the app key explicitly, and says why | `supervisor/control.py` · `test_control_api.py::test_the_app_key_is_refused_and_told_why`, `test_console.py::test_every_screens_data_call_is_refused_to_the_app_key` |
+| **T4** | A non-loopback listener without TLS is refused at configuration load, for the router and the control API alike | `config.py` `ListenConfig`/`ControlConfig` · `test_config.py::test_listening_off_loopback_requires_tls`, `::test_the_control_api_off_loopback_requires_tls` |
+| **T5** | The account credential is read from the environment only and never leaves the process; the host gets the provider's instance-scoped credential | `providers/vast.py` `client` · `deadman.py` · `test_threat_model.py::test_nothing_a_host_receives_can_carry_the_account_credential`, `test_deadman.py::test_the_timer_carries_only_the_instance_scoped_credential` |
+| **T6** | The app's `Authorization` and the whole `X-GPM-*` dialect are stripped before forwarding | `router/app.py` `_DROP_UPSTREAM`, `_upstream_headers()` · `test_routing.py::test_the_app_key_never_reaches_the_engine`, `test_threat_model.py::test_the_app_key_is_stripped_before_a_request_is_forwarded` |
+| **T7** | **Nothing.** Accepted and documented — and now stated in `SECURITY.md` and the renting guide, not only here | `test_threat_model.py::test_the_deliberate_non_goals_are_in_user_facing_documentation` |
+| **T8** | Nothing beyond corrupt-output detection. Accepted | — |
+| **T9** | Catalog-only resolution; the served build reported on every response and in the log | `catalog.py` `select_variant()` · `test_catalog.py`, `test_passthrough_fidelity.py::test_a_schema_request_goes_to_the_build_that_enforces_one` |
+| **T10** | The request path cannot reach `pull` or `load_and_pin`; pulls happen in the supervisor, for configured tags only; the engine image is pinned | `test_threat_model.py::test_the_request_path_cannot_reach_a_pull_or_a_load`, `::test_only_the_supervisor_pulls_and_only_for_configured_tags` |
+| **T11** | Lease-only spending with a mandatory cap; every bid clamped to both ceilings *after* the strategy returns; caps on the higher of estimate and reported charges, less a margin; rate caps; one host at a time | `supervisor/renting.py` `_cap_bid()`, `_refuse_bid_for_burn()`, `enforce_lease_limits()` · `test_renting.py` (11 tests) · `test_threat_model.py::test_every_bid_a_strategy_returns_passes_through_the_supervisors_clamp` |
+| **T12** | Router survives the supervisor; dead-man timer on every host; lease expiry; orphan sweep; parking time-limited | `test_two_processes.py::test_routing_continues_when_the_supervisor_dies` · `test_deadman.py::test_it_fires_when_the_pool_goes_silent` (the script is executed, not merely asserted on) · `test_interruption_drill.py` |
+| **T13** | The provider is the source of truth for existence; label-scoped listing under `gpm/<pool>/`; every destroy verified by re-listing; a restart adopts rather than sweeps | `supervisor/renting.py` `sweep_orphans()`, `_destroy_instance()`, `adopt()` · `test_renting.py::test_a_stray_instance_carrying_the_pools_label_is_swept`, `::test_a_destroy_that_fails_is_retried_and_only_counts_once_verified`, `test_adoption.py` |
+| **T14** | Only plug-ins named in configuration load; strategies are pure functions with no I/O, and the supervisor re-checks every cap after they return. **A provider or engine plug-in still runs with full authority** — documented, not mitigated | `providers/base.py` `get_provider()` · `test_threat_model.py::test_the_strategies_module_performs_no_io` · stated in `SECURITY.md` |
+| **T15** | Queue timeout, per-request deadlines, cancel on disconnect. No per-client limits inside a pool | `test_time_budget.py` (6 tests) |
+| **T16** | The request log's record has no field that could hold text; decision events carry numbers and identifiers | `db.py` `RequestRecord` · `test_request_log.py::test_the_log_has_nowhere_to_put_prompt_or_completion_text`, `test_threat_model.py::test_the_decision_log_records_numbers_and_identifiers_not_bodies` |
+| **T17** | Plain `http` off loopback without auth refused at load unless `allow_insecure` is set per host — and switching it on is a change the plan makes you retype | `config.py` `TransportConfig._check()` · `test_config.py::test_plain_http_off_loopback_is_refused` · `test_console.py::test_switching_on_allow_insecure_must_be_retyped` |
+| **T18** | Host keys pinned on first connection in a pool-owned known-hosts file, checked on every later one; the address comes from the provider's authenticated API | `transports/tunnel.py` `build_ssh_command()` · `test_tunnel.py::test_the_host_key_is_pinned_on_first_use_against_a_pool_owned_file` |
+| **T19** | The database and key files are created owner-only, and a key file others can read is refused | `db.py` `_secure_path()` · `keys.py` `_check_permissions()` · `test_request_log.py::test_the_database_is_not_readable_by_anyone_else`, `test_control_api.py::test_a_key_file_others_can_read_is_refused` |
+
+### What the re-read changed
+
+- **T7 and T14** were stated only here. They are now in `SECURITY.md` under "out of scope, by
+  design" and — for T7 — in the renting guide, where someone is about to add a marketplace host.
+- **T13** gained the `gpm/<pool>/` label prefix. The first live run found another tool renting
+  on the same account, so scoping the sweep by pool name alone was not enough.
+
+## 7. Reporting
 
 The public repository carries a security policy with a private reporting channel
 ([release-checklist.md](release-checklist.md)). A finding that lets anyone spend an operator's

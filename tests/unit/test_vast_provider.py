@@ -150,7 +150,9 @@ async def test_creating_passes_the_bid_the_label_and_the_start_up_script():
 
 
 async def test_a_lost_bid_raises_rather_than_returning_something_half_made():
-    handler = lambda request: httpx.Response(200, json={"success": False, "msg": "outbid"})
+    def handler(request):
+        return httpx.Response(200, json={"success": False, "msg": "outbid"})
+
     offer = (await provider(market()).search_offers(OfferQuery()))[0]
 
     with pytest.raises(BidLost, match="outbid"):
@@ -158,7 +160,9 @@ async def test_a_lost_bid_raises_rather_than_returning_something_half_made():
 
 
 async def test_an_offer_that_went_between_search_and_create_is_typed():
-    handler = lambda request: httpx.Response(410, json={"error": "no_such_ask"})
+    def handler(request):
+        return httpx.Response(410, json={"error": "no_such_ask"})
+
     offer = (await provider(market()).search_offers(OfferQuery()))[0]
 
     with pytest.raises(OfferGone):
