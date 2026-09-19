@@ -1,0 +1,15 @@
+[project]
+name = "gpm-client"
+version = "0.1.0"
+description = "Client SDK for a GPM pool: an httpx transport that waits and retries for capacity by default."
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27,<0.29",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gpm_client"]

@@ -1,0 +1,19 @@
+[tool.uv.workspace]
+members = ["client", "server"]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-timeout>=2.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "integration: needs a real, locally-running Ollama (opt-in, not run by default)",
+]
+addopts = "-m 'not integration'"
+# Every test here drives real servers over real sockets; a hang must fail loudly, not stall.
+timeout = 120

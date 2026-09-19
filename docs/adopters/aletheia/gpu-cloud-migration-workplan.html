@@ -1,0 +1,487 @@
+<title>Aletheia GPU Cloud Workplan</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,500..800&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap">
+<style>
+:root{
+  --ground:#F2F4F3; --surface:#FFFFFF; --ink:#141C1A; --muted:#566560; --rule:#D3DBD8;
+  --accent:#1D5C58; --accent-soft:#E1ECEA; --gate:#9A5B12; --gate-soft:#F6EBDC;
+  --high:#A8322A; --high-soft:#F6E1DE; --med:#9A5B12; --med-soft:#F6EBDC; --low:#3F6E4A; --low-soft:#E2EEE4;
+  --bar-run:#1D5C58; --bar-idle:#A8322A;
+  --display:"Archivo","Arial Narrow",system-ui,sans-serif;
+  --body:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ground:#0F1514; --surface:#162020; --ink:#E4EBE8; --muted:#94A39E; --rule:#2A3634;
+    --accent:#6FB8B1; --accent-soft:#1A2D2B; --gate:#E0A45A; --gate-soft:#2B2217;
+    --high:#E8847A; --high-soft:#34201D; --med:#E0A45A; --med-soft:#2B2217; --low:#8CC196; --low-soft:#1B2A1E;
+    --bar-run:#6FB8B1; --bar-idle:#E8847A;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0F1514; --surface:#162020; --ink:#E4EBE8; --muted:#94A39E; --rule:#2A3634;
+  --accent:#6FB8B1; --accent-soft:#1A2D2B; --gate:#E0A45A; --gate-soft:#2B2217;
+  --high:#E8847A; --high-soft:#34201D; --med:#E0A45A; --med-soft:#2B2217; --low:#8CC196; --low-soft:#1B2A1E;
+  --bar-run:#6FB8B1; --bar-idle:#E8847A;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+@media (prefers-reduced-motion: reduce){html{scroll-behavior:auto}}
+body{background:var(--ground);color:var(--ink);font-family:var(--body);font-size:15.5px;line-height:1.6;padding-inline:20px;padding-block:0 64px}
+code,.mono{font-family:var(--mono);font-size:.86em}
+code{background:var(--accent-soft);color:var(--ink);padding:.08em .35em;border-radius:3px;overflow-wrap:anywhere}
+a{color:var(--accent)}
+a:focus-visible,input:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+h1,h2,h3{font-family:var(--display);text-wrap:balance;margin:0;line-height:1.15}
+h1{font-size:clamp(2rem,4.2vw,2.9rem);font-weight:760;font-variation-settings:"wdth" 88;letter-spacing:-.01em}
+h2{font-size:1.55rem;font-weight:720;font-variation-settings:"wdth" 90}
+h3{font-size:1.12rem;font-weight:680;font-variation-settings:"wdth" 94}
+p{margin:0}
+.eyebrow{font-family:var(--mono);font-size:.74rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+
+.shell{max-width:1120px;margin-inline:auto;display:grid;grid-template-columns:200px minmax(0,1fr);gap:56px}
+.index{position:sticky;top:0;align-self:start;padding-block:40px;display:flex;flex-direction:column;gap:18px}
+.index nav{display:flex;flex-direction:column;gap:2px;border-left:1px solid var(--rule)}
+.index a{display:grid;grid-template-columns:22px 1fr;gap:6px;text-decoration:none;color:var(--muted);font-size:.86rem;padding:4px 0 4px 12px;margin-left:-1px;border-left:2px solid transparent}
+.index a:hover{color:var(--ink);border-left-color:var(--accent)}
+.index a .n{font-family:var(--mono);font-size:.78rem}
+.index .sep{height:10px}
+main{min-width:0;display:flex;flex-direction:column;gap:64px;padding-block:40px}
+
+.masthead{display:flex;flex-direction:column;gap:16px;padding-bottom:28px;border-bottom:1px solid var(--rule)}
+.masthead .lede{max-width:64ch;color:var(--muted);font-size:1.05rem}
+.meta{display:flex;flex-wrap:wrap;gap:8px}
+.chip{font-family:var(--mono);font-size:.72rem;letter-spacing:.04em;padding:3px 8px;border-radius:999px;border:1px solid var(--rule);color:var(--muted);background:var(--surface);white-space:nowrap}
+
+section{display:flex;flex-direction:column;gap:20px}
+.prose{max-width:66ch;display:flex;flex-direction:column;gap:12px}
+.prose p{color:var(--ink)}
+.muted{color:var(--muted)}
+
+/* Finding */
+.finding{background:var(--surface);border:1px solid var(--rule);border-radius:6px;padding:28px;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.15fr);gap:36px}
+.finding .claim{display:flex;flex-direction:column;gap:14px}
+.finding .claim h2{font-size:1.8rem}
+.priority{margin:0;padding-left:1.3em;display:flex;flex-direction:column;gap:4px}
+.priority li::marker{font-family:var(--mono);color:var(--accent)}
+.chart{display:flex;flex-direction:column;gap:14px}
+.chart .cap{font-size:.8rem;color:var(--muted)}
+.bars{display:flex;flex-direction:column;gap:10px;margin:0;padding:0;list-style:none}
+.bar{display:grid;grid-template-columns:minmax(0,1fr);gap:4px}
+.bar .lbl{display:flex;justify-content:space-between;gap:12px;font-size:.84rem}
+.bar .lbl .v{font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+.track{height:12px;background:var(--accent-soft);border-radius:2px;position:relative;overflow:hidden}
+.fill{position:absolute;inset:0 auto 0 0;min-width:3px;border-radius:2px}
+.fill.run{background:var(--bar-run)}
+.fill.idle{background:var(--bar-idle)}
+.axis{display:flex;justify-content:space-between;font-family:var(--mono);font-size:.72rem;color:var(--muted);border-top:1px solid var(--rule);padding-top:4px;font-variant-numeric:tabular-nums}
+.legend{display:flex;gap:16px;font-size:.78rem;color:var(--muted)}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.legend i{width:10px;height:10px;border-radius:2px;display:inline-block}
+
+/* Favour rows */
+.rows{display:flex;flex-direction:column;border-top:1px solid var(--rule)}
+.row{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr);gap:24px;padding-block:16px;border-bottom:1px solid var(--rule)}
+.row .k{font-weight:600}
+.row .k small{display:block;font-weight:400;color:var(--muted);font-size:.8rem;margin-top:4px;font-family:var(--mono);overflow-wrap:anywhere}
+.callout{border-left:3px solid var(--gate);background:var(--gate-soft);padding:12px 16px;max-width:66ch;border-radius:0 4px 4px 0}
+
+/* Decisions */
+.decisions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+.dec{background:var(--surface);border:1px solid var(--rule);border-radius:6px;padding:20px;display:flex;flex-direction:column;gap:10px}
+.dec .id{font-family:var(--mono);font-size:.74rem;color:var(--accent);letter-spacing:.06em}
+.dec .rec{font-size:.92rem}
+.dec .rec b{color:var(--accent)}
+.dec .flip{font-size:.84rem;color:var(--muted);border-top:1px dashed var(--rule);padding-top:10px;margin-top:auto}
+
+/* Tables */
+.tablewrap{overflow-x:auto;border:1px solid var(--rule);border-radius:6px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:.9rem}
+th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--rule);vertical-align:top}
+th{font-family:var(--mono);font-size:.72rem;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:500;white-space:nowrap}
+tr:last-child td{border-bottom:0}
+td.num{font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+tr.total td{font-weight:600}
+.sev{font-family:var(--mono);font-size:.72rem;padding:2px 8px;border-radius:999px;white-space:nowrap}
+.sev.high{color:var(--high);background:var(--high-soft)}
+.sev.med{color:var(--med);background:var(--med-soft)}
+.sev.low{color:var(--low);background:var(--low-soft)}
+
+/* Phases */
+.phases{display:flex;flex-direction:column}
+.phase{display:grid;grid-template-columns:52px minmax(0,1fr);gap:20px;position:relative}
+.phase::before{content:"";position:absolute;left:25px;top:52px;bottom:0;width:1px;background:var(--rule)}
+.phase:last-child::before{display:none}
+.num{font-family:var(--display);font-variation-settings:"wdth" 80}
+.pnum{width:52px;height:52px;border-radius:50%;border:1.5px solid var(--accent);color:var(--accent);background:var(--ground);display:grid;place-items:center;font-size:1.35rem;font-weight:700;position:relative;z-index:1}
+.pbody{display:flex;flex-direction:column;gap:14px;padding-bottom:40px;min-width:0}
+.phead{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:8px 16px;padding-top:12px}
+.phead .sub{font-size:.9rem;color:var(--muted);flex-basis:100%}
+.count{font-family:var(--mono);font-size:.74rem;color:var(--muted);font-variant-numeric:tabular-nums}
+.tasks{display:flex;flex-direction:column;gap:2px;margin:0;padding:0;list-style:none}
+.task{display:grid;grid-template-columns:20px minmax(0,1fr);gap:10px;align-items:start;padding:6px 8px;margin-inline:-8px;border-radius:4px;cursor:pointer}
+.task:hover{background:var(--accent-soft)}
+.task input{margin:4px 0 0;width:16px;height:16px;accent-color:var(--accent);cursor:pointer}
+.task input:checked + span{color:var(--muted);text-decoration:line-through;text-decoration-color:var(--rule)}
+.gatechip{font-family:var(--mono);font-size:.68rem;letter-spacing:.05em;text-transform:uppercase;color:var(--gate);border:1px solid var(--gate);border-radius:3px;padding:0 5px;margin-right:6px;white-space:nowrap}
+.exit{display:grid;grid-template-columns:auto minmax(0,1fr);gap:4px 12px;background:var(--gate-soft);border:1px solid color-mix(in srgb,var(--gate) 35%,transparent);border-radius:4px;padding:12px 14px;font-size:.9rem}
+.exit dt{font-family:var(--mono);font-size:.7rem;letter-spacing:.07em;text-transform:uppercase;color:var(--gate);padding-top:3px}
+.exit dd{margin:0}
+.note{font-size:.88rem;color:var(--muted);max-width:66ch}
+
+.qs{display:flex;flex-direction:column;gap:12px;margin:0;padding-left:1.2em;max-width:66ch}
+.sources{font-size:.84rem;color:var(--muted);display:flex;flex-direction:column;gap:6px;margin:0;padding-left:1.2em}
+footer{font-size:.8rem;color:var(--muted);border-top:1px solid var(--rule);padding-top:16px}
+
+@media (max-width: 900px){
+  .shell{grid-template-columns:minmax(0,1fr);gap:0}
+  .index{position:static;padding-block:24px 0}
+  .index nav{flex-direction:row;flex-wrap:wrap;border-left:0;gap:6px}
+  .index a{border:1px solid var(--rule);border-radius:999px;padding:3px 10px;margin:0;grid-template-columns:auto auto}
+  .index .sep{display:none}
+  .finding{grid-template-columns:minmax(0,1fr)}
+  .decisions{grid-template-columns:minmax(0,1fr)}
+  .row{grid-template-columns:minmax(0,1fr);gap:6px}
+}
+@media (max-width: 480px){
+  body{padding-inline:16px}
+  .phase{grid-template-columns:36px minmax(0,1fr);gap:14px}
+  .pnum{width:36px;height:36px;font-size:1rem}
+  .phase::before{left:17.5px;top:36px}
+  .finding{padding:20px}
+}
+</style>
+
+<div class="shell">
+  <aside class="index" aria-label="Contents">
+    <span class="eyebrow">Contents</span>
+    <nav>
+      <a href="#finding"><span class="n">·</span>Key finding</a>
+      <a href="#favour"><span class="n">·</span>Already working</a>
+      <a href="#decisions"><span class="n">·</span>Decisions</a>
+      <span class="sep"></span>
+      <a href="#p0"><span class="n">0</span>Guardrails</a>
+      <a href="#p1"><span class="n">1</span>Langfuse</a>
+      <a href="#p2"><span class="n">2</span>GPU node</a>
+      <a href="#p3"><span class="n">3</span>Parity gate</a>
+      <a href="#p4"><span class="n">4</span>Auto-stop, spot</a>
+      <a href="#p5"><span class="n">5</span>vLLM</a>
+      <a href="#p6"><span class="n">6</span>Steady state</a>
+      <span class="sep"></span>
+      <a href="#cost"><span class="n">·</span>Cost model</a>
+      <a href="#risks"><span class="n">·</span>Risks</a>
+      <a href="#open"><span class="n">·</span>Open questions</a>
+    </nav>
+  </aside>
+
+  <main>
+    <header class="masthead">
+      <span class="eyebrow">Aletheia · Dev track · Draft</span>
+      <h1>GPU Cloud Workplan</h1>
+      <p class="lede">Move simulator generation and the per-turn labeling pipeline off the local M4 Pro onto a rented NVIDIA GPU, without losing Langfuse traces when a spot machine goes away.</p>
+      <div class="meta">
+        <span class="chip">Written 2026-09-15</span>
+        <span class="chip">Nothing provisioned yet</span>
+        <span class="chip">Prices verified 2026-09-15</span>
+        <span class="chip">Tick boxes save in this browser</span>
+      </div>
+    </header>
+
+    <section id="finding">
+      <div class="finding">
+        <div class="claim">
+          <span class="eyebrow">Key finding</span>
+          <h2>Idle time costs more than the hourly rate.</h2>
+          <p>A full 834-session run costs between $0.23 and $10.90 of GPU time. The same GPU left running for a month costs $245 to $780. Spot saves 60 to 70 percent of a number that is already small. Forgetting to stop the box wastes far more.</p>
+          <p class="muted">Cost controls, highest impact first:</p>
+          <ol class="priority">
+            <li>Automatic stop when idle</li>
+            <li>Right-sizing the model to the job</li>
+            <li>Throughput from continuous batching</li>
+            <li>Spot or community pricing</li>
+          </ol>
+        </div>
+        <figure class="chart" style="margin:0">
+          <figcaption class="cap">Dollars, linear scale. Run bars are to scale, which is why they are slivers.</figcaption>
+          <ul class="bars">
+            <li class="bar"><div class="lbl"><span>One run · 4090 + vLLM, 7B</span><span class="v">$0.23</span></div><div class="track"><div class="fill run" style="width:0.03%"></div></div></li>
+            <li class="bar"><div class="lbl"><span>One run · 4090 + Ollama, 7B</span><span class="v">$1.36</span></div><div class="track"><div class="fill run" style="width:0.17%"></div></div></li>
+            <li class="bar"><div class="lbl"><span>One run · L40S + Ollama, 27B</span><span class="v">$10.90</span></div><div class="track"><div class="fill run" style="width:1.4%"></div></div></li>
+            <li class="bar"><div class="lbl"><span>Idle month · RTX 4090</span><span class="v">$245</span></div><div class="track"><div class="fill idle" style="width:31.4%"></div></div></li>
+            <li class="bar"><div class="lbl"><span>Idle month · L40S</span><span class="v">$780</span></div><div class="track"><div class="fill idle" style="width:100%"></div></div></li>
+          </ul>
+          <div class="axis" aria-hidden="true"><span>$0</span><span>$195</span><span>$390</span><span>$585</span><span>$780</span></div>
+          <div class="legend"><span><i style="background:var(--bar-run)"></i>One full run</span><span><i style="background:var(--bar-idle)"></i>One month idle</span></div>
+        </figure>
+      </div>
+    </section>
+
+    <section id="favour">
+      <div class="prose">
+        <span class="eyebrow">Verified in the current source</span>
+        <h2>Already working in our favour</h2>
+        <p>Three properties of the existing code make this migration cheaper than it looks.</p>
+      </div>
+      <div class="rows">
+        <div class="row">
+          <div class="k">Generation resumes after every session<small>generate_sessions.py · run_batched_generation.py</small></div>
+          <p>Already spot-ready. A reclaim costs at most one in-flight session. Only the checkpoint file's location has to change.</p>
+        </div>
+        <div class="row">
+          <div class="k">Langfuse is not the system of record<small>export_langfuse_conversations.py · new_export2/ · export_20260914/</small></div>
+          <p>Traces are exported to JSON after each run. Losing the Langfuse database is annoying, not fatal, which lowers the persistence bar.</p>
+        </div>
+        <div class="row">
+          <div class="k">The inference endpoint is one variable<small>OLLAMA_URL · agents/model_config.py</small></div>
+          <p>Phase 2 is a configuration change, not a code change.</p>
+        </div>
+      </div>
+      <p class="callout">Because the exports are the durable copy, Langfuse retention becomes a real deadline. Cloud Hobby keeps 30 days and Core keeps 90. Export must run inside that window.</p>
+    </section>
+
+    <section id="decisions">
+      <div class="prose">
+        <span class="eyebrow">Settle before spending</span>
+        <h2>Four decisions</h2>
+        <p>Each has a recommendation and the condition that would change it.</p>
+      </div>
+      <div class="decisions">
+        <article class="dec">
+          <span class="id">D1 · Drives every cost figure</span>
+          <h3>Which model is production?</h3>
+          <p class="rec">Small models narrate fake confirmations on the closing turn. <code>qwen3.8:27b</code> closed the loop reliably in the 2026-09-12 runs. <b>Decide from Phase 3 measurements, not argument.</b></p>
+          <div class="tablewrap"><table>
+            <thead><tr><th>Production</th><th>VRAM</th><th>Card</th></tr></thead>
+            <tbody>
+              <tr><td>7B + e4b</td><td class="num">24 GB</td><td>RTX 4090 · $0.34/hr</td></tr>
+              <tr><td>27B class</td><td class="num">48 GB</td><td>L40S · $1.09/hr</td></tr>
+            </tbody>
+          </table></div>
+          <p class="flip">If the small model's miss rate is acceptable for generation, take the 4090 and save three times over.</p>
+        </article>
+        <article class="dec">
+          <span class="id">D2</span>
+          <h3>Langfuse, managed or self-hosted?</h3>
+          <p class="rec"><b>Cloud Core at $29 a month.</b> One full cycle is about 50,000 units. Hobby caps at 50,000 and then stops tracing without warning.</p>
+          <p class="flip">Self-hosting wins past roughly four full cycles a month, because unit pricing punishes bulk synthetic runs.</p>
+        </article>
+        <article class="dec">
+          <span class="id">D3</span>
+          <h3>Which provider?</h3>
+          <p class="rec"><b>RunPod.</b> Network volumes, per-second billing, and the cheapest verified 4090 rate. Pin the region first, because volumes are region-locked.</p>
+          <p class="flip">Choose AWS <code>g5.xlarge</code> spot at $0.44/hr in us-east-1 if one account with IAM and budget alarms matters more.</p>
+        </article>
+        <article class="dec">
+          <span class="id">D4</span>
+          <h3>Ollama or vLLM?</h3>
+          <p class="rec"><b>Ollama first.</b> It needs no code change. vLLM gives 5 to 15 times the throughput but needs per-model tool-call parsers, and we depend on 41 action tools.</p>
+          <p class="flip">Revisit once Phases 1 to 4 are stable. Never couple the migration to that risk.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="phases">
+      <div class="prose">
+        <span class="eyebrow">Sequence</span>
+        <h2>Phases</h2>
+        <p>Each phase ends at an exit criterion. Do not start the next phase until it is met. Amber marks a step that needs explicit approval before it runs.</p>
+      </div>
+
+      <div class="phases">
+        <article class="phase" id="p0" data-phase="p0">
+          <div class="pnum num">0</div>
+          <div class="pbody">
+            <div class="phead"><h3>Accounts and guardrails</h3><span class="count" data-count>0 / 5 done</span><span class="sub">No GPU spend.</span></div>
+            <ul class="tasks">
+              <li><label class="task"><input type="checkbox" id="p0-1"><span>Settle decisions D1 to D4.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p0-2"><span>Create the provider account and set a hard $100 monthly budget alert.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p0-3"><span>Create the Langfuse Cloud org and project, and store the new keys.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p0-4"><span>Map every MLX tag to its GGUF equivalent. <code>gemma4:e4b-mlx</code> and <code>gemma4:31b-mlx</code> do not exist on NVIDIA.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p0-5"><span>Confirm the embedding model stays <code>nomic-embed-text-v2-moe</code>.</span></label></li>
+            </ul>
+            <dl class="exit"><dt>Exit</dt><dd>A written list of exact model tags to pull, and a budget alert that fires.</dd></dl>
+          </div>
+        </article>
+
+        <article class="phase" id="p1" data-phase="p1">
+          <div class="pnum num">1</div>
+          <div class="pbody">
+            <div class="phead"><h3>Persistent Langfuse</h3><span class="count" data-count>0 / 4 done</span><span class="sub">$29 a month. Do this before renting any GPU, so the persistent piece exists first.</span></div>
+            <ul class="tasks">
+              <li><label class="task"><input type="checkbox" id="p1-1"><span>Point the laptop at Langfuse Cloud through <code>LANGFUSE_BASE_URL</code>, <code>LANGFUSE_HOST</code>, <code>LANGFUSE_PUBLIC_KEY</code> and <code>LANGFUSE_SECRET_KEY</code> in <code>chat-agents/.env</code>.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p1-2"><span><span class="gatechip">Approval</span>Run one session locally against Cloud.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p1-3"><span>Test both SDKs separately. The pipeline pins Langfuse v3, while <code>chat-agents/.venv</code> carries v4.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p1-4"><span>Run the conversation export against Cloud and confirm the shape matches <code>new_export2/</code>.</span></label></li>
+            </ul>
+            <dl class="exit"><dt>Exit</dt><dd>A laptop trace appears in Cloud and the export script round-trips it.</dd><dt>Rollback</dt><dd>Revert the four variables. Local Langfuse is untouched throughout.</dd></dl>
+          </div>
+        </article>
+
+        <article class="phase" id="p2" data-phase="p2">
+          <div class="pnum num">2</div>
+          <div class="pbody">
+            <div class="phead"><h3>GPU node, on-demand, Ollama</h3><span class="count" data-count>0 / 6 done</span><span class="sub">On-demand on purpose. Debug without interruptions in the mix.</span></div>
+            <ul class="tasks">
+              <li><label class="task"><input type="checkbox" id="p2-1"><span>Provision the card chosen in D1, on-demand for this phase only.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p2-2"><span>Create a 100 GB network volume, about $7 a month, and mount it at the Ollama model directory.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p2-3"><span>Pull the GGUF tags from Phase 0 and confirm each one loads and answers.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p2-4"><span>Deploy chat-agents on the node with <code>OLLAMA_URL</code> pointing at its local Ollama.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p2-5"><span>Point the Langfuse variables at Cloud from the node.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p2-6"><span><span class="gatechip">Approval</span>Get sign-off before the first multi-session run.</span></label></li>
+            </ul>
+            <dl class="exit"><dt>Exit</dt><dd>One session runs end to end, calls tools, reaches a terminal outcome, and its trace lands in Cloud.</dd><dt>Rollback</dt><dd>Destroy the node. The volume and Langfuse both survive on their own.</dd></dl>
+          </div>
+        </article>
+
+        <article class="phase" id="p3" data-phase="p3">
+          <div class="pnum num">3</div>
+          <div class="pbody">
+            <div class="phead"><h3>Parity gate</h3><span class="count" data-count>0 / 5 done</span><span class="sub">The phase most likely to be skipped, and the most expensive to skip.</span></div>
+            <p class="note">Apple MLX builds and CUDA GGUF builds produce different outputs. The labeling pipeline's calibration and accuracy baselines were set against the old ones.</p>
+            <ul class="tasks">
+              <li><label class="task"><input type="checkbox" id="p3-1"><span><span class="gatechip">Approval</span>Run a matched set on the node. Start with <code>--limit 1</code>, then a handful.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p3-2"><span>Compare against the local baseline: outcome distribution, action-tool call rate, turn counts, and the step 1 to 3 labels.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p3-3"><span>Re-measure the closing-turn tool-call miss rate per model. This result decides D1.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p3-4"><span>Check that step 3's JSON schema binds on CUDA, and whether that changes its output shape. MLX ignored it.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p3-5"><span>Leave the embedding model unchanged. The calibration centroids depend on it, and nothing warns if it drifts.</span></label></li>
+            </ul>
+            <dl class="exit"><dt>Exit</dt><dd>A written parity verdict: outputs are equivalent, differences are understood and accepted, or back to Phase 2 with another tag.</dd></dl>
+          </div>
+        </article>
+
+        <article class="phase" id="p4" data-phase="p4">
+          <div class="pnum num">4</div>
+          <div class="pbody">
+            <div class="phead"><h3>Auto-stop, then spot</h3><span class="count" data-count>0 / 5 done</span><span class="sub">The watchdog first. It is worth more than the spot discount.</span></div>
+            <ul class="tasks">
+              <li><label class="task"><input type="checkbox" id="p4-1"><span>Add an idle watchdog that stops the node after a set number of minutes with no requests.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p4-2"><span>Move <code>generation_log.json</code> and every pipeline output onto the network volume.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p4-3"><span>Convert the node to spot or community pricing.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p4-4"><span>Add a boot script that mounts the volume, starts Ollama and resumes the generation loop.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p4-5"><span><span class="gatechip">Approval</span>Kill the node mid-run on purpose. Confirm no lost or duplicated sessions.</span></label></li>
+            </ul>
+            <dl class="exit"><dt>Exit</dt><dd>A forced kill costs at most one in-flight session, and an idle node stops itself.</dd><dt>Accepted</dt><dd>A hard kill skips the Langfuse flush, so traces buffered at that moment are lost. The checkpoint log is the resume source of truth, so no work is lost.</dd></dl>
+          </div>
+        </article>
+
+        <article class="phase" id="p5" data-phase="p5">
+          <div class="pnum num">5</div>
+          <div class="pbody">
+            <div class="phead"><h3>vLLM throughput</h3><span class="count" data-count>0 / 6 done</span><span class="sub">Optional. Highest payoff and highest risk. Only after Phases 1 to 4 are stable.</span></div>
+            <ul class="tasks">
+              <li><label class="task"><input type="checkbox" id="p5-1"><span>Run vLLM's OpenAI-compatible server alongside Ollama, not instead of it.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p5-2"><span>Enable auto tool choice with the right per-model tool-call parser. All 41 action tools must still fire.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p5-3"><span>Adapt the client with an adapter in <code>agents/agent_runtime.py</code>, a LiteLLM proxy, or a client switch.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p5-4"><span>Use guided decoding for the structured output of steps 1 to 3.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p5-5"><span><span class="gatechip">Approval</span>Re-run the Phase 3 parity gate against vLLM.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p5-6"><span>Benchmark tokens per hour and cost per run against Ollama on the same card.</span></label></li>
+            </ul>
+            <dl class="exit"><dt>Exit</dt><dd>A measured throughput gain with tool-calling parity held. If parity fails, stay on Ollama.</dd></dl>
+          </div>
+        </article>
+
+        <article class="phase" id="p6" data-phase="p6">
+          <div class="pnum num">6</div>
+          <div class="pbody">
+            <div class="phead"><h3>Steady state</h3><span class="count" data-count>0 / 3 done</span></div>
+            <ul class="tasks">
+              <li><label class="task"><input type="checkbox" id="p6-1"><span>Write a short runbook: start, run, export, stop.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p6-2"><span>Make Langfuse export a mandatory post-run step, inside the 90-day retention window.</span></label></li>
+              <li><label class="task"><input type="checkbox" id="p6-3"><span>Record the real cost of each run for the first month and compare against the estimates below.</span></label></li>
+            </ul>
+            <dl class="exit"><dt>Exit</dt><dd>A month of measured costs replaces the estimates in this plan.</dd></dl>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section id="cost">
+      <div class="prose">
+        <span class="eyebrow">Estimates until Phase 6 replaces them</span>
+        <h2>Cost model</h2>
+      </div>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Fixed, monthly</th><th>Cost</th></tr></thead>
+        <tbody>
+          <tr><td>Langfuse Cloud Core</td><td class="num">$29</td></tr>
+          <tr><td>100 GB network volume</td><td class="num">~$7</td></tr>
+          <tr class="total"><td>Fixed total</td><td class="num">~$36</td></tr>
+        </tbody>
+      </table></div>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Per 834-session run</th><th>Run time</th><th>GPU cost</th></tr></thead>
+        <tbody>
+          <tr><td>M4 Pro today</td><td class="num">50+ h</td><td class="num">$0</td></tr>
+          <tr><td>RTX 4090 + Ollama, 7B</td><td class="num">~4 h</td><td class="num">$1.36</td></tr>
+          <tr><td>RTX 4090 + vLLM, 7B</td><td class="num">~40 min</td><td class="num">$0.23</td></tr>
+          <tr><td>L40S + Ollama, 27B</td><td class="num">~10 h</td><td class="num">$10.90</td></tr>
+        </tbody>
+      </table></div>
+      <p class="note">Assumes roughly 6 million output tokens per run.</p>
+    </section>
+
+    <section id="risks">
+      <div class="prose"><h2>Risk register</h2></div>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Risk</th><th>Severity</th><th>Mitigation</th><th>Phase</th></tr></thead>
+        <tbody>
+          <tr><td>CUDA outputs differ from MLX and silently invalidate baselines</td><td><span class="sev high">High</span></td><td>Parity gate with a written verdict</td><td class="num">3</td></tr>
+          <tr><td>Embedding model swapped, centroids invalidated with no warning</td><td><span class="sev high">High</span></td><td>Pin <code>nomic-embed-text-v2-moe</code></td><td class="num">0, 3</td></tr>
+          <tr><td>vLLM tool-call parser breaks some action tools</td><td><span class="sev high">High</span></td><td>Keep Ollama; parity gate before cutover</td><td class="num">5</td></tr>
+          <tr><td>An idle node burns the budget</td><td><span class="sev high">High</span></td><td>Idle watchdog before spot</td><td class="num">4</td></tr>
+          <tr><td>Hobby tier silently stops tracing at 50,000 units</td><td><span class="sev med">Medium</span></td><td>Take Core</td><td class="num">0</td></tr>
+          <tr><td>Traces expire before export</td><td><span class="sev med">Medium</span></td><td>Mandatory post-run export</td><td class="num">6</td></tr>
+          <tr><td>Weights re-downloaded on every reclaim</td><td><span class="sev med">Medium</span></td><td>Volume mounted at the model directory</td><td class="num">2</td></tr>
+          <tr><td>Checkpoint log on ephemeral disk</td><td><span class="sev med">Medium</span></td><td>Move it to the volume</td><td class="num">4</td></tr>
+          <tr><td>Volume created in the wrong region</td><td><span class="sev low">Low</span></td><td>Pin the region first</td><td class="num">0</td></tr>
+          <tr><td>Langfuse v3 and v4 SDKs behave differently against Cloud</td><td><span class="sev low">Low</span></td><td>Test each separately</td><td class="num">1</td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <section id="open">
+      <div class="prose"><h2>Open questions</h2></div>
+      <ul class="qs">
+        <li>Is the 27B model needed on every turn, or only on closing turns? Splitting would close most of the cost gap, but it is a design change.</li>
+        <li>Is the small models' closing-turn miss rate a defect or a behavioural signal worth keeping? The answer changes what parity means in Phase 3.</li>
+        <li>At what run cadence does self-hosted Langfuse beat Cloud Core? Recompute once real unit counts arrive.</li>
+      </ul>
+    </section>
+
+    <section id="sources">
+      <div class="prose"><span class="eyebrow">Sources · re-check before committing</span></div>
+      <ul class="sources">
+        <li>RunPod 4090 Community $0.34/hr, Secure $0.69/hr, L40S $1.09/hr: <a href="https://www.synpixcloud.com/blog/rtx-4090-cloud-rental-worth-it">SynpixCloud</a>, <a href="https://flexprice.io/blog/runprod-pricing-guide-with-gpu-costs">Flexprice</a></li>
+        <li>AWS g5.xlarge spot from $0.4419/hr in us-east-1: <a href="https://compute.doit.com/spot/us-east-1/g5.xlarge">DoiT</a></li>
+        <li>AWS g6e.xlarge about $1.86/hr on-demand: <a href="https://cloudprice.net/aws/ec2/instances/g6e.xlarge">CloudPrice</a></li>
+        <li>Langfuse Hobby and Core tiers: <a href="https://costbench.com/software/ai-observability/langfuse/free-plan/">Costbench</a>, <a href="https://markaicode.com/pricing/langfuse-pricing/">Markaicode</a></li>
+      </ul>
+    </section>
+
+    <footer>Source document: gpm/docs/adopters/aletheia/gpu-cloud-migration-workplan.md</footer>
+  </main>
+</div>
+
+<script>
+(function(){
+  var KEY="gpu-workplan-checks";
+  var state={};
+  try{state=JSON.parse(localStorage.getItem(KEY)||"{}")||{};}catch(e){state={};}
+  function save(){try{localStorage.setItem(KEY,JSON.stringify(state));}catch(e){}}
+  function recount(){
+    document.querySelectorAll("[data-phase]").forEach(function(ph){
+      var boxes=ph.querySelectorAll("input[type=checkbox]");
+      var done=0; boxes.forEach(function(b){if(b.checked)done++;});
+      var c=ph.querySelector("[data-count]");
+      if(c)c.textContent=done+" / "+boxes.length+" done";
+    });
+  }
+  document.querySelectorAll(".task input").forEach(function(b){
+    if(state[b.id])b.checked=true;
+    b.addEventListener("change",function(){state[b.id]=b.checked;save();recount();});
+  });
+  recount();
+})();
+</script>

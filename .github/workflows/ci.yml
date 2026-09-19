@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    # The whole default suite runs with no GPU and no cloud account — that is the point of the
+    # fake provider and the fake engine, and CI is where it stays true.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install ${{ matrix.python }}
+      - run: uv sync --python ${{ matrix.python }}
+      - run: uv run pytest -q
+
+  no-spending-in-ci:
+    # A test that could reach a real provider must not exist in the default suite. If this job
+    # ever fails, something that can spend money became reachable without an opt-in marker.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync
+      - name: the default suite names no real provider
+        run: |
+          uv run python - <<'PY'
+          import subprocess, sys
+          collected = subprocess.run(
+              ["uv", "run", "pytest", "--collect-only", "-q"],
+              capture_output=True, text=True, check=True,
+          ).stdout
+          assert "integration" not in collected, "an integration test is in the default suite"
+          print("default suite:", collected.strip().splitlines()[-1])
+          PY
+      - name: no provider credential is read anywhere in the default suite
+        run: |
+          ! grep -rn "VAST_API_KEY" tests/ --include="*.py" \
+            | grep -v "test_vast_provider.py" \
+            | grep -v "monkeypatch.delenv"
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync
+      - run: uv run pip install pip-audit
+      - run: uv run pip-audit --strict

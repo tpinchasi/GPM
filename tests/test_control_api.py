@@ -1,0 +1,287 @@
+"""The control API: everything that spends money, behind the admin key.
+
+docs/spec/console-and-control-api.md §1 and threat model T1/T3. The rule with teeth is that the
+app key is refused here — an app that can request a completion must not be able to open a lease.
+"""
+
+import httpx
+import pytest
+from fakes.harness import BackgroundLoop, ServerHandle
+from gpm_server.config import PoolConfig
+from gpm_server.db import Database
+from gpm_server.keys import KeyFileUnsafe, KeyStore, fingerprint, mint, verify
+from gpm_server.supervisor import Supervisor
+from gpm_server.supervisor.control import create_control_app
+
+APP_KEY = "gpma_test_app_key"
+ADMIN_KEY = "gpmx_test_admin_key"
+MODEL = "m1"
+
+
+@pytest.fixture
+def control(tmp_path):
+    config = PoolConfig.model_validate(
+        {
+            "pool": {"name": "test", "model_set": [MODEL], "probe_interval_s": 3600},
+            "auth": {"app_keys": [APP_KEY], "admin_keys": [ADMIN_KEY]},
+            "hosts": [
+                {
+                    "id": "local-1",
+                    "kind": "local",
+                    "transport": {"type": "http", "base_url": "http://127.0.0.1:1"},
+                }
+            ],
+            "rented": {
+                "provider": "fake",
+                "bidding": {"bid_ceiling": 0.60},
+                "scale": {"scale_up_after_s": 0},
+            },
+        }
+    )
+    loop = BackgroundLoop()
+    database = Database(tmp_path / "gpm.sqlite3")
+    supervisor = Supervisor(config, database)
+    server = ServerHandle(create_control_app(supervisor, config), loop)
+    try:
+        yield supervisor, server.base_url, loop
+    finally:
+        server.stop()
+        loop.stop()
+        database.close()
+
+
+def client(url, key=ADMIN_KEY):
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    return httpx.Client(base_url=url, headers=headers, timeout=30)
+
+
+# --- keys ---
+
+
+def test_a_key_is_shown_once_and_stored_only_as_a_hash(tmp_path):
+    store = KeyStore(tmp_path / "app.keys")
+    key, record = store.create("app", label="batch driver")
+
+    assert key.startswith("gpma_")
+    assert record.hashed == fingerprint(key)
+    assert key not in (tmp_path / "app.keys").read_text()  # the file cannot hand anyone a key
+
+
+def test_two_keys_of_a_role_are_valid_at_once_so_rotation_needs_no_downtime(tmp_path):
+    store = KeyStore(tmp_path / "app.keys")
+    first, first_record = store.create("app")
+    second, _ = store.create("app")
+
+    assert verify(first, store.hashes("app"))
+    assert verify(second, store.hashes("app"))
+
+    store.revoke(first_record.key_id)
+    assert not verify(first, store.hashes("app"))
+    assert verify(second, store.hashes("app"))
+
+
+def test_a_key_file_others_can_read_is_refused(tmp_path):
+    path = tmp_path / "app.keys"
+    store = KeyStore(path)
+    store.create("app")
+    path.chmod(0o644)
+
+    with pytest.raises(KeyFileUnsafe, match="readable by others"):
+        store.load()
+
+
+def test_an_unknown_key_verifies_against_nothing():
+    assert not verify(mint("app"), {fingerprint(mint("app"))})
+    assert not verify(None, {fingerprint("x")})
+    assert not verify("anything", set())
+
+
+# --- the boundary ---
+
+
+def test_the_control_api_needs_the_admin_key(control):
+    _, url, _ = control
+    with client(url, key=None) as http:
+        assert http.get("/pool/status").status_code == 401
+    with client(url, key="wrong") as http:
+        assert http.get("/pool/status").status_code == 401
+
+
+def test_the_app_key_is_refused_and_told_why(control):
+    """An app that can request a completion must not thereby be able to spend."""
+    _, url, _ = control
+    with client(url, key=APP_KEY) as http:
+        response = http.post("/pool/leases", json={"workers": 1, "max_spend": 1.0, "allow_rent": True})
+
+    assert response.status_code == 403
+    assert response.json()["error"] == "app_key_refused"
+    assert "admin key" in response.json()["detail"]
+
+
+def test_a_request_from_another_site_is_refused(control):
+    """Threat model T1: a web page open in the operator's browser must not drive this."""
+    _, url, _ = control
+    with client(url) as http:
+        response = http.get("/pool/status", headers={"Origin": "https://evil.example"})
+    assert response.status_code == 403
+    assert response.json()["error"] == "bad_origin"
+
+
+# --- leases ---
+
+
+def test_opening_a_lease_states_the_worst_case(control):
+    _, url, _ = control
+    with client(url) as http:
+        response = http.post(
+            "/pool/leases",
+            json={"workers": 4, "max_hours": 2, "max_spend": 3.0, "allow_rent": True},
+        )
+
+    assert response.status_code == 201
+    worst = response.json()["worst_case"]
+    assert worst["dollars"] == 3.0
+    assert worst["hours"] == 2
+    assert worst["max_hourly_burn"] == 1.00  # the shipped default (D32)
+
+
+def test_a_lease_that_can_rent_is_refused_without_a_dollar_cap(control):
+    _, url, _ = control
+    with client(url) as http:
+        response = http.post("/pool/leases", json={"workers": 4, "allow_rent": True})
+
+    assert response.status_code == 400
+    assert "dollar cap" in response.json()["detail"]
+
+
+def test_a_lease_can_be_tightened_but_not_loosened(control):
+    _, url, _ = control
+    with client(url) as http:
+        lease_id = http.post(
+            "/pool/leases", json={"workers": 4, "max_spend": 3.0, "allow_rent": True}
+        ).json()["lease_id"]
+
+        assert http.patch(f"/pool/leases/{lease_id}", json={"max_spend": 1.0}).status_code == 200
+        loosened = http.patch(f"/pool/leases/{lease_id}", json={"max_spend": 99.0})
+
+    assert loosened.status_code == 400
+    assert "tightened" in loosened.json()["detail"]
+
+
+def test_leases_report_spend_against_their_cap(control):
+    supervisor, url, loop = control
+    with client(url) as http:
+        http.post("/pool/leases", json={"workers": 4, "max_spend": 3.0, "allow_rent": True})
+        loop.run(supervisor.fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={}))
+        lease = http.get("/pool/leases").json()["leases"][0]
+
+    assert lease["state"] == "open"
+    assert lease["dollars_left"] <= 3.0 * 0.9  # the cap, less the safety margin
+    assert "estimated_spend" in lease
+
+
+# --- plan spends nothing ---
+
+
+def test_plan_says_what_would_happen_and_creates_nothing(control):
+    supervisor, url, _ = control
+    with client(url) as http:
+        http.post("/pool/leases", json={"workers": 8, "max_spend": 3.0, "allow_rent": True})
+        plan = http.get("/pool/plan").json()["plan"]
+
+    acquire = [step for step in plan if step["step"] == "acquire"][0]
+    assert acquire["would_rent"] is True
+    assert acquire["would_bid"]["bid"] == pytest.approx(0.12)
+    assert acquire["reasons"]
+    assert supervisor.fleet.provider.instances == {}  # nothing was created
+
+
+def test_plan_shows_what_a_cap_would_refuse(control):
+    supervisor, url, _ = control
+    supervisor.config.limits.max_hourly_burn = 0.01
+    with client(url) as http:
+        http.post("/pool/leases", json={"workers": 8, "max_spend": 3.0, "allow_rent": True})
+        plan = http.get("/pool/plan").json()["plan"]
+
+    acquire = [step for step in plan if step["step"] == "acquire"][0]
+    assert acquire["would_rent"] is False
+    assert "burn" in acquire["refused_by_caps"]
+
+
+# --- the panic button ---
+
+
+def test_down_all_destroys_everything_rented_and_closes_the_leases(control):
+    supervisor, url, loop = control
+    with client(url) as http:
+        http.post("/pool/leases", json={"workers": 8, "max_spend": 3.0, "allow_rent": True})
+        loop.run(supervisor.fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={}))
+        assert supervisor.fleet.hosts
+
+        released = http.post("/pool/down").json()["released"]
+
+    assert released
+    assert supervisor.fleet.hosts == {}
+    assert supervisor.fleet.provider.instances == {}
+    assert supervisor.leases.open_leases() == []
+
+
+def test_preparing_a_host_reports_what_it_bid(control):
+    supervisor, url, _ = control
+    with client(url) as http:
+        response = http.post(
+            "/pool/hosts/prepare", json={"max_spend": 1.0, "max_hours": 1, "when_ready": "park"}
+        )
+
+    assert response.status_code == 201
+    assert response.json()["bid_hourly"] == pytest.approx(0.12)
+    assert supervisor.fleet.hosts
+
+
+def test_events_carry_the_numbers_behind_each_decision(control):
+    supervisor, url, loop = control
+    with client(url) as http:
+        http.post("/pool/leases", json={"workers": 8, "max_spend": 3.0, "allow_rent": True})
+        loop.run(supervisor.fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={}))
+        events = http.get("/pool/events").json()["events"]
+
+    rented = [event for event in events if event["kind"] == "rented"][0]
+    assert rented["numbers"]["floor"] == 0.10
+    assert rented["numbers"]["bid"] == pytest.approx(0.12)
+
+
+# --- read-only market view ---
+
+
+def test_the_market_preview_runs_the_real_filters_and_creates_nothing(control):
+    """Spec §2.2: moving a ceiling and watching '4 pass' become '0 pass' is how an operator
+    learns what a number means."""
+    supervisor, url, _ = control
+    with client(url) as http:
+        preview = http.get("/pool/market/preview").json()
+
+    assert preview["seen"] == 1
+    assert preview["passed"] == 1
+    assert preview["best"][0]["would_bid"] == pytest.approx(0.12)
+    assert preview["policy"]["bid_ceiling"] == 0.60
+    assert supervisor.fleet.provider.instances == {}  # nothing was created
+
+
+def test_a_ceiling_that_bites_shows_up_as_a_rejection_reason(control):
+    supervisor, url, _ = control
+    supervisor.fleet.rented.offer_policy.min_gpu_memory_gb = 999
+    with client(url) as http:
+        preview = http.get("/pool/market/preview").json()
+
+    assert preview["passed"] == 0
+    assert preview["rejected"] == 1
+    assert any("gpu memory" in reason for reason in preview["rejected_by_reason"])
+
+
+def test_the_account_check_spends_nothing(control):
+    supervisor, url, _ = control
+    with client(url) as http:
+        account = http.get("/pool/account").json()
+
+    assert account["credential_valid"] is True
+    assert supervisor.fleet.provider.instances == {}

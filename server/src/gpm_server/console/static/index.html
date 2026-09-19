@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPM console</title>
+<link rel="stylesheet" href="console.css">
+</head>
+<body>
+<header id="top">
+  <div class="brand">GPM <span id="pool-name" class="muted"></span></div>
+  <nav id="nav">
+    <a href="#overview">Overview</a>
+    <a href="#hosts">Hosts</a>
+    <a href="#rented">Rented capacity</a>
+    <a href="#models">Models</a>
+    <a href="#leases">Leases</a>
+    <a href="#decisions">Decisions</a>
+    <a href="#config">Configuration</a>
+  </nav>
+  <div class="right">
+    <span id="link-state" class="pill muted">disconnected</span>
+    <button id="panic" class="danger" title="Destroy every rented host now, verified. Leases are closed.">Release all rented</button>
+  </div>
+</header>
+
+<dialog id="key-dialog">
+  <form method="dialog" id="key-form">
+    <h2>Admin key</h2>
+    <p class="muted">Held in this tab's memory only, sent as a header on every call. Never stored.</p>
+    <input id="key-input" type="password" autocomplete="off" placeholder="gpmx_…" required>
+    <p id="key-error" class="error" hidden></p>
+    <button type="submit">Open the console</button>
+  </form>
+</dialog>
+
+<dialog id="confirm-dialog">
+  <form method="dialog">
+    <h2 id="confirm-title"></h2>
+    <div id="confirm-body"></div>
+    <div id="confirm-retype" hidden>
+      <label>Type the value again to confirm <input id="confirm-input" autocomplete="off"></label>
+    </div>
+    <div class="row">
+      <button value="cancel">Cancel</button>
+      <button value="ok" id="confirm-ok" class="primary">Confirm</button>
+    </div>
+  </form>
+</dialog>
+
+<main id="screen"></main>
+<script src="app.js"></script>
+</body>
+</html>

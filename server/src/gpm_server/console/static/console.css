@@ -1,0 +1,65 @@
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1c2128; --muted: #6b7380; --line: #e1e5ea;
+  --accent: #2563eb; --ok: #15803d; --warn: #b45309; --bad: #b91c1c; --tag: #eef2f7;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0f1216; --panel: #171b21; --ink: #e6e9ee; --muted: #8b95a3; --line: #2a313b;
+          --accent: #60a5fa; --ok: #4ade80; --warn: #fbbf24; --bad: #f87171; --tag: #232a34; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+header#top { display: flex; align-items: center; gap: 24px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 2; }
+.brand { font-weight: 700; letter-spacing: .02em; }
+nav#nav { display: flex; gap: 4px; flex-wrap: wrap; }
+nav#nav a { padding: 6px 10px; border-radius: 6px; color: var(--ink); text-decoration: none; }
+nav#nav a.active { background: var(--tag); font-weight: 600; }
+.right { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+main#screen { padding: 16px; max-width: 1400px; margin: 0 auto; }
+h1 { font-size: 20px; margin: 4px 0 12px; }
+h2 { font-size: 15px; margin: 18px 0 8px; }
+.muted { color: var(--muted); }
+.mono { font-family: var(--mono); font-size: 12.5px; }
+.error { color: var(--bad); }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+.panel h2:first-child { margin-top: 0; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+td.num, th.num { text-align: right; font-family: var(--mono); font-size: 12.5px; }
+tr.expandable { cursor: pointer; }
+tr.detail td { background: var(--tag); }
+pre { margin: 0; white-space: pre-wrap; font-family: var(--mono); font-size: 12px; }
+.pill { display: inline-block; padding: 1px 8px; border-radius: 999px; background: var(--tag); font-size: 12px; }
+.pill.ready, .pill.ok { color: var(--ok); }
+.pill.preparing, .pill.scheduling, .pill.warn { color: var(--warn); }
+.pill.unreachable, .pill.bad, .pill.released { color: var(--bad); }
+.pill.parked, .pill.disabled { color: var(--muted); }
+button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer; }
+button:hover { border-color: var(--muted); }
+button.primary { background: var(--accent); border-color: var(--accent); color: white; }
+button.danger { color: var(--bad); border-color: var(--bad); }
+button.small { padding: 2px 8px; font-size: 12px; }
+button:disabled { opacity: .5; cursor: default; }
+input, textarea, select { font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+textarea.mono { width: 100%; min-height: 420px; }
+label { display: block; margin: 6px 0; }
+label input { margin-left: 8px; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+.burn { height: 8px; background: var(--tag); border-radius: 4px; overflow: hidden; }
+.burn > div { height: 100%; background: var(--accent); }
+.burn.warn > div { background: var(--warn); }
+.burn.bad > div { background: var(--bad); }
+dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); color: var(--ink); padding: 18px 20px; max-width: 520px; }
+dialog::backdrop { background: rgba(0,0,0,.45); }
+dialog input { width: 100%; }
+dialog h2 { margin-top: 0; }
+.feed { max-height: 420px; overflow: auto; }
+.feed .ev { padding: 6px 0; border-bottom: 1px solid var(--line); }
+.feed .ev .k { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 2px 14px; }
+.kv .k { color: var(--muted); }
+.stat { font-size: 22px; font-weight: 600; }
+.tier { color: var(--muted); font-size: 12px; margin: 10px 0 4px; }
+.numbers { font-family: var(--mono); font-size: 12px; color: var(--muted); }
