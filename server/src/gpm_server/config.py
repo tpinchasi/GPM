@@ -35,6 +35,9 @@ class Variant(BaseModel):
     #: schema, False when it is known to accept one and ignore it, and unset when nobody has
     #: said. A schema-carrying request is never routed to a False.
     enforces_schema: Optional[bool] = None
+    #: Optional: the download size, so a plan can say in gigabytes what an agent would fetch.
+    #: An engine cannot tell the size of a model it does not have yet.
+    size_gb: Optional[float] = Field(default=None, gt=0)
 
 
 class CatalogEntry(BaseModel):
@@ -127,6 +130,50 @@ def _is_loopback(base_url: str) -> bool:
         return False
 
 
+class AgentConfig(BaseModel):
+    """Where this host's agent answers (docs/spec/host-agent.md). The pool dials it, under the
+    same rule as the engine: a bearer key never crosses a network in clear text by accident.
+
+    Give `url` for an agent reached over `http` or `https`. On a host reached by SSH tunnel,
+    give `remote_port` instead: the agent stays on loopback over there, exposed to nothing, and
+    the pool forwards a second local port to it with the host's own SSH settings and pinned key.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    url: Optional[str] = None
+    #: Tunnel hosts only: the port the agent listens on, on the far side's loopback.
+    remote_port: Optional[int] = Field(default=None, ge=1, le=65535)
+    #: Names the environment variable holding the agent key. Never the key itself.
+    bearer_env: str
+    verify: bool | str = True
+    allow_insecure: bool = False
+    #: With an agent, the host is delegated: the agent pulls what the model set needs and holds
+    #: it as `residency` says. False keeps the agent to reporting what the machine is.
+    manage_models: bool = True
+
+    @model_validator(mode="after")
+    def _check(self) -> "AgentConfig":
+        if (self.url is None) == (self.remote_port is None):
+            raise ValueError("an agent needs exactly one of `url` (http/https) or `remote_port` (on a tunnel host)")
+        if self.url is None:
+            return self
+        scheme = urlparse(self.url).scheme
+        if scheme not in ("http", "https"):
+            raise ValueError(f"an agent url must be http or https, not {scheme!r}")
+        if scheme == "http" and not self.allow_insecure and not _is_loopback(self.url):
+            raise ValueError(
+                "a plain-http agent off loopback carries its agent key in clear text. Use https, "
+                "or set allow_insecure: true on this agent to say so deliberately."
+            )
+        return self
+
+    def key(self) -> Optional[str]:
+        """Read when the agent is dialled, not at load: a missing agent key must not stop the
+        pool from serving. The host works without its agent; the console says it is missing."""
+        return os.environ.get(self.bearer_env) or None
+
+
 _DEFAULT_PRIORITY = {"local": 0, "fixed-remote": 10, "rented-interruptible": 20}
 
 
@@ -146,6 +193,17 @@ class HostConfig(BaseModel):
     #: it when memory is wanted elsewhere — for a laptop that is also used for other work.
     #: Either way nothing is ever downloaded because a request asked for it (spec §3).
     residency: Literal["pinned", "on_demand"] = "pinned"
+    #: Optional. With an agent the pool learns what the machine is, rather than being told.
+    agent: Optional[AgentConfig] = None
+
+    @model_validator(mode="after")
+    def _agent_matches_transport(self) -> "HostConfig":
+        if self.agent is not None and self.agent.remote_port is not None and self.transport.type != "tunnel":
+            raise ValueError(
+                f"host {self.id!r}: an agent `remote_port` is forwarded over the host's SSH tunnel, "
+                f"and this host's transport is {self.transport.type!r}. Give the agent a `url` instead."
+            )
+        return self
 
     @property
     def routing_priority(self) -> int:

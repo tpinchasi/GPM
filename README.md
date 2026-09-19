@@ -66,6 +66,7 @@ uv run pytest -m integration                   # opt-in, needs a local Ollama ho
 | Path | What it is |
 |---|---|
 | [client/](client/) | `gpm_client` — the SDK an app depends on. One dependency: `httpx`. **[How to use it](client/README.md)** |
+| [agent/](agent/) | `gpm_agent` — the optional host agent: tells the pool what a machine is. [Design](docs/spec/host-agent.md) |
 | [server/](server/) | `gpm_server` — the router, the engine adapters, the `pool` command |
 | [tests/](tests/) | The default suite against a fake engine and a fake provider, and the opt-in suites against a real Ollama |
 

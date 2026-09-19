@@ -55,6 +55,9 @@ const api = {
   configHistory: () => call("GET", "/pool/config/history"),
   rollbackConfig: (version) => call("POST", "/pool/config/rollback", { version }),
   testHost: (host) => call("POST", "/pool/hosts/test", host),
+  restartEngine: (hostId, applySettings) =>
+    call("POST", `/pool/hosts/${hostId}/engine/restart`, { confirm: hostId, apply_settings: applySettings }),
+  deleteModel: (hostId, tag) => call("POST", `/pool/hosts/${hostId}/models/delete`, { tag, confirm: tag }),
 };
 
 // --- small helpers ---
@@ -216,9 +219,149 @@ screens.hosts = (status) => [
       el("td", {}, host.tunnel ? pill(host.tunnel.up ? "up" : "down", host.tunnel.up ? "ok" : "bad") : "—",
         host.tunnel ? el("div", { class: "muted mono" }, `:${host.tunnel.local_port} · ${host.tunnel.restarts} restart(s)`) : null),
       el("td", { class: "num" }, host.requests_served ?? 0))))),
+  ...status.hosts.filter((host) => host.agent).map(agentPanel),
   el("h2", {}, "Test connection"),
   hostTestForm(),
 ];
+
+// What the agent on the machine reports — read, never typed. A silent agent is said to be
+// silent; the host keeps serving and nothing is inferred from it.
+const gigabytes = (bytes) => (bytes === null || bytes === undefined ? "—" : `${(bytes / 1e9).toFixed(1)} GB`);
+function agentPanel(host) {
+  const agent = host.agent;
+  const facts = agent.facts;
+  const head = el("h2", {}, `Agent on ${host.host_id} `,
+    pill(agent.reachable ? "answers" : "silent", agent.reachable ? "ok" : "warn"));
+  if (!facts) {
+    return el("div", { class: "panel" }, head,
+      el("p", { class: "muted" }, `${agent.detail || "no answer yet"} · key ${agent.key === "set" ? "set ✓" : "missing ✗"} · ${agent.url}`),
+      el("p", { class: "muted" }, "The host is still verified by its engine and keeps serving. Nothing is assumed about the machine."));
+  }
+  const accelerators = facts.accelerators === null ? "could not tell"
+    : facts.accelerators.length ? facts.accelerators.map((a) => `${a.name} · ${gigabytes(a.memory_bytes)}${a.unified ? " unified" : ""}`).join("; ")
+    : "none found";
+  const engine = facts.engine || {};
+  return el("div", { class: "panel" }, head,
+    agent.capability_conflict ? el("p", { class: "error" }, agent.capability_conflict) : null,
+    el("div", { class: "kv" },
+      el("div", { class: "k" }, "machine"), el("div", {}, `${facts.os} · ${facts.arch}`),
+      el("div", { class: "k" }, "accelerators"), el("div", {}, accelerators),
+      el("div", { class: "k" }, "capabilities"), el("div", {},
+        (host.capabilities || []).join(", ") || "—",
+        el("span", { class: "muted" }, (host.configured_capabilities || []).length ? " — as configured" : " — found by the agent")),
+      el("div", { class: "k" }, "memory"), el("div", {}, `${gigabytes(facts.memory.available_bytes)} available of ${gigabytes(facts.memory.total_bytes)}`),
+      el("div", { class: "k" }, "disk for models"), el("div", {}, `${gigabytes(facts.disk.free_bytes)} free`, el("span", { class: "muted mono" }, `  ${facts.disk.path}`)),
+      el("div", { class: "k" }, "engine"), el("div", {}, engine.answers
+        ? `${engine.name} ${engine.version || ""} · ${(engine.models_on_disk || []).length} model(s) on disk, ${(engine.models_loaded || []).length} loaded`
+        : el("span", { class: "error" }, `${engine.name}: ${engine.detail || "not answering"}`)),
+      el("div", { class: "k" }, "owner allows"), el("div", { class: "muted" },
+        `delete models: ${facts.allows.delete ? "yes" : "no"} · restart engine: ${facts.allows.restart ? "yes" : "no command set"}`),
+      el("div", { class: "k" }, "agent"), el("div", { class: "muted" }, `v${facts.agent.version} · last answered ${clock(agent.asked_at)}`)),
+    engineControl(host, agent, facts),
+    agentModels(host, agent, facts));
+}
+
+// The engine has to run as many requests at once as the host has workers, and hold the whole
+// model set together, or the pool's numbers are fiction. With an agent the pool can set that —
+// through a command and a file path the machine's owner wrote, and only when you press this.
+function engineControl(host, agent, facts) {
+  const wanted = agent.wanted_engine_settings;
+  const inForce = facts.engine_settings;
+  const differs = !inForce || inForce.workers !== wanted.workers || (inForce.models_held ?? 0) < wanted.models_held;
+  const describe = (s) => (s ? `${s.workers ?? "?"} at once · ${s.models_held ?? "?"} model(s) held` : "never set through the agent");
+  const restart = (applySettings) => async (e) => {
+    const ok = await confirmAction({
+      title: applySettings ? `Apply the pool's settings and restart the engine on ${host.host_id}?` : `Restart the engine on ${host.host_id}?`,
+      body: `The engine stops and starts again, using the command ${host.host_id}'s owner wrote on that machine. Requests in flight there fail over to another host, or fail.`
+        + (applySettings ? ` It will start with ${describe(wanted)}.` : ""),
+      retype: host.host_id,
+    });
+    if (!ok) return;
+    const button = e.target; const label = button.textContent; button.disabled = true; button.textContent = "restarting…";
+    try {
+      const result = await api.restartEngine(host.host_id, applySettings);
+      alert(result.engine_answers
+        ? `Restarted (exit ${result.restart_exit_code}). The engine is answering.`
+        : `The command ran (exit ${result.restart_exit_code}) but the engine is NOT answering.\n\n${result.restart_output || ""}`);
+      await refresh();
+    } catch (error) { alert(error.message); } finally { button.disabled = false; button.textContent = label; }
+  };
+  return el("div", {},
+    el("h2", {}, "Engine settings"),
+    el("div", { class: "kv" },
+      el("div", { class: "k" }, "the pool needs"), el("div", {}, describe(wanted)),
+      el("div", { class: "k" }, "set on the machine"), el("div", {}, describe(inForce), " ",
+        differs ? pill("differs", "warn") : pill("matches", "ok"))),
+    facts.allows.restart
+      ? el("div", { class: "row" },
+          facts.allows.engine_settings
+            ? el("button", { class: differs ? "primary" : "", onclick: restart(true) }, "Apply the pool's settings and restart")
+            : null,
+          el("button", { onclick: restart(false) }, "Restart engine"))
+      : null,
+    facts.allows.restart && facts.allows.engine_settings ? null : el("p", { class: "muted" },
+      !facts.allows.restart
+        ? "To let the pool restart this engine, the machine's owner adds a restart_command (an argument list) to the agent's settings there. The pool can ask for it to be run; it can never say what it is."
+        : "To let the pool set these, the machine's owner adds an engine_env_file path to the agent's settings, and points the engine's service at that file."));
+}
+
+// What the machine holds against what the pool asked it to hold. The agent pulls what is
+// missing; it never deletes. Deleting is the button below, and only that.
+function agentModels(host, agent, facts) {
+  if (!agent.manages_models) return el("p", { class: "muted" }, "This agent reports only: manage_models is off for this host.");
+  const models = agent.models;
+  if (!models) return el("p", { class: "muted" }, "Waiting for the agent's first answer about models.");
+  const stateOf = (model) => {
+    if (model.pulling) {
+      const { completed_bytes: done, total_bytes: total } = model.pulling;
+      const share = total ? Math.min(1, done / total) : 0;
+      return el("div", {}, pill("pulling", "warn"), ` ${gigabytes(done)} of ${gigabytes(total)}`,
+        el("div", { class: "burn" }, el("div", { style: `width:${(share * 100).toFixed(1)}%` })));
+    }
+    if (model.error) return el("div", {}, pill("failed", "bad"), el("div", { class: "muted" }, model.error));
+    if (model.loaded) return pill(model.pinned_by_agent ? "loaded · pinned by the agent" : "loaded", "ok");
+    if (model.on_disk) return pill(models.residency === "on_demand" ? "on disk · loads on use" : "on disk · loading", "ok");
+    return pill("not on disk yet", "warn");
+  };
+  const mayDelete = facts.allows.delete;
+  return el("div", {},
+    el("h2", {}, "Models the pool asked this machine to hold ", el("span", { class: "muted" }, `· ${models.residency === "on_demand" ? "on demand" : "pinned"}`)),
+    el("table", {}, el("tbody", {}, models.models.map((model) => el("tr", {},
+      el("td", { class: "mono" }, model.tag), el("td", { class: "num muted" }, gigabytes(model.size_bytes)), el("td", {}, stateOf(model)))))),
+    el("p", { class: "muted" }, `${gigabytes(models.free_disk_bytes)} free; pulls stop before it falls under this machine's ${gigabytes(models.min_free_disk_bytes)} floor, which its owner sets.`),
+    el("h2", {}, "Other models on this machine ", el("span", { class: "muted" }, "· not named by this pool; never touched unless you delete one")),
+    models.surplus.length ? el("table", {}, el("tbody", {}, models.surplus.map((model) => el("tr", {},
+      el("td", { class: "mono" }, model.tag),
+      el("td", { class: "num muted" }, gigabytes(model.size_bytes)),
+      el("td", { class: "muted" }, model.loaded ? "loaded now" : ""),
+      el("td", {}, mayDelete
+        ? el("button", { class: "small danger", onclick: async (e) => {
+            const ok = await confirmAction({
+              title: `Delete ${model.tag} from ${host.host_id}?`,
+              body: `This removes ${gigabytes(model.size_bytes)} from that machine's disk. It cannot be undone; the model would have to be downloaded again. Other software on the machine may be using it.`,
+              retype: model.tag,
+            });
+            if (ok) run(e.target, () => api.deleteModel(host.host_id, model.tag));
+          } }, "Delete")
+        : null)))))
+      : el("p", { class: "muted" }, "None."),
+    mayDelete ? null : el("p", { class: "muted" }, "This machine's owner has switched deletion off in the agent's own settings; the pool cannot change that."));
+}
+
+// A serialising engine is the one failure the pool can put right itself — on a host that runs
+// an agent whose owner has allowed it. Say which hosts those are, rather than leave the
+// operator with a variable name to go and set by hand.
+function engineSettingsHint() {
+  const withAgent = (state.status?.hosts || []).filter((host) => host.agent?.facts);
+  const able = withAgent.filter((host) => host.agent.facts.allows.engine_settings);
+  if (able.length) {
+    return el("p", {}, "The pool can fix this itself on ", el("strong", {}, able.map((h) => h.host_id).join(", ")),
+      ": under that host's agent above, press ", el("strong", {}, "Apply the pool's settings and restart"), ".");
+  }
+  return el("p", { class: "muted" }, withAgent.length
+    ? "A host's agent could fix this for you, once that machine's owner adds a restart_command and an engine_env_file to the agent's settings."
+    : "With gpm-agent running on the host, the pool could set this and restart the engine for you.");
+}
 
 function hostTestForm() {
   const output = el("div", { class: "muted" }, "Checks an unsaved host definition: reach, authenticate, the whole model set resident together, capabilities, and whether the engine actually serves requests in parallel. Saves nothing.");
@@ -238,7 +381,8 @@ function hostTestForm() {
               el("td", {}, pill(step.ok ? "pass" : "fail", step.ok ? "ok" : "bad")),
               el("td", {}, step.name),
               el("td", { class: "muted" }, step.detail || ""))))),
-            el("p", {}, `Workers that would apply: ${result.workers}`));
+            el("p", {}, `Workers that would apply: ${result.workers}`),
+            result.steps.some((step) => step.fix === "engine_settings") ? engineSettingsHint() : null);
         } catch (error) {
           output.replaceChildren(el("p", { class: "error" }, error.message));
         } finally { button.disabled = false; button.textContent = label; }

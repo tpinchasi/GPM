@@ -563,3 +563,102 @@ def test_history_is_trimmed(tmp_path, monkeypatch):
         store.apply(BASE_YAML.replace("max_hourly_burn: 1.00", f"max_hourly_burn: {burn}"))
         time.sleep(0.002)
     assert len(store.history()) == 3
+
+
+# --- a plan is never silent about part of the file ---
+
+FULL_YAML = edited(
+    BASE_YAML,
+    "  bidding: {bid_ceiling: 0.60}",
+    "  bidding: {bid_ceiling: 0.60, premium: 0.02}\n"
+    "  disk_gb: 20\n  model_set_gb: 0.4\n  workers: 2\n  capabilities: [cuda]\n"
+    "  offer_policy: {min_gpu_memory_gb: 12, min_disk_gb: 20, max_all_in_hourly: 0.30,\n"
+    "                 max_download_per_gb: 0.01, min_download_mbps: 100, min_reliability: 0.95}\n"
+    "  teardown: {idle_minutes: 10, deadman_minutes: 20}",
+)
+
+
+def test_the_live_failure_a_resized_rented_block_is_now_in_the_plan():
+    """Found applying a real change: disk, download estimate and the offer policy all moved,
+    and the plan listed none of them."""
+    assert "disk_gb: 20" in FULL_YAML
+    current = parse(FULL_YAML)
+    candidate = parse(
+        FULL_YAML.replace("disk_gb: 20", "disk_gb: 40").replace("model_set_gb: 0.4", "model_set_gb: 29")
+        .replace("min_gpu_memory_gb: 12", "min_gpu_memory_gb: 40")
+    )
+    said = " | ".join(c.detail for c in plan_changes(current, candidate))
+    for expected in ("rented.disk_gb changes from 20.0 to 40.0", "rented.model_set_gb", "rented.offer_policy.min_gpu_memory_gb"):
+        assert expected in said, said
+
+
+def test_raising_or_removing_a_price_ceiling_is_loosening_and_must_be_retyped():
+    current = parse(FULL_YAML)
+    raised = parse(FULL_YAML.replace("max_all_in_hourly: 0.30", "max_all_in_hourly: 3.0"))
+    removed = parse(FULL_YAML.replace("max_download_per_gb: 0.01,", ""))
+    lowered = parse(FULL_YAML.replace("max_all_in_hourly: 0.30", "max_all_in_hourly: 0.10"))
+
+    up = [c for c in plan_changes(current, raised) if c.kind == "max_all_in_hourly_raised"][0]
+    assert up.requires_retype == "3.000" and "$0.300/h to $3.000/h" in up.detail
+    gone = [c for c in plan_changes(current, removed) if c.kind == "max_download_per_gb_raised"][0]
+    assert gone.requires_retype == "none" and "no limit" in gone.detail
+    down = [c for c in plan_changes(current, lowered) if c.kind == "max_all_in_hourly_lowered"][0]
+    assert down.requires_retype is None
+
+
+def test_no_setting_anywhere_in_the_file_can_change_without_the_plan_saying_so():
+    """By construction, not by enumeration: every leaf of a fully populated configuration is
+    changed, one at a time, and the plan must never come back empty. A setting added to the
+    configuration tomorrow is covered the day it is added."""
+    from gpm_server.config import PoolConfig
+    from gpm_server.configplan import _leaves
+
+    current = parse(FULL_YAML)
+    dumped = current.model_dump(mode="json")
+    tried, silent = 0, []
+    for path, value in _leaves({k: v for k, v in dumped.items() if k != "hosts"}).items():
+        if isinstance(value, bool):
+            changed = not value
+        elif isinstance(value, (int, float)):
+            changed = value + 1
+        elif isinstance(value, str):
+            changed = value + "x"
+        else:
+            continue  # None and empty containers: nothing to perturb
+        mutated = PoolConfig.model_validate(current.model_dump(mode="json")).model_dump(mode="json")
+        node = mutated
+        *parents, leaf = path.split(".")
+        for key in parents:
+            node = node[key]
+        node[leaf] = changed
+        try:
+            candidate = PoolConfig.model_validate(mutated)
+        except ValueError:
+            continue  # not a value this setting accepts; the loader refuses it before any plan
+        tried += 1
+        if not plan_changes(current, candidate):
+            silent.append(path)
+    assert tried >= 30, tried  # the test is only worth something if it really walked the file
+    assert silent == [], f"the plan said nothing about: {silent}"
+
+
+@pytest.mark.parametrize("serialise, passes, fix", [(True, False, "engine_settings"), (False, True, "")])
+def test_the_concurrency_check_tells_a_serialising_engine_from_a_parallel_one(console, serialise, passes, fix):
+    """The check the console's Test connection rests on, against an engine that really does
+    run one request at a time — and one that does not. A failure names its fix in a form a
+    client can act on: the pool can now apply it itself through a host's agent (D41)."""
+    from fakes.fake_ollama import FakeOllama
+
+    _, url, _, loop = console
+    engine = FakeOllama(resident={MODEL})
+    engine.generate_delay_s, engine.serialise = 0.25, serialise
+    server = ServerHandle(engine.app, loop)
+    try:
+        with client(url) as http:
+            result = http.post("/pool/hosts/test", json={"base_url": server.base_url, "workers": 4}).json()
+    finally:
+        server.stop()
+    step = next(s for s in result["steps"] if s["name"] == "concurrency")
+    assert step["ok"] is passes, step
+    assert step["fix"] == fix
+    assert ("serialising" in step["detail"]) is serialise

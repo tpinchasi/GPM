@@ -27,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uvx ruff check client/src server/src tests
+      - run: uvx ruff check client/src server/src agent/src tests
       # The console is never imported by Python, so only a JavaScript parser can tell us it
       # still parses. A syntax error there is total: the page draws nothing at all.
       - run: node --check server/src/gpm_server/console/static/app.js

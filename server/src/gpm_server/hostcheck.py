@@ -29,9 +29,13 @@ class Step:
     name: str
     ok: bool
     detail: str = ""
+    #: What would put a failure right, as a name a client can act on — never instructions to
+    #: parse. `engine_settings`: the engine must be restarted with more parallelism, which the
+    #: pool can do itself on a host that runs an agent (docs/spec/host-agent.md, D41).
+    fix: str = ""
 
     def as_dict(self) -> dict[str, Any]:
-        return {"name": self.name, "ok": self.ok, "detail": self.detail}
+        return {"name": self.name, "ok": self.ok, "detail": self.detail, "fix": self.fix}
 
 
 async def _concurrency(client: httpx.AsyncClient, engine: Any, tag: str, workers: int) -> Step:
@@ -71,6 +75,7 @@ async def _concurrency(client: httpx.AsyncClient, engine: Any, tag: str, workers
             f"{workers} at once took {ratio:.1f}x one ({together:.2f}s against {single:.2f}s): the "
             f"engine is serialising. Set its parallelism to at least {workers} — for Ollama, "
             f"OLLAMA_NUM_PARALLEL={workers}",
+            fix="engine_settings",
         )
     return Step("concurrency", True, f"{workers} at once took {ratio:.1f}x one: really parallel")
 

@@ -192,6 +192,17 @@ def _host(args: argparse.Namespace) -> int:
                 "when_ready": args.when_ready,
             },
         )
+    if args.action == "restart-engine":
+        return _control(
+            args, "POST", f"/pool/hosts/{args.host_id}/engine/restart",
+            {"confirm": args.confirm, "apply_settings": args.apply_settings},
+        )
+    if args.action == "delete-model":
+        # The same call the console's button makes. The tag is given twice on purpose.
+        return _control(
+            args, "POST", f"/pool/hosts/{args.host_id}/models/delete",
+            {"tag": args.tag, "confirm": args.confirm},
+        )
     return _control(args, "POST", f"/pool/hosts/{args.host_id}/{args.action}")
 
 
@@ -324,7 +335,11 @@ def main(argv: list[str] | None = None) -> int:
     host_test.set_defaults(func=_host_test)
 
     host = subparsers.add_parser("host", help="prepare, drain, release or park a rented host")
-    host.add_argument("action", choices=["prepare", "drain", "release", "park"])
+    host.add_argument("action", choices=["prepare", "drain", "release", "park", "delete-model", "restart-engine"])
+    host.add_argument("--apply-settings", action="store_true",
+                      help="restart-engine: first write the parallelism and models-held the pool needs")
+    host.add_argument("--tag", default=None, help="delete-model: the model tag to delete from the host's disk")
+    host.add_argument("--confirm", default=None, help="delete-model: the same tag again. restart-engine: the host id again")
     host.add_argument("host_id", nargs="?", default=None)
     host.add_argument("--max-spend", type=float, default=None)
     host.add_argument("--max-hours", type=float, default=1.0)

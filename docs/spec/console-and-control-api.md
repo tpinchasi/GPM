@@ -15,11 +15,14 @@
 - **Changing configuration never spends money.** Spending is only ever a lease or a host
   preparation, each behind a confirmation that states the worst case in dollars.
 - **Loosening is harder than tightening.** Lowering a ceiling applies on save. Raising a bid
-  ceiling, the hourly burn cap or the maximum rented hosts, or switching on `allow_insecure`,
-  requires typing the new value again.
+  ceiling, the hourly burn cap or the maximum rented hosts; raising or removing the offer
+  policy's two price ceilings (`max_all_in_hourly`, `max_download_per_gb`); or switching on
+  `allow_insecure`, requires typing the new value again.
 - **Nothing is applied blind.** Save runs validate → **plan** → apply: the console shows what
   the change will cause right now ("host X's bid is above the new ceiling → it will be drained
-  and released") before the operator commits.
+  and released") before the operator commits. **A plan is complete by construction**: what it
+  cannot explain in words it still reports, setting by setting, so no part of the file can
+  change without appearing in it (D42).
 - **The admin key is required on every control-API request**, sent as a header, never a cookie,
   with `Host` / `Origin` checked — on loopback too, because any web page open in the same
   browser can send requests to `127.0.0.1`. The app key is refused here.

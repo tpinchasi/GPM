@@ -16,7 +16,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 from .config import ConfigError, PoolConfig, load_config
 
@@ -44,6 +44,16 @@ class Change:
 
 
 @dataclasses.dataclass(frozen=True)
+class MachineNow:
+    """What a host's agent last said about the machine, while the change is considered."""
+
+    #: The platform found; None when the agent is silent or could not tell.
+    capabilities: Optional[frozenset[str]]
+    on_disk: frozenset[str]
+    free_disk_bytes: Optional[int]
+
+
+@dataclasses.dataclass(frozen=True)
 class RentedNow:
     """What the pool is holding while the change is considered."""
 
@@ -52,9 +62,13 @@ class RentedNow:
 
 
 def plan_changes(
-    current: PoolConfig, candidate: PoolConfig, rented: Sequence[RentedNow] = ()
+    current: PoolConfig,
+    candidate: PoolConfig,
+    rented: Sequence[RentedNow] = (),
+    machines: Optional[Mapping[str, MachineNow]] = None,
 ) -> list[Change]:
     changes: list[Change] = []
+    changes.extend(_machine_changes(candidate, machines or {}))
 
     # --- hosts ---
     before = {host.id: host for host in current.hosts}
@@ -75,6 +89,16 @@ def plan_changes(
                 changes.append(Change("workers_lowered", f"host {host_id!r} goes from {old.workers} to {new.workers} workers; the surplus drain after their current request"))
         if old.disabled != new.disabled:
             changes.append(Change("host_disabled", f"host {host_id!r} is {'disabled' if new.disabled else 'enabled'}"))
+        if old.agent != new.agent:
+            if new.agent is None:
+                detail = f"host {host_id!r} loses its agent: the pool goes back to verifying this host only, and stops learning what the machine is"
+            elif old.agent is None:
+                detail = (f"host {host_id!r} gains an agent at {_where(new.agent)}: the pool will read what the machine is from it"
+                          + (", pull the models its set needs there, and hold them as its residency says"
+                             if new.agent.manage_models else "; it reports only, because manage_models is off"))
+            else:
+                detail = f"host {host_id!r}'s agent moves to {_where(new.agent)}; traffic to its engine is not interrupted"
+            changes.append(Change("host_agent", detail))
         if old.residency != new.residency:
             if new.residency == "on_demand":
                 detail = (f"host {host_id!r} becomes on-demand: it is routable once the model set is on disk, "
@@ -112,7 +136,104 @@ def plan_changes(
 
     # --- limits and money ---
     changes.extend(_limit_changes(current, candidate, rented))
+    # --- and everything else: a plan is never silent about part of the file ---
+    changes.extend(_everything_else(current, candidate))
     return changes
+
+
+#: Settings a change above already explains, in words. Everything not listed here is still
+#: reported — generically, by `_everything_else` — so adding a setting to the configuration
+#: can never again produce a plan that omits it.
+_EXPLAINED = (
+    "pool.model_set", "pool.queue_timeout_s", "catalog", "listen",
+    "limits.max_rented_hosts", "limits.max_hourly_burn",
+    "rented.bidding.bid_ceiling", "rented.image",
+    "rented.teardown.idle_minutes", "rented.teardown.deadman_minutes",
+    "rented.offer_policy.max_all_in_hourly", "rented.offer_policy.max_download_per_gb",
+)
+_EXPLAINED_PER_HOST = ("transport", "workers", "disabled", "agent", "residency")
+
+
+def _leaves(value: Any, path: str = "") -> dict[str, Any]:
+    if isinstance(value, dict) and value:
+        found: dict[str, Any] = {}
+        for key, inner in value.items():
+            found.update(_leaves(inner, f"{path}.{key}" if path else str(key)))
+        return found
+    return {path: value}
+
+
+def _everything_else(current: PoolConfig, candidate: PoolConfig) -> list[Change]:
+    before, after = current.model_dump(mode="json"), candidate.model_dump(mode="json")
+    if (before.get("rented") is None) != (after.get("rented") is None):
+        before.pop("rented", None), after.pop("rented", None)  # said once, as `rented_section`
+    hosts_before = {host["id"]: host for host in before.pop("hosts")}
+    hosts_after = {host["id"]: host for host in after.pop("hosts")}
+
+    pairs = [("", _leaves(before), _leaves(after))]
+    for host_id in sorted(hosts_before.keys() & hosts_after.keys()):  # added and removed are said already
+        old = {k: v for k, v in hosts_before[host_id].items() if k not in _EXPLAINED_PER_HOST}
+        new = {k: v for k, v in hosts_after[host_id].items() if k not in _EXPLAINED_PER_HOST}
+        pairs.append((f"host {host_id!r}: ", _leaves(old), _leaves(new)))
+
+    changes: list[Change] = []
+    for prefix, old, new in pairs:
+        for path in sorted(old.keys() | new.keys()):
+            if old.get(path) == new.get(path):
+                continue
+            if not prefix and any(path == known or path.startswith(known + ".") for known in _EXPLAINED):
+                continue
+            changes.append(Change("setting", f"{prefix}{path} changes from {old.get(path)!r} to {new.get(path)!r}"))
+    return changes
+
+
+def _where(agent: Any) -> str:
+    return agent.url or f"port {agent.remote_port} on the far side of the host's SSH tunnel"
+
+
+_PLATFORMS = frozenset({"apple-silicon", "cuda", "rocm"})
+
+
+def _machine_changes(candidate: PoolConfig, machines: Mapping[str, MachineNow]) -> list[Change]:
+    """What applying this would make each delegated machine do — stated before it happens,
+    in gigabytes where the catalog says how big a build is."""
+    from .catalog import variants_for_host
+
+    changes: list[Change] = []
+    sizes = {v.tag: v.size_gb for entry in candidate.catalog.values() for v in entry.variants}
+    for host in candidate.hosts:
+        machine = machines.get(host.id)
+        if host.agent is None or machine is None:
+            continue
+        stated = frozenset(host.capabilities) & _PLATFORMS
+        found = None if machine.capabilities is None else machine.capabilities & _PLATFORMS
+        if found is not None and stated and stated != found:
+            changes.append(Change(
+                "capability_conflict",
+                f"host {host.id!r} is configured as {sorted(stated)} but its agent found "
+                f"{sorted(found) or 'no accelerator'}; the configured list would be used as written",
+            ))
+        if not host.agent.manage_models:
+            continue
+        capabilities = frozenset(host.capabilities) | (found or frozenset() if not stated else frozenset())
+        variants = variants_for_host(candidate.pool.model_set, candidate.catalog, capabilities, candidate.engine)
+        missing = sorted({group[0].tag for group in variants.values() if group} - machine.on_disk)
+        if not missing:
+            continue
+        known = [sizes[tag] for tag in missing if sizes.get(tag)]
+        size = f"about {sum(known):.1f} GB" if len(known) == len(missing) else (
+            f"at least {sum(known):.1f} GB; some sizes are not stated in the catalog" if known else "sizes not stated in the catalog"
+        )
+        free = "" if machine.free_disk_bytes is None else f"; {machine.free_disk_bytes / 1e9:.0f} GB free there"
+        detail = f"host {host.id!r}: its agent will download {missing} ({size}{free})"
+        if known and machine.free_disk_bytes is not None and sum(known) * 1e9 > machine.free_disk_bytes:
+            detail += " — which does not fit, so the agent will refuse and the host will stay out of routing"
+        changes.append(Change("agent_download", detail))
+    return changes
+
+
+def _price(cap: Optional[float], unit: str) -> str:
+    return "no limit" if cap is None else f"${cap:.3f}{unit}"
 
 
 def _limit_changes(current: PoolConfig, candidate: PoolConfig, rented: Sequence[RentedNow]) -> list[Change]:
@@ -169,6 +290,23 @@ def _limit_changes(current: PoolConfig, candidate: PoolConfig, rented: Sequence[
                 names = ", ".join(f"{h.host_id} at ${h.bid_hourly:.3f}" for h in over)
                 detail += f"; {names} now bids above it and will be drained and released"
             changes.append(Change("bid_ceiling_lowered", detail))
+
+        # The other two price ceilings. Raising or removing either lets the pool pay more, so
+        # it is loosening, and loosening is typed again — the same rule as the bid ceiling.
+        for field, what, unit in (
+            ("max_all_in_hourly", "the all-in hourly price the pool will accept", "/h"),
+            ("max_download_per_gb", "the download price the pool will accept", "/GB"),
+        ):
+            old_cap, new_cap = getattr(old_rented.offer_policy, field), getattr(new_rented.offer_policy, field)
+            if old_cap == new_cap:
+                continue
+            loosened = new_cap is None or (old_cap is not None and new_cap > old_cap)
+            changes.append(Change(
+                f"{field}_{'raised' if loosened else 'lowered'}",
+                f"{what} goes from {_price(old_cap, unit)} to {_price(new_cap, unit)}"
+                + ("" if loosened else "; offers above it are rejected from the next pass"),
+                requires_retype=("none" if new_cap is None else f"{new_cap:.3f}") if loosened else None,
+            ))
 
         if new_rented.image != old_rented.image:
             changes.append(Change("image", f"the engine image changes to {new_rented.image}; it applies to hosts rented from now on"))

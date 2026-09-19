@@ -183,6 +183,8 @@ class SshTunnel:
     async def _wait_until_listening(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            if self._stopping:
+                return False  # stopped while coming up: nobody is waiting for this any more
             if self._process is not None and self._process.returncode is not None:
                 return False
             try:

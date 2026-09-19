@@ -1,0 +1,135 @@
+# A pool over hosts you already have. Start it with:  gpm serve -c pool.yaml
+#
+# Phase 1 serves static hosts only — nothing here rents anything, and nothing here spends
+# money. The pool verifies a host's engine, it never configures it: every model in `model_set`
+# must already be loaded on every host before that host is used.
+
+pool:
+  name: default
+  # Every host keeps all of these loaded, all the time. A host that does not hold them all
+  # stays out of routing (state `preparing`) until it does.
+  model_set:
+    - my-model:7b
+    - my-embedder
+  queue_timeout_s: 30         # must stay below client_time_to_first_byte_s
+  client_time_to_first_byte_s: 300
+  probe_interval_s: 10
+
+listen:
+  host: 127.0.0.1
+  port: 8080
+  # Off loopback, TLS is required — a bearer key over plain HTTP is a published key.
+  # tls_certfile: /etc/gpm/cert.pem
+  # tls_keyfile: /etc/gpm/key.pem
+
+control:
+  # The control API — leases, preparing hosts, the panic button. Served by the supervisor, and
+  # only when an admin key exists.
+  host: 127.0.0.1
+  port: 8081
+
+auth:
+  # Two roles, never interchangeable: an app that can request a completion must not be able to
+  # open a lease. Keys are stored hashed; create them with `gpm key create --role app|admin`.
+  app_keys_file: ~/.config/gpm/default.app-keys
+  admin_keys_file: ~/.config/gpm/default.admin-keys
+
+engine: ollama
+
+# Only names listed here are ever resolved to another build. Anything else is passed through
+# exactly as requested — never guessed, never pulled.
+catalog:
+  my-model:7b:
+    variants:
+      # First variant whose requirements the host meets wins.
+      - tag: my-model:7b-mlx
+        requires: [apple-silicon]
+        runtime_class: apple-mlx
+        enforces_schema: false
+      - tag: my-model:7b            # no requirements: the fallback everywhere
+        runtime_class: by-platform
+        # Three values. `true` where the engine really enforces the schema; `false` where it
+        # accepts one and ignores it — a request carrying a schema is never routed there;
+        # omitted where nobody has checked, which is usable but ranked after any `true`.
+        enforces_schema: true
+
+hosts:
+  - id: laptop
+    kind: local
+    capabilities: [apple-silicon]
+    workers: 3
+    # pinned (the default): routable only while the whole model set is loaded, for a machine
+    # dedicated to serving. on_demand: routable once the set is on disk; the engine loads a
+    # model on first use and may evict it — for a machine also used for other work. Neither
+    # ever downloads anything because a request asked.
+    residency: on_demand
+    transport:
+      type: http
+      base_url: http://127.0.0.1:11434
+
+  - id: workstation
+    kind: fixed-remote
+    capabilities: [cuda]
+    workers: 6
+    transport:
+      type: https
+      base_url: https://gpu.example.internal
+      bearer_env: GPM_WORKSTATION_KEY
+
+  # A tunnel keeps the engine off the public network entirely: the pool holds an SSH local
+  # forward and dials its own loopback port. No base_url — the pool derives one. The host's
+  # key is recorded on first connection and checked on every later one.
+  - id: datacentre
+    kind: fixed-remote
+    capabilities: [cuda, fp8]
+    workers: 6
+    transport:
+      type: tunnel
+      ssh_host: gpu.example.net
+      ssh_user: ubuntu
+      ssh_key: ~/.ssh/pool_key
+      remote_port: 11434        # where the engine listens on the far side; never guessed
+
+# Rented capacity. Remove this section entirely and the pool has no way to spend at all.
+# Nothing here rents on its own: a lease with a dollar cap is the only thing that can.
+limits:
+  max_rented_hosts: 1          # conservative by default (D32)
+  max_hourly_burn: 1.00
+
+rented:
+  provider: vast               # the account credential is read from VAST_API_KEY, never from here
+  image: ollama/ollama:0.34.2  # pinned, never a floating tag
+  disk_gb: 60
+  workers: 2
+  capabilities: [cuda]
+  model_set_gb: 10             # what the model set costs to download, for ranking and estimates
+  ssh_key: ~/.ssh/pool_key
+
+  offer_policy:                # hard filters, never relaxed unattended
+    min_gpu_memory_gb: 24
+    max_all_in_hourly: 0.66
+    max_download_per_gb: 0.01
+    min_download_mbps: 100
+    min_reliability: 0.95
+    verified_only: true
+
+  scale:
+    scale_up_after_s: 120      # a short burst is not worth a multi-gigabyte download
+    min_useful_hours: 1
+    one_at_a_time: true        # a bad market yields one failed bid, not five
+
+  bidding:
+    strategy: floor_plus_premium
+    premium: 0.02              # absolute, not a multiplier: floors span an order of magnitude
+    bid_ceiling: 0.60          # mandatory
+    on_demand_crossover: 0.8
+
+  spend:
+    cap_safety_margin: 0.10    # a lease stops before its cap, not at it
+    drift_alert: 0.15
+
+  teardown:
+    idle_minutes: 10
+    deadman_minutes: 20        # the on-host timer, armed at creation
+    deadman_action: destroy
+    max_park_hours: 72

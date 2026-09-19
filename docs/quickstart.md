@@ -46,6 +46,10 @@ Then decide, per host, how it holds them — its `residency`:
   of seconds for a large model — so this is something to choose, not the default. Set it on
   the host in the configuration below: `residency: on_demand`.
 
+Or skip the pulling altogether: run [`gpm-agent`](../agent/README.md) on the machine, name it on
+the host as `agent:`, and the pool fetches what its model set needs and holds it as `residency`
+says — after a plan has told you how many gigabytes that is.
+
 Either way a host that does not hold the whole set stays out of routing, and the console says
 which model is missing and whether it is missing from memory or from disk. That is the intended
 behaviour, not a failure.
@@ -88,6 +92,9 @@ hosts:
       ssh_user: you
       ssh_key: ~/.ssh/id_ed25519
       remote_port: 11434
+    # Optional: with gpm-agent running there (on its loopback), the pool learns what the machine
+    # is and fetches the models itself. Forwarded over the same SSH connection.
+    # agent: { remote_port: 8095, bearer_env: WORKSTATION_AGENT_KEY }
 ```
 
 There is no `rented:` section, so **this pool has no way to spend money at all.**

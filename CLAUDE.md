@@ -37,6 +37,9 @@ state; a static HTML/JS console with no build step. The client SDK is a separate
   spending.
 - **Router and supervisor stay separate processes** sharing SQLite, never calling each other.
   Nothing slow or blocking goes on the router's request path.
+- **The host agent's protocol is a closed list of verbs.** No operation takes a command, a path
+  or a URL from the pool; the pool dials the agent, never the reverse; it is never on the request
+  path. Adding a verb is a decision, recorded as one (D40, `docs/spec/host-agent.md`).
 - **Providers are HTTP API clients, never CLI wrappers.** Strategies are pure functions that
   return their reasons; the supervisor re-checks every cap and ceiling after they return.
 - **Every test runs without a cloud account or a GPU** — against the fake provider and a fake

@@ -39,6 +39,16 @@ class FakeOllama:
         self.healthy = healthy
         #: Scripted: a host that cannot fetch the model set must not join the pool.
         self.refuse_pull = False
+        #: Scripted: what a pull reports as its size, and a pause between its progress frames.
+        self.pull_bytes = 1_000_000_000
+        self.pull_delay_s = 0.0
+        #: Scripted: how long one generation takes, and whether the engine runs them one at a
+        #: time whatever it was asked for — an engine left at parallelism 1.
+        self.generate_delay_s = 0.0
+        self.serialise = False
+        self._one_at_a_time = asyncio.Lock()
+        #: Tags held with `keep_alive: -1` — what "pinned" means to this engine.
+        self.pinned: set[str] = set()
         #: Every request as it arrived: (path, raw body bytes, headers).
         self.received: list[tuple[str, bytes, dict[str, str]]] = []
         self.started = 0
@@ -53,6 +63,7 @@ class FakeOllama:
                 Route("/api/generate", self._generate, methods=["POST"]),
                 Route("/api/embed", self._embed, methods=["POST"]),
                 Route("/api/pull", self._pull, methods=["POST"]),
+                Route("/api/delete", self._delete, methods=["DELETE"]),
             ]
         )
 
@@ -134,11 +145,18 @@ class FakeOllama:
         refused = self._use(model)
         if refused is not None:
             return refused
+        if "keep_alive" in parsed:
+            (self.pinned.add if parsed["keep_alive"] == -1 else self.pinned.discard)(model)
         if "prompt" not in parsed and "keep_alive" in parsed:
             return JSONResponse({"model": model, "done": True, "done_reason": "load"})
         content = self._content_for(parsed)
         if not parsed.get("stream", True):
             self.started += 1
+            if self.serialise:
+                async with self._one_at_a_time:
+                    await asyncio.sleep(self.generate_delay_s)
+            else:
+                await asyncio.sleep(self.generate_delay_s)
             self.completed += 1
             return JSONResponse(
                 {"model": model, "created_at": _CREATED_AT, "response": content, "done": True}
@@ -169,11 +187,26 @@ class FakeOllama:
             return JSONResponse({"error": f"no such model {tag}"}, status_code=404)
 
         async def frames():
-            yield (json.dumps({"status": "pulling", "total": 1_000_000_000}) + "\n").encode()
-            self.resident.add(tag)
-            yield (json.dumps({"status": "success", "total": 1_000_000_000}) + "\n").encode()
+            # A pull puts the model on disk. It does not load it: that is a separate act.
+            size = self.pull_bytes
+            for done in (0, size // 2, size):
+                frame = {"status": "pulling", "digest": "sha256:layer", "total": size, "completed": done}
+                yield (json.dumps(frame) + "\n").encode()
+                if self.pull_delay_s:
+                    await asyncio.sleep(self.pull_delay_s)
+            self.available.add(tag)
+            yield (json.dumps({"status": "success"}) + "\n").encode()
 
         return StreamingResponse(frames(), media_type="application/x-ndjson")
+
+    async def _delete(self, request: Request) -> Response:
+        _, parsed = await self._record(request)
+        tag = parsed.get("model", "")
+        if tag not in self.available | self.resident:
+            return JSONResponse({"error": f"model '{tag}' not found"}, status_code=404)
+        for held in (self.available, self.resident, self.pinned):
+            held.discard(tag)
+        return JSONResponse({})
 
     def _final(self, model: str, message: dict[str, Any]) -> dict[str, Any]:
         return {

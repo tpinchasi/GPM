@@ -26,11 +26,12 @@ from fastapi.staticfiles import StaticFiles
 
 from ..catalog import variants_for_host
 from ..config import ConfigError, PoolConfig
-from ..configplan import ConfigStore, RentedNow, StaleVersion, plan_changes
+from ..configplan import ConfigStore, MachineNow, RentedNow, StaleVersion, plan_changes
 from ..contract import CONTRACT_VERSION
 from ..hostcheck import test_connection
 from ..keys import verify
 from ..ledger import LeaseRefused
+from . import agents
 from .service import Supervisor
 
 log = logging.getLogger("gpm.control")
@@ -80,6 +81,10 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 "that is the app key. An app that can request a completion must not be able "
                 "to spend; use the admin key here.",
             )
+        if token.startswith("gpmg_"):
+            # The third role (docs/spec/host-agent.md §5): it admits the pool to one host's
+            # agent, and must never admit anything to the pool.
+            return _error(403, "agent_key_refused", "that is an agent key; use the admin key here.")
         if not verify(token, admin_hashes):
             return _error(401, "unauthorized", "unknown admin key")
         if not _same_origin(request, allowed_hosts):
@@ -125,6 +130,21 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             if group
         }
 
+    def machines_now() -> dict[str, MachineNow]:
+        """What each answering agent last said, for a plan to reason from."""
+        found: dict[str, MachineNow] = {}
+        for host in supervisor.hosts.values():
+            view = host.agent
+            if view is None or not view.reachable or view.facts is None:
+                continue
+            engine = view.facts.get("engine") or {}
+            found[host.host_id] = MachineNow(
+                capabilities=view.derived_capabilities,
+                on_disk=frozenset(m["tag"] for m in engine.get("models_on_disk", [])),
+                free_disk_bytes=(view.facts.get("disk") or {}).get("free_bytes"),
+            )
+        return found
+
     def status_payload() -> dict[str, Any]:
         fleet = supervisor.fleet
         counters = supervisor.counters.all()
@@ -140,7 +160,10 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 "workers": host.config.workers,
                 "busy": counter.busy if counter else 0,
                 "requests_served": counter.requests_served if counter else 0,
-                "capabilities": sorted(host.config.capabilities),
+                # What builds are resolved against: the configured list, plus the platform the
+                # agent found where the list names none.
+                "capabilities": sorted(host.capabilities),
+                "configured_capabilities": sorted(host.config.capabilities),
                 "resident": sorted(host.resident),
                 "available": sorted(host.available),
                 "residency": host.config.residency,
@@ -150,6 +173,25 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             tunnel = supervisor.tunnel_status(host.host_id)
             if tunnel is not None:
                 entry["tunnel"] = tunnel
+            if host.config.agent is not None:
+                view = host.agent
+                entry["agent"] = {
+                    "url": host.config.agent.url or f"127.0.0.1:{host.config.agent.remote_port} on the host, over its SSH tunnel",
+                    "tunnel": (
+                        {"up": host.agent_tunnel.up, "local_port": host.agent_tunnel.local_port,
+                         "restarts": host.agent_tunnel.restarts, "last_error": host.agent_tunnel.last_error}
+                        if host.agent_tunnel is not None else None
+                    ),
+                    "key": "set" if host.config.agent.key() else "missing",  # never the key
+                    "reachable": bool(view and view.reachable),
+                    "detail": view.detail if view else "not asked yet",
+                    "asked_at": view.asked_at if view else None,
+                    "facts": view.facts if view and view.reachable else None,
+                    "manages_models": host.config.agent.manage_models,
+                    "wanted_engine_settings": agents.wanted_engine_settings(host.config.workers, len(host.required_tags)),
+                    "models": view.models if view and view.reachable else None,
+                    "capability_conflict": agents.capability_conflict(host.config.capabilities, view),
+                }
             hosts.append(entry)
 
         rented = []
@@ -375,7 +417,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         if errors:
             return JSONResponse({"errors": errors, "changes": []})
         candidate = store().parse(text)
-        changes = plan_changes(supervisor.config, candidate, rented_now())
+        changes = plan_changes(supervisor.config, candidate, rented_now(), machines_now())
         return JSONResponse({"errors": [], "changes": [change.as_dict() for change in changes]})
 
     @app.put("/pool/config")
@@ -517,6 +559,67 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             {"host_id": host.host_id, "lease_id": host.lease_id, "bid_hourly": host.bid_hourly},
             status_code=201,
         )
+
+    @app.post("/pool/hosts/{host_id}/engine/restart")
+    async def restart_host_engine(host_id: str, request: Request) -> JSONResponse:
+        """Restart a host's engine through its agent, optionally after writing the settings the
+        pool needs it to run with (D41). An operator's explicit act: a restart drops whatever
+        the engine is doing, so the supervisor's own pass never calls this."""
+        host = supervisor.hosts.get(host_id)
+        if host is None or host.config.agent is None:
+            return _error(404, "no_agent", f"no configured host {host_id!r} with an agent")
+        try:
+            body = await request.json()
+        except ValueError:
+            return _error(400, "bad_request", "the body must be JSON")
+        if body.get("confirm") != host_id:
+            return _error(400, "not_confirmed", "type the host id again as `confirm`: requests in flight on that host will fail over or fail")
+        settings = (
+            agents.wanted_engine_settings(host.config.workers, len(host.required_tags))
+            if body.get("apply_settings") else None
+        )
+        status_code, answer = await agents.restart_engine(host.agent_endpoint, settings, transport=supervisor._agent_transport)
+        if status_code == 200:
+            supervisor.events.record(
+                "agent_engine_restarted",
+                f"host {host_id}: engine restarted on the operator's instruction"
+                + (" with the pool's settings" if settings else "")
+                + ("" if answer.get("engine_answers") else " — and it is NOT answering"),
+                host_id=host_id,
+                numbers={**(settings or {}), "exit_code": answer.get("restart_exit_code"), "settings_written": answer.get("settings_written")},
+            )
+        return JSONResponse(status_code=status_code, content=answer)
+
+    @app.post("/pool/hosts/{host_id}/models/delete")
+    async def delete_host_model(host_id: str, request: Request) -> JSONResponse:
+        """Delete one model from a host's disk, through its agent (D40). An operator's explicit
+        act and nothing else: the supervisor's own pass never calls this. Three refusals stand
+        between the button and the disk — this one, and two the agent makes for itself."""
+        host = supervisor.hosts.get(host_id)
+        if host is None or host.config.agent is None:
+            return _error(404, "no_agent", f"no configured host {host_id!r} with an agent")
+        try:
+            body = await request.json()
+        except ValueError:
+            return _error(400, "bad_request", "the body must be JSON")
+        tag, confirm = body.get("tag"), body.get("confirm")
+        if not isinstance(tag, str) or not tag:
+            return _error(400, "bad_request", "name the tag to delete")
+        if confirm != tag:
+            return _error(400, "not_confirmed", "type the tag again as `confirm`: deleting a model cannot be undone")
+        named = {variant.tag for group in host.variants.values() for variant in group}
+        if tag in named:
+            return _error(
+                409, "model_required",
+                f"{tag} is a build this pool's catalog names for {host_id}; take it out of the model set first",
+            )
+        status_code, answer = await agents.delete_model(host.agent_endpoint, tag, transport=supervisor._agent_transport)
+        if status_code == 200:
+            supervisor.events.record(
+                "agent_model_deleted", f"host {host_id}: {tag} deleted from disk on the operator's instruction", host_id=host_id,
+            )
+            return JSONResponse({"host_id": host_id, "deleted": tag})
+        return JSONResponse(status_code=status_code, content=answer)
 
     @app.post("/pool/hosts/{host_id}/{action}")
     async def host_action(host_id: str, action: str) -> JSONResponse:

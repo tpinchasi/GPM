@@ -24,7 +24,7 @@ from typing import Optional
 import httpx
 
 from ..catalog import ResolvedVariant, variants_for_host
-from ..config import ConfigError, HostConfig, PoolConfig, load_config
+from ..config import AgentConfig, ConfigError, HostConfig, PoolConfig, load_config
 from ..configplan import ConfigStore
 from ..db import Database, HostCounters, HostRow, HostTable, SupervisorLock
 from ..engines import Engine, get_engine
@@ -32,6 +32,7 @@ from ..ledger import EventLog, LeaseStore, SpendLedger
 from ..models import HostState
 from ..providers.base import get_provider
 from ..transports import SshTunnel, build_client
+from . import agents
 from .renting import Fleet
 
 log = logging.getLogger("gpm.supervisor")
@@ -49,12 +50,30 @@ class SupervisedHost:
     state: HostState = HostState.UNREACHABLE
     resident: frozenset[str] = frozenset()
     available: frozenset[str] = frozenset()
+    #: The last answer from this host's agent, if it has one (docs/spec/host-agent.md).
+    agent: Optional[agents.AgentView] = None
+    #: The forward to an agent that sits on the far side of this host's SSH tunnel.
+    agent_tunnel: Optional[SshTunnel] = None
     last_error: Optional[str] = None
     last_probe_at: Optional[float] = None
 
     @property
     def host_id(self) -> str:
         return self.config.id
+
+    @property
+    def agent_endpoint(self) -> Optional[AgentConfig]:
+        """The agent as it is actually dialled: where configuration gave a port on the far
+        side of the tunnel, the pool's own forwarded loopback port."""
+        agent = self.config.agent
+        if agent is None or self.agent_tunnel is None:
+            return agent
+        return agent.model_copy(update={"url": self.agent_tunnel.local_url, "remote_port": None})
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        """The configured list, with the platform the agent found where it names none."""
+        return agents.effective_capabilities(self.config.capabilities, self.agent)
 
     @property
     def required_tags(self) -> frozenset[str]:
@@ -109,6 +128,8 @@ class Supervisor:
         self._rented_clients: dict[str, httpx.AsyncClient] = {}
         #: Model-set preparations in flight, keyed by host id.
         self._preparing: dict[str, asyncio.Task[None]] = {}
+        #: Tests substitute a transport that answers as an agent would.
+        self._agent_transport: Optional[httpx.AsyncBaseTransport] = None
 
     def _build(self, host_config: HostConfig) -> SupervisedHost:
         capabilities = frozenset(host_config.capabilities)
@@ -132,6 +153,26 @@ class Supervisor:
             state=HostState.DISABLED if host_config.disabled else HostState.UNREACHABLE,
         )
 
+    def _sync_agent_tunnel(self, host: SupervisedHost, previous: Optional[AgentConfig] = None) -> Optional[SshTunnel]:
+        """Make the agent's forward match configuration, without touching the engine's: adding,
+        moving or removing an agent must not interrupt the traffic the host is serving. Returns
+        a tunnel that now needs starting."""
+        agent = host.config.agent
+        wanted = agent.remote_port if agent is not None else None
+        running = host.agent_tunnel.transport.remote_port if host.agent_tunnel is not None else None
+        if wanted == running:
+            return None
+        if host.agent_tunnel is not None:
+            asyncio.create_task(host.agent_tunnel.stop())
+            host.agent_tunnel = None
+        if wanted is None:
+            return None
+        forward = host.config.transport.model_copy(
+            update={"remote_host": "127.0.0.1", "remote_port": wanted, "local_port": None}
+        )
+        host.agent_tunnel = SshTunnel(f"{host.host_id}:agent", forward)
+        return host.agent_tunnel
+
     # --- lifecycle ---
 
     async def start(self) -> None:
@@ -139,6 +180,9 @@ class Supervisor:
         for host in self.hosts.values():
             if host.tunnel is not None:
                 await host.tunnel.start()
+            forward = self._sync_agent_tunnel(host)
+            if forward is not None:
+                await forward.start()
         await self.adopt_rented()
         await self.pass_once()
 
@@ -174,6 +218,8 @@ class Supervisor:
         for host in self.hosts.values():
             if host.tunnel is not None:
                 await host.tunnel.stop()
+            if host.agent_tunnel is not None:
+                await host.agent_tunnel.stop()
             await host.client.aclose()
         for task in self._preparing.values():
             task.cancel()
@@ -193,6 +239,7 @@ class Supervisor:
         what is broken, then acquire what is missing.
         """
         self._follow_config_file()
+        await asyncio.gather(*(self._ask_agent(host) for host in self.hosts.values()))
         await asyncio.gather(*(self._probe(host) for host in self.hosts.values()))
         await self._probe_rented()
         self._publish_all()
@@ -266,12 +313,15 @@ class Supervisor:
             else:
                 existing.config = host_config
                 existing.variants = variants_for_host(
-                    new.pool.model_set, new.catalog, frozenset(host_config.capabilities), self.engine.name
+                    new.pool.model_set, new.catalog, existing.capabilities, self.engine.name
                 )
                 if host_config.disabled and existing.state is not HostState.DISABLED:
                     existing.state = HostState.DISABLED
                 elif not host_config.disabled and existing.state is HostState.DISABLED:
                     existing.state = HostState.UNREACHABLE
+            forward = self._sync_agent_tunnel(self.hosts[host_id])
+            if forward is not None:
+                asyncio.create_task(forward.start())
 
         if self.fleet is not None and new.rented is not None:
             self.fleet.config = new
@@ -287,6 +337,8 @@ class Supervisor:
         host = self.hosts.pop(host_id, None)
         if host is None:
             return
+        if host.agent_tunnel is not None:
+            asyncio.create_task(host.agent_tunnel.stop())
         if host.tunnel is not None:
             asyncio.create_task(host.tunnel.stop())
         asyncio.create_task(host.client.aclose())
@@ -320,6 +372,42 @@ class Supervisor:
             else:
                 idle[host_id] = max(0.0, now - max(counter.last_request_at, host.ready_at))
         return idle
+
+    async def _ask_agent(self, host: SupervisedHost) -> None:
+        """Before the probe, so a platform the agent found decides which build the probe looks
+        for. A silent agent changes nothing: the host is judged by its engine, as ever."""
+        if host.config.agent is None or host.config.disabled:
+            return
+        before = host.capabilities
+        was_reachable = host.agent.reachable if host.agent else None
+        models_before = host.agent.models if host.agent else None
+        host.agent = await agents.ask(host.agent_endpoint, transport=self._agent_transport)
+        if host.agent.reachable is not was_reachable:
+            self.events.record(
+                "agent_reachable" if host.agent.reachable else "agent_unreachable",
+                f"host {host.host_id}: " + ("its agent answers" if host.agent.reachable else host.agent.detail or "agent silent"),
+                host_id=host.host_id,
+            )
+        if host.capabilities != before:
+            host.variants = variants_for_host(
+                self.config.pool.model_set, self.config.catalog, host.capabilities, self.engine.name
+            )
+            self.events.record(
+                "capabilities_derived",
+                f"host {host.host_id}: the agent found {sorted(host.capabilities - before)}; builds re-resolved",
+                host_id=host.host_id,
+                numbers={"capabilities": sorted(host.capabilities)},
+            )
+        if host.agent.reachable and host.config.agent.manage_models:
+            # After the platform is known, so the machine is asked for the right builds.
+            models = await agents.hold(
+                host.agent_endpoint, host.required_tags, host.config.residency, transport=self._agent_transport
+            )
+            host.agent = dataclasses.replace(host.agent, models=models)
+            for kind, summary, numbers in agents.model_events(models_before, models):
+                self.events.record(kind, f"host {host.host_id}: {summary}", host_id=host.host_id, numbers=numbers)
+        elif host.agent.reachable is False and models_before is not None:
+            host.agent = dataclasses.replace(host.agent, models=None)
 
     async def _probe_rented(self) -> None:
         """A rented host is verified exactly like any other: only `ready` hosts are routed to,
@@ -489,7 +577,7 @@ class Supervisor:
                     dial_url=host.dial_url,
                     state=host.state.value,
                     workers=host.config.workers,
-                    capabilities=tuple(host.config.capabilities),
+                    capabilities=tuple(sorted(host.capabilities)),
                     variants={
                         name: tuple(
                             (v.tag, v.runtime_class, v.enforces_schema) for v in variants

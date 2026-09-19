@@ -6,8 +6,9 @@ __pycache__/
 dist/
 build/
 
-# Local pool state and configuration
-pool.yaml
+# Local pool state and configuration (root only — server/examples/pool.yaml is the tracked
+# sample the quickstart tells people to copy, and must stay committed)
+/pool.yaml
 # applied-configuration history kept beside the file: a copy of the local configuration
 *.yaml.versions/
 *.sqlite3
