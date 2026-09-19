@@ -6,10 +6,10 @@ and instances rented on a bidding marketplace — routes each request to a free 
 best available host, and does the renting, bidding, recovery and tear-down itself, inside
 spending limits an operator sets.
 
-**Status: phases 1–3 are built** — the router and client SDK, the supervisor with leases,
+**Status: phases 1–4 are built** — the router and client SDK, the supervisor with leases,
 renting and the dead-man timer, and the operator console. It has run against a real marketplace:
 a capped live run bid, prepared a host, served a request through the router, recovered from a
-real eviction unattended and tore everything down, for $0.008. Phase 4 (Release) is in progress.
+real eviction unattended and tore everything down, for $0.008. Two release-checklist items remain.
 See [STATUS.md](STATUS.md) for exactly where things stand.
 
 **Intent: to be released publicly as a reusable framework.** This repository is private until
@@ -48,6 +48,9 @@ reply = pool.chat("my-model:7b", [{"role": "user", "content": "hello"}])
 reply.content, reply.served_model
 ```
 
+The SDK waits and retries for capacity by default; [client/README.md](client/README.md) covers
+the transport, the retry policy, errors, streaming and what each answer tells you.
+
 Every model in the pool's set must already be loaded on a host before that host is used: the
 pool verifies a host's engine, it never configures it, and no request ever triggers a pull.
 
@@ -62,7 +65,7 @@ uv run pytest -m integration                   # opt-in, needs a local Ollama ho
 
 | Path | What it is |
 |---|---|
-| [client/](client/) | `gpm_client` — the SDK an app depends on. One dependency: `httpx` |
+| [client/](client/) | `gpm_client` — the SDK an app depends on. One dependency: `httpx`. **[How to use it](client/README.md)** |
 | [server/](server/) | `gpm_server` — the router, the engine adapters, the `pool` command |
 | [tests/](tests/) | The default suite against a fake engine and a fake provider, and the opt-in suites against a real Ollama |
 

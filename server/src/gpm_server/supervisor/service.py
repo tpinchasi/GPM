@@ -48,6 +48,7 @@ class SupervisedHost:
     tunnel: Optional[SshTunnel] = None
     state: HostState = HostState.UNREACHABLE
     resident: frozenset[str] = frozenset()
+    available: frozenset[str] = frozenset()
     last_error: Optional[str] = None
     last_probe_at: Optional[float] = None
 
@@ -439,19 +440,30 @@ class Supervisor:
             host.state = HostState.UNREACHABLE
             host.last_error = health.detail
             host.resident = frozenset()
+            host.available = frozenset()
         else:
             try:
                 resident = await self.engine.models_resident(host.client)
+                available = await self.engine.models_available(host.client)
             except httpx.HTTPError as exc:
                 host.state = HostState.UNREACHABLE
                 host.last_error = str(exc)
                 host.resident = frozenset()
+                host.available = frozenset()
             else:
                 host.resident = resident
-                missing = host.required_tags - resident
+                host.available = available
+                # A pinned host serves only what is loaded; an on-demand host serves what is
+                # on disk and lets the engine load it on first use. Neither ever downloads.
+                if host.config.residency == "on_demand":
+                    missing = host.required_tags - available
+                    what = "not on disk"
+                else:
+                    missing = host.required_tags - resident
+                    what = "not resident"
                 if missing:
                     host.state = HostState.PREPARING
-                    host.last_error = f"model set not resident: missing {sorted(missing)}"
+                    host.last_error = f"model set {what}: missing {sorted(missing)}"
                 else:
                     host.state = HostState.READY
                     host.last_error = None
@@ -485,6 +497,8 @@ class Supervisor:
                         for name, variants in host.variants.items()
                     },
                     resident=host.resident,
+                    available=host.available,
+                    residency=host.config.residency,
                     last_error=host.last_error,
                 )
             )

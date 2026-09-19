@@ -28,6 +28,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uvx ruff check client/src server/src tests
+      # The console is never imported by Python, so only a JavaScript parser can tell us it
+      # still parses. A syntax error there is total: the page draws nothing at all.
+      - run: node --check server/src/gpm_server/console/static/app.js
 
   no-spending-in-ci:
     # A test that could reach a real provider must not exist in the default suite. If this job

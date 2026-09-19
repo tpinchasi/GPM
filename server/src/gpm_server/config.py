@@ -140,6 +140,12 @@ class HostConfig(BaseModel):
     capabilities: list[str] = Field(default_factory=list)
     priority: Optional[int] = None
     disabled: bool = False
+    #: `pinned`: the host is routable only while the whole model set is loaded, and a model
+    #: found evicted takes it out of routing — for a machine dedicated to serving. `on_demand`:
+    #: routable once the set is *on disk*; the engine loads a model on first use and may evict
+    #: it when memory is wanted elsewhere — for a laptop that is also used for other work.
+    #: Either way nothing is ever downloaded because a request asked for it (spec §3).
+    residency: Literal["pinned", "on_demand"] = "pinned"
 
     @property
     def routing_priority(self) -> int:

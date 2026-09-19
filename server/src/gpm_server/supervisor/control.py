@@ -17,13 +17,14 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Mapping, Optional, Sequence
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from ..catalog import variants_for_host
 from ..config import ConfigError, PoolConfig
 from ..configplan import ConfigStore, RentedNow, StaleVersion, plan_changes
 from ..contract import CONTRACT_VERSION
@@ -90,7 +91,13 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         # The page itself holds no data and no secret; the key is entered into it, and every
         # call it then makes carries the key as a header like any other client.
         if request.url.path == "/ui" or request.url.path.startswith("/ui/"):
-            return await call_next(request)
+            response = await call_next(request)
+            # Without this a browser keeps the page's script for as long as it likes and a
+            # plain reload does not ask again — so after an upgrade, or a fix, the operator
+            # is still running the old console and nothing tells them. `no-cache` means "ask
+            # every time"; the ETag makes the answer a cheap 304 when nothing changed.
+            response.headers["cache-control"] = "no-cache"
+            return response
         refusal = authorised(request)
         if refusal is not None:
             return refusal
@@ -100,6 +107,23 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
     app.mount("/ui", StaticFiles(directory=str(static_dir), html=True), name="console")
 
     # --- reading ---
+
+    def served_on(
+        variants: Mapping[str, Sequence[Any]], resident: frozenset[str], available: frozenset[str]
+    ) -> dict[str, Any]:
+        """Per logical model, the variant the pool resolved for this host — and whether *that
+        tag* is loaded, and on disk. The logical name itself is never what the engine holds."""
+        return {
+            name: {
+                "tag": group[0].tag,
+                "runtime_class": group[0].runtime_class,
+                "enforces_schema": group[0].enforces_schema,
+                "resident": group[0].tag in resident,
+                "available": group[0].tag in available,
+            }
+            for name, group in variants.items()
+            if group
+        }
 
     def status_payload() -> dict[str, Any]:
         fleet = supervisor.fleet
@@ -118,6 +142,9 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 "requests_served": counter.requests_served if counter else 0,
                 "capabilities": sorted(host.config.capabilities),
                 "resident": sorted(host.resident),
+                "available": sorted(host.available),
+                "residency": host.config.residency,
+                "served": served_on(host.variants, host.resident, host.available),
                 "last_error": host.last_error,
             }
             tunnel = supervisor.tunnel_status(host.host_id)
@@ -127,12 +154,27 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
 
         rented = []
         if fleet is not None:
+            rented_variants = variants_for_host(
+                supervisor.config.pool.model_set,
+                supervisor.config.catalog,
+                frozenset(fleet.rented.capabilities),
+                supervisor.engine.name,
+            )
             for host in fleet.hosts.values():
                 counter = counters.get(host.host_id)
                 rented.append(
                     {
                         "host_id": host.host_id,
                         "state": host.state,
+                        "resident": sorted(getattr(host, "resident", frozenset())),
+                        # The pool built this host and pinned the set on it; a loaded tag is
+                        # on disk by definition, and the rest is not probed separately.
+                        "residency": "pinned",
+                        "served": served_on(
+                            rented_variants,
+                            getattr(host, "resident", frozenset()),
+                            getattr(host, "resident", frozenset()),
+                        ),
                         "machine": host.offer.machine_id,
                         "hardware": host.offer.hardware,
                         "bid_hourly": host.bid_hourly,

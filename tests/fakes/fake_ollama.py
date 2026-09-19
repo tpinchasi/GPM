@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from typing import Any, Optional
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -24,11 +24,16 @@ class FakeOllama:
         self,
         *,
         resident: set[str] | frozenset[str] = frozenset(),
+        available: set[str] | frozenset[str] | None = None,
         chunk_delay_s: float = 0.0,
         chunks: int = 3,
         healthy: bool = True,
     ):
+        #: Loaded in memory (`/api/ps`). A tag can only be loaded if it is on disk.
         self.resident: set[str] = set(resident)
+        #: On disk (`/api/tags`), loaded or not. A request for a tag on disk loads it, as the
+        #: engine does; a request for one that is not is a 404 — never a download.
+        self.available: set[str] = set(resident) | set(available or ())
         self.chunk_delay_s = chunk_delay_s
         self.chunks = chunks
         self.healthy = healthy
@@ -58,16 +63,25 @@ class FakeOllama:
             return JSONResponse({"error": "engine down"}, status_code=500)
         return JSONResponse({"version": "0.0.0-fake"})
 
-    def _model_list(self) -> dict[str, Any]:
-        return {"models": [{"name": tag, "model": tag, "size": 1} for tag in sorted(self.resident)]}
+    def _model_list(self, tags: set[str]) -> dict[str, Any]:
+        return {"models": [{"name": tag, "model": tag, "size": 1} for tag in sorted(tags)]}
 
     async def _ps(self, request: Request) -> Response:
         if not self.healthy:
             return JSONResponse({"error": "engine down"}, status_code=500)
-        return JSONResponse(self._model_list())
+        return JSONResponse(self._model_list(self.resident))
 
     async def _tags(self, request: Request) -> Response:
-        return JSONResponse(self._model_list())
+        # A loaded tag is on disk by definition, however the test put it in memory.
+        return JSONResponse(self._model_list(self.available | self.resident))
+
+    def _use(self, model: str) -> Optional[Response]:
+        """What the engine does with the model field of an inference call: a tag on disk is
+        loaded if it was not; a tag not on disk is refused. It is never fetched."""
+        if model not in self.available | self.resident:
+            return JSONResponse({"error": f"model '{model}' not found"}, status_code=404)
+        self.resident.add(model)
+        return None
 
     # --- inference ---
 
@@ -102,6 +116,9 @@ class FakeOllama:
         if "messages" not in parsed:
             return JSONResponse({"error": "messages must be provided"}, status_code=400)
         model = parsed.get("model", "")
+        refused = self._use(model)
+        if refused is not None:
+            return refused
         message = self._message(parsed)
         if not parsed.get("stream", True):
             self.started += 1
@@ -114,8 +131,10 @@ class FakeOllama:
     async def _generate(self, request: Request) -> Response:
         _, parsed = await self._record(request)
         model = parsed.get("model", "")
+        refused = self._use(model)
+        if refused is not None:
+            return refused
         if "prompt" not in parsed and "keep_alive" in parsed:
-            self.resident.add(model)  # a bare load, as the engine treats it
             return JSONResponse({"model": model, "done": True, "done_reason": "load"})
         content = self._content_for(parsed)
         if not parsed.get("stream", True):
@@ -131,6 +150,9 @@ class FakeOllama:
         texts = parsed.get("input") or []
         if isinstance(texts, str):
             texts = [texts]
+        refused = self._use(parsed.get("model", ""))
+        if refused is not None:
+            return refused
         self.started += 1
         self.completed += 1
         return JSONResponse(

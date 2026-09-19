@@ -95,6 +95,10 @@ class EngineSpec:
     chunks: int = 3
     #: "http" or "tunnel" — how the router reaches this engine.
     transport: str = "http"
+    #: Tags on this engine's disk but not loaded; `resident` tags are on disk as well.
+    available: set[str] = dataclasses.field(default_factory=set)
+    #: "pinned" or "on_demand" — the host's residency policy in the pool's configuration.
+    residency: str = "pinned"
 
 
 @dataclasses.dataclass
@@ -130,7 +134,10 @@ class PoolHarness:
 
         host_entries = []
         for spec in engines:
-            fake = FakeOllama(resident=spec.resident, chunk_delay_s=spec.chunk_delay_s, chunks=spec.chunks)
+            fake = FakeOllama(
+                resident=spec.resident, available=spec.available,
+                chunk_delay_s=spec.chunk_delay_s, chunks=spec.chunks,
+            )
             server = ServerHandle(fake.app, self.loop)
             self.engines[spec.id] = RunningEngine(spec=spec, fake=fake, server=server)
             if spec.transport == "tunnel":
@@ -152,6 +159,8 @@ class PoolHarness:
             }
             if spec.priority is not None:
                 entry["priority"] = spec.priority
+            if spec.residency != "pinned":
+                entry["residency"] = spec.residency
             for key, value in (host_overrides or {}).get(spec.id, {}).items():
                 if isinstance(value, dict) and isinstance(entry.get(key), dict):
                     entry[key].update(value)
@@ -166,7 +175,10 @@ class PoolHarness:
         self.rentable: dict[str, RunningEngine] = {}
         rentable_urls: list[str] = []
         for spec in rentable or []:
-            fake = FakeOllama(resident=spec.resident, chunk_delay_s=spec.chunk_delay_s, chunks=spec.chunks)
+            fake = FakeOllama(
+                resident=spec.resident, available=spec.available,
+                chunk_delay_s=spec.chunk_delay_s, chunks=spec.chunks,
+            )
             server = ServerHandle(fake.app, self.loop)
             self.rentable[spec.id] = RunningEngine(spec=spec, fake=fake, server=server)
             rentable_urls.append(server.base_url)

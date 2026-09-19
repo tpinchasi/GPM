@@ -59,6 +59,8 @@ CREATE TABLE IF NOT EXISTS hosts (
     capabilities   TEXT NOT NULL,   -- JSON array
     variants       TEXT NOT NULL,   -- JSON {logical: [[tag, runtime_class, enforces_schema], ...]}
     resident       TEXT NOT NULL,   -- JSON array of tags loaded right now
+    available      TEXT NOT NULL DEFAULT '[]',       -- JSON array of tags on disk
+    residency      TEXT NOT NULL DEFAULT 'pinned',   -- pinned | on_demand
     lease_id       TEXT,
     provider_ref   TEXT,            -- JSON, rented hosts only
     hourly_rate    REAL,
@@ -147,8 +149,28 @@ def connect(path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(_SCHEMA)
+    _add_missing_columns(conn)
     conn.commit()
     return conn
+
+
+# Columns added after a table first shipped. `CREATE TABLE IF NOT EXISTS` leaves an existing
+# file alone, so each is added on open when absent; the default is what a row written by an
+# older process would have meant.
+_ADDED_COLUMNS = {
+    "hosts": [
+        ("available", "TEXT NOT NULL DEFAULT '[]'"),
+        ("residency", "TEXT NOT NULL DEFAULT 'pinned'"),
+    ],
+}
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    for table, columns in _ADDED_COLUMNS.items():
+        present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, definition in columns:
+            if name not in present:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
 class Database:
@@ -251,6 +273,8 @@ class HostRow:
     #: logical name -> variants in preference order, each (tag, runtime_class, enforces_schema)
     variants: dict[str, tuple[tuple[str, str, Optional[bool]], ...]]
     resident: frozenset[str]
+    available: frozenset[str] = frozenset()
+    residency: str = "pinned"
     lease_id: Optional[str] = None
     provider_ref: Optional[dict[str, Any]] = None
     hourly_rate: Optional[float] = None
@@ -273,6 +297,8 @@ def _row_to_host(row: sqlite3.Row) -> HostRow:
             for name, variants in json.loads(row["variants"]).items()
         },
         resident=frozenset(json.loads(row["resident"])),
+        available=frozenset(json.loads(row["available"])),
+        residency=row["residency"],
         lease_id=row["lease_id"],
         provider_ref=json.loads(row["provider_ref"]) if row["provider_ref"] else None,
         hourly_rate=row["hourly_rate"],
@@ -290,15 +316,16 @@ class HostTable:
             """
             INSERT INTO hosts (
                 host_id, kind, transport_type, priority, dial_url, state, workers,
-                capabilities, variants, resident, lease_id, provider_ref, hourly_rate,
-                last_error, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                capabilities, variants, resident, available, residency, lease_id,
+                provider_ref, hourly_rate, last_error, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(host_id) DO UPDATE SET
                 kind=excluded.kind, transport_type=excluded.transport_type,
                 priority=excluded.priority, dial_url=excluded.dial_url,
                 state=excluded.state, workers=excluded.workers,
                 capabilities=excluded.capabilities, variants=excluded.variants,
-                resident=excluded.resident, lease_id=excluded.lease_id,
+                resident=excluded.resident, available=excluded.available,
+                residency=excluded.residency, lease_id=excluded.lease_id,
                 provider_ref=excluded.provider_ref, hourly_rate=excluded.hourly_rate,
                 last_error=excluded.last_error, updated_at=excluded.updated_at
             """,
@@ -313,6 +340,8 @@ class HostTable:
                 json.dumps(list(host.capabilities)),
                 json.dumps({name: [list(v) for v in vs] for name, vs in host.variants.items()}),
                 json.dumps(sorted(host.resident)),
+                json.dumps(sorted(host.available)),
+                host.residency,
                 host.lease_id,
                 json.dumps(host.provider_ref) if host.provider_ref is not None else None,
                 host.hourly_rate,

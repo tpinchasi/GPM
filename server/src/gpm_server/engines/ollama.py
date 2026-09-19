@@ -109,11 +109,19 @@ class OllamaEngine:
     async def models_resident(self, client: httpx.AsyncClient) -> frozenset[str]:
         response = await client.get("/api/ps")
         response.raise_for_status()
-        entries = response.json().get("models", [])
-        resident: set[str] = set()
-        for entry in entries:
-            for key in ("name", "model"):
-                value = entry.get(key)
-                if isinstance(value, str):
-                    resident.add(value)
-        return frozenset(resident)
+        return _tags_in(response.json().get("models", []))
+
+    async def models_available(self, client: httpx.AsyncClient) -> frozenset[str]:
+        response = await client.get("/api/tags")
+        response.raise_for_status()
+        return _tags_in(response.json().get("models", []))
+
+
+def _tags_in(entries: list[dict]) -> frozenset[str]:
+    tags: set[str] = set()
+    for entry in entries:
+        for key in ("name", "model"):
+            value = entry.get(key)
+            if isinstance(value, str):
+                tags.add(value)
+    return frozenset(tags)

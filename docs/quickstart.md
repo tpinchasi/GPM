@@ -20,22 +20,35 @@ Two packages get installed: `gpm-server` (the router, the supervisor and the `gp
 
 ## 2. Load the models on every host
 
-A pool declares the set of models it serves, and **every host keeps all of them loaded, all the
-time**. Nothing is loaded on demand, so nothing is ever swapped out mid-run. The pool *verifies*
-this; it never configures someone else's engine, and no request can trigger a download.
-
-On each machine that will serve:
+A pool declares the set of models it serves, and **every host must be able to serve all of
+them**. The pool *verifies* this; it never configures someone else's engine, and no request can
+ever trigger a download. On each machine that will serve:
 
 ```sh
 ollama pull qwen2.5:7b-instruct
 ollama pull nomic-embed-text
-# keep them resident rather than letting the engine unload them after a few minutes
-curl http://127.0.0.1:11434/api/generate -d '{"model":"qwen2.5:7b-instruct","keep_alive":-1}'
-curl http://127.0.0.1:11434/api/embed    -d '{"model":"nomic-embed-text","input":["warm"],"keep_alive":-1}'
 ```
 
-A host that does not hold the whole set stays out of routing, and the console says which model
-is missing. That is the intended behaviour, not a failure.
+Then decide, per host, how it holds them — its `residency`:
+
+- **`pinned`** (the default) — the host is routable only while **the whole set is loaded**, and
+  a model found evicted takes it out of routing. For a machine dedicated to serving. Keep the
+  models resident rather than letting the engine unload them after a few minutes:
+
+  ```sh
+  curl http://127.0.0.1:11434/api/generate -d '{"model":"qwen2.5:7b-instruct","keep_alive":-1}'
+  curl http://127.0.0.1:11434/api/embed    -d '{"model":"nomic-embed-text","input":["warm"],"keep_alive":-1}'
+  ```
+
+- **`on_demand`** — the host is routable once **the whole set is on disk**; the engine loads a
+  model on first use and may evict it when the memory is wanted elsewhere. For a laptop that
+  is also used for other work. The request that finds a model cold pays its load time — tens
+  of seconds for a large model — so this is something to choose, not the default. Set it on
+  the host in the configuration below: `residency: on_demand`.
+
+Either way a host that does not hold the whole set stays out of routing, and the console says
+which model is missing and whether it is missing from memory or from disk. That is the intended
+behaviour, not a failure.
 
 ## 3. Write a configuration
 

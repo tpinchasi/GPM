@@ -6,6 +6,8 @@ criterion: every console action is possible from the CLI, a mistyped ceiling is 
 before apply, and the app key is refused.
 """
 
+import shutil
+import subprocess
 import textwrap
 import time
 from pathlib import Path
@@ -72,6 +74,89 @@ def edited(text, old, new):
     return text.replace(old, new)
 
 
+# --- the page parses at all ---
+
+STATIC = Path(__file__).resolve().parents[1] / "server/src/gpm_server/console/static"
+CLOSERS = {")": "(", "]": "[", "}": "{"}
+
+
+def unbalanced(source: str) -> str | None:
+    """Where the brackets stop matching, ignoring comments and string literals.
+
+    The console is written as deeply nested `el(...)` calls, so a dropped `)` is the mistake
+    this style invites — and it is fatal: the whole script fails to parse, the page draws
+    nothing, and no test that only reads the file as text notices. This is a cheap structural
+    check that runs everywhere; `node --check` below is the real parser where one is installed.
+    """
+    stack: list[tuple[str, int]] = []
+    index, line, length = 0, 1, len(source)
+    while index < length:
+        char = source[index]
+        if char == "\n":
+            line += 1
+        elif char == "/" and source[index + 1: index + 2] == "/":
+            index = source.find("\n", index)
+            if index < 0:
+                break
+            continue
+        elif char == "/" and source[index + 1: index + 2] == "*":
+            end = source.index("*/", index)
+            line += source.count("\n", index, end)
+            index = end + 2
+            continue
+        elif char in "\"'`":
+            quote, index = char, index + 1
+            while index < length and source[index] != quote:
+                if source[index] == "\\":
+                    index += 1
+                elif source[index] == "\n":
+                    line += 1
+                index += 1
+        elif char in "([{":
+            stack.append((char, line))
+        elif char in CLOSERS:
+            if not stack or stack[-1][0] != CLOSERS[char]:
+                opened = f"{stack[-1][0]!r} opened on line {stack[-1][1]}" if stack else "nothing open"
+                return f"line {line}: {char!r} closes nothing — {opened}"
+            stack.pop()
+        index += 1
+    if stack:
+        char, opened_on = stack[-1]
+        return f"{char!r} opened on line {opened_on} is never closed"
+    return None
+
+
+@pytest.mark.parametrize("name", ["app.js"])
+def test_the_console_script_parses(name):
+    """It is served to a browser and never imported by Python, so nothing else would tell us."""
+    source = (STATIC / name).read_text()
+    assert unbalanced(source) is None, unbalanced(source)
+
+    node = shutil.which("node")
+    if node:  # a real parser wherever one is installed, and always in CI
+        subprocess.run([node, "--check", str(STATIC / name)], check=True, capture_output=True)
+
+
+def test_the_bracket_check_would_catch_a_dropped_closing_paren():
+    """The check itself, on the exact mistake it exists for — and on what must not trip it."""
+    assert unbalanced('el("a", el("b"));') is None
+    assert "never closed" in unbalanced('el("a", el("b");')
+    # A bracket inside a string, a comment or a template literal is not a bracket.
+    assert unbalanced('const s = ")))"; // )))\nconst t = `${x} )`;') is None
+
+
+def test_every_screen_the_navigation_offers_exists_in_the_script():
+    """A nav link with no screen behind it silently falls back to the overview."""
+    page = (STATIC / "index.html").read_text()
+    script = (STATIC / "app.js").read_text()
+    import re
+
+    links = set(re.findall(r'<a href="#([a-z]+)"', page))
+    assert links, page
+    for name in links:
+        assert f"screens.{name} =" in script, name
+
+
 # --- the page ---
 
 
@@ -89,6 +174,17 @@ def test_the_page_is_served_and_holds_no_key_of_its_own(console):
     assert "document.cookie" not in script
     # ...and every call it makes carries it as a header.
     assert "Authorization: `Bearer ${ADMIN_KEY}`" in script
+
+
+def test_the_console_is_never_served_from_a_stale_cache(console):
+    """Found the hard way: after a fix to app.js the owner's browser kept running the old,
+    broken script — a plain reload revalidates the page, not its scripts, unless told to."""
+    _, url, _, _ = console
+    with httpx.Client(base_url=url, timeout=30) as anonymous:
+        for path in ("/ui/", "/ui/app.js", "/ui/console.css"):
+            response = anonymous.get(path)
+            assert response.headers.get("cache-control") == "no-cache", path
+            assert "etag" in response.headers, path  # so "ask every time" is a cheap 304
 
 
 def test_the_page_cannot_read_anything_without_the_key(console):
@@ -134,6 +230,37 @@ def test_status_carries_the_model_set_and_catalog_the_models_screen_draws(consol
         changed = edited(path.read_text(), f"model_set: [{MODEL}]", "model_set: [m2]")
         http.put("/pool/config", json={"text": changed, "version": status_version(http)})
         assert http.get("/pool/status").json()["model_set"] == ["m2"]
+
+
+def test_the_models_screen_is_told_which_build_is_served_and_whether_that_tag_is_resident(console):
+    """Found live: a host holding the Apple build of a model showed 'missing' because the
+    screen looked for the logical name in the resident list. The pool resolves a variant per
+    host; status must say which one, so the screen draws what the pool decided."""
+    supervisor, url, path, _ = console
+    with client(url) as http:
+        with_catalog = edited(
+            edited(path.read_text(), "    workers: 2\n", "    workers: 2\n    capabilities: [apple-silicon]\n"),
+            "hosts:\n",
+            "catalog:\n"
+            f"  {MODEL}:\n"
+            "    variants:\n"
+            f"      - {{tag: {MODEL}-mlx, requires: [apple-silicon], runtime_class: apple-mlx, enforces_schema: false}}\n"
+            f"      - {{tag: {MODEL}}}\n"
+            "hosts:\n",
+        )
+        assert http.put("/pool/config", json={"text": with_catalog, "version": status_version(http)}).status_code == 200
+
+        # The engine holds the build, never the logical name.
+        supervisor.hosts["local-1"].resident = frozenset({f"{MODEL}-mlx"})
+        host = http.get("/pool/status").json()["hosts"][0]
+
+    served = host["served"][MODEL]
+    assert served == {
+        "tag": f"{MODEL}-mlx", "runtime_class": "apple-mlx", "enforces_schema": False,
+        "resident": True, "available": False,  # never probed: the engine at :1 is unreachable
+    }
+    assert host["residency"] == "pinned"
+    assert MODEL not in host["resident"]  # what the old screen was checking, and would still call missing
 
 
 def status_version(http):

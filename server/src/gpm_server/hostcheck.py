@@ -121,18 +121,21 @@ async def test_connection(
             return {"ok": False, "steps": [s.as_dict() for s in steps], "workers": 0}
 
         resident = await engine.models_resident(client)
+        available = await engine.models_available(client)
         steps.append(Step("models", True, f"resident now: {', '.join(sorted(resident)) or 'none'}"))
 
         variants = variants_for_host(list(model_set), catalog, frozenset(capabilities), engine.name)
         required = {group[0].tag for group in variants.values() if group}
-        missing = required - resident
-        steps.append(Step(
-            "model set",
-            not missing,
-            "the whole set is resident together"
-            if not missing
-            else f"missing {sorted(missing)}: this host would not join the pool until they are loaded",
-        ))
+        residency = host.get("residency", "pinned")
+        if residency == "on_demand":
+            missing = required - available
+            ok_detail = "the whole set is on disk; models load on first use"
+            fail_detail = f"missing {sorted(missing)}: not on disk. Pull them; the pool never downloads for a request"
+        else:
+            missing = required - resident
+            ok_detail = "the whole set is resident together"
+            fail_detail = f"missing {sorted(missing)}: this host would not join the pool until they are loaded"
+        steps.append(Step("model set", not missing, ok_detail if not missing else fail_detail))
 
         steps.append(Step("capabilities", True, ", ".join(capabilities) if capabilities else "none declared; the no-requirements variant is served"))
 

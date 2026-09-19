@@ -29,8 +29,9 @@ state; a static HTML/JS console with no build step. The client SDK is a separate
 - **Safe by default.** Nothing rents without a lease; a lease that can rent must have a dollar
   cap; the app key is always required and can never reach the control API; no unauthenticated
   listener off loopback; only catalogued models are ever resolved; no request can trigger a
-  model pull or load; the provider account credential never goes on a rented host, in a log, or
-  to a browser.
+  model pull (a load into memory is allowed only on a host whose `residency` is `on_demand`,
+  for a tag already on its disk — D39); the provider account credential never goes on a rented
+  host, in a log, or to a browser.
 - **The app boundary.** Apps know one URL, one key and the contract in
   `docs/spec/app-contract.md`. The pool never calls into an app; apps never trigger recovery or
   spending.

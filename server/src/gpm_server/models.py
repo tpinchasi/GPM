@@ -63,12 +63,24 @@ class Host:
     state: HostState = HostState.UNREACHABLE
     #: Tags the engine reports loaded right now. Empty until the first successful probe.
     resident: frozenset[str] = frozenset()
+    #: Tags on the engine's disk, loaded or not; and whether this host may be routed to for a
+    #: tag that is on disk but not loaded (the engine then loads it on first use).
+    available: frozenset[str] = frozenset()
+    residency: str = "pinned"
     last_error: Optional[str] = None
     last_probe_at: Optional[float] = None
     #: Counters the router publishes for the supervisor (docs/spec/supervisor.md §1).
     last_request_at: Optional[float] = None
     requests_served: int = 0
     failures: int = 0
+
+    @property
+    def servable(self) -> frozenset[str]:
+        """The tags a request may be routed here for: what is loaded on a pinned host; what is
+        on disk on an on-demand one, where the engine loads on first use."""
+        if self.residency == "on_demand":
+            return self.available | self.resident
+        return self.resident
 
     @property
     def busy(self) -> int:

@@ -98,6 +98,8 @@ class HostRegistry:
             literal_variants=_literal_variants(variants),
             state=HostState(row.state),
             resident=row.resident,
+            available=row.available,
+            residency=row.residency,
             last_error=row.last_error,
         )
 

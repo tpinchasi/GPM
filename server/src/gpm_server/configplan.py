@@ -60,7 +60,8 @@ def plan_changes(
     before = {host.id: host for host in current.hosts}
     after = {host.id: host for host in candidate.hosts}
     for host_id in sorted(after.keys() - before.keys()):
-        changes.append(Change("host_added", f"host {host_id!r} is added; it will be probed and joins once the whole model set is resident"))
+        joins = "on disk" if after[host_id].residency == "on_demand" else "resident"
+        changes.append(Change("host_added", f"host {host_id!r} is added; it will be probed and joins once the whole model set is {joins}"))
     for host_id in sorted(before.keys() - after.keys()):
         changes.append(Change("host_removed", f"host {host_id!r} is removed; it will be drained and stop receiving requests"))
     for host_id in sorted(after.keys() & before.keys()):
@@ -74,6 +75,14 @@ def plan_changes(
                 changes.append(Change("workers_lowered", f"host {host_id!r} goes from {old.workers} to {new.workers} workers; the surplus drain after their current request"))
         if old.disabled != new.disabled:
             changes.append(Change("host_disabled", f"host {host_id!r} is {'disabled' if new.disabled else 'enabled'}"))
+        if old.residency != new.residency:
+            if new.residency == "on_demand":
+                detail = (f"host {host_id!r} becomes on-demand: it is routable once the model set is on disk, "
+                          "the engine loads a model on first use, and an evicted model no longer takes it out of routing")
+            else:
+                detail = (f"host {host_id!r} becomes pinned: it is routable only while the whole model set is loaded, "
+                          "and leaves routing at the next probe if it is not")
+            changes.append(Change("host_residency", detail))
         if not old.transport.allow_insecure and new.transport.allow_insecure:
             changes.append(Change(
                 "allow_insecure",

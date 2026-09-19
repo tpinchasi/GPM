@@ -56,7 +56,7 @@ class Dispatcher:
             variants = (literal,)
         return select_variant(
             variants,
-            host.resident,
+            host.servable,
             wants_schema=need.wants_schema,
             runtime_class_pin=need.runtime_class_pin,
         )

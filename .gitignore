@@ -8,6 +8,8 @@ build/
 
 # Local pool state and configuration
 pool.yaml
+# applied-configuration history kept beside the file: a copy of the local configuration
+*.yaml.versions/
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm

@@ -64,6 +64,11 @@ class Engine(Protocol):
     async def models_resident(self, client: httpx.AsyncClient) -> frozenset[str]:
         """The tags loaded in memory *now* — not merely present on disk."""
 
+    async def models_available(self, client: httpx.AsyncClient) -> frozenset[str]:
+        """The tags present on disk, loaded or not. What an `on_demand` host is judged by:
+        a tag here can be served without a download; one absent cannot, and never will be
+        because a request asked."""
+
     # --- preparing a host the pool created ---
 
     async def pull(self, client: httpx.AsyncClient, tag: str) -> PullResult:

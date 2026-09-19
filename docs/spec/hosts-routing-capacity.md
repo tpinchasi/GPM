@@ -66,13 +66,13 @@ stateDiagram-v2
     requested --> scheduling: bid placed
     scheduling --> released: bid lost
     scheduling --> preparing: instance running
-    preparing --> ready: whole model set loaded and verified
+    preparing --> ready: whole model set verified — loaded (pinned) or on disk (on-demand)
     ready --> unreachable: probe fails N times
     unreachable --> ready: probe recovers
     unreachable --> recovering: provider reports outbid / stopped
     recovering --> preparing: back on the same machine, disk kept
     recovering --> released: replaced by another host
-    ready --> quarantined: corrupt output, or a resident model evicted
+    ready --> quarantined: corrupt output, or a resident model evicted (pinned hosts)
     quarantined --> preparing: engine restarted, set reloaded
     quarantined --> released: did not clear
     ready --> draining: idle, overflow gone, lease ended, operator
@@ -152,22 +152,28 @@ A worker is only real if the engine can run that many requests at once.
 
 ## 3. The pool's model set
 
-A pool declares **the set of models it serves**, and every host keeps **all of them loaded, all
-the time**, in one engine process. Nothing loads on demand, so nothing is swapped: no request
-can evict a model another needs, no host thrashes, and worker counts stay valid because the set
-never changes underneath them.
+A pool declares **the set of models it serves**, and every host must be able to serve **all of
+them**. How a host holds them is its **residency** policy, set per host:
+
+| `residency` | `ready` means | A model found evicted | For |
+|---|---|---|---|
+| `pinned` (default) | The full set is **loaded together**, in one engine process, kept indefinitely | Takes the host out of `ready`; it is re-prepared and the event logged | A machine dedicated to serving: nothing is swapped, no request can evict a model another needs, no host thrashes |
+| `on_demand` | The full set is **on disk**; the engine loads a model on first use and may evict it when memory is wanted elsewhere | Nothing: the next request for it pays the load again | A machine also used for other work — a laptop — where keeping tens of gigabytes resident is not acceptable |
+
+Hosts the pool creates are always `pinned`: it configures them, so it sets this at creation.
+On the others the policy is verified by test-connection and every probe.
 
 - The model set belongs to the pool, with its hosts, key and budget. **Leases do not name models.**
-- A host is `ready` only when the **full set is resident together** — engine configured to keep
-  models loaded indefinitely and to hold at least that many at once. Set at creation on hosts
-  the pool creates; verified by test-connection and every probe on the others.
-- **A host that cannot hold the full set does not join the pool**, whatever its kind. The
-  console says which host fails and by how much. The set, the context length and the smallest
-  host have to agree.
+- **A host that cannot hold the full set does not join the pool**, whatever its kind — not
+  loaded on a pinned host, not on disk on an on-demand one. The console says which host fails
+  and by how much. The set, the context length and the smallest host have to agree.
 - **A request for a model outside the set is refused** (`404 model_not_in_pool`), never loaded.
   Adding a model is a configuration change applied by re-preparing hosts.
-- **A resident model found evicted** takes the host out of `ready`; it is re-prepared and the
-  event logged. It means the set does not actually fit.
+- **Nothing is ever downloaded because a request asked**, on either policy. A tag that is not
+  on disk keeps the host out of routing until the operator pulls it. A load into memory on an
+  on-demand host is the engine's own behaviour, for a tag the operator listed and put there;
+  the request that finds a model cold pays its load time, and `X-GPM-Wait-S` does not include
+  it — that is generation from the pool's point of view.
 
 ## 4. Model resolution
 
@@ -278,9 +284,10 @@ Strict tiers. A lower tier is touched only when every eligible worker above it i
 
 Per request:
 
-1. **Eligible hosts** = state `ready` (which implies the whole model set is loaded); a usable
-   variant of the requested model for this request (§4.1, including the schema rule); runtime
-   class acceptable if the request pinned one. Priority only orders eligible hosts.
+1. **Eligible hosts** = state `ready` (the whole model set loaded on a pinned host, on disk on
+   an on-demand one); a usable variant of the requested model for this request (§4.1, including
+   the schema rule) — one that is loaded, or on disk where the host is on-demand; runtime class
+   acceptable if the request pinned one. Priority only orders eligible hosts.
 2. Take the **highest-priority tier with an idle worker**.
 3. Within that tier, the host with the lowest `busy / total` workers; ties broken by measured
    throughput. **Session affinity is off by default**; `within_tier` and `across_tiers` exist as

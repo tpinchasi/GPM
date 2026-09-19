@@ -201,7 +201,7 @@ screens.hosts = (status) => [
   el("table", {},
     el("thead", {}, el("tr", {},
       el("th", {}, "Host"), el("th", {}, "Kind"), el("th", {}, "Transport"), el("th", {}, "State"),
-      el("th", { class: "num" }, "Workers"), el("th", {}, "Capabilities"), el("th", {}, "Tunnel"), el("th", { class: "num" }, "Served"))),
+      el("th", { class: "num" }, "Workers"), el("th", {}, "Capabilities"), el("th", {}, "Residency"), el("th", {}, "Tunnel"), el("th", { class: "num" }, "Served"))),
     el("tbody", {}, status.hosts.map((host) => el("tr", {},
       el("td", { class: "mono" }, host.host_id),
       el("td", {}, host.kind),
@@ -209,6 +209,10 @@ screens.hosts = (status) => [
       el("td", {}, pill(host.state), host.last_error ? el("div", { class: "muted" }, host.last_error) : null),
       el("td", { class: "num" }, host.workers),
       el("td", { class: "muted" }, (host.capabilities || []).join(", ") || "—"),
+      el("td", { class: "muted", title: host.residency === "on_demand"
+          ? "routable once the model set is on disk; the engine loads a model on first use and may evict it"
+          : "routable only while the whole model set is loaded" },
+        host.residency === "on_demand" ? "on demand" : "pinned"),
       el("td", {}, host.tunnel ? pill(host.tunnel.up ? "up" : "down", host.tunnel.up ? "ok" : "bad") : "—",
         host.tunnel ? el("div", { class: "muted mono" }, `:${host.tunnel.local_port} · ${host.tunnel.restarts} restart(s)`) : null),
       el("td", { class: "num" }, host.requests_served ?? 0))))),
@@ -284,7 +288,7 @@ screens.rented = async (status) => {
         el("td", { class: "num" }, money(host.estimated_spend), el("div", { class: "muted" }, `rep ${money(host.reported_spend)}`)),
         el("td", {}, el("div", { class: "row" },
           el("button", { class: "small", onclick: (e) => run(e.target, () => api.hostAction(host.host_id, "park")) }, "Park"),
-          el("button", { class: "small danger", onclick: (e) => run(e.target, () => api.hostAction(host.host_id, "release")) }, "Release"))))))
+          el("button", { class: "small danger", onclick: (e) => run(e.target, () => api.hostAction(host.host_id, "release")) }, "Release")))))))
       : el("p", { class: "muted" }, "Nothing rented."),
   ];
 };
@@ -331,12 +335,31 @@ function preparePanel() {
 }
 
 screens.models = (status) => {
+  // What the pool resolved for each (host, logical model) — the build that is actually served
+  // there, and whether *that tag* is resident. A logical name is never what the engine holds.
   const rows = [];
   for (const host of [...status.hosts, ...status.rented]) {
     for (const model of status.model_set || []) {
-      rows.push({ host: host.host_id, model, resident: (host.resident || []).includes(model) });
+      const served = (host.served || {})[model];
+      rows.push({ host: host.host_id, model, served, residency: host.residency || "pinned" });
     }
   }
+  // Loaded is what a pinned host needs; on disk is enough for an on-demand one, whose engine
+  // loads on first use. Not on disk is missing on either: nothing is ever downloaded for a request.
+  const residentPill = (row) => {
+    const label = variant(row.model, row.served.tag);
+    if (row.served.resident) return pill("resident ✓" + label, "ok");
+    if (row.served.available && row.residency === "on_demand") return pill("on disk · loads on use" + label, "ok");
+    if (row.served.available) return pill("on disk, not loaded ✗" + label, "bad");
+    return pill("missing ✗" + label, "bad");
+  };
+  const schema = (value) => value === true ? "enforces" : value === false ? "ignores" : "unknown";
+  // "mlx variant" for gemma4:e4b served as gemma4:e4b-mlx; nothing when the tag is the name.
+  const variant = (model, tag) => {
+    if (!tag || tag === model) return "";
+    const suffix = tag.startsWith(model) ? tag.slice(model.length).replace(/^[-:_]/, "") : tag;
+    return ` (${suffix} variant)`;
+  };
   return [
     el("h1", {}, "Models"),
     el("p", { class: "muted" }, "Every host holds the pool's whole model set, loaded, all the time. A host that does not is not routed to."),
@@ -344,11 +367,15 @@ screens.models = (status) => {
       el("div", { class: "mono" }, (status.model_set || []).join("  ·  ") || "—")),
     el("h2", {}, "Per host"),
     el("table", {},
-      el("thead", {}, el("tr", {}, el("th", {}, "Host"), el("th", {}, "Model"), el("th", {}, "Resident"))),
+      el("thead", {}, el("tr", {}, el("th", {}, "Host"), el("th", {}, "Model"), el("th", {}, "Build served"),
+        el("th", {}, "Runtime class"), el("th", {}, "Schema"), el("th", {}, "Resident"))),
       el("tbody", {}, rows.map((row) => el("tr", {},
         el("td", { class: "mono" }, row.host),
         el("td", { class: "mono" }, row.model),
-        el("td", {}, pill(row.resident ? "resident ✓" : "missing ✗", row.resident ? "ok" : "bad")))))),
+        el("td", { class: "mono" }, row.served ? row.served.tag : el("span", { class: "muted" }, "no usable variant")),
+        el("td", { class: "muted" }, row.served ? row.served.runtime_class : "—"),
+        el("td", { class: "muted" }, row.served ? schema(row.served.enforces_schema) : "—"),
+        el("td", {}, row.served ? residentPill(row) : pill("not served", "bad")))))),
   ];
 };
 
@@ -398,7 +425,7 @@ screens.leases = async () => {
                 run(e.target, () => api.tightenLease(lease.lease_id, { max_spend: Number(value) }));
               } }, "Tighten"),
               el("button", { class: "small", onclick: (e) => run(e.target, () => api.closeLease(lease.lease_id)) }, "Close"))
-          : null)))),
+          : null))))),
   ];
 };
 
@@ -513,9 +540,17 @@ async function render() {
   }
   const main = document.getElementById("screen");
   try {
-    const parts = await (screens[name] || screens.overview)(state.status);
+    const pending = (screens[name] || screens.overview)(state.status);
+    if (pending instanceof Promise) {
+      // A screen that has to ask the provider takes seconds. Say so, rather than leaving the
+      // previous screen on the page where it reads as this one's answer.
+      main.replaceChildren(el("p", { class: "muted" }, "Loading…"));
+    }
+    const parts = await pending;
+    if (state.screen !== name) return;  // the operator moved on while we were waiting
     main.replaceChildren(...[parts].flat().filter(Boolean));
   } catch (error) {
+    if (state.screen !== name) return;
     main.replaceChildren(el("p", { class: "error" }, error.message));
   }
 }
