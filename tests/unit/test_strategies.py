@@ -206,11 +206,25 @@ def test_an_eviction_outside_a_lease_just_stops_billing():
 # --- tear-down ---
 
 
-def test_an_idle_host_is_released():
-    host = HostView("h1", 20, 0, 2, idle_seconds=11 * 60, bid_hourly=0.12)
+def test_an_idle_host_is_paused_first():
+    host = HostView("h1", 20, 0, 2, idle_seconds=3 * 60, bid_hourly=0.12)
     actions = decide_teardown([host], Demand(4, 0, 2), lease(), TeardownConfig(), lease_open=True)
     assert actions[0].action == "park"
-    assert "idle 11.0 min" in actions[0].reasons[0]
+    assert "idle 3.0 min, past the 2" in actions[0].reasons[0]
+
+
+def test_a_host_still_unused_at_the_second_limit_is_destroyed():
+    host = HostView("h1", 20, 0, 2, idle_seconds=6 * 60, bid_hourly=0.12)
+    actions = decide_teardown([host], Demand(4, 0, 2), lease(), TeardownConfig(), lease_open=True)
+    assert actions[0].action == "destroy"
+    assert "past the 5 min limit" in actions[0].reasons[0]
+
+
+def test_the_destroy_limit_follows_an_operators_own_idle_window():
+    assert TeardownConfig(idle_minutes=10).destroy_after_minutes == 25
+    assert TeardownConfig(idle_minutes=10, destroy_idle_minutes=12).destroy_after_minutes == 12
+    with pytest.raises(ValueError, match="paused first"):
+        TeardownConfig(idle_minutes=10, destroy_idle_minutes=5)
 
 
 def test_an_idle_host_is_destroyed_where_parking_is_off():

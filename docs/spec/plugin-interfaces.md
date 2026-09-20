@@ -58,6 +58,11 @@ class Provider(Protocol):
 | `reported_charges` | What the provider says the instance has cost so far, or `None` if it cannot say |
 | Every operation | Bounded by a timeout; raises typed errors (`ProviderAuthError`, `ProviderRateLimited`, `ProviderUnavailable`, `OfferGone`, `BidLost`); never blocks indefinitely |
 
+**Optional in an instance's status: `startup_material`** — true, false, or unknown. A provider
+that can tell whether an instance still carries the start-up material it was created with says
+so, and the pool ends a host that lost it (D65). A provider that cannot leaves it unknown, and
+the pool falls back to its give-up rule for hosts that never start.
+
 ### Declared capabilities
 
 A provider states what it can do; the pool adapts rather than assumes.

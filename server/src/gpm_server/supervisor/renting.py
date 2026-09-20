@@ -71,6 +71,9 @@ class RentedHost:
     connection: Optional[ConnectionInfo] = None
     ready_at: Optional[float] = None
     parked_at: Optional[float] = None
+    #: When this host was parked for having no traffic, the moment its idleness began — so the
+    #: destroy limit is counted from its last request, not from the park (D64).
+    idle_since: Optional[float] = None
     prepared: bool = False
     #: Set by a preparation, so idle release does not reap a host that has no traffic *yet*.
     hold_until: Optional[float] = None
@@ -164,6 +167,9 @@ class Fleet:
         self.last_refusal: Optional[str] = None
         #: A provider that says "too many requests" is answered by asking less often, not by
         #: asking again next pass. Doubles per refusal, cleared by a search that works.
+        #: Set when a host is given up for idleness: from then on the lease's standing demand
+        #: does not bring capacity back by itself — measured load does (D64).
+        self.idle_gate = False
         self._offer_backoff_s = 0.0
         self._offer_retry_at = 0.0
 
@@ -232,6 +238,7 @@ class Fleet:
         ready_workers_higher_tiers: int,
         idle_seconds: dict[str, float],
         busy: Optional[Mapping[str, int]] = None,
+        pressure: bool = False,
     ) -> None:
         open_leases = self.leases.open_leases()
         await self.finish_draining(busy or {})
@@ -246,7 +253,7 @@ class Fleet:
 
         await self.handle_evictions()
         await self.tear_down(open_leases, idle_seconds, ready_workers_higher_tiers)
-        await self.acquire(open_leases, ready_workers_higher_tiers)
+        await self.acquire(open_leases, ready_workers_higher_tiers, pressure=pressure)
 
     async def enforce_lease_limits(self, lease: Lease) -> bool:
         """Time or dollars reached → release everything the lease holds. Returns True when
@@ -912,6 +919,7 @@ class Fleet:
             host.lease_id = lease.lease_id
             host.state = "preparing"
             host.parked_at = None
+            host.idle_since = None
             self.events.record(
                 "park_restarted",
                 f"{host.host_id} restarted from parked at ${capped:.3f}/h — it already holds "
@@ -929,6 +937,14 @@ class Fleet:
         now = time.time()
         for host in list(self.hosts.values()):
             if host.released or host.state != "parked" or host.parked_at is None:
+                continue
+            idle_limit = self.rented.teardown.destroy_after_minutes * 60
+            if host.idle_since is not None and now - host.idle_since >= idle_limit:
+                await self.destroy(
+                    host,
+                    f"unused for {(now - host.idle_since) / 60:.1f} min, past the "
+                    f"{self.rented.teardown.destroy_after_minutes:g} min limit",
+                )
                 continue
             if now - host.parked_at >= limit:
                 await self.destroy(
@@ -954,6 +970,7 @@ class Fleet:
             "engine_seen_at": host.engine_seen_at,
             "state": host.state,
             "parked_at": host.parked_at,
+            "idle_since": host.idle_since,
             "offer": dataclasses.asdict(dataclasses.replace(host.offer, raw={})),
         }
 
@@ -1006,12 +1023,15 @@ class Fleet:
                 when_ready=ref.get("when_ready") or "join",
                 download_cost=float(ref.get("download_cost") or 0.0),
                 parked_at=ref.get("parked_at"),
+                idle_since=ref.get("idle_since"),
                 # What its engine was launched with. A row from before profiles existed was
                 # launched with the rented default of the day.
                 workers=int(ref.get("workers") or self.rented.workers),
                 interruptible=bool(ref.get("interruptible", True)),
                 engine_seen_at=ref.get("engine_seen_at"),
             )
+            if host.idle_since is not None:
+                self.idle_gate = True  # paused for idleness: load, not the lease, brings it back
             if host.state == "ready":
                 # Readiness is re-verified, never assumed — and the clock on "not ready in
                 # time" starts now, not when the host was created (D50).
@@ -1126,7 +1146,31 @@ class Fleet:
                 self._end_prepare_lease(host, "no longer exists at the provider")
                 continue
 
+            if (
+                status.startup_material is False
+                and host.state != "ready"
+                and self.deadman_onstart() is not None
+            ):
+                # Created with a start-up script and reported back without one (seen live): no
+                # dead-man timer, no key for the pool, so it can never join and nothing on it
+                # would stop it billing. There is no way in to repair it. End it now (D65).
+                self.avoid(host.offer.machine_id, "came up without its start-up material")
+                self.events.record(
+                    "host_without_startup",
+                    f"{host.host_id} came up without the start-up material it was created with: "
+                    "no dead-man timer and no way in for the pool; ending it",
+                    numbers={"machine": host.offer.machine_id},
+                    host_id=host.host_id,
+                    lease_id=host.lease_id,
+                )
+                await self.destroy(host, "came up without its start-up material")
+                continue
+
             if status.state != InstanceState.STOPPED:
+                continue
+            if host.state == "parked":
+                # Stopped because the pool parked it. Read as an eviction, it would be re-bid
+                # and restarted the moment it was parked (D64).
                 continue
 
             if not host.interruptible:
@@ -1194,8 +1238,21 @@ class Fleet:
 
     # --- acquire what is missing ---
 
-    async def acquire(self, open_leases: list[Lease], ready_workers_higher_tiers: int) -> None:
+    async def acquire(
+        self, open_leases: list[Lease], ready_workers_higher_tiers: int, pressure: bool = False
+    ) -> None:
         lease = next((lease for lease in open_leases if lease.allow_rent), None)
+        if self.idle_gate:
+            # A host was given up because nothing was using it. The lease says what may be
+            # spent, not that it must be: capacity comes back when load asks for it (D64).
+            if not pressure:
+                self.overflow_since = None
+                return
+            self.idle_gate = False
+            if lease is not None and self._refuse_for_caps_quietly(lease) is None:
+                back = await self.restart_idle_parked(lease)
+                if back is not None:
+                    return
         rented_workers = sum(
             h.workers for h in self.hosts.values() if not h.released and h.state == "ready"
         )
@@ -1240,6 +1297,18 @@ class Fleet:
 
         assert lease is not None
         await self.rent_one(lease, decision.reasons)
+
+    def _refuse_for_caps_quietly(self, lease: Lease) -> Optional[str]:
+        """The dollar check alone: a parked host is already counted among the pool's hosts."""
+        left = self.budget_left(lease)
+        return None if left > 0 else f"the lease has ${left:.4f} left"
+
+    async def restart_idle_parked(self, lease: Lease) -> Optional[RentedHost]:
+        """Load came back while a host was paused: it returns at once, with no download and no
+        wait for the scale-up window, which exists to stop a burst buying a download."""
+        if not any(h.state == "parked" and h.idle_since is not None and not h.released for h in self.hosts.values()):
+            return None
+        return await self.restart_parked(lease)
 
     def _refuse_for_caps(self, demand: Demand, lease: Optional[Lease]) -> Optional[str]:
         if lease is None:
@@ -1520,14 +1589,21 @@ class Fleet:
             host = self.hosts.get(action.host_id)
             if host is None or host.released:
                 continue
-            if action.host_id in held:
-                continue  # prepared and still inside its hold, so it is not idle "yet"
+            idle = action.reasons[0].startswith("idle")
+            if action.host_id in held and not idle:
+                continue  # prepared and inside its hold: not surplus yet. Unused is another matter (D64)
+            if idle:
+                self.idle_gate = True
             if "overflow" in action.reasons[0]:
                 if reaped_for_overflow >= 1:
                     continue  # one host at a time (spec §9)
                 reaped_for_overflow += 1
             if action.action == "park" and self.provider.capabilities.parkable:
+                if idle:
+                    host.idle_since = now - idle_seconds.get(host.host_id, 0.0)
                 await self.park(host, "; ".join(action.reasons))
+            elif action.action == "park" and idle:
+                continue  # cannot be paused here: it runs on until the destroy limit
             else:
                 await self.destroy(host, "; ".join(action.reasons))
 

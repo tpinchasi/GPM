@@ -123,6 +123,25 @@ A host is rented when all of these hold:
 | Caps allow it | hosts, hourly burn, lease dollars ≥ start-up cost + one hour of burn | §4 |
 | Nothing is already on its way | no host `scheduling` or `preparing` | **One at a time** — a bad market yields one failed bid, not five |
 
+### 5.1 Dynamic allocation (D66) — decided, not built
+
+Opt-in: `rented.allocation: dynamic`. The lease stays the only spending authority and becomes
+the ceiling; the **demand** is measured — the load signal of §9 — instead of read from the lease.
+
+Hosts are added **gradually**. The first round adds one. If the load is still there once that
+round's hosts are ready or given up, and `ramp_backoff_s` has passed, the next round adds
+`ramp_factor` times as many — 1, 2, 4 … up to `max_round` — and the ramp resets when the load
+clears. Waiting for the previous round matters: a host takes minutes to become ready, and
+doubling before it has helped buys capacity the first round was about to supply. Every host in
+every round is chosen by the offer rules of §6 and re-checked against every cap on its own; a
+round that loses its bids does not grow the next. Shrinking is §9's pause-then-destroy.
+
+```yaml
+rented:
+  allocation: dynamic            # lease (default) | dynamic
+  dynamic: { ramp_factor: 2, ramp_backoff_s: 300, max_round: 8, min_hosts: 0 }
+```
+
 Count: `ceil(overflow / workers of the chosen offer)`. Each host must hold the pool's whole
 model set. **Parked hosts are tried first** (§8).
 
@@ -217,7 +236,7 @@ ready from its advertised download speed; hourly rate while preparing; storage r
 | Step | What the operator sees |
 |---|---|
 | Bid | Offer chosen, bid placed, won or lost; a lost bid retries within the caps |
-| Instance up | Image pulled, engine answering, dead-man timer armed |
+| Instance up | Image pulled, engine answering, dead-man timer armed. A host the provider reports as having come up **without its start-up material** is ended in the same pass and its machine avoided (D65): it has no timer and no way in |
 | Models | Per-model download progress, gigabytes so far, download cost so far against the estimate. **Each model is loaded and pinned as soon as its own download finishes, while the rest are still downloading** (D57), so the loading of one overlaps the download of the next |
 | Verify | Every model loads; all resident **together**; a short clean generation per model. Readiness is unchanged by D57: a host joins on the whole set, never on a partial one |
 | Size | Worker count for this hardware and model set; engine parallelism set to match |
@@ -238,7 +257,9 @@ cannot, the supervisor bids on a fresh offer and the parked host stays parked un
 
 | Trigger | Action |
 |---|---|
-| Idle for `idle_minutes` | drain → park if a lease is still open, else destroy |
+| Unused for `idle_minutes` (2) | **paused** — parked where the provider can park; elsewhere it runs on (D64) |
+| Still unused `destroy_idle_minutes` (5) after its last request | destroy. Unset, this limit follows `idle_minutes` at the same ratio |
+| Load returns while a host is paused | it is restarted **at once** — no scale-up window, since a restart buys no download |
 | Overflow gone for 600 s | same, one host at a time. Deliberately slower than the 120 s scale-up, so capacity does not flap |
 | Lease closed or expired | drain all rented hosts → destroy |
 | Lease budget nearly spent | stop admitting requests to rented hosts while the remaining dollars still cover the drain window, then drain → destroy |
@@ -248,6 +269,13 @@ cannot, the supervisor bids on a fresh offer and the parked host stays parked un
 | Operator: `gpm release <host>` | drain → destroy |
 | Operator: `gpm down --all` | the panic button — destroy everything now, no drain, verified |
 | Operator: `gpm stop --release` | drain → destroy everything, then stop |
+
+**The lease says what may be spent, not that it must be (D64).** Once a host has been given up
+for being unused, the lease's standing demand does not bring capacity back by itself; *measured
+load* does — every ready worker busy on two passes running, or a request that waited, or was
+refused for waiting, in the last half minute. A prepared host's hold (§8) stops it being reaped as
+surplus; it does not shelter a host nobody is using. A host the pool parked is stopped on purpose
+and is never read as an eviction.
 
 **Order:** reverse routing priority, then highest cost per worker, then fewest busy workers.
 
@@ -316,7 +344,7 @@ rented:
                 on_demand_crossover: 0.8, attempts: 3, retry_market_every_min: 10 }
     spend:    { cap_safety_margin: 0.10, drift_alert: 0.15 }
     prepare:  { max_park_hours: 72, default_when_ready: join }
-    teardown: { idle_minutes: 2, drain_timeout_s: 300, deadman_minutes: 20, deadman_action: destroy }
+    teardown: { idle_minutes: 2, destroy_idle_minutes: 5, drain_timeout_s: 300, deadman_minutes: 20, deadman_action: destroy }
 
 capacity_profiles:                             # workers per hardware class; first match wins
   - match: { hardware: "1x RTX PRO 6000 Max-Q" }  # the offer's hardware, compared whole

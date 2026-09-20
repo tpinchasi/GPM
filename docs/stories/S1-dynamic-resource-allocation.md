@@ -1,7 +1,8 @@
 # S1 — Dynamic resource allocation
 
-> Status: **planned, not decided.** Part of the [feature list](README.md). Nothing here is
-> specification until its decisions are recorded in [decisions.md](../decisions.md).
+> Status: **decided (D66), not built.** Part of the [feature list](README.md). The owner's answer to the open questions:
+> *add hosts gradually — one, then multiply by a factor, again and again, with a back-off between rounds.*
+> The specification now carries it; this page remains as the reasoning and the build plan.
 
 ## The story
 
@@ -66,6 +67,26 @@ argument; the supervisor gathers them and passes them in. No I/O, no clock, repl
 per unit of measured throughput once S5 supplies that number, the highest hourly rate until then.
 A host leaving always drains first (D53).
 
+## The ramp — the owner's answer to "how many at once"
+
+Not one at a time, and not the whole gap at once. The scheme a widely used cluster framework uses
+for its executors: start with one, and while the backlog lasts, ask for a multiple each round.
+
+| Round | Adds | Starts when |
+|---|---|---|
+| 1 | 1 host | load has held for `window_s` |
+| 2 | `ramp_factor` × 1 = 2 | round 1's hosts are ready or given up, `ramp_backoff_s` has passed, and the load is still there |
+| 3 | 4 | the same, after round 2 |
+| … | up to `max_round` | |
+
+The ramp **resets when the load clears**. Waiting for the previous round to land is the
+difference from multiplying on a timer: a host takes minutes to become ready, and doubling before
+it has helped would buy capacity the last round was about to supply. A round that loses its bids
+does not grow the next one. Every host in every round is chosen by the configured offer rules and
+re-checked against every cap on its own — a round is a number of attempts, not a bulk purchase.
+
+This replaces `max_preparing` in the sketch below.
+
 ## Configuration sketch
 
 ```yaml
@@ -75,7 +96,9 @@ rented:
     target_utilisation: 0.75     # rent before saturation, not at it
     window_s: 120                # how long a signal must hold
     min_hosts: 0                 # a warm floor kept while a lease is open
-    max_preparing: 1             # how many hosts may be coming up at once
+    ramp_factor: 2               # each round adds this many times the last
+    ramp_backoff_s: 300          # and waits this long after the last round has landed
+    max_round: 8                 # the most one round may add
 ```
 
 ## What it gives up

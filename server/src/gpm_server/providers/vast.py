@@ -366,6 +366,9 @@ class VastProvider:
             stopped_by_provider=stopped_by_provider,
             bid_hourly=float(entry["dph_total"]) if entry.get("dph_total") else None,
             detail=entry.get("status_msg"),
+            # Seen live: an instance created with a start-up script and reported back without
+            # one. The field is always present on this API, so its emptiness is an answer.
+            startup_material=bool(entry["onstart"]) if "onstart" in entry else None,
         )
 
     async def set_bid(self, instance: Instance, bid: float) -> None:

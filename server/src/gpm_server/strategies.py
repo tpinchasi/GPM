@@ -330,6 +330,15 @@ def decide_teardown(
                 TeardownAction(host.host_id, "destroy", ["the lease's dollar cap is spent"])
             )
             continue
+        if host.idle_seconds >= cfg.destroy_after_minutes * 60:
+            actions.append(
+                TeardownAction(
+                    host.host_id,
+                    "destroy",
+                    [f"idle {host.idle_seconds / 60:.1f} min, past the {cfg.destroy_after_minutes:g} min limit"],
+                )
+            )
+            continue
         if host.idle_seconds >= idle_limit_s:
             action = "park" if cfg.park_when_idle else "destroy"
             actions.append(

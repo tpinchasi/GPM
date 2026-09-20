@@ -86,15 +86,78 @@ async def test_a_preparation_cannot_start_without_a_dollar_cap(fleet):
         await fleet.prepare(max_spend=None, max_hours=2)
 
 
-async def test_a_prepared_host_is_held_rather_than_reaped_for_having_no_traffic_yet(fleet):
+async def test_a_prepared_host_inside_its_hold_is_not_reaped_as_surplus(fleet):
     host = await fleet.prepare(max_spend=1.00, max_hours=2)
     assert host.hold_until > time.time()
+    host.state = "ready"
 
-    # It has served nothing at all, which would otherwise look exactly like idleness.
-    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={host.host_id: 99 * 60})
+    # Demand is covered without it, which would otherwise make it surplus — but it has only
+    # just been asked for, and it is not idle.
+    await fleet.pass_once(ready_workers_higher_tiers=99, idle_seconds={host.host_id: 0})
 
-    assert host.host_id in fleet.hosts
-    assert not fleet.hosts[host.host_id].released
+    assert host.state == "ready" and not host.released
+
+
+# --- unused: paused, then destroyed; load brings it back (D64) ---
+
+
+async def ready_prepared_host(fleet):
+    host = await fleet.prepare(max_spend=1.00, max_hours=2)
+    host.state = "ready"
+    host.ready_at = time.time()
+    return host
+
+
+async def test_an_unused_host_is_paused_even_inside_its_hold(fleet):
+    """The lease says what may be spent, not that it must be (the owner, 2026-09-20)."""
+    host = await ready_prepared_host(fleet)
+    assert host.hold_until > time.time()
+
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={host.host_id: 3 * 60})
+
+    assert host.state == "parked"
+    assert host.idle_since == pytest.approx(time.time() - 3 * 60, abs=5)
+    assert fleet.provider.instances[host.instance.instance_id].state == "stopped"
+
+
+async def test_a_paused_host_still_unused_at_the_second_limit_is_destroyed(fleet):
+    host = await ready_prepared_host(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={host.host_id: 3 * 60})
+    assert host.state == "parked"
+
+    host.idle_since = time.time() - 6 * 60  # five minutes since its last request have passed
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+
+    assert host.released
+    assert host.instance.instance_id not in fleet.provider.instances
+
+
+async def test_load_brings_a_paused_host_straight_back(fleet):
+    host = await ready_prepared_host(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={host.host_id: 3 * 60})
+    instances_before = set(fleet.provider.instances)
+
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={}, pressure=True)
+
+    assert host.state in ("scheduling", "preparing") and host.idle_since is None
+    assert set(fleet.provider.instances) == instances_before  # restarted, nothing new rented
+    assert "park_restarted" in kinds(fleet)
+
+
+async def test_the_lease_alone_does_not_bring_a_paused_host_back(fleet):
+    """Before D64 the lease's standing demand restarted an idle host two minutes after it was
+    parked, to idle and be parked again."""
+    host = await ready_prepared_host(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={host.host_id: 3 * 60})
+    instances_before = set(fleet.provider.instances)
+
+    for _ in range(3):  # scale_up_after_s is 0 in this fleet: only the gate holds it back
+        await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={}, pressure=False)
+
+    assert host.state == "parked"
+    assert "eviction" not in kinds(fleet)  # parked on purpose is not outbid
+    assert set(fleet.provider.instances) == instances_before
+    assert "park_restarted" not in kinds(fleet)
 
 
 async def test_the_model_set_is_pulled_and_pinned_on_a_prepared_host(fleet):
@@ -500,3 +563,19 @@ async def test_a_fast_enough_download_is_left_alone_and_reports_its_speed(tmp_pa
 async def test_the_speed_floor_can_be_switched_off(tmp_path):
     loaded, events, engine = await _prepare_over(tmp_path, min_pull_mbps=0)
     assert loaded
+
+
+async def test_a_host_that_came_up_without_its_start_up_material_is_ended_at_once(fleet):
+    """Seen live: an instance created with the script and reported back without it. It refused
+    SSH for six minutes, had no dead-man timer, and billed until the operator released it."""
+    fleet.provider.drop_startup_material = True
+    host = await fleet.prepare(max_spend=1.00, max_hours=2)
+    assert host is not None
+
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+
+    assert host.released
+    assert host.instance.instance_id not in fleet.provider.instances
+    assert "host_without_startup" in kinds(fleet)
+    assert host.offer.machine_id in fleet.avoided_now()
+

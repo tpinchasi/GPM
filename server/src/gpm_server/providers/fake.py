@@ -97,6 +97,8 @@ class FakeProvider:
         self.unavailable = False
         #: Scripted: the account credential is missing or refused.
         self.credential_refused = False
+        #: Scripted: the next instance comes up without the start-up material it was given.
+        self.drop_startup_material = False
         self.calls: list[str] = []
 
     # --- scripting helpers ---
@@ -191,7 +193,7 @@ class FakeProvider:
             machine_id=offer.machine_id,
             bid_hourly=bid if bid is not None else offer.all_in_hourly,
             offer=offer,
-            spec=spec,
+            spec=dataclasses.replace(spec, onstart=None) if self.drop_startup_material else spec,
             state=InstanceState.RUNNING,
             running_since=time.time(),
             engine_url=self.engine_urls.pop(0) if self.engine_urls else None,
@@ -231,6 +233,7 @@ class FakeProvider:
             state=found.state,
             stopped_by_provider=found.stopped_by_provider,
             bid_hourly=found.bid_hourly,
+            startup_material=bool(found.spec.onstart),
         )
 
     async def connection(self, instance: Instance) -> ConnectionInfo:

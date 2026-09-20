@@ -1,7 +1,8 @@
 # S5 — Automatic worker adjustment per host
 
-> Status: **planned, not decided.** Part of the [feature list](README.md). Nothing here is
-> specification until its decisions are recorded in [decisions.md](../decisions.md).
+> Status: **decided (D67), not built.** Part of the [feature list](README.md). The owner's answer on the ceiling: **the default is
+> six.** Auto mode never probes above the ceiling; going past six is an operator raising a profile.
+> The specification now carries it; this page remains as the reasoning and the build plan.
 
 ## The story
 
@@ -37,7 +38,8 @@ The label cannot tell these apart. Only the running host can.
 **Launch at the ceiling, move below it for free.** The expensive direction today is *up*: engine
 parallelism is fixed at start, so raising means a relaunch and a minute without the host (D56).
 The way round is to start the engine at the most this machine could hold — the smaller of the
-capacity profile's maximum and the memory ceiling — and let the pool use fewer workers than that.
+capacity profile's maximum and the memory ceiling, **six where no profile matches** — and let the
+pool use fewer workers than that.
 Workers stay real, because they never exceed what the engine runs; and **every adjustment, up or
 down, becomes a change of router slots: instant, graceful, no restart.** D41's rule is never
 touched, because nothing is restarted.

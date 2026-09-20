@@ -126,6 +126,10 @@ class InstanceStatus:
     stopped_by_provider: Optional[bool] = None
     bid_hourly: Optional[float] = None
     detail: Optional[str] = None
+    #: Does the instance carry the start-up material it was created with? False when the
+    #: provider reports it absent; None when the provider cannot say. A host without it has no
+    #: dead-man timer and no way in for the pool, and can never join (D65).
+    startup_material: Optional[bool] = None
 
 
 @dataclasses.dataclass(frozen=True)

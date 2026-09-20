@@ -116,6 +116,7 @@ class Supervisor:
         self.passes = 0
         #: True while the provider could not be asked which rented hosts still exist (D61).
         self._adoption_pending = False
+        self._saturated_passes = 0
         self._stopping = False
         for host_config in config.hosts:
             self.hosts[host_config.id] = self._build(host_config)
@@ -292,6 +293,7 @@ class Supervisor:
                 ready_workers_higher_tiers=self._ready_workers(),
                 idle_seconds=self._idle_seconds(),
                 busy={host_id: counter.busy for host_id, counter in self.counters.all().items()},
+                pressure=self._pressure(),
             )
             self._publish_rented()
 
@@ -396,6 +398,31 @@ class Supervisor:
             for host in self.hosts.values()
             if host.state is HostState.READY
         )
+
+    def _pressure(self) -> bool:
+        """Is load asking for more than the ready hosts give? (D64)
+
+        Two measurements, both written by the router off the request path: every ready worker
+        busy on two passes running — a client sized to capacity builds no queue, but saturation
+        shows — or a request that waited, or was refused for waiting, in the last half minute.
+        """
+        counters = self.counters.all()
+        ready: list[tuple[str, int]] = [
+            (host.host_id, host.config.workers) for host in self.hosts.values() if host.state is HostState.READY
+        ]
+        if self.fleet is not None:
+            ready += [(h.host_id, h.workers) for h in self.fleet.hosts.values() if not h.released and h.state == "ready"]
+        saturated = bool(ready) and all(
+            (counters.get(host_id).busy if counters.get(host_id) else 0) >= workers for host_id, workers in ready
+        )
+        self._saturated_passes = self._saturated_passes + 1 if saturated else 0
+        if self._saturated_passes >= 2:
+            return True
+        waited = self.db.query(
+            "SELECT 1 FROM request_log WHERE ts > ? AND (queue_wait_ms >= 1000 OR reason = 'queue_timeout') LIMIT 1",
+            (time.time() - 30,),
+        )
+        return bool(waited)
 
     def _idle_seconds(self) -> dict[str, float]:
         """How long each rented host has had nothing routed to it, from the counters the

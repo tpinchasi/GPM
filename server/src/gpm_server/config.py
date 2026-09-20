@@ -382,8 +382,13 @@ class SpendConfig(BaseModel):
 class TeardownConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    #: A rented host with nothing routed to it for this long is given up (D58).
+    #: A rented host with nothing routed to it for this long is paused: parked where the
+    #: provider can park, left running where it cannot (D58, D64).
     idle_minutes: float = 2.0
+    #: …and one still unused this long after its last request is destroyed. Between the two,
+    #: measured load brings a parked host straight back (D64).
+    #: Unset, it follows the idle window at the shipped ratio — 2 minutes gives 5.
+    destroy_idle_minutes: Optional[float] = Field(default=None, gt=0)
     drain_timeout_s: float = 300.0
     deadman_minutes: float = 20.0
     deadman_action: Literal["destroy", "stop"] = "destroy"
@@ -395,6 +400,22 @@ class TeardownConfig(BaseModel):
     #: The longest lease allowed on a provider with no instance-scoped credential, where
     #: nothing on the host can stop it billing.
     max_hours_without_deadman: float = 1.0
+
+    @model_validator(mode="after")
+    def _idle_order(self) -> "TeardownConfig":
+        if self.destroy_idle_minutes is not None and self.destroy_idle_minutes < self.idle_minutes:
+            raise ValueError(
+                f"destroy_idle_minutes ({self.destroy_idle_minutes:g}) must not be below "
+                f"idle_minutes ({self.idle_minutes:g}): a host is paused first, destroyed after"
+            )
+        return self
+
+    @property
+    def destroy_after_minutes(self) -> float:
+        """When an unused host is destroyed, counted from its last request."""
+        if self.destroy_idle_minutes is not None:
+            return self.destroy_idle_minutes
+        return self.idle_minutes * 2.5
     #: A host whose engine has still never answered after this is given up: the provider is
     #: stuck scheduling or starting it, and it has been billing all the while. Much shorter
     #: than `max_preparing_minutes`, which has to allow for downloading the model set.
