@@ -31,6 +31,7 @@ from .base import (
     ProviderAuthError,
     ProviderCapabilities,
     ProviderUnavailable,
+    SelfTerminateRequest,
 )
 
 
@@ -259,11 +260,13 @@ class FakeProvider:
         self._guard("account")
         return AccountStatus(credential_valid=True, credit_remaining=100.0)
 
-    def self_terminate_command(self, action: str = "destroy") -> str:
+    def self_terminate_request(self, action: str = "destroy") -> SelfTerminateRequest:
         # Instance-scoped credential only, exactly as a real provider's would be.
-        return (
-            f'curl -sS -X POST -H "Authorization: Bearer $CONTAINER_API_KEY" '
-            f'"{self.self_terminate_url}?action={action}&instance=$CONTAINER_ID"'
+        return SelfTerminateRequest(
+            method="DELETE" if action == "destroy" else "PUT",
+            url=f"{self.self_terminate_url}?instance=$CONTAINER_ID",
+            headers={"Authorization": "Bearer $CONTAINER_API_KEY"},
+            body=None if action == "destroy" else '{"state": "stopped"}',
         )
 
 

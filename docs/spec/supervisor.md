@@ -215,6 +215,16 @@ timer**, installed by the start-up script and independent of anything off-host.
 
 Lease expiry and the orphan sweep at next start are the second and third lines of defence.
 
+
+**The call, not a command (D71).** The provider returns the *request* its instance makes to end
+itself — method, URL, headers, body — and the start-up script writes it to a file as JSON and
+reads it back when it fires: nothing about a provider's URL or header can become shell on a
+machine the pool does not trust. The script resolves an HTTP client **at arm time**, while the
+pool is still watching: `curl`, else `wget`, else `python3`, else one quiet package install.
+Where a machine has none, it records that it has none and the timer falls back to **stopping the
+container** — the accelerator stops billing, the instance shows as stopped, and a live pool
+destroys it on its next pass. The first engine image carries no HTTP client at all, so a timer
+that named one would have armed, looked healthy, and failed only after the pool had died.
 ## 8. Preparing a rented host on request
 
 Overflow-driven renting answers "demand exceeded what I have". **Prepare a host** answers "get
