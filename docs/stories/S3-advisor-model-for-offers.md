@@ -1,7 +1,9 @@
 # S3 — An advisor model that picks the machine
 
-> Status: **planned, not decided.** Part of the [feature list](README.md). Nothing here is
-> specification until its decisions are recorded in [decisions.md](../decisions.md).
+> Status: **partly decided (D69), not built.** Part of the [feature list](README.md). Decided: the
+> machine history comes first and is judged on its own; the advisor may decline every offer, inside
+> bounds; and an evaluation suite gates it. **Still open: how the advisor reaches a model** — the
+> owner's answer, "via tool", needs one clarification (see the end of this page).
 
 ## The story
 
@@ -89,6 +91,27 @@ control pass, never on a request path, and is bounded by a timeout.
 **Toggleable** per pool (`advisor.enabled`), and per action: prepare-a-host gains "let the
 advisor choose", and the market preview shows what it would pick and why, spending nothing.
 
+## Declining, and the evaluations that gate it (D69)
+
+**The advisor may say "none of these — wait."** Waiting is sometimes right in a bad market; the
+hard filters already say an empty result means stay paused. But a stage that can stall renting is
+bounded: after `max_declines` in a row, or `max_wait_s` since the first, the rule ranking's first
+choice is used. Every decline is a logged decision with its reasons.
+
+**Evaluations are part of the feature.** The advisor is not switched on for real spending until
+it has been shown to be worth having, on the record the pool already holds:
+
+| The suite | What it measures |
+|---|---|
+| **Replay** — each recorded renting decision is put to the advisor again, with the history as it stood *then* | Would it have chosen differently from the rules? |
+| **Hindsight score** — each choice is judged by what happened to that machine: reached ready or not, time to ready, how long it lasted, measured cost per request | Were its different choices *better*? |
+| **Decline audit** — for every "wait", what the market offered over the following minutes | Was waiting right, or did it just delay the same rental? |
+| **Robustness** — malformed answers, unknown ids, prompt-injection text planted in an offer's free-text fields | Does every bad answer fall back to the rules? |
+
+The baseline is the history-fed deterministic score, not the bare rules — the advisor has to beat
+the simpler mechanism, or it is not worth its non-determinism. The harness and its scoring run
+with a fake advisor and need no GPU; scoring a real model is an opt-in run, like every live test.
+
 ## Configuration sketch
 
 ```yaml
@@ -100,6 +123,8 @@ rented:
     model: <a small model from the catalog>
     consider_top: 8
     timeout_s: 20
+    max_declines: 3                     # "none of these" in a row, then the rules choose
+    max_wait_s: 900
 ```
 
 ## Safety
@@ -118,14 +143,27 @@ rented:
    **Amends plugin-interfaces §3** by naming a non-pure stage and bounding it.
 3. How the supervisor reaches a model without breaking the router/supervisor separation.
 
-## Open questions for the owner
+## The owner's answers
 
-1. **History alone first?** Recommended: build and run the history-fed score, then add the
-   advisor and compare the two on the same decisions before trusting it.
-2. **Is "the pool's own URL with an app key" acceptable**, or must the advisor endpoint always
-   be separate from the pool it advises?
-3. **May the advisor decline every offer** — "none of these, wait"? Recommended: not at first. A
-   stage that can stall renting needs its own bounds.
+1. **History alone first?** Yes. Built, run and judged before any model is involved (D69).
+2. **How does the advisor reach a model?** "Via tool" — **to be clarified**, see below.
+3. **May it decline every offer?** It can happen, inside bounds — and good evaluations must
+   validate its responses before it is trusted (D69).
+
+## Still open: what "via tool" means
+
+Two readings, and they are different designs:
+
+- **(a) The advisor works through tool calls.** Instead of being handed everything in one prompt,
+  the model is given a closed set of tools — look up a machine's history, list the accepted
+  offers, `choose(offer_id, reasons)`, `decline(reasons)` — and answers by calling them. The
+  closed tool list plays the same part as the agent's closed verb list: the model can only do
+  what a tool permits, and `choose` accepts only an id from the accepted list.
+- **(b) The advisor is a separate tool beside the pool** — its own small program that uses the
+  pool like any other app to reach a model, rather than the supervisor calling a model itself.
+
+Reading (a) says how the model is *used*; reading (b) says where it *runs*. They can also both
+be true.
 
 ## Build stages
 
@@ -133,8 +171,10 @@ rented:
    on the Rented capacity screen. One gap to close: a rental's machine id is only in its event's
    text today, so the event gains it as a number.
 2. History in the deterministic score; the preview shows the adjustment and its reason.
-3. The advisor stage with a fake advisor; fallback paths; decision log.
-4. A real endpoint; the side-by-side comparison in the Decisions screen.
+3. The evaluation harness: replay, hindsight score, decline audit, robustness — with a fake
+   advisor, against the recorded rentals.
+4. The advisor stage itself; fallback paths; bounded declining; decision log.
+5. A real model, scored by the harness; switched on for spending only if it beats stage 2.
 
 ## Tests
 
