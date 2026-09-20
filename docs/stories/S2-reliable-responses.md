@@ -95,20 +95,18 @@ pool:
     max_buffer_mb: 16
 ```
 
-## Decisions this story needs
+## Decisions this story rests on (D62)
 
 1. Buffered delivery by host kind, with the defaults above.
 2. Failover widened to "before the first client byte" — **amends app-contract §5 rule 2**.
 3. The new dialect items. Adding optional items is a minor contract change; the behaviour change
    is operator-configured and disclosed on every response, so it is not silent.
 
-## Open questions for the owner
+## The owner's answers
 
-1. **On by default?** A pool upgraded to this version would start buffering on interruptible
-   hosts. Recommended: on, because a broken stream is the worse surprise — but it is a visible
-   change for an existing app.
-2. **May an app override it per request?** Recommended: yes, operator-switchable.
-3. **`max_redispatch`: 1 or 2?** Each attempt can cost a full generation time.
+Accepted as recommended: **on by default** for interruptible hosts, because a broken stream is
+the worse surprise; **an app may override it per request**, where the operator allows; and
+**`max_redispatch` is 1**, since each attempt can cost a full generation time.
 
 ## Build stages
 

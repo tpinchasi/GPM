@@ -198,20 +198,24 @@ adoption after a supervisor restart restores what the engine was actually starte
 operator's act and never the supervisor's own pass: a relaunch stops a host serving, and
 evidence-based resizing stays post-v1 (§2.2).
 
-### 2.4 Automatic adjustment (D67) — decided, not built
+### 2.4 Automatic adjustment (D67, D68) — decided, not built
 
-Opt-in: `rented.workers_auto`. The engine is launched at the **ceiling** — the capacity profile's
-maximum, and **six where no profile matches** — and the pool uses that many workers or fewer.
-Workers stay real, since they never exceed what the engine runs, and every adjustment in either
-direction is a change of router slots: instant, graceful, no restart.
+Opt-in: `rented.workers_auto`. A host **starts** at its capacity profile's number — **six where no
+profile matches** — and finds its own from there, in both directions.
 
-A host steps **down** by one when throughput stayed flat after its last step up, when a resident
-model was evicted, or when its service time is far above the pool's median for the same model.
-It steps **up** by one when it is saturated, requests are waiting, and its last step up raised
-throughput by `min_gain`. One change per host per window; never above the ceiling, never below
-one. Going past the ceiling is an operator raising a profile (§2.3), not the pool experimenting.
-What a host settles on is kept in the machine history, so that machine's next rental starts from
-evidence. This replaces §2.2's "never up" for pools that enable it.
+The engine is launched at the most the machine can really hold: the memory ceiling of §2.1, or
+`workers_auto.max` (default 16) where that is lower. The pool uses that many workers or fewer, so
+workers stay real — they never exceed what the engine runs — and every adjustment is a change of
+router slots: instant, graceful, no restart.
+
+A host steps **up** by one when it is saturated, requests are waiting, and its last step up raised
+throughput by `min_gain`. It steps **down** by one when throughput stayed flat after its last step
+up, when a resident model was evicted, or when its service time is far above the pool's median
+for the same model. One change per host per window; never above the launch bound, never below
+one. A profile's number is therefore a starting point and the evidence for it, not a cap; an
+operator who wants a hard limit sets `workers_auto.max`. What a host settles on is kept in the
+machine history, so that machine's next rental starts from evidence. This replaces §2.2's "never
+up" for pools that enable it.
 
 ## 3. The pool's model set
 

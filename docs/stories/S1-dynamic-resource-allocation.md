@@ -85,8 +85,6 @@ it has helped would buy capacity the last round was about to supply. A round tha
 does not grow the next one. Every host in every round is chosen by the configured offer rules and
 re-checked against every cap on its own — a round is a number of attempts, not a bulk purchase.
 
-This replaces `max_preparing` in the sketch below.
-
 ## Configuration sketch
 
 ```yaml
@@ -111,25 +109,25 @@ that cannot wait.
 ## Safety
 
 - Nothing rents without a lease; every cap is re-checked after the strategy returns.
-- `max_preparing` defaults to 1, preserving "a bad market yields one failed bid, not five".
+- The ramp's first round is one host, preserving "a bad market yields one failed bid, not five";
+  a round that loses its bids does not grow the next.
 - A host is not rented unless the lease outlasts its start-up by a useful hour (unchanged).
 - Every decision is logged with the numbers behind it; `gpm plan` shows what it would do now.
 
-## Decisions this story needs
+## Decisions this story rests on (D66)
 
 1. Dynamic allocation, opt-in. **Supersedes "Demand is the lease"** (supervisor §5) for pools
    that enable it, and moves *queue-driven scale-up* out of the roadmap's after-v1 column.
-2. The demand formula and its default target.
-3. Whether more than one host may be prepared at once.
+2. The load signal is D64's, already built for bringing a paused host back.
+3. Hosts are added in a ramp; one-at-a-time becomes its first round.
 
-## Open questions for the owner
+## The owner's answers
 
-1. **`max_preparing` above 1?** Reaching six hosts one at a time took over half an hour live.
-   Raising it multiplies the cost of a bad market. Recommended: keep 1 as the default, allow up
-   to 3, each still individually re-checked against the caps.
-2. **Default target utilisation.** 0.75 rents earlier and costs more; 0.9 rides closer to
-   saturation.
-3. **A warm floor.** Should `min_hosts` exist at all, given it spends with no traffic?
+1. **More than one host at once?** Yes — gradually: one, then a multiple, again and again, with
+   a back-off between rounds. That is the ramp above.
+2. **Default target utilisation:** 0.75, as recommended; an operator's to change.
+3. **A warm floor:** `min_hosts` exists and defaults to 0, so nothing is spent without traffic
+   unless an operator asks for it.
 
 ## Build stages
 

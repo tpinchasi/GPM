@@ -41,7 +41,7 @@ request path; the provider's account credential never goes near the host.
 loopback, and the pool forwards a second local port to it over the same SSH connection — the
 arrangement already built for configured hosts behind a tunnel. Nothing new listens anywhere.
 
-**Getting it there.** Two ways, and the choice is the main open question:
+**Getting it there.** Two ways were weighed; pushing was chosen:
 
 | | Pushed by the pool over SSH | Downloaded by the start-up script |
 |---|---|---|
@@ -90,7 +90,7 @@ own start-up material rather than by a machine owner — consistent with
 [hosts-routing-capacity.md](../spec/hosts-routing-capacity.md): what the pool creates is the
 pool's to configure. It is still fixed at installation and never sent over the protocol.
 
-## Decisions this story needs
+## Decisions this story rests on (D63)
 
 1. The agent on rented hosts. **Supersedes the recommendation in host-agent §8.**
 2. Push or download; the form of the artefact.
@@ -98,12 +98,11 @@ pool's to configure. It is still fixed at installation and never sent over the p
 4. **Amends D41** for pool-created hosts only: the restart command comes from the pool's start-up
    material. For delegated hosts D41 stands untouched.
 
-## Open questions for the owner
+## The owner's answers
 
-1. **Push or download?** Recommended: push, for the reasons in the table.
-2. **Fallback, or give the host up, when the agent does not answer?** Recommended: fall back.
-3. **Should the agent replace the SSH heartbeat, or run beside it for a while?** Recommended:
-   beside it until it has been seen working live.
+Accepted as recommended: the pool **pushes** the agent over SSH; a host whose agent does not
+answer **falls back** to today's preparation and still joins; and the agent's heartbeat runs
+**beside** the SSH heartbeat until it has been seen working live.
 
 ## Build stages
 
