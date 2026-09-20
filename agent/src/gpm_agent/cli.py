@@ -22,6 +22,8 @@ def _init(args: argparse.Namespace) -> int:
         settings = Settings(
             key_hash=fingerprint(key), host=args.host, port=args.port,
             engine_url=args.engine_url, heartbeat_file=args.heartbeat_file,
+            restart_command=([args.restart_command] if args.restart_command else None),
+            engine_env_file=args.engine_env_file,
         )
     settings.check()
     save(settings, path)
@@ -60,6 +62,8 @@ def main(argv: list[str] | None = None) -> int:
     init.add_argument("--port", type=int, default=8095)
     init.add_argument("--engine-url", default="http://127.0.0.1:11434")
     init.add_argument("--heartbeat-file", default=None, help="the dead-man timer's file, where the pool created this host")
+    init.add_argument("--restart-command", default=None, help="how the engine is restarted here (a program to run)")
+    init.add_argument("--engine-env-file", default=None, help="where the engine's start-up environment is written")
     init.add_argument("--rotate", action="store_true", help="mint a new key, keep everything else")
     init.set_defaults(run=_init)
 

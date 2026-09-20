@@ -833,6 +833,38 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             return JSONResponse({"host_id": host_id, "deleted": tag})
         return JSONResponse(status_code=status_code, content=answer)
 
+    @app.post("/pool/hosts/{host_id}/resize")
+    async def resize_host(host_id: str, request: Request) -> JSONResponse:
+        """How many requests this host takes at once, changed while it runs (D56).
+
+        Lowering is immediate and graceful. Raising relaunches the engine through the host's
+        own agent, so it costs that host about a minute and — like every restart — is an
+        operator's explicit act, with the host id typed again (D41).
+        """
+        fleet = supervisor.fleet
+        if fleet is None or host_id not in fleet.hosts:
+            return _error(404, "unknown_host", f"no rented host {host_id!r}")
+        try:
+            body = await request.json()
+        except ValueError:
+            return _error(400, "bad_request", "the body must be JSON")
+        workers = body.get("workers")
+        if not isinstance(workers, int) or isinstance(workers, bool):
+            return _error(400, "bad_request", "`workers` must be a whole number")
+        host = fleet.hosts[host_id]
+        if workers > host.workers and body.get("confirm") != host_id:
+            return _error(
+                400,
+                "not_confirmed",
+                "raising the count relaunches this host's engine: requests in flight on it will "
+                "fail over or fail. Type the host id again as `confirm`.",
+            )
+        done, why = await fleet.resize(host, workers)
+        if not done:
+            return _error(400, "cannot_resize", why)
+        supervisor._publish_rented()
+        return JSONResponse({"host_id": host_id, "workers": host.workers, "detail": why})
+
     @app.post("/pool/hosts/{host_id}/{action}")
     async def host_action(host_id: str, action: str) -> JSONResponse:
         fleet = supervisor.fleet

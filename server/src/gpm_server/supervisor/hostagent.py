@@ -28,6 +28,9 @@ log = logging.getLogger("gpm.hostagent")
 REMOTE_DIR = "/var/run/gpm"
 ARCHIVE = f"{REMOTE_DIR}/gpm-agent.pyz"
 SETTINGS = f"{REMOTE_DIR}/agent.json"
+HEARTBEAT = f"{REMOTE_DIR}/heartbeat"
+ENGINE_RESTART = f"{REMOTE_DIR}/restart-engine.sh"
+ENGINE_ENV = f"{REMOTE_DIR}/engine.env"
 #: The agent listens here, on the host's loopback only. Never exposed; the pool forwards to it.
 AGENT_PORT = 8195
 
@@ -86,7 +89,12 @@ async def install(
         f"mkdir -p {REMOTE_DIR} && chmod 700 {REMOTE_DIR} && rm -f {SETTINGS} && "
         f"python3 {ARCHIVE} -c {SETTINGS} init "
         f"--host 127.0.0.1 --port {agent_port} "
-        f"--engine-url http://127.0.0.1:{engine_port}"
+        f"--engine-url http://127.0.0.1:{engine_port} "
+        f"--heartbeat-file {HEARTBEAT} "
+        # On a host the pool created, what restarts the engine is the pool's own start-up
+        # material — fixed at installation, never sent over the protocol (D63 amending D41).
+        f"--restart-command {ENGINE_RESTART} "
+        f"--engine-env-file {ENGINE_ENV}"
     )
     if code != 0:
         raise AgentInstallFailed(f"the agent could not be set up: {output.strip()[:200]}")

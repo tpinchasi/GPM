@@ -161,8 +161,8 @@ loaded for their own reasons is not the pool's to unload.
 3. Operator-defined restart and engine settings.
 4. The agent behind an SSH tunnel.
 5. The agent on hosts the pool rents (§9). **Built** — packed, pushed, started, asked for facts,
-   and now the preparation path (delivering D57) with its own heartbeat verb. The worker count
-   (D56) still goes the old way: it is the last piece.
+   the preparation path (delivering D57), its own heartbeat verb, and the worker count changed
+   while the host runs (delivering D56).
 
 Still not built, and still waiting on a package index: installing the agent over SSH onto a
 *configured* host that someone else owns.

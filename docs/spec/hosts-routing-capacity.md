@@ -191,7 +191,9 @@ directions are not symmetric, because only one of them needs the engine to chang
 What reaches the host is a closed set of bounded whole numbers — `workers`, `models_held`, and
 optionally `context` — exactly as for a delegated host (D41). The relaunch is performed by the
 start-up script the pool installed when it created the host; the pool never sends a command, a
-path or a URL.
+path or a URL. The operator asks with `gpm host resize <id> --workers N`; a **raise** relaunches
+that host's engine, so the host id is typed again, and the host holds its model set once more
+before anything is routed to it. A host with no agent can be lowered but not raised, and says so.
 
 The new number is bounded by the memory ceiling of §2.1 and stored with the host, so an
 adoption after a supervisor restart restores what the engine was actually started with. It is an

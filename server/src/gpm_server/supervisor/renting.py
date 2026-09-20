@@ -597,6 +597,67 @@ class Fleet:
             lease_id=host.lease_id,
         )
 
+    async def resize(self, host: RentedHost, workers: int) -> tuple[bool, str]:
+        """Change how many requests a running host is given (D56). Returns (done, why).
+
+        The two directions are not the same thing. **Lowering** is the pool using fewer of the
+        slots the engine already has: the surplus workers drain and nothing in flight is
+        disturbed. **Raising** needs the engine itself to run more at once, which means a
+        relaunch — so it needs this host's agent, and it costs the host about a minute.
+        """
+        if workers < 1:
+            return False, "a host serves with at least one worker"
+        if workers == host.workers:
+            return True, f"{host.host_id} already runs {workers} workers"
+
+        if workers < host.workers:
+            was = host.workers
+            host.workers = workers
+            self.events.record(
+                "host_resized",
+                f"{host.host_id} now takes {workers} requests at once, down from {was}; the "
+                "surplus workers drain and the engine is left alone",
+                numbers={"workers": workers, "was": was, "restarted": False},
+                host_id=host.host_id,
+                lease_id=host.lease_id,
+            )
+            return True, f"{host.host_id} now takes {workers} at once"
+
+        if host.agent is None:
+            return False, (
+                f"{host.host_id} has no agent, and raising its workers means relaunching its "
+                "engine — which only an agent on that host can do"
+            )
+        settings = agents.wanted_engine_settings(workers, len(self.required_tags))
+        status, answer = await agents.restart_engine(
+            host.agent, settings, transport=self._agent_transport
+        )
+        if status != 200:
+            return False, f"its agent refused the change: {answer.get('detail') or status}"
+        if not answer.get("engine_answers"):
+            # It restarted and did not come back: the host keeps the count it can actually
+            # serve, and the probe finds it unready until the engine returns.
+            self.events.record(
+                "host_resize_failed",
+                f"{host.host_id}: its engine was relaunched for {workers} workers and is not answering",
+                numbers={"workers": workers},
+                host_id=host.host_id,
+                lease_id=host.lease_id,
+            )
+            return False, "the engine was relaunched and is not answering"
+        was = host.workers
+        host.workers = workers
+        host.state = "preparing"  # it has to hold the model set again before it is routed to
+        self.events.record(
+            "host_resized",
+            f"{host.host_id} now takes {workers} requests at once, up from {was}; its engine "
+            "was relaunched by its own agent",
+            numbers={"workers": workers, "was": was, "restarted": True},
+            host_id=host.host_id,
+            lease_id=host.lease_id,
+        )
+        return True, f"{host.host_id} now takes {workers} at once"
+
     async def ask_agent(self, host: RentedHost) -> None:
         """What the machine says about itself — load, accelerator, memory (D63)."""
         if host.agent is None:

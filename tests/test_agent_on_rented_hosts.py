@@ -129,3 +129,23 @@ def test_the_installed_agent_is_not_configuration(archive):
 def test_the_file_copy_carries_no_shell(archive):
     command = hostagent.push_command("/var/run/gpm/x; rm -rf /")
     assert "'/var/run/gpm/x; rm -rf /'" in command  # quoted whole, never split into shell
+
+
+# --- changing the worker count while the host runs (D56, stage 5) ---
+
+
+class StubAgent:
+    """An agent that answers a restart the way a real one does."""
+
+    def __init__(self, status=200, engine_answers=True):
+        self.status = status
+        self.engine_answers = engine_answers
+        self.asked: list[dict] = []
+        self.manage_models = True
+
+    def key(self):
+        return MINTED
+
+    async def restart(self, settings):
+        self.asked.append(settings)
+        return self.status, {"engine_answers": self.engine_answers, "settings": settings}

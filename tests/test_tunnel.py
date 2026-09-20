@@ -209,10 +209,13 @@ async def test_a_tunnel_that_comes_up_and_dies_backs_off_instead_of_hammering():
     every second — and the provider answers that by throttling authentication, which is what
     keeps the tunnel down. A link must *hold* before its failures are treated as new."""
     port = unused_port()
+    # Comes up, is seen to be up, and dies — the shape that used to forgive the backoff. It
+    # ends when the forward is *probed* rather than after a delay, so a slow machine cannot
+    # turn this into a test that sometimes never sees the tunnel at all.
     flap = [
         sys.executable, "-c",
-        "import socket,time;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);"
-        f"s.bind(('127.0.0.1',{port}));s.listen(1);time.sleep(0.2)",
+        "import socket;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);"
+        f"s.bind(('127.0.0.1',{port}));s.listen(1);s.accept();s.close()",
     ]
     tunnel = SshTunnel(
         "rented-1",
