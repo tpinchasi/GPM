@@ -207,6 +207,17 @@ def _host(args: argparse.Namespace) -> int:
         )
     if args.action == "show":
         return _control(args, "GET", f"/pool/hosts/{args.host_id}")
+    if args.action == "resize":
+        if args.workers is None:
+            print("resize needs --workers", file=sys.stderr)
+            return 2
+        body = {"workers": args.workers}
+        if args.confirm:
+            body["confirm"] = args.confirm
+        answer = _control(args, "POST", f"/pool/hosts/{args.host_id}/resize", body)
+        print(answer.get("detail") or answer)
+        return 0
+
     if args.action == "restart-engine":
         return _control(
             args, "POST", f"/pool/hosts/{args.host_id}/engine/restart",
@@ -352,12 +363,13 @@ def main(argv: list[str] | None = None) -> int:
     host_test.set_defaults(func=_host_test)
 
     host = subparsers.add_parser("host", help="prepare, drain, release or park a rented host")
-    host.add_argument("action", choices=["prepare", "drain", "release", "park", "delete-model", "restart-engine", "show"])
+    host.add_argument("action", choices=["prepare", "drain", "release", "park", "delete-model", "restart-engine", "resize", "show"])
     host.add_argument("--apply-settings", action="store_true",
                       help="restart-engine: first write the parallelism and models-held the pool needs")
     host.add_argument("--tag", default=None, help="delete-model: the model tag to delete from the host's disk")
     host.add_argument("--confirm", default=None, help="delete-model: the same tag again. restart-engine: the host id again")
     host.add_argument("host_id", nargs="?", default=None)
+    host.add_argument("--workers", type=int, default=None, help="resize: how many requests this host takes at once")
     host.add_argument("--max-spend", type=float, default=None)
     host.add_argument("--max-hours", type=float, default=1.0)
     host.add_argument("--bid-ceiling", type=float, default=None)

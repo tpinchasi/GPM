@@ -626,3 +626,62 @@ async def test_the_agent_is_not_installed_when_the_operator_says_not_to(tmp_path
         assert host.agent is None and not called
     finally:
         database.close()
+
+
+async def test_a_host_takes_fewer_requests_at_once_without_touching_its_engine(fleet):
+    """Lowering is the pool using fewer of the slots the engine already has: instant, graceful,
+    and no restart — which is what makes it free (D56)."""
+    host = await fleet.prepare(max_spend=1.00, max_hours=2)
+    host.state = "ready"
+
+    done, why = await fleet.resize(host, 1)
+
+    assert done and host.workers == 1
+    assert host.state == "ready", "nothing was restarted, so nothing has to be re-verified"
+    resized = [e for e in fleet.events.recent() if e["kind"] == "host_resized"][0]
+    assert resized["numbers"]["restarted"] is False
+
+
+async def test_raising_the_count_needs_the_hosts_own_agent(fleet):
+    host = await fleet.prepare(max_spend=1.00, max_hours=2)
+    host.state = "ready"
+
+    done, why = await fleet.resize(host, host.workers + 4)
+
+    assert not done and "no agent" in why
+    assert host.workers == 2, "the count only changes when the engine really can"
+
+
+async def test_raising_the_count_relaunches_the_engine_through_the_agent(fleet, monkeypatch):
+    host = await fleet.prepare(max_spend=1.00, max_hours=2)
+    host.state = "ready"
+    host.agent = object()
+    asked = {}
+
+    async def restart(agent, settings, transport=None):
+        asked.update(settings)
+        return 200, {"engine_answers": True}
+
+    monkeypatch.setattr("gpm_server.supervisor.agents.restart_engine", restart)
+
+    done, why = await fleet.resize(host, 6)
+
+    assert done and host.workers == 6
+    assert asked["workers"] == 6, "the engine is told the number, as a number (D41)"
+    assert host.state == "preparing", "it holds the set again before anything is routed to it"
+
+
+async def test_an_engine_that_does_not_come_back_does_not_get_the_new_count(fleet, monkeypatch):
+    host = await fleet.prepare(max_spend=1.00, max_hours=2)
+    host.state = "ready"
+    host.agent = object()
+
+    async def restart(agent, settings, transport=None):
+        return 200, {"engine_answers": False}
+
+    monkeypatch.setattr("gpm_server.supervisor.agents.restart_engine", restart)
+
+    done, why = await fleet.resize(host, 6)
+
+    assert not done and host.workers == 2
+    assert "host_resize_failed" in kinds(fleet)

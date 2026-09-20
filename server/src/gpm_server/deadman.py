@@ -21,6 +21,9 @@ if TYPE_CHECKING:  # a type only, so the timer keeps no import of the provider p
 
 #: Where the timer keeps its two timestamps on the host.
 STATE_DIR = "/var/run/gpm"
+#: The script that starts the engine, and starts it again when its settings change (D56).
+ENGINE_RESTART = f"{STATE_DIR}/restart-engine.sh"
+ENGINE_ENV = f"{STATE_DIR}/engine.env"
 
 _SCRIPT = """#!/bin/sh
 # GPM dead-man timer. Ends this instance if the pool goes silent.
@@ -181,6 +184,40 @@ def build_script(
     )
 
 
+def engine_restart_script(engine_start: str, *, state_dir: str = STATE_DIR) -> str:
+    """Stop the engine this script last started, then start it again with today's settings.
+
+    The settings arrive as an environment file the agent writes (D41: bounded whole numbers,
+    turned into the engine's own variable names by the agent, never by the pool). The engine's
+    own start-up line is the operator's, unchanged, so nothing here knows what an engine is.
+    """
+    return f"""#!/bin/sh
+# GPM: start the engine, or start it again with what is in {state_dir}/engine.env.
+set -u
+PIDFILE="{state_dir}/engine.pid"
+
+if [ -r "$PIDFILE" ]; then
+    OLD=$(cat "$PIDFILE" 2>/dev/null || echo)
+    if [ -n "$OLD" ] && kill -0 "$OLD" 2>/dev/null; then
+        kill -TERM "$OLD" 2>/dev/null || true
+        # Give it a moment to put its models down before anything else is started.
+        i=0
+        while kill -0 "$OLD" 2>/dev/null && [ "$i" -lt 30 ]; do sleep 1; i=$((i + 1)); done
+        kill -KILL "$OLD" 2>/dev/null || true
+    fi
+fi
+
+if [ -r "{state_dir}/engine.env" ]; then
+    set -a
+    . "{state_dir}/engine.env"
+    set +a
+fi
+
+{engine_start}
+echo $! > "$PIDFILE"
+"""
+
+
 def heartbeat_command(state_dir: str = STATE_DIR) -> str:
     """What the supervisor runs on the host each pass, over the connection it already holds."""
     return f"mkdir -p {state_dir} && touch {state_dir}/heartbeat"
@@ -232,5 +269,17 @@ def onstart_script(
     if public_key:
         lines.append(install_public_key_command(public_key, ssh_user))
     if extra:
-        lines.append(extra)
+        # The engine is started through a script rather than inline, so the same command can
+        # start it again later with different settings — which is what resizing a running host
+        # comes down to (D56). The operator's `engine_start` is reused verbatim; the pool never
+        # invents a way to run an engine.
+        lines.extend(
+            [
+                f"cat > {ENGINE_RESTART} <<'GPM_ENGINE_EOF'",
+                engine_restart_script(extra, state_dir=state_dir),
+                "GPM_ENGINE_EOF",
+                f"chmod +x {ENGINE_RESTART}",
+                f"sh {ENGINE_RESTART}",
+            ]
+        )
     return "\n".join(lines)

@@ -1,11 +1,11 @@
 # S4 — The host agent on rented hosts
 
-> Status: **stages 1-4 built (D63, D72), stage 5 next**, 2026-09-21. Part of the
-> [feature list](README.md). The agent is packed here, pushed over SSH, started on the host's
-> loopback and reached through a second forward; it fetches and holds the model set, **loading
-> each model as its own download finishes (D57)**, and beats the host's dead-man timer beside
-> the SSH beat. What remains is the worker count (D56). Stage 1 also found that the image the
-> pool was renting has no HTTP client, so the timer could not have fired (D71, merged separately).
+> Status: **built (D63, D72)**, 2026-09-21. Part of the [feature list](README.md). The agent is
+> packed here, pushed over SSH, started on the host's loopback and reached through a second
+> forward; it fetches and holds the model set, **loading each model as its own download finishes
+> (D57)**, beats the host's dead-man timer beside the SSH beat, and **changes the host's worker
+> count while it runs (D56)**. Stage 1 also found that the image the pool was renting has no HTTP
+> client, so the timer could not have fired (D71, merged separately).
 
 ## The story
 
@@ -115,7 +115,7 @@ answer **falls back** to today's preparation and still joins; and the agent's he
 2. ~~Push, start, per-host key; second forward; facts from a rented host.~~ **Built.**
 3. ~~`PUT /models` as the preparation path, with load-as-landed.~~ **Built — delivers D57.**
 4. ~~The heartbeat verb; SSH heartbeat kept beside it.~~ **Built.**
-5. `POST /engine` on rented hosts (**delivers D56's mechanism**).
+5. ~~`POST /engine` on rented hosts.~~ **Built — delivers D56's mechanism.**
 
 ## Tests
 

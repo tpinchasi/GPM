@@ -334,3 +334,50 @@ def test_the_account_check_spends_nothing(control):
 
     assert account["credential_valid"] is True
     assert supervisor.fleet.provider.instances == {}
+
+
+# --- changing a running host's worker count (D56) ---
+
+
+def rent_one(supervisor, loop):
+    supervisor.fleet.run_on_host = lambda *a: (0, "")
+    supervisor.fleet.open_lease(workers=2, max_hours=2, max_spend=2.0, allow_rent=True)
+    host = loop.run(supervisor.fleet.rent_one(supervisor.leases.open_leases()[0], ["for the test"]))
+    host.state = "ready"
+    host.workers = 3  # something to lower from, and to be refused a raise above
+    return host
+
+
+def test_raising_a_hosts_workers_asks_for_the_host_id_again(control):
+    """It relaunches that host's engine, and every restart is typed twice (D41)."""
+    supervisor, url, loop = control
+    host = rent_one(supervisor, loop)
+
+    with client(url) as http:
+        refused = http.post(f"/pool/hosts/{host.host_id}/resize", json={"workers": host.workers + 2})
+
+    assert refused.status_code == 400
+    assert refused.json()["error"] == "not_confirmed"
+    assert host.workers == 3, "nothing changed on a refusal"
+
+
+def test_lowering_a_hosts_workers_needs_no_retype_because_nothing_restarts(control):
+    supervisor, url, loop = control
+    host = rent_one(supervisor, loop)
+
+    with client(url) as http:
+        answered = http.post(f"/pool/hosts/{host.host_id}/resize", json={"workers": 1})
+
+    assert answered.status_code == 200
+    assert answered.json()["workers"] == 1 and host.workers == 1
+
+
+def test_resizing_needs_the_admin_key_like_everything_that_changes_the_pool(control):
+    supervisor, url, loop = control
+    host = rent_one(supervisor, loop)
+
+    with client(url, key=APP_KEY) as http:
+        refused = http.post(f"/pool/hosts/{host.host_id}/resize", json={"workers": 1})
+
+    assert refused.status_code in (401, 403)
+    assert host.workers == 3
