@@ -532,6 +532,10 @@ class RentedConfig(BaseModel):
     #: Runs after the dead-man timer is armed, for images whose entrypoint the provider's
     #: launch mode does not run. Image-specific, so it lives next to `image`.
     engine_start: Optional[str] = None
+    #: Put the pool's own agent on hosts it rents (D63): it reports what the machine is really
+    #: doing, and later manages its models and worker count. A host with no interpreter gets no
+    #: agent and joins without one, so this is safe to leave on.
+    agent_on_rented_hosts: bool = True
     offer_policy: OfferPolicy = Field(default_factory=OfferPolicy)
     scale: ScaleConfig = Field(default_factory=ScaleConfig)
     bidding: BiddingConfig

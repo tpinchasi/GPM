@@ -1,8 +1,11 @@
 # S4 — The host agent on rented hosts
 
-> Status: **decided (D63), not built.** Part of the [feature list](README.md). The owner accepted
-> this story as written, with its recommended answers to the open questions; the specification
-> now carries it, and this page remains as the reasoning and the build plan.
+> Status: **stage 2 built (D63, D72)**, 2026-09-21; stages 3–5 to come. Part of the
+> [feature list](README.md). The agent is packed here, pushed over SSH, started on the host's
+> loopback and reached through a second forward; the machine's facts come back. Preparation and
+> the worker count still go the way they did. Stage 1 answered the packaging question and found
+> something else: the engine image the pool was renting has no HTTP client, so the dead-man timer
+> could not have fired (D71, fixed and merged separately).
 
 ## The story
 
@@ -106,8 +109,10 @@ answer **falls back** to today's preparation and still joins; and the agent's he
 
 ## Build stages
 
-1. Verify what the engine image carries; choose the artefact form; build it in CI.
-2. Push, start, per-host key; second forward; facts from a rented host in the console.
+1. ~~Verify what the engine image carries; choose the artefact form.~~ **Done**: no interpreter
+   in the upstream image, python3 in the provider's own, so the agent ships as a zipapp (D72)
+   and the pool's image moves to `vastai/ollama`.
+2. ~~Push, start, per-host key; second forward; facts from a rented host.~~ **Built.**
 3. `PUT /models` as the preparation path, with load-as-landed (**delivers D57**).
 4. The heartbeat verb; SSH heartbeat kept as the fallback.
 5. `POST /engine` on rented hosts (**delivers D56's mechanism**).

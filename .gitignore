@@ -14,3 +14,6 @@ build/
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
+
+# The host agent, packed for pushing to rented hosts — built, never committed.
+gpm-agent.pyz

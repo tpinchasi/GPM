@@ -159,7 +159,8 @@ loaded for their own reasons is not the pool's to unload.
 2. Pull and load/pin/unload to satisfy the model set and `residency`; plan shows the download.
 3. Operator-defined restart and engine settings.
 4. The agent behind an SSH tunnel.
-5. The agent on hosts the pool rents (§9). **Decided (D63), not built.**
+5. The agent on hosts the pool rents (§9). **Stage 5a built** — packed, pushed, started, and
+   asked for facts; the model set and the worker count still go the old way (5b, 5c).
 
 Still not built, and still waiting on a package index: installing the agent over SSH onto a
 *configured* host that someone else owns.
@@ -172,8 +173,10 @@ The offer does not state the facts that matter: machines with identical offers h
 fourfold in throughput, for reasons visible only from the machine. So a rented host runs the same
 agent, with the same closed verbs, and **the pool still dials**.
 
-- **Put there by the pool.** Once the host's SSH answers, the pool copies the agent and a key made
-  for that host alone, and starts it on the host's loopback. Nothing secret goes into the
+- **Put there by the pool, as a zipapp (D72).** Once the host's SSH answers, the pool copies a
+  single `.pyz` — the agent and its pure-Python dependencies — and a key made for that host
+  alone, and starts it with the host's own `python3` on the host's loopback. A host with no
+  interpreter gets no agent, and joins without one. Nothing secret goes into the
   start-up script, which a provider stores and can read. The pool reaches the agent through a
   second forward on the SSH connection it already holds (stage 4).
 - **It is the preparation path.** `PUT /models` works toward the model set and loads each model

@@ -2,8 +2,8 @@
 
 > The planned features, one story each: what it is for, the evidence behind it, a design, what it
 > gives up, and the owner's answers. **All five are decided** and written into
-> [spec/](../spec/); their pages remain as the reasoning and the build plan. **S2 is built; the
-> other four are not.**
+> [spec/](../spec/); their pages remain as the reasoning and the build plan. **S2 is built, S4 is
+> part-built; S1, S3 and S5 are not started.**
 > Keep this table current: a story's status changes here first.
 
 | # | Feature | Status | Depends on | Touches |
@@ -11,7 +11,7 @@
 | [S1](S1-dynamic-resource-allocation.md) | **Dynamic resource allocation** — hosts added and given up from measured queue pressure and worker utilisation; explicitly enabled; machines still chosen by the configured rules; hosts added in a ramp — 1, 2, 4 … | **Decided (D66)**, not built | — (better with S5) | Supersedes "demand is the lease" for pools that enable it |
 | [S2](S2-reliable-responses.md) | **Reliable responses** — responses from interruptible hosts are held until whole, so a lost host means a re-run, never half an answer; other host kinds keep streaming | **Built** (D62) | — | Amends the app contract's failover rule; new dialect items |
 | [S3](S3-advisor-model-for-offers.md) | **An advisor model that picks the machine** — a small model chooses among offers the rules already accepted, by calling tools over the machine history; toggleable; falls back to the rules | **Decided (D69, D70)**, not built | — (richer with S4, S5) | Names a non-pure stage beside the strategy interface; a closed tool list, as the agent has closed verbs |
-| [S4](S4-agent-on-rented-hosts.md) | **The host agent on rented hosts** — model sync and load, worker count, heartbeat, the machine's own facts | **Decided (D63)**, not built | — | Supersedes the recommendation in host-agent §8; **delivers D56 and D57** |
+| [S4](S4-agent-on-rented-hosts.md) | **The host agent on rented hosts** — model sync and load, worker count, heartbeat, the machine's own facts | **Stage 2 built** (D63, D72) | — | Supersedes the recommendation in host-agent §8; **delivers D56 and D57** |
 | [S5](S5-automatic-worker-adjustment.md) | **Automatic worker adjustment per host** — each host finds its own number from load, profile and latency while it serves; starts at six and climbs on evidence, bounded by what the machine can hold | **Decided (D67, D68)**, not built | S4 (its slots-only core does not) | Supersedes "step down on evidence, never up" and D56's operator-only rule; replaces the one-off parallelism measurement |
 
 ## Already specified, waiting on a story

@@ -579,3 +579,50 @@ async def test_a_host_that_came_up_without_its_start_up_material_is_ended_at_onc
     assert "host_without_startup" in kinds(fleet)
     assert host.offer.machine_id in fleet.avoided_now()
 
+
+
+# --- the agent the pool puts on a host it rents (D63) ---
+
+
+async def test_a_host_that_cannot_take_an_agent_still_prepares(fleet):
+    """No agent is never fatal: the host is prepared the way it always was, and the reason is
+    recorded rather than left for someone to notice."""
+    host = await fleet.prepare(max_spend=1.00, max_hours=2)
+
+    async def no_interpreter(_host, command):
+        return (0, "") if "command -v python3" in command else (0, "")
+
+    fleet.run_on_host = no_interpreter
+    await fleet.install_agent(host)
+
+    assert host.agent is None
+    assert "no python3" in (host.agent_detail or "")
+    assert "agent_not_installed" in kinds(fleet)
+    # And the host is still perfectly usable.
+    loop = BackgroundLoop()
+    engine_fake = FakeOllama(resident=set())
+    server = ServerHandle(engine_fake.app, loop)
+    try:
+        client = build_client(fleet.config.hosts[0].transport, fleet.config.pool, server.base_url)
+        try:
+            assert await fleet.load_model_set(host, OllamaEngine(), client)
+        finally:
+            await client.aclose()
+    finally:
+        server.stop()
+        loop.stop()
+
+
+async def test_the_agent_is_not_installed_when_the_operator_says_not_to(tmp_path):
+    database = Database(tmp_path / "gpm.sqlite3")
+    try:
+        fleet = make_fleet(database, FakeProvider(), agent_on_rented_hosts=False)
+        host = await fleet.prepare(max_spend=1.00, max_hours=2)
+
+        called = []
+        fleet.run_on_host = lambda *a: called.append(a)
+        await fleet.install_agent(host)
+
+        assert host.agent is None and not called
+    finally:
+        database.close()
