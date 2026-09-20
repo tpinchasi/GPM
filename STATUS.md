@@ -151,52 +151,27 @@ Read [docs/overview.md](docs/overview.md) first, then [docs/decisions.md](docs/d
 
 ## Next actions, in order
 
-1. **Pending, on hold by the owner: register the RTX PRO 6000 Max-Q capacity profile (D45).**
-   Built and tested, not applied. The running router and supervisor predate the
-   `capacity_profiles` field and configuration refuses unknown fields, so **both must restart
-   onto the current code first** — the supervisor restart is invisible to apps, the router
-   restart drops live connections for a few seconds (the SDK retries a request that fails
-   before its first byte; a stream already under way fails). Then add this to `pool.yaml`
-   through the Configuration screen (plan shows one change, no retype):
-
-   ```yaml
-   capacity_profiles:
-     - match: { hardware: "1x RTX PRO 6000 Max-Q" }
-       max_workers: 6
-       note: "measured 2026-09-19: 2,765 requests at up to 6 in flight, no errors, median latency flat from 4 to 6"
-   ```
-
-   Verified before holding: it validates and plans cleanly against the live configuration with
-   the current code. The owner chose to wait for a quiet moment for the router restart.
-2. **A refused prepare says the wrong thing, and the market list does not show the burn cap.**
-   Found 2026-09-19: with `max_rented_hosts` raised to 2 and one H200 NVL already at $0.777/h,
-   every second prepare was refused by the **pool-wide hourly burn cap** ($0.80) — the decision
-   log says so exactly (`rent_refused`: "bidding $0.420/h would take the burn to $1.197/h, above
-   the $0.80 cap") — but the control API answered with a fixed *"no acceptable offer; nothing
-   was spent"* (`control.py`, prepare endpoint) whatever the reason, while the market list kept
-   showing offers that pass the *per-host* offer policy. Same class as D44: the true reason
-   exists and is thrown away on the way to the operator. Fix: return the refusal the pass
-   recorded; have the market preview state the burn headroom left by what is already running,
-   and mark offers that would not fit in it. Needs the supervisor restart that is on hold.
-1. **Owner decision, open: whether to build the last two agent items at all.** Stages 1–4 of
-   the host agent are built (facts; holding the model set and console deletion; restart and
-   engine settings; the agent behind an SSH tunnel). Two items from the original stage 4 are
-   **not** built and the recommendation is to defer both: *install over SSH* and *the agent on
-   rented hosts in place of the prepare path*. Both need `gpm-agent` installable from a package
-   index, which it is not before release. And on a rented host the pool already is the
-   configurator over a path proven live for $0.008; an interpreter plus an agent on every
-   instance adds billed boot time and new failure modes to the spending path, to learn facts the
-   offer already stated. Revisit after release, if ever.
-2. **The console has no test that executes it.** A syntax error shipped because every console
-   test read the script as text. A bracket check and `node --check` in CI now exist; the real
-   fix is an opt-in browser test (a Chrome driver over the debug protocol was written in the
-   session scratchpad and proved the approach — it is not in the repository).
-3. **Shutdown hygiene.** A SIGTERM while a console event stream is open leaves tracebacks from
-   the dying supervisor; and `gpm serve` stopped with `pkill` can leave its supervisor child
-   alive, holding the lock. Harmless, confusing.
-4. **Release checklist:** two items open, both the adopter-file decision the owner deferred.
-   Type-checking in CI is deliberately deferred. `NOTICE` says "ClearViews" with no legal
-   suffix — amend if the entity has one.
+1. **Tunnels should outlive the supervisor.** Designed, not built. Rented hosts are reached
+   through SSH tunnels the supervisor owns as child processes, so a supervisor restart makes
+   them unreachable until the new one reopens them (seen live: `503 hosts_unreachable`). The
+   fix is to start `ssh` detached, record pid and port in the host row, leave tunnels up on
+   shutdown and *adopt* them on start — verifying identity (pid alive, our command, same
+   instance) before trusting a listening port, or the router could send prompts to a stranger's
+   machine. Until then: restart the supervisor when nothing is rented, as was done for the
+   2026-09-20 deploy.
+2. **Owner decision, open: the last two agent items.** Install-over-SSH and the agent on rented
+   hosts are not built, and the recommendation is to defer both until `gpm-agent` is on a
+   package index. Rented hosts are prepared by the pool directly, over the tunnel.
+3. **A refused prepare still answers "no acceptable offer"** whatever the real reason; the
+   decision log has the truth. Return the refusal the pass recorded, and have the market
+   preview show the headroom that running hosts leave under an overall cap, when one is set.
+4. **The pool's spend estimate leaves out storage and download.** Seen live: the provider
+   reported $1.80 against an estimate of $0.46. Caps enforce on the higher of the two, so it
+   held — but with a provider that reports nothing, the estimate alone would be ~4× low. Also
+   `spend_drift` fires every pass rather than once.
+5. **`gpm serve` does not respawn a supervisor child that exits**; it only logs.
+6. **Release checklist:** two items open, both the adopter-file decision the owner deferred.
+   Type-checking in CI is deferred. `NOTICE` says "ClearViews" with no legal suffix.
 
 ## What is decided (index — the detail is in [docs/decisions.md](docs/decisions.md))
 
@@ -287,6 +262,7 @@ In `~/workspace/Aletheia`: backlog entries `GPU-POOL-01` and `GPU-CLOUD-01` in
 | 2026-09-17 | Architecture review written (18 findings). Decided one by one with the owner: F1 record-and-measure; F2 two processes; F3 time budget; F4 pool API key as the isolation unit; F5 deferred; F6 v1 cut line with three owner musts; F7 phase re-order; F9 catalog-only resolution; F11 whole model set resident + FCFS; F13 spend reconciliation + provider API. Owner added: public-framework intent; current scripts are not design inputs; prepare-a-host from the console. Verified: the first provider's per-instance restricted key makes the dead-man timer possible without the account key. |
 | 2026-09-17 | F14–F18 delegated and done: docs split into generic core + adopter guide; plug-in interfaces; capability-keyed variants; threat model; release checklist. Owner created this repository (GPM, private); docs moved here; this file, the README and `CLAUDE.md` written for handoff. **Not committed.** |
 | 2026-09-17 | **Phase 1 built.** `uv` workspace with `client/` and `server/`; config and its refusals; engine interface + Ollama adapter; dispatch with tiers, FCFS queue and failover-once; the request path with passthrough, cancel-on-disconnect and the time budget; readiness probe; SQLite request log; the SDK's transport and `PoolClient`; `gpm serve` / `gpm status`. 104 fake-engine tests plus 9 against a real local Ollama, all green; `gpm serve` driven by hand against that Ollama as well. Two decisions the build forced: **D28** (three dialect additions) and **D29** (three-valued `enforces_schema`) — both recorded in the decision log and in the spec. **Still not committed.** |
+| 2026-09-20 | **Everything built over the previous day was deployed.** First the one thing blocking it: the per-host spending cap (D46), the owner's request, had been left half-applied and was the cause of all five failing tests. Finished — the overall hourly cap is optional and unset by default, the bound is `max_rented_hosts × bid_ceiling` and is stated wherever limits are shown, and removing an overall cap is loosening, retyped. **463 tests, none failing**, for the first time since it landed. Committed and pushed as `3d69e41` (repository confirmed private). Then deployed at a moment chosen for it — nothing rented, no lease open, the laptop idle — so that restarting the router interrupted nobody and no tunnel was cut: agent, router and supervisor restarted onto the pushed commit, with the supervisor once again a child of `gpm serve` rather than the standalone process left from the night's restarts. The RTX PRO 6000 Max-Q capacity profile the owner had put on hold was registered through plan → apply (one change, no retype). Verified in a real browser against the live pool: every screen renders, the stream is live, the 13 search fields are populated from the pool's own saved policy, the per-host view opens, and the limits panel shows the per-host ceiling beside the overall cap. The pass found one cosmetic bug — `replaceChildren` renders a null argument as the text "null" — fixed. |
 | 2026-09-20 | **Non-interruptible rentals (D52) and graceful draining (D53).** Two things the specification had promised and never had: an on-demand rented kind, deferred from v1, and the `ready → draining` transition with its `drain_timeout_s`, which existed in configuration and in no code. **On-demand:** `rented.mode` chooses `interruptible`, `on_demand`, or `cheaper` — the last searches both listings and lets the existing score decide, since it already weighs price against the download a lost host would waste. An on-demand offer is created with no price at all, which is what makes it on-demand; above a ceiling it is refused rather than clamped, because a marketplace does not accept less than it asks; and a non-interruptible host that stops was not outbid, so it is released rather than re-bid on. The dead-man timer matters more here, not less: nothing else ends a forgotten host. **Draining:** a lease ending no longer drops requests in flight. The host goes to `draining`, which the router understands as not eligible, keeps the work it has, and is ended when the router's own busy count reaches zero or the timeout expires — and the released event says which, because a host that never finishes is still billing. A host with nothing on it is ended at once rather than billed to drain. Two tests that asserted immediate destruction were rewritten to the new contract. 458 passing. |
 | 2026-09-20 | **The offer search is now edited on the Rented capacity screen (D51).** Every offer-policy and bidding parameter is a field there, built from what the pool reports as saved rather than a copy that can drift. **Try these** runs the real offer pipeline against the live market with the unsaved values and saves nothing; **Save to configuration** writes them into `pool.yaml` in place through a new `PATCH /pool/config/rented`, then validates, plans and applies, refusing anything that loosens a limit until the new value is retyped. The editor changes one key and leaves the rest of the file byte for byte — the owner's comments and the one-line `bidding: { … }` style survive — because loading the YAML and dumping it back deletes every comment; a key it cannot place unambiguously is refused rather than guessed. **Three bugs found by driving it in a browser rather than assuming:** `market.box` was the *preview payload*, not the module state, because both were called `market` (shadowing — "Try these" threw); the "saved" note was wiped by the re-render that followed a save; and **"Try these" reset the form**, because it went through the helper that refreshes the screen, so the values just typed were thrown away and the next Save saw no change. All three fixed and re-driven end to end against a throwaway pool on its own port, so the owner's running one was never touched. 449 passing. |
 | 2026-09-20 | **A supervisor restart destroyed a healthy host, and broke the console — both fixed (D50).** Restarting the supervisor onto the night's code adopted both rented hosts and then destroyed one of them eleven seconds later: *"not ready after 30 minutes"*. Adoption marks a host `preparing` so readiness is re-verified, but the deadline counted from **creation**, and the host had existed for 42 minutes; its twin survived only by being probed before the check ran. The deadline now starts on entering `preparing`, wherever that happens — adoption, or a ready host whose engine blinks — through one `mark_preparing()`; two tests pin it. **A second thing I had told the owner was wrong:** the restart *did* interrupt traffic — `503 hosts_unreachable` — because rented hosts are reached through SSH tunnels the supervisor owns as child processes, so they die with it. Local and fixed hosts are unaffected; tunnelled ones are not. **And the console broke again**: an edit of mine ate a character (`const feed = () =>` → `const feed = () =`), which kills the whole script, and every Python test passed because nothing executed the page — the second syntax error to reach a live console in one day. There is now a test that loads the real page in Chrome and fails unless it runs to its last line; putting tonight's bug back proves it catches what the bracket check cannot. Lease actions (Tighten · **Extend** · Close) are now one shared control on both the overview and the Leases screen, driven end to end in a real browser: the retype gate holds OK disabled, nothing is sent until it is satisfied, and then exactly one request carrying `confirm`. 445 passing. |

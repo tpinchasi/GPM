@@ -131,7 +131,8 @@ async function drawHost() {
     return;
   }
   if (hostWatch.id !== id) return;  // closed or switched while we were asking
-  document.getElementById("host-dialog-body").replaceChildren(...hostPanel(detail));
+  // Filtered: replaceChildren turns a null argument into the text "null".
+  document.getElementById("host-dialog-body").replaceChildren(...hostPanel(detail).filter(Boolean));
 }
 
 function hostPanel(d) {
