@@ -9,7 +9,7 @@
 | Field | Meaning |
 |---|---|
 | `host_id` | Stable name within the pool |
-| `kind` | `local` / `fixed-remote` / `rented-interruptible` |
+| `kind` | `local` / `fixed-remote` / `rented-interruptible` / `rented-on-demand` |
 | `provider_ref` | The provider's own identifiers, for rented hosts (instance, machine, offer) |
 | `transport` | How it is reached: `tunnel`, `http` or `https` (§1.3), and the resulting URL and auth headers the router dials |
 | `capabilities` | What the host can run — a set of labels such as `apple-silicon`, `cuda`, `fp8` — and how each was learned (§4.2) |
@@ -347,7 +347,7 @@ Strict tiers. A lower tier is touched only when every eligible worker above it i
 |---|---|---|
 | 0 — first | `local` | Free, and treated as always up (still probed; an unreachable local engine is skipped, not fed) |
 | 10 | `fixed-remote` | Steady capacity that exists whether or not it is used |
-| 20 — last | `rented-interruptible` | Brought up and down on demand, and may vanish mid-run |
+| 20 — last | `rented-interruptible`, `rented-on-demand` | Brought up and down on demand, and may vanish mid-run |
 
 Per request:
 

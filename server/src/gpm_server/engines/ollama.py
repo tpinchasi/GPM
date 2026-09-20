@@ -55,6 +55,11 @@ class OllamaEngine:
             return False
         return bool(_decode(body).get("stream", True))
 
+    def keepalive_frame(self, path: str) -> Optional[bytes]:
+        """None: this engine answers in newline-delimited JSON, where every line a client
+        reads is a frame it will try to parse. There is no harmless one to send."""
+        return None
+
     async def health(self, client: httpx.AsyncClient) -> Health:
         try:
             response = await client.get("/api/version")

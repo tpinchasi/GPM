@@ -60,6 +60,18 @@ class Engine(Protocol):
     def is_streaming(self, path: str, body: bytes) -> bool:
         """True when the response will be streamed."""
 
+    def keepalive_frame(self, path: str) -> Optional[bytes]:
+        """A frame that is *harmless* in this engine's stream format, or None (D62).
+
+        While the pool holds a response until it is whole, it sends the client nothing, and an
+        intermediary with an idle timeout may cut the connection. An engine whose format has a
+        no-op frame — a comment line in server-sent events, say — declares it here and the pool
+        sends it meanwhile. An engine whose format has none declares nothing, and the pool
+        sends nothing: a frame a client might parse as content is worse than a dropped
+        connection. Newline-delimited JSON has no such frame, so the first engine returns None.
+        """
+        return None
+
     # --- probe path ---
 
     async def health(self, client: httpx.AsyncClient) -> Health:

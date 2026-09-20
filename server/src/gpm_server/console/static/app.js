@@ -232,7 +232,11 @@ screens.overview = (status) => {
   }
   for (const host of status.rented) {
     if (!tiers.has(20)) tiers.set(20, []);
-    tiers.get(20).push({ ...host, kind: "rented-interruptible", rented: true });
+    tiers.get(20).push({
+      ...host,
+      kind: host.interruptible === false ? "rented-on-demand" : "rented-interruptible",
+      rented: true,
+    });
   }
   // Rented hosts serve like any other once ready, so they count toward capacity. A host that
   // is not ready yet serves nothing, so neither do its workers.

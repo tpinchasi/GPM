@@ -45,6 +45,8 @@ class FakeOllama:
         #: Scripted: how many pulls are cut partway, with the connection dropped mid-body the
         #: way a real one was — and how many end quietly without the engine saying "success".
         self.pull_cut_times = 0
+        #: Scripted: how many generations are cut mid-stream, as a host taken away does it.
+        self.cut_stream_times = 0
         self.pull_end_early_times = 0
         self.pulls = 0
         #: Scripted: how long one generation takes, and whether the engine runs them one at a
@@ -259,8 +261,15 @@ class FakeOllama:
 
         async def body():
             self.started += 1
+            cut = self.cut_stream_times > 0
+            if cut:
+                self.cut_stream_times -= 1
             try:
-                for piece in pieces:
+                for index, piece in enumerate(pieces):
+                    if cut and index == 1:
+                        # What an interruptible host does when it is taken away: some frames,
+                        # then the connection dies with no ending frame.
+                        raise ConnectionResetError("fake: host taken away mid-generation")
                     if self.chunk_delay_s:
                         await asyncio.sleep(self.chunk_delay_s)
                     if generate:

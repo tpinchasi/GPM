@@ -1,8 +1,11 @@
 # S2 — Reliable responses from interruptible hosts
 
-> Status: **decided (D62), not built.** Part of the [feature list](README.md). The owner accepted
-> this story as written, with its recommended answers to the open questions; the specification
-> now carries it, and this page remains as the reasoning and the build plan.
+> Status: **built (D62)**, 2026-09-20. Part of the [feature list](README.md). Delivered as
+> planned, with one thing the plan had not seen: every rented host was published as
+> `rented-interruptible`, on-demand ones included, so the router could not tell the kinds apart.
+> On-demand rentals now publish as `rented-on-demand`. Stage 4's keep-alive frame is an engine
+> hook that the first engine declares as `None` — newline-delimited JSON has no harmless frame —
+> so nothing is sent and no untested machinery was built for it.
 
 ## The story
 
