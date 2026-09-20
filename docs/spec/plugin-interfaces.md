@@ -58,6 +58,11 @@ class Provider(Protocol):
 | `reported_charges` | What the provider says the instance has cost so far, or `None` if it cannot say |
 | Every operation | Bounded by a timeout; raises typed errors (`ProviderAuthError`, `ProviderRateLimited`, `ProviderUnavailable`, `OfferGone`, `BidLost`); never blocks indefinitely |
 
+**`self_terminate_request(action)`** returns the call one instance makes to end itself — method,
+URL, headers, optional body — never a command line (D71). Header values may name an environment
+variable the provider injects; the account credential never appears. The host decides how to make
+the call, because what a machine has to make it with is not the provider's business.
+
 **Optional in an instance's status: `startup_material`** — true, false, or unknown. A provider
 that can tell whether an instance still carries the start-up material it was created with says
 so, and the pool ends a host that lost it (D65). A provider that cannot leaves it unknown, and

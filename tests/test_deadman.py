@@ -5,6 +5,7 @@ short window against a local stand-in for the provider's API, so "it fires when 
 silent, and does not while work is happening" is checked rather than assumed.
 """
 
+import json
 import re
 import subprocess
 import threading
@@ -18,7 +19,8 @@ from gpm_server.config import PoolConfig
 from gpm_server.db import Database
 from gpm_server.deadman import build_script, heartbeat_command, onstart_script
 from gpm_server.ledger import EventLog, LeaseStore, SpendLedger
-from gpm_server.providers import FakeProvider, ProviderCapabilities
+from gpm_server.providers import FakeProvider
+from gpm_server.providers.base import ProviderCapabilities, SelfTerminateRequest
 from gpm_server.supervisor.renting import Fleet
 
 
@@ -68,13 +70,22 @@ def run_timer(script_path: Path, seconds: float) -> subprocess.Popen:
     return process
 
 
+def _request(url: str, method: str = "DELETE"):
+    """What a provider hands the timer: the call, never a command line (D71)."""
+    return SelfTerminateRequest(
+        method=method,
+        url=url,
+        headers={"Authorization": "Bearer $CONTAINER_API_KEY"},
+    )
+
+
 # --- what the script says ---
 
 
 def test_the_timer_carries_only_the_instance_scoped_credential():
     """Threat model T5: the account credential is never placed on a rented machine."""
     provider = FakeProvider()
-    script = onstart_script(provider.self_terminate_command(), window_s=1200)
+    script = onstart_script(provider.self_terminate_request(), window_s=1200)
 
     referenced = set(re.findall(r"\$\{?([A-Z][A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD))", script))
     assert referenced == {"CONTAINER_API_KEY"}  # the provider's per-instance key, and nothing else
@@ -82,19 +93,19 @@ def test_the_timer_carries_only_the_instance_scoped_credential():
 
 
 def test_both_conditions_are_required():
-    script = build_script("true", window_s=1200)
+    script = build_script(_request("http://127.0.0.1:9/x"), window_s=1200)
     assert '"$SINCE_HEARTBEAT" -ge "$WINDOW" ] && [ "$SINCE_ACTIVITY" -ge "$WINDOW"' in script
 
 
 def test_the_timer_is_armed_before_anything_else_in_the_start_up():
-    script = onstart_script("true", window_s=60, extra="start-the-engine")
+    script = onstart_script(_request("http://127.0.0.1:9/x"), window_s=60, extra="start-the-engine")
     assert script.index("deadman.sh") < script.index("start-the-engine")
 
 
 def test_the_pools_public_key_is_installed_after_the_timer_is_armed():
     """So the supervisor can reach a host whatever keys the account has registered."""
     key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyMaterialOnly pool"
-    script = onstart_script("true", window_s=60, public_key=key, extra="start-the-engine")
+    script = onstart_script(_request("http://127.0.0.1:9/x"), window_s=60, public_key=key, extra="start-the-engine")
     assert script.index("deadman.sh") < script.index("authorized_keys") < script.index("start-the-engine")
     assert key in script
     assert "chmod 600" in script  # sshd refuses a world-readable authorized_keys
@@ -132,8 +143,7 @@ def test_it_fires_when_the_pool_goes_silent(tmp_path, endpoint, monkeypatch):
     """No heartbeat and no inference for the window: the instance ends itself."""
     state = tmp_path / "state"
     script = build_script(
-        f'curl -sS -X POST -H "Authorization: Bearer $CONTAINER_API_KEY" '
-        f'"{endpoint.url}?instance=$CONTAINER_ID"',
+        _request(f"{endpoint.url}?instance=$CONTAINER_ID", method="POST"),
         window_s=1,
         poll_s=1,
         engine_port=unused_port(),
@@ -159,7 +169,7 @@ def test_it_fires_when_the_pool_goes_silent(tmp_path, endpoint, monkeypatch):
 def test_inference_is_detected_from_the_raw_tcp_table_without_ss_or_netstat():
     """Seen live: the engine image ships neither `ss` nor `netstat`. /proc/net/tcp always
     exists on Linux, so the awk match on it is what actually keeps a busy host alive."""
-    script = build_script("true", window_s=60)
+    script = build_script(_request("http://127.0.0.1:9/x"), window_s=60)
     assert "/proc/net/tcp" in script
     assert "printf '%04X'" in script  # 11434 -> 2CAA, as the kernel prints it
     # The awk program: established (01) and the local port suffix matches.
@@ -179,9 +189,7 @@ def test_inference_is_detected_from_the_raw_tcp_table_without_ss_or_netstat():
 
 def test_it_stays_quiet_while_the_supervisor_is_beating(tmp_path, endpoint):
     state = tmp_path / "state"
-    script = build_script(
-        f'curl -sS -X POST "{endpoint.url}"',
-        window_s=3,
+    script = build_script(_request(endpoint.url, method="POST"), window_s=3,
         poll_s=1,
         engine_port=unused_port(),
         state_dir=str(state),
@@ -289,3 +297,37 @@ async def test_a_heartbeat_that_cannot_be_delivered_does_not_stop_the_pass(tmp_p
         assert len(fleet.hosts) == 1
     finally:
         database.close()
+
+
+# --- the timer must be able to make its call (D71) ---
+
+
+def test_the_timer_does_not_depend_on_any_one_http_client():
+    """Found by inspecting the engine image: it carries neither curl nor wget, so a timer that
+    shells out to curl is armed, looks healthy, and fails at the only moment it matters."""
+    script = build_script(_request("https://provider.example/instances/$CONTAINER_ID/"), window_s=60)
+
+    assert "command -v curl" in script
+    assert "command -v wget" in script
+    assert "command -v python3" in script
+    # And when the machine has none of them, it still stops billing for the accelerator.
+    assert "kill -TERM 1" in script
+
+
+def test_the_call_travels_as_data_not_as_a_command_line():
+    """A URL or header is written as JSON and read back when the timer fires, so nothing about
+    the request can turn into shell."""
+    script = build_script(
+        _request("https://provider.example/instances/$CONTAINER_ID/; rm -rf /"), window_s=60
+    )
+    written = re.search(r"<<'GPM_REQUEST_EOF'\n(.*?)\nGPM_REQUEST_EOF", script, re.S)
+    assert written is not None, "the request should be written as data"
+    payload = json.loads(written.group(1))
+    assert payload["url"].endswith("; rm -rf /")  # carried whole, as a JSON string
+    assert payload["headers"]["Authorization"] == "Bearer $CONTAINER_API_KEY"
+
+
+def test_the_script_is_valid_shell_for_a_plain_posix_sh():
+    script = build_script(_request("https://provider.example/x"), window_s=60)
+    checked = subprocess.run(["sh", "-n"], input=script, text=True, capture_output=True)
+    assert checked.returncode == 0, checked.stderr

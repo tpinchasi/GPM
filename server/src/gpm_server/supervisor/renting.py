@@ -372,7 +372,7 @@ class Fleet:
         if not self.provider.capabilities.self_terminate:
             return None
         return onstart_script(
-            self.provider.self_terminate_command(self.rented.teardown.deadman_action),
+            self.provider.self_terminate_request(self.rented.teardown.deadman_action),
             window_s=int(self.rented.teardown.deadman_minutes * 60),
             engine_port=self.rented.engine_port,
             public_key=self.pool_public_key(),

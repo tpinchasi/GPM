@@ -30,7 +30,7 @@ def source_of(module) -> str:
 def test_nothing_a_host_receives_can_carry_the_account_credential(provider):
     """Everything the pool writes onto an instance, scanned for anything secret-shaped."""
     onstart = deadman.onstart_script(
-        provider.self_terminate_command("destroy"),
+        provider.self_terminate_request("destroy"),
         window_s=1200,
         public_key="ssh-ed25519 AAAAPublicHalfOnly pool",
     )

@@ -327,17 +327,18 @@ async def test_the_account_credential_is_never_read_from_configuration(monkeypat
 # --- what goes on the host ---
 
 
-def test_the_self_terminate_command_uses_only_the_instance_scoped_key():
-    command = VastProvider().self_terminate_command("destroy")
-    assert "$CONTAINER_API_KEY" in command
-    assert "$CONTAINER_ID" in command
-    assert "VAST_API_KEY" not in command
-    assert command.startswith("curl -sS -X DELETE")
+def test_the_self_terminate_request_uses_only_the_instance_scoped_key():
+    request = VastProvider().self_terminate_request("destroy")
+    assert request.method == "DELETE"
+    assert request.headers["Authorization"] == "Bearer $CONTAINER_API_KEY"
+    assert "$CONTAINER_ID" in request.url
+    assert "VAST_API_KEY" not in str(request)
 
 
 def test_stopping_instead_of_destroying_is_available():
-    command = VastProvider().self_terminate_command("stop")
-    assert '"state": "stopped"' in command
+    request = VastProvider().self_terminate_request("stop")
+    assert request.method == "PUT"
+    assert request.body is not None and '"state": "stopped"' in request.body
 
 
 # --- one fetch per instance per pass ---

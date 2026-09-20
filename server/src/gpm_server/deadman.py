@@ -14,7 +14,10 @@ The credential is the provider's **instance-scoped** one, which can only act on 
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:  # a type only, so the timer keeps no import of the provider package
+    from .providers.base import SelfTerminateRequest
 
 #: Where the timer keeps its two timestamps on the host.
 STATE_DIR = "/var/run/gpm"
@@ -22,6 +25,7 @@ STATE_DIR = "/var/run/gpm"
 _SCRIPT = """#!/bin/sh
 # GPM dead-man timer. Ends this instance if the pool goes silent.
 # It carries no account credential: {fire_note}
+# The call it makes is the provider's; how it makes it depends on what this machine has.
 set -u
 STATE_DIR="${{GPM_STATE_DIR:-{state_dir}}}"
 WINDOW="${{GPM_DEADMAN_SECONDS:-{window_s}}}"
@@ -29,6 +33,40 @@ POLL="${{GPM_DEADMAN_POLL_SECONDS:-{poll_s}}}"
 PORT="${{GPM_ENGINE_PORT:-{engine_port}}}"
 
 mkdir -p "$STATE_DIR"
+
+# The call this instance makes to end itself, as data rather than as a command line.
+cat > "$STATE_DIR/terminate.json" <<'GPM_REQUEST_EOF'
+{request_json}
+GPM_REQUEST_EOF
+
+# How this machine can make an HTTPS call. Resolved *now*, while the pool is watching, rather
+# than in twenty minutes when nothing is left to tell (D71): the first engine image carries
+# neither curl nor wget, and a timer that cannot call the provider is no timer at all.
+if command -v curl >/dev/null 2>&1; then HTTP_CLIENT=curl
+elif command -v wget >/dev/null 2>&1; then HTTP_CLIENT=wget
+elif command -v python3 >/dev/null 2>&1; then HTTP_CLIENT=python3
+else
+    # Last resort, and only at arm time: one package, quietly, best effort.
+    (apt-get update -qq && apt-get install -y -qq curl) >/dev/null 2>&1 || true
+    if command -v curl >/dev/null 2>&1; then HTTP_CLIENT=curl; else HTTP_CLIENT=none; fi
+fi
+echo "$HTTP_CLIENT" > "$STATE_DIR/http_client"
+[ "$HTTP_CLIENT" = none ] && echo "gpm: no http client on this machine; the timer will stop \
+the container instead of ending the instance" >&2
+
+fire() {{
+    case "$HTTP_CLIENT" in
+    curl)    {curl_call} ;;
+    wget)    {wget_call} ;;
+    python3) {python_call} ;;
+    *)
+        # It cannot reach the provider, so it does the one thing it can: stop the container.
+        # Billing for the accelerator ends, the instance shows as stopped, and a pool that is
+        # alive destroys it on its next pass.
+        kill -TERM 1 2>/dev/null || halt -f 2>/dev/null || true ;;
+    esac
+}}
+
 HEARTBEAT="$STATE_DIR/heartbeat"
 ACTIVITY="$STATE_DIR/activity"
 touch "$HEARTBEAT" "$ACTIVITY"
@@ -62,25 +100,79 @@ while true; do
     if [ "$SINCE_HEARTBEAT" -ge "$WINDOW" ] && [ "$SINCE_ACTIVITY" -ge "$WINDOW" ]; then
         echo "gpm: no supervisor for ${{SINCE_HEARTBEAT}}s and no inference for \
 ${{SINCE_ACTIVITY}}s; ending this instance" >&2
-        {fire_command}
+        fire
         exit 0
     fi
 done
 """
 
 
+def _shell_quote(value: str) -> str:
+    """Single-quoted for `sh`, with any quote of its own closed and reopened."""
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def _calls(request: "SelfTerminateRequest", state_dir: str) -> dict[str, str]:
+    """One provider request, in each client the host might have.
+
+    The request itself travels as **data**: written to a file at arm time and read back when
+    the timer fires. Nothing is interpolated into a command line, so a URL or a header value
+    can hold anything without becoming shell. Header values may name an environment variable
+    the provider injected, which each form expands on the host.
+    """
+    import json
+
+    headers = dict(request.headers)
+    curl = ["curl -sS -X " + request.method]
+    wget = ["wget -q -O - --method=" + request.method]
+    for key, value in headers.items():
+        curl.append(f'-H "{key}: {value}"')
+        wget.append(f'--header="{key}: {value}"')
+    if request.body:
+        curl.append("-d " + _shell_quote(request.body))
+        wget.append("--body-data=" + _shell_quote(request.body))
+    curl.append(f'"{request.url}"')
+    wget.append(f'"{request.url}"')
+
+    program = (
+        "import json, os, urllib.request\n"
+        f'd = json.load(open("{state_dir}/terminate.json"))\n'
+        "h = {k: os.path.expandvars(v) for k, v in d[\"headers\"].items()}\n"
+        "b = d.get(\"body\")\n"
+        "r = urllib.request.Request(os.path.expandvars(d[\"url\"]), method=d[\"method\"],\n"
+        "                           headers=h, data=b.encode() if b else None)\n"
+        "try:\n"
+        "    urllib.request.urlopen(r, timeout=30).read()\n"
+        "except Exception as exc:\n"
+        "    print(\"gpm: self-terminate failed:\", exc)\n"
+    )
+    return {
+        "curl_call": " ".join(curl),
+        "wget_call": " ".join(wget),
+        "python_call": "python3 -c " + _shell_quote(program),
+        "request_json": json.dumps(
+            {
+                "method": request.method,
+                "url": request.url,
+                "headers": headers,
+                "body": request.body,
+            }
+        ),
+    }
+
+
 def build_script(
-    fire_command: str,
+    request: "SelfTerminateRequest",
     *,
     window_s: int,
     poll_s: int = 30,
     engine_port: int = 11434,
     state_dir: str = STATE_DIR,
 ) -> str:
-    """The on-host loop. `fire_command` comes from the provider — only it knows how one of its
-    instances ends itself, and with which instance-scoped credential."""
+    """The on-host loop. The request comes from the provider — only it knows how one of its
+    instances ends itself, and with which instance-scoped credential (D71)."""
     return _SCRIPT.format(
-        fire_command=fire_command,
+        **_calls(request, state_dir),
         fire_note="it uses the provider's instance-scoped credential.",
         window_s=int(window_s),
         poll_s=int(poll_s),
@@ -110,7 +202,7 @@ def install_public_key_command(public_key: str, ssh_user: str = "root") -> str:
 
 
 def onstart_script(
-    fire_command: str,
+    request: "SelfTerminateRequest",
     *,
     window_s: int,
     engine_port: int = 11434,
@@ -127,7 +219,7 @@ def onstart_script(
     supervisor can reach the host to heartbeat the timer and forward the engine.
     """
     script = build_script(
-        fire_command, window_s=window_s, poll_s=poll_s, engine_port=engine_port, state_dir=state_dir
+        request, window_s=window_s, poll_s=poll_s, engine_port=engine_port, state_dir=state_dir
     )
     lines = [
         "mkdir -p " + state_dir,

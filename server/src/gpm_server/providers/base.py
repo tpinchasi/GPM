@@ -118,6 +118,26 @@ class InstanceState(str):
 
 
 @dataclasses.dataclass(frozen=True)
+class SelfTerminateRequest:
+    """How one instance ends itself: the call, not a command line (D71).
+
+    The provider says *what* to ask for; the host's script decides *how* to ask, with whatever
+    HTTP client that machine turns out to have. A command line naming one client is a
+    dependency on a binary the engine image may not carry — the first one carries neither curl
+    nor wget.
+
+    A header value may name an environment variable the provider injects
+    (`$CONTAINER_API_KEY`), expanded on the host. The account credential never appears here
+    (threat model T5).
+    """
+
+    method: str
+    url: str
+    headers: dict[str, str] = dataclasses.field(default_factory=dict)
+    body: Optional[str] = None
+
+
+@dataclasses.dataclass(frozen=True)
 class InstanceStatus:
     state: str
     #: True when the provider stopped it — outbid — rather than the pool asking for it.
@@ -204,12 +224,13 @@ class Provider(Protocol):
 
     async def account(self) -> AccountStatus: ...
 
-    def self_terminate_command(self, action: str = "destroy") -> str:
-        """A shell command an instance runs to end **itself**, using the provider's
-        instance-scoped credential as the instance already holds it.
+    def self_terminate_request(self, action: str = "destroy") -> SelfTerminateRequest:
+        """The call an instance makes to end **itself**, with the provider's instance-scoped
+        credential as the instance already holds it (D71).
 
-        Only meaningful where `capabilities.self_terminate` is set. It must never embed the
-        account credential: this string is written to a file on a machine the pool does not
+        A request, not a command line: the host script picks a client that exists on that
+        machine. Only meaningful where `capabilities.self_terminate` is set. It must never
+        embed the account credential — this is written to a file on a machine the pool does not
         trust (threat model T5).
         """
 

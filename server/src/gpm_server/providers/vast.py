@@ -36,6 +36,7 @@ from .base import (
     ProviderCapabilities,
     ProviderRateLimited,
     ProviderUnavailable,
+    SelfTerminateRequest,
 )
 
 log = logging.getLogger("gpm.vast")
@@ -452,12 +453,14 @@ class VastProvider:
             credit_remaining=float(payload["credit"]) if payload.get("credit") is not None else None,
         )
 
-    def self_terminate_command(self, action: str = "destroy") -> str:
-        """Run *on the instance*, with the key the provider put there — never the account key."""
-        method = "DELETE" if action == "destroy" else "PUT"
-        body = "" if action == "destroy" else " -d '{\"state\": \"stopped\"}'"
-        return (
-            f'curl -sS -X {method} -H "Authorization: Bearer $CONTAINER_API_KEY" '
-            f'-H "Content-Type: application/json"{body} '
-            f'"{self.base_url}/api/v0/instances/$CONTAINER_ID/"'
+    def self_terminate_request(self, action: str = "destroy") -> SelfTerminateRequest:
+        """Made *on the instance*, with the key the provider put there — never the account key."""
+        return SelfTerminateRequest(
+            method="DELETE" if action == "destroy" else "PUT",
+            url=f"{self.base_url}/api/v0/instances/$CONTAINER_ID/",
+            headers={
+                "Authorization": "Bearer $CONTAINER_API_KEY",
+                "Content-Type": "application/json",
+            },
+            body=None if action == "destroy" else '{"state": "stopped"}',
         )
