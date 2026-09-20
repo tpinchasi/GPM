@@ -503,6 +503,12 @@ class Supervisor:
                 )
                 self._rented_clients[host_id] = client
 
+            if host.agent is None:
+                # Once SSH answers there is a host to work with; the install is never allowed
+                # to fail the preparation, and the download carries on regardless (D63).
+                await self.fleet.install_agent(host)
+            await self.fleet.ask_agent(host)
+
             health = await self.engine.health(client)
             if not health.ok:
                 host.mark_preparing()

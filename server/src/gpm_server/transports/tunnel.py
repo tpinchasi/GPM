@@ -97,12 +97,17 @@ def build_ssh_exec_command(
     return base
 
 
-async def run_command(command: Command, timeout: float = 20.0) -> tuple[int, str]:
+async def run_command(
+    command: Command, timeout: float = 20.0, stdin: Optional[bytes] = None
+) -> tuple[int, str]:
     process = await asyncio.create_subprocess_exec(
-        *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        *command,
+        stdin=asyncio.subprocess.PIPE if stdin is not None else None,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
     )
     try:
-        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        stdout, _ = await asyncio.wait_for(process.communicate(input=stdin), timeout=timeout)
     except asyncio.TimeoutError:
         process.kill()
         await process.wait()

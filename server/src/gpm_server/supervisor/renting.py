@@ -15,8 +15,10 @@ import dataclasses
 import logging
 import time
 import uuid
+from pathlib import Path
 from typing import Mapping, Optional
 
+from .. import agentpkg
 from ..config import BiddingConfig, OfferPolicy, PoolConfig, RentedConfig, TransportConfig
 from ..deadman import heartbeat_command, onstart_script
 from ..engines import get_engine
@@ -47,6 +49,7 @@ from ..strategies import (
     rank_offers,
 )
 from ..transports import SshTunnel, build_ssh_exec_command, run_command
+from . import agents, hostagent
 
 log = logging.getLogger("gpm.renting")
 
@@ -71,6 +74,11 @@ class RentedHost:
     connection: Optional[ConnectionInfo] = None
     ready_at: Optional[float] = None
     parked_at: Optional[float] = None
+    #: The agent the pool installed here, if any, and what it reported. A host without one is
+    #: prepared the way it always was (D63).
+    agent: Optional[hostagent.RentedAgent] = None
+    agent_facts: Optional[dict] = None
+    agent_detail: Optional[str] = None
     #: When this host was parked for having no traffic, the moment its idleness began — so the
     #: destroy limit is counted from its last request, not from the park (D64).
     idle_since: Optional[float] = None
@@ -155,7 +163,14 @@ class Fleet:
         self.charges_ever_reported = False
         #: How a command is run on a rented host. Substituted in tests; ssh otherwise.
         self.run_on_host = self._ssh_run
+        self.push_to_host = self._ssh_push
+        #: Where the packed agent is kept between installs, beside the pool's own state.
+        self.state_dir = Path(config.request_log).expanduser().resolve().parent
+        #: Tests dial the agent through their own transport; nothing else sets this.
+        self._agent_transport = None
         self.engine = get_engine(config.engine)
+        #: A second forward per host, to the agent on its loopback (D63).
+        self.agent_tunnels: dict[str, SshTunnel] = {}
         #: Forwards to rented hosts the provider cannot expose directly, keyed by host id.
         self.tunnels: dict[str, SshTunnel] = {}
         #: Machines that just failed to start or to download, and until when they are skipped.
@@ -466,7 +481,28 @@ class Fleet:
         await tunnel.start(wait_s=1.0)
         return tunnel.local_url
 
+    async def _open_agent_tunnel(self, host_id: str, connection: ConnectionInfo, port: int) -> Optional[str]:
+        """The second forward: the agent listens on the host's loopback and nothing else."""
+        if not connection.ssh_host:
+            return None
+        transport = TransportConfig(
+            type="tunnel",
+            ssh_host=connection.ssh_host,
+            ssh_port=connection.ssh_port or 22,
+            ssh_user=connection.ssh_user or self.rented.ssh_user,
+            ssh_key=self.rented.ssh_key,
+            remote_port=port,
+            known_hosts=self.rented.known_hosts,
+        )
+        tunnel = SshTunnel(f"{host_id}/agent", transport)
+        self.agent_tunnels[host_id] = tunnel
+        await tunnel.start(wait_s=1.0)
+        return tunnel.local_url
+
     async def close_tunnel(self, host_id: str) -> None:
+        agent_tunnel = self.agent_tunnels.pop(host_id, None)
+        if agent_tunnel is not None:
+            await agent_tunnel.stop()
         tunnel = self.tunnels.pop(host_id, None)
         if tunnel is not None:
             await tunnel.stop()
@@ -485,6 +521,81 @@ class Fleet:
                 command=command,
             )
         )
+
+    async def _ssh_push(self, host: RentedHost, data: bytes, path: str) -> tuple[int, str]:
+        """Copy one file to a rented host over the connection the pool already has."""
+        connection = host.connection
+        if connection is None or not connection.ssh_host:
+            return 1, "no ssh connection for this host"
+        return await run_command(
+            build_ssh_exec_command(
+                ssh_host=connection.ssh_host,
+                ssh_port=connection.ssh_port or 22,
+                ssh_user=connection.ssh_user,
+                ssh_key=self.rented.ssh_key,
+                known_hosts=self.rented.known_hosts,
+                command=hostagent.push_command(path),
+            ),
+            timeout=120.0,
+            stdin=data,
+        )
+
+    async def install_agent(self, host: RentedHost) -> None:
+        """Put the agent on a host once its SSH answers. Never fatal (D63)."""
+        if host.agent is not None or not self.rented.agent_on_rented_hosts:
+            return
+        archive = agentpkg.cached(self.state_dir)
+        if archive is None:
+            host.agent_detail = "the agent could not be packed on the pool's machine"
+            return
+        try:
+            key = await hostagent.install(
+                run=lambda command: self.run_on_host(host, command),
+                push=lambda data, path: self.push_to_host(host, data, path),
+                archive=archive,
+                engine_port=self.rented.engine_port,
+            )
+        except hostagent.AgentInstallFailed as exc:
+            host.agent_detail = str(exc)
+            self.events.record(
+                "agent_not_installed",
+                f"{host.host_id} is preparing without an agent: {exc}",
+                host_id=host.host_id,
+                lease_id=host.lease_id,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 - an agent is never worth failing a host for
+            host.agent_detail = f"installing the agent failed: {exc}"
+            log.warning("installing the agent on %s failed: %s", host.host_id, exc)
+            return
+
+        url = None
+        if host.connection is not None:
+            url = await self._open_agent_tunnel(host.host_id, host.connection, hostagent.AGENT_PORT)
+        if url is None:
+            host.agent_detail = "the agent is installed but no forward to it could be opened"
+            return
+        host.agent = hostagent.RentedAgent(url=url, secret=key)
+        host.agent_detail = None
+        self.events.record(
+            "agent_installed",
+            f"{host.host_id} runs the pool's agent, reached on its own forward",
+            numbers={"digest": agentpkg.digest(archive)},
+            host_id=host.host_id,
+            lease_id=host.lease_id,
+        )
+
+    async def ask_agent(self, host: RentedHost) -> None:
+        """What the machine says about itself — load, accelerator, memory (D63)."""
+        if host.agent is None:
+            return
+        view = await agents.ask(host.agent, transport=self._agent_transport)
+        if view.ok:
+            host.agent_facts = view.facts
+            host.agent_detail = None
+        else:
+            host.agent_facts = None
+            host.agent_detail = view.detail
 
     # --- what would happen (spec §3) ---
 
