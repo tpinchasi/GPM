@@ -1,9 +1,9 @@
 # S3 — An advisor model that picks the machine
 
-> Status: **partly decided (D69), not built.** Part of the [feature list](README.md). Decided: the
-> machine history comes first and is judged on its own; the advisor may decline every offer, inside
-> bounds; and an evaluation suite gates it. **Still open: how the advisor reaches a model** — the
-> owner's answer, "via tool", needs one clarification (see the end of this page).
+> Status: **decided (D69, D70), not built.** Part of the [feature list](README.md). The machine
+> history comes first and is judged on its own; the advisor answers by calling tools from a closed
+> list, may decline within bounds, and is gated by an evaluation suite. The specification carries
+> the decisions; this page remains as the reasoning and the build plan.
 
 ## The story
 
@@ -66,9 +66,9 @@ offers ─► hard filters ─► rule ranking ─► top N ─► ADVISOR ─�
                                   machine history ───┘
 ```
 
-- **Input:** the top *N* ranked offers with the numbers the rules used, and the history rows for
-  those machines. Nothing about requests, prompts, apps or keys.
-- **Output:** structured and schema-checked — `{offer_id, reasons[]}`. An id not in the list, a
+- **Input:** nothing is pushed at it. It calls `list_offers` and `machine_history` for what it
+  wants (D70). No tool exposes requests, prompts, apps or keys.
+- **Output:** a `choose` or `decline` call. An id not in the list, a
   malformed answer, a timeout, or an unreachable endpoint all mean the same thing: **the rule
   ranking's first choice is used**, and the log says the advisor was not heard.
 - **After it answers**, the bid strategy prices the offer and the supervisor re-checks every cap
@@ -106,7 +106,7 @@ it has been shown to be worth having, on the record the pool already holds:
 | **Replay** — each recorded renting decision is put to the advisor again, with the history as it stood *then* | Would it have chosen differently from the rules? |
 | **Hindsight score** — each choice is judged by what happened to that machine: reached ready or not, time to ready, how long it lasted, measured cost per request | Were its different choices *better*? |
 | **Decline audit** — for every "wait", what the market offered over the following minutes | Was waiting right, or did it just delay the same rental? |
-| **Robustness** — malformed answers, unknown ids, prompt-injection text planted in an offer's free-text fields | Does every bad answer fall back to the rules? |
+| **Robustness** — unknown tools, ids outside the list, loops that never end in `choose` or `decline`, prompt-injection text planted in an offer's free-text fields | Does every bad exchange fall back to the rules? |
 
 The baseline is the history-fed deterministic score, not the bare rules — the advisor has to beat
 the simpler mechanism, or it is not worth its non-determinism. The harness and its scoring run
@@ -122,6 +122,7 @@ rented:
     key_env: GPM_ADVISOR_KEY
     model: <a small model from the catalog>
     consider_top: 8
+    max_tool_calls: 12                  # the exchange is bounded, then the rules choose
     timeout_s: 20
     max_declines: 3                     # "none of these" in a row, then the rules choose
     max_wait_s: 900
@@ -139,31 +140,41 @@ rented:
 ## Decisions this story needs
 
 1. A machine-history table, and its use in the deterministic score.
-2. The advisor stage: its place in the pipeline, its closed input and output, its fallback.
+2. The advisor stage: its place in the pipeline, its closed tool list and its fallback.
    **Amends plugin-interfaces §3** by naming a non-pure stage and bounding it.
 3. How the supervisor reaches a model without breaking the router/supervisor separation.
 
 ## The owner's answers
 
 1. **History alone first?** Yes. Built, run and judged before any model is involved (D69).
-2. **How does the advisor reach a model?** "Via tool" — **to be clarified**, see below.
+2. **How is the advisor asked?** By tool call — a closed list of four (D70), below.
 3. **May it decline every offer?** It can happen, inside bounds — and good evaluations must
    validate its responses before it is trusted (D69).
 
-## Still open: what "via tool" means
+## How the advisor is asked: tool calls (D70)
 
-Two readings, and they are different designs:
+The model is not handed a prompt containing every offer and every history row. It is given four
+tools and answers by calling them:
 
-- **(a) The advisor works through tool calls.** Instead of being handed everything in one prompt,
-  the model is given a closed set of tools — look up a machine's history, list the accepted
-  offers, `choose(offer_id, reasons)`, `decline(reasons)` — and answers by calling them. The
-  closed tool list plays the same part as the agent's closed verb list: the model can only do
-  what a tool permits, and `choose` accepts only an id from the accepted list.
-- **(b) The advisor is a separate tool beside the pool** — its own small program that uses the
-  pool like any other app to reach a model, rather than the supervisor calling a model itself.
+| Tool | Returns / does |
+|---|---|
+| `list_offers()` | The offers the hard filters already accepted, with the numbers the rules used |
+| `machine_history(machine_id)` | That machine's record: rentals, time to ready, evictions, failures, measured cost per request |
+| `choose(offer_id, reasons)` | Ends the exchange on one of the listed offers |
+| `decline(reasons)` | Ends it with "none of these — wait", inside the bounds above |
 
-Reading (a) says how the model is *used*; reading (b) says where it *runs*. They can also both
-be true.
+**The closed list is the security property**, exactly as it is for the host agent's verbs (D40).
+No tool spends, reveals a credential, or touches request content, and `choose` accepts only an id
+that `list_offers` returned — so the advisor still cannot widen what the filters accepted. The
+loop is bounded by `max_tool_calls` and the stage timeout; an unknown tool, an out-of-list id, or
+a run that never ends in `choose` or `decline` all land on D69's fallback: the rule ranking's
+first choice, logged as the advisor not being heard.
+
+The sequence of calls is stored as the decision's explanation, so the Decisions screen shows what
+the advisor actually consulted rather than a paragraph written after the fact.
+
+An endpoint whose model cannot call tools is refused at configuration load, with the reason. The
+advisor stays off rather than quietly becoming a single-prompt stage.
 
 ## Build stages
 
@@ -173,14 +184,15 @@ be true.
 2. History in the deterministic score; the preview shows the adjustment and its reason.
 3. The evaluation harness: replay, hindsight score, decline audit, robustness — with a fake
    advisor, against the recorded rentals.
-4. The advisor stage itself; fallback paths; bounded declining; decision log.
+4. The advisor stage itself: the four tools, bounded loop, fallback paths, bounded declining,
+   the call transcript in the decision log.
 5. A real model, scored by the harness; switched on for spending only if it beats stage 2.
 
 ## Tests
 
-A fake advisor that answers well, answers with an unknown id, answers garbage, hangs, or is
-unreachable: the first picks its offer, the rest fall back, none bypasses a cap. No model and no
-GPU is needed by any test.
+A fake advisor that calls the tools well, calls an unknown one, `choose`s an id the filters
+rejected, never terminates, hangs, or is unreachable: the first picks its offer, the rest fall
+back, none bypasses a cap. No model and no GPU is needed by any test.
 
 ## Depends on
 
