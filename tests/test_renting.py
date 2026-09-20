@@ -411,6 +411,7 @@ async def test_a_host_that_never_becomes_ready_is_given_up_on(fleet):
     await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
     host = next(iter(fleet.hosts.values()))
 
+    host.engine_seen_at = time.time()  # it started — so this is "never got ready", not "stuck"
     host.created_at -= 31 * 60
     host.preparing_since -= 31 * 60  # it has been *preparing* that long, not merely existing
     await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
@@ -582,3 +583,69 @@ def test_the_router_stops_choosing_a_host_that_is_draining():
     assert HostState.DRAINING is not HostState.READY
     source = __import__("inspect").getsource(Dispatcher.eligible)
     assert "HostState.READY" in source
+
+
+# --- watching a rented host while it comes up (D54) ---
+
+
+async def test_a_host_stuck_before_it_ever_starts_is_given_up_early(fleet):
+    """Seen live: a host sat at "scheduling" while billing, until the owner released it by
+    hand. The 30-minute preparing window is for downloads; a host that has not even started
+    is judged against a much shorter one."""
+    fleet.rented.teardown.max_starting_minutes = 10
+    open_lease(fleet, workers=2)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    host = next(iter(fleet.hosts.values()))
+    machine = host.offer.machine_id
+    assert host.engine_seen_at is None
+
+    host.preparing_since -= 11 * 60
+    fleet.leases.close(host.lease_id, "test: stop it renting again")
+    await fleet.tear_down([], {}, 0)
+
+    assert host.released
+    seen = kinds(fleet)
+    assert "host_stuck_starting" in seen and "machine_avoided" in seen
+    assert machine in fleet.avoided_now()
+
+
+async def test_a_host_whose_engine_has_answered_is_not_called_stuck(fleet):
+    fleet.rented.teardown.max_starting_minutes = 10
+    open_lease(fleet, workers=2)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    host = next(iter(fleet.hosts.values()))
+    host.engine_seen_at = time.time()  # started; now downloading, which takes as long as it takes
+    host.preparing_since -= 11 * 60
+
+    await fleet.tear_down(fleet.leases.open_leases(), {}, 0)
+    assert not host.released
+
+
+async def test_a_machine_that_just_failed_is_not_bid_on_again(fleet):
+    """Seen live: the best-ranked offer was the machine that had just failed, four times."""
+    fleet.provider.offers = [
+        default_offer(offer_id="o-1", machine_id="bad", min_bid_hourly=0.10),   # ranks first
+        default_offer(offer_id="o-2", machine_id="good", min_bid_hourly=0.30),
+    ]
+    fleet.avoid("bad", "could not download m1")
+    open_lease(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+
+    (host,) = fleet.hosts.values()
+    assert host.offer.machine_id == "good"
+    preview = await fleet.market_preview(hours=1)
+    assert preview["avoided"] == {"bad": "could not download m1"}
+    assert any("avoid" in reason for reason in preview["rejected_by_reason"])
+
+
+async def test_an_avoided_machine_comes_back_when_its_time_is_up(fleet):
+    fleet.avoid("m-1", "never started")
+    assert "m-1" in fleet.avoided_now()
+    fleet.avoided["m-1"] = (time.time() - 1, "never started")
+    assert fleet.avoided_now() == {}
+
+
+async def test_avoiding_can_be_switched_off(fleet):
+    fleet.rented.teardown.avoid_failed_machine_minutes = 0
+    fleet.avoid("m-1", "never started")
+    assert fleet.avoided_now() == {}

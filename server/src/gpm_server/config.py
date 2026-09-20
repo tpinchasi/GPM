@@ -394,6 +394,17 @@ class TeardownConfig(BaseModel):
     #: The longest lease allowed on a provider with no instance-scoped credential, where
     #: nothing on the host can stop it billing.
     max_hours_without_deadman: float = 1.0
+    #: A host whose engine has still never answered after this is given up: the provider is
+    #: stuck scheduling or starting it, and it has been billing all the while. Much shorter
+    #: than `max_preparing_minutes`, which has to allow for downloading the model set.
+    max_starting_minutes: float = Field(default=10.0, gt=0)
+    #: A model download slower than this, sustained for `slow_pull_grace_s`, gives the host up
+    #: — the offer's advertised speed was not what the machine delivers. 0 switches it off.
+    min_pull_mbps: float = Field(default=50.0, ge=0)
+    slow_pull_grace_s: float = Field(default=120.0, ge=0)
+    #: A machine that failed to start or to download is not bid on again for this long, or the
+    #: best-ranked offer — the same machine — is simply rented again.
+    avoid_failed_machine_minutes: float = Field(default=60.0, ge=0)
     #: How many times one model's download is tried before the host is given up. A cut
     #: download resumes from what arrived, so a retry is cheap; a host is not.
     pull_attempts: int = Field(default=4, ge=1, le=10)

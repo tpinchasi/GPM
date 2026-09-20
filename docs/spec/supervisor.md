@@ -55,6 +55,13 @@ a dollar cap.** Inside an open lease the supervisor may bid, recover and replace
 with no lease, or a lease exhausted, rented hosts are drained and released. A lease may tighten
 the pool's configured limits, never loosen them. An abandoned lease expires by its time limit.
 
+**A rented host is watched while it comes up** (D54). `teardown.max_starting_minutes`: its
+engine has never answered — stuck scheduling or starting — so it is ended early rather than
+billed for the whole preparing window. `teardown.min_pull_mbps` over `slow_pull_grace_s`: its
+download is far below what the offer advertised. Either way, and on a download that fails for
+good, the **machine** is skipped for `avoid_failed_machine_minutes`, or the best-ranked offer —
+the machine that just failed — is simply rented again.
+
 **An open lease can be changed while it runs** (D49): tightened freely, or **raised** — more
 hours for a host worth keeping, more dollars to pay for them, more workers — with the raise
 confirmed by typing the new value again, as loosening is everywhere else. Extending the hours

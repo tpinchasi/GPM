@@ -162,6 +162,9 @@ function hostPanel(d) {
         const share = p.total ? Math.min(1, p.completed / p.total) : 0;
         return el("div", {},
           el("div", { class: "mono" }, `${tag} — ${gigabytes(p.completed)} of ${gigabytes(p.total)}`,
+            // Measured here, not the offer's claim — a machine advertising gigabits and
+            // delivering a crawl is exactly what gets a host given up.
+            p.mbps != null && p.completed < p.total ? el("span", { class: "muted" }, ` · ${p.mbps.toFixed(0)} Mbps`) : null,
             p.attempt > 1 ? el("span", { class: "muted" }, ` · attempt ${p.attempt}`) : null),
           el("div", { class: "burn" }, el("div", { style: `width:${(share * 100).toFixed(1)}%` })));
       })) : null,
@@ -814,6 +817,10 @@ function hostLimitControl(current) {
 
 const marketPanel = (market) => {
   if (market.error) return el("p", { class: "error" }, market.error);
+  const skipped = Object.entries(market.avoided || {});
+  const avoidedNote = skipped.length ? el("p", { class: "muted" },
+    "Skipped for now because they just failed: ",
+    skipped.map(([machine, why]) => `${machine} (${why})`).join(" · ")) : null;
   // "Could not ask" is not "nothing out there" — say which, or an operator reads a throttled
   // provider as an empty market and goes looking for the wrong problem (D44).
   if (market.problem) {
@@ -822,7 +829,7 @@ const marketPanel = (market) => {
       el("p", { class: "mono" }, market.problem),
       el("p", { class: "muted" }, "Nothing will be rented until this clears. A provider that is rate-limiting usually just needs fewer passes: raise probe_interval_s, or close leases you are not using."));
   }
-  return el("div", { class: "grid" },
+  return el("div", {}, avoidedNote, el("div", { class: "grid" },
     el("div", { class: "panel" },
       el("div", { class: "stat" }, `${market.passed} pass · ${market.rejected} rejected`),
       el("div", { class: "muted" }, `${market.seen} offers seen through your policy`),
@@ -847,7 +854,7 @@ const marketPanel = (market) => {
           el("td", { class: "num", title: offer.workers_from || "" },
             offer.workers ?? "—",
             offer.workers_from && offer.workers_from.startsWith("capacity profile") ? "" : el("span", { class: "muted" }, " default")),
-          el("td", { class: "num" }, Math.round(offer.score))))))));
+          el("td", { class: "num" }, Math.round(offer.score)))))))));
 };
 
 function preparePanel() {

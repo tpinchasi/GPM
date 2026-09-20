@@ -454,3 +454,49 @@ async def test_the_stage_says_which_model_is_downloading_and_then_that_it_is_loa
     assert stage == f"downloading {MODEL}"
     assert progress[MODEL]["total"] == engine_fake.pull_bytes
     assert host.stage == ""  # cleared once the set is held
+
+
+# --- a download far slower than the offer promised (D54) ---
+
+
+async def test_a_download_far_slower_than_promised_gives_the_host_up(tmp_path):
+    """Seen live: a download crawling on a machine advertising gigabits, released by hand."""
+    database = Database(tmp_path / "slow.sqlite3")
+    fleet = make_fleet(database, FakeProvider(), teardown={
+        "pull_retry_after_s": 0, "min_pull_mbps": 50, "slow_pull_grace_s": 0.3,
+    })
+    loop = BackgroundLoop()
+    engine_fake = FakeOllama(resident=set())
+    engine_fake.pull_bytes = 3_000_000      # 3 MB...
+    engine_fake.pull_delay_s = 0.4          # ...over more than a second: about 20 Mbps
+    server = ServerHandle(engine_fake.app, loop)
+    try:
+        fleet.provider.engine_urls = [server.base_url]
+        host = await fleet.prepare(max_spend=1.00, max_hours=2)
+        client = build_client(fleet.config.hosts[0].transport, fleet.config.pool, server.base_url)
+        try:
+            loaded = await fleet.load_model_set(host, OllamaEngine(), client)
+        finally:
+            await client.aclose()
+        events = fleet.events.recent()
+        avoided = fleet.avoided_now()
+    finally:
+        server.stop()
+        loop.stop()
+        database.close()
+
+    assert not loaded
+    slow = next(e for e in events if e["kind"] == "host_too_slow")
+    assert "under the 50 Mbps floor" in slow["summary"] and "advertised" in slow["summary"]
+    assert engine_fake.pulls == 1  # not retried: the same link would be just as slow
+    assert host.offer.machine_id in avoided
+
+
+async def test_a_fast_enough_download_is_left_alone_and_reports_its_speed(tmp_path):
+    loaded, events, engine = await _prepare_over(tmp_path, min_pull_mbps=50, slow_pull_grace_s=0.0)
+    assert loaded and "host_too_slow" not in {e["kind"] for e in events}
+
+
+async def test_the_speed_floor_can_be_switched_off(tmp_path):
+    loaded, events, engine = await _prepare_over(tmp_path, min_pull_mbps=0)
+    assert loaded

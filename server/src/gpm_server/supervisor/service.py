@@ -437,6 +437,8 @@ class Supervisor:
             if not health.ok:
                 host.mark_preparing()
                 continue
+            if host.engine_seen_at is None:
+                host.engine_seen_at = time.time()  # it has started; "stuck starting" is over
             try:
                 resident = await self.engine.models_resident(client)
             except httpx.HTTPError:

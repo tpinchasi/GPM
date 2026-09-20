@@ -20,6 +20,7 @@ from typing import Mapping, Optional
 from ..config import BiddingConfig, OfferPolicy, PoolConfig, RentedConfig, TransportConfig
 from ..deadman import heartbeat_command, onstart_script
 from ..engines import get_engine
+from ..engines.base import PullResult
 from ..ledger import EventLog, Lease, LeaseRefused, LeaseStore, SpendLedger
 from ..providers.base import (
     BidLost,
@@ -50,6 +51,11 @@ from ..transports import SshTunnel, build_ssh_exec_command, run_command
 log = logging.getLogger("gpm.renting")
 
 
+class PullTooSlow(Exception):
+    """Raised from inside a download's progress report to stop it: the machine's link is far
+    below what its offer advertised, and every minute of waiting is billed."""
+
+
 @dataclasses.dataclass
 class RentedHost:
     host_id: str
@@ -74,6 +80,9 @@ class RentedHost:
     idle_since: Optional[float] = None
     released: bool = False
     resident: frozenset[str] = frozenset()
+    #: When this host's engine first answered. None means it has never started — which is
+    #: what "stuck scheduling" looks like from here.
+    engine_seen_at: Optional[float] = None
     #: While draining: when to stop waiting for its work to finish, and what to do then.
     drain_until: Optional[float] = None
     drain_then: str = "destroy"
@@ -146,6 +155,9 @@ class Fleet:
         self.engine = get_engine(config.engine)
         #: Forwards to rented hosts the provider cannot expose directly, keyed by host id.
         self.tunnels: dict[str, SshTunnel] = {}
+        #: Machines that just failed to start or to download, and until when they are skipped.
+        #: In memory only: a restart forgets, which costs at most one more try.
+        self.avoided: dict[str, tuple[float, str]] = {}
         #: Why the last offer search came back empty, when it was not the market's doing.
         self.last_offer_error: Optional[str] = None
         #: A provider that says "too many requests" is answered by asking less often, not by
@@ -536,7 +548,8 @@ class Fleet:
         if decision.rent and refusal is None and lease is not None:
             offers = await self._offers()
             ranked, rejected = rank_offers(
-                offers, self.rented.offer_policy, self.rented.bidding, lease.hours_left(), self.rented.model_set_gb
+                offers, self._policy_with_avoided(self.rented.offer_policy), self.rented.bidding,
+                lease.hours_left(), self.rented.model_set_gb,
             )
             step["offers_seen"] = len(offers)
             step["offers_rejected"] = {key: value for key, value in list(rejected.items())[:10]}
@@ -584,7 +597,9 @@ class Fleet:
             bid_config = BiddingConfig.model_validate({**bid_config.model_dump(), **bidding})
 
         offers = await self._offers(policy)
-        ranked, rejected = rank_offers(offers, policy, bid_config, hours, self.rented.model_set_gb)
+        ranked, rejected = rank_offers(
+            offers, self._policy_with_avoided(policy), bid_config, hours, self.rented.model_set_gb
+        )
         problem = self.last_offer_error
         by_reason: dict[str, int] = {}
         for reasons in rejected.values():
@@ -623,6 +638,8 @@ class Fleet:
             # None when the market really was asked. Set when it could not be, so nobody
             # reads "0 offers seen" as "there is nothing out there" (D44).
             "problem": problem,
+            # Machines skipped for now because they just failed, and why.
+            "avoided": self.avoided_now(),
             "best": accepted,
             "policy": {
                 "bid_ceiling": bid_config.bid_ceiling,
@@ -680,6 +697,30 @@ class Fleet:
         host.when_ready = when_ready
         return host
 
+    def avoid(self, machine_id: str, why: str) -> None:
+        """Do not bid on this machine again for a while. Without this the best-ranked offer —
+        the machine that just failed — is simply rented again (seen live: four times running)."""
+        minutes = self.rented.teardown.avoid_failed_machine_minutes
+        if minutes <= 0:
+            return
+        self.avoided[machine_id] = (time.time() + minutes * 60, why)
+        self.events.record(
+            "machine_avoided",
+            f"machine {machine_id} {why}; not bidding on it for {minutes:g} minutes",
+            numbers={"machine": machine_id, "minutes": minutes},
+        )
+
+    def avoided_now(self) -> dict[str, str]:
+        now = time.time()
+        self.avoided = {m: (until, why) for m, (until, why) in self.avoided.items() if until > now}
+        return {m: why for m, (_, why) in self.avoided.items()}
+
+    def _policy_with_avoided(self, policy: OfferPolicy) -> OfferPolicy:
+        skipped = self.avoided_now()
+        if not skipped:
+            return policy
+        return policy.model_copy(update={"avoid_machines": sorted(set(policy.avoid_machines) | set(skipped))})
+
     async def _pull_with_retries(self, host: RentedHost, engine, client, tag: str):
         """One model's download, tried again when the failure is the kind that passes.
 
@@ -698,10 +739,36 @@ class Fleet:
                 return None
             host.stage = f"downloading {tag}" + (f" (attempt {attempt} of {attempts})" if attempt > 1 else "")
 
-            def progress(done: int, total: int, tag=tag, attempt=attempt) -> None:
-                host.progress[tag] = {"completed": done, "total": total, "attempt": attempt}
+            samples: list[tuple[float, int]] = []
 
-            result = await self._pull(engine, client, tag, progress)
+            def progress(done: int, total: int, tag=tag, attempt=attempt, samples=samples) -> None:
+                now = time.monotonic()
+                samples.append((now, done))
+                grace = self.rented.teardown.slow_pull_grace_s
+                while len(samples) > 1 and now - samples[0][0] > max(grace, 1.0):
+                    samples.pop(0)
+                window = now - samples[0][0]
+                mbps = (done - samples[0][1]) * 8 / 1e6 / window if window > 0 else None
+                host.progress[tag] = {"completed": done, "total": total, "attempt": attempt, "mbps": mbps}
+                floor = self.rented.teardown.min_pull_mbps
+                # Judged only over a full window: a download ramps up, and a blip is not a verdict.
+                if floor > 0 and mbps is not None and window >= grace and mbps < floor and done < total:
+                    raise PullTooSlow(
+                        f"downloading {tag} at {mbps:.0f} Mbps, under the {floor:.0f} Mbps floor for "
+                        f"{window:.0f}s — the offer advertised {host.offer.download_mbps:.0f} Mbps"
+                    )
+
+            try:
+                result = await self._pull(engine, client, tag, progress)
+            except PullTooSlow as slow:
+                # Not retried: the same link on the same machine will be just as slow.
+                self.events.record(
+                    "host_too_slow", f"{host.host_id}: {slow}",
+                    numbers={"tag": tag, "floor_mbps": self.rented.teardown.min_pull_mbps,
+                             "advertised_mbps": host.offer.download_mbps},
+                    host_id=host.host_id, lease_id=host.lease_id,
+                )
+                return PullResult(tag=tag, ok=False, detail=str(slow), retryable=False)
             if result.ok:
                 host.progress[tag] = {"completed": result.bytes_total, "total": result.bytes_total, "attempt": attempt}
             if result.ok or not result.retryable or attempt == attempts:
@@ -748,6 +815,7 @@ class Fleet:
                     host_id=host.host_id,
                     lease_id=host.lease_id,
                 )
+                self.avoid(host.offer.machine_id, f"could not download {tag}")
                 return False
             moved += result.bytes_total
 
@@ -858,6 +926,7 @@ class Fleet:
             "download_cost": host.download_cost,
             "workers": host.workers,
             "interruptible": host.interruptible,
+            "engine_seen_at": host.engine_seen_at,
             "state": host.state,
             "parked_at": host.parked_at,
             "offer": dataclasses.asdict(dataclasses.replace(host.offer, raw={})),
@@ -913,6 +982,7 @@ class Fleet:
                 # launched with the rented default of the day.
                 workers=int(ref.get("workers") or self.rented.workers),
                 interruptible=bool(ref.get("interruptible", True)),
+                engine_seen_at=ref.get("engine_seen_at"),
             )
             if host.state == "ready":
                 # Readiness is re-verified, never assumed — and the clock on "not ready in
@@ -1186,7 +1256,7 @@ class Fleet:
         offers = await self._offers()
         ranked, rejected = rank_offers(
             offers,
-            self.rented.offer_policy,
+            self._policy_with_avoided(self.rented.offer_policy),
             self.rented.bidding,
             lease.hours_left(),
             self.rented.model_set_gb,
@@ -1326,7 +1396,22 @@ class Fleet:
         ready = [h for h in live if h.state == "ready"]
         for host in preparing:
             since = host.preparing_since or host.created_at
+            starting_for = (now - since) / 60
+            if host.engine_seen_at is None and starting_for >= self.rented.teardown.max_starting_minutes:
+                # Stuck before it ever served anything: the provider is still scheduling or
+                # starting it. Waiting the full preparing window would bill three times as long.
+                self.avoid(host.offer.machine_id, "never started")
+                self.events.record(
+                    "host_stuck_starting",
+                    f"{host.host_id} has not started after {starting_for:.0f} minutes "
+                    f"(limit {self.rented.teardown.max_starting_minutes:g}); giving it up",
+                    numbers={"minutes": round(starting_for, 1), "machine": host.offer.machine_id},
+                    host_id=host.host_id, lease_id=host.lease_id,
+                )
+                await self.destroy(host, f"never started within {self.rented.teardown.max_starting_minutes:g} minutes")
+                continue
             if (now - since) / 60 >= self.rented.teardown.max_preparing_minutes:
+                self.avoid(host.offer.machine_id, "never became ready")
                 await self.destroy(
                     host,
                     f"not ready after {self.rented.teardown.max_preparing_minutes:g} minutes",
