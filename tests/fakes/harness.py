@@ -127,6 +127,7 @@ class PoolHarness:
         host_overrides: Optional[dict[str, dict[str, Any]]] = None,
         rentable: Optional[list[EngineSpec]] = None,
         rented: Optional[dict[str, Any]] = None,
+        delivery: Optional[dict[str, Any]] = None,
     ):
         self.loop = BackgroundLoop()
         self._tmp = tempfile.TemporaryDirectory()
@@ -198,6 +199,7 @@ class PoolHarness:
                     "probe_interval_s": probe_interval_s,
                     "upstream_connect_timeout_s": upstream_connect_timeout_s,
                     "upstream_read_timeout_s": upstream_read_timeout_s,
+                    **({"delivery": delivery} if delivery else {}),
                 },
                 "auth": {"app_keys": [APP_KEY]},
                 "catalog": catalog or {},

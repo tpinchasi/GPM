@@ -52,6 +52,23 @@ def _reply_from_response(response: httpx.Response) -> Reply:
 _DEFAULT_TIMEOUT = httpx.Timeout(connect=5.0, read=300.0, write=300.0, pool=300.0)
 
 
+def _budget_from_status(data: dict, current: httpx.Timeout) -> Optional[httpx.Timeout]:
+    """The pool's published time-to-first-byte, when it asks for more than we allow.
+
+    A pool that holds responses from hosts that can be taken away (D62) turns "time to first
+    byte" into the whole generation, so a budget sized for a streamed first token is too short
+    there. The pool publishes what it expects; this adopts it, and never shortens anything.
+    """
+    published = (data.get("limits") or {}).get("client_time_to_first_byte_s")
+    if not isinstance(published, (int, float)):
+        return None
+    if current.read is not None and current.read >= published:
+        return None
+    return httpx.Timeout(
+        connect=current.connect, read=float(published), write=current.write, pool=current.pool
+    )
+
+
 class PoolClient:
     def __init__(
         self,
@@ -101,6 +118,9 @@ class PoolClient:
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             data = self._client.get("/pool/status").json()
+            wider = _budget_from_status(data, self._client.timeout)
+            if wider is not None:
+                self._client.timeout = wider
             if any(h.get("state") == "ready" for h in data.get("hosts", [])):
                 return
             if deadline is not None and time.monotonic() >= deadline:
@@ -167,6 +187,9 @@ class AsyncPoolClient:
         while True:
             resp = await self._client.get("/pool/status")
             data = resp.json()
+            wider = _budget_from_status(data, self._client.timeout)
+            if wider is not None:
+                self._client.timeout = wider
             if any(h.get("state") == "ready" for h in data.get("hosts", [])):
                 return
             if deadline is not None and time.monotonic() >= deadline:

@@ -49,6 +49,11 @@ class Worker:
         return self.state is WorkerState.IDLE
 
 
+#: Every kind of host the pool rents. An interruptible one can be taken away mid-generation;
+#: an on-demand one cannot, and the difference decides how its responses are delivered (D62).
+RENTED_KINDS = ("rented-interruptible", "rented-on-demand")
+
+
 @dataclasses.dataclass
 class Host:
     host_id: str

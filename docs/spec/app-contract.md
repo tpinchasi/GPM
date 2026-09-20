@@ -57,6 +57,7 @@ On top of it the pool adds a short, named dialect. Nothing else is added silentl
 | `503` | `no_offer` | Renting is authorised but no acceptable offer exists right now | wait and retry |
 | `503` | `no_lease` | Only rented hosts could serve this and no lease is open — waiting cannot help | **fail fast** with `PoolUnavailable` (overridable) |
 | `503` | `no_eligible_host` | Hosts are ready, but none holds a build of this model that satisfies the request — its schema requirement or its pinned runtime class | wait and retry |
+| `503` | `host_lost` | The host serving this was taken away before any of the response reached you; nothing partial was sent (§5.1) | wait and retry |
 | `504` | `deadline_exceeded` | The request's `X-GPM-Deadline` passed before it could be served | **fail fast** — the app already said the answer would be useless |
 
 ```json
@@ -177,7 +178,11 @@ the app's hands. So, **by host kind**, the router may hold a response until it i
 | Host kind | Default | |
 |---|---|---|
 | `rented-interruptible` | `buffered` | The operator may set `stream` |
-| every other kind | `stream` | These do not vanish without notice |
+| `rented-on-demand`, `fixed-remote`, `local` | `stream` | These do not vanish without notice |
+
+`GET /pool/status` publishes the policy under `delivery`, so an SDK can size its
+time-to-first-byte from it; the pool's own SDK widens its budget to the published figure and
+never shortens it.
 
 A buffered response is delivered as **the same frames, verbatim and in order**, in the engine's
 own streaming format: an app that asked for a stream still parses a stream, and the body is

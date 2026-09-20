@@ -725,7 +725,8 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             required = set(supervisor._rented_required_tags())
             client = supervisor._rented_clients.get(host_id)
             detail.update(
-                kind="rented-interruptible", state=rented.state, workers=rented.workers,
+                kind="rented-interruptible" if rented.interruptible else "rented-on-demand",
+                state=rented.state, workers=rented.workers,
                 residency="pinned", hardware=rented.offer.hardware, machine=rented.offer.machine_id,
                 instance=rented.instance.instance_id, bid_hourly=rented.bid_hourly,
                 interruptible=rented.interruptible,

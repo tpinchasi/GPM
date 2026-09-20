@@ -29,7 +29,7 @@ from ..configplan import ConfigStore
 from ..db import Database, HostCounters, HostRow, HostTable, SupervisorLock
 from ..engines import Engine, get_engine
 from ..ledger import EventLog, LeaseStore, SpendLedger
-from ..models import HostState
+from ..models import RENTED_KINDS, HostState
 from ..providers.base import ProviderAuthError, ProviderError, get_provider
 from ..transports import SshTunnel, build_client
 from . import agents
@@ -216,7 +216,7 @@ class Supervisor:
     async def adopt_rented(self) -> None:
         """Before the first pass — and so before the first sweep — take back the rented hosts
         the last supervisor published, and drop the rows of hosts the provider no longer has."""
-        rows = [row for row in self.table.all() if row.kind == "rented-interruptible"]
+        rows = [row for row in self.table.all() if row.kind in RENTED_KINDS]
         if not rows:
             return
         if self.fleet is None:
@@ -568,7 +568,7 @@ class Supervisor:
             self.table.publish(
                 HostRow(
                     host_id=host_id,
-                    kind="rented-interruptible",
+                    kind="rented-interruptible" if host.interruptible else "rented-on-demand",
                     transport_type="http",
                     priority=20,
                     dial_url=host.dial_url,
@@ -586,7 +586,7 @@ class Supervisor:
                 )
             )
         for row in self.table.all():
-            if row.kind == "rented-interruptible" and row.host_id not in live:
+            if row.kind in RENTED_KINDS and row.host_id not in live:
                 self.table.remove(row.host_id)
 
     async def _probe(self, host: SupervisedHost) -> None:

@@ -134,7 +134,13 @@ def _upstream_headers(request: Request) -> dict[str, str]:
     return headers
 
 
-def _downstream_headers(upstream: httpx.Response, assignment: Assignment, wait_s: float) -> dict[str, str]:
+def _downstream_headers(
+    upstream: httpx.Response,
+    assignment: Assignment,
+    wait_s: float,
+    delivery: str = "stream",
+    attempts: int = 1,
+) -> dict[str, str]:
     headers = {
         key: value for key, value in upstream.headers.items() if key.lower() not in _DROP_DOWNSTREAM
     }
@@ -143,7 +149,23 @@ def _downstream_headers(upstream: httpx.Response, assignment: Assignment, wait_s
     headers["X-GPM-Runtime-Class"] = assignment.variant.runtime_class
     headers["X-GPM-Wait-S"] = f"{wait_s:.3f}"
     headers["X-GPM-Contract"] = CONTRACT_VERSION
+    headers["X-GPM-Delivery"] = delivery
+    headers["X-GPM-Attempts"] = str(attempts)
     return headers
+
+
+def _delivery_for(state: RouterState, host_kind: str, request: Request) -> str:
+    """Stream as the engine generates, or hold the response until it is whole? (D62)
+
+    By host kind, because it is the kind that says whether the host can vanish mid-generation.
+    An app may ask for tokens as they come, where the operator allows it.
+    """
+    cfg = state.config.pool.delivery
+    wanted = cfg.for_kind(host_kind)
+    asked = (request.headers.get("x-gpm-delivery") or "").strip().lower()
+    if asked in ("stream", "buffered") and cfg.allow_request_override:
+        return asked
+    return wanted
 
 
 async def _wait_for_disconnect(request: Request) -> None:
@@ -239,6 +261,17 @@ def create_app(
                     "queue_timeout_s": config.pool.queue_timeout_s,
                     "client_time_to_first_byte_s": config.pool.client_time_to_first_byte_s,
                 },
+                # How a response reaches the app, per host kind (D62). An SDK sizes its
+                # time-to-first-byte from this: a held response arrives whole, so "first byte"
+                # is the end of the generation, not the start.
+                "delivery": {
+                    "by_kind": {
+                        kind: config.pool.delivery.for_kind(kind)
+                        for kind in ("local", "fixed-remote", "rented-interruptible", "rented-on-demand")
+                    },
+                    "allow_request_override": config.pool.delivery.allow_request_override,
+                    "max_redispatch": config.pool.delivery.max_redispatch,
+                },
                 "capacity": {
                     "hosts_ready": sum(1 for h in state.hosts if h.state is HostState.READY),
                     "workers_total": sum(h.total_workers for h in state.hosts),
@@ -309,6 +342,12 @@ def create_app(
         upstream: Optional[httpx.Response] = None
         wait_s = 0.0
         dispatched_at = started
+        delivery = "stream"
+        raw: Optional[AsyncIterator[bytes]] = None
+        buffered: list[bytes] = []
+        attempts = 0
+        redispatched = 0
+        max_buffer_bytes = int(config.pool.delivery.max_buffer_mb * 1_000_000)
 
         while True:
             try:
@@ -345,9 +384,9 @@ def create_app(
             # headers arrive only after the whole generation, so measuring from after `send`
             # would report a 46-second answer as under a millisecond (seen live).
             dispatched_at = time.monotonic()
+            attempts += 1
             try:
                 upstream = await assignment.host.client.send(upstream_request, stream=True)
-                break
             except httpx.HTTPError as exc:
                 # Failed before the first response byte: retry once, on the next eligible host
                 # in priority order. Never for "no capacity" (docs/spec/app-contract.md §5).
@@ -359,14 +398,106 @@ def create_app(
                 if len(excluded) > 1:
                     await record("failed", status_code=503, reason="hosts_unreachable", host_id=host_id)
                     return _no_capacity("hosts_unreachable", f"two hosts failed before answering: {exc}")
+                continue
+
+            delivery = _delivery_for(state, assignment.host.kind, request)
+            if delivery != "buffered" or upstream.status_code >= 400:
+                # Streamed as the engine generates it, which is also how an error answer goes
+                # back: there is nothing to gain by holding a 4xx the engine already decided.
+                delivery = "stream"
+                break
+
+            # Held until whole (D62). Until the first byte reaches the client, a host lost
+            # mid-generation costs a re-run rather than a broken stream.
+            buffered = []
+            size = 0
+            overflowed = False
+            raw = upstream.aiter_raw()
+            try:
+                async for chunk in raw:
+                    buffered.append(chunk)
+                    size += len(chunk)
+                    if size > max_buffer_bytes:
+                        # Bigger than the pool will hold: stream the rest rather than fail it.
+                        overflowed = True
+                        break
+            except asyncio.CancelledError:
+                with anyio.CancelScope(shield=True):
+                    await upstream.aclose()
+                    await state.dispatcher.release(assignment)
+                    await record("cancelled", reason="client_disconnected", host_id=assignment.host.host_id,
+                                 queue_wait_ms=wait_s * 1000)
+                raise
+            except Exception as exc:  # noqa: BLE001 — every upstream failure means the same here
+                host_id = assignment.host.host_id
+                assignment.host.failures += 1
+                with anyio.CancelScope(shield=True):
+                    await upstream.aclose()
+                    await state.dispatcher.release(assignment)
+                log.warning("host %s failed while buffering: %s", host_id, exc)
+                excluded.add(host_id)
+                await record(
+                    "redispatched", host_id=host_id, worker_id=assignment.worker.worker_id,
+                    model_served=assignment.variant.tag, runtime_class=assignment.variant.runtime_class,
+                    queue_wait_ms=wait_s * 1000, latency_ms=(time.monotonic() - dispatched_at) * 1000,
+                    reason="upstream_lost_while_buffering",
+                )
+                if redispatched >= config.pool.delivery.max_redispatch or (
+                    request_deadline is not None and time.monotonic() >= request_deadline
+                ):
+                    await record("failed", status_code=503, reason="host_lost", host_id=host_id)
+                    return _no_capacity(
+                        "host_lost",
+                        "the host serving this request was lost before any of it reached you; "
+                        "nothing partial was sent",
+                    )
+                redispatched += 1
+                # The client has received nothing, so the pool runs it again itself.
+                queue_deadline = time.monotonic() + config.pool.queue_timeout_s
+                if request_deadline is not None:
+                    queue_deadline = min(queue_deadline, request_deadline)
+                continue
+
+            if overflowed:
+                delivery = "stream-after-overflow"
+            break
 
         assert assignment is not None and upstream is not None
         held = assignment
+        prefix = b"".join(buffered)
+        rest = raw if prefix else upstream.aiter_raw()
+
+        if delivery == "buffered":
+            # Whole, and byte-identical to what the engine sent: the frames are the engine's
+            # own, in order, so a client that asked for a stream still parses a stream.
+            held.host.requests_served += 1
+            with anyio.CancelScope(shield=True):
+                await upstream.aclose()
+                await state.dispatcher.release(held)
+                await record(
+                    "ok",
+                    host_id=held.host.host_id,
+                    worker_id=held.worker.worker_id,
+                    model_served=held.variant.tag,
+                    runtime_class=held.variant.runtime_class,
+                    queue_wait_ms=wait_s * 1000,
+                    latency_ms=(time.monotonic() - dispatched_at) * 1000,
+                    status_code=upstream.status_code,
+                )
+            return Response(
+                content=prefix,
+                status_code=upstream.status_code,
+                headers=_downstream_headers(upstream, assignment, wait_s, delivery, attempts),
+            )
 
         async def stream() -> AsyncIterator[bytes]:
             outcome = "ok"
             try:
-                async for chunk in upstream.aiter_raw():
+                if prefix:
+                    # What was buffered before the response outgrew the pool's limit; the rest
+                    # continues from the same iterator, never a second pass over the stream.
+                    yield prefix
+                async for chunk in rest:
                     yield chunk
             except asyncio.CancelledError:
                 outcome = "cancelled"
@@ -398,7 +529,7 @@ def create_app(
         return StreamingResponse(
             stream(),
             status_code=upstream.status_code,
-            headers=_downstream_headers(upstream, assignment, wait_s),
+            headers=_downstream_headers(upstream, assignment, wait_s, delivery, attempts),
         )
 
     return app

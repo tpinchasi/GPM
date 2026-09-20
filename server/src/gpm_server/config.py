@@ -174,7 +174,7 @@ class AgentConfig(BaseModel):
         return os.environ.get(self.bearer_env) or None
 
 
-_DEFAULT_PRIORITY = {"local": 0, "fixed-remote": 10, "rented-interruptible": 20}
+_DEFAULT_PRIORITY = {"local": 0, "fixed-remote": 10, "rented-interruptible": 20, "rented-on-demand": 20}
 
 
 class HostConfig(BaseModel):
@@ -296,6 +296,36 @@ class ControlConfig(BaseModel):
         return self
 
 
+class DeliveryConfig(BaseModel):
+    """How a response reaches the app: as it is generated, or once it is whole (D62).
+
+    A host that can be taken away mid-generation hands the app tokens it cannot take back, so
+    its responses are held until complete; the pool can then re-run a lost request itself.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    rented_interruptible: Literal["buffered", "stream"] = "buffered"
+    rented_on_demand: Literal["buffered", "stream"] = "stream"
+    local: Literal["buffered", "stream"] = "stream"
+    fixed_remote: Literal["buffered", "stream"] = "stream"
+    #: May an app ask for tokens as they come, and accept that the stream may break?
+    allow_request_override: bool = True
+    #: How many further hosts a request lost mid-buffer may be tried on. Each attempt can cost
+    #: a whole generation time, so it is not a number to raise lightly.
+    max_redispatch: int = Field(default=1, ge=0, le=3)
+    #: A response larger than this is flushed and streamed from there on, never failed.
+    max_buffer_mb: float = Field(default=16.0, gt=0)
+
+    def for_kind(self, kind: str) -> str:
+        return {
+            "rented-interruptible": self.rented_interruptible,
+            "rented-on-demand": self.rented_on_demand,
+            "local": self.local,
+            "fixed-remote": self.fixed_remote,
+        }.get(kind, "stream")
+
+
 class PoolSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -309,6 +339,7 @@ class PoolSettings(BaseModel):
     upstream_read_timeout_s: float = 300.0
     #: What the SDK allows for time-to-first-byte. Only used to enforce the invariant below.
     client_time_to_first_byte_s: float = 300.0
+    delivery: DeliveryConfig = Field(default_factory=DeliveryConfig)
 
     @field_validator("model_set")
     @classmethod
