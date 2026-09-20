@@ -132,6 +132,7 @@ fails until it is edited on purpose to admit another.
 | `GET /facts` | — | §3 |
 | `PUT /models` | `{tags, residency}` — the **whole** desired state | Starts working toward it in the background, one pull at a time, and answers at once with where each tag stands (on disk, loaded, pulling with bytes, last error), free disk, the owner's floor, and the surplus. A tag that failed is left alone for a minute, not retried every pass |
 | `DELETE /models` | `{tag}` | §4's deletion, inside its bounds |
+| `POST /heartbeat` | — | Touches the dead-man timer's file on a host the pool created (D63). No body, and no other bound: it can only *postpone* a shutdown the pool could equally cause by going silent. A machine nobody rented carries no timer, and the verb says so |
 | `POST /engine` | `{settings}` — `null`, or `{workers, models_held, context?}` as bounded whole numbers | Writes the engine's start-up environment to the file the owner named, if it changed; runs the owner's restart command; waits for the engine to answer; reports the exit code, the tail of the output, and whether the engine came back |
 
 A tag travels in a body, never a path, and must be a plain model tag — a name, optionally
@@ -159,8 +160,9 @@ loaded for their own reasons is not the pool's to unload.
 2. Pull and load/pin/unload to satisfy the model set and `residency`; plan shows the download.
 3. Operator-defined restart and engine settings.
 4. The agent behind an SSH tunnel.
-5. The agent on hosts the pool rents (§9). **Stage 5a built** — packed, pushed, started, and
-   asked for facts; the model set and the worker count still go the old way (5b, 5c).
+5. The agent on hosts the pool rents (§9). **Built** — packed, pushed, started, asked for facts,
+   and now the preparation path (delivering D57) with its own heartbeat verb. The worker count
+   (D56) still goes the old way: it is the last piece.
 
 Still not built, and still waiting on a package index: installing the agent over SSH onto a
 *configured* host that someone else owns.
@@ -180,10 +182,13 @@ agent, with the same closed verbs, and **the pool still dials**.
   start-up script, which a provider stores and can read. The pool reaches the agent through a
   second forward on the SSH connection it already holds (stage 4).
 - **It is the preparation path.** `PUT /models` works toward the model set and loads each model
-  as its own download finishes (D57); `POST /engine` changes the worker count (D56). Neither
-  needed a new verb.
+  **as its own download finishes** (D57) rather than pulling everything and then loading
+  everything — which left the accelerator idle through the whole last phase of a billing host,
+  measured live at 78 seconds. `POST /engine` changes the worker count (D56). Neither needed a
+  new verb.
 - **One new verb, and more facts.** `POST /heartbeat`, with no body, touches the dead-man timer's
-  heartbeat file — it can only postpone a shutdown the pool could equally cause by going silent.
+  heartbeat file — it runs **beside** the pool's SSH heartbeat, not instead of it, until it has
+  been seen working on a live host — it can only postpone a shutdown the pool could equally cause by going silent.
   `GET /facts` adds load average, accelerator utilisation and memory, and measured generation
   rate. The verb list stays closed; the test that guards it is edited for exactly this.
 - **The restart command is the pool's here.** On a host the pool created, what restarts the
