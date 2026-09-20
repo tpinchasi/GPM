@@ -78,6 +78,10 @@ class RentedHost:
     #: prepared the way it always was (D63).
     agent: Optional[hostagent.RentedAgent] = None
     agent_facts: Optional[dict] = None
+    agent_models: Optional[dict] = None
+    #: True once this host's agent has answered a heartbeat, so an operator can see the verb
+    #: working before the ssh beat beside it is retired.
+    agent_beats: bool = False
     agent_detail: Optional[str] = None
     #: When this host was parked for having no traffic, the moment its idleness began — so the
     #: destroy limit is counted from its last request, not from the park (D64).
@@ -452,6 +456,14 @@ class Fleet:
         for host in list(self.hosts.values()):
             if host.released or host.connection is None:
                 continue
+            if host.agent is not None:
+                # Through the agent where there is one — and *beside* the ssh beat, not instead
+                # of it, until the verb has been seen working on a live host (D63).
+                detail = await agents.beat(host.agent, transport=self._agent_transport)
+                if detail is not None:
+                    host.agent_detail = detail
+                else:
+                    host.agent_beats = True
             try:
                 code, output = await self.run_on_host(host, heartbeat_command())
             except Exception as exc:  # noqa: BLE001 - never let a heartbeat take a pass down
@@ -940,6 +952,60 @@ class Fleet:
             return await engine.pull(client, tag, on_progress=progress)
         except TypeError:
             return await engine.pull(client, tag)
+
+    async def load_model_set_through_agent(self, host: RentedHost) -> Optional[bool]:
+        """Let the host's own agent fetch and hold the model set (D63, stage 3).
+
+        It works toward the whole desired state in the background, one pull at a time, and
+        loads each model the moment that model's own download finishes (D57) — so the last
+        phase of preparation is not a minute of an idle accelerator on a billing host.
+
+        Returns True when the set is held, False while it is still coming, None when this host
+        has no agent to ask — the caller then prepares it the way it always did.
+        """
+        if host.agent is None or not host.agent.manage_models:
+            return None
+        tags = sorted(self.required_tags)
+        report = await agents.hold(host.agent, tags, "pinned", transport=self._agent_transport)
+        if report is None:
+            host.agent_detail = "the agent stopped answering while the model set was loading"
+            return None
+        host.agent_models = report
+        held = {
+            model.get("tag"): model
+            for model in report.get("models", [])
+            if isinstance(model, dict)
+        }
+        failed = [
+            f"{tag}: {held[tag].get('error')}"
+            for tag in tags
+            if tag in held and held[tag].get("error")
+        ]
+        if failed:
+            self.events.record(
+                "prepare_failed",
+                f"{host.host_id}: its agent could not hold the model set — {'; '.join(failed)}",
+                host_id=host.host_id,
+                lease_id=host.lease_id,
+            )
+            return False
+        if not all(held.get(tag, {}).get("loaded") for tag in tags):
+            pulling = next(
+                (held[tag]["pulling"] for tag in tags if held.get(tag, {}).get("pulling")), None
+            )
+            host.progress = pulling or host.progress
+            return False
+        host.download_cost = host.offer.download_per_gb * (
+            sum(int(model.get("size_bytes") or 0) for model in held.values()) / 1e9
+        )
+        self.events.record(
+            "prepared",
+            f"{host.host_id} holds the pool's model set, fetched by its own agent",
+            numbers={"tags": tags},
+            host_id=host.host_id,
+            lease_id=host.lease_id,
+        )
+        return True
 
     async def load_model_set(self, host: RentedHost, engine, client) -> bool:
         """Pull every tag, then check they are resident **together** — a host that cannot hold

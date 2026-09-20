@@ -8,6 +8,7 @@ ever will: the restart runs the owner's command, and its settings are bounded in
 from __future__ import annotations
 
 import contextlib
+import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
@@ -138,6 +139,25 @@ def create_app(
     async def delete_model(request: Request) -> JSONResponse:
         return await _models(request, "delete")
 
+    async def heartbeat(request: Request) -> JSONResponse:
+        """Postpone the dead-man timer, on a host the pool created (D63).
+
+        No body, and nothing to get wrong: it touches one file. A machine nobody rented has no
+        timer, so there is nothing here to beat and the verb says so.
+        """
+        refused = refusal(request)
+        if refused is not None:
+            return refused
+        if not settings.heartbeat_file:
+            return _error(409, "no_timer", "this machine carries no dead-man timer")
+        path = Path(settings.heartbeat_file).expanduser()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+        except OSError as exc:
+            return _error(500, "heartbeat_failed", f"the timer's file could not be touched: {exc}")
+        return JSONResponse({"beat": True, "at": time.time()})
+
     base = f"/agent/v{PROTOCOL_VERSION}"
     app = Starlette(
         routes=[
@@ -147,6 +167,8 @@ def create_app(
             Route(f"{base}/models", delete_model, methods=["DELETE"]),
             # Restart the engine with the owner's command; optionally after writing settings.
             Route(f"{base}/engine", engine_restart, methods=["POST"]),
+            # Postpones a shutdown the pool could equally cause by going silent (D63).
+            Route(f"{base}/heartbeat", heartbeat, methods=["POST"]),
         ],
         lifespan=lifespan,
     )

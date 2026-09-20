@@ -542,6 +542,18 @@ class Supervisor:
         if host is None:
             return
         try:
+            # A host with an agent is fetched by its agent: one pull at a time, each model
+            # loaded as its own download finishes (D57). Without one, the pool does it the way
+            # it always has, over the engine's own API.
+            through_agent = await self.fleet.load_model_set_through_agent(host)
+            if through_agent is False:
+                if host.agent_models is not None and any(
+                    (model or {}).get("error") for model in host.agent_models.get("models", [])
+                ):
+                    await self.fleet.destroy(host, "could not hold the pool's model set")
+                return  # still coming; the next pass asks again
+            if through_agent:
+                return
             loaded = await self.fleet.load_model_set(host, self.engine, client)
             if not loaded:
                 await self.fleet.destroy(host, "could not hold the pool's model set")

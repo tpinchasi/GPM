@@ -19,7 +19,10 @@ def _init(args: argparse.Namespace) -> int:
         settings = load(path)
         settings.key_hash = fingerprint(key)
     else:
-        settings = Settings(key_hash=fingerprint(key), host=args.host, port=args.port, engine_url=args.engine_url)
+        settings = Settings(
+            key_hash=fingerprint(key), host=args.host, port=args.port,
+            engine_url=args.engine_url, heartbeat_file=args.heartbeat_file,
+        )
     settings.check()
     save(settings, path)
     print(f"Agent key (shown once; only its hash is stored in {path}):\n\n  {key}\n")
@@ -56,6 +59,7 @@ def main(argv: list[str] | None = None) -> int:
     init.add_argument("--host", default="127.0.0.1")
     init.add_argument("--port", type=int, default=8095)
     init.add_argument("--engine-url", default="http://127.0.0.1:11434")
+    init.add_argument("--heartbeat-file", default=None, help="the dead-man timer's file, where the pool created this host")
     init.add_argument("--rotate", action="store_true", help="mint a new key, keep everything else")
     init.set_defaults(run=_init)
 

@@ -96,6 +96,28 @@ async def hold(
         return None
 
 
+async def beat(
+    agent, *, transport: Optional[httpx.AsyncBaseTransport] = None
+) -> Optional[str]:
+    """Postpone the host's dead-man timer through its agent (D63). None on success.
+
+    One request on a connection the pool already holds, in place of an SSH session per host
+    per pass. It can only ever postpone a shutdown the pool could equally cause by going
+    silent, so there is nothing here to bound.
+    """
+    key = agent.key()
+    if key is None:
+        return "no key for this agent"
+    try:
+        async with _client(agent, key, transport) as client:
+            response = await client.post(f"/agent/v{PROTOCOL}/heartbeat")
+    except httpx.HTTPError as exc:
+        return f"agent unreachable: {str(exc) or type(exc).__name__}"
+    if response.status_code != 200:
+        return f"the agent answered {response.status_code} to a heartbeat"
+    return None
+
+
 async def delete_model(
     agent: AgentConfig, tag: str, *, transport: Optional[httpx.AsyncBaseTransport] = None
 ) -> tuple[int, dict[str, Any]]:

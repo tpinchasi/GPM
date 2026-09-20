@@ -169,6 +169,7 @@ def test_the_verbs_are_a_closed_list():
         ("/agent/v1/models", ("PUT",)),     # stage 2: hold this set of tags
         ("/agent/v1/models", ("DELETE",)),  # stage 2: delete this tag (D40's three bounds)
         ("/agent/v1/engine", ("POST",)),    # stage 3: restart, with the owner's command (D41)
+        ("/agent/v1/heartbeat", ("POST",)),  # stage 5a: postpone the timer on a rented host (D63)
     }
 
 
@@ -787,3 +788,68 @@ async def test_a_remembered_pin_the_engine_has_since_dropped_is_forgotten_not_re
     await machine.hold([], "on_demand")
     assert machine.engine.resident == set()  # releasing would have *loaded* it; it must not
     assert machine.app.state.work.pinned_by_agent == set()
+
+
+# --- the heartbeat verb, on a host the pool created (D63) ---
+
+
+async def post(app, path, key=AGENT_KEY, **kwargs):
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://agent") as http:
+        return await http.post(path, headers=headers, **kwargs)
+
+
+async def test_the_heartbeat_postpones_the_timer_on_a_rented_host(tmp_path):
+    """It touches one file — and can only ever postpone a shutdown the pool could equally
+    cause by going silent, which is why it needs no other bound."""
+    beat_file = tmp_path / "state" / "heartbeat"
+    app = agent_app(heartbeat_file=str(beat_file))
+
+    answered = await post(app, "/agent/v1/heartbeat")
+
+    assert answered.status_code == 200 and answered.json()["beat"] is True
+    assert beat_file.exists(), "the timer's file is what the verb exists to touch"
+
+    before = beat_file.stat().st_mtime_ns
+    time.sleep(0.01)
+    await post(app, "/agent/v1/heartbeat")
+    assert beat_file.stat().st_mtime_ns > before
+
+
+async def test_a_machine_nobody_rented_has_no_timer_to_beat():
+    answered = await post(agent_app(), "/agent/v1/heartbeat")
+    assert answered.status_code == 409
+    assert answered.json()["error"] == "no_timer"
+
+
+async def test_the_heartbeat_needs_the_agent_key_like_everything_else(tmp_path):
+    app = agent_app(heartbeat_file=str(tmp_path / "heartbeat"))
+    assert (await post(app, "/agent/v1/heartbeat", key=None)).status_code == 401
+    assert not (tmp_path / "heartbeat").exists()
+
+
+# --- each model loaded as its own download finishes (D57) ---
+
+
+async def test_a_model_is_loaded_as_soon_as_its_own_download_finishes():
+    """Not pull-everything-then-load-everything: that left the accelerator idle through the
+    whole last phase, on a host that is billing (measured live: 78 seconds)."""
+    with pool_harness([EngineSpec(id="e", resident=set(), available=set())], model_set=["a", "b"]) as pool:
+        engine = pool.engines["e"].fake
+        app = agent_app(engine_app=engine.app)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://agent") as http:
+            await http.put(
+                "/agent/v1/models",
+                headers={"Authorization": f"Bearer {AGENT_KEY}"},
+                json={"tags": ["a", "b"], "residency": "pinned"},
+            )
+            for _ in range(40):
+                await asyncio.sleep(0.05)
+                if {"a", "b"} <= engine.resident:
+                    break
+
+    ordered = [path for path, _body, _headers in engine.received if path in ("/api/pull", "/api/generate", "/api/show", "/api/embed")]
+    pulls = [i for i, path in enumerate(ordered) if path == "/api/pull"]
+    loads = [i for i, path in enumerate(ordered) if path != "/api/pull"]
+    assert len(pulls) == 2 and loads, "both models pulled, and loading happened"
+    assert min(loads) < max(pulls), "the first model was loaded before the last one downloaded"

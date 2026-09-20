@@ -733,6 +733,14 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 hours_held=round(rented.hours_held, 3), lease_id=rented.lease_id,
                 estimated_spend=round(rented.estimate(), 4), reported_spend=round(rented.reported_spend, 4),
                 stage=rented.stage, progress=rented.progress, prepared=rented.prepared,
+                # What the machine says about itself, where the pool put an agent on it (D63).
+                agent={
+                    "installed": rented.agent is not None,
+                    "beats": rented.agent_beats,
+                    "detail": rented.agent_detail,
+                    "facts": rented.agent_facts,
+                    "models": rented.agent_models,
+                },
                 tunnel=(
                     {"up": t.up, "local_port": t.local_port, "restarts": t.restarts, "last_error": t.last_error}
                     if (t := supervisor.fleet.tunnels.get(host_id)) else None

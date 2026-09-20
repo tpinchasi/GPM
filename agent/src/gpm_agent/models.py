@@ -171,15 +171,20 @@ class ModelWork:
         loaded = set(state["models_loaded"])
 
         for tag in self.desired.tags:
-            if tag in on_disk or not self._may_retry(tag):
-                continue
-            if await self._pull(tag):
+            if tag not in on_disk and self._may_retry(tag):
+                if not await self._pull(tag):
+                    continue
                 on_disk.add(tag)
-
-        if self.desired.residency == "pinned":
-            for tag in self.desired.tags:
-                if tag in on_disk and not (tag in loaded and tag in self.pinned_by_agent) and self._may_retry(tag):
-                    await self._hold(tag, pinned=True)
+            # Loaded the moment its own download finishes, while the rest are still coming
+            # (D57). The alternative — pull everything, then load everything — leaves the
+            # accelerator idle for the whole of the last phase, on a host that is billing.
+            if (
+                self.desired.residency == "pinned"
+                and tag in on_disk
+                and not (tag in loaded and tag in self.pinned_by_agent)
+                and self._may_retry(tag)
+            ):
+                await self._hold(tag, pinned=True)
         # A pin does not outlive the engine: a remembered tag that is no longer loaded was
         # unpinned by an engine restart, and is not this agent's to release any more.
         stale = {tag for tag in self.pinned_by_agent if tag not in loaded and tag not in self.desired.tags}

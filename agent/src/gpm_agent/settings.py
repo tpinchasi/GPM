@@ -71,6 +71,11 @@ class Settings:
     #: read (a systemd `EnvironmentFile=`, a launch script). The pool supplies numbers; the
     #: owner supplies the path. Absent means the pool cannot change engine settings here.
     engine_env_file: Optional[str] = None
+    #: The dead-man timer's heartbeat file, on a host the pool created (D63). The pool writes
+    #: this when it installs the agent; on a machine somebody else owns there is no timer, and
+    #: the heartbeat verb is refused. Touching it can only ever *postpone* a shutdown the pool
+    #: could equally cause by going silent, which is why it needs no other bound.
+    heartbeat_file: Optional[str] = None
 
     def check(self) -> None:
         if not is_loopback(self.host) and not (self.tls_certfile and self.tls_keyfile):
