@@ -117,16 +117,30 @@ class LeaseStore:
         max_spend: Optional[float] = None,
         max_hours: Optional[float] = None,
         workers: Optional[int] = None,
+        loosen: bool = False,
     ) -> Lease:
+        """Change an open lease's limits.
+
+        Tightening is always allowed. **Raising one requires `loosen`** — the caller saying it
+        meant to, which the console and the CLI only do after the operator has typed the new
+        value again (D49). Raising is permitted at all because the same operator can open a
+        second lease with any cap they like; refusing it only made them do that, and lose the
+        history of the first.
+        """
         lease = self.get(lease_id)
         if lease is None:
             raise LeaseRefused(f"no lease {lease_id!r}")
-        if max_spend is not None and max_spend > lease.max_spend:
-            raise LeaseRefused("a lease may only be tightened: the dollar cap cannot be raised")
-        if max_hours is not None and max_hours > lease.max_hours:
-            raise LeaseRefused("a lease may only be tightened: the time limit cannot be raised")
-        if workers is not None and workers > lease.workers:
-            raise LeaseRefused("a lease may only be tightened: workers cannot be raised")
+        if not lease.is_open:
+            raise LeaseRefused(f"lease {lease_id!r} is closed; open a new one")
+        if not loosen:
+            if max_spend is not None and max_spend > lease.max_spend:
+                raise LeaseRefused("raising the dollar cap must be confirmed: type the new value again")
+            if max_hours is not None and max_hours > lease.max_hours:
+                raise LeaseRefused("raising the time limit must be confirmed: type the new value again")
+            if workers is not None and workers > lease.workers:
+                raise LeaseRefused("raising the worker count must be confirmed: type the new value again")
+        if max_spend is not None and max_spend <= 0:
+            raise LeaseRefused("a lease that may rent must keep a dollar cap above zero")
         self.db.execute(
             "UPDATE leases SET max_spend = ?, max_hours = ?, workers = ? WHERE lease_id = ?",
             (
@@ -194,13 +208,20 @@ class EventLog:
         )
         return [{**dict(row), "numbers": json.loads(row["numbers"])} for row in rows]
 
-    def recent(self, limit: int = 100, kind: Optional[str] = None) -> list[dict[str, Any]]:
-        if kind is None:
-            rows = self.db.query("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,))
-        else:
-            rows = self.db.query(
-                "SELECT * FROM events WHERE kind = ? ORDER BY id DESC LIMIT ?", (kind, limit)
-            )
+    def recent(
+        self, limit: int = 100, kind: Optional[str] = None, host_id: Optional[str] = None
+    ) -> list[dict[str, Any]]:
+        where, params = [], []
+        if kind is not None:
+            where.append("kind = ?")
+            params.append(kind)
+        if host_id is not None:
+            where.append("host_id = ?")
+            params.append(host_id)
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        rows = self.db.query(
+            f"SELECT * FROM events{clause} ORDER BY id DESC LIMIT ?", (*params, limit)
+        )
         return [{**dict(row), "numbers": json.loads(row["numbers"])} for row in rows]
 
 

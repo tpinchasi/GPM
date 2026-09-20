@@ -248,6 +248,7 @@ class Supervisor:
             await self.fleet.pass_once(
                 ready_workers_higher_tiers=self._ready_workers(),
                 idle_seconds=self._idle_seconds(),
+                busy={host_id: counter.busy for host_id, counter in self.counters.all().items()},
             )
             self._publish_rented()
 
@@ -434,12 +435,12 @@ class Supervisor:
 
             health = await self.engine.health(client)
             if not health.ok:
-                host.state = "preparing"
+                host.mark_preparing()
                 continue
             try:
                 resident = await self.engine.models_resident(client)
             except httpx.HTTPError:
-                host.state = "preparing"
+                host.mark_preparing()
                 continue
             required = self._rented_required_tags()
             host.resident = resident
@@ -448,7 +449,7 @@ class Supervisor:
                     host.ready_at = time.time()
                 host.state = "ready"
                 continue
-            host.state = "preparing"
+            host.mark_preparing()
             # A host the pool created is the pool's to configure (spec §1.2): pull the set
             # and pin it, once, off the pass — a download takes minutes and must not stall
             # the loop. The next probes find the set resident and mark the host ready.
@@ -499,8 +500,8 @@ class Supervisor:
                     transport_type="http",
                     priority=20,
                     dial_url=host.dial_url,
-                    state=host.state if host.state in ("ready", "preparing") else "preparing",
-                    workers=rented.workers,
+                    state=host.state if host.state in ("ready", "preparing", "draining") else "preparing",
+                    workers=host.workers,
                     capabilities=tuple(rented.capabilities),
                     variants={
                         name: tuple((v.tag, v.runtime_class, v.enforces_schema) for v in group)

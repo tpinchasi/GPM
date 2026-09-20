@@ -54,7 +54,13 @@ declared this and never delivered.
 
 - **`list_instances` returns everything** carrying the label prefix, in any state, including
   stopped instances that still bill storage. The orphan sweep and crash recovery rest on it.
-- **`create` either returns an instance or leaves nothing behind.** A losing bid must raise,
+- **`create` either returns an instance or leaves nothing behind.** Verify this yourself before
+  reporting a lost bid — look for the label you were about to use and end what you find. A real
+  marketplace answered `success: false` and created the instance anyway (D43), and the pool
+  paid for two machines it did not know it had. **The pool now re-checks this by label after
+  every failed bid and refuses to bid again until it can prove nothing is running**, so a
+  plug-in that gets it wrong costs an operator a pass rather than a machine — but get it right.
+  A losing bid must raise,
   not leave a parked instance quietly billing.
 - **`destroy` is idempotent.** The pool verifies by listing again; it never trusts your return
   value.

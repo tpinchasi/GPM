@@ -64,31 +64,60 @@ class OllamaEngine:
             return Health(ok=False, detail=f"/api/version returned {response.status_code}")
         return Health(ok=True)
 
-    async def pull(self, client: httpx.AsyncClient, tag: str) -> PullResult:
+    async def pull(self, client: httpx.AsyncClient, tag: str, on_progress=None) -> PullResult:
+        """Fetch one tag. The engine keeps the layers it already has, so a pull tried again
+        after a cut picks up where it stopped rather than starting over.
+
+        `on_progress(completed, total)` is called as layers arrive, so an operator watching a
+        host be prepared can see a 19 GB download move rather than a host sitting at
+        "preparing" for minutes with nothing to look at.
+        """
         moved = 0
+        finished = False
         try:
             async with client.stream(
                 "POST", "/api/pull", json={"model": tag, "stream": True}, timeout=None
             ) as response:
                 if response.status_code != 200:
-                    return PullResult(tag=tag, ok=False, detail=f"pull returned {response.status_code}")
+                    return PullResult(
+                        tag=tag, ok=False, detail=f"pull returned {response.status_code}",
+                        # The engine or what is in front of it is struggling; a tag it does not
+                        # have, or a request it refuses, will not change by asking again.
+                        retryable=response.status_code >= 500 or response.status_code == 429,
+                    )
                 async for line in response.aiter_lines():
                     if not line.strip():
                         continue
                     frame = json.loads(line)
                     if frame.get("error"):
-                        return PullResult(tag=tag, ok=False, detail=frame["error"])
+                        error = str(frame["error"])
+                        return PullResult(tag=tag, ok=False, detail=error, retryable=not _permanent(error))
                     moved = max(moved, int(frame.get("total") or 0))
+                    finished = finished or frame.get("status") == "success"
+                    if on_progress is not None and frame.get("total"):
+                        on_progress(int(frame.get("completed") or 0), int(frame["total"]))
+        except httpx.TransportError as exc:
+            # Seen live: "peer closed connection without sending complete message body" — the
+            # download was cut, and what arrived is kept for the next attempt.
+            return PullResult(tag=tag, ok=False, detail=str(exc) or type(exc).__name__, retryable=True)
         except (httpx.HTTPError, ValueError) as exc:
-            return PullResult(tag=tag, ok=False, detail=str(exc))
+            return PullResult(tag=tag, ok=False, detail=str(exc) or type(exc).__name__, retryable=True)
+        if not finished:
+            # The stream ended without the engine saying it finished. A cut that happens to land
+            # between two lines looks exactly like this, and must not pass as a download.
+            return PullResult(tag=tag, ok=False, detail="the pull ended before the engine reported success", retryable=True)
         return PullResult(tag=tag, ok=True, bytes_total=moved)
 
     async def load_and_pin(self, client: httpx.AsyncClient, tags: list[str]) -> None:
         """`keep_alive: -1` is what "loaded, all the time" means to this engine."""
         for tag in tags:
-            response = await client.post(
-                "/api/generate", json={"model": tag, "keep_alive": -1}, timeout=None
-            )
+            # An embedding model refuses /api/generate with a 400 (seen live), so it is loaded
+            # through the endpoint it does serve. The engine says which kind a tag is.
+            shown = await client.post("/api/show", json={"model": tag})
+            shown.raise_for_status()
+            capabilities = shown.json().get("capabilities") or []
+            path = "/api/embed" if "embedding" in capabilities else "/api/generate"
+            response = await client.post(path, json={"model": tag, "keep_alive": -1}, timeout=None)
             response.raise_for_status()
         resident = await self.models_resident(client)
         missing = set(tags) - resident
@@ -115,6 +144,15 @@ class OllamaEngine:
         response = await client.get("/api/tags")
         response.raise_for_status()
         return _tags_in(response.json().get("models", []))
+
+
+#: Error text that means the pull cannot succeed however often it is tried.
+_PERMANENT_PULL_ERRORS = ("not found", "does not exist", "manifest unknown", "invalid model", "no space left")
+
+
+def _permanent(error: str) -> bool:
+    lowered = error.lower()
+    return any(marker in lowered for marker in _PERMANENT_PULL_ERRORS)
 
 
 def _tags_in(entries: list[dict]) -> frozenset[str]:

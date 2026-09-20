@@ -55,6 +55,13 @@ a dollar cap.** Inside an open lease the supervisor may bid, recover and replace
 with no lease, or a lease exhausted, rented hosts are drained and released. A lease may tighten
 the pool's configured limits, never loosen them. An abandoned lease expires by its time limit.
 
+**An open lease can be changed while it runs** (D49): tightened freely, or **raised** — more
+hours for a host worth keeping, more dollars to pay for them, more workers — with the raise
+confirmed by typing the new value again, as loosening is everywhere else. Extending the hours
+also pushes out the hold on a host prepared under that lease, so the lease cannot outlive the
+host it was extended for. A lease still cannot loosen a pool-level ceiling, and a closed lease
+is never reopened: open a new one.
+
 ## 3. Control loop
 
 Every pass (default 15 s):
@@ -296,10 +303,12 @@ rented:
     prepare:  { max_park_hours: 72, default_when_ready: join }
     teardown: { idle_minutes: 10, drain_timeout_s: 300, deadman_minutes: 20, deadman_action: destroy }
 
-capacity_profiles:                             # hardware ceiling on workers; first match wins
-  - { match: { capability: apple-silicon, class: laptop }, max_workers: 3 }
-  - { match: { capability: cuda, min_vram_gb: 80 },        max_workers: 6 }
-  - { match: { any: true },                                max_workers: formula }
+capacity_profiles:                             # workers per hardware class; first match wins
+  - match: { hardware: "1x RTX PRO 6000 Max-Q" }  # the offer's hardware, compared whole
+    max_workers: 6
+    note: "measured: latency flat from 4 to 6 in flight"   # the evidence, shown where it is used
+  - { match: { capability: cuda, min_gpu_memory_gb: 80 }, max_workers: 4 }
+  # no match → rented.workers
 
 calibration:                                   # memory-ceiling constants, per model set
   "<model set>@32k": { fixed_gib: 10.0, per_worker_gib: 7.6, operate_at: 0.67 }

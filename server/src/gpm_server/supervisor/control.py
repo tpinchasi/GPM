@@ -26,7 +26,15 @@ from fastapi.staticfiles import StaticFiles
 
 from ..catalog import variants_for_host
 from ..config import ConfigError, PoolConfig
-from ..configplan import ConfigStore, MachineNow, RentedNow, StaleVersion, plan_changes
+from ..configplan import (
+    CannotEdit,
+    ConfigStore,
+    MachineNow,
+    RentedNow,
+    StaleVersion,
+    plan_changes,
+    set_values,
+)
 from ..contract import CONTRACT_VERSION
 from ..hostcheck import test_connection
 from ..keys import verify
@@ -49,6 +57,36 @@ def _same_origin(request: Request, allowed_hosts: set[str]) -> bool:
         return True
     host = urlparse(origin).hostname or ""
     return host in allowed_hosts
+
+
+def _stage_of(detail: dict[str, Any]) -> str:
+    """Where preparing this host has got to, in words, from what is known about it.
+
+    Derived rather than stored, so it cannot drift from the facts it describes.
+    """
+    if detail.get("state") == "ready":
+        return "ready — serving requests"
+    if detail.get("state") == "parked":
+        return "parked — stopped, disk kept, billing storage only"
+    provider = (detail.get("provider") or {}).get("detail") or ""
+    engine = detail.get("engine") or {}
+    stage = detail.get("stage") or ""
+
+    if not engine.get("answers"):
+        if "pulling" in provider.lower():
+            return f"the provider is still starting the machine: {provider.strip()}"
+        return "waiting for the engine to answer — the machine is starting, or the tunnel is not up yet"
+    if stage:
+        progress = (detail.get("progress") or {}).get(stage.split()[-1] if stage.startswith("downloading") else "")
+        if progress and progress.get("total"):
+            done, total = progress["completed"] / 1e9, progress["total"] / 1e9
+            return f"{stage} — {done:.1f} of {total:.1f} GB"
+        return stage
+    if engine.get("missing_from_disk"):
+        return f"models still to download: {', '.join(engine['missing_from_disk'])}"
+    if engine.get("not_loaded"):
+        return f"downloaded; loading into memory: {', '.join(engine['not_loaded'])}"
+    return "the model set is loaded; waiting for the next probe to mark it ready"
 
 
 def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
@@ -226,7 +264,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                         "lease_id": host.lease_id,
                         "parked_at": host.parked_at,
                         "hours_held": round(host.hours_held, 3),
-                        "workers": fleet.rented.workers,
+                        "workers": host.workers,
                         "busy": counter.busy if counter else 0,
                     }
                 )
@@ -277,6 +315,9 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 "limits": {
                     "max_rented_hosts": supervisor.config.limits.max_rented_hosts,
                     "max_hourly_burn": supervisor.config.limits.max_hourly_burn,
+                    # What the configured limits actually allow, whichever of them binds (D46).
+                    "worst_case_hourly": supervisor.fleet.worst_case_hourly() if supervisor.fleet else 0.0,
+                    "per_host_ceiling": supervisor.config.rented.bidding.bid_ceiling if supervisor.config.rented else None,
                 },
                 "provider": (
                     {
@@ -319,8 +360,8 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         )
 
     @app.get("/pool/events")
-    async def events(limit: int = 100, kind: Optional[str] = None) -> JSONResponse:
-        return JSONResponse({"events": supervisor.events.recent(limit=limit, kind=kind)})
+    async def events(limit: int = 100, kind: Optional[str] = None, host_id: Optional[str] = None) -> JSONResponse:
+        return JSONResponse({"events": supervisor.events.recent(limit=limit, kind=kind, host_id=host_id)})
 
     @app.get("/pool/leases")
     async def leases() -> JSONResponse:
@@ -434,6 +475,49 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         supervisor.reload_config()
         return JSONResponse({"version": version})
 
+    @app.patch("/pool/config/rented")
+    async def set_rented_search(request: Request) -> JSONResponse:
+        """Change the offer policy or the bidding from the Rented capacity screen (D51).
+
+        The file stays the source of truth and the rules are the file's: the change is written
+        into it in place — comments, ordering and flow style untouched — then validated,
+        planned, and applied only if nothing that loosens a limit is unconfirmed.
+        """
+        if store() is None:
+            return _error(400, "no_config_file", "this pool was not started from a file")
+        body = await request.json()
+        text, version = store().read()
+        try:
+            for section in ("offer_policy", "bidding"):
+                wanted = body.get(section) or {}
+                if wanted:
+                    text = set_values(text, ("rented", section), wanted)
+        except CannotEdit as exc:
+            return _error(409, "cannot_edit", str(exc))
+
+        errors = store().validate(text)
+        if errors:
+            return _error(400, "invalid_config", "; ".join(errors))
+
+        candidate = store().parse(text)
+        changes = plan_changes(supervisor.config, candidate, rented_now(), machines_now())
+        loosening = [c for c in changes if c.requires_retype]
+        if loosening and str(body.get("confirm")) not in {str(c.requires_retype) for c in loosening}:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "not_confirmed",
+                    "detail": "this loosens a limit; send `confirm` with the new value",
+                    "changes": [c.as_dict() for c in changes],
+                },
+            )
+        try:
+            new_version = store().apply(text, version)
+        except (StaleVersion, ConfigError) as exc:
+            return _error(409 if isinstance(exc, StaleVersion) else 400, "not_applied", str(exc))
+        supervisor.reload_config()
+        return JSONResponse({"version": new_version, "changes": [c.as_dict() for c in changes]})
+
     @app.get("/pool/config/history")
     async def config_history() -> JSONResponse:
         if store() is None:
@@ -515,6 +599,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     "hours": lease.max_hours,
                     "max_rented_hosts": config.limits.max_rented_hosts,
                     "max_hourly_burn": config.limits.max_hourly_burn,
+                    "worst_case_hourly": supervisor.fleet.worst_case_hourly() if supervisor.fleet else 0.0,
                 },
             },
             status_code=201,
@@ -526,18 +611,56 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         return JSONResponse({"lease_id": lease_id, "state": "closed"})
 
     @app.patch("/pool/leases/{lease_id}")
-    async def tighten_lease(lease_id: str, request: Request) -> JSONResponse:
+    async def amend_lease(lease_id: str, request: Request) -> JSONResponse:
+        """Tighten an open lease, or extend it (D49).
+
+        Tightening needs nothing. Raising a limit — more dollars, more hours, more workers —
+        needs `confirm` carrying the new value, the same rule the console applies to loosening
+        anywhere else. Extending the hours also pushes out the hold on a host prepared under
+        this lease, or the lease would outlive the host it was extended for.
+        """
         body = await request.json()
-        try:
-            lease = supervisor.leases.tighten(
-                lease_id,
-                max_spend=body.get("max_spend"),
-                max_hours=body.get("max_hours"),
-                workers=body.get("workers"),
+        before = supervisor.leases.get(lease_id)
+        if before is None:
+            return _error(404, "unknown_lease", f"no lease {lease_id!r}")
+
+        wanted = {k: body.get(k) for k in ("max_spend", "max_hours", "workers")}
+        raised = {
+            k: v for k, v in wanted.items()
+            if v is not None and v > getattr(before, k)
+        }
+        if raised and str(body.get("confirm")) not in {str(v) for v in raised.values()}:
+            return _error(
+                400, "not_confirmed",
+                "raising " + ", ".join(sorted(raised)) + " must be confirmed: send `confirm` "
+                "with the new value. Tightening needs no confirmation.",
             )
+        try:
+            lease = supervisor.leases.tighten(lease_id, **wanted, loosen=bool(raised))
         except LeaseRefused as exc:
             return _error(400, "lease_refused", str(exc))
-        return JSONResponse({"lease_id": lease.lease_id, "max_spend": lease.max_spend})
+
+        held = []
+        if raised.get("max_hours") and supervisor.fleet is not None:
+            # The host was held only as long as the lease was going to last.
+            for host in supervisor.fleet.hosts.values():
+                if host.lease_id == lease_id and host.prepared and not host.released:
+                    host.hold_until = lease.opened_at + lease.max_hours * 3600
+                    held.append(host.host_id)
+        if raised:
+            supervisor.events.record(
+                "lease_extended",
+                f"{lease_id} extended: "
+                + ", ".join(f"{k} {getattr(before, k)} → {v}" for k, v in sorted(raised.items()))
+                + (f"; {', '.join(held)} held for the longer lease" if held else ""),
+                numbers={**raised, "was": {k: getattr(before, k) for k in raised}},
+                lease_id=lease_id,
+            )
+        return JSONResponse({
+            "lease_id": lease.lease_id, "max_spend": lease.max_spend,
+            "max_hours": lease.max_hours, "workers": lease.workers,
+            "hours_left": round(lease.hours_left(), 3), "hosts_held": held,
+        })
 
     @app.post("/pool/hosts/prepare")
     async def prepare_host(request: Request) -> JSONResponse:
@@ -559,6 +682,73 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             {"host_id": host.host_id, "lease_id": host.lease_id, "bid_hourly": host.bid_hourly},
             status_code=201,
         )
+
+    @app.get("/pool/hosts/{host_id}")
+    async def host_detail(host_id: str) -> JSONResponse:
+        """Everything about one host in one answer: what it is, what stage preparing it has
+        reached, what its engine holds right now, and its own slice of the decision log.
+
+        This is what an operator otherwise has to assemble by hand from three places while a
+        host sits at "preparing" with nothing to look at.
+        """
+        configured = supervisor.hosts.get(host_id)
+        rented = supervisor.fleet.hosts.get(host_id) if supervisor.fleet else None
+        if configured is None and rented is None:
+            return _error(404, "unknown_host", f"no host {host_id!r}")
+
+        detail: dict[str, Any] = {"host_id": host_id, "events": supervisor.events.recent(limit=60, host_id=host_id)}
+        required: set[str] = set()
+        client = None
+
+        if configured is not None:
+            required = set(configured.required_tags)
+            client = configured.client
+            detail.update(
+                kind=configured.config.kind, state=configured.state.value, workers=configured.config.workers,
+                residency=configured.config.residency, last_error=configured.last_error,
+                transport=configured.config.transport.type, dial_url=configured.dial_url,
+                tunnel=supervisor.tunnel_status(host_id),
+            )
+        else:
+            required = set(supervisor._rented_required_tags())
+            client = supervisor._rented_clients.get(host_id)
+            detail.update(
+                kind="rented-interruptible", state=rented.state, workers=rented.workers,
+                residency="pinned", hardware=rented.offer.hardware, machine=rented.offer.machine_id,
+                instance=rented.instance.instance_id, bid_hourly=rented.bid_hourly,
+                hours_held=round(rented.hours_held, 3), lease_id=rented.lease_id,
+                estimated_spend=round(rented.estimate(), 4), reported_spend=round(rented.reported_spend, 4),
+                stage=rented.stage, progress=rented.progress, prepared=rented.prepared,
+                tunnel=(
+                    {"up": t.up, "local_port": t.local_port, "restarts": t.restarts, "last_error": t.last_error}
+                    if (t := supervisor.fleet.tunnels.get(host_id)) else None
+                ),
+            )
+            try:  # what the provider itself says — "Pulling from ollama/ollama", and the like
+                status = await supervisor.fleet.provider.status(rented.instance)
+                detail["provider"] = {"state": str(status.state), "detail": status.detail}
+            except Exception as exc:  # noqa: BLE001 - a detail view never fails over a detail
+                detail["provider"] = {"state": "unknown", "detail": str(exc)}
+
+        detail["required_tags"] = sorted(required)
+        if client is not None:
+            try:
+                resident = await supervisor.engine.models_resident(client)
+                available = await supervisor.engine.models_available(client)
+                detail["engine"] = {
+                    "answers": True,
+                    "loaded": sorted(resident),
+                    "on_disk": sorted(available | resident),
+                    "missing_from_disk": sorted(required - (available | resident)),
+                    "not_loaded": sorted(required - resident),
+                }
+            except Exception as exc:  # noqa: BLE001 - say it is not answering, do not 500
+                detail["engine"] = {"answers": False, "detail": str(exc) or type(exc).__name__}
+        else:
+            detail["engine"] = {"answers": False, "detail": "the pool has no connection to this host yet"}
+
+        detail["stage_detail"] = _stage_of(detail)
+        return JSONResponse(detail)
 
     @app.post("/pool/hosts/{host_id}/engine/restart")
     async def restart_host_engine(host_id: str, request: Request) -> JSONResponse:

@@ -142,7 +142,11 @@ def test_opening_a_lease_states_the_worst_case(control):
     worst = response.json()["worst_case"]
     assert worst["dollars"] == 3.0
     assert worst["hours"] == 2
-    assert worst["max_hourly_burn"] == 1.00  # the shipped default (D32)
+    # No overall cap by default any more (D46): the bound is per host, and it is stated.
+    assert worst["max_hourly_burn"] is None
+    assert worst["worst_case_hourly"] == pytest.approx(
+        worst["max_rented_hosts"] * 0.60  # this fixture's per-host bid ceiling
+    )
 
 
 def test_a_lease_that_can_rent_is_refused_without_a_dollar_cap(control):
@@ -154,18 +158,32 @@ def test_a_lease_that_can_rent_is_refused_without_a_dollar_cap(control):
     assert "dollar cap" in response.json()["detail"]
 
 
-def test_a_lease_can_be_tightened_but_not_loosened(control):
-    _, url, _ = control
+def test_a_lease_is_tightened_freely_and_extended_only_when_confirmed(control):
+    """Extending in flight is what an operator wants when a host is worth keeping; raising a
+    limit is still loosening, so it is typed again (D49)."""
+    supervisor, url, _ = control
     with client(url) as http:
         lease_id = http.post(
-            "/pool/leases", json={"workers": 4, "max_spend": 3.0, "allow_rent": True}
+            "/pool/leases", json={"workers": 4, "max_hours": 1.0, "max_spend": 3.0, "allow_rent": True}
         ).json()["lease_id"]
 
         assert http.patch(f"/pool/leases/{lease_id}", json={"max_spend": 1.0}).status_code == 200
-        loosened = http.patch(f"/pool/leases/{lease_id}", json={"max_spend": 99.0})
 
-    assert loosened.status_code == 400
-    assert "tightened" in loosened.json()["detail"]
+        unconfirmed = http.patch(f"/pool/leases/{lease_id}", json={"max_hours": 4.0})
+        assert unconfirmed.status_code == 400 and unconfirmed.json()["error"] == "not_confirmed"
+
+        wrong = http.patch(f"/pool/leases/{lease_id}", json={"max_hours": 4.0, "confirm": "3.0"})
+        assert wrong.status_code == 400
+
+        extended = http.patch(f"/pool/leases/{lease_id}", json={"max_hours": 4.0, "confirm": "4.0"})
+        assert extended.status_code == 200 and extended.json()["max_hours"] == 4.0
+        assert extended.json()["hours_left"] > 3.9
+        # and the worker count is left exactly as it was: only what was asked for changes
+        assert extended.json()["workers"] == 4
+
+        missing = http.patch("/pool/leases/nobody", json={"max_hours": 9.0})
+    assert missing.status_code == 404
+    assert "lease_extended" in [e["kind"] for e in supervisor.events.recent(20)]
 
 
 def test_leases_report_spend_against_their_cap(control):

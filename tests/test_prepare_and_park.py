@@ -6,6 +6,7 @@ preparing answers "get one ready before I start" and "keep one warm between runs
 
 import time
 
+import httpx
 import pytest
 from fakes.fake_ollama import FakeOllama
 from fakes.harness import BackgroundLoop, ServerHandle
@@ -117,6 +118,22 @@ async def test_the_model_set_is_pulled_and_pinned_on_a_prepared_host(fleet):
         assert MODEL in engine_fake.resident
         prepared = [e for e in fleet.events.recent() if e["kind"] == "prepared"][0]
         assert prepared["numbers"]["tags"] == [MODEL]
+    finally:
+        server.stop()
+        loop.stop()
+
+
+async def test_an_embedding_model_in_the_set_is_pinned_through_the_endpoint_it_serves():
+    """The engine refuses `generate` for an embedding model (seen live: a 400 that sent a
+    rented host back as unable to hold the set)."""
+    loop = BackgroundLoop()
+    engine_fake = FakeOllama(available={"chat-model:1", "an-embed-model:1"})
+    server = ServerHandle(engine_fake.app, loop)
+    try:
+        async with httpx.AsyncClient(base_url=server.base_url) as client:
+            await OllamaEngine().load_and_pin(client, ["an-embed-model:1", "chat-model:1"])
+        assert engine_fake.pinned == {"chat-model:1", "an-embed-model:1"}
+        assert engine_fake.resident >= {"chat-model:1", "an-embed-model:1"}
     finally:
         server.stop()
         loop.stop()
@@ -255,3 +272,185 @@ async def test_an_engine_start_command_runs_after_the_timer_is_armed(tmp_path):
         assert onstart.index("deadman.sh") < onstart.index("ollama serve &")
     finally:
         database.close()
+
+
+# --- a cut download is retried, not the host thrown away ---
+
+
+async def _prepare_over(tmp_path, cut=0, end_early=0, refuse=False, released_after=None, **teardown):
+    """A real engine on a real socket: a download can only truly be cut over one."""
+    database = Database(tmp_path / "retry.sqlite3")
+    fleet = make_fleet(database, FakeProvider(), teardown={"pull_retry_after_s": 0, **teardown})
+    loop = BackgroundLoop()
+    engine_fake = FakeOllama(resident=set())
+    engine_fake.pull_cut_times, engine_fake.pull_end_early_times, engine_fake.refuse_pull = cut, end_early, refuse
+    server = ServerHandle(engine_fake.app, loop)
+    try:
+        fleet.provider.engine_urls = [server.base_url]
+        host = await fleet.prepare(max_spend=1.00, max_hours=2)
+        if released_after is not None:
+            real_pull = OllamaEngine.pull
+
+            async def pull_then_release(self, client, tag):
+                result = await real_pull(self, client, tag)
+                if engine_fake.pulls >= released_after:
+                    host.released = True
+                return result
+
+            engine = OllamaEngine()
+            engine.pull = pull_then_release.__get__(engine)
+        else:
+            engine = OllamaEngine()
+        client = build_client(fleet.config.hosts[0].transport, fleet.config.pool, server.base_url)
+        try:
+            loaded = await fleet.load_model_set(host, engine, client)
+        finally:
+            await client.aclose()
+        return loaded, fleet.events.recent(), engine_fake  # read before the database closes
+    finally:
+        server.stop()
+        loop.stop()
+        database.close()
+
+
+async def test_a_download_cut_partway_is_retried_and_the_host_joins(tmp_path):
+    """Seen live: three H200 hosts destroyed in a row, each after its model download was cut."""
+    loaded, events, engine = await _prepare_over(tmp_path, cut=2)
+
+    assert loaded and MODEL in engine.resident
+    assert engine.pulls == 3
+    retries = [e for e in events if e["kind"] == "pull_retry"]
+    assert [e["numbers"]["attempt"] for e in reversed(retries)] == [2, 3]
+    assert "resuming what arrived" in retries[0]["summary"]
+    assert {"prepared"} <= {e["kind"] for e in events} and "prepare_failed" not in {e["kind"] for e in events}
+
+
+async def test_a_download_that_ends_without_success_is_not_taken_as_done(tmp_path):
+    loaded, events, engine = await _prepare_over(tmp_path, end_early=1)
+    assert loaded and engine.pulls == 2  # the quiet early end was retried, not believed
+
+
+async def test_a_model_the_registry_does_not_have_is_not_retried(tmp_path):
+    loaded, events, engine = await _prepare_over(tmp_path, refuse=True)
+    assert not loaded and engine.pulls == 1
+    assert "pull_retry" not in {e["kind"] for e in events}
+    failed = next(e for e in events if e["kind"] == "prepare_failed")
+    assert failed["numbers"]["retryable"] is False
+
+
+async def test_retries_are_bounded_and_say_how_many_there_were(tmp_path):
+    loaded, events, engine = await _prepare_over(tmp_path, cut=99, pull_attempts=3)
+    assert not loaded and engine.pulls == 3
+    failed = next(e for e in events if e["kind"] == "prepare_failed")
+    assert "after 3 attempts" in failed["summary"]
+
+
+async def test_a_host_released_while_its_download_is_retried_is_not_pulled_again(tmp_path):
+    loaded, events, engine = await _prepare_over(tmp_path, cut=99, released_after=1)
+    assert not loaded and engine.pulls == 1
+
+
+# --- a prepare lease ends with its host (D47) ---
+
+
+def lease_of(fleet, lease_id):
+    return fleet.leases.get(lease_id)
+
+
+async def test_a_prepare_lease_closes_when_its_host_is_destroyed(fleet):
+    """Found live: four prepare leases outlived their hosts, one by 18 minutes, each still
+    spending authority whose workers the pool counted as demand."""
+    host = await fleet.prepare(max_spend=1.00, max_hours=2)
+    await fleet.destroy(host, "could not hold the pool's model set")
+
+    lease = lease_of(fleet, host.lease_id)
+    assert not lease.is_open
+    assert host.host_id in lease.closed_reason and "could not hold" in lease.closed_reason
+    assert "lease_closed" in kinds(fleet)
+
+
+async def test_a_prepare_lease_closes_when_its_host_is_evicted_and_not_re_bid(fleet):
+    host = await fleet.prepare(max_spend=1.00, max_hours=2)
+    fleet.provider.evict(host.instance.instance_id)
+    fleet.provider.offers = []  # nothing to re-bid on, nothing to replace it with
+    await fleet.handle_evictions()
+
+    assert host.released
+    eviction = next(e for e in fleet.events.recent() if e["kind"] == "eviction")
+    assert "rebid" not in eviction["summary"]
+    assert not lease_of(fleet, host.lease_id).is_open
+
+
+async def test_a_prepare_lease_closes_when_its_host_vanishes_at_the_provider(fleet):
+    host = await fleet.prepare(max_spend=1.00, max_hours=2)
+    del fleet.provider.instances[host.instance.instance_id]
+    await fleet.handle_evictions()
+    assert "no longer exists" in lease_of(fleet, host.lease_id).closed_reason
+
+
+async def test_once_closed_nothing_is_rented_in_its_place(fleet):
+    host = await fleet.prepare(max_spend=1.00, max_hours=2)
+    await fleet.destroy(host, "evicted; destroy")
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    assert fleet.hosts == {}
+    assert len(fleet.provider.instances) == 0
+
+
+async def test_an_overflow_lease_stays_open_after_an_eviction_so_capacity_is_recovered(fleet):
+    """Unchanged on purpose: an overflow lease is standing demand, not one host's."""
+    lease = fleet.open_lease(workers=6, max_hours=4, max_spend=5.00, allow_rent=True)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    (host,) = fleet.hosts.values()
+    assert not host.prepared
+    await fleet.destroy(host, "evicted; replace")
+    assert lease_of(fleet, lease.lease_id).is_open
+
+
+async def test_a_lease_already_closed_keeps_the_reason_it_closed_for(fleet):
+    host = await fleet.prepare(max_spend=1.00, max_hours=2)
+    fleet.leases.close(host.lease_id, "dollar cap reached")
+    await fleet.destroy(host, "dollar cap reached")
+    assert lease_of(fleet, host.lease_id).closed_reason == "dollar cap reached"
+
+
+async def test_a_download_reports_its_progress_while_it_runs(tmp_path):
+    """So a host being prepared shows a 19 GB download moving, rather than "preparing"."""
+    loaded, events, engine = await _prepare_over(tmp_path)
+    assert loaded
+    prepared = next(e for e in events if e["kind"] == "prepared")
+    assert prepared["numbers"]["bytes"] == engine.pull_bytes
+
+
+async def test_the_stage_says_which_model_is_downloading_and_then_that_it_is_loading(tmp_path):
+    seen = []
+    database = Database(tmp_path / "stage.sqlite3")
+    fleet = make_fleet(database, FakeProvider(), teardown={"pull_retry_after_s": 0})
+    loop = BackgroundLoop()
+    engine_fake = FakeOllama(resident=set())
+    server = ServerHandle(engine_fake.app, loop)
+    try:
+        fleet.provider.engine_urls = [server.base_url]
+        host = await fleet.prepare(max_spend=1.00, max_hours=2)
+        engine = OllamaEngine()
+        real_pull = engine.pull
+
+        async def watch(client, tag, on_progress=None):
+            result = await real_pull(client, tag, on_progress=on_progress)
+            seen.append((host.stage, dict(host.progress)))
+            return result
+
+        engine.pull = watch
+        client = build_client(fleet.config.hosts[0].transport, fleet.config.pool, server.base_url)
+        try:
+            assert await fleet.load_model_set(host, engine, client)
+        finally:
+            await client.aclose()
+    finally:
+        server.stop()
+        loop.stop()
+        database.close()
+
+    stage, progress = seen[0]
+    assert stage == f"downloading {MODEL}"
+    assert progress[MODEL]["total"] == engine_fake.pull_bytes
+    assert host.stage == ""  # cleared once the set is held

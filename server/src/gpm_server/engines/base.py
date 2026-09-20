@@ -29,6 +29,10 @@ class PullResult:
     #: What the pull moved, for the cost the console shows against its estimate.
     bytes_total: int = 0
     detail: Optional[str] = None
+    #: Whether a failed pull is worth trying again: a connection cut mid-download is; a tag
+    #: the registry does not have is not. Unset means no — an adapter that does not say is
+    #: not retried, which is what it did before retries existed.
+    retryable: bool = False
 
 
 @runtime_checkable

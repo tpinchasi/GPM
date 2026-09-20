@@ -394,6 +394,38 @@ class TeardownConfig(BaseModel):
     #: The longest lease allowed on a provider with no instance-scoped credential, where
     #: nothing on the host can stop it billing.
     max_hours_without_deadman: float = 1.0
+    #: How many times one model's download is tried before the host is given up. A cut
+    #: download resumes from what arrived, so a retry is cheap; a host is not.
+    pull_attempts: int = Field(default=4, ge=1, le=10)
+    #: The wait before the second attempt; it doubles for each one after, up to two minutes.
+    pull_retry_after_s: float = Field(default=10.0, ge=0.0)
+
+
+class CapacityMatch(BaseModel):
+    """What a capacity profile applies to. Every field given must hold; none given matches all."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: The hardware as the market lists it, e.g. "1x RTX PRO 6000 Max-Q" — compared whole and
+    #: case-insensitively, so "2x …" of the same card is a different profile, as it should be.
+    hardware: Optional[str] = None
+    min_gpu_memory_gb: Optional[float] = None
+    capability: Optional[str] = None
+
+
+class CapacityProfile(BaseModel):
+    """How many workers a class of hardware runs (docs/spec/hosts-routing-capacity.md §2.1).
+
+    On hosts the pool creates, the engine is launched with the same parallelism, so the number
+    is real and not just a count of queue slots. First matching profile wins.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    match: CapacityMatch
+    max_workers: int = Field(ge=1, le=64)
+    #: Why this number: the evidence it rests on. Shown beside it wherever it is used.
+    note: Optional[str] = None
 
 
 class LimitsConfig(BaseModel):
@@ -401,8 +433,13 @@ class LimitsConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    max_rented_hosts: int = 1
-    max_hourly_burn: float = 1.00
+    max_rented_hosts: int = Field(default=1, ge=0)
+    #: Optional, and unset by default (D46): the cap that matters is per host — every bid is
+    #: clamped to `rented.bidding.bid_ceiling` and every offer filtered by `max_all_in_hourly` —
+    #: so the pool's hourly spend is already bounded by `max_rented_hosts × bid_ceiling`, and a
+    #: second total would only block the host count the operator asked for. Set it to impose an
+    #: overall budget below that bound.
+    max_hourly_burn: Optional[float] = Field(default=None, gt=0)
 
 
 class RentedConfig(BaseModel):
@@ -410,6 +447,10 @@ class RentedConfig(BaseModel):
 
     provider: str
     provider_settings: dict[str, Any] = Field(default_factory=dict)
+    #: How hosts are rented (D52). `interruptible`: bid, cheaper, can be outbid at any moment.
+    #: `on_demand`: pay the listed price, and nobody can take the host away. `cheaper`: look at
+    #: both and let ranking decide, which weighs the price against the download it would waste.
+    mode: Literal["interruptible", "on_demand", "cheaper"] = "interruptible"
     #: Pinned, never a floating tag (threat model T10).
     image: str = "ollama/ollama:0.34.2"
     disk_gb: float = 60.0
@@ -443,6 +484,7 @@ class PoolConfig(BaseModel):
     auth: AuthConfig
     engine: str = "ollama"
     catalog: dict[str, CatalogEntry] = Field(default_factory=dict)
+    capacity_profiles: list[CapacityProfile] = Field(default_factory=list)
     hosts: list[HostConfig] = Field(default_factory=list)
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
     #: Absent means the pool cannot rent at all — there is nothing to spend with.

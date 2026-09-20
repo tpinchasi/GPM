@@ -137,6 +137,46 @@ def test_the_console_script_parses(name):
         subprocess.run([node, "--check", str(STATIC / name)], check=True, capture_output=True)
 
 
+def _a_browser() -> str | None:
+    found = shutil.which("google-chrome") or shutil.which("chromium")
+    mac = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    return found or (mac if Path(mac).exists() else None)
+
+
+def test_a_browser_really_runs_the_page_to_its_last_line():
+    """The bracket check is not a parser, and `node` is not on every machine. Twice in one day
+    a syntax error reached a running console — once a dropped `)`, once an arrow eaten by an
+    edit (`const feed = () =`) — and both times every Python test passed, because nothing
+    executed the page. A browser does.
+
+    Loading the real page and finding the key dialog open proves the script parsed *and* ran
+    to its final statement, which is what opens it.
+    """
+    browser = _a_browser()
+    if browser is None:
+        pytest.skip("no browser here; `node --check` above and CI cover the parse")
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as profile:
+        # It prints the DOM and then does not exit, so take what it printed and end it.
+        browsing = subprocess.Popen(
+            [browser, "--headless=new", "--disable-gpu", "--no-first-run", f"--user-data-dir={profile}",
+             "--virtual-time-budget=4000", "--dump-dom", (STATIC / "index.html").as_uri()],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            dom, complaints = browsing.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            browsing.kill()
+            dom, complaints = browsing.communicate()
+
+    assert 'id="key-dialog" open' in dom, (
+        "the page did not run to its last line — the script failed to parse or threw:\n"
+        + dom[-600:] + "\n" + complaints[-2000:]
+    )
+
+
 def test_the_bracket_check_would_catch_a_dropped_closing_paren():
     """The check itself, on the exact mistake it exists for — and on what must not trip it."""
     assert unbalanced('el("a", el("b"));') is None
@@ -662,3 +702,218 @@ def test_the_concurrency_check_tells_a_serialising_engine_from_a_parallel_one(co
     assert step["ok"] is passes, step
     assert step["fix"] == fix
     assert ("serialising" in step["detail"]) is serialise
+
+
+async def test_a_market_that_could_not_be_asked_is_not_reported_as_an_empty_market(console):
+    """Found live: the provider rate-limited the pool, the offer search returned [], and the
+    console said "0 offers seen" — which reads as "the market has nothing in it". The two are
+    entirely different problems and must not look the same (D44)."""
+    from gpm_server.providers.base import ProviderRateLimited
+
+    supervisor, url, _, loop = console
+
+    async def refuse(_query):
+        raise ProviderRateLimited("POST /api/v0/bundles: rate limited")
+
+    supervisor.fleet.provider.search_offers = refuse
+    preview = loop.run(supervisor.fleet.market_preview(hours=1))
+
+    assert preview["seen"] == 0
+    assert "rate limited" in preview["problem"]
+
+    # And when the market really is empty, nothing is blamed on the provider.
+    async def nothing(_query):
+        return []
+
+    supervisor.fleet.provider.search_offers = nothing
+    supervisor.fleet._offer_retry_at = 0.0  # past the back-off the refusal above set
+    assert loop.run(supervisor.fleet.market_preview(hours=1))["problem"] is None
+
+
+async def test_a_rate_limited_market_is_backed_off_rather_than_asked_again_next_pass(console):
+    """Asking again on the next pass is what earned the refusal in the first place (D44)."""
+    from gpm_server.providers.base import ProviderRateLimited
+
+    supervisor, url, _, loop = console
+    asked = []
+
+    async def refuse(_query):
+        asked.append(1)
+        raise ProviderRateLimited("rate limited")
+
+    supervisor.fleet.provider.search_offers = refuse
+    for _ in range(4):
+        loop.run(supervisor.fleet.market_preview(hours=1))
+
+    assert len(asked) == 1, "the provider was asked again while backing off"
+    preview = loop.run(supervisor.fleet.market_preview(hours=1))
+    assert "not asking again" in preview["problem"]
+
+    # Once the window passes and the provider answers, the backoff clears.
+    supervisor.fleet._offer_retry_at = 0.0
+
+    async def works(_query):
+        return []
+
+    supervisor.fleet.provider.search_offers = works
+    assert loop.run(supervisor.fleet.market_preview(hours=1))["problem"] is None
+    assert supervisor.fleet._offer_backoff_s == 0.0
+
+
+# --- following one host while it is prepared (D48) ---
+
+
+def test_the_decision_log_can_be_asked_for_one_hosts_slice(console):
+    supervisor, url, _, _ = console
+    supervisor.events.record("rented", "a", host_id="host-a")
+    supervisor.events.record("rented", "b", host_id="host-b")
+    supervisor.events.record("prepared", "a again", host_id="host-a")
+
+    with client(url) as http:
+        mine = http.get("/pool/events?host_id=host-a").json()["events"]
+        everything = http.get("/pool/events").json()["events"]
+
+    assert [e["summary"] for e in mine] == ["a again", "a"]
+    assert len(everything) > len(mine)
+
+
+def test_one_host_answers_with_its_state_its_engine_and_its_own_events(console):
+    supervisor, url, _, _ = console
+    supervisor.events.record("rented", "something about it", host_id="local-1")
+
+    with client(url) as http:
+        detail = http.get("/pool/hosts/local-1").json()
+        unknown = http.get("/pool/hosts/nobody")
+
+    assert detail["host_id"] == "local-1" and detail["kind"] == "local"
+    assert detail["required_tags"] == [MODEL]
+    # Nothing listens at the fixture's address, so the honest answer is "not answering".
+    assert detail["engine"]["answers"] is False
+    assert [e["summary"] for e in detail["events"]] == ["something about it"]
+    assert "stage_detail" in detail
+    assert unknown.status_code == 404
+
+
+@pytest.mark.parametrize("detail, expected", [
+    ({"state": "ready"}, "ready — serving requests"),
+    ({"state": "parked"}, "parked"),
+    ({"state": "preparing", "engine": {"answers": False}, "provider": {"detail": "Pulling from ollama/ollama"}},
+     "the provider is still starting"),
+    ({"state": "preparing", "engine": {"answers": False}}, "waiting for the engine to answer"),
+    ({"state": "preparing", "engine": {"answers": True}, "stage": "downloading m1",
+      "progress": {"m1": {"completed": 6_000_000_000, "total": 18_600_000_000}}},
+     "downloading m1 — 6.0 of 18.6 GB"),
+    ({"state": "preparing", "engine": {"answers": True, "missing_from_disk": ["m1"], "not_loaded": ["m1"]}},
+     "models still to download: m1"),
+    ({"state": "preparing", "engine": {"answers": True, "missing_from_disk": [], "not_loaded": ["m1"]}},
+     "downloaded; loading into memory: m1"),
+    ({"state": "preparing", "engine": {"answers": True, "missing_from_disk": [], "not_loaded": []}},
+     "waiting for the next probe"),
+])
+def test_the_stage_is_said_in_words_and_derived_from_what_is_known(detail, expected):
+    from gpm_server.supervisor.control import _stage_of
+
+    assert expected in _stage_of(detail)
+
+
+def test_the_console_opens_a_host_and_follows_it():
+    """Structural: the page must ask for one host and keep asking while the panel is open."""
+    script = (STATIC / "app.js").read_text()
+    assert "/pool/hosts/${encodeURIComponent(id)}" in script
+    assert "hostLink" in script and "setInterval(drawHost" in script
+    assert "clearInterval(hostWatch.timer)" in script  # and stop when it is closed
+
+
+async def test_extending_a_lease_keeps_the_host_it_was_extended_for(console):
+    """The point of extending in flight: the host must outlive the original hour too."""
+    supervisor, url, _, loop = console
+    host = loop.run(supervisor.fleet.prepare(max_spend=1.00, max_hours=1.0))
+    was_held_until = host.hold_until
+    lease_id = host.lease_id
+
+    with client(url) as http:
+        answer = http.patch(f"/pool/leases/{lease_id}", json={"max_hours": 5.0, "confirm": "5.0"})
+
+    assert answer.status_code == 200
+    assert answer.json()["hosts_held"] == [host.host_id]
+    assert host.hold_until > was_held_until + 3 * 3600
+    extended = next(e for e in supervisor.events.recent(20) if e["kind"] == "lease_extended")
+    assert host.host_id in extended["summary"] and "max_hours 1.0 → 5.0" in extended["summary"]
+
+
+def test_a_lease_can_be_acted_on_wherever_it_is_shown():
+    """The overview and the Leases screen share one set of buttons, so they cannot drift into
+    offering different things for the same lease."""
+    script = (STATIC / "app.js").read_text()
+    assert script.count("leaseActions(lease)") == 2  # the overview table, and the leases table
+    actions = script[script.index("const leaseActions"):script.index("const leaseActions") + 900]
+    for label in ("Tighten", "Extend", "Close"):
+        assert f'"{label}")' in actions, label
+
+
+# --- changing the offer search from the Rented capacity screen (D51) ---
+
+
+def test_a_setting_is_changed_in_place_leaving_the_rest_of_the_file_alone():
+    """Loading the YAML and dumping it back would delete every comment an operator wrote."""
+    from gpm_server.configplan import set_values
+
+    before = (
+        "rented:\n"
+        "  provider: vast            # the account credential is read from the environment\n"
+        "  offer_policy:\n"
+        "    min_gpu_memory_gb: 80\n"
+        "    max_download_per_gb: 0.015   # half a cent per GB\n"
+        "    verified_only: true\n"
+        "  bidding: { bid_ceiling: 0.80, premium: 0.02 }\n"
+    )
+    after = set_values(before, ("rented", "offer_policy"), {"min_gpu_memory_gb": 48, "avoid_machines": ["144381"]})
+    after = set_values(after, ("rented", "bidding"), {"bid_ceiling": 0.9, "attempts": 5})
+
+    assert "# the account credential is read from the environment" in after
+    assert "max_download_per_gb: 0.015   # half a cent per GB" in after  # untouched, comment kept
+    assert "    min_gpu_memory_gb: 48\n" in after
+    assert '    avoid_machines: ["144381"]\n' in after  # added under the right block
+    assert "  bidding: { bid_ceiling: 0.9, premium: 0.02, attempts: 5 }\n" in after  # flow style kept
+
+
+def test_a_setting_the_pool_cannot_place_unambiguously_is_refused_not_guessed():
+    from gpm_server.configplan import CannotEdit, set_values
+
+    with pytest.raises(CannotEdit, match="not in the configuration"):
+        set_values("rented:\n  provider: vast\n", ("rented", "offer_policy"), {"min_disk_gb": 1})
+    twice = "rented:\n  offer_policy:\n    min_disk_gb: 10\n    min_disk_gb: 20\n"
+    with pytest.raises(CannotEdit, match="more than once"):
+        set_values(twice, ("rented", "offer_policy"), {"min_disk_gb": 30})
+
+
+def test_the_search_can_be_changed_from_the_rented_screen(console):
+    supervisor, url, path, _ = console
+    path.write_text(edited(path.read_text(), "  bidding: {bid_ceiling: 0.60}",
+                           "  bidding: {bid_ceiling: 0.60}\n  offer_policy: {min_gpu_memory_gb: 24}"))
+    supervisor.reload_config()
+
+    with client(url) as http:
+        tightened = http.patch("/pool/config/rented", json={"offer_policy": {"min_gpu_memory_gb": 48}})
+        assert tightened.status_code == 200, tightened.text
+        assert supervisor.config.rented.offer_policy.min_gpu_memory_gb == 48
+
+        # Raising a price ceiling is loosening: refused, and the refusal carries the plan.
+        loosened = http.patch("/pool/config/rented", json={"bidding": {"bid_ceiling": 5.0}})
+        assert loosened.status_code == 400 and loosened.json()["error"] == "not_confirmed"
+        retype = [c for c in loosened.json()["changes"] if c["requires_retype"]][0]
+        assert supervisor.config.rented.bidding.bid_ceiling == 0.60  # nothing applied
+
+        confirmed = http.patch("/pool/config/rented", json={"bidding": {"bid_ceiling": 5.0}, "confirm": retype["value"]})
+        assert confirmed.status_code == 200
+        assert supervisor.config.rented.bidding.bid_ceiling == 5.0
+
+        nonsense = http.patch("/pool/config/rented", json={"offer_policy": {"min_reliability": "soon"}})
+    assert nonsense.status_code == 400 and nonsense.json()["error"] == "invalid_config"
+
+
+def test_the_preview_says_what_is_saved_so_the_form_is_the_pools_own(console):
+    supervisor, url, _, loop = console
+    preview = loop.run(supervisor.fleet.market_preview(hours=1))
+    assert preview["saved"]["bidding"]["bid_ceiling"] == supervisor.config.rented.bidding.bid_ceiling
+    assert "min_gpu_memory_gb" in preview["saved"]["offer_policy"]

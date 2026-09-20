@@ -42,6 +42,11 @@ class FakeOllama:
         #: Scripted: what a pull reports as its size, and a pause between its progress frames.
         self.pull_bytes = 1_000_000_000
         self.pull_delay_s = 0.0
+        #: Scripted: how many pulls are cut partway, with the connection dropped mid-body the
+        #: way a real one was — and how many end quietly without the engine saying "success".
+        self.pull_cut_times = 0
+        self.pull_end_early_times = 0
+        self.pulls = 0
         #: Scripted: how long one generation takes, and whether the engine runs them one at a
         #: time whatever it was asked for — an engine left at parallelism 1.
         self.generate_delay_s = 0.0
@@ -62,6 +67,7 @@ class FakeOllama:
                 Route("/api/chat", self._chat, methods=["POST"]),
                 Route("/api/generate", self._generate, methods=["POST"]),
                 Route("/api/embed", self._embed, methods=["POST"]),
+                Route("/api/show", self._show, methods=["POST"]),
                 Route("/api/pull", self._pull, methods=["POST"]),
                 Route("/api/delete", self._delete, methods=["DELETE"]),
             ]
@@ -142,6 +148,9 @@ class FakeOllama:
     async def _generate(self, request: Request) -> Response:
         _, parsed = await self._record(request)
         model = parsed.get("model", "")
+        if _is_embedding(model):
+            # What the real engine answers (seen live).
+            return JSONResponse({"error": f'"{model}" does not support generate'}, status_code=400)
         refused = self._use(model)
         if refused is not None:
             return refused
@@ -168,27 +177,53 @@ class FakeOllama:
         texts = parsed.get("input") or []
         if isinstance(texts, str):
             texts = [texts]
-        refused = self._use(parsed.get("model", ""))
+        model = parsed.get("model", "")
+        refused = self._use(model)
         if refused is not None:
             return refused
+        if "keep_alive" in parsed:
+            (self.pinned.add if parsed["keep_alive"] == -1 else self.pinned.discard)(model)
         self.started += 1
         self.completed += 1
         return JSONResponse(
             {
-                "model": parsed.get("model", ""),
+                "model": model,
                 "embeddings": [[float(len(text)), 0.5, 0.25] for text in texts],
             }
         )
 
+    async def _show(self, request: Request) -> Response:
+        _, parsed = await self._record(request)
+        model = parsed.get("model", "")
+        if model not in self.available:
+            return JSONResponse({"error": f"model '{model}' not found"}, status_code=404)
+        return JSONResponse({"capabilities": ["embedding"] if _is_embedding(model) else ["completion"]})
+
     async def _pull(self, request: Request) -> Response:
         _, parsed = await self._record(request)
         tag = parsed.get("model", "")
+        self.pulls += 1
         if self.refuse_pull:
             return JSONResponse({"error": f"no such model {tag}"}, status_code=404)
+
+        cut = self.pull_cut_times > 0
+        early = not cut and self.pull_end_early_times > 0
+        if cut:
+            self.pull_cut_times -= 1
+        elif early:
+            self.pull_end_early_times -= 1
 
         async def frames():
             # A pull puts the model on disk. It does not load it: that is a separate act.
             size = self.pull_bytes
+            if cut or early:
+                frame = {"status": "pulling", "digest": "sha256:layer", "total": size, "completed": size // 3}
+                yield (json.dumps(frame) + "\n").encode()
+                if cut:
+                    # Raised inside the body after headers went out: the server drops the
+                    # connection, and the client sees an incomplete chunked read — as seen live.
+                    raise ConnectionResetError("fake: download cut")
+                return
             for done in (0, size // 2, size):
                 frame = {"status": "pulling", "digest": "sha256:layer", "total": size, "completed": done}
                 yield (json.dumps(frame) + "\n").encode()
@@ -278,3 +313,8 @@ def unused_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def _is_embedding(model: str) -> bool:
+    """The fake's stand-in for what the real engine reads from the model file."""
+    return "embed" in model

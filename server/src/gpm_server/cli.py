@@ -167,8 +167,8 @@ def _lease(args: argparse.Namespace) -> int:
             "POST",
             "/pool/leases",
             {
-                "workers": args.workers,
-                "max_hours": args.max_hours,
+                "workers": args.workers if args.workers is not None else 1,
+                "max_hours": args.max_hours if args.max_hours is not None else 4.0,
                 "max_spend": args.max_spend,
                 "allow_rent": args.allow_rent,
                 "bid_ceiling": args.bid_ceiling,
@@ -176,6 +176,13 @@ def _lease(args: argparse.Namespace) -> int:
         )
     if args.action == "close":
         return _control(args, "DELETE", f"/pool/leases/{args.lease_id}")
+    if args.action in ("tighten", "extend"):
+        # One call either way: the pool decides which it is by comparing with the lease, and
+        # only a raise needs --confirm.
+        body = {k: v for k, v in (
+            ("max_spend", args.max_spend), ("max_hours", args.max_hours), ("workers", args.workers),
+        ) if v is not None}
+        return _control(args, "PATCH", f"/pool/leases/{args.lease_id}", {**body, "confirm": args.confirm})
     return _control(args, "GET", "/pool/leases")
 
 
@@ -192,6 +199,8 @@ def _host(args: argparse.Namespace) -> int:
                 "when_ready": args.when_ready,
             },
         )
+    if args.action == "show":
+        return _control(args, "GET", f"/pool/hosts/{args.host_id}")
     if args.action == "restart-engine":
         return _control(
             args, "POST", f"/pool/hosts/{args.host_id}/engine/restart",
@@ -308,14 +317,16 @@ def main(argv: list[str] | None = None) -> int:
     key.set_defaults(func=_key)
 
     lease = subparsers.add_parser("lease", help="open, close and list leases")
-    lease.add_argument("action", choices=["open", "close", "list"])
+    lease.add_argument("action", choices=["open", "close", "list", "tighten", "extend"])
     lease.add_argument("lease_id", nargs="?", default=None)
-    lease.add_argument("--workers", type=int, default=1)
-    lease.add_argument("--max-hours", type=float, default=4.0)
+    lease.add_argument("--workers", type=int, default=None)
+    lease.add_argument("--max-hours", type=float, default=None)
     #: No default on purpose: a lease that can rent must state its dollars (D32).
     lease.add_argument("--max-spend", type=float, default=None)
     lease.add_argument("--allow-rent", action="store_true")
     lease.add_argument("--bid-ceiling", type=float, default=None)
+    lease.add_argument("--confirm", default=None,
+                       help="extend: the new value again, since raising a limit is loosening")
     lease.add_argument("--url", default=None)
     lease.set_defaults(func=_lease)
 
@@ -335,7 +346,7 @@ def main(argv: list[str] | None = None) -> int:
     host_test.set_defaults(func=_host_test)
 
     host = subparsers.add_parser("host", help="prepare, drain, release or park a rented host")
-    host.add_argument("action", choices=["prepare", "drain", "release", "park", "delete-model", "restart-engine"])
+    host.add_argument("action", choices=["prepare", "drain", "release", "park", "delete-model", "restart-engine", "show"])
     host.add_argument("--apply-settings", action="store_true",
                       help="restart-engine: first write the parallelism and models-held the pool needs")
     host.add_argument("--tag", default=None, help="delete-model: the model tag to delete from the host's disk")

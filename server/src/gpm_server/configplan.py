@@ -14,6 +14,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
@@ -134,6 +135,35 @@ def plan_changes(
             needs_restart=True,
         ))
 
+    # --- capacity profiles ---
+    def profiles(config: PoolConfig) -> dict[str, tuple[int, Optional[str]]]:
+        found = {}
+        for profile in config.capacity_profiles:
+            m = profile.match
+            key = ", ".join(f"{k}={v}" for k, v in m.model_dump(exclude_none=True).items()) or "all hardware"
+            found[key] = (profile.max_workers, profile.note)
+        return found
+
+    old_profiles, new_profiles = profiles(current), profiles(candidate)
+    for key in sorted(old_profiles.keys() | new_profiles.keys()):
+        before, after = old_profiles.get(key), new_profiles.get(key)
+        if before == after:
+            continue
+        if after is None:
+            detail = f"the capacity profile for {key} ({before[0]} workers) is removed"
+        elif before is None:
+            detail = f"hosts matching {key} will run {after[0]} workers" + (f" — {after[1]}" if after[1] else "")
+        else:
+            detail = f"hosts matching {key} go from {before[0]} to {after[0]} workers"
+        changes.append(Change(
+            "capacity_profile",
+            detail + "; applies to hosts rented from now on — a running host keeps the "
+            "parallelism its engine was started with",
+        ))
+    if [p.match for p in current.capacity_profiles] != [p.match for p in candidate.capacity_profiles] and \
+            old_profiles.keys() == new_profiles.keys():
+        changes.append(Change("capacity_profile", "the capacity profiles are reordered; the first match wins"))
+
     # --- limits and money ---
     changes.extend(_limit_changes(current, candidate, rented))
     # --- and everything else: a plan is never silent about part of the file ---
@@ -150,6 +180,7 @@ _EXPLAINED = (
     "rented.bidding.bid_ceiling", "rented.image",
     "rented.teardown.idle_minutes", "rented.teardown.deadman_minutes",
     "rented.offer_policy.max_all_in_hourly", "rented.offer_policy.max_download_per_gb",
+    "capacity_profiles",
 )
 _EXPLAINED_PER_HOST = ("transport", "workers", "disabled", "agent", "residency")
 
@@ -253,18 +284,28 @@ def _limit_changes(current: PoolConfig, candidate: PoolConfig, rented: Sequence[
             detail += f"; {over} host(s) beyond it will be drained and released"
         changes.append(Change("max_rented_hosts_lowered", detail))
 
-    if new_limits.max_hourly_burn > old_limits.max_hourly_burn:
-        changes.append(Change(
-            "burn_raised",
-            f"the hourly burn cap goes from ${old_limits.max_hourly_burn:.2f} to ${new_limits.max_hourly_burn:.2f}",
-            requires_retype=f"{new_limits.max_hourly_burn:.2f}",
-        ))
-    elif new_limits.max_hourly_burn < old_limits.max_hourly_burn:
-        burn = sum(host.bid_hourly for host in rented)
-        detail = f"the hourly burn cap drops to ${new_limits.max_hourly_burn:.2f}"
-        if burn > new_limits.max_hourly_burn:
-            detail += f"; the pool is burning ${burn:.3f}/h, so nothing new will be rented until it falls"
-        changes.append(Change("burn_lowered", detail))
+    # The overall cap is optional (D46): unset, the bound is hosts × the per-host ceiling.
+    # Unset is the *looser* end — removing a cap is loosening, setting one is tightening.
+    old_burn, new_burn = old_limits.max_hourly_burn, new_limits.max_hourly_burn
+    says = lambda cap: "no overall cap" if cap is None else f"${cap:.2f}/h"  # noqa: E731
+    if old_burn != new_burn:
+        loosened = new_burn is None or (old_burn is not None and new_burn > old_burn)
+        if loosened:
+            detail = f"the overall hourly burn cap goes from {says(old_burn)} to {says(new_burn)}"
+            if new_burn is None and candidate.rented is not None:
+                bound = new_limits.max_rented_hosts * candidate.rented.bidding.bid_ceiling
+                detail += (f"; spending is then bounded per host — {new_limits.max_rented_hosts} host(s) × "
+                           f"${candidate.rented.bidding.bid_ceiling:.2f}/h = ${bound:.2f}/h at most")
+            changes.append(Change(
+                "burn_raised", detail,
+                requires_retype="none" if new_burn is None else f"{new_burn:.2f}",
+            ))
+        else:
+            burn = sum(host.bid_hourly for host in rented)
+            detail = f"the overall hourly burn cap goes from {says(old_burn)} to {says(new_burn)}"
+            if burn > new_burn:
+                detail += f"; the pool is burning ${burn:.3f}/h, so nothing new will be rented until it falls"
+            changes.append(Change("burn_lowered", detail))
 
     old_rented, new_rented = current.rented, candidate.rented
     if (old_rented is None) != (new_rented is None):
@@ -433,3 +474,107 @@ class ConfigStore:
         if text is None:
             raise ConfigError(f"no kept version {version!r}")
         return self.apply(text)
+
+
+# --- changing one setting without rewriting the file ---------------------------------------
+
+
+class CannotEdit(Exception):
+    """The file cannot be changed here without guessing. The message is for an operator."""
+
+
+def _as_yaml(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)) or value is None:
+        return "null" if value is None else repr(value)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_as_yaml(item) for item in value) + "]"
+    return json.dumps(str(value))
+
+
+def _block_of(lines: list[str], key: str, start: int, end: int, indent: Optional[int]) -> tuple[int, int, int]:
+    """Where `key:`'s own lines are, within lines[start:end]. Returns (its line, first child,
+    last child). Raises if it is missing or appears more than once, because a config the pool
+    cannot read unambiguously is one it must not edit."""
+    pattern = re.compile(rf"^(\s*){re.escape(key)}\s*:(.*)$")
+    found = [
+        (n, m) for n in range(start, end)
+        if (m := pattern.match(lines[n])) and (indent is None or len(m.group(1)) == indent)
+    ]
+    if not found:
+        raise CannotEdit(f"{key!r} is not in the configuration; add it on the Configuration screen first")
+    if len(found) > 1:
+        raise CannotEdit(f"{key!r} appears {len(found)} times; change it on the Configuration screen")
+    at, match = found[0]
+    own_indent = len(match.group(1))
+    last = at
+    for n in range(at + 1, end):
+        stripped = lines[n].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if len(lines[n]) - len(lines[n].lstrip()) <= own_indent:
+            break
+        last = n
+    return at, at + 1, last + 1
+
+
+def set_values(text: str, path: Sequence[str], values: Mapping[str, Any]) -> str:
+    """Change `values` inside the mapping at `path` (e.g. `("rented", "offer_policy")`).
+
+    Everything else in the file is left byte for byte: comments, ordering, and whether a
+    mapping was written in block or flow style. The alternative — loading the YAML and dumping
+    it back — silently deletes every comment an operator wrote, which is not an acceptable
+    price for changing one number (D51).
+    """
+    if not values:
+        return text
+    lines = text.splitlines()
+    start, end, indent = 0, len(lines), 0
+    for step in path:
+        at, first, last = _block_of(lines, step, start, end, indent)
+        inline = lines[at].split(":", 1)[1].strip()
+        if inline.startswith("{"):
+            lines[at] = _set_in_flow(lines[at], values, step)
+            return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+        start, end = first, last
+        indent = None  # children of this block; their own indent is whatever it is
+
+    child_indent = next(
+        (len(line) - len(line.lstrip()) for line in lines[start:end] if line.strip() and not line.strip().startswith("#")),
+        None,
+    )
+    if child_indent is None:
+        raise CannotEdit(f"{'.'.join(path)} has nothing in it to change")
+
+    for key, value in values.items():
+        pattern = re.compile(rf"^(\s*){re.escape(key)}(\s*:\s*)(.*?)(\s+#.*)?$")
+        hits = [n for n in range(start, end) if pattern.match(lines[n]) and len(pattern.match(lines[n]).group(1)) == child_indent]
+        if len(hits) > 1:
+            raise CannotEdit(f"{key!r} appears more than once under {'.'.join(path)}")
+        if hits:
+            match = pattern.match(lines[hits[0]])
+            # The trailing comment is the operator's and is kept, even when it no longer fits.
+            lines[hits[0]] = f"{match.group(1)}{key}{match.group(2)}{_as_yaml(value)}{match.group(4) or ''}"
+        else:
+            lines.insert(end, f"{' ' * child_indent}{key}: {_as_yaml(value)}")
+            end += 1
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+
+
+def _set_in_flow(line: str, values: Mapping[str, Any], name: str) -> str:
+    """A one-line `key: { a: 1, b: 2 }`, changed inside its braces."""
+    head, _, rest = line.partition("{")
+    body, closing, tail = rest.rpartition("}")
+    if not closing:
+        raise CannotEdit(f"{name!r} is written across lines; change it on the Configuration screen")
+    for key, value in values.items():
+        pattern = re.compile(rf"(^|,)(\s*){re.escape(key)}(\s*:\s*)([^,}}]*)")
+        if pattern.search(body):
+            body = pattern.sub(
+                lambda m, key=key, value=value: f"{m.group(1)}{m.group(2)}{key}{m.group(3)}{_as_yaml(value)}",
+                body, count=1,
+            )
+        else:
+            body = (body.rstrip() + ", " if body.strip() else " ") + f"{key}: {_as_yaml(value)} "
+    return f"{head}{{{body}}}{tail}"

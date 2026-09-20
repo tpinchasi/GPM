@@ -89,6 +89,9 @@ class VastProvider:
         self._charges: Optional[tuple[float, dict[str, float]]] = None
         #: How far back to look. A parked host bills storage for as long as it is kept.
         self.charges_window_days = 45
+        #: A guard on the paginated instance listing: better to refuse than to act on half of
+        #: what is running.
+        self.max_instance_pages = 50
 
     # --- plumbing ---
 
@@ -119,13 +122,27 @@ class VastProvider:
         except httpx.HTTPError as exc:
             raise ProviderUnavailable(f"{method} {path}: {exc}") from exc
 
+        if 300 <= response.status_code < 400:
+            # Never quietly read a redirect's own body as the answer (D43) — the one path this
+            # bit us on had a body that happened to parse as valid, contentless JSON.
+            raise ProviderUnavailable(
+                f"{method} {path}: unexpected redirect to {response.headers.get('location', '?')}"
+            )
         if response.status_code in (401, 403):
             raise ProviderAuthError(f"{method} {path}: the account credential was refused")
         if response.status_code == 429:
             raise ProviderRateLimited(f"{method} {path}: rate limited")
         if response.status_code == 410:
-            # The offer went between search and create — ordinary in a live market.
-            raise OfferGone(f"{method} {path}: no longer available")
+            # On an offer, "gone" is ordinary in a live market: it went between search and
+            # create. On any other path it means the *endpoint* is gone — this API answers 410
+            # `deprecated_endpoint` for the retired v0 instance listing (D43) — and calling
+            # that a vanished offer would send the caller down the "try the next offer" path
+            # when the truth is "this client is broken".
+            if "/asks/" in path:
+                raise OfferGone(f"{method} {path}: no longer available")
+            raise ProviderUnavailable(
+                f"{method} {path}: the provider says this endpoint is gone ({response.text[:120]})"
+            )
         if response.status_code >= 400:
             raise ProviderUnavailable(f"{method} {path}: {response.status_code} {response.text[:200]}")
         if not response.content:
@@ -138,22 +155,27 @@ class VastProvider:
     # --- the interface ---
 
     async def search_offers(self, query: OfferQuery) -> list[Offer]:
-        body: dict[str, Any] = {
-            "limit": query.limit,
-            "type": "bid",  # interruptible: the only kind the pool bids on
-            "rentable": {"eq": True},
-        }
+        found: list[Offer] = []
+        if query.interruptible:
+            raw = await self._listing("bid", query)
+            on_demand = await self._on_demand_prices(raw)
+            found.extend(self._to_offer(entry, on_demand) for entry in raw)
+        if query.on_demand:
+            # Priced at what it says, and not outbiddable: its own price is also its ceiling.
+            raw = await self._listing("on-demand", query)
+            found.extend(self._to_offer(entry, {}, interruptible=False) for entry in raw)
+        return found
+
+    async def _listing(self, kind: str, query: OfferQuery) -> list[dict[str, Any]]:
+        body: dict[str, Any] = {"limit": query.limit, "type": kind, "rentable": {"eq": True}}
         if query.verified_only:
             body["verified"] = {"eq": True}
         if query.min_gpu_memory_gb:
             body["gpu_ram"] = {"gte": query.min_gpu_memory_gb * 1024}
         if query.min_disk_gb:
             body["disk_space"] = {"gte": query.min_disk_gb}
-
         payload = await self._call("POST", "/api/v0/bundles", json=body)
-        raw_offers = payload.get("offers", payload if isinstance(payload, list) else [])
-        on_demand = await self._on_demand_prices(raw_offers)
-        return [self._to_offer(entry, on_demand) for entry in raw_offers]
+        return payload.get("offers", payload if isinstance(payload, list) else [])
 
     async def _on_demand_prices(self, bid_offers: list[dict[str, Any]]) -> dict[str, float]:
         """The on-demand price of each machine, from the on-demand listing.
@@ -186,7 +208,10 @@ class VastProvider:
             prices[machine] = min(prices.get(machine, float("inf")), float(price))
         return prices
 
-    def _to_offer(self, entry: dict[str, Any], on_demand: Optional[dict[str, float]] = None) -> Offer:
+    def _to_offer(
+        self, entry: dict[str, Any], on_demand: Optional[dict[str, float]] = None,
+        interruptible: bool = True,
+    ) -> Offer:
         disk_gb = float(entry.get("disk_space") or 0)
         storage_monthly_per_gb = float(entry.get("storage_cost") or 0)
         return Offer(
@@ -196,9 +221,14 @@ class VastProvider:
             gpus=int(entry.get("num_gpus") or 1),
             gpu_memory_gb=_gb(entry.get("gpu_ram")),
             disk_gb=disk_gb,
-            min_bid_hourly=float(entry.get("min_bid") or 0),
+            # On an on-demand listing there is no bid: the price is the price.
+            min_bid_hourly=float(entry.get("min_bid") or 0) if interruptible else float(entry.get("dph_total") or 0),
             all_in_hourly=float(entry.get("dph_total") or 0),
-            on_demand_hourly=(on_demand or {}).get(str(entry.get("machine_id"))),
+            on_demand_hourly=(
+                (on_demand or {}).get(str(entry.get("machine_id")))
+                if interruptible else float(entry.get("dph_total") or 0)
+            ),
+            interruptible=interruptible,
             # Quoted per gigabyte per month; the pool reasons in dollars per hour.
             storage_hourly=storage_monthly_per_gb * disk_gb / _HOURS_PER_MONTH,
             download_per_gb=float(entry.get("inet_down_cost") or 0),
@@ -228,12 +258,35 @@ class VastProvider:
             body["onstart"] = spec.onstart
 
         payload = await self._call("PUT", f"/api/v0/asks/{offer.offer_id}/", json=body)
-        if not payload.get("success", True):
-            raise BidLost(f"bid ${bid} on {offer.machine_id}: {payload.get('msg', 'refused')}")
+        refused = payload.get("msg", "refused") if not payload.get("success", True) else None
         contract = payload.get("new_contract")
-        if contract is None:
-            raise BidLost(f"bid ${bid} on {offer.machine_id} returned no instance")
+
+        if refused is not None or contract is None:
+            # Seen live: this API answered `success: false` and created the instance anyway.
+            # "Either an instance or nothing behind" is this method's contract, so before
+            # reporting the bid lost, look for what the label would have been and end it.
+            stray = await self._destroy_stray(spec.label)
+            detail = refused or "returned no instance"
+            if stray:
+                detail += f" — but created {stray}, which has been destroyed"
+            raise BidLost(f"bid ${bid} on {offer.machine_id}: {detail}")
+
         return Instance(instance_id=str(contract), label=spec.label, machine_id=offer.machine_id)
+
+    async def _destroy_stray(self, label: str) -> Optional[str]:
+        """An instance this exact label names, ended. Returns its id if there was one.
+
+        The label is chosen before the call and used once, so it identifies the attempt even
+        when the response does not.
+
+        A failure to list or destroy propagates as a `ProviderError` rather than a `BidLost`,
+        which is the difference between "that bid did not take, try the next offer" and "I
+        cannot prove nothing is running, stop" — and the caller acts on exactly that.
+        """
+        for instance in await self.list_instances(label):
+            await self.destroy(instance)
+            return instance.instance_id
+        return None
 
     def _remember(self, entry: dict[str, Any]) -> None:
         if entry.get("id") is not None:
@@ -250,9 +303,31 @@ class VastProvider:
         return entry
 
     async def list_instances(self, label_prefix: str) -> list[Instance]:
-        payload = await self._call("GET", "/api/v0/instances", params={"owner": "me"})
+        """Every instance on the account carrying this prefix, in any state.
+
+        On `/api/v1/`, not v0: v0's collection endpoint answers `410 deprecated_endpoint`, and
+        the bare `/api/v0/instances` before it answers a 301 whose body is valid JSON with no
+        "instances" key — which is how this read as "nothing exists" while three instances
+        were billing (D43). v1 paginates, and a half-read page here means a missed orphan, so
+        the pages are followed to the end.
+        """
+        entries: list[dict[str, Any]] = []
+        params: dict[str, Any] = {"owner": "me"}
+        for _ in range(self.max_instance_pages):
+            payload = await self._call("GET", "/api/v1/instances/", params=params)
+            entries.extend(payload.get("instances", []))
+            token = payload.get("next_token")
+            if not token:
+                break
+            params = {**params, "start_token": token}
+        else:
+            raise ProviderUnavailable(
+                f"the instance listing did not end after {self.max_instance_pages} pages; "
+                "refusing to act on a partial list of what is running"
+            )
+
         found = []
-        for entry in payload.get("instances", []):
+        for entry in entries:
             self._remember(entry)
             label = entry.get("label") or ""
             if not label.startswith(label_prefix):

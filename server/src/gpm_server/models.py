@@ -25,6 +25,8 @@ class HostState(str, Enum):
     READY = "ready"
     #: Reachable, but the pool's whole model set is not resident yet.
     PREPARING = "preparing"
+    #: On its way out: it keeps the requests it already has and is given no new ones (D53).
+    DRAINING = "draining"
     UNREACHABLE = "unreachable"
     DISABLED = "disabled"
 

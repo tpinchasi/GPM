@@ -82,6 +82,9 @@ class Offer:
     verified: bool = False
     #: A rough throughput proxy for ranking — never presented as a benchmark.
     throughput_proxy: float = 0.0
+    #: Whether this offer is bid for and can be outbid. False is an on-demand rental: it costs
+    #: `all_in_hourly`, there is nothing to bid, and nobody can take it away (D52).
+    interruptible: bool = True
     raw: dict[str, Any] = dataclasses.field(default_factory=dict, repr=False)
 
 
@@ -157,6 +160,10 @@ class OfferQuery:
     max_all_in_hourly: Optional[float] = None
     verified_only: bool = False
     limit: int = 100
+    #: Which rentals to look at: interruptible ones to bid for, non-interruptible ones at the
+    #: listed price, or both and let ranking choose.
+    interruptible: bool = True
+    on_demand: bool = False
 
 
 @runtime_checkable

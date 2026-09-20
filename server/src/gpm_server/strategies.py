@@ -224,6 +224,17 @@ def price_bid(offer: Offer, cfg: BiddingConfig, lease_ceiling: Optional[float] =
     A multiplier is wrong here — floors span an order of magnitude or more, so any fixed
     multiple is either free or wasteful.
     """
+    if not offer.interruptible:
+        # Nothing to bid: the price is fixed and the host cannot be outbid. A ceiling it
+        # exceeds is a refusal, never a clamp — offering less does not rent it (D52).
+        price = offer.all_in_hourly
+        ceiling = cfg.bid_ceiling if lease_ceiling is None else min(cfg.bid_ceiling, lease_ceiling)
+        reasons = [f"on-demand at ${price:.3f}/h — a fixed price, not a bid; it cannot be outbid"]
+        if price > ceiling:
+            reasons.append(f"above the ${ceiling:.3f} ceiling, and a fixed price cannot be lowered to meet it")
+            return Bid(hourly=0.0, reasons=reasons)
+        return Bid(hourly=round(price, 4), reasons=reasons)
+
     reasons = [f"floor ${offer.min_bid_hourly:.3f} + premium ${cfg.premium:.3f}"]
     bid = offer.min_bid_hourly + cfg.premium
 

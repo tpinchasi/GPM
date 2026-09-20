@@ -10,11 +10,12 @@ not.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
 import time
 import uuid
-from typing import Optional
+from typing import Mapping, Optional
 
 from ..config import BiddingConfig, OfferPolicy, PoolConfig, RentedConfig, TransportConfig
 from ..deadman import heartbeat_command, onstart_script
@@ -31,6 +32,7 @@ from ..providers.base import (
     OfferQuery,
     Provider,
     ProviderError,
+    ProviderRateLimited,
 )
 from ..strategies import (
     Demand,
@@ -72,6 +74,36 @@ class RentedHost:
     idle_since: Optional[float] = None
     released: bool = False
     resident: frozenset[str] = frozenset()
+    #: While draining: when to stop waiting for its work to finish, and what to do then.
+    drain_until: Optional[float] = None
+    drain_then: str = "destroy"
+    drain_reason: str = ""
+    #: Whether this host was bid for. A non-interruptible one cannot be outbid, so a stop is
+    #: a fault to recover from, never an eviction to re-bid on (D52).
+    interruptible: bool = True
+    #: When this host started *preparing* — not when it was created. A host taken back after
+    #: a supervisor restart is marked preparing again so readiness is re-verified, and the
+    #: "not ready in time" rule must measure from then, or a host that has been serving for an
+    #: hour is destroyed the moment it is adopted (D50: it was, live).
+    preparing_since: Optional[float] = None
+    #: What preparing this host is doing right now, and how far each download has got —
+    #: for the operator watching, not for any decision.
+    stage: str = ""
+    progress: dict = dataclasses.field(default_factory=dict)
+    #: How many workers this host runs — fixed at creation, because the engine was launched
+    #: with that parallelism. From the matching capacity profile, or the rented default.
+    workers: int = 1
+
+    def mark_preparing(self) -> None:
+        """Enter `preparing`, starting the clock that "not ready in time" is measured against.
+
+        Only on the way *in*: a host already preparing keeps the deadline it has. Anything that
+        measures this from `created_at` instead destroys hosts that have been serving for
+        hours the moment they are adopted or blink (D50 — seen live).
+        """
+        if self.state != "preparing":
+            self.preparing_since = time.time()
+        self.state = "preparing"
 
     @property
     def hours_held(self) -> float:
@@ -114,6 +146,12 @@ class Fleet:
         self.engine = get_engine(config.engine)
         #: Forwards to rented hosts the provider cannot expose directly, keyed by host id.
         self.tunnels: dict[str, SshTunnel] = {}
+        #: Why the last offer search came back empty, when it was not the market's doing.
+        self.last_offer_error: Optional[str] = None
+        #: A provider that says "too many requests" is answered by asking less often, not by
+        #: asking again next pass. Doubles per refusal, cleared by a search that works.
+        self._offer_backoff_s = 0.0
+        self._offer_retry_at = 0.0
 
     # --- money ---
 
@@ -175,8 +213,14 @@ class Fleet:
 
     # --- the pass ---
 
-    async def pass_once(self, ready_workers_higher_tiers: int, idle_seconds: dict[str, float]) -> None:
+    async def pass_once(
+        self,
+        ready_workers_higher_tiers: int,
+        idle_seconds: dict[str, float],
+        busy: Optional[Mapping[str, int]] = None,
+    ) -> None:
         open_leases = self.leases.open_leases()
+        await self.finish_draining(busy or {})
         await self.beat_deadman_timers()
         await self.sweep_orphans()
         await self.expire_parked()
@@ -229,7 +273,56 @@ class Fleet:
     async def release_lease(self, lease: Lease, reason: str) -> None:
         for host in list(self.hosts.values()):
             if host.lease_id == lease.lease_id:
-                await self.destroy(host, reason)
+                # Not destroyed outright: a lease ending is not a reason to drop the requests
+                # already running on its host (D53).
+                await self.drain(host, reason)
+
+    async def drain(self, host: RentedHost, reason: str, then: str = "destroy") -> None:
+        """Stop sending this host new work, let what it has finish, then end it.
+
+        The router stops choosing a host that is not `ready`, so publishing `draining` is what
+        makes it stop taking new requests; the ones already on it keep their workers until they
+        answer. `teardown.drain_timeout_s` bounds the wait — a host that never finishes is
+        still billing, so it is ended anyway and that is said plainly.
+        """
+        if host.state == "draining":
+            return
+        if host.state not in ("ready", "preparing"):
+            await self.destroy(host, reason)  # nothing is being served on it
+            return
+        host.state = "draining"
+        host.drain_until = time.time() + self.rented.teardown.drain_timeout_s
+        host.drain_then = then
+        host.drain_reason = reason
+        self.events.record(
+            "draining",
+            f"{host.host_id} is draining ({reason}): no new requests, and up to "
+            f"{self.rented.teardown.drain_timeout_s:g}s for the ones it has",
+            numbers={"drain_timeout_s": self.rented.teardown.drain_timeout_s},
+            host_id=host.host_id,
+            lease_id=host.lease_id,
+        )
+
+    async def finish_draining(self, busy: Mapping[str, int]) -> None:
+        """End each draining host once its last request has answered, or time is up."""
+        for host in list(self.hosts.values()):
+            if host.state != "draining" or host.released:
+                continue
+            still = busy.get(host.host_id, 0)
+            if still <= 0:
+                await self._end_drain(host, f"{host.drain_reason}; its work had finished")
+            elif host.drain_until is not None and time.time() >= host.drain_until:
+                await self._end_drain(
+                    host,
+                    f"{host.drain_reason}; {still} request(s) had still not finished after "
+                    f"{self.rented.teardown.drain_timeout_s:g}s, and it was still billing",
+                )
+
+    async def _end_drain(self, host: RentedHost, reason: str) -> None:
+        if host.drain_then == "park":
+            await self.park(host, reason)
+        else:
+            await self.destroy(host, reason)
 
     # --- leases ---
 
@@ -280,11 +373,29 @@ class Fleet:
             return None
         return pub.read_text().strip()
 
-    def instance_env(self) -> dict[str, str]:
+    def workers_for(self, offer: Offer) -> tuple[int, str]:
+        """How many workers a host rented from this offer would run, and why (spec §2.1).
+
+        The first capacity profile the offer matches decides; with none, the rented default.
+        """
+        capabilities = set(self.rented.capabilities)
+        for profile in self.config.capacity_profiles:
+            match = profile.match
+            if match.hardware is not None and match.hardware.strip().lower() != offer.hardware.strip().lower():
+                continue
+            if match.min_gpu_memory_gb is not None and offer.gpu_memory_gb < match.min_gpu_memory_gb:
+                continue
+            if match.capability is not None and match.capability not in capabilities:
+                continue
+            why = f"capacity profile for {match.hardware or 'this hardware'}"
+            return profile.max_workers, why + (f" ({profile.note})" if profile.note else "")
+        return self.rented.workers, "the rented default; no capacity profile matches this hardware"
+
+    def instance_env(self, workers: Optional[int] = None) -> dict[str, str]:
         """What makes the engine run this many workers at this context, holding the whole
         model set — set at creation on hosts the pool creates (spec §2.2)."""
         return self.engine.launch_settings(
-            workers=self.rented.workers,
+            workers=workers if workers is not None else self.rented.workers,
             context=self.rented.context_length,
             n_models=len(self.config.pool.model_set),
         )
@@ -399,7 +510,7 @@ class Fleet:
 
         lease = next((lease for lease in open_leases if lease.allow_rent), None)
         rented_workers = sum(
-            self.rented.workers for h in self.hosts.values() if not h.released and h.state == "ready"
+            h.workers for h in self.hosts.values() if not h.released and h.state == "ready"
         )
         demand = Demand(
             wanted_workers=lease.workers if lease else 0,
@@ -474,6 +585,7 @@ class Fleet:
 
         offers = await self._offers(policy)
         ranked, rejected = rank_offers(offers, policy, bid_config, hours, self.rented.model_set_gb)
+        problem = self.last_offer_error
         by_reason: dict[str, int] = {}
         for reasons in rejected.values():
             # An offer is counted against the first filter that stopped it.
@@ -483,10 +595,14 @@ class Fleet:
         accepted = []
         for offer, offer_score in ranked[:10]:
             bid = price_bid(offer, bid_config)
+            workers, workers_why = self.workers_for(offer)
             accepted.append(
                 {
                     "machine": offer.machine_id,
                     "hardware": offer.hardware,
+                    # What a host rented from this offer would run, and whether a profile says so.
+                    "workers": workers,
+                    "workers_from": workers_why,
                     "gpu_memory_gb": round(offer.gpu_memory_gb, 1),
                     "floor": offer.min_bid_hourly,
                     "would_bid": bid.hourly,
@@ -504,11 +620,22 @@ class Fleet:
             "passed": len(ranked),
             "rejected": len(rejected),
             "rejected_by_reason": dict(sorted(by_reason.items(), key=lambda kv: -kv[1])),
+            # None when the market really was asked. Set when it could not be, so nobody
+            # reads "0 offers seen" as "there is nothing out there" (D44).
+            "problem": problem,
             "best": accepted,
             "policy": {
                 "bid_ceiling": bid_config.bid_ceiling,
                 "premium": bid_config.premium,
                 "on_demand_crossover": bid_config.on_demand_crossover,
+            },
+            # What this preview ran with, and what is saved — the console builds its form from
+            # these, so the fields are always the pool's own, never a copy that can drift.
+            "offer_policy": policy.model_dump(),
+            "bidding": bid_config.model_dump(),
+            "saved": {
+                "offer_policy": self.rented.offer_policy.model_dump(),
+                "bidding": self.rented.bidding.model_dump(),
             },
         }
 
@@ -553,24 +680,78 @@ class Fleet:
         host.when_ready = when_ready
         return host
 
+    async def _pull_with_retries(self, host: RentedHost, engine, client, tag: str):
+        """One model's download, tried again when the failure is the kind that passes.
+
+        Found live: three H200 hosts in a row were destroyed because the download stream was
+        cut partway ("peer closed connection without sending complete message body"). The
+        engine keeps the layers that arrived, so another attempt resumes rather than restarts
+        — much cheaper than a new host, and a new host re-downloads everything. A failure the
+        engine calls permanent (a tag it does not have) is not retried. Returns None if the
+        host is released meanwhile; the last result otherwise.
+        """
+        attempts = self.rented.teardown.pull_attempts
+        wait = self.rented.teardown.pull_retry_after_s
+        result = None
+        for attempt in range(1, attempts + 1):
+            if host.released:
+                return None
+            host.stage = f"downloading {tag}" + (f" (attempt {attempt} of {attempts})" if attempt > 1 else "")
+
+            def progress(done: int, total: int, tag=tag, attempt=attempt) -> None:
+                host.progress[tag] = {"completed": done, "total": total, "attempt": attempt}
+
+            result = await self._pull(engine, client, tag, progress)
+            if result.ok:
+                host.progress[tag] = {"completed": result.bytes_total, "total": result.bytes_total, "attempt": attempt}
+            if result.ok or not result.retryable or attempt == attempts:
+                if not result.ok and attempt > 1:
+                    result = dataclasses.replace(
+                        result, detail=f"{result.detail} (after {attempt} attempts)"
+                    )
+                return result
+            self.events.record(
+                "pull_retry",
+                f"{host.host_id}: pulling {tag} was cut ({result.detail}); trying again in "
+                f"{wait:.0f}s — attempt {attempt + 1} of {attempts}, resuming what arrived",
+                numbers={"tag": tag, "attempt": attempt + 1, "of": attempts, "wait_s": wait},
+                host_id=host.host_id,
+                lease_id=host.lease_id,
+            )
+            await asyncio.sleep(wait)
+            wait = min(wait * 2, 120.0)
+        return result
+
+    @staticmethod
+    async def _pull(engine, client, tag: str, progress):
+        """Ask for progress where the engine reports it, and do not require it: an engine
+        adapter written before progress existed takes two arguments and still works."""
+        try:
+            return await engine.pull(client, tag, on_progress=progress)
+        except TypeError:
+            return await engine.pull(client, tag)
+
     async def load_model_set(self, host: RentedHost, engine, client) -> bool:
         """Pull every tag, then check they are resident **together** — a host that cannot hold
         the whole set does not join the pool."""
         tags = sorted(self.required_tags)
         moved = 0
         for tag in tags:
-            result = await engine.pull(client, tag)
+            result = await self._pull_with_retries(host, engine, client, tag)
+            if result is None:
+                return False  # the host was released while its download was being retried
             if not result.ok:
                 self.events.record(
                     "prepare_failed",
                     f"{host.host_id}: pulling {tag} failed: {result.detail}",
-                    numbers={"tag": tag},
+                    numbers={"tag": tag, "retryable": result.retryable},
                     host_id=host.host_id,
                     lease_id=host.lease_id,
                 )
                 return False
             moved += result.bytes_total
 
+        host.stage = "loading the model set into memory"
         try:
             await engine.load_and_pin(client, tags)
         except Exception as exc:  # noqa: BLE001 - the engine says why, and the host does not join
@@ -582,6 +763,7 @@ class Fleet:
             )
             return False
 
+        host.stage = ""
         download_cost = host.offer.download_per_gb * (moved / 1e9)
         host.download_cost = download_cost
         self.events.record(
@@ -674,6 +856,8 @@ class Fleet:
             "hold_until": host.hold_until,
             "when_ready": host.when_ready,
             "download_cost": host.download_cost,
+            "workers": host.workers,
+            "interruptible": host.interruptible,
             "state": host.state,
             "parked_at": host.parked_at,
             "offer": dataclasses.asdict(dataclasses.replace(host.offer, raw={})),
@@ -725,9 +909,16 @@ class Fleet:
                 when_ready=ref.get("when_ready") or "join",
                 download_cost=float(ref.get("download_cost") or 0.0),
                 parked_at=ref.get("parked_at"),
+                # What its engine was launched with. A row from before profiles existed was
+                # launched with the rented default of the day.
+                workers=int(ref.get("workers") or self.rented.workers),
+                interruptible=bool(ref.get("interruptible", True)),
             )
             if host.state == "ready":
-                host.state = "preparing"  # readiness is re-verified, never assumed
+                # Readiness is re-verified, never assumed — and the clock on "not ready in
+                # time" starts now, not when the host was created (D50).
+                host.state = "adopting"
+            host.mark_preparing()
             try:
                 host.connection = await self.provider.connection(instance)
             except ProviderError as exc:
@@ -748,6 +939,47 @@ class Fleet:
                 lease_id=host.lease_id,
             )
         return adopted
+
+    async def _left_nothing_behind(self, label: str, lease: Lease) -> bool:
+        """After a bid the provider reported lost: is anything running under its label?
+
+        Returns False when something was left and could not be ended, or when the provider
+        could not be asked at all — either way the pool stops bidding rather than stacking a
+        second machine on top of one that may be billing.
+        """
+        try:
+            stray = await self.provider.list_instances(label)
+        except ProviderError as exc:
+            self.events.record(
+                "bid_unverifiable",
+                f"a bid failed and the provider could not be asked what it left behind ({exc}); "
+                "no further bids this pass",
+                numbers={"label": label},
+                lease_id=lease.lease_id,
+            )
+            return False
+        if not stray:
+            return True
+
+        ended = []
+        for instance in stray:
+            self.events.record(
+                "bid_left_an_instance",
+                f"the bid reported lost had in fact created {instance.instance_id}; destroying it",
+                numbers={"instance": instance.instance_id, "label": label},
+                lease_id=lease.lease_id,
+            )
+            if await self._destroy_instance(instance, "left behind by a failed bid"):
+                ended.append(instance.instance_id)
+        if len(ended) == len(stray):
+            return True
+        self.events.record(
+            "bid_left_an_instance_undestroyed",
+            "an instance left by a failed bid could not be destroyed; no further bids this pass",
+            numbers={"label": label},
+            lease_id=lease.lease_id,
+        )
+        return False
 
     # --- release what should not exist ---
 
@@ -793,9 +1025,22 @@ class Fleet:
                 )
                 host.released = True
                 self.hosts.pop(host.host_id, None)
+                self._end_prepare_lease(host, "no longer exists at the provider")
                 continue
 
             if status.state != InstanceState.STOPPED:
+                continue
+
+            if not host.interruptible:
+                # Nobody outbid this one — it is not that kind of rental. Something else
+                # stopped it, so there is nothing to re-bid: give it up and say so (D52).
+                self.events.record(
+                    "host_stopped",
+                    f"{host.host_id} stopped, and it was rented on demand so it was not outbid; releasing it",
+                    host_id=host.host_id,
+                    lease_id=host.lease_id,
+                )
+                await self.destroy(host, "an on-demand host stopped without being asked to")
                 continue
 
             # Stopped, and the pool never asked for that: an eviction (spec §1.2).
@@ -814,7 +1059,7 @@ class Fleet:
                     host_id=host.host_id,
                     priority=20,
                     busy_workers=0,
-                    total_workers=self.rented.workers,
+                    total_workers=host.workers,
                     idle_seconds=0,
                     bid_hourly=host.bid_hourly,
                     machine_id=host.offer.machine_id,
@@ -854,7 +1099,7 @@ class Fleet:
     async def acquire(self, open_leases: list[Lease], ready_workers_higher_tiers: int) -> None:
         lease = next((lease for lease in open_leases if lease.allow_rent), None)
         rented_workers = sum(
-            self.rented.workers for h in self.hosts.values() if not h.released and h.state == "ready"
+            h.workers for h in self.hosts.values() if not h.released and h.state == "ready"
         )
         pending = sum(
             1 for h in self.hosts.values() if not h.released and h.state in ("scheduling", "preparing")
@@ -908,15 +1153,27 @@ class Fleet:
                 f"{self.config.limits.max_rented_hosts}"
             )
         burn = sum(h.bid_hourly for h in live)
-        if burn >= self.config.limits.max_hourly_burn:
-            return f"hourly burn ${burn:.3f} is at the ${self.config.limits.max_hourly_burn:.2f} cap"
+        total = self.config.limits.max_hourly_burn
+        if total is not None and burn >= total:
+            return f"hourly burn ${burn:.3f} is at the ${total:.2f} cap"
         left = self.budget_left(lease)
         if left <= 0:
             return f"the lease has ${left:.4f} left once the safety margin is taken off"
         return None
 
+    def worst_case_hourly(self) -> float:
+        """The most the rented hosts can burn per hour: every host at the per-host ceiling, as
+        many hosts as the pool may hold — or the overall cap, if one is set below that (D46)."""
+        bound = self.config.limits.max_rented_hosts * self.rented.bidding.bid_ceiling
+        total = self.config.limits.max_hourly_burn
+        return bound if total is None else min(bound, total)
+
     def _refuse_bid_for_burn(self, bid: float) -> Optional[str]:
-        """The cap applies to the burn this bid *would* create, not only to today's."""
+        """The cap applies to the burn this bid *would* create, not only to today's. With no
+        overall cap set there is nothing to refuse here: the bid is already clamped to the
+        per-host ceiling, and the host count to the pool's limit (D46)."""
+        if self.config.limits.max_hourly_burn is None:
+            return None
         burn = sum(h.bid_hourly for h in self.hosts.values() if not h.released) + bid
         if burn > self.config.limits.max_hourly_burn:
             return (
@@ -940,7 +1197,11 @@ class Fleet:
                 f"{len(offers)} offers seen, none passed the policy; staying paused rather "
                 "than relaxing a filter"
                 if offers
-                else "the market returned no offers at all",
+                else (
+                    f"the market could not be asked: {self.last_offer_error}"
+                    if self.last_offer_error
+                    else "the market returned no offers at all"
+                ),
                 numbers={"seen": len(offers), "rejected": rejected},
                 lease_id=lease.lease_id,
             )
@@ -960,16 +1221,18 @@ class Fleet:
                 continue
 
             host_id = f"rented-{uuid.uuid4().hex[:6]}"
+            workers, workers_why = self.workers_for(offer)
             spec = InstanceSpec(
                 label=f"{self.label_prefix}{host_id}",
                 image=self.rented.image,
                 disk_gb=self.rented.disk_gb,
-                env=self.instance_env(),
+                env=self.instance_env(workers),
                 # Armed before anything else runs, and carrying no account credential.
                 onstart=self.deadman_onstart(),
             )
             try:
-                instance = await self.provider.create(offer, spec, capped)
+                # No price on an on-demand rental: the provider's listed rate is what is paid.
+                instance = await self.provider.create(offer, spec, capped if offer.interruptible else None)
             except (BidLost, OfferGone) as exc:
                 self.events.record(
                     "bid_failed",
@@ -977,6 +1240,12 @@ class Fleet:
                     numbers={"bid": capped, "offer": offer.offer_id, "score": offer_score},
                     lease_id=lease.lease_id,
                 )
+                # A bid is not failed until nothing is running under its label. Bidding on the
+                # next offer while a machine from this one bills is how one lease ends up
+                # paying for three hosts (D43) — so this is checked here, in the pool, and not
+                # left to a plug-in's own discipline. Unprovable means stop, not carry on.
+                if not await self._left_nothing_behind(spec.label, lease):
+                    return None
                 continue
             except ProviderError as exc:
                 self.events.record(
@@ -993,16 +1262,20 @@ class Fleet:
                 offer=offer,
                 bid_hourly=capped,
                 lease_id=lease.lease_id,
+                workers=workers,
+                interruptible=offer.interruptible,
             )
             connection = await self.provider.connection(instance)
             host.connection = connection
             host.dial_url = connection.public_url or await self._open_tunnel(host_id, connection)
-            host.state = "preparing"
+            host.mark_preparing()
             self.hosts[host_id] = host
             self.events.record(
                 "rented",
-                f"bid ${capped:.3f}/h on {offer.machine_id} ({offer.hardware})",
+                (f"bid ${capped:.3f}/h" if offer.interruptible else f"on demand at ${capped:.3f}/h, not outbiddable")
+                + f" on {offer.machine_id} ({offer.hardware}), {workers} workers: {workers_why}",
                 numbers={
+                    "workers": workers,
                     "bid": capped,
                     "floor": offer.min_bid_hourly,
                     "all_in": offer.all_in_hourly,
@@ -1052,14 +1325,15 @@ class Fleet:
         preparing = [h for h in live if h.state != "ready"]
         ready = [h for h in live if h.state == "ready"]
         for host in preparing:
-            if (now - host.created_at) / 60 >= self.rented.teardown.max_preparing_minutes:
+            since = host.preparing_since or host.created_at
+            if (now - since) / 60 >= self.rented.teardown.max_preparing_minutes:
                 await self.destroy(
                     host,
                     f"not ready after {self.rented.teardown.max_preparing_minutes:g} minutes",
                 )
 
         wanted = lease.workers if lease else 0
-        covered = ready_workers_higher_tiers + len(ready) * self.rented.workers
+        covered = ready_workers_higher_tiers + sum(h.workers for h in ready)
         if lease is not None and covered >= wanted and wanted > 0:
             self.overflow_gone_since = self.overflow_gone_since or now
         else:
@@ -1071,7 +1345,7 @@ class Fleet:
                 host_id=h.host_id,
                 priority=20,
                 busy_workers=0,
-                total_workers=self.rented.workers,
+                total_workers=h.workers,
                 idle_seconds=idle_seconds.get(h.host_id, 0.0),
                 bid_hourly=h.bid_hourly,
                 machine_id=h.offer.machine_id,
@@ -1082,11 +1356,14 @@ class Fleet:
         # "Overflow gone" is only surplus if demand stays covered *without* the host being
         # reaped, and only once it has stayed gone for the scale-down window.
         surplus_workers = covered - wanted
-        overflow_gone = gone_for >= self.rented.scale.scale_down_after_s and surplus_workers >= self.rented.workers
+        # Only surplus if losing *any* ready host would still cover demand — with hosts of
+        # different sizes, the largest is the one to measure against.
+        largest = max((h.workers for h in ready), default=self.rented.workers)
+        overflow_gone = gone_for >= self.rented.scale.scale_down_after_s and surplus_workers >= largest
         demand = Demand(
             wanted_workers=wanted,
             ready_workers_higher_tiers=ready_workers_higher_tiers,
-            rented_workers=len(ready) * self.rented.workers,
+            rented_workers=sum(h.workers for h in ready),
             overflow_age_s=0.0 if overflow_gone else 1.0,
         )
         held = {
@@ -1160,6 +1437,34 @@ class Fleet:
                 host_id=host.host_id,
                 lease_id=host.lease_id,
             )
+            self._end_prepare_lease(host, reason)
+
+    def _end_prepare_lease(self, host: RentedHost, why: str) -> None:
+        """A prepare lease exists to get *one* host ready; when that host is gone, so is the
+        lease (D47).
+
+        Left open, it is still spending authority, and its workers still count as demand — so
+        the pool may rent a replacement nobody asked for, quite possibly on the machine that
+        just failed. Found live: four prepare leases outlived their hosts tonight, one by 18
+        minutes, each until the operator closed it by hand. An overflow lease is a different
+        thing — standing demand, deliberately kept open after an eviction so capacity is
+        recovered — and is left alone.
+        """
+        if not host.prepared:
+            return
+        if any(h.lease_id == host.lease_id and not h.released for h in self.hosts.values()):
+            return
+        lease = self.leases.get(host.lease_id)
+        if lease is None or not lease.is_open:
+            return  # already closed, and its reason (a cap, an expiry) is the one to keep
+        self.leases.close(host.lease_id, f"its host {host.host_id} is gone: {why}")
+        self.events.record(
+            "lease_closed",
+            f"{host.lease_id} closed with its prepared host {host.host_id} ({why}); prepare "
+            "again for another — nothing is rented in its place",
+            host_id=host.host_id,
+            lease_id=host.lease_id,
+        )
 
     async def _destroy_instance(self, instance: Instance, reason: str) -> bool:
         """A release counts only once the provider's listing no longer shows it."""
@@ -1195,13 +1500,41 @@ class Fleet:
         whenever a filter bites, and the operator could never see *which* filter — but
         "4 pass, 76 rejected, and here is why" is the whole point of the offer policy.
         """
-        try:
-            return await self.provider.search_offers(
-                OfferQuery(verified_only=(policy or self.rented.offer_policy).verified_only)
+        now = time.monotonic()
+        if now < self._offer_retry_at:
+            self.last_offer_error = (
+                f"{self.last_offer_error or 'the provider refused'} — not asking again for "
+                f"{self._offer_retry_at - now:.0f}s"
             )
-        except ProviderError as exc:
-            log.warning("offer search failed: %s", exc)
             return []
+        try:
+            mode = self.rented.mode
+            offers = await self.provider.search_offers(
+                OfferQuery(
+                    verified_only=(policy or self.rented.offer_policy).verified_only,
+                    interruptible=mode in ("interruptible", "cheaper"),
+                    on_demand=mode in ("on_demand", "cheaper"),
+                )
+            )
+        except ProviderRateLimited as exc:
+            # Asking again on the next pass is what earned the refusal. Back off instead, and
+            # keep backing off until it works (D44).
+            self._offer_backoff_s = min(max(self._offer_backoff_s * 2, 60.0), 900.0)
+            self._offer_retry_at = now + self._offer_backoff_s
+            log.warning("offer search rate limited; not asking again for %.0fs", self._offer_backoff_s)
+            self.last_offer_error = f"{exc} — not asking again for {self._offer_backoff_s:.0f}s"
+            return []
+        except ProviderError as exc:
+            # Remembered, not just logged: an empty list here is indistinguishable from a
+            # market with nothing in it, and "0 offers seen" is a very different thing to tell
+            # an operator than "the provider would not answer" (D44).
+            log.warning("offer search failed: %s", exc)
+            self.last_offer_error = str(exc)
+            return []
+        self._offer_backoff_s = 0.0
+        self._offer_retry_at = 0.0
+        self.last_offer_error = None
+        return offers
 
     def _lease_view(self, lease: Optional[Lease]) -> Optional[LeaseView]:
         if lease is None:

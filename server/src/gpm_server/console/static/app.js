@@ -27,7 +27,9 @@ async function call(method, path, body) {
   try { payload = await response.json(); } catch { /* some answers have no body */ }
   if (!response.ok) {
     const detail = payload?.detail || payload?.error || `${response.status}`;
-    throw new Error(detail);
+    const failure = new Error(detail);
+    if (payload?.changes) failure.changes = payload.changes;  // a refused plan explains itself
+    throw failure;
   }
   return payload;
 }
@@ -55,6 +57,8 @@ const api = {
   configHistory: () => call("GET", "/pool/config/history"),
   rollbackConfig: (version) => call("POST", "/pool/config/rollback", { version }),
   testHost: (host) => call("POST", "/pool/hosts/test", host),
+  hostDetail: (id) => call("GET", `/pool/hosts/${encodeURIComponent(id)}`),
+  setSearch: (body) => call("PATCH", "/pool/config/rented", body),
   restartEngine: (hostId, applySettings) =>
     call("POST", `/pool/hosts/${hostId}/engine/restart`, { confirm: hostId, apply_settings: applySettings }),
   deleteModel: (hostId, tag) => call("POST", `/pool/hosts/${hostId}/models/delete`, { tag, confirm: tag }),
@@ -81,6 +85,100 @@ const money = (n) => (n === null || n === undefined ? "—" : `$${Number(n).toFi
 const rate = (n) => (n === null || n === undefined ? "—" : `$${Number(n).toFixed(3)}/h`);
 const clock = (ts) => (ts ? new Date(ts * 1000).toLocaleTimeString() : "—");
 const pill = (text, kind) => el("span", { class: `pill ${kind || text || ""}` }, text ?? "—");
+
+// Following one host while it is prepared: its own timeline, what its engine holds right now,
+// and how far each download has got. Assembling this by hand from three places is what an
+// operator otherwise does while a host sits at "preparing" with nothing to look at.
+const hostLink = (id) =>
+  el("a", { href: "#", class: "mono", onclick: (e) => { e.preventDefault(); openHost(id); } }, id);
+
+const hostWatch = { id: null, timer: null };
+
+function openHost(id) {
+  const dialog = document.getElementById("host-dialog");
+  hostWatch.id = id;
+  document.getElementById("host-dialog-title").textContent = id;
+  document.getElementById("host-dialog-body").replaceChildren(el("p", { class: "muted" }, "Loading…"));
+  if (!dialog.open) dialog.showModal();
+  document.getElementById("host-dialog-close").onclick = () => closeHost();
+  dialog.addEventListener("close", closeHost, { once: true });
+  drawHost();
+  clearInterval(hostWatch.timer);
+  // While a host is being prepared its state changes every few seconds; this is the one view
+  // worth following closely, and it is the operator's own machine or their rented one.
+  hostWatch.timer = setInterval(drawHost, 3000);
+}
+
+function closeHost() {
+  clearInterval(hostWatch.timer);
+  hostWatch.timer = null;
+  hostWatch.id = null;
+  const dialog = document.getElementById("host-dialog");
+  if (dialog.open) dialog.close();
+}
+
+async function drawHost() {
+  const id = hostWatch.id;
+  if (!id) return;
+  let detail;
+  try {
+    detail = await api.hostDetail(id);
+  } catch (error) {
+    document.getElementById("host-dialog-body").replaceChildren(
+      el("p", { class: "error" }, error.message),
+      el("p", { class: "muted" }, "A pool running an older supervisor has no per-host view; restart it to get one."));
+    clearInterval(hostWatch.timer);
+    return;
+  }
+  if (hostWatch.id !== id) return;  // closed or switched while we were asking
+  document.getElementById("host-dialog-body").replaceChildren(...hostPanel(detail));
+}
+
+function hostPanel(d) {
+  const engine = d.engine || {};
+  const progress = Object.entries(d.progress || {});
+  const facts = [
+    ["stage", el("strong", {}, d.stage_detail || d.state)],
+    ["state", pill(d.state, d.state === "ready" ? "ok" : "warn")],
+    ["kind", `${d.kind}${d.hardware ? " · " + d.hardware : ""}`],
+    ["workers", String(d.workers ?? "—")],
+  ];
+  if (d.bid_hourly !== undefined) {
+    facts.push(["cost", `${rate(d.bid_hourly)} · held ${((d.hours_held || 0) * 60).toFixed(0)} min · spent ${money(d.estimated_spend)} (provider says ${money(d.reported_spend)})`]);
+    facts.push(["lease", d.lease_id || "—"]);
+  }
+  if (d.provider) facts.push(["the provider says", `${d.provider.state}${d.provider.detail ? " · " + d.provider.detail : ""}`]);
+  if (d.tunnel) facts.push(["tunnel", `${d.tunnel.up ? "up" : "down"} on :${d.tunnel.local_port} · ${d.tunnel.restarts} restart(s)`]);
+  facts.push(["engine", engine.answers
+    ? `answers · ${(engine.on_disk || []).length} on disk, ${(engine.loaded || []).length} loaded`
+    : el("span", { class: "error" }, `not answering: ${engine.detail || "?"}`)]);
+
+  return [
+    el("div", { class: "kv" }, ...facts.flatMap(([k, v]) => [el("div", { class: "k" }, k), el("div", {}, v)])),
+    progress.length ? el("div", {},
+      el("h2", {}, "Downloads"),
+      ...progress.map(([tag, p]) => {
+        const share = p.total ? Math.min(1, p.completed / p.total) : 0;
+        return el("div", {},
+          el("div", { class: "mono" }, `${tag} — ${gigabytes(p.completed)} of ${gigabytes(p.total)}`,
+            p.attempt > 1 ? el("span", { class: "muted" }, ` · attempt ${p.attempt}`) : null),
+          el("div", { class: "burn" }, el("div", { style: `width:${(share * 100).toFixed(1)}%` })));
+      })) : null,
+    engine.answers ? el("div", {},
+      el("h2", {}, "The model set on this host"),
+      el("table", {}, el("tbody", {}, (d.required_tags || []).map((tag) => el("tr", {},
+        el("td", { class: "mono" }, tag),
+        el("td", {}, (engine.loaded || []).includes(tag) ? pill("loaded", "ok")
+          : (engine.on_disk || []).includes(tag) ? pill("on disk", "warn")
+          : pill("not here yet", "bad")))))),
+    ) : null,
+    el("h2", {}, "What has happened to this host"),
+    (d.events || []).length
+      ? el("div", { class: "panel feed" }, (d.events || []).map((e) => el("div", { class: "ev" },
+          el("span", { class: "k" }, `${clock(e.ts)}  ${e.kind}  `), e.summary)))
+      : el("p", { class: "muted" }, "Nothing recorded for this host yet."),
+  ];
+}
 
 function confirmAction({ title, body, retype }) {
   const dialog = document.getElementById("confirm-dialog");
@@ -130,9 +228,12 @@ screens.overview = (status) => {
     if (!tiers.has(20)) tiers.set(20, []);
     tiers.get(20).push({ ...host, kind: "rented-interruptible", rented: true });
   }
-  const ready = status.hosts.filter((h) => h.state === "ready").length;
-  const workers = status.hosts.reduce((n, h) => n + (h.workers || 0), 0);
-  const busy = status.hosts.reduce((n, h) => n + (h.busy || 0), 0);
+  // Rented hosts serve like any other once ready, so they count toward capacity. A host that
+  // is not ready yet serves nothing, so neither do its workers.
+  const serving = [...status.hosts, ...status.rented].filter((h) => h.state === "ready");
+  const ready = serving.length;
+  const workers = serving.reduce((n, h) => n + (h.workers || 0), 0);
+  const busy = serving.reduce((n, h) => n + (h.busy || 0), 0);
   const burn = status.rented.reduce((n, h) => n + (h.bid_hourly || 0), 0);
 
   return [
@@ -143,7 +244,9 @@ screens.overview = (status) => {
         el("div", { class: "muted" }, `workers busy · ${ready} host(s) ready`)),
       el("div", { class: "panel" }, el("h2", {}, "Rented"),
         el("div", { class: "stat" }, status.rented.length),
-        el("div", { class: "muted" }, `burning ${rate(burn)} · cap ${rate(status.limits.max_hourly_burn)}`)),
+        el("div", { class: "muted" }, status.limits.max_hourly_burn == null
+          ? `burning ${rate(burn)} · at most ${rate(status.limits.worst_case_hourly)} (${status.limits.max_rented_hosts} × ${rate(status.limits.per_host_ceiling)})`
+          : `burning ${rate(burn)} · cap ${rate(status.limits.max_hourly_burn)}`)),
       el("div", { class: "panel" }, el("h2", {}, "Open leases"),
         el("div", { class: "stat" }, status.open_leases.length),
         el("div", { class: "muted" }, status.open_leases.length ? "spending is authorised" : "nothing may be rented")),
@@ -156,7 +259,7 @@ screens.overview = (status) => {
           el("th", {}, "Resident"), el("th", { class: "num" }, "Cost"), el("th", {}, ""))),
         el("tbody", {}, hosts.map((host) =>
           el("tr", {},
-            el("td", { class: "mono" }, host.host_id),
+            el("td", { class: "mono" }, hostLink(host.host_id)),
             el("td", {}, pill(host.state), host.last_error ? el("div", { class: "muted" }, host.last_error) : null),
             el("td", { class: "num" }, `${host.busy ?? 0} / ${host.workers ?? 0}`),
             el("td", { class: "muted mono" }, (host.resident || []).join(", ") || (host.rented ? host.hardware : "—")),
@@ -189,9 +292,51 @@ const leaseTable = (leases) => leases.length
             ? el("div", { class: "muted" }, `stops at ${money(lease.stops_at)}`) : null),
           el("td", {}, el("div", { class: `burn ${fraction > 0.8 ? "bad" : fraction > 0.5 ? "warn" : ""}` },
             el("div", { style: `width:${(fraction * 100).toFixed(1)}%` }))),
-          el("td", {}, el("button", { class: "small", onclick: (e) => run(e.target, () => api.closeLease(lease.lease_id)) }, "Close")));
+          el("td", {}, leaseActions(lease)));
       })))
   : el("p", { class: "muted" }, "No open lease, so nothing can be rented.");
+
+// The same three actions wherever a lease is shown — the overview and the Leases screen —
+// because an operator who can see a lease should be able to act on it there.
+const leaseActions = (lease) => (lease.state && lease.state !== "open") ? null : el("div", { class: "row" },
+  el("button", { class: "small", onclick: async (e) => {
+    const value = prompt("Tighten the dollar cap to:", String(lease.max_spend));
+    if (value === null) return;
+    run(e.target, () => api.tightenLease(lease.lease_id, { max_spend: Number(value) }));
+  } }, "Tighten"),
+  el("button", { class: "small", onclick: (e) => extendLease(e, lease) }, "Extend"),
+  el("button", { class: "small", onclick: (e) => run(e.target, () => api.closeLease(lease.lease_id)) }, "Close"));
+
+// Extending a lease in flight: more hours for a host worth keeping, more dollars to pay for
+// them. Raising a limit is loosening wherever it appears, so it is typed again (D49) — and the
+// worst case is stated first, because that is what the operator is really agreeing to.
+async function extendLease(event, lease) {
+  const hours = prompt("Run this lease for how many hours in total?", String(lease.max_hours));
+  if (hours === null) return;
+  const wantedHours = Number(hours);
+  if (!Number.isFinite(wantedHours) || wantedHours <= 0) return;
+  const dollars = prompt("And its dollar cap in total?", String(lease.max_spend));
+  if (dollars === null) return;
+  const wantedSpend = Number(dollars);
+  if (!Number.isFinite(wantedSpend) || wantedSpend <= 0) return;
+
+  const raised = [];
+  if (wantedHours > lease.max_hours) raised.push(["max_hours", wantedHours]);
+  if (wantedSpend > lease.max_spend) raised.push(["max_spend", wantedSpend]);
+  const body = { max_hours: wantedHours, max_spend: wantedSpend };
+  if (raised.length) {
+    const ok = await confirmAction({
+      title: `Extend ${lease.lease_id}?`,
+      body: el("div", {},
+        el("p", {}, `Worst case becomes ${money(wantedSpend)} over ${wantedHours}h — it is spending authority, and hosts held under it keep running.`),
+        el("p", { class: "muted" }, raised.map(([k, v]) => `${k}: ${k === "max_spend" ? money(lease[k]) + " → " + money(v) : lease[k] + "h → " + v + "h"}`).join(" · "))),
+      retype: String(raised[0][1]),
+    });
+    if (!ok) return;
+    body.confirm = String(raised[0][1]);
+  }
+  run(event.target, () => api.tightenLease(lease.lease_id, body));
+}
 
 const feed = () => el("div", { class: "panel feed" }, state.events.slice(0, 40).map((event) =>
   el("div", { class: "ev" },
@@ -206,7 +351,7 @@ screens.hosts = (status) => [
       el("th", {}, "Host"), el("th", {}, "Kind"), el("th", {}, "Transport"), el("th", {}, "State"),
       el("th", { class: "num" }, "Workers"), el("th", {}, "Capabilities"), el("th", {}, "Residency"), el("th", {}, "Tunnel"), el("th", { class: "num" }, "Served"))),
     el("tbody", {}, status.hosts.map((host) => el("tr", {},
-      el("td", { class: "mono" }, host.host_id),
+      el("td", { class: "mono" }, hostLink(host.host_id)),
       el("td", {}, host.kind),
       el("td", {}, host.transport),
       el("td", {}, pill(host.state), host.last_error ? el("div", { class: "muted" }, host.last_error) : null),
@@ -410,20 +555,23 @@ screens.rented = async (status) => {
             el("span", { class: "muted" }, status.provider.capabilities.reports_charges ? " — narrows once a charge is reported" : " — wider: this provider reports no charges")))),
       el("div", { class: "panel" }, el("h2", {}, "Limits"),
         el("div", { class: "kv" },
-          el("div", { class: "k" }, "max rented hosts"), el("div", {}, status.limits.max_rented_hosts),
-          el("div", { class: "k" }, "max hourly burn"), el("div", {}, rate(status.limits.max_hourly_burn))),
+          el("div", { class: "k" }, "max rented hosts"), el("div", {}, hostLimitControl(status.limits.max_rented_hosts)),
+          el("div", { class: "k" }, "per-host ceiling"), el("div", {}, rate(status.limits.per_host_ceiling)),
+          el("div", { class: "k" }, "overall cap"), el("div", {}, status.limits.max_hourly_burn == null
+            ? el("span", { class: "muted" }, `none — bounded at ${rate(status.limits.worst_case_hourly)} by hosts × ceiling`)
+            : rate(status.limits.max_hourly_burn))),
         el("p", { class: "muted" }, "Raising either is a configuration change that must be retyped to confirm.")),
       preparePanel(),
     ),
-    el("h2", {}, "Live market — the real offer pipeline, read-only"),
-    marketPanel(market),
+    ...searchSection(market),
+    ...marketSection(market),
     el("h2", {}, "Rented and parked hosts"),
     status.rented.length ? el("table", {},
       el("thead", {}, el("tr", {},
         el("th", {}, "Host"), el("th", {}, "State"), el("th", {}, "Machine"), el("th", { class: "num" }, "Bid"),
         el("th", { class: "num" }, "Storage"), el("th", { class: "num" }, "Held"), el("th", { class: "num" }, "Spend"), el("th", {}, ""))),
       el("tbody", {}, status.rented.map((host) => el("tr", {},
-        el("td", { class: "mono" }, host.host_id),
+        el("td", { class: "mono" }, hostLink(host.host_id)),
         el("td", {}, pill(host.state)),
         el("td", { class: "muted" }, `${host.machine} · ${host.hardware || ""}`),
         el("td", { class: "num" }, rate(host.bid_hourly)),
@@ -437,8 +585,242 @@ screens.rented = async (status) => {
   ];
 };
 
+// The market, refreshed in place: by the button, and on its own every minute while it is on
+// screen. Only this panel is replaced — re-rendering the whole screen would wipe whatever is
+// being typed into the Prepare form beside it. And it only asks while it is visible: each
+// refresh is a real call to the provider, which is what got the pool rate-limited (D44). A
+// refresh during that back-off costs the provider nothing — it reports why, and waits.
+// Every parameter the offer search uses, editable here. Trying values is free — the preview
+// runs the real pipeline against the live market and saves nothing — and saving goes through
+// the file, the plan, and the retype rule, exactly as the Configuration screen does (D51).
+const SEARCH_FIELDS = [
+  ["offer_policy", "min_gpu_memory_gb", "number", "the card must have at least this much memory"],
+  ["offer_policy", "min_disk_gb", "number", "the machine must offer at least this much disk"],
+  ["offer_policy", "max_all_in_hourly", "number", "the most this pool will pay per host, per hour"],
+  ["offer_policy", "max_download_per_gb", "number", "the most it will pay per GB downloaded"],
+  ["offer_policy", "min_download_mbps", "number", "slower than this and the model set takes too long"],
+  ["offer_policy", "min_reliability", "number", "the provider's own score, 0 to 1"],
+  ["offer_policy", "verified_only", "checkbox", "only machines the provider has verified"],
+  ["offer_policy", "exclude_hardware", "list", "refused by name, case-insensitive"],
+  ["offer_policy", "avoid_machines", "list", "machine ids to skip — one that keeps failing, say"],
+  ["bidding", "bid_ceiling", "number", "never bid above this, whatever a strategy returns"],
+  ["bidding", "premium", "number", "added to the market floor when bidding"],
+  ["bidding", "on_demand_crossover", "number", "past this fraction of the on-demand price, do not bid"],
+  ["bidding", "attempts", "number", "offers to try in one pass before giving up"],
+];
+
+const search = { inputs: {}, saved: null, message: "" };
+
+function searchSection(market) {
+  const saved = (market.saved || {});
+  search.saved = saved;
+  search.inputs = {};
+  const rows = SEARCH_FIELDS.filter(([section]) => saved[section]).map(([section, key, kind, why]) => {
+    const value = saved[section][key];
+    const input = kind === "checkbox"
+      ? el("input", { type: "checkbox", ...(value ? { checked: true } : {}) })
+      : el("input", {
+          type: kind === "number" ? "number" : "text", step: "any", style: "width:9rem",
+          value: value === null || value === undefined ? "" : (kind === "list" ? value.join(", ") : String(value)),
+        });
+    search.inputs[`${section}.${key}`] = { input, kind, section, key, was: value };
+    return el("tr", {},
+      el("td", { class: "mono" }, key),
+      el("td", {}, input),
+      el("td", { class: "muted" }, why));
+  });
+
+  const note = el("span", { class: "muted" }, search.message);
+  if (!rows.length) {
+    return [
+      el("h2", {}, "What the pool looks for"),
+      el("p", { class: "muted" }, "This pool's supervisor does not report its offer policy yet; restart it to edit the search here. Until then the Configuration screen is the place."),
+    ];
+  }
+  return [
+    el("h2", {}, "What the pool looks for"),
+    el("div", { class: "panel" },
+      el("table", {}, el("tbody", {}, rows)),
+      el("div", { class: "row" },
+        // Deliberately not through `run`: that refreshes the screen, which would rebuild this
+        // form from the saved values and throw away what was just typed into it.
+        el("button", { class: "primary", onclick: async (e) => {
+          const button = e.target, label = button.textContent;
+          button.disabled = true; button.textContent = "asking…";
+          try {
+            const fresh = await api.market(1, searchValues());
+            marketView.box.replaceChildren(marketPanel(fresh));
+            marketView.at = Date.now();
+            stampMarket();
+            search.message = fresh.problem
+              ? ` the market could not be asked: ${fresh.problem}`
+              : ` tried, not saved — ${fresh.passed} of ${fresh.seen} offers pass these values`;
+          } catch (error) {
+            search.message = ` ${error.message}`;
+          } finally {
+            note.textContent = search.message;
+            button.disabled = false; button.textContent = label;
+          }
+        } }, "Try these"),
+        el("button", { onclick: (e) => saveSearch(e, note) }, "Save to configuration"),
+        el("button", { class: "small", onclick: () => render() }, "Reset"),
+        note)),
+  ];
+}
+
+function searchValues() {
+  const body = { offer_policy: {}, bidding: {} };
+  for (const { input, kind, section, key } of Object.values(search.inputs)) {
+    if (kind === "checkbox") { body[section][key] = input.checked; continue; }
+    const raw = input.value.trim();
+    if (kind === "list") { body[section][key] = raw ? raw.split(",").map((s) => s.trim()).filter(Boolean) : []; continue; }
+    body[section][key] = raw === "" ? null : Number(raw);
+  }
+  return body;
+}
+
+function changedValues() {
+  const body = { offer_policy: {}, bidding: {} };
+  const wanted = searchValues();
+  for (const { section, key, was } of Object.values(search.inputs)) {
+    const now = wanted[section][key];
+    if (JSON.stringify(now) !== JSON.stringify(was ?? null)) body[section][key] = now;
+  }
+  return body;
+}
+
+async function saveSearch(event, note) {
+  const body = changedValues();
+  const count = Object.values(body).reduce((n, section) => n + Object.keys(section).length, 0);
+  if (!count) { search.message = " nothing changed"; note.textContent = search.message; return; }
+  const button = event.target;
+  button.disabled = true;
+  try {
+    let answer;
+    try {
+      answer = await api.setSearch(body);
+    } catch (error) {
+      // A change that loosens a limit comes back refused, with the plan that says why.
+      const changes = error.changes || [];
+      const retype = changes.find((c) => c.requires_retype);
+      if (!retype) throw error;
+      const ok = await confirmAction({
+        title: "This loosens a limit",
+        body: el("div", {}, ...changes.map((c) => el("p", {}, c.detail))),
+        retype: retype.value,
+      });
+      if (!ok) return;
+      answer = await api.setSearch({ ...body, confirm: retype.value });
+    }
+    search.message = ` saved · ${(answer.changes || []).length} change(s) applied`;
+    note.textContent = search.message;
+    await refresh();
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+const MARKET_REFRESH_S = 60;
+const marketView = { box: null, stamp: null, button: null, busy: false, at: 0 };
+
+function marketSection(initial) {
+  marketView.box = el("div", {}, marketPanel(initial));
+  marketView.stamp = el("span", { class: "muted" });
+  marketView.button = el("button", { class: "small", onclick: () => refreshMarket() }, "Refresh");
+  marketView.at = Date.now();
+  stampMarket();
+  return [
+    el("div", { class: "row" },
+      el("h2", {}, "Live market — the real offer pipeline, read-only"), marketView.button, marketView.stamp),
+    marketView.box,
+  ];
+}
+
+const marketOnScreen = () =>
+  state.screen === "rented" && marketView.box !== null && document.body.contains(marketView.box);
+
+function stampMarket() {
+  if (!marketView.stamp) return;
+  const next = Math.max(0, Math.round(MARKET_REFRESH_S - (Date.now() - marketView.at) / 1000));
+  marketView.stamp.textContent = marketView.busy
+    ? " asking the provider…"
+    : ` updated ${new Date(marketView.at).toLocaleTimeString()} · refreshes in ${next}s`;
+}
+
+async function refreshMarket() {
+  if (marketView.busy || !marketOnScreen()) return;
+  marketView.busy = true;
+  marketView.button.disabled = true;
+  stampMarket();
+  try {
+    const fresh = await api.market(1).catch((error) => ({ error: error.message }));
+    if (marketOnScreen()) {  // the operator may have moved on while it was asked
+      marketView.box.replaceChildren(marketPanel(fresh));
+    }
+  } finally {
+    marketView.at = Date.now();
+    marketView.busy = false;
+    marketView.button.disabled = false;
+    stampMarket();
+  }
+}
+
+// One timer for the life of the page, not one per visit to the screen.
+setInterval(() => {
+  if (!marketOnScreen()) return;
+  if (Date.now() - marketView.at >= MARKET_REFRESH_S * 1000) refreshMarket();
+  else stampMarket();
+}, 1000);
+
+// The number of hosts the pool may rent at once. A configuration change like any other, so it
+// goes validate → plan → apply, and raising it must be typed again (spec §1): more hosts is
+// more money. The pool rents up to this many as demand needs them — it is a ceiling, not an
+// order to rent that many.
+function hostLimitControl(current) {
+  const input = el("input", { type: "number", min: "0", max: "50", step: "1", value: String(current), style: "width:4.5rem" });
+  const set = async (e) => {
+    const wanted = Number(input.value);
+    if (!Number.isInteger(wanted) || wanted < 0 || wanted === current) return;
+    const button = e.target; button.disabled = true;
+    try {
+      const { text, version } = await api.getConfig();
+      const pattern = /max_rented_hosts:\s*\d+/g;
+      const found = text.match(pattern) || [];
+      if (found.length !== 1) {
+        alert("Could not find a single max_rented_hosts in the configuration file; change it on the Configuration screen.");
+        return;
+      }
+      const candidate = text.replace(pattern, `max_rented_hosts: ${wanted}`);
+      const plan = await api.planConfig(candidate);
+      if (plan.errors && plan.errors.length) { alert(plan.errors.join("\n")); return; }
+      const body = el("div", {}, ...plan.changes.map((c) => el("p", {}, c.detail)));
+      const ok = await confirmAction({
+        title: `Rent up to ${wanted} host${wanted === 1 ? "" : "s"} at once?`,
+        body,
+        retype: plan.changes.some((c) => c.requires_retype) ? String(wanted) : null,
+      });
+      if (!ok) return;
+      await api.applyConfig(candidate, version);
+      await refresh();
+    } catch (error) {
+      alert(error.message);
+    } finally { button.disabled = false; }
+  };
+  return el("div", { class: "row" }, input, el("button", { class: "small", onclick: set }, "Set"));
+}
+
 const marketPanel = (market) => {
   if (market.error) return el("p", { class: "error" }, market.error);
+  // "Could not ask" is not "nothing out there" — say which, or an operator reads a throttled
+  // provider as an empty market and goes looking for the wrong problem (D44).
+  if (market.problem) {
+    return el("div", { class: "panel" },
+      el("p", { class: "error" }, "The market could not be asked, so this is not a picture of what is out there."),
+      el("p", { class: "mono" }, market.problem),
+      el("p", { class: "muted" }, "Nothing will be rented until this clears. A provider that is rate-limiting usually just needs fewer passes: raise probe_interval_s, or close leases you are not using."));
+  }
   return el("div", { class: "grid" },
     el("div", { class: "panel" },
       el("div", { class: "stat" }, `${market.passed} pass · ${market.rejected} rejected`),
@@ -450,7 +832,9 @@ const marketPanel = (market) => {
       el("table", {},
         el("thead", {}, el("tr", {},
           el("th", {}, "Hardware"), el("th", { class: "num" }, "Floor"), el("th", { class: "num" }, "Would bid"),
-          el("th", { class: "num" }, "On-demand"), el("th", { class: "num" }, "$/GB"), el("th", { class: "num" }, "Score"))),
+          el("th", { class: "num" }, "On-demand"), el("th", { class: "num" }, "$/GB"),
+          el("th", { class: "num", title: "Workers a host rented from this offer would run" }, "Workers"),
+          el("th", { class: "num" }, "Score"))),
         el("tbody", {}, (market.best || []).map((offer, index) => el("tr", {},
           el("td", {}, index === 0 ? el("strong", {}, offer.hardware) : offer.hardware,
             el("div", { class: "muted mono" }, `${offer.machine} · ${offer.gpu_memory_gb}GB · ${offer.download_mbps}Mbps`)),
@@ -458,6 +842,10 @@ const marketPanel = (market) => {
           el("td", { class: "num" }, el("strong", {}, rate(offer.would_bid))),
           el("td", { class: "num" }, rate(offer.on_demand)),
           el("td", { class: "num" }, `$${Number(offer.download_per_gb).toFixed(4)}`),
+          // A profile's number is shown plainly; the default is marked, so it reads as unmeasured.
+          el("td", { class: "num", title: offer.workers_from || "" },
+            offer.workers ?? "—",
+            offer.workers_from && offer.workers_from.startsWith("capacity profile") ? "" : el("span", { class: "muted" }, " default")),
           el("td", { class: "num" }, Math.round(offer.score))))))));
 };
 
@@ -561,15 +949,7 @@ screens.leases = async () => {
         el("td", { class: "num" }, money(lease.estimated_spend)),
         el("td", { class: "num" }, money(lease.max_spend)),
         el("td", { class: "num" }, money(lease.dollars_left)),
-        el("td", {}, lease.state === "open"
-          ? el("div", { class: "row" },
-              el("button", { class: "small", onclick: async (e) => {
-                const value = prompt("Tighten the dollar cap to:", String(lease.max_spend));
-                if (value === null) return;
-                run(e.target, () => api.tightenLease(lease.lease_id, { max_spend: Number(value) }));
-              } }, "Tighten"),
-              el("button", { class: "small", onclick: (e) => run(e.target, () => api.closeLease(lease.lease_id)) }, "Close"))
-          : null))))),
+        el("td", {}, leaseActions(lease)))))),
   ];
 };
 

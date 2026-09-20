@@ -30,7 +30,11 @@
 | Can disappear without notice | rarely | rarely | yes — outbid at any time |
 | Treated as always up for routing | yes, but still probed | no | no |
 
-An on-demand (non-interruptible) rented kind is a deferred feature, not part of v1.
+**Both rented kinds are supported** (D52), chosen by `rented.mode`: `interruptible` bids and
+can be outbid; `on_demand` pays the listed price and cannot be; `cheaper` looks at both and lets
+ranking decide. A fixed price is never bid down — above a ceiling it is refused, because
+offering a marketplace less than it asks does not rent the machine — and a non-interruptible
+host that stops was not outbid, so it is released rather than re-bid on.
 
 ### 1.3 Transports
 
@@ -131,6 +135,13 @@ workers(host) = min( capacity profile maximum   — what this hardware class can
    model set**, since they are only valid for the set they were measured on.
 3. **No profile and no calibration → 1 worker**, flagged in the console. The pool does not guess
    upward.
+
+**Built for hosts the pool rents (D45).** A profile matches on the *offer* — its hardware as the
+market lists it, compared whole (so two of a card is not one of it), its memory, the rented
+capabilities — and is decided **before the bid**, so the engine is launched with that
+parallelism and the number is real. The host keeps it for its life, across a supervisor restart,
+whatever the profiles say later. With no match, a rented host runs `rented.workers`, marked as
+the default wherever it is shown. The market preview shows what each offer would run.
 
 Worker counts are recomputed when the pool's model set or context length changes — never per
 request.

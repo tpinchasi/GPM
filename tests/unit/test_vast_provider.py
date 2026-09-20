@@ -172,6 +172,42 @@ async def test_an_offer_that_went_between_search_and_create_is_typed():
 # --- state ---
 
 
+# --- D43: a redirect must never be read as the answer ---
+
+
+async def test_the_real_apis_redirect_on_the_bare_list_path_is_not_silently_read_as_empty():
+    """Reproduces the live bug exactly: the real API 301s a GET without the trailing slash to
+    the same URL with one, and the redirect's own body happens to parse as valid JSON with no
+    "instances" key — which is why this read as "nothing exists" for as long as it did."""
+
+    def handler(request):
+        if request.url.path == "/api/v0/instances":  # the bare path: a 301 whose body is JSON
+            return httpx.Response(
+                301,
+                headers={"location": "/api/v0/instances/?owner=me"},
+                json={"message": "The resource has been moved...", "code": "301 Moved Permanently"},
+            )
+        if request.url.path == "/api/v0/instances/":  # and behind it, a 410
+            return httpx.Response(410, json={"success": False, "error": "deprecated_endpoint"})
+        assert request.url.path == "/api/v1/instances/", request.url.path
+        return httpx.Response(200, json={"instances": [{"id": 1, "label": "p/a", "machine_id": 5}]})
+
+    instances = await provider(handler).list_instances("p/")
+    assert [i.instance_id for i in instances] == ["1"]
+
+
+async def test_any_unexpected_redirect_raises_rather_than_being_read_as_the_payload():
+    """Defense in depth beyond the one path above: whatever the reason, a 3xx is never quietly
+    treated as a 2xx-shaped answer just because its body happens to parse as JSON."""
+    from gpm_server.providers import ProviderUnavailable
+
+    def handler(request):
+        return httpx.Response(302, headers={"location": "/elsewhere"}, json={"ok": True})
+
+    with pytest.raises(ProviderUnavailable, match="redirect"):
+        await provider(handler).list_instances("p/")
+
+
 async def test_the_orphan_sweep_only_sees_this_pools_label():
     payload = {
         "instances": [
@@ -328,7 +364,7 @@ async def test_the_listing_feeds_the_cache_so_the_sweep_pass_costs_one_call():
 
     def handler(request):
         calls.append(request.url.path)
-        if request.url.path == "/api/v0/instances":
+        if request.url.path == "/api/v1/instances/":
             return httpx.Response(200, json={"instances": [{"id": 1, "label": "p/a", "machine_id": 5, "actual_status": "running", "intended_status": "running"}]})
         return httpx.Response(200, json={"instances": {}})
 
@@ -336,7 +372,7 @@ async def test_the_listing_feeds_the_cache_so_the_sweep_pass_costs_one_call():
     await p.list_instances("p/")
     status = await p.status(Instance("1"))
     assert status.state == InstanceState.RUNNING
-    assert calls == ["/api/v0/instances"]
+    assert calls == ["/api/v1/instances/"]
 
 
 async def test_a_stale_entry_is_fetched_again():
@@ -363,3 +399,80 @@ async def test_destroying_forgets_what_was_remembered():
     p._instances["1"] = (10**12, {"id": 1, "actual_status": "running"})
     await p.destroy(Instance("1"))
     assert (await p.status(Instance("1"))).state == InstanceState.GONE
+
+
+async def test_every_page_of_the_instance_listing_is_followed():
+    """A half-read listing is a missed orphan. v1 paginates with `next_token`."""
+    pages = {
+        None: {"instances": [{"id": 1, "label": "p/a", "machine_id": 5}], "next_token": "t2"},
+        "t2": {"instances": [{"id": 2, "label": "p/b", "machine_id": 6}], "next_token": None},
+    }
+
+    def handler(request):
+        return httpx.Response(200, json=pages[request.url.params.get("start_token")])
+
+    assert [i.instance_id for i in await provider(handler).list_instances("p/")] == ["1", "2"]
+
+
+async def test_a_listing_that_never_ends_is_refused_rather_than_half_believed():
+    from gpm_server.providers import ProviderUnavailable
+
+    def handler(request):
+        return httpx.Response(200, json={"instances": [{"id": 1, "label": "p/a"}], "next_token": "more"})
+
+    p = provider(handler)
+    p.max_instance_pages = 3
+    with pytest.raises(ProviderUnavailable, match="partial list"):
+        await p.list_instances("p/")
+
+
+async def test_a_bid_reported_lost_that_actually_created_an_instance_destroys_it():
+    """Seen live: this API answered `success: false` and created the instance anyway. Three
+    of those in one pass is how one lease came to be paying for three machines."""
+    destroyed = []
+
+    def handler(request):
+        if request.method == "PUT":
+            return httpx.Response(200, json={"success": False})
+        if request.method == "DELETE":
+            destroyed.append(request.url.path)
+            return httpx.Response(200, json={})
+        return httpx.Response(200, json={"instances": [{"id": 77, "label": "p/rented-x", "machine_id": 5}]})
+
+    offer = (await provider(market()).search_offers(OfferQuery()))[0]
+    spec = InstanceSpec(label="p/rented-x", image="img", disk_gb=10, onstart="")
+    with pytest.raises(BidLost, match="created 77, which has been destroyed"):
+        await provider(handler).create(offer, spec, 0.2)
+    assert destroyed == ["/api/v0/instances/77/"]
+
+
+async def test_a_lost_bid_that_cannot_be_checked_raises_a_provider_error_not_a_lost_bid():
+    """The caller treats these differently on purpose: BidLost means try the next offer,
+    ProviderError means stop. Not knowing what is running must never mean "try the next"."""
+    from gpm_server.providers import ProviderUnavailable
+
+    def handler(request):
+        if request.method == "PUT":
+            return httpx.Response(200, json={"success": False})
+        return httpx.Response(500, json={})
+
+    offer = (await provider(market()).search_offers(OfferQuery()))[0]
+    spec = InstanceSpec(label="p/rented-x", image="img", disk_gb=10, onstart="")
+    with pytest.raises(ProviderUnavailable):
+        await provider(handler).create(offer, spec, 0.2)
+
+
+async def test_a_gone_offer_and_a_gone_endpoint_are_not_the_same_error():
+    """410 on an offer is a market event — try the next one. 410 anywhere else means this
+    client is calling something that no longer exists, and must not read as a lost offer."""
+    from gpm_server.providers import ProviderUnavailable
+
+    gone = httpx.Response(410, json={"success": False, "error": "deprecated_endpoint"})
+    with pytest.raises(OfferGone):
+        await provider(lambda r: gone).create(
+            (await provider(market()).search_offers(OfferQuery()))[0],
+            InstanceSpec(label="p/x", image="i", disk_gb=10, onstart=""),
+            bid=0.2,
+        )
+    with pytest.raises(ProviderUnavailable, match="endpoint is gone"):
+        await provider(lambda r: gone).list_instances("p/")

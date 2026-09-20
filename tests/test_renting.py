@@ -94,12 +94,25 @@ async def test_a_lease_that_may_not_rent_needs_no_cap(fleet):
     assert fleet.hosts == {}
 
 
-async def test_a_lease_may_only_be_tightened(fleet):
+async def test_a_lease_is_tightened_freely_but_raised_only_on_purpose(fleet):
+    """D49 replaced tighten-only: raising is allowed, but never by accident — the caller has
+    to say it meant to, and the console and CLI only do that once the operator retypes it."""
     lease = open_lease(fleet)
     fleet.leases.tighten(lease.lease_id, max_spend=2.00)
     assert fleet.leases.get(lease.lease_id).max_spend == 2.00
-    with pytest.raises(LeaseRefused, match="tightened"):
+
+    with pytest.raises(LeaseRefused, match="must be confirmed"):
         fleet.leases.tighten(lease.lease_id, max_spend=50.00)
+
+    fleet.leases.tighten(lease.lease_id, max_spend=50.00, loosen=True)
+    assert fleet.leases.get(lease.lease_id).max_spend == 50.00
+
+
+async def test_a_closed_lease_is_not_reopened_by_amending_it(fleet):
+    lease = open_lease(fleet)
+    fleet.leases.close(lease.lease_id, "done")
+    with pytest.raises(LeaseRefused, match="closed"):
+        fleet.leases.tighten(lease.lease_id, max_hours=10, loosen=True)
 
 
 async def test_a_lease_may_not_loosen_the_pools_bid_ceiling(fleet):
@@ -205,7 +218,10 @@ async def test_a_lease_stops_before_its_cap_when_the_provider_reports_more(fleet
     await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
 
     assert fleet.leases.get(lease.lease_id).state == "closed"
-    assert fleet.hosts == {}  # everything the lease held was released
+    # Everything the lease held is on its way out; idle, so the next pass ends it.
+    assert all(h.state == "draining" for h in fleet.hosts.values())
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    assert fleet.hosts == {}
     capped = [e for e in fleet.events.recent() if e["kind"] == "lease_capped"][0]
     # Enforced at the cap less the safety margin, so it stops *before* the limit.
     assert capped["numbers"]["enforced_at"] == pytest.approx(0.90)
@@ -253,9 +269,15 @@ async def test_an_expired_lease_releases_what_it_held(fleet):
     )
     await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
 
-    assert fleet.hosts == {}
+    # It drains first — a lease ending is not a reason to drop requests in flight (D53).
+    (host,) = fleet.hosts.values()
+    assert host.state == "draining" and "draining" in kinds(fleet)
     assert fleet.leases.get(lease.lease_id).state == "closed"
     assert "lease_expired" in kinds(fleet)
+
+    # Nothing is running on it, so the next pass ends it.
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={}, busy={host.host_id: 0})
+    assert fleet.hosts == {}
 
 
 # --- release what should not exist ---
@@ -390,7 +412,173 @@ async def test_a_host_that_never_becomes_ready_is_given_up_on(fleet):
     host = next(iter(fleet.hosts.values()))
 
     host.created_at -= 31 * 60
+    host.preparing_since -= 31 * 60  # it has been *preparing* that long, not merely existing
     await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
 
     assert host.host_id not in fleet.hosts
     assert any("not ready after" in e["summary"] for e in fleet.events.recent())
+
+
+async def test_a_long_running_host_is_not_given_up_on_the_moment_it_is_re_verified(fleet):
+    """What a supervisor restart did live (D50): adoption marks a host `preparing` so its
+    readiness is re-verified, and the deadline was measured from when it was *created* — so a
+    host that had been serving for an hour was destroyed a second after it was taken back."""
+    fleet.rented.teardown.max_preparing_minutes = 30
+    open_lease(fleet, workers=2)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    host = next(iter(fleet.hosts.values()))
+
+    host.created_at -= 3 * 3600  # three hours old, and serving all that time
+    host.state = "ready"
+    host.mark_preparing()  # exactly what adoption, or a blink of its engine, does
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+
+    assert host.host_id in fleet.hosts, "a host that has only just started preparing was destroyed"
+
+
+# --- renting on demand: a host nobody can outbid (D52) ---
+
+
+def on_demand_offer(**overrides):
+    base = dict(offer_id="od-1", machine_id="m-9", min_bid_hourly=0.50, all_in_hourly=0.50,
+                on_demand_hourly=0.50, interruptible=False)
+    base.update(overrides)
+    return default_offer(**base)
+
+
+async def test_an_on_demand_host_is_rented_at_its_price_with_no_bid(fleet):
+    fleet.rented.mode = "on_demand"
+    fleet.provider.offers = [on_demand_offer()]
+    open_lease(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+
+    (host,) = fleet.hosts.values()
+    assert host.interruptible is False
+    assert host.bid_hourly == 0.50  # the listed price, not floor plus a premium
+    # The provider was asked to create it without a price: that is what makes it on-demand.
+    (created,) = fleet.provider.instances.values()
+    assert created.bid_hourly == 0.50 and "create" in fleet.provider.calls
+    rented = next(e for e in fleet.events.recent() if e["kind"] == "rented")
+    assert "not outbiddable" in rented["summary"]
+
+
+async def test_a_fixed_price_above_the_ceiling_is_refused_not_bid_down(fleet):
+    """You cannot offer a marketplace less than its asking price and be served."""
+    from gpm_server.strategies import price_bid
+
+    bid = price_bid(on_demand_offer(all_in_hourly=2.0), fleet.rented.bidding)
+    assert bid.hourly == 0.0
+    assert "cannot be lowered" in " ".join(bid.reasons)
+
+    fleet.rented.mode = "on_demand"
+    fleet.provider.offers = [on_demand_offer(all_in_hourly=2.0)]  # ceiling is 0.60
+    open_lease(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    assert fleet.hosts == {}
+
+
+async def test_an_on_demand_host_that_stops_is_not_treated_as_outbid(fleet):
+    fleet.rented.mode = "on_demand"
+    fleet.provider.offers = [on_demand_offer()]
+    open_lease(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    (host,) = fleet.hosts.values()
+
+    fleet.provider.evict(host.instance.instance_id)  # the provider stops it, whatever the reason
+    await fleet.handle_evictions()
+
+    assert host.released
+    kinds_seen = kinds(fleet)
+    assert "host_stopped" in kinds_seen and "eviction" not in kinds_seen
+
+
+async def test_which_listings_are_searched_follows_the_mode(fleet):
+    asked = []
+
+    async def remember(query):
+        asked.append((query.interruptible, query.on_demand))
+        return []
+
+    fleet.provider.search_offers = remember
+    for mode in ("interruptible", "on_demand", "cheaper"):
+        fleet.rented.mode = mode
+        await fleet._offers()
+    assert asked == [(True, False), (False, True), (True, True)]
+
+
+async def test_with_both_kinds_in_hand_ranking_chooses(fleet):
+    """`cheaper` is not "always bid": a cheap fixed price can beat a risky one."""
+    fleet.rented.mode = "cheaper"
+    fleet.provider.offers = [
+        default_offer(offer_id="bid-1", machine_id="m-1", min_bid_hourly=0.40),   # 0.42 with premium
+        on_demand_offer(offer_id="od-1", machine_id="m-2", all_in_hourly=0.20),
+    ]
+    open_lease(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+
+    (host,) = fleet.hosts.values()
+    assert host.offer.machine_id == "m-2" and host.interruptible is False
+
+
+# --- a host that is going still finishes what it was given (D53) ---
+
+
+async def test_a_host_with_work_in_flight_is_drained_not_dropped(fleet):
+    """A lease ending is not a reason to drop the requests already running on its host."""
+    lease = open_lease(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    (host,) = fleet.hosts.values()
+    host.state = "ready"
+
+    fleet.leases.close(lease.lease_id, "time limit reached")  # as the real path does first
+    await fleet.release_lease(lease, "time limit reached")
+    assert host.state == "draining" and not host.released
+
+    # Two requests are still running on it: it is left alone, and stays out of routing.
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={}, busy={host.host_id: 2})
+    assert host.host_id in fleet.hosts and host.state == "draining"
+
+    # The last one answers, and only then is it ended.
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={}, busy={host.host_id: 0})
+    assert fleet.hosts == {}
+    released = next(e for e in fleet.events.recent() if e["kind"] == "released")
+    assert "its work had finished" in released["summary"]
+
+
+async def test_draining_does_not_wait_for_ever_because_it_is_still_billing(fleet):
+    fleet.rented.teardown.drain_timeout_s = 0.0
+    lease = open_lease(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    (host,) = fleet.hosts.values()
+    host.state = "ready"
+
+    fleet.leases.close(lease.lease_id, "dollar cap reached")
+    await fleet.release_lease(lease, "dollar cap reached")
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={}, busy={host.host_id: 1})
+
+    assert fleet.hosts == {}
+    released = next(e for e in fleet.events.recent() if e["kind"] == "released")
+    assert "still not finished" in released["summary"] and "still billing" in released["summary"]
+
+
+async def test_a_host_that_is_serving_nothing_yet_is_not_kept_alive_to_drain(fleet):
+    """A host that never became ready has no work to protect; draining it would only bill."""
+    open_lease(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    (host,) = fleet.hosts.values()
+    host.state = "scheduling"
+
+    await fleet.drain(host, "nothing to keep")
+    assert host.released and fleet.hosts == {}
+
+
+def test_the_router_stops_choosing_a_host_that_is_draining():
+    """Publishing `draining` is what stops new work reaching it — so the state must be one the
+    router understands, and must not be eligible."""
+    from gpm_server.models import HostState
+    from gpm_server.router.dispatch import Dispatcher
+
+    assert HostState("draining") is HostState.DRAINING
+    assert HostState.DRAINING is not HostState.READY
+    source = __import__("inspect").getsource(Dispatcher.eligible)
+    assert "HostState.READY" in source
