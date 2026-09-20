@@ -40,6 +40,8 @@ On top of it the pool adds a short, named dialect. Nothing else is added silentl
 | `X-GPM-Session` | Optional | Groups calls in the pool's request log. Affects routing only if the operator switched on an affinity or build-consistency option |
 | `X-GPM-Deadline` | Optional | Absolute time after which the response is useless; lets the pool drop work that can no longer be used (§5) |
 | `X-GPM-Runtime-Class` (request) | Optional | Pins the request to hosts whose served build is of the given class — for runs that must not mix builds |
+| `X-GPM-Delivery`, `X-GPM-Attempts` (response) | Always reported | How the response reached the app — `stream`, `buffered`, or `stream-after-overflow` — and how many hosts were tried (§5.1) |
+| `X-GPM-Delivery: stream` (request) | Optional, if the operator allows | Asks for tokens as they come from a host that can be interrupted, accepting that the stream may break (§5.1) |
 
 ### Status codes an app will see
 
@@ -142,8 +144,10 @@ contract states the budget.
 1. **Cancel on disconnect.** When the client goes away the router cancels the upstream request
    and frees the worker at once, queued or generating.
 2. **One layer retries for capacity — the client side.** The router's own cross-host retry is
-   for one case only: the chosen host failed before the first response byte. It is attempted
-   **once**, on the next eligible host in priority order, and never for "no capacity".
+   for one case only: the chosen host failed before the first byte **reached the client**. For a
+   streamed response that is the first upstream byte; for a buffered one (§5.1) it is any point
+   in the generation. It is attempted `max_redispatch` times (default **once**), on the next
+   eligible host in priority order, inside the request's deadline, and never for "no capacity".
 3. **The SDK owns client timeouts**, split three ways; callers do not set raw ones.
 
    | Timeout | Covers | Default |
@@ -164,6 +168,34 @@ contract states the budget.
 For non-streaming requests "first byte" is the whole response, so the time-to-first-byte budget
 must cover the full generation; the SDK derives it from the request's output-length limit when
 one is given.
+
+### 5.1 Buffered delivery from hosts that can be interrupted (D62)
+
+An interruptible host can vanish with no notice, and a streamed response is by then partly in
+the app's hands. So, **by host kind**, the router may hold a response until it is whole:
+
+| Host kind | Default | |
+|---|---|---|
+| `rented-interruptible` | `buffered` | The operator may set `stream` |
+| every other kind | `stream` | These do not vanish without notice |
+
+A buffered response is delivered as **the same frames, verbatim and in order**, in the engine's
+own streaming format: an app that asked for a stream still parses a stream, and the body is
+byte-identical to a direct one. Only the timing differs — **time to first byte becomes the whole
+generation**, so rule 3's note on non-streaming requests applies, and `GET /pool/status`
+publishes the delivery policy for the SDK to size its budget from. The "between bytes" timeout
+does not run while the pool is buffering.
+
+If the host is lost while buffering, the app has received nothing, so the pool runs the request
+again itself (rule 2). Generation has no side effects — a tool call is returned to the app, never
+executed by the pool. If no host can take it, the app gets a retryable `503`.
+
+- A response that outgrows `max_buffer_mb` (default 16) is flushed and streamed from there on,
+  marked `stream-after-overflow`, rather than failed.
+- Cancel-on-disconnect is unchanged: the app's connection stays open while the pool buffers.
+- An engine plug-in may declare a keep-alive frame that is harmless in its stream format, sent
+  while buffering so that an intermediary's idle timeout does not cut the connection. Where an
+  engine declares none, nothing is sent.
 
 ## 6. Versioning
 

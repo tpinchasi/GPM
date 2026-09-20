@@ -159,12 +159,40 @@ loaded for their own reasons is not the pool's to unload.
 2. Pull and load/pin/unload to satisfy the model set and `residency`; plan shows the download.
 3. Operator-defined restart and engine settings.
 4. The agent behind an SSH tunnel.
+5. The agent on hosts the pool rents (§9). **Decided (D63), not built.**
 
-Not built, and **recommended against for now** (an open owner decision, see STATUS.md):
-installing the agent over SSH, and running it on rented hosts in place of the prepare path.
-Both need the agent to be installable from a package index, which it is not until release; and
-on a rented host the pool already is the configurator, over a path proven live — putting an
-interpreter and an agent on every instance would add billed boot time and new ways to fail to
-a spending path, to learn facts the provider's offer already stated.
+Still not built, and still waiting on a package index: installing the agent over SSH onto a
+*configured* host that someone else owns.
 
 Stages 1 to 4 are built. Every stage is tested against a real agent app and the fake engine: no GPU, no cloud account.
+
+## 9. On hosts the pool rents (D63)
+
+The offer does not state the facts that matter: machines with identical offers have differed
+fourfold in throughput, for reasons visible only from the machine. So a rented host runs the same
+agent, with the same closed verbs, and **the pool still dials**.
+
+- **Put there by the pool.** Once the host's SSH answers, the pool copies the agent and a key made
+  for that host alone, and starts it on the host's loopback. Nothing secret goes into the
+  start-up script, which a provider stores and can read. The pool reaches the agent through a
+  second forward on the SSH connection it already holds (stage 4).
+- **It is the preparation path.** `PUT /models` works toward the model set and loads each model
+  as its own download finishes (D57); `POST /engine` changes the worker count (D56). Neither
+  needed a new verb.
+- **One new verb, and more facts.** `POST /heartbeat`, with no body, touches the dead-man timer's
+  heartbeat file — it can only postpone a shutdown the pool could equally cause by going silent.
+  `GET /facts` adds load average, accelerator utilisation and memory, and measured generation
+  rate. The verb list stays closed; the test that guards it is edited for exactly this.
+- **The restart command is the pool's here.** On a host the pool created, what restarts the
+  engine comes from the pool's own start-up material — what the pool creates is the pool's to
+  configure — fixed at installation and never sent over the protocol. On a delegated host it
+  remains the owner's (D41), unchanged.
+
+Three rules keep the agent from becoming a new way to lose money:
+
+1. **The dead-man timer stays an independent script**, armed first, with the instance-scoped
+   credential. If the agent dies, the timer still fires.
+2. **No agent is never fatal.** A host whose agent has not answered within `agent_wait_s` is
+   prepared over the engine's API as before, the reason is recorded, and it joins.
+3. **Installing it overlaps the first model download**, so it adds nothing to the billed path.
+

@@ -14,6 +14,7 @@ from gpm_server.config import PoolConfig
 from gpm_server.db import Database, HostTable
 from gpm_server.providers import FakeProvider
 from gpm_server.supervisor import Supervisor
+from gpm_server.supervisor.service import ProviderCredentialMissing
 
 MODEL = "m1"
 
@@ -209,3 +210,87 @@ def test_the_published_ref_carries_no_secret(tmp_path, market):
         loop.run(supervisor.aclose())
     finally:
         database.close()
+
+
+def test_a_supervisor_that_cannot_ask_the_provider_keeps_every_record(tmp_path, market):
+    """Seen live, and it cost a host: a supervisor started where the provider could not be
+    asked read "could not list" as "nothing there", dropped the host's record, and the next
+    supervisor destroyed the healthy instance as an orphan."""
+    loop, provider, _ = market
+    database = Database(tmp_path / "gpm.sqlite3")
+    try:
+        first = Supervisor(config(), database, provider=provider)
+        first.fleet.run_on_host = silent
+        loop.run(first.start())
+        host = rent_one(loop, first)
+        instance_id = host.instance.instance_id
+        loop.run(first.aclose())
+
+        provider.unavailable = True  # the second supervisor cannot reach the provider
+        second = Supervisor(config(), database, provider=provider)
+        second.fleet.run_on_host = silent
+        loop.run(second.start())
+        loop.run(second.pass_once())
+
+        rows = {row.host_id for row in HostTable(database).all()}
+        assert host.host_id in rows, "the record was dropped because the provider could not be asked"
+        assert "adoption_deferred" in [e["kind"] for e in second.events.recent(50)]
+        loop.run(second.aclose())
+
+        provider.unavailable = False  # and the third can: it adopts, it does not sweep
+        third = Supervisor(config(), database, provider=provider)
+        third.fleet.run_on_host = silent
+        loop.run(third.start())
+
+        assert instance_id in provider.instances, "a healthy host was destroyed as an orphan"
+        assert host.host_id in third.fleet.hosts
+        assert "orphan_swept" not in [e["kind"] for e in third.events.recent(50)]
+        loop.run(third.aclose())
+    finally:
+        database.close()
+
+
+def test_adoption_resumes_in_the_same_supervisor_once_the_provider_answers(tmp_path, market):
+    loop, provider, _ = market
+    database = Database(tmp_path / "gpm.sqlite3")
+    try:
+        first = Supervisor(config(), database, provider=provider)
+        first.fleet.run_on_host = silent
+        loop.run(first.start())
+        host = rent_one(loop, first)
+        loop.run(first.aclose())
+
+        provider.unavailable = True
+        second = Supervisor(config(), database, provider=provider)
+        second.fleet.run_on_host = silent
+        loop.run(second.start())
+        assert host.host_id not in second.fleet.hosts
+
+        provider.unavailable = False
+        loop.run(second.pass_once())
+        assert host.host_id in second.fleet.hosts
+        loop.run(second.aclose())
+    finally:
+        database.close()
+
+
+def test_a_supervisor_with_no_usable_credential_does_not_start(tmp_path, market):
+    loop, provider, _ = market
+    database = Database(tmp_path / "gpm.sqlite3")
+    try:
+        first = Supervisor(config(), database, provider=provider)
+        first.fleet.run_on_host = silent
+        loop.run(first.start())
+        host = rent_one(loop, first)
+        loop.run(first.aclose())
+
+        provider.credential_refused = True
+        second = Supervisor(config(), database, provider=provider)
+        with pytest.raises(ProviderCredentialMissing, match="credential"):
+            loop.run(second.start())
+
+        assert host.host_id in {row.host_id for row in HostTable(database).all()}
+        loop.run(second.aclose())
+    finally:
+        database.close()
+

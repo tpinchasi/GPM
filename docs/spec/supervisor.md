@@ -41,6 +41,12 @@ what was intended.** On start the supervisor lists the provider's instances carr
 pool's label first, then adopts those it intended and sweeps those it did not. A crash can
 never leave a billing host that nothing knows about.
 
+**An unanswered question is not the answer "nothing" (D61).** If the provider cannot be asked at
+start-up, every rented host's record is kept exactly as found; adoption is retried on each pass,
+and until it succeeds nothing is swept, rented or pruned. If rented capacity is configured and
+the provider refuses the credential, or the process has none, the supervisor does not start: it
+could neither adopt its hosts nor verify a destroy, and says what to set instead.
+
 ## 2. Leases — the only thing that can spend
 
 ```
@@ -90,7 +96,7 @@ Ordered by value — idle time, not the hourly rate, dominates cost.
 
 | Control | Rule |
 |---|---|
-| Idle release | A rented host with nothing routed for `idle_minutes` is drained, then parked if a lease is still open, else destroyed |
+| Idle release | A rented host with nothing routed for `idle_minutes` (default **2**, D58) is drained, then parked if a lease is still open, else destroyed |
 | Lease expiry | Time or dollar limit reached → drain → destroy. The budget is a hard stop |
 | **Spend is reconciled, not just estimated** | The pool's own figure (bid × time) misses storage while stopped, per-gigabyte download charges and provider rounding. Each pass the supervisor also reads **provider-reported charges** and records both. Caps are enforced against **whichever is higher**, less `cap_safety_margin` (default 10 %), so a lease stops *before* its limit. A gap above a threshold is logged and shown in the console. A provider that cannot report charges must declare so; the margin is then widened |
 | Orphan sweep | Any provider instance carrying this pool's label that the database does not know → alert, destroy after a grace period. Covers instances that bill storage while never running |
@@ -126,7 +132,9 @@ model set. **Parked hosts are tried first** (§8).
 
 1. **Hard filters** — memory, memory-bandwidth band, provider verification, reliability,
    download speed, disk, excluded hardware, per-gigabyte download-price ceiling, all-in hourly
-   ceiling, "the model set fits at the pool's context length", and the machine avoid list.
+   ceiling, "the model set fits at the pool's context length", and the machine avoid list —
+   which always includes every machine the pool already rents: it is still listed, to be outbid,
+   and the tenant it would outbid is the pool (D59).
    **Never relaxed unattended** — an empty result means stay paused. The filters are applied by
    the pool, not pushed into the provider's own query, so every rejected offer carries the
    reason it was rejected; a market that merely *looks* empty teaches an operator nothing.
@@ -210,8 +218,8 @@ ready from its advertised download speed; hourly rate while preparing; storage r
 |---|---|
 | Bid | Offer chosen, bid placed, won or lost; a lost bid retries within the caps |
 | Instance up | Image pulled, engine answering, dead-man timer armed |
-| Models | Per-model download progress, gigabytes so far, download cost so far against the estimate |
-| Verify | Every model loads; all resident **together**; a short clean generation per model |
+| Models | Per-model download progress, gigabytes so far, download cost so far against the estimate. **Each model is loaded and pinned as soon as its own download finishes, while the rest are still downloading** (D57), so the loading of one overlaps the download of the next |
+| Verify | Every model loads; all resident **together**; a short clean generation per model. Readiness is unchanged by D57: a host joins on the whole set, never on a partial one |
 | Size | Worker count for this hardware and model set; engine parallelism set to match |
 | Ready | Cost to date, hourly cost from here, storage cost if parked |
 
@@ -308,7 +316,7 @@ rented:
                 on_demand_crossover: 0.8, attempts: 3, retry_market_every_min: 10 }
     spend:    { cap_safety_margin: 0.10, drift_alert: 0.15 }
     prepare:  { max_park_hours: 72, default_when_ready: join }
-    teardown: { idle_minutes: 10, drain_timeout_s: 300, deadman_minutes: 20, deadman_action: destroy }
+    teardown: { idle_minutes: 2, drain_timeout_s: 300, deadman_minutes: 20, deadman_action: destroy }
 
 capacity_profiles:                             # workers per hardware class; first match wins
   - match: { hardware: "1x RTX PRO 6000 Max-Q" }  # the offer's hardware, compared whole

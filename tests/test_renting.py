@@ -521,6 +521,23 @@ async def test_with_both_kinds_in_hand_ranking_chooses(fleet):
     assert host.offer.machine_id == "m-2" and host.interruptible is False
 
 
+async def test_the_pool_does_not_bid_against_its_own_host(fleet):
+    """The machine it already rents is still listed — to be outbid. Outbidding yourself buys
+    nothing and costs a host."""
+    open_lease(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    (host,) = fleet.hosts.values()
+
+    preview = await fleet.market_preview()
+    assert preview["passed"] == 0
+    assert "already rented" in fleet.avoided_now()[host.offer.machine_id]
+    assert await fleet.prepare(max_spend=1.0, max_hours=1.0) is None
+    assert len(fleet.provider.instances) == 1
+
+    await fleet.destroy(host, "done")
+    assert (await fleet.market_preview())["passed"] == 1  # and it is back once we have let go
+
+
 # --- choosing the host and the kind of rental yourself (D55) ---
 
 
@@ -718,7 +735,8 @@ async def test_a_machine_that_just_failed_is_not_bid_on_again(fleet):
     (host,) = fleet.hosts.values()
     assert host.offer.machine_id == "good"
     preview = await fleet.market_preview(hours=1)
-    assert preview["avoided"] == {"bad": "could not download m1"}
+    assert preview["avoided"]["bad"] == "could not download m1"
+    assert "already rented" in preview["avoided"]["good"]  # and never against its own host
     assert any("avoid" in reason for reason in preview["rejected_by_reason"])
 
 

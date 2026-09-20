@@ -74,6 +74,7 @@ def _supervise(args: argparse.Namespace) -> int:
     from .db import SupervisorBusy
     from .state import open_database
     from .supervisor import run
+    from .supervisor.service import ProviderCredentialMissing
 
     config = load_config(args.config)
     database = open_database(config)
@@ -98,6 +99,9 @@ def _supervise(args: argparse.Namespace) -> int:
     except SupervisorBusy as exc:
         print(str(exc), file=sys.stderr)
         return 3
+    except ProviderCredentialMissing as exc:
+        print(str(exc), file=sys.stderr)
+        return 4
     finally:
         database.close()
     return 0

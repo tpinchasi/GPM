@@ -73,7 +73,7 @@ rented:
     bid_ceiling: 0.30
 
   teardown:
-    idle_minutes: 10           # idle time, not the hourly rate, is what actually costs you
+    idle_minutes: 2            # idle time, not the hourly rate, is what actually costs you
     deadman_minutes: 20
     deadman_action: destroy
 ```

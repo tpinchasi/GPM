@@ -382,7 +382,8 @@ class SpendConfig(BaseModel):
 class TeardownConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    idle_minutes: float = 10.0
+    #: A rented host with nothing routed to it for this long is given up (D58).
+    idle_minutes: float = 2.0
     drain_timeout_s: float = 300.0
     deadman_minutes: float = 20.0
     deadman_action: Literal["destroy", "stop"] = "destroy"

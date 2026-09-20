@@ -1,4 +1,4 @@
-# Roadmap — v1 Scope, Phases, Deferred Requirements, Open Questions
+# Roadmap — v1 Scope, Phases, Deferred Requirements, Open Questions, Planned Features
 
 > Reasons are in [decisions.md](decisions.md) (D18, D20).
 
@@ -71,3 +71,20 @@ up on purpose rather than rediscovered.
 6. **On-demand fallback** — may a lease fall back to a non-interruptible instance when bidding
    fails or crosses the on-demand crossover, or should the run always wait? Drafted as off.
 7. **Name and licence** — see [release-checklist.md](release-checklist.md).
+
+## 5. Planned features
+
+Chosen from what v1's real use showed to hurt, as §1 said the after-v1 column would be. Each is a
+story with its evidence, design, costs and open owner choices: the maintained list is
+[stories/README.md](stories/README.md).
+
+| Story | Feature | Moves out of §1's "After v1" |
+|---|---|---|
+| S1 | Dynamic resource allocation | *queue-driven scale-up* |
+| S2 | Reliable responses from interruptible hosts | — |
+| S3 | An advisor model that picks the machine | *machine memory* (as the machine-history table) |
+| S4 | The host agent on rented hosts | — (reverses host-agent §8's recommendation) |
+| S5 | Automatic worker adjustment per host | *evidence-based worker step-down*; *calibration runs* |
+
+A story is a plan. Nothing in it is specification until its decisions are recorded.
+

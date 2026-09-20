@@ -7,7 +7,9 @@ cannot cover is the `ssh` command itself, so that is asserted option by option i
 """
 
 import asyncio
+import sys
 import time
+from unittest import mock
 
 import httpx
 import pytest
@@ -199,6 +201,42 @@ async def test_a_forward_that_never_comes_up_is_reported_not_hung():
         assert not tunnel.up
     finally:
         await tunnel.stop()
+
+
+async def test_a_tunnel_that_comes_up_and_dies_backs_off_instead_of_hammering():
+    """Seen live: sixteen reconnects in six minutes against a machine whose SSH kept dropping.
+    Coming up at all used to forgive the backoff, so a link that held for a second reconnected
+    every second — and the provider answers that by throttling authentication, which is what
+    keeps the tunnel down. A link must *hold* before its failures are treated as new."""
+    port = unused_port()
+    flap = [
+        sys.executable, "-c",
+        "import socket,time;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);"
+        f"s.bind(('127.0.0.1',{port}));s.listen(1);time.sleep(0.2)",
+    ]
+    tunnel = SshTunnel(
+        "rented-1",
+        tunnel_config(remote_port=unused_port(), ssh_host="127.0.0.1", local_port=port),
+        command_builder=lambda transport, p: flap,
+    )
+    waits = []
+    real_sleep = asyncio.sleep
+
+    async def remember(seconds):
+        if seconds >= 1.0:  # the backoff; the short ones are the come-up poll
+            waits.append(seconds)
+        await real_sleep(0)
+
+    with mock.patch("gpm_server.transports.tunnel.asyncio.sleep", remember):
+        await tunnel.start(wait_s=2)
+        assert tunnel.up  # it really did come up
+        for _ in range(400):
+            if len(waits) >= 3:
+                break
+            await real_sleep(0.01)
+    await tunnel.stop()
+
+    assert waits[:3] == [1.0, 2.0, 4.0], f"a flapping tunnel must back off, got {waits[:3]}"
 
 
 # --- a pool over a tunnel host ---

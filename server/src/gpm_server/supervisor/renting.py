@@ -731,7 +731,14 @@ class Fleet:
     def avoided_now(self) -> dict[str, str]:
         now = time.time()
         self.avoided = {m: (until, why) for m, (until, why) in self.avoided.items() if until > now}
-        return {m: why for m, (_, why) in self.avoided.items()}
+        skipped = {m: why for m, (_, why) in self.avoided.items()}
+        # A machine this pool already rents still appears in the interruptible listing — its
+        # GPU is "available" to anyone who outbids the tenant, and the tenant is us. Bidding on
+        # it either fails or evicts our own host at a higher price (seen live: both).
+        for host in self.hosts.values():
+            if not host.released:
+                skipped.setdefault(host.offer.machine_id, f"already rented by this pool as {host.host_id}")
+        return skipped
 
     def _policy_with_avoided(self, policy: OfferPolicy) -> OfferPolicy:
         skipped = self.avoided_now()
@@ -950,7 +957,7 @@ class Fleet:
             "offer": dataclasses.asdict(dataclasses.replace(host.offer, raw={})),
         }
 
-    async def adopt(self, rows: list) -> list[str]:
+    async def adopt(self, rows: list) -> Optional[list[str]]:
         """On start, list what the provider has under this pool's label, take back what the
         database says was intended, and leave the rest for the sweep.
 
@@ -961,8 +968,11 @@ class Fleet:
         try:
             existing = {i.instance_id: i for i in await self.provider.list_instances(self.label_prefix)}
         except ProviderError as exc:
+            # "Could not ask" is not "nothing there" (D44, D61). Returning an empty list here
+            # once told the caller to drop every row — and the next supervisor, finding the
+            # instances with no record of them, destroyed healthy hosts as orphans (seen live).
             log.warning("could not list instances to adopt: %s", exc)
-            return []
+            return None
 
         adopted: list[str] = []
         for row in rows:

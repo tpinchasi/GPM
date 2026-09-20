@@ -65,7 +65,9 @@ and optional headers.
   in a known-hosts file the pool owns; the address always comes from the provider's
   authenticated API, never from the host itself. The forward is the `ssh` client run and
   supervised as a child process, reconnecting with back-off on a local port that is fixed for
-  the host's lifetime, and it binds loopback only.
+  the host's lifetime, and it binds loopback only. The back-off is forgiven only once a forward
+  has held for 30 s (D60): one that comes up and dies at once would otherwise reconnect every
+  second, and a provider answers that by throttling authentication.
 - For rented hosts on `http` / `https`, the start-up script must put an authenticating proxy in
   front of the engine. `tunnel` needs none of that, which is why it is the default.
 
@@ -146,8 +148,9 @@ workers(host) = min( capacity profile maximum   — what this hardware class can
 **Built for hosts the pool rents (D45).** A profile matches on the *offer* — its hardware as the
 market lists it, compared whole (so two of a card is not one of it), its memory, the rented
 capabilities — and is decided **before the bid**, so the engine is launched with that
-parallelism and the number is real. The host keeps it for its life, across a supervisor restart,
-whatever the profiles say later. With no match, a rented host runs `rented.workers`, marked as
+parallelism and the number is real. The number is then stored with the host and survives a
+supervisor restart; editing the profiles later does not reach a host already running. It changes
+only when an operator resizes that host (§2.3). With no match, a rented host runs `rented.workers`, marked as
 the default wherever it is shown. The market preview shows what each offer would run.
 
 Worker counts are recomputed when the pool's model set or context length changes — never per
@@ -157,7 +160,9 @@ request.
 
 A worker is only real if the engine can run that many requests at once.
 
-- **Hosts the pool creates**: engine parallelism and context length are set at creation to match.
+- **Hosts the pool creates**: engine parallelism and context length are set at creation to match,
+  and stay in step afterwards — a resize relaunches the engine rather than changing the count
+  alone (§2.3).
 - **Hosts the pool does not create**: the pool cannot set engine parallelism and engines often do
   not report it. Left at a lower default, extra requests silently queue *inside the engine* and
   every latency figure lies. So **test connection** includes a concurrency check — *n* short
@@ -167,6 +172,31 @@ A worker is only real if the engine can run that many requests at once.
   with concurrency while throughput stays flat, the supervisor removes one worker and logs why.
   Raising a ceiling is an operator decision. *(Evidence-based step-down and calibration runs are
   post-v1; v1 uses profiles, the formula and overrides.)*
+
+### 2.3 Resizing a host that is already running (D56)
+
+An operator may change a rented host's worker count without replacing the host. The two
+directions are not symmetric, because only one of them needs the engine to change:
+
+- **Lowering** takes effect immediately. The surplus workers go `draining`, finish what they are
+  serving and stop (§2). The engine keeps its larger parallelism; the pool simply stops using it.
+  Nothing in flight is disturbed. This is also how an operator steers traffic away from a host
+  that is serving badly without giving it up.
+- **Raising** relaunches the engine, because parallelism is fixed when the engine starts. The
+  host drains first, so no request in flight is failed; the engine is relaunched with the new
+  numbers; the pinned model set is loaded again from the host's own disk — no download — and the
+  host returns to `ready`. It is out of service for roughly a minute, reported as a stage like
+  any other preparation.
+
+What reaches the host is a closed set of bounded whole numbers — `workers`, `models_held`, and
+optionally `context` — exactly as for a delegated host (D41). The relaunch is performed by the
+start-up script the pool installed when it created the host; the pool never sends a command, a
+path or a URL.
+
+The new number is bounded by the memory ceiling of §2.1 and stored with the host, so an
+adoption after a supervisor restart restores what the engine was actually started with. It is an
+operator's act and never the supervisor's own pass: a relaunch stops a host serving, and
+evidence-based resizing stays post-v1 (§2.2).
 
 ## 3. The pool's model set
 

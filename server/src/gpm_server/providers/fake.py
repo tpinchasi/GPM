@@ -28,6 +28,7 @@ from .base import (
     Offer,
     OfferGone,
     OfferQuery,
+    ProviderAuthError,
     ProviderCapabilities,
     ProviderUnavailable,
 )
@@ -94,6 +95,8 @@ class FakeProvider:
         self.self_terminate_url = "http://127.0.0.1:9/fake-terminate"
         #: Raise ProviderUnavailable from every call while set.
         self.unavailable = False
+        #: Scripted: the account credential is missing or refused.
+        self.credential_refused = False
         self.calls: list[str] = []
 
     # --- scripting helpers ---
@@ -141,6 +144,8 @@ class FakeProvider:
 
     def _guard(self, call: str) -> None:
         self.calls.append(call)
+        if self.credential_refused:
+            raise ProviderAuthError("fake provider is scripted to refuse the credential")
         if self.unavailable:
             raise ProviderUnavailable("fake provider is scripted unavailable")
 

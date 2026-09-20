@@ -28,6 +28,12 @@ Command = list[str]
 CommandBuilder = Callable[[TransportConfig, int], Command]
 
 _RESTART_BACKOFF_MAX_S = 30.0
+#: How long a tunnel must hold before its restart backoff is forgiven. Coming up at all is not
+#: enough: a tunnel that comes up and dies a second later would otherwise reconnect every
+#: second for as long as the host lives. Seen live against a machine whose SSH was refusing —
+#: sixteen reconnects in six minutes, which the provider answers by throttling authentication,
+#: so the hammering is what keeps the tunnel down.
+_STEADY_AFTER_S = 30.0
 
 
 def allocate_local_port() -> int:
@@ -164,13 +170,16 @@ class SshTunnel:
                 backoff = min(backoff * 2, _RESTART_BACKOFF_MAX_S)
                 continue
 
-            if await self._wait_until_listening(10.0):
-                backoff = 1.0
+            came_up = await self._wait_until_listening(10.0)
+            if came_up:
                 self.last_error = None
                 log.info("tunnel %s up on 127.0.0.1:%d", self.host_id, self.local_port)
+            up_at = time.monotonic()
 
             stderr = await self._process.stderr.read() if self._process.stderr else b""
             await self._process.wait()
+            if came_up and time.monotonic() - up_at >= _STEADY_AFTER_S:
+                backoff = 1.0  # it worked for a while: this is a new problem, not the same one
             self.up = False
             if self._stopping:
                 return

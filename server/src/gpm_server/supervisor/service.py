@@ -30,12 +30,17 @@ from ..db import Database, HostCounters, HostRow, HostTable, SupervisorLock
 from ..engines import Engine, get_engine
 from ..ledger import EventLog, LeaseStore, SpendLedger
 from ..models import HostState
-from ..providers.base import get_provider
+from ..providers.base import ProviderAuthError, ProviderError, get_provider
 from ..transports import SshTunnel, build_client
 from . import agents
 from .renting import Fleet
 
 log = logging.getLogger("gpm.supervisor")
+
+
+class ProviderCredentialMissing(Exception):
+    """Rented capacity is configured and the provider will not accept this process's credential.
+    Raised at start, before anything is adopted, swept or published."""
 
 
 @dataclasses.dataclass
@@ -109,6 +114,8 @@ class Supervisor:
         self.spend = SpendLedger(database)
         self.hosts: dict[str, SupervisedHost] = {}
         self.passes = 0
+        #: True while the provider could not be asked which rented hosts still exist (D61).
+        self._adoption_pending = False
         self._stopping = False
         for host_config in config.hosts:
             self.hosts[host_config.id] = self._build(host_config)
@@ -183,8 +190,27 @@ class Supervisor:
             forward = self._sync_agent_tunnel(host)
             if forward is not None:
                 await forward.start()
+        await self._refuse_without_a_credential()
         await self.adopt_rented()
         await self.pass_once()
+
+    async def _refuse_without_a_credential(self) -> None:
+        """A pool configured to rent must be able to ask its provider what exists. One that
+        cannot — no credential, or a refused one — can neither adopt its hosts nor verify a
+        destroy, so it does not start (D61). A provider that is merely unreachable is a
+        different case: the supervisor starts, and adoption waits."""
+        if self.fleet is None:
+            return
+        try:
+            await self.fleet.provider.account()
+        except ProviderAuthError as exc:
+            raise ProviderCredentialMissing(
+                f"rented capacity is configured but the provider's credential is not usable: {exc}. "
+                "Set it in this process's environment, or remove the `rented` section. Nothing "
+                "was changed: every rented host's record is as it was."
+            ) from exc
+        except ProviderError:
+            return
 
     async def adopt_rented(self) -> None:
         """Before the first pass — and so before the first sweep — take back the rented hosts
@@ -196,7 +222,22 @@ class Supervisor:
             for row in rows:
                 self.table.remove(row.host_id)
             return
-        adopted = set(await self.fleet.adopt(rows))
+        answer = await self.fleet.adopt(rows)
+        if answer is None:
+            # The provider could not be asked, so nothing is known about these hosts: their
+            # rows are kept exactly as found, and nothing is swept, rented or pruned until a
+            # later pass can ask (D61).
+            if not self._adoption_pending:
+                self.events.record(
+                    "adoption_deferred",
+                    f"the provider could not be asked about {len(rows)} rented host(s); their "
+                    "records are kept and nothing is swept or rented until it can be",
+                    numbers={"hosts": sorted(row.host_id for row in rows)},
+                )
+            self._adoption_pending = True
+            return
+        self._adoption_pending = False
+        adopted = set(answer)
         for row in rows:
             if row.host_id not in adopted:
                 self.table.remove(row.host_id)
@@ -239,12 +280,14 @@ class Supervisor:
         what is broken, then acquire what is missing.
         """
         self._follow_config_file()
+        if self._adoption_pending:
+            await self.adopt_rented()
         await asyncio.gather(*(self._ask_agent(host) for host in self.hosts.values()))
         await asyncio.gather(*(self._probe(host) for host in self.hosts.values()))
         await self._probe_rented()
         self._publish_all()
 
-        if self.fleet is not None:
+        if self.fleet is not None and not self._adoption_pending:
             await self.fleet.pass_once(
                 ready_workers_higher_tiers=self._ready_workers(),
                 idle_seconds=self._idle_seconds(),
