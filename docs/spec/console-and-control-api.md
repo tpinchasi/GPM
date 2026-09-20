@@ -35,7 +35,7 @@
 |---|---|---|
 | **Overview** | Hosts grouped by routing tier: state, busy / total workers (each worker and its current request on expand), build being served, cost per hour. Open leases with burn-down against their caps. Queue depth and wait. Live event feed | **Release all rented** — the panic button, always visible. Drain / release per host |
 | **Hosts** | Every `local` and `fixed-remote` host: transport, priority, workers (profile ceiling, memory ceiling, the number in force), capabilities and how each was learned | Add / edit / disable. **Test connection** before saving. Restart engine |
-| **Rented capacity** | Provider account (credential valid, credit left); offer policy, bid strategy, tear-down settings — each field beside its default and a one-line reason. Rented and **parked** hosts with their running and storage cost | Edit with **live market preview**. **Prepare a host**. Restart or destroy a parked host |
+| **Rented capacity** | Provider account (credential valid, credit left); offer policy, bid strategy, tear-down settings — each field beside its default and a one-line reason. Rented and **parked** hosts with their running and storage cost | Edit with **live market preview** — both rental kinds listed, labelled, each row with its own **Rent**. **Prepare a host**, as a bid, on demand, or as configured. Restart or destroy a parked host |
 | **Rented capacity → what the pool looks for** | Every offer-policy and bidding parameter, editable in place. **Try these** runs the real pipeline against the live market with the unsaved values and saves nothing; **Save** writes them into the configuration file *in place* — comments, ordering and flow style untouched — then validates, plans, and applies, with loosening retyped as anywhere else | `PATCH /pool/config/rented` |
 | **One host** | Opened from any host id. Its state and stage in words (*starting · downloading gemma4:26b 12.1 of 18.6 GB · loading into memory · ready*), what the provider says about the machine, tunnel, cost so far, the model set with what is on disk and what is loaded, per-model download progress, and that host's own slice of the decision log. Follows the host while open | — (`GET /pool/hosts/{id}`, `gpm host show <id>`) |
 | **Models** | The pool's model set; the catalog of logical names and variants; per-host matrix of which build is served, its runtime class, whether it enforces schemas; capacity profiles and calibration entries | Edit the set and the catalog (changing the set re-prepares hosts — shown in plan) |
@@ -109,10 +109,10 @@ finally **join**, **park** or **destroy**.
 | `POST /pool/config/validate`, `POST /pool/config/plan` | Check, and preview consequences, without applying |
 | `GET/POST /pool/leases`, `DELETE /pool/leases/{id}`, `PATCH …` (tighten only) | Leases |
 | `POST /pool/hosts/test` | Test connection for an unsaved host definition |
-| `POST /pool/hosts/prepare`, `GET /pool/hosts/prepare/{id}` | Prepare a rented host; progress |
+| `POST /pool/hosts/prepare`, `GET /pool/hosts/prepare/{id}` | Prepare a rented host; progress. Optional `kind` (`interruptible` · `on_demand`) rents the best offer of that kind; optional `offer_id` rents that one offer or nothing (D55). A refusal says the actual reason and that nothing was spent |
 | `POST /pool/hosts/{id}/drain | release | park | restart | disable | enable` | Per-host actions |
 | `POST /pool/down` | Destroy all rented hosts now, verified |
-| `GET /pool/market/preview` | Run the offer pipeline read-only with supplied settings |
+| `GET /pool/market/preview` | Run the offer pipeline read-only with supplied settings. `kinds=both` lists bid and on-demand offers together whatever `rented.mode` is; every row carries its `offer_id` and `kind` |
 | `POST /pool/keys`, `DELETE /pool/keys/{id}` | Create, rotate and revoke app and admin keys |
 
 CLI verbs map one-to-one: `gpm status | plan | serve | stop [--release] | restart | lease … |

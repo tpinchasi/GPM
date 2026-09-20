@@ -197,6 +197,8 @@ def _host(args: argparse.Namespace) -> int:
                 "max_hours": args.max_hours,
                 "bid_ceiling": args.bid_ceiling,
                 "when_ready": args.when_ready,
+                "offer_id": args.offer_id,
+                "kind": args.kind,
             },
         )
     if args.action == "show":
@@ -356,6 +358,9 @@ def main(argv: list[str] | None = None) -> int:
     host.add_argument("--max-hours", type=float, default=1.0)
     host.add_argument("--bid-ceiling", type=float, default=None)
     host.add_argument("--when-ready", choices=["join", "park", "destroy"], default="join")
+    host.add_argument("--offer-id", default=None, help="prepare: rent exactly this offer from `gpm market`")
+    host.add_argument("--kind", choices=["interruptible", "on_demand"], default=None,
+                      help="prepare: bid for it, or pay the listed price so it cannot be outbid")
     host.add_argument("--url", default=None)
     host.set_defaults(func=_host)
 

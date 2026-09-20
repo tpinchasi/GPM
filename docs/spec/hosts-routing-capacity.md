@@ -36,6 +36,13 @@ ranking decide. A fixed price is never bid down — above a ceiling it is refuse
 offering a marketplace less than it asks does not rent the machine — and a non-interruptible
 host that stops was not outbid, so it is released rather than re-bid on.
 
+**The mode is a default, not a fence** (D55). It governs what the pool rents by itself — overflow
+under a lease, recovery after an eviction. An operator preparing a host may name a `kind`, or
+one particular offer from the market view, whatever the mode; so one pool can hold on-demand
+hosts and bid hosts together, and each reports which it is (`interruptible`). A chosen offer
+goes through every filter, ceiling and cap any other offer does, and if it cannot be rented —
+gone, outbid, or no longer passing — nothing is rented instead.
+
 ### 1.3 Transports
 
 Transport is a property of the host, independent of its kind. The router only ever sees a URL

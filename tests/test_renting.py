@@ -521,6 +521,90 @@ async def test_with_both_kinds_in_hand_ranking_chooses(fleet):
     assert host.offer.machine_id == "m-2" and host.interruptible is False
 
 
+# --- choosing the host and the kind of rental yourself (D55) ---
+
+
+def both_kinds():
+    return [
+        default_offer(offer_id="bid-1", machine_id="m-1", min_bid_hourly=0.10),
+        default_offer(offer_id="bid-2", machine_id="m-2", min_bid_hourly=0.30),
+        on_demand_offer(offer_id="od-1", machine_id="m-3", all_in_hourly=0.50),
+    ]
+
+
+async def test_the_market_shows_both_kinds_whatever_the_mode_and_says_which_is_which(fleet):
+    fleet.provider.offers = both_kinds()
+    assert fleet.rented.mode == "interruptible"
+
+    configured = await fleet.market_preview()
+    assert {row["kind"] for row in configured["best"]} == {"interruptible"}
+
+    preview = await fleet.market_preview(kinds="both")
+    by_id = {row["offer_id"]: row for row in preview["best"]}
+    assert set(by_id) == {"bid-1", "bid-2", "od-1"}
+    assert by_id["od-1"]["kind"] == "on_demand" and by_id["od-1"]["would_bid"] == 0.50
+    assert by_id["bid-1"]["kind"] == "interruptible"
+    assert fleet.provider.instances == {}  # looking rents nothing
+
+
+async def test_the_chosen_offer_is_the_one_rented_not_the_best_ranked(fleet):
+    fleet.provider.offers = both_kinds()
+    host = await fleet.prepare(max_spend=1.0, max_hours=1.0, offer_id="bid-2")
+
+    assert host.offer.offer_id == "bid-2" and host.interruptible is True
+    assert len(fleet.provider.instances) == 1
+
+
+async def test_an_on_demand_host_can_be_chosen_while_the_pool_is_set_to_bid(fleet):
+    """Mixed renting: the mode is the default for what the pool rents by itself, not a limit
+    on what an operator may choose by hand."""
+    fleet.provider.offers = both_kinds()
+    host = await fleet.prepare(max_spend=1.0, max_hours=1.0, offer_id="od-1")
+    assert host.interruptible is False and host.bid_hourly == 0.50
+
+    second = await fleet.prepare(max_spend=1.0, max_hours=1.0, offer_id="bid-1")
+    assert second.interruptible is True
+    assert sorted(h.interruptible for h in fleet.hosts.values()) == [False, True]
+
+
+async def test_asking_for_a_kind_rents_the_best_of_that_kind(fleet):
+    fleet.provider.offers = both_kinds()
+    host = await fleet.prepare(max_spend=1.0, max_hours=1.0, kind="on_demand")
+    assert host.offer.offer_id == "od-1"
+
+    with pytest.raises(LeaseRefused, match="kind"):
+        await fleet.prepare(max_spend=1.0, max_hours=1.0, kind="spot")
+
+
+async def test_a_chosen_offer_that_has_gone_is_not_replaced_by_another(fleet):
+    """The operator confirmed one machine at one price. Renting a different one "instead" would
+    be spending on something nobody agreed to."""
+    fleet.provider.offers = both_kinds()
+    assert await fleet.prepare(max_spend=1.0, max_hours=1.0, offer_id="no-such-offer") is None
+
+    assert fleet.provider.instances == {} and fleet.hosts == {}
+    assert "no-such-offer" in fleet.last_refusal
+    assert "chosen_offer_unavailable" in kinds(fleet)
+    assert fleet.leases.open_leases() == []  # and the lease it opened does not linger
+
+
+async def test_a_chosen_offer_that_loses_its_bid_is_not_replaced_either(fleet):
+    fleet.provider.offers = both_kinds()
+    fleet.provider.lose_bid_on.add("bid-1")
+    assert await fleet.prepare(max_spend=1.0, max_hours=1.0, offer_id="bid-1") is None
+    assert fleet.provider.instances == {} and fleet.hosts == {}
+    assert fleet.leases.open_leases() == []
+
+
+async def test_choosing_an_offer_does_not_get_it_past_the_pools_ceilings(fleet):
+    """Picking by hand picks among what policy allows; it is not a way round policy."""
+    fleet.provider.offers = [*both_kinds(),
+                             on_demand_offer(offer_id="od-dear", machine_id="m-4", all_in_hourly=2.0)]
+    # ceiling is 0.60
+    assert await fleet.prepare(max_spend=5.0, max_hours=1.0, offer_id="od-dear") is None
+    assert fleet.provider.instances == {}
+
+
 # --- a host that is going still finishes what it was given (D53) ---
 
 

@@ -42,8 +42,8 @@ const api = {
   account: () => call("GET", "/pool/account"),
   market: (hours = 4, policy) =>
     policy
-      ? call("POST", `/pool/market/preview?hours=${hours}`, policy)
-      : call("GET", `/pool/market/preview?hours=${hours}`),
+      ? call("POST", `/pool/market/preview?hours=${hours}&kinds=both`, policy)
+      : call("GET", `/pool/market/preview?hours=${hours}&kinds=both`),
   openLease: (body) => call("POST", "/pool/leases", body),
   closeLease: (id) => call("DELETE", `/pool/leases/${id}`),
   tightenLease: (id, body) => call("PATCH", `/pool/leases/${id}`, body),
@@ -145,6 +145,8 @@ function hostPanel(d) {
     ["workers", String(d.workers ?? "—")],
   ];
   if (d.bid_hourly !== undefined) {
+    facts.push(["rented as", d.interruptible === false
+      ? "on demand — a fixed price, cannot be outbid" : "a bid — can be outbid at any moment"]);
     facts.push(["cost", `${rate(d.bid_hourly)} · held ${((d.hours_held || 0) * 60).toFixed(0)} min · spent ${money(d.estimated_spend)} (provider says ${money(d.reported_spend)})`]);
     facts.push(["lease", d.lease_id || "—"]);
   }
@@ -572,12 +574,13 @@ screens.rented = async (status) => {
     el("h2", {}, "Rented and parked hosts"),
     status.rented.length ? el("table", {},
       el("thead", {}, el("tr", {},
-        el("th", {}, "Host"), el("th", {}, "State"), el("th", {}, "Machine"), el("th", { class: "num" }, "Bid"),
+        el("th", {}, "Host"), el("th", {}, "State"), el("th", {}, "Machine"), el("th", {}, "Rented as"), el("th", { class: "num" }, "Price"),
         el("th", { class: "num" }, "Storage"), el("th", { class: "num" }, "Held"), el("th", { class: "num" }, "Spend"), el("th", {}, ""))),
       el("tbody", {}, status.rented.map((host) => el("tr", {},
         el("td", { class: "mono" }, hostLink(host.host_id)),
         el("td", {}, pill(host.state)),
         el("td", { class: "muted" }, `${host.machine} · ${host.hardware || ""}`),
+        el("td", {}, host.interruptible === false ? pill("on demand", "ok") : pill("bid", "warn")),
         el("td", { class: "num" }, rate(host.bid_hourly)),
         el("td", { class: "num" }, rate(host.storage_hourly)),
         el("td", { class: "num" }, `${(host.hours_held ?? 0).toFixed(2)}h`),
@@ -839,14 +842,17 @@ const marketPanel = (market) => {
     el("div", { class: "panel" }, el("h2", {}, "Best offers"),
       el("table", {},
         el("thead", {}, el("tr", {},
-          el("th", {}, "Hardware"), el("th", { class: "num" }, "Floor"), el("th", { class: "num" }, "Would bid"),
+          el("th", {}, "Hardware"), el("th", {}, "Kind"), el("th", { class: "num" }, "Floor"), el("th", { class: "num" }, "Would pay"),
           el("th", { class: "num" }, "On-demand"), el("th", { class: "num" }, "$/GB"),
           el("th", { class: "num", title: "Workers a host rented from this offer would run" }, "Workers"),
-          el("th", { class: "num" }, "Score"))),
+          el("th", { class: "num" }, "Score"), el("th", {}, ""))),
         el("tbody", {}, (market.best || []).map((offer, index) => el("tr", {},
           el("td", {}, index === 0 ? el("strong", {}, offer.hardware) : offer.hardware,
             el("div", { class: "muted mono" }, `${offer.machine} · ${offer.gpu_memory_gb}GB · ${offer.download_mbps}Mbps`)),
-          el("td", { class: "num" }, rate(offer.floor)),
+          // A bid can be outbid at any moment; a fixed price cannot. Same machine, different deal.
+          el("td", {}, offer.kind === "on_demand"
+            ? pill("on demand", "ok") : pill("bid", "warn")),
+          el("td", { class: "num" }, offer.kind === "on_demand" ? "—" : rate(offer.floor)),
           el("td", { class: "num" }, el("strong", {}, rate(offer.would_bid))),
           el("td", { class: "num" }, rate(offer.on_demand)),
           el("td", { class: "num" }, `$${Number(offer.download_per_gb).toFixed(4)}`),
@@ -854,23 +860,58 @@ const marketPanel = (market) => {
           el("td", { class: "num", title: offer.workers_from || "" },
             offer.workers ?? "—",
             offer.workers_from && offer.workers_from.startsWith("capacity profile") ? "" : el("span", { class: "muted" }, " default")),
-          el("td", { class: "num" }, Math.round(offer.score)))))))));
+          el("td", { class: "num" }, Math.round(offer.score)),
+          el("td", {}, offer.offer_id
+            ? el("button", { class: "small", onclick: (e) => rentThis(e, offer) }, "Rent")
+            : null))))))));
 };
 
+// Renting one particular offer, the way it is listed: this machine, as a bid or at its fixed
+// price. It is still the pool's policy deciding what may be rented — the list only shows what
+// passes — and if the offer has gone by the time it is asked for, nothing is rented instead.
+async function rentThis(event, offer) {
+  const spend = Number(document.getElementById("prepare-spend")?.value || 1);
+  const hours = Number(document.getElementById("prepare-hours")?.value || 1);
+  const when = document.getElementById("prepare-when")?.value || "join";
+  const fixed = offer.kind === "on_demand";
+  const ok = await confirmAction({
+    title: `Rent ${offer.hardware}?`,
+    body: el("div", {},
+      el("p", {}, fixed
+        ? `On demand at ${rate(offer.would_bid)} — a fixed price. Nobody can outbid it; it runs until the lease ends or you release it.`
+        : `A bid of ${rate(offer.would_bid)} (floor ${rate(offer.floor)}). Cheaper, and it can be outbid at any moment.`),
+      el("p", {}, `Worst case: ${money(spend)} over ${hours}h, this one host. Machine ${offer.machine} · ${offer.gpu_memory_gb} GB · ${offer.workers} workers.`),
+      el("p", { class: "muted" }, "Cap and time limit come from the Prepare a host panel above. If this offer has gone, nothing else is rented in its place.")),
+  });
+  if (!ok) return;
+  run(event.target, () => api.prepare({
+    max_spend: spend, max_hours: hours, when_ready: when, offer_id: offer.offer_id, kind: offer.kind,
+  }));
+}
+
 function preparePanel() {
-  const spend = el("input", { type: "number", step: "0.01", value: "1.00", style: "width:6rem" });
-  const hours = el("input", { type: "number", step: "0.5", value: "1", style: "width:5rem" });
-  const when = el("select", {}, el("option", { value: "join" }, "join the pool"), el("option", { value: "park" }, "park it"), el("option", { value: "destroy" }, "destroy"));
+  const spend = el("input", { id: "prepare-spend", type: "number", step: "0.01", value: "1.00", style: "width:6rem" });
+  const hours = el("input", { id: "prepare-hours", type: "number", step: "0.5", value: "1", style: "width:5rem" });
+  const when = el("select", { id: "prepare-when" }, el("option", { value: "join" }, "join the pool"), el("option", { value: "park" }, "park it"), el("option", { value: "destroy" }, "destroy"));
+  const kind = el("select", {},
+    el("option", { value: "" }, "as the pool is configured"),
+    el("option", { value: "interruptible" }, "bid — cheaper, can be outbid"),
+    el("option", { value: "on_demand" }, "on demand — fixed price, cannot be outbid"));
   return el("div", { class: "panel" }, el("h2", {}, "Prepare a host"),
     el("p", { class: "muted" }, "Its own small lease: rent, load the model set, verify, then join, park or destroy. Borrows no authority from any other lease."),
     el("label", {}, "Dollar cap ", spend),
     el("label", {}, "Time limit (hours) ", hours),
     el("label", {}, "When ready ", when),
+    el("label", {}, "Rent it ", kind),
+    el("p", { class: "muted" }, "Or pick one machine: every row in the market below has its own Rent button."),
     el("div", { class: "row" }, el("button", { class: "primary", onclick: async (e) => {
       const worst = el("div", {}, el("p", {}, `This spends money. Worst case: ${money(Number(spend.value))} over ${hours.value}h, one host.`),
         el("p", { class: "muted" }, "The pool bids on the best offer its policy allows, and stops at the cap less the safety margin."));
       if (!(await confirmAction({ title: "Prepare a host?", body: worst }))) return;
-      run(e.target, () => api.prepare({ max_spend: Number(spend.value), max_hours: Number(hours.value), when_ready: when.value }));
+      run(e.target, () => api.prepare({
+        max_spend: Number(spend.value), max_hours: Number(hours.value), when_ready: when.value,
+        ...(kind.value ? { kind: kind.value } : {}),
+      }));
     } }, "Prepare a host")));
 }
 

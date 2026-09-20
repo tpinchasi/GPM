@@ -160,6 +160,8 @@ class Fleet:
         self.avoided: dict[str, tuple[float, str]] = {}
         #: Why the last offer search came back empty, when it was not the market's doing.
         self.last_offer_error: Optional[str] = None
+        #: Why the last attempt to rent rented nothing — for whoever asked, in their words.
+        self.last_refusal: Optional[str] = None
         #: A provider that says "too many requests" is answered by asking less often, not by
         #: asking again next pass. Doubles per refusal, cleared by a search that works.
         self._offer_backoff_s = 0.0
@@ -580,6 +582,7 @@ class Fleet:
         hours: float = 4.0,
         offer_policy: Optional[dict] = None,
         bidding: Optional[dict] = None,
+        kinds: Optional[str] = None,
     ) -> dict:
         """The offer pipeline, read-only (docs/spec/console-and-control-api.md §2.2).
 
@@ -596,7 +599,9 @@ class Fleet:
         if bidding:
             bid_config = BiddingConfig.model_validate({**bid_config.model_dump(), **bidding})
 
-        offers = await self._offers(policy)
+        if kinds is not None and kinds not in self._KINDS:
+            raise ValueError(f"kinds must be one of {sorted(self._KINDS)}")
+        offers = await self._offers(policy, kinds)
         ranked, rejected = rank_offers(
             offers, self._policy_with_avoided(policy), bid_config, hours, self.rented.model_set_gb
         )
@@ -613,6 +618,9 @@ class Fleet:
             workers, workers_why = self.workers_for(offer)
             accepted.append(
                 {
+                    # What to name to rent exactly this one, and how it would be rented.
+                    "offer_id": offer.offer_id,
+                    "kind": "interruptible" if offer.interruptible else "on_demand",
                     "machine": offer.machine_id,
                     "hardware": offer.hardware,
                     # What a host rented from this offer would run, and whether a profile says so.
@@ -667,6 +675,8 @@ class Fleet:
         when_ready: str = "join",
         engine: Optional[object] = None,
         client_for: Optional[object] = None,
+        offer_id: Optional[str] = None,
+        kind: Optional[str] = None,
     ) -> Optional[RentedHost]:
         """Get a host ready *before* a run, or keep one warm between runs.
 
@@ -687,7 +697,15 @@ class Fleet:
             lease_id=lease.lease_id,
         )
 
-        host = await self.restart_parked(lease) or await self.rent_one(lease, ["prepared on request"])
+        if kind is not None and kind not in ("interruptible", "on_demand"):
+            self.leases.close(lease.lease_id, "nothing could be prepared")
+            raise LeaseRefused("kind must be interruptible or on_demand")
+        # A parked host is reused only when the operator did not name a particular one.
+        reused = None if (offer_id or kind) else await self.restart_parked(lease)
+        host = reused or await self.rent_one(
+            lease, ["prepared on request" + (f": chosen offer {offer_id}" if offer_id else "")],
+            offer_id=offer_id, kind=kind,
+        )
         if host is None:
             self.leases.close(lease.lease_id, "nothing could be prepared")
             return None
@@ -1252,8 +1270,19 @@ class Fleet:
             )
         return None
 
-    async def rent_one(self, lease: Lease, reasons: list[str]) -> Optional[RentedHost]:
-        offers = await self._offers()
+    async def rent_one(
+        self, lease: Lease, reasons: list[str],
+        offer_id: Optional[str] = None, kind: Optional[str] = None,
+    ) -> Optional[RentedHost]:
+        """Rent the best offer — or, when an operator named one, exactly that one.
+
+        Naming an offer chooses *among* what the policy allows; it is not a way round it. The
+        offer still has to pass every hard filter and every ceiling, and if it has gone, or no
+        longer passes, nothing else is rented in its place: the operator asked for that host,
+        not for a host (D55).
+        """
+        self.last_refusal = None
+        offers = await self._offers(kinds=kind or ("both" if offer_id else None))
         ranked, rejected = rank_offers(
             offers,
             self._policy_with_avoided(self.rented.offer_policy),
@@ -1261,7 +1290,25 @@ class Fleet:
             lease.hours_left(),
             self.rented.model_set_gb,
         )
+        if offer_id is not None:
+            chosen = [pair for pair in ranked if pair[0].offer_id == offer_id]
+            if not chosen:
+                # Say exactly why, from the same filters — gone, or refused and by which rule.
+                if offer_id in rejected:
+                    why = f"that offer no longer passes: {'; '.join(rejected[offer_id])}"
+                elif any(o.offer_id == offer_id for o in offers):
+                    why = "that offer is no longer acceptable"
+                else:
+                    why = f"offer {offer_id} is gone from the market, or no longer passes the pool's filters; refresh and choose again"
+                self.last_refusal = why
+                self.events.record("chosen_offer_unavailable", why, numbers={"offer": offer_id}, lease_id=lease.lease_id)
+                return None
+            ranked = chosen  # that host, or nothing: never a substitute
         if not ranked:
+            self.last_refusal = (
+                f"{len(offers)} offers seen, none passed the policy" if offers
+                else (self.last_offer_error or "the market returned no offers")
+            )
             self.events.record(
                 "no_offer",
                 f"{len(offers)} offers seen, none passed the policy; staying paused rather "
@@ -1285,6 +1332,7 @@ class Fleet:
 
             refusal = self._refuse_bid_for_burn(capped)
             if refusal is not None:
+                self.last_refusal = refusal
                 self.events.record(
                     "rent_refused", refusal, numbers={"bid": capped}, lease_id=lease.lease_id
                 )
@@ -1310,6 +1358,7 @@ class Fleet:
                     numbers={"bid": capped, "offer": offer.offer_id, "score": offer_score},
                     lease_id=lease.lease_id,
                 )
+                self.last_refusal = f"the bid on {offer.machine_id} did not take: {exc}"
                 # A bid is not failed until nothing is running under its label. Bidding on the
                 # next offer while a machine from this one bills is how one lease ends up
                 # paying for three hosts (D43) — so this is checked here, in the pool, and not
@@ -1578,7 +1627,11 @@ class Fleet:
 
     # --- helpers ---
 
-    async def _offers(self, policy: Optional[OfferPolicy] = None) -> list[Offer]:
+    #: Which listings each choice searches: (interruptible, on_demand).
+    _KINDS = {"interruptible": (True, False), "on_demand": (False, True),
+              "cheaper": (True, True), "both": (True, True)}
+
+    async def _offers(self, policy: Optional[OfferPolicy] = None, kinds: Optional[str] = None) -> list[Offer]:
         """Ask the market broadly and filter here.
 
         Pushing the policy into the provider's query would make the market look empty
@@ -1593,12 +1646,14 @@ class Fleet:
             )
             return []
         try:
-            mode = self.rented.mode
+            # The pool's mode decides what it rents *by itself*. One request — a preview, or an
+            # operator preparing a particular host — may name its own (D55).
+            bids, fixed = self._KINDS[kinds or self.rented.mode]
             offers = await self.provider.search_offers(
                 OfferQuery(
                     verified_only=(policy or self.rented.offer_policy).verified_only,
-                    interruptible=mode in ("interruptible", "cheaper"),
-                    on_demand=mode in ("on_demand", "cheaper"),
+                    interruptible=bids,
+                    on_demand=fixed,
                 )
             )
         except ProviderRateLimited as exc:

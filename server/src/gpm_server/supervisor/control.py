@@ -258,6 +258,8 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                         "machine": host.offer.machine_id,
                         "hardware": host.offer.hardware,
                         "bid_hourly": host.bid_hourly,
+                        # A pool may hold both at once (D55): which can be outbid, which cannot.
+                        "interruptible": host.interruptible,
                         "storage_hourly": round(host.offer.storage_hourly, 5),
                         "estimated_spend": round(host.estimate(), 4),
                         "reported_spend": round(host.reported_spend, 4),
@@ -396,14 +398,17 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         return JSONResponse({"plan": await supervisor.fleet.plan(supervisor._ready_workers())})
 
     @app.get("/pool/market/preview")
-    async def market_preview(hours: float = 4.0) -> JSONResponse:
+    async def market_preview(hours: float = 4.0, kinds: Optional[str] = None) -> JSONResponse:
         """Read-only: the live market through the pool's own filters. Spends nothing."""
         if supervisor.fleet is None:
             return _error(400, "cannot_rent", "this pool has no rented capacity configured")
-        return JSONResponse(await supervisor.fleet.market_preview(hours=hours))
+        try:
+            return JSONResponse(await supervisor.fleet.market_preview(hours=hours, kinds=kinds))
+        except ValueError as exc:
+            return _error(400, "bad_kinds", str(exc))
 
     @app.post("/pool/market/preview")
-    async def market_preview_unsaved(request: Request, hours: float = 4.0) -> JSONResponse:
+    async def market_preview_unsaved(request: Request, hours: float = 4.0, kinds: Optional[str] = None) -> JSONResponse:
         """The same pipeline with the values **currently in the form, not yet saved** — which
         is what makes moving a ceiling and watching "4 pass" become "0 pass" possible."""
         if supervisor.fleet is None:
@@ -415,6 +420,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     hours=hours,
                     offer_policy=body.get("offer_policy"),
                     bidding=body.get("bidding"),
+                    kinds=kinds,
                 )
             )
         except (TypeError, ValueError) as exc:
@@ -673,11 +679,17 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 max_hours=float(body.get("max_hours", 1)),
                 bid_ceiling=body.get("bid_ceiling"),
                 when_ready=body.get("when_ready", "join"),
+                # Optional: exactly this offer, and how to rent it (D55).
+                offer_id=str(body["offer_id"]) if body.get("offer_id") is not None else None,
+                kind=body.get("kind"),
             )
         except LeaseRefused as exc:
             return _error(400, "lease_refused", str(exc))
         if host is None:
-            return _error(503, "nothing_prepared", "no acceptable offer; nothing was spent")
+            # The real reason, not a fixed sentence: a burn cap, a filter, a lost bid and a
+            # vanished offer all used to read "no acceptable offer".
+            why = supervisor.fleet.last_refusal or "no acceptable offer"
+            return _error(503, "nothing_prepared", f"{why}; nothing was spent")
         return JSONResponse(
             {"host_id": host.host_id, "lease_id": host.lease_id, "bid_hourly": host.bid_hourly},
             status_code=201,
@@ -716,6 +728,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 kind="rented-interruptible", state=rented.state, workers=rented.workers,
                 residency="pinned", hardware=rented.offer.hardware, machine=rented.offer.machine_id,
                 instance=rented.instance.instance_id, bid_hourly=rented.bid_hourly,
+                interruptible=rented.interruptible,
                 hours_held=round(rented.hours_held, 3), lease_id=rented.lease_id,
                 estimated_spend=round(rented.estimate(), 4), reported_spend=round(rented.reported_spend, 4),
                 stage=rented.stage, progress=rented.progress, prepared=rented.prepared,

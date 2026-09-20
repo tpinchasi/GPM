@@ -256,6 +256,37 @@ def test_preparing_a_host_reports_what_it_bid(control):
     assert supervisor.fleet.hosts
 
 
+def test_one_offer_from_the_market_can_be_rented_as_listed(control):
+    """D55: the market lists both kinds, each row names its offer, and prepare takes that name."""
+    from gpm_server.providers import default_offer
+
+    supervisor, url, _ = control
+    supervisor.fleet.provider.offers.append(default_offer(
+        offer_id="od-1", machine_id="m-9", min_bid_hourly=0.50, all_in_hourly=0.50,
+        on_demand_hourly=0.50, interruptible=False))
+    with client(url) as http:
+        rows = http.get("/pool/market/preview?kinds=both").json()["best"]
+        fixed = next(row for row in rows if row["kind"] == "on_demand")
+        response = http.post("/pool/hosts/prepare", json={
+            "max_spend": 1.0, "max_hours": 1, "offer_id": fixed["offer_id"], "kind": fixed["kind"]})
+
+    assert response.status_code == 201
+    (host,) = supervisor.fleet.hosts.values()
+    assert host.offer.offer_id == "od-1" and host.interruptible is False
+
+
+def test_a_refused_prepare_says_the_real_reason(control):
+    supervisor, url, _ = control
+    with client(url) as http:
+        response = http.post("/pool/hosts/prepare", json={
+            "max_spend": 1.0, "max_hours": 1, "offer_id": "gone-already"})
+
+    assert response.status_code >= 400
+    assert "gone-already" in response.json()["detail"]
+    assert "nothing was spent" in response.json()["detail"]
+    assert supervisor.fleet.provider.instances == {}
+
+
 def test_events_carry_the_numbers_behind_each_decision(control):
     supervisor, url, loop = control
     with client(url) as http:
