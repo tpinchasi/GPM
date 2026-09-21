@@ -67,8 +67,10 @@ act, through S4's agent.
   raised aggregate throughput by a meaningful margin — past six if the evidence carries it, never
   past the launch bound.
 - **Hold** otherwise. One change per host per window; no step up straight after a step down.
-- **A floor of one.** A host that would go below it is not resized; it is reported as a machine
-  not worth keeping — a signal for S1's shrink ordering, not a decision made here.
+- **A floor of one, and then a replacement (D75).** A host that would go below it is not resized.
+  Where its cost per unit of work is far worse than the pool's median, it is given up instead:
+  drained, destroyed, its machine avoided, and the replacement bought by the ordinary allocation
+  path. Shrinking a bad machine to one worker still pays its hourly rate for almost nothing.
 
 **What it learns is kept.** The settled number and measured throughput are written to the machine
 history (S3), so the next rental of that machine starts from evidence, and a capacity profile's
