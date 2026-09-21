@@ -6,12 +6,14 @@ lease stops before its dollar cap, and a release counts only once the provider a
 """
 
 import time
+from pathlib import Path
 
 import pytest
-from gpm_server.config import PoolConfig
+from gpm_server.config import OfferPolicy, PoolConfig
 from gpm_server.db import Database
 from gpm_server.ledger import EventLog, LeaseRefused, LeaseStore, SpendLedger
 from gpm_server.providers import FakeProvider, default_offer
+from gpm_server.strategies import reject_reasons
 from gpm_server.supervisor.renting import Fleet
 
 MODEL = "m1"
@@ -751,3 +753,144 @@ async def test_avoiding_can_be_switched_off(fleet):
     fleet.rented.teardown.avoid_failed_machine_minutes = 0
     fleet.avoid("m-1", "never started")
     assert fleet.avoided_now() == {}
+
+
+# --- what the machine itself said, when a host never answered (D78) ---
+
+
+async def _a_host_stuck_starting(fleet):
+    fleet.rented.teardown.max_starting_minutes = 10
+    open_lease(fleet, workers=2)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    host = next(iter(fleet.hosts.values()))
+    host.preparing_since -= 11 * 60
+    fleet.leases.close(host.lease_id, "test: stop it renting again")
+    return host
+
+
+async def test_a_host_given_up_for_never_starting_says_what_its_boot_output_said(fleet):
+    """Found live: three hosts were read as refusing the pool's key when their own boot output
+    said the provider's proxy had never published them. One call tells the two apart."""
+    host = await _a_host_stuck_starting(fleet)
+    fleet.provider.boot_output[host.instance.instance_id] = "\n".join(
+        ["Warning: Permanently added 'proxy' to the list of known hosts."]
+        + ["Error: remote port forwarding failed for listen port 24390"] * 40
+    )
+
+    await fleet.tear_down([], {}, 0)
+
+    assert host.released
+    stuck = [e for e in fleet.events.recent() if e["kind"] == "host_stuck_starting"][0]
+    assert "remote port forwarding failed for listen port 24390" in stuck["summary"]
+    assert stuck["summary"].count("remote port forwarding failed") == 1, "said once, not forty times"
+
+
+async def test_a_provider_with_no_boot_output_changes_nothing(fleet):
+    import dataclasses
+
+    fleet.provider.capabilities = dataclasses.replace(
+        fleet.provider.capabilities, reports_instance_logs=False
+    )
+    host = await _a_host_stuck_starting(fleet)
+
+    await fleet.tear_down([], {}, 0)
+
+    assert host.released and "host_stuck_starting" in kinds(fleet)
+
+
+async def test_boot_output_that_cannot_be_read_never_delays_giving_a_host_up(fleet, monkeypatch):
+    host = await _a_host_stuck_starting(fleet)
+
+    async def broken(instance, tail=60):
+        raise RuntimeError("the provider's log endpoint is down")
+
+    monkeypatch.setattr(fleet.provider, "instance_logs", broken)
+    await fleet.tear_down([], {}, 0)
+
+    assert host.released
+
+
+# --- a machine whose driver the engine cannot use (D81) ---
+
+
+def _offer_with_driver(version, **rest):
+    return default_offer(driver_version=version, **rest)
+
+
+def test_a_driver_too_old_for_the_engine_image_is_refused_before_it_is_rented():
+    """Found live, in the engine's own log on a billing host:
+
+        WARN "NVIDIA driver too old" device="NVIDIA A100-SXM4-80GB"
+             compute=8.0 driver=535 required_driver="550 or newer"
+        INFO "inference compute" id=cpu library=cpu
+
+    It loaded a 26B model at 100% CPU, never finished the model set, and was given up half an
+    hour later — an A100-80GB rented at $1.06/h that never touched the accelerator.
+    """
+    policy = OfferPolicy(min_driver_version="550")
+
+    refused = reject_reasons(_offer_with_driver("535.183.01"), policy)
+    assert any(r.startswith("driver:") for r in refused), refused
+    assert "535.183.01" in refused[0] and "550" in refused[0]
+
+    assert not reject_reasons(_offer_with_driver("595.84"), policy)
+    assert not reject_reasons(_offer_with_driver("550"), policy)
+
+
+def test_a_machine_that_does_not_say_its_driver_is_not_assumed_to_pass():
+    """The filter exists because the cost of being wrong is a whole rental."""
+    assert reject_reasons(_offer_with_driver(None), OfferPolicy(min_driver_version="550"))
+    assert not reject_reasons(_offer_with_driver(None), OfferPolicy())  # nothing asked, nothing refused
+
+
+def test_driver_versions_compare_by_number_and_not_as_text():
+    """"595.84" is above "550"; as text it is below it."""
+    from gpm_server.strategies import driver_below
+
+    assert driver_below("535", "550") is True
+    assert driver_below("595.84", "550") is False
+    assert driver_below("550", "550") is False
+    assert driver_below("9.1", "9") is False
+    assert driver_below(None, "550") is None
+    assert driver_below("not a version", "550") is None
+
+
+def _all_offers_refused(fleet):
+    fleet.rented.offer_policy = OfferPolicy(min_gpu_memory_gb=10_000)  # nothing can pass
+
+
+async def test_a_market_that_refuses_everything_is_recorded_once_not_once_a_pass(fleet):
+    """Live, a pool whose filters rejected every offer wrote the same line every fifteen
+    seconds. A decision log that repeats itself is one an operator stops reading — and the
+    reading of it is the whole point of recording refusals."""
+    _all_offers_refused(fleet)
+    open_lease(fleet, workers=2)
+
+    for _ in range(4):
+        await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+
+    said = [e for e in fleet.events.recent(50) if e["kind"] == "no_offer"]
+    assert len(said) == 1, f"{len(said)} identical refusals written"
+    assert said[0]["numbers"]["seen"] >= 1
+
+
+async def test_a_market_that_changes_its_mind_is_recorded_again(fleet):
+    """Said once per market, not once ever: a different set of reasons is news."""
+    _all_offers_refused(fleet)
+    open_lease(fleet, workers=2)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+
+    fleet.rented.offer_policy = OfferPolicy(min_disk_gb=10_000)  # refused, for another reason
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+
+    said = [e for e in fleet.events.recent(50) if e["kind"] == "no_offer"]
+    assert len(said) == 2, "a market refusing for a new reason was not recorded"
+
+
+def test_a_provider_back_off_note_does_not_nest():
+    """Live: 'rate limited — not asking again for 60s — not asking again for 44s'."""
+    source = (Path(__file__).resolve().parent.parent / "server/src/gpm_server/supervisor/renting.py").read_text()
+    waiting = source[source.index("if now < self._offer_retry_at:"):]
+    waiting = waiting[: waiting.index("return []")]
+    assert "self._offer_refusal" in waiting
+    assert "self.last_offer_error or" not in waiting, "the note is built from itself again"

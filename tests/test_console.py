@@ -937,3 +937,66 @@ def test_the_allocation_panel_is_built_from_what_the_pool_reports():
     assert "workers_auto" in source
     # And it saves through the same path as the search: file, plan, retype.
     assert "api.setSearch" in source.split("function saveAllocation")[1].split("function ")[0]
+
+
+async def test_the_worker_ceiling_can_be_raised_without_the_cli(console):
+    """Found live (D80): a pool refusing 70% of its requests sat at "the load has cleared"
+    because its lease allowed 5 workers and one rented host already supplied 6. Under dynamic
+    allocation that number is what decides whether another host is ever rented, and it was the
+    one field the console's Extend dialog could not change."""
+    supervisor, url, _, loop = console
+    host = loop.run(supervisor.fleet.prepare(max_spend=1.00, max_hours=1.0))
+    lease_id = host.lease_id
+    before = supervisor.leases.get(lease_id).workers
+
+    with client(url) as http:
+        refused = http.patch(f"/pool/leases/{lease_id}", json={"workers": before + 40})
+        raised = http.patch(
+            f"/pool/leases/{lease_id}", json={"workers": before + 40, "confirm": str(before + 40)}
+        )
+
+    assert refused.status_code == 400, "raising a ceiling went through unconfirmed"
+    assert raised.status_code == 200
+    assert supervisor.leases.get(lease_id).workers == before + 40
+    extended = next(e for e in supervisor.events.recent(20) if e["kind"] == "lease_extended")
+    assert f"workers {before} → {before + 40}" in extended["summary"]
+
+
+def test_the_extend_dialog_asks_for_the_worker_ceiling():
+    """Structural, like the rest here: the page is served to a browser, never imported, so
+    nothing else would notice the field going missing again."""
+    script = (STATIC / "app.js").read_text()
+    dialog = script[script.index("async function extendLease"):]
+    dialog = dialog[: dialog.index("\n}")]
+
+    assert "lease.workers" in dialog, "the dialog does not offer the current ceiling"
+    assert "wantedWorkers" in dialog and "workers: wantedWorkers" in dialog
+    assert '"workers", wantedWorkers' in dialog, "raising workers is not confirmed like the rest"
+
+
+async def test_how_the_pool_rents_is_set_where_renting_is_watched(console):
+    """Found live (D80): a pool on the default `interruptible` never asks the on-demand
+    listing, so an operator watching a fixed-price host in the market could not learn why it
+    was never rented — it was not rejected, it was never seen. The only way to change it was
+    the raw configuration file."""
+    supervisor, url, _, loop = console
+    was = supervisor.config.rented.mode
+    assert was != "cheaper", "this pool already rents both ways; the test proves nothing"
+
+    with client(url) as http:
+        before = http.get("/pool/market/preview?hours=1").json()
+        answer = http.patch("/pool/config/rented", json={"mode": "cheaper"})
+        after = http.get("/pool/market/preview?hours=1").json()
+
+    assert before["saved"]["mode"] == was, "the screen did not show the mode in force"
+    assert answer.status_code == 200, answer.text
+    assert supervisor.config.rented.mode == "cheaper"
+    assert after["saved"]["mode"] == "cheaper", "the screen would still show the old mode"
+
+
+def test_the_rented_screen_offers_every_way_of_renting():
+    script = (STATIC / "app.js").read_text()
+    assert "const MODES" in script
+    for mode in ("interruptible", "on_demand", "cheaper"):
+        assert f'["{mode}"' in script, f"{mode} cannot be chosen in the console"
+    assert "body.mode = mode.value" in script, "the chosen mode is never sent"

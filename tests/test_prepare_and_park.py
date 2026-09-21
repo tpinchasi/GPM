@@ -327,6 +327,23 @@ async def test_the_engine_is_launched_to_match_the_workers_and_the_model_set(fle
     assert env["OLLAMA_KEEP_ALIVE"] == "-1"         # loaded, all the time
 
 
+async def test_the_engine_on_a_rented_host_listens_on_loopback_only(fleet):
+    """Found live: a rented host's engine was answering strangers on the open internet.
+
+    The provider's image published the engine's port and the engine bound every interface, so
+    anyone who found the address could list the models and use an accelerator the pool was
+    paying for. The pool dials through a forward into the machine, so loopback costs it
+    nothing — and there is no authentication on an engine to fall back on (D77).
+    """
+    host = await fleet.prepare(max_spend=1.00, max_hours=1)
+    env = fleet.provider.instances[host.instance.instance_id].spec.env
+
+    assert env["OLLAMA_HOST"] == "127.0.0.1:11434"
+    assert not any(
+        value.startswith(("0.0.0.0", "::", "*")) for value in env.values()
+    ), f"the engine was launched reachable from off the host: {env}"
+
+
 async def test_an_engine_start_command_runs_after_the_timer_is_armed(tmp_path):
     database = Database(tmp_path / "gpm.sqlite3")
     try:
@@ -804,3 +821,121 @@ async def test_each_model_is_loaded_as_it_lands_even_without_an_agent(fleet):
     loads = [i for i, path in enumerate(ordered) if path in ("/api/generate", "/api/embed")]
     assert len(pulls) == 2 and loads, "both models pulled, and loading happened"
     assert min(loads) < max(pulls), "the first model was loaded before the last one downloaded"
+
+
+async def test_a_rented_host_with_a_working_agent_does_not_stop_the_control_loop(fleet, monkeypatch):
+    """Found live, on the first rented host whose agent ever installed at once: asking the
+    agent read a field its answer does not have, the pass raised, and because the probe runs
+    before preparation the host never began downloading — it sat there billing, healthy."""
+    from gpm_server.supervisor import agents, hostagent
+
+    host = await fleet.prepare(max_spend=1.00, max_hours=1)
+    host.agent = hostagent.RentedAgent(url="http://127.0.0.1:1", secret="gpmg_" + "0" * 64)
+
+    async def answers(agent, transport=None):
+        return agents.AgentView(reachable=True, facts={"os": "Linux"})
+
+    monkeypatch.setattr(agents, "ask", answers)
+    await fleet.ask_agent(host)
+    assert host.agent_facts == {"os": "Linux"} and host.agent_detail is None
+
+    async def silent(agent, transport=None):
+        return agents.AgentView(reachable=False, detail="no answer")
+
+    monkeypatch.setattr(agents, "ask", silent)
+    await fleet.ask_agent(host)
+    assert host.agent_facts is None and host.agent_detail == "no answer"
+
+
+async def test_a_freshly_installed_agent_is_given_a_moment_before_the_slow_path(fleet, monkeypatch):
+    """Found live: asked the instant its install returned, the agent was not listening yet; one
+    failed call and the host was prepared without it — pull, then load, then pull — for good."""
+    from gpm_server.supervisor import agents, hostagent
+
+    host = await fleet.prepare(max_spend=1.00, max_hours=1)
+    host.agent = hostagent.RentedAgent(url="http://127.0.0.1:1", secret="gpmg_" + "0" * 64)
+    fleet.agent_hold_retry_s = 0.01
+    calls = []
+
+    async def not_yet_then_answers(agent, tags, residency, transport=None):
+        calls.append(1)
+        if len(calls) < 3:
+            return None
+        return {"models": [{"tag": tag, "loaded": False, "pulling": {"tag": tag}} for tag in tags]}
+
+    monkeypatch.setattr(agents, "hold", not_yet_then_answers)
+    assert await fleet.load_model_set_through_agent(host) is False  # coming, through the agent
+    assert len(calls) == 3
+
+    async def never(agent, tags, residency, transport=None):
+        calls.append(1)
+        return None
+
+    calls.clear()
+    monkeypatch.setattr(agents, "hold", never)
+    assert await fleet.load_model_set_through_agent(host) is None   # a real silence falls back
+    assert len(calls) == fleet.agent_hold_attempts
+
+
+async def test_a_download_through_the_agent_is_reported_the_way_the_console_reads_it(fleet, monkeypatch):
+    """Found live: the agent's own words were passed straight to the console, which drew an
+    empty bar for a download that was running. Both paths must speak one shape."""
+    from gpm_server.supervisor import agents, hostagent
+
+    host = await fleet.prepare(max_spend=1.00, max_hours=1)
+    host.agent = hostagent.RentedAgent(url="http://127.0.0.1:1", secret="gpmg_" + "0" * 64)
+    (tag,) = sorted(fleet.required_tags)
+
+    async def halfway(agent, tags, residency, transport=None):
+        return {"models": [{"tag": tag, "on_disk": False, "loaded": False, "size_bytes": None,
+                            "pulling": {"tag": tag, "completed_bytes": 5_000, "total_bytes": 10_000}}]}
+
+    monkeypatch.setattr(agents, "hold", halfway)
+    assert await fleet.load_model_set_through_agent(host) is False
+
+    shown = host.progress[tag]
+    assert shown["completed"] == 5_000 and shown["total"] == 10_000 and shown["attempt"] == 1
+    assert set(host.progress) == {tag}, "keyed by model tag, as the direct path is"
+
+
+async def test_a_host_whose_engine_runs_on_the_processor_is_given_up(fleet):
+    """Found live on an 80GB A100: the image refused the machine's driver, ollama fell back to
+    the CPU, and `nvidia-smi` read 0 MiB used while a 26B model loaded at 100% CPU. It passed
+    every filter, answered every probe, and was worth nothing at an accelerator's price. D81's
+    driver floor refuses that machine before renting; this is the same fault arriving any other
+    way, on a host already paid for."""
+    loop = BackgroundLoop()
+    engine_fake = FakeOllama(resident={MODEL})
+    engine_fake.on_cpu = {MODEL}          # the card is there and the engine is not using it
+    server = ServerHandle(engine_fake.app, loop)
+    try:
+        import httpx as _httpx
+
+        async with _httpx.AsyncClient(base_url=server.base_url, timeout=10) as client:
+            on_cpu = await OllamaEngine().serving_from_cpu(client)
+        assert on_cpu == frozenset({MODEL})
+
+        engine_fake.on_cpu = set()        # and when it is using the card, nothing is reported
+        async with _httpx.AsyncClient(base_url=server.base_url, timeout=10) as client:
+            assert await OllamaEngine().serving_from_cpu(client) == frozenset()
+    finally:
+        server.stop()
+        loop.stop()
+
+
+async def test_an_engine_that_does_not_report_where_it_runs_is_not_accused(fleet):
+    """`size_vram` absent means this engine build does not say — not that it is on the CPU.
+    Guessing would destroy healthy hosts."""
+    import httpx as _httpx
+
+    loop = BackgroundLoop()
+    engine_fake = FakeOllama(resident={MODEL})
+    server = ServerHandle(engine_fake.app, loop)
+    try:
+        # An engine build that does not report `size_vram` at all.
+        engine_fake._model_list = lambda tags: {"models": [{"name": t, "size": 1} for t in sorted(tags)]}
+        async with _httpx.AsyncClient(base_url=server.base_url, timeout=10) as client:
+            assert await OllamaEngine().serving_from_cpu(client) == frozenset()
+    finally:
+        server.stop()
+        loop.stop()

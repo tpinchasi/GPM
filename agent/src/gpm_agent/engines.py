@@ -86,7 +86,22 @@ class OllamaFacts:
         Either form *loads* the model if it is not loaded, so the caller releases only what is
         loaded now — releasing a cold model would do the opposite of what was meant."""
         keep_alive: Any = -1 if pinned else "5m"
-        response = await client.post("/api/generate", json={"model": tag, "keep_alive": keep_alive}, timeout=None)
+        # An embedding model refuses `generate` with a 400, so it is held through the endpoint
+        # it does serve; the engine says which kind a tag is. Found live, twice: once in the
+        # pool's own engine code, and again here — where it cost a healthy host, destroyed for
+        # "could not hold the model set" with two of its three models already loaded.
+        path = "/api/generate"
+        shown = await client.post("/api/show", json={"model": tag})
+        if shown.status_code == 200 and "embedding" in (shown.json().get("capabilities") or []):
+            path = "/api/embed"
+        # A **deadline**, not `timeout=None`. Seen live: a machine whose engine had fallen back
+        # to the processor took a 26B model past sixteen minutes, the agent waited in this call
+        # the whole time, and because the loop is one tag after another the rest of the model
+        # set never started. The agent answered every poll cheerfully while nothing moved. A
+        # load that outlasts this is reported as an error, which is a fact the pool can act on.
+        response = await client.post(
+            path, json={"model": tag, "keep_alive": keep_alive}, timeout=LOAD_TIMEOUT_S
+        )
         if response.status_code != 200:
             raise EngineRefused(f"the engine would not {'pin' if pinned else 'release'} {tag}: {response.status_code}")
 
@@ -94,6 +109,12 @@ class OllamaFacts:
         response = await client.request("DELETE", "/api/delete", json={"model": tag})
         if response.status_code != 200:
             raise EngineRefused(f"the engine would not delete {tag}: {response.status_code}")
+
+
+#: The longest a single model may take to load before it is called a failure. Generous — a
+#: large model on a healthy accelerator is a matter of a minute or two — and finite, which is
+#: the point: without it one stuck load stalls a host's whole preparation silently.
+LOAD_TIMEOUT_S = 600.0
 
 
 class EngineRefused(Exception):

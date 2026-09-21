@@ -12,6 +12,7 @@ is the source of truth for intent, the provider for existence (supervisor.md §1
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -34,6 +35,7 @@ from .base import (
     OfferQuery,
     ProviderAuthError,
     ProviderCapabilities,
+    ProviderError,
     ProviderRateLimited,
     ProviderUnavailable,
     SelfTerminateRequest,
@@ -67,6 +69,9 @@ class VastProvider:
         reports_charges=True,
         price_history=False,
         direct_port_mapping=True,
+        #: `PUT /instances/request_logs/{id}/` hands back a URL the boot output is fetched
+        #: from. It says outright what a host that never answered was doing (D78).
+        reports_instance_logs=True,
     )
 
     def __init__(
@@ -234,6 +239,8 @@ class VastProvider:
             storage_hourly=storage_monthly_per_gb * disk_gb / _HOURS_PER_MONTH,
             download_per_gb=float(entry.get("inet_down_cost") or 0),
             download_mbps=float(entry.get("inet_down") or 0),
+            # What the engine image will find when it looks for the card (D81).
+            driver_version=str(entry["driver_version"]) if entry.get("driver_version") else None,
             reliability=float(entry.get("reliability") or entry.get("reliability2") or 0),
             verified=str(entry.get("verification", "")).lower() == "verified",
             # `dlperf` is the provider's own throughput index; it ranks, it does not benchmark.
@@ -398,6 +405,35 @@ class VastProvider:
             ssh_port=int(entry["ssh_port"]) if entry.get("ssh_port") else None,
             ssh_user="root",
         )
+
+    async def instance_logs(self, instance: Instance, tail: int = 60) -> Optional[str]:
+        """This instance's boot output (D78).
+
+        Two steps, as the provider defines it: ask for the logs, then fetch them from the URL
+        it names. That URL is the provider's own and is read for text only — nothing in it is
+        executed, and nothing the machine wrote decides what the pool does next.
+        """
+        try:
+            asked = await self._call(
+                "PUT", f"/api/v0/instances/request_logs/{instance.instance_id}/", json={"tail": tail}
+            )
+        except ProviderError:
+            return None
+        url = (asked or {}).get("result_url") if isinstance(asked, dict) else None
+        if not url:
+            return None
+        # The provider writes the file after answering, so a first read can find nothing there.
+        for attempt in range(6):
+            if attempt:
+                await asyncio.sleep(1.0)
+            try:
+                response = await self.client.get(url)
+            except httpx.HTTPError:
+                return None
+            if response.status_code == 200 and response.text.strip():
+                lines = response.text.splitlines()
+                return "\n".join(lines[-tail:])
+        return None
 
     async def _charges_by_instance(self) -> dict[str, float]:
         cached = self._charges

@@ -193,3 +193,65 @@ def test_stopping_the_supervisor_process_releases_its_lock(tmp_path):
     finally:
         if child.poll() is None:
             child.kill()
+
+
+def test_a_supervisor_told_its_lock_was_taken_says_so(tmp_path):
+    database = Database(tmp_path / "gpm.sqlite3")
+    try:
+        first = SupervisorLock(database, pool="p", owner="first", stale_after=0.2)
+        first.acquire()
+        assert first.beat() is True
+
+        time.sleep(0.3)  # it stops beating; a successor takes the pool, as it should
+        SupervisorLock(database, pool="p", owner="second", stale_after=0.2).acquire()
+
+        assert first.beat() is False, "the first still believes it holds a lock it lost"
+    finally:
+        database.close()
+
+
+def test_a_supervisor_whose_every_pass_fails_still_holds_its_lock(pool, monkeypatch):
+    """Found live: a pass that raised every time never reached the heartbeat at its end, so the
+    lock went stale under a running supervisor, a second one took it, and two ran at once."""
+    supervisor = pool.supervisor
+    supervisor.lock.stale_after = 0.5
+
+    async def always_fails():
+        raise RuntimeError("every pass raises")
+
+    monkeypatch.setattr(supervisor, "pass_once", always_fails)
+    monkeypatch.setattr(supervisor.config.pool, "probe_interval_s", 0.1)
+
+    async def loop_for_a_while():
+        import asyncio
+
+        task = asyncio.create_task(supervisor.run_forever())
+        await asyncio.sleep(1.2)  # more than two stale windows of nothing but failing passes
+        supervisor._stopping = True
+        await task
+
+    pool.loop.run(loop_for_a_while())
+    supervisor._stopping = False
+
+    second = Supervisor(pool.config, pool.database)
+    with pytest.raises(SupervisorBusy):
+        pool.loop.run(second.start())
+
+
+def test_a_supervisor_that_lost_its_lock_stops_rather_than_run_beside_the_new_one(pool, monkeypatch):
+    supervisor = pool.supervisor
+    monkeypatch.setattr(supervisor.config.pool, "probe_interval_s", 0.05)
+    passes = []
+
+    async def counted():
+        passes.append(1)
+
+    monkeypatch.setattr(supervisor, "pass_once", counted)
+    # Someone else now owns the pool.
+    pool.database.execute(
+        "UPDATE supervisor_lock SET owner = ? WHERE pool = ?", ("somebody-else", supervisor.lock.pool)
+    )
+
+    pool.loop.run(supervisor.run_forever())  # returns by itself; it does not loop on
+
+    assert passes == [], "it ran a pass on a pool it no longer holds"

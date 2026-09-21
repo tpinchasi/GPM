@@ -181,6 +181,12 @@ agent, with the same closed verbs, and **the pool still dials**.
   interpreter gets no agent, and joins without one. Nothing secret goes into the
   start-up script, which a provider stores and can read. The pool reaches the agent through a
   second forward on the SSH connection it already holds (stage 4).
+- **Packed once a run, never once a state directory.** The archive is built from the agent
+  installed beside the supervisor, and an archive an *earlier* run left on disk is not reused:
+  a pool running today's agent would otherwise ship a file packed weeks ago. Seen live — every
+  rented host was given an agent whose `init` predated the options the pool had begun sending
+  it, and each one joined agentless with `unrecognized arguments`, silently, because the file
+  was present and presence was taken for currency. Packing costs about a second per run.
 - **It is the preparation path.** `PUT /models` works toward the model set and loads each model
   **as its own download finishes** (D57) rather than pulling everything and then loading
   everything — which left the accelerator idle through the whole last phase of a billing host,

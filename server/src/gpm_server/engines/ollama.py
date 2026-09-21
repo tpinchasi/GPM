@@ -152,19 +152,48 @@ class OllamaEngine:
                 f"{sorted(missing)} would not stay resident together with the rest of the set"
             )
 
-    def launch_settings(self, workers: int, context: int, n_models: int) -> dict[str, str]:
-        return {
+    def launch_settings(
+        self, workers: int, context: int, n_models: int, listen: Optional[str] = None
+    ) -> dict[str, str]:
+        settings = {
             "OLLAMA_NUM_PARALLEL": str(workers),
             "OLLAMA_MAX_LOADED_MODELS": str(n_models),
             "OLLAMA_CONTEXT_LENGTH": str(context),
             # Nothing is loaded on demand and nothing is ever swapped out.
             "OLLAMA_KEEP_ALIVE": "-1",
         }
+        if listen:
+            # Left to itself this engine binds every interface, and a provider whose image
+            # publishes the port then puts it on the open internet with no authentication at
+            # all — found live: a rented host's model list and its accelerator were answering
+            # strangers. The pool dials through a forward into the machine, so loopback costs
+            # the pool nothing (D77).
+            settings["OLLAMA_HOST"] = listen
+        return settings
 
     async def models_resident(self, client: httpx.AsyncClient) -> frozenset[str]:
         response = await client.get("/api/ps")
         response.raise_for_status()
         return _tags_in(response.json().get("models", []))
+
+    async def serving_from_cpu(self, client: httpx.AsyncClient) -> Optional[frozenset[str]]:
+        """This engine reports, per loaded model, how much of it is in accelerator memory.
+        None of it there means it is being served by the processor (D81)."""
+        try:
+            response = await client.get("/api/ps")
+            response.raise_for_status()
+            loaded = response.json().get("models", [])
+        except (httpx.HTTPError, ValueError):
+            return None
+        if not loaded:
+            return frozenset()
+        on_cpu = {
+            model.get("name") or model.get("model")
+            for model in loaded
+            # Absent means this engine build does not report it — not that it is on the CPU.
+            if "size_vram" in model and not model.get("size_vram")
+        }
+        return frozenset(tag for tag in on_cpu if tag)
 
     async def models_available(self, client: httpx.AsyncClient) -> frozenset[str]:
         response = await client.get("/api/tags")

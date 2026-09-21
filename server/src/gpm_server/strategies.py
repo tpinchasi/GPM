@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import re
 from typing import Any, Optional, Sequence
 
 from .config import BiddingConfig, OfferPolicy, ScaleConfig, TeardownConfig
@@ -298,6 +299,26 @@ def decide_rent(demand: Demand, lease: Optional[LeaseView], cfg: ScaleConfig, of
 # --- which offers are acceptable, and in what order (spec §6.1) ---
 
 
+def driver_below(reported: Optional[str], floor: str) -> Optional[bool]:
+    """Is `reported` below `floor`? None when it cannot be told from a version string.
+
+    Compared part by part as numbers, so "595.84" is above "550" and "9.1" is above "9". A
+    provider that reports something unparseable is not guessed at: the caller decides what an
+    unknown driver is worth, and an unknown one is not treated as a pass.
+    """
+    def parts(text: Optional[str]) -> Optional[tuple[int, ...]]:
+        if not text:
+            return None
+        found = re.findall(r"\d+", str(text))
+        return tuple(int(n) for n in found) if found else None
+
+    got, want = parts(reported), parts(floor)
+    if got is None or want is None:
+        return None
+    width = max(len(got), len(want))
+    return got + (0,) * (width - len(got)) < want + (0,) * (width - len(want))
+
+
 def reject_reasons(offer: Offer, policy: OfferPolicy, model_set_gb: float = 0.0) -> list[str]:
     """Hard filters. **Never relaxed unattended** — an empty result means stay paused."""
     # Each reason is "<filter>: <what happened>". The filter name is stable, so the console
@@ -327,6 +348,17 @@ def reject_reasons(offer: Offer, policy: OfferPolicy, model_set_gb: float = 0.0)
         reasons.append(
             f"reliability: {offer.reliability:.3f} below the {policy.min_reliability:.3f} minimum"
         )
+    if policy.min_driver_version is not None:
+        below = driver_below(offer.driver_version, policy.min_driver_version)
+        if below is True:
+            reasons.append(
+                f"driver: {offer.driver_version} below the {policy.min_driver_version} this "
+                "engine image needs — the card would sit idle while the CPU serves"
+            )
+        elif below is None and offer.driver_version is None:
+            reasons.append(
+                f"driver: this machine does not say, and {policy.min_driver_version} is required"
+            )
     if policy.verified_only and not offer.verified:
         reasons.append("verification: the provider has not verified this machine")
     if offer.machine_id in policy.avoid_machines:

@@ -80,9 +80,12 @@ class FakeProvider:
             self_terminate=True,
             reports_charges=True,
             direct_port_mapping=False,
+            reports_instance_logs=True,
         )
         self.offers: list[Offer] = list(offers or [default_offer()])
         self.instances: dict[str, FakeInstance] = {}
+        #: What a test says a machine wrote to its own boot output, by instance id (D78).
+        self.boot_output: dict[str, str] = {}
         self._ids = itertools.count(1)
 
         # --- the script ---
@@ -259,6 +262,15 @@ class FakeProvider:
             ssh_port=22000 + int(found.instance_id[2:]),
             public_url=found.engine_url,
         )
+
+    async def instance_logs(self, instance: Instance, tail: int = 60) -> Optional[str]:
+        """Whatever a test said this machine wrote as it came up (D78)."""
+        if not self.capabilities.reports_instance_logs:
+            return None
+        text = self.boot_output.get(instance.instance_id)
+        if text is None:
+            return None
+        return "\n".join(text.splitlines()[-tail:])
 
     async def reported_charges(self, instance: Instance) -> Optional[Charges]:
         self._guard("reported_charges")

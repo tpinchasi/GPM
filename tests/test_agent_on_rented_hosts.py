@@ -78,6 +78,37 @@ def test_a_pool_that_cannot_pack_the_agent_says_so_instead_of_failing(tmp_path):
     assert agentpkg.cached(tmp_path, root="a-distribution-that-is-not-installed") is None
 
 
+def test_an_archive_an_earlier_run_left_behind_is_never_shipped(tmp_path):
+    """The fault this caught live: a supervisor shipping an agent packed weeks earlier.
+
+    Its `init` predated the options the pool had begun sending, so every rented host joined
+    agentless with "unrecognized arguments" — and nothing in the pool could tell, because the
+    file was there and the pool trusted that it was current.
+    """
+    stale = tmp_path / "gpm-agent.pyz"
+    stale.write_bytes(b"what an older pool packed")
+
+    packed = agentpkg.cached(tmp_path)
+
+    assert packed is not None
+    assert packed.read_bytes() != b"what an older pool packed", "the stale file was shipped"
+    assert "gpm_agent" in {n.split("/")[0] for n in zipfile.ZipFile(packed).namelist()}
+
+
+def test_the_agent_is_packed_once_a_run_and_not_once_a_host(tmp_path, monkeypatch):
+    """Rebuilding per run is cheap; rebuilding per host would put a build on every rental."""
+    agentpkg.cached(tmp_path)
+
+    builds = []
+    monkeypatch.setattr(
+        agentpkg, "build", lambda destination, root=agentpkg.ROOT_DISTRIBUTION: builds.append(destination)
+    )
+    agentpkg.cached(tmp_path)
+    agentpkg.cached(tmp_path)
+
+    assert builds == [], "packed again for a host that could have had the one from this run"
+
+
 # --- putting it on a host ---
 
 

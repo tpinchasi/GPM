@@ -252,6 +252,16 @@ class Supervisor:
             await asyncio.sleep(self.config.pool.probe_interval_s)
             if self._stopping:
                 return
+            # The heartbeat says "this process is alive and looping", so it is refreshed here
+            # and not at the end of a pass. Found live: a pass that raised every time never
+            # reached its heartbeat, the lock went stale under a running supervisor, a second
+            # one took it, and the two ran side by side. And a supervisor that finds the lock
+            # is no longer its own stops: two of them acting on one pool is the thing the lock
+            # exists to prevent.
+            if not self.lock.beat():
+                log.error("another supervisor has taken this pool's lock; stopping this one")
+                self._stopping = True
+                return
             try:
                 await self.pass_once()
             except Exception:  # a bad pass must never take the supervisor down
@@ -658,6 +668,24 @@ class Supervisor:
                 resident = await self.engine.models_resident(client)
             except httpx.HTTPError:
                 host.mark_preparing()
+                continue
+
+            # A rented host whose engine is serving from the processor is worthless at an
+            # accelerator's price, and looks healthy by every other measure (D81). The driver
+            # floor refuses that machine before it is rented; this is the same fault arriving
+            # any other way, on a host already being paid for.
+            on_cpu = await self.engine.serving_from_cpu(client)
+            if on_cpu:
+                self.fleet.avoid(host.offer.machine_id, "its engine ran on the processor")
+                self.fleet.events.record(
+                    "engine_without_accelerator",
+                    f"{host.host_id} is serving {', '.join(sorted(on_cpu))} from the processor, "
+                    "not the accelerator it is paid for; giving it up",
+                    numbers={"machine": host.offer.machine_id, "models": sorted(on_cpu)},
+                    host_id=host.host_id,
+                    lease_id=host.lease_id,
+                )
+                await self.fleet.destroy(host, "its engine could not use the accelerator")
                 continue
             required = self._rented_required_tags()
             if host.state == "ready" and (required & host.resident) - resident:

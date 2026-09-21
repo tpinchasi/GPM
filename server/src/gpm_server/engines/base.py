@@ -87,6 +87,17 @@ class Engine(Protocol):
     async def health(self, client: httpx.AsyncClient) -> Health:
         """Is the engine answering?"""
 
+    async def serving_from_cpu(self, client: httpx.AsyncClient) -> Optional[frozenset[str]]:
+        """Resident models the engine is running on the **processor**, not the accelerator.
+
+        None where an engine cannot say. A host that answers, holds its model set and serves
+        every request from the CPU looks healthy by every other measure and is worthless at an
+        accelerator's price — seen live on an 80GB A100 whose driver the image refused (D81).
+        The driver floor refuses that machine before it is rented; this catches whatever else
+        puts an engine on the CPU, on a host already paid for.
+        """
+        return None
+
     async def models_resident(self, client: httpx.AsyncClient) -> frozenset[str]:
         """The tags loaded in memory *now* — not merely present on disk."""
 
@@ -105,9 +116,16 @@ class Engine(Protocol):
         """Load all the tags and keep them loaded; raise if they cannot all be resident
         together."""
 
-    def launch_settings(self, workers: int, context: int, n_models: int) -> dict[str, str]:
+    def launch_settings(
+        self, workers: int, context: int, n_models: int, listen: Optional[str] = None
+    ) -> dict[str, str]:
         """Environment that makes the engine run `workers` requests in parallel at `context`,
-        holding `n_models` models. Used only on hosts the pool creates."""
+        holding `n_models` models. Used only on hosts the pool creates.
+
+        `listen` is the address the engine binds, and on a host the pool creates it is always
+        loopback: the pool reaches the engine through a forward into the machine, so an engine
+        listening on every interface is reachable by everyone *else* and by the pool no more
+        easily (D77)."""
 
 
 class EngineNotFound(Exception):

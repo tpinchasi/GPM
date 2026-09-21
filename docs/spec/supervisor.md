@@ -19,9 +19,24 @@ They share one **SQLite database (WAL mode)** and never call each other. The sup
 the host table, leases and decisions; the router reads the table and writes the request log and
 per-host counters, which is how the supervisor learns about idleness and corrupt output. One
 command starts both; each can be restarted alone. Exactly one supervisor runs per pool, enforced
-by a lock. Configuration stays a human-editable file; state is the database. Key files, any
+by a lock. Its heartbeat is refreshed at the top of every loop — so a pass that fails cannot let
+the lock go stale under a live supervisor — and a supervisor that finds the lock is no longer
+its own stops rather than act beside the one that took it (D78). Configuration stays a human-editable file; state is the database. Key files, any
 configuration that references secrets, and the database are created owner-readable only, and
 the pool refuses to start if they are group- or world-readable.
+
+### 1.1 What is running is a release, not a tree (D79)
+
+A pool that spends money runs a **tagged release**: `deploy/gpm-deploy <tag>` builds one from
+`git archive` of that tag into its own directory with its own virtual environment, installed
+non-editable, and `current` is a symlink swapped in one step once the build has proved it can
+name its own tag and pack its agent. Rolling back is activating the previous tag, which is
+still on disk. The packed agent a rented host receives comes from that same install, so the
+agent on a host always matches the release that put it there.
+
+`gpm --version` says which release this is — or says plainly that it is a development tree,
+where every edit changes the running pool. Three separate live failures came from that state
+and none of them announced itself.
 
 ### 1.1 Stopping is explicit — exiting destroys nothing
 
@@ -102,6 +117,7 @@ Ordered by value — idle time, not the hourly rate, dominates cost.
 | Orphan sweep | Any provider instance carrying this pool's label that the database does not know → alert, destroy after a grace period. Covers instances that bill storage while never running |
 | Verified release | A release counts only once the provider's listing no longer shows the instance; retried with back-off |
 | Rate caps | Maximum rented hosts at once; maximum hourly burn; per-offer bid, all-in and download-price ceilings |
+| Driver floor | `offer_policy.min_driver_version`: a machine whose accelerator driver is below what the engine image needs is refused **before renting** (D81). Below it the engine finds the card unusable and serves from the CPU — at the accelerator's price, with every other filter passed |
 | Replace only when it is cheaper | Re-bidding in place beats replacing whenever the download cost of a new host exceeds the price difference over the hours left (§6) |
 | Spend ledger | Append-only cost events per host and lease |
 
@@ -242,6 +258,16 @@ Where a machine has none, it records that it has none and the timer falls back t
 container** — the accelerator stops billing, the instance shows as stopped, and a live pool
 destroys it on its next pass. The first engine image carries no HTTP client at all, so a timer
 that named one would have armed, looked healthy, and failed only after the pool had died.
+
+**The way in is put back, not merely put there (D76).** The start-up script writes the pool's
+public key to the host's `authorized_keys`, and then goes on re-asserting it every ten seconds
+for the first ten minutes, from a small background script beside the timer's own state. A
+provider's boot runs after the start-up script and may rewrite that file or move the directory
+containing it; a host this happens to refuses the pool for its whole life, and the pool can
+neither probe it, install an agent, nor end it early — it bills until the giving-up window
+closes. Writing the key once is a guess about boot ordering on somebody else's image; putting
+it back for as long as the machine is still settling is not. The loop ends on its own, so a
+long-lived host carries nothing extra.
 ## 8. Preparing a rented host on request
 
 Overflow-driven renting answers "demand exceeded what I have". **Prepare a host** answers "get
@@ -267,6 +293,8 @@ ready from its advertised download speed; hourly rate while preparing; storage r
 | Models | Per-model download progress, gigabytes so far, download cost so far against the estimate. **Each model is loaded and pinned as soon as its own download finishes, while the rest are still downloading** (D57), so the loading of one overlaps the download of the next |
 | Verify | Every model loads; all resident **together**; a short clean generation per model. Readiness is unchanged by D57: a host joins on the whole set, never on a partial one |
 | Size | Worker count for this hardware and model set; engine parallelism set to match |
+| Given up | A host whose engine never answers within `max_starting_minutes` is destroyed and its machine avoided; where the provider offers it, the event quotes what the machine's own boot output said (D78) — data, shown to the operator, never acted on |
+| Listen | The engine binds **loopback only** (D77). The pool dials it through a forward into the machine, never across the network, so it has no reason to accept a connection from anywhere else — and a provider image that publishes the engine's port would otherwise leave an unauthenticated engine on the open internet |
 | Ready | Cost to date, hourly cost from here, storage cost if parked |
 
 | When ready | Effect |
