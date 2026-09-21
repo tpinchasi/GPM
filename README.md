@@ -15,41 +15,140 @@ See [STATUS.md](STATUS.md) for exactly where things stand.
 **Intent: to be released publicly as a reusable framework.** This repository is private until
 the items in [docs/release-checklist.md](docs/release-checklist.md) are done.
 
-## Running it
+## Install
+
+Needs Python 3.11 or newer and [uv](https://docs.astral.sh/uv/). One workspace, three packages:
+the server, the client SDK, and the optional host agent.
 
 ```sh
-uv sync                                        # one workspace, two packages
-cp server/examples/pool.yaml pool.yaml         # then edit: hosts, model set, catalog
-uv run gpm key create --role app               # shown once; only its hash is stored
-uv run gpm key create --role admin             # the control API and console need this one
+git clone <this repository> && cd GPM
+uv sync                                        # everything, including the dev tools
+uv run gpm --help
+```
+
+An app only needs the client, which depends on `httpx` and nothing else:
+
+```sh
+uv pip install ./client                        # or: pip install gpm-client, once published
+```
+
+## Configure
+
+One file describes the pool. Start from the example and edit it:
+
+```sh
+cp server/examples/pool.yaml pool.yaml
+```
+
+The parts that matter, and what each decides:
+
+| Block | What it sets |
+|---|---|
+| `pool.model_set` | The models **every** host must hold before it is used. A request for anything else is refused, never loaded on demand |
+| `catalog` | Logical names (`my-model:7b`) and the per-capability builds they resolve to, so one request serves an Apple-silicon build on the laptop and a CUDA build on a rented host |
+| `hosts` | The machines you already have — local, or remote over `http`, `https` or an SSH `tunnel` |
+| `listen` / `control` | Where the app-facing router and the operator control API listen. Loopback unless you give TLS |
+| `auth` | Where the hashed key files live (below) |
+| `rented` | Everything about renting: provider, image, offer policy, bidding ceilings, teardown timings, and the opt-in features — `allocation: dynamic`, `workers_auto`, `agent_on_rented_hosts` |
+| `limits` | Pool-wide ceilings: how many rented hosts at once, and optionally an overall hourly burn |
+
+Check a change before it takes effect — `plan` says what would differ, and loosening a ceiling
+has to be typed again:
+
+```sh
+uv run gpm config validate -f pool.yaml
+uv run gpm config plan -f pool.yaml
+uv run gpm config apply -f pool.yaml
+```
+
+### Keys
+
+Three roles, never interchangeable. **Only hashes are stored**; each key is shown once, when it
+is created.
+
+| Key | Who holds it | What it opens | Where the pool reads it |
+|---|---|---|---|
+| **App key** (`gpma_…`) | Every application | The router: inference, and nothing else. **Required, loopback included** | `auth.app_keys_file` |
+| **Admin key** (`gpmx_…`) | The operator | The control API and console: leases, renting, configuration. **Never reaches an app**, and an app key is refused here | `auth.admin_keys_file` |
+| **Agent key** (`gpmg_…`) | One host's agent | That host's agent, and only from the pool | Named by `agent.bearer_env` on that host |
+
+```sh
+uv run gpm key create --role app                 # give this to an application
+uv run gpm key create --role admin               # keep this to yourself
+uv run gpm key list                              # fingerprints and when each was made
+uv run gpm key revoke <fingerprint>
+```
+
+The provider's account credential is **never** written in configuration and never placed on a
+rented machine: it is read from the environment of the supervisor's own process
+(`VAST_API_KEY` for the first provider). What a rented host carries is the provider's
+instance-scoped credential, which can only end that one instance.
+
+## Run it
+
+```sh
+export VAST_API_KEY=…                          # only if the pool may rent
 uv run gpm serve -c pool.yaml                  # the router, and the supervisor beside it
 uv run gpm status                              # what the pool sees
 ```
+
+`gpm serve` runs the router in this process and the supervisor in its own, sharing one SQLite
+file. They never call each other: if the supervisor stops, the router keeps serving from the
+last table it published.
 
 Then open **http://127.0.0.1:8081/ui** for the console: hosts by tier, leases with their
 burn-down, the live market through your own offer policy, and every decision with the numbers
 behind it. Everything it does is also a CLI verb — `gpm lease`, `gpm host`, `gpm config`,
 `gpm market`, `gpm plan`, `gpm down --all`.
 
+### Deploy
+
+Two processes, one directory, no services to install:
+
+```sh
+uv run gpm serve -c pool.yaml                  # both halves
+uv run gpm supervise -c pool.yaml              # or: the supervisor alone, on its own machine
+uv run gpm serve -c pool.yaml --router-only    # and the router alone, reading the same database
+```
+
+- **Keep the database and `pool.yaml` together**, and back up the database: it holds the host
+  table, the leases, the spend ledger and the decision log.
+- **Only one supervisor may run per pool.** A second refuses to start, by a lock in the
+  database, and says which process holds it.
+- **The listeners are loopback by default.** Off loopback, the router needs TLS; a plain-HTTP
+  listener with a key travelling over it is refused at load.
+- **Restart when nothing is rented** where you can: a restart takes back its hosts, but the
+  SSH tunnels to them are re-opened as it starts.
+
 **Nothing rents until you say so.** A lease is the only thing that can spend, and one that may
 rent cannot be opened without a dollar cap:
 
 ```sh
 uv run gpm lease open --workers 4 --max-hours 2 --max-spend 5.00 --allow-rent
+uv run gpm host prepare --max-spend 3 --max-hours 3 --when-ready join   # or one host, now
+uv run gpm down --all                                                   # the panic button
 ```
 
-An app then knows one URL and one key:
+## Use it from an application
+
+An app knows one URL and one key:
+
+```sh
+export GPM_URL=http://127.0.0.1:8080
+export GPM_API_KEY=gpma_…
+```
 
 ```python
 from gpm_client import PoolClient
 
-pool = PoolClient()                            # GPM_URL, GPM_API_KEY
+pool = PoolClient()                            # reads GPM_URL and GPM_API_KEY
 reply = pool.chat("my-model:7b", [{"role": "user", "content": "hello"}])
-reply.content, reply.served_model
+reply.content, reply.served_model              # what came back, and which build served it
 ```
 
-The SDK waits and retries for capacity by default; [client/README.md](client/README.md) covers
-the transport, the retry policy, errors, streaming and what each answer tells you.
+The SDK waits and retries for capacity by default, and raises rather than waiting where waiting
+cannot help. [client/README.md](client/README.md) covers the transport, the retry policy, the
+errors, streaming, and what each answer tells you.
 
 Every model in the pool's set must already be loaded on a host before that host is used: the
 pool verifies a host's engine, it never configures it, and no request ever triggers a pull.
@@ -57,9 +156,15 @@ pool verifies a host's engine, it never configures it, and no request ever trigg
 ### Tests
 
 ```sh
-uv run pytest                                  # the whole default suite: no GPU, no cloud account
+uv run pytest                                  # the default suite: no GPU, no cloud account
+uv run pytest -m simulation                    # whole-pool scenarios against a moving market
 uv run pytest -m integration                   # opt-in, needs a local Ollama holding the models
 ```
+
+The **[simulation](docs/simulation.md)** runs the real router and supervisor against a market
+that moves under them — load that climbs and stops, machines that come and go, hosts taken away
+mid-answer, a provider that goes quiet, a supervisor restarted under traffic. It is a merge
+gate: CI runs it beside the unit suite on every pull request.
 
 ## Layout
 
@@ -68,7 +173,7 @@ uv run pytest -m integration                   # opt-in, needs a local Ollama ho
 | [client/](client/) | `gpm_client` — the SDK an app depends on. One dependency: `httpx`. **[How to use it](client/README.md)** |
 | [agent/](agent/) | `gpm_agent` — the optional host agent: tells the pool what a machine is. [Design](docs/spec/host-agent.md) |
 | [server/](server/) | `gpm_server` — the router, the engine adapters, the `pool` command |
-| [tests/](tests/) | The default suite against a fake engine and a fake provider, and the opt-in suites against a real Ollama |
+| [tests/](tests/) | The default suite against a fake engine and a fake provider, the opt-in suite against a real Ollama, and [the simulation](docs/simulation.md) |
 
 ## Licence
 
@@ -89,6 +194,8 @@ Start with the overview. The specification is generic and names no adopter.
 | [docs/spec/supervisor.md](docs/spec/supervisor.md) | Process layout, leases, cost controls and spend reconciliation, renting, bidding, evictions, the dead-man timer, preparing a host on request, tear-down, configuration sketch |
 | [docs/spec/plugin-interfaces.md](docs/spec/plugin-interfaces.md) | The three extension points — provider, engine, strategy — with guarantees, declared capabilities and the fake provider |
 | [docs/spec/console-and-control-api.md](docs/spec/console-and-control-api.md) | The operator console's rules and screens, test-connection, live market preview, the control API |
+| [docs/simulation.md](docs/simulation.md) | The whole-pool simulation: what it runs, the thirteen scenarios, what every run must hold to, and the faults it has already found |
+| [docs/stories/README.md](docs/stories/README.md) | The planned features, one story each: the evidence behind them, the design, what each gives up |
 | [docs/roadmap.md](docs/roadmap.md) | v1 scope, the four build phases and their exit criteria, deferred requirements, open questions |
 | [docs/decisions.md](docs/decisions.md) | Every decision, numbered: what, why, what was rejected; verified facts and unverified assumptions |
 | [docs/threat-model.md](docs/threat-model.md) | Assets, actors, 19 threats with mitigations and residual risk, deliberate non-goals |

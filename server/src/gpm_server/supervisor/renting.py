@@ -93,6 +93,8 @@ class RentedHost:
     #: True when a model the pool requires was seen to leave this host's memory.
     lost_a_model: bool = False
     agent_detail: Optional[str] = None
+    #: How many times the pool has tried to put an agent here, so it stops trying.
+    agent_attempts: int = 0
     #: When this host was parked for having no traffic, the moment its idleness began — so the
     #: destroy limit is counted from its last request, not from the park (D64).
     idle_since: Optional[float] = None
@@ -580,8 +582,16 @@ class Fleet:
         )
 
     async def install_agent(self, host: RentedHost) -> None:
-        """Put the agent on a host once its SSH answers. Never fatal (D63)."""
+        """Put the agent on a host once its SSH answers. Never fatal (D63).
+
+        Tried a few times, because SSH answers before the machine has settled — and then left
+        alone. A host that cannot take an agent is not going to start being able to, and
+        asking it every pass costs an SSH round trip a pass and fills the log with one host's
+        refusal (seen in the simulation: 153 events for two hosts).
+        """
         if host.agent is not None or not self.rented.agent_on_rented_hosts:
+            return
+        if host.agent_attempts >= self.rented.agent_attempts:
             return
         archive = agentpkg.cached(self.state_dir)
         if archive is None:
@@ -595,15 +605,20 @@ class Fleet:
                 engine_port=self.rented.engine_port,
             )
         except hostagent.AgentInstallFailed as exc:
+            host.agent_attempts += 1
             host.agent_detail = str(exc)
-            self.events.record(
-                "agent_not_installed",
-                f"{host.host_id} is preparing without an agent: {exc}",
-                host_id=host.host_id,
-                lease_id=host.lease_id,
-            )
+            if host.agent_attempts >= self.rented.agent_attempts:
+                # Said once, when the pool has stopped trying — not once a pass.
+                self.events.record(
+                    "agent_not_installed",
+                    f"{host.host_id} is preparing without an agent: {exc}",
+                    numbers={"attempts": host.agent_attempts},
+                    host_id=host.host_id,
+                    lease_id=host.lease_id,
+                )
             return
         except Exception as exc:  # noqa: BLE001 - an agent is never worth failing a host for
+            host.agent_attempts += 1
             host.agent_detail = f"installing the agent failed: {exc}"
             log.warning("installing the agent on %s failed: %s", host.host_id, exc)
             return
@@ -1633,6 +1648,14 @@ class Fleet:
         elif self.ramp_round and not self.ramp_landed_at:
             self.ramp_landed_at = now
 
+        # A paused host is capacity the pool already has: waking one adds nothing to the host
+        # count, costs no download, and is the right answer before renting anything. It has to
+        # be tried *before* the caps are consulted, or a pool sitting at its host limit with
+        # every host paused refuses the load it could serve at once (found by the simulation).
+        woken = await self.restart_idle_parked(lease)
+        if woken is not None:
+            return
+
         ramp = decide_ramp(
             round_size=self.ramp_round,
             load_present=load.present or below_floor,
@@ -1647,19 +1670,6 @@ class Fleet:
         # Never more than the gap itself asks for: a ramp is a rate, not a target.
         by_overflow = max(1, math.ceil(overflow / max(1, self.rented.workers)))
         asked = max(1, min(ramp.hosts, by_overflow)) if not below_floor else ramp.hosts
-        self.events.record(
-            "ramp_round",
-            f"{ramp.reasons[0]}; renting {asked} of them",
-            numbers={
-                "round": asked,
-                "wanted_workers": wanted,
-                "ready_workers": rented_workers + ready_workers_higher_tiers,
-                "waiting": load.waiting,
-                "busy": load.busy_workers,
-            },
-            lease_id=lease.lease_id,
-        )
-
         rented_now = 0
         for _ in range(asked):
             demand = Demand(
@@ -1685,6 +1695,21 @@ class Fleet:
             rented_now += 1
 
         if rented_now:
+            # Said once a round, and only when a round actually bought something: a pass that
+            # decides to rent and is then refused by a cap has already said so.
+            self.events.record(
+                "ramp_round",
+                f"{ramp.reasons[0]}; rented {rented_now} of {asked}",
+                numbers={
+                    "round": asked,
+                    "rented": rented_now,
+                    "wanted_workers": wanted,
+                    "ready_workers": rented_workers + ready_workers_higher_tiers,
+                    "waiting": load.waiting,
+                    "busy": load.busy_workers,
+                },
+                lease_id=lease.lease_id,
+            )
             self.ramp_round = asked
             self.ramp_landed_at = 0.0
 

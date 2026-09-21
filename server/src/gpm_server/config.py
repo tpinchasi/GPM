@@ -589,6 +589,10 @@ class RentedConfig(BaseModel):
     #: open lease and its dollar cap — the lease stops being the demand and becomes the ceiling.
     allocation: Literal["lease", "dynamic"] = "lease"
     dynamic: DynamicAllocationConfig = Field(default_factory=DynamicAllocationConfig)
+    #: How many times the pool tries to put its agent on a host before leaving it without
+    #: one. SSH answers before a machine has settled, so a first failure is not the last word;
+    #: a machine with no interpreter, though, is not going to grow one.
+    agent_attempts: int = Field(default=3, ge=1)
     #: Each host finds its own worker count while it serves (D67, D68). Off by default.
     workers_auto: WorkersAutoConfig = Field(default_factory=WorkersAutoConfig)
     offer_policy: OfferPolicy = Field(default_factory=OfferPolicy)
