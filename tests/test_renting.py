@@ -751,3 +751,58 @@ async def test_avoiding_can_be_switched_off(fleet):
     fleet.rented.teardown.avoid_failed_machine_minutes = 0
     fleet.avoid("m-1", "never started")
     assert fleet.avoided_now() == {}
+
+
+# --- what the machine itself said, when a host never answered (D78) ---
+
+
+async def _a_host_stuck_starting(fleet):
+    fleet.rented.teardown.max_starting_minutes = 10
+    open_lease(fleet, workers=2)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    host = next(iter(fleet.hosts.values()))
+    host.preparing_since -= 11 * 60
+    fleet.leases.close(host.lease_id, "test: stop it renting again")
+    return host
+
+
+async def test_a_host_given_up_for_never_starting_says_what_its_boot_output_said(fleet):
+    """Found live: three hosts were read as refusing the pool's key when their own boot output
+    said the provider's proxy had never published them. One call tells the two apart."""
+    host = await _a_host_stuck_starting(fleet)
+    fleet.provider.boot_output[host.instance.instance_id] = "\n".join(
+        ["Warning: Permanently added 'proxy' to the list of known hosts."]
+        + ["Error: remote port forwarding failed for listen port 24390"] * 40
+    )
+
+    await fleet.tear_down([], {}, 0)
+
+    assert host.released
+    stuck = [e for e in fleet.events.recent() if e["kind"] == "host_stuck_starting"][0]
+    assert "remote port forwarding failed for listen port 24390" in stuck["summary"]
+    assert stuck["summary"].count("remote port forwarding failed") == 1, "said once, not forty times"
+
+
+async def test_a_provider_with_no_boot_output_changes_nothing(fleet):
+    import dataclasses
+
+    fleet.provider.capabilities = dataclasses.replace(
+        fleet.provider.capabilities, reports_instance_logs=False
+    )
+    host = await _a_host_stuck_starting(fleet)
+
+    await fleet.tear_down([], {}, 0)
+
+    assert host.released and "host_stuck_starting" in kinds(fleet)
+
+
+async def test_boot_output_that_cannot_be_read_never_delays_giving_a_host_up(fleet, monkeypatch):
+    host = await _a_host_stuck_starting(fleet)
+
+    async def broken(instance, tail=60):
+        raise RuntimeError("the provider's log endpoint is down")
+
+    monkeypatch.setattr(fleet.provider, "instance_logs", broken)
+    await fleet.tear_down([], {}, 0)
+
+    assert host.released

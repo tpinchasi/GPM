@@ -252,6 +252,16 @@ class Supervisor:
             await asyncio.sleep(self.config.pool.probe_interval_s)
             if self._stopping:
                 return
+            # The heartbeat says "this process is alive and looping", so it is refreshed here
+            # and not at the end of a pass. Found live: a pass that raised every time never
+            # reached its heartbeat, the lock went stale under a running supervisor, a second
+            # one took it, and the two ran side by side. And a supervisor that finds the lock
+            # is no longer its own stops: two of them acting on one pool is the thing the lock
+            # exists to prevent.
+            if not self.lock.beat():
+                log.error("another supervisor has taken this pool's lock; stopping this one")
+                self._stopping = True
+                return
             try:
                 await self.pass_once()
             except Exception:  # a bad pass must never take the supervisor down

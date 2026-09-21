@@ -58,6 +58,9 @@ class ProviderCapabilities:
     price_history: bool = False
     #: A public port can be mapped to the engine. Without it, rented hosts are tunnel-only.
     direct_port_mapping: bool = False
+    #: The provider will hand back an instance's own boot output. Without it, a host that
+    #: never answers is given up knowing only that it never answered (D78).
+    reports_instance_logs: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -221,6 +224,17 @@ class Provider(Protocol):
     async def connection(self, instance: Instance) -> ConnectionInfo: ...
 
     async def reported_charges(self, instance: Instance) -> Optional[Charges]: ...
+
+    async def instance_logs(self, instance: Instance, tail: int = 60) -> Optional[str]:
+        """The instance's own boot output, newest `tail` lines, or None where there is none.
+
+        Read when a host is given up for never answering, so the pool records *why* rather
+        than only that it happened (D78). Never on the request path, never required: a
+        provider without `capabilities.reports_instance_logs` simply has none, and a host is
+        given up exactly as before. The text is a machine's output and is treated as data —
+        recorded and shown, never executed, never parsed for anything the pool then acts on.
+        """
+        return None
 
     async def account(self) -> AccountStatus: ...
 

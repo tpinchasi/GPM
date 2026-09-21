@@ -19,7 +19,9 @@ They share one **SQLite database (WAL mode)** and never call each other. The sup
 the host table, leases and decisions; the router reads the table and writes the request log and
 per-host counters, which is how the supervisor learns about idleness and corrupt output. One
 command starts both; each can be restarted alone. Exactly one supervisor runs per pool, enforced
-by a lock. Configuration stays a human-editable file; state is the database. Key files, any
+by a lock. Its heartbeat is refreshed at the top of every loop — so a pass that fails cannot let
+the lock go stale under a live supervisor — and a supervisor that finds the lock is no longer
+its own stops rather than act beside the one that took it (D78). Configuration stays a human-editable file; state is the database. Key files, any
 configuration that references secrets, and the database are created owner-readable only, and
 the pool refuses to start if they are group- or world-readable.
 
@@ -277,6 +279,7 @@ ready from its advertised download speed; hourly rate while preparing; storage r
 | Models | Per-model download progress, gigabytes so far, download cost so far against the estimate. **Each model is loaded and pinned as soon as its own download finishes, while the rest are still downloading** (D57), so the loading of one overlaps the download of the next |
 | Verify | Every model loads; all resident **together**; a short clean generation per model. Readiness is unchanged by D57: a host joins on the whole set, never on a partial one |
 | Size | Worker count for this hardware and model set; engine parallelism set to match |
+| Given up | A host whose engine never answers within `max_starting_minutes` is destroyed and its machine avoided; where the provider offers it, the event quotes what the machine's own boot output said (D78) — data, shown to the operator, never acted on |
 | Listen | The engine binds **loopback only** (D77). The pool dials it through a forward into the machine, never across the network, so it has no reason to accept a connection from anywhere else — and a provider image that publishes the engine's port would otherwise leave an unauthenticated engine on the open internet |
 | Ready | Cost to date, hourly cost from here, storage cost if parked |
 

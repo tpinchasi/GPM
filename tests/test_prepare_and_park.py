@@ -821,3 +821,57 @@ async def test_each_model_is_loaded_as_it_lands_even_without_an_agent(fleet):
     loads = [i for i, path in enumerate(ordered) if path in ("/api/generate", "/api/embed")]
     assert len(pulls) == 2 and loads, "both models pulled, and loading happened"
     assert min(loads) < max(pulls), "the first model was loaded before the last one downloaded"
+
+
+async def test_a_rented_host_with_a_working_agent_does_not_stop_the_control_loop(fleet, monkeypatch):
+    """Found live, on the first rented host whose agent ever installed at once: asking the
+    agent read a field its answer does not have, the pass raised, and because the probe runs
+    before preparation the host never began downloading — it sat there billing, healthy."""
+    from gpm_server.supervisor import agents, hostagent
+
+    host = await fleet.prepare(max_spend=1.00, max_hours=1)
+    host.agent = hostagent.RentedAgent(url="http://127.0.0.1:1", secret="gpmg_" + "0" * 64)
+
+    async def answers(agent, transport=None):
+        return agents.AgentView(reachable=True, facts={"os": "Linux"})
+
+    monkeypatch.setattr(agents, "ask", answers)
+    await fleet.ask_agent(host)
+    assert host.agent_facts == {"os": "Linux"} and host.agent_detail is None
+
+    async def silent(agent, transport=None):
+        return agents.AgentView(reachable=False, detail="no answer")
+
+    monkeypatch.setattr(agents, "ask", silent)
+    await fleet.ask_agent(host)
+    assert host.agent_facts is None and host.agent_detail == "no answer"
+
+
+async def test_a_freshly_installed_agent_is_given_a_moment_before_the_slow_path(fleet, monkeypatch):
+    """Found live: asked the instant its install returned, the agent was not listening yet; one
+    failed call and the host was prepared without it — pull, then load, then pull — for good."""
+    from gpm_server.supervisor import agents, hostagent
+
+    host = await fleet.prepare(max_spend=1.00, max_hours=1)
+    host.agent = hostagent.RentedAgent(url="http://127.0.0.1:1", secret="gpmg_" + "0" * 64)
+    fleet.agent_hold_retry_s = 0.01
+    calls = []
+
+    async def not_yet_then_answers(agent, tags, residency, transport=None):
+        calls.append(1)
+        if len(calls) < 3:
+            return None
+        return {"models": [{"tag": tag, "loaded": False, "pulling": {"tag": tag}} for tag in tags]}
+
+    monkeypatch.setattr(agents, "hold", not_yet_then_answers)
+    assert await fleet.load_model_set_through_agent(host) is False  # coming, through the agent
+    assert len(calls) == 3
+
+    async def never(agent, tags, residency, transport=None):
+        calls.append(1)
+        return None
+
+    calls.clear()
+    monkeypatch.setattr(agents, "hold", never)
+    assert await fleet.load_model_set_through_agent(host) is None   # a real silence falls back
+    assert len(calls) == fleet.agent_hold_attempts

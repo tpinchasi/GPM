@@ -670,6 +670,60 @@ class Fleet:
             lease_id=host.lease_id,
         )
 
+    #: Lines in a machine's boot output worth repeating when a host never answered. A stuck
+    #: host writes thousands of lines and almost all of them are ordinary; these are the ones
+    #: that have actually explained a failure.
+    _TELLING = (
+        "remote port forwarding failed",   # the provider's proxy never published the host
+        "no space left",
+        "out of memory",
+        "cannot allocate",
+        "permission denied",
+        "failed to start",
+        "error response from daemon",
+        "cuda",
+    )
+
+    async def why_it_never_started(self, host: RentedHost, tail: int = 80) -> Optional[str]:
+        """What the machine itself said, for a host that never answered (D78).
+
+        The pool has been guessing at these from the outside, and guessed wrong: two hosts were
+        read as refusing the pool's SSH key when their own logs said the provider's proxy had
+        refused to publish them at all — the same `Permission denied` either way, from opposite
+        causes. One call distinguishes them.
+
+        Best-effort by construction. It runs only as a host is given up, never on the request
+        path, and anything it cannot get back leaves the host given up exactly as before. What
+        comes back is a machine's output: recorded and shown, never executed, and never used to
+        decide anything.
+        """
+        if not self.provider.capabilities.reports_instance_logs or host.instance is None:
+            return None
+        try:
+            text = await self.provider.instance_logs(host.instance, tail=tail)
+        except Exception as exc:  # noqa: BLE001 - diagnosis must never delay a tear-down
+            log.debug("could not read %s's boot output: %s", host.host_id, exc)
+            return None
+        if not text:
+            return None
+
+        seen: list[str] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or not any(word in stripped.lower() for word in self._TELLING):
+                continue
+            if stripped not in seen:
+                seen.append(stripped)
+            if len(seen) >= 3:
+                break
+        if not seen:
+            # Nothing recognised: the last line still beats nothing at all.
+            last = [line.strip() for line in text.splitlines() if line.strip()]
+            return last[-1][:200] if last else None
+        repeats = len(text.splitlines())
+        note = "; ".join(line[:160] for line in seen)
+        return f"{note} (in {repeats} lines of boot output)"
+
     async def resize(self, host: RentedHost, workers: int) -> tuple[bool, str]:
         """Change how many requests a running host is given (D56). Returns (done, why).
 
@@ -752,7 +806,7 @@ class Fleet:
         if host.agent is None:
             return
         view = await agents.ask(host.agent, transport=self._agent_transport)
-        if view.ok:
+        if view.reachable:
             host.agent_facts = view.facts
             host.agent_detail = None
         else:
@@ -1110,6 +1164,11 @@ class Fleet:
         except TypeError:
             return await engine.pull(client, tag)
 
+    #: How long a just-installed agent is given to start answering before the pool prepares
+    #: the host without it.
+    agent_hold_attempts = 5
+    agent_hold_retry_s = 2.0
+
     async def load_model_set_through_agent(self, host: RentedHost) -> Optional[bool]:
         """Let the host's own agent fetch and hold the model set (D63, stage 3).
 
@@ -1123,7 +1182,18 @@ class Fleet:
         if host.agent is None or not host.agent.manage_models:
             return None
         tags = sorted(self.required_tags)
-        report = await agents.hold(host.agent, tags, "pinned", transport=self._agent_transport)
+        # An agent that was started a second ago may not be listening yet. Seen live: the pool
+        # asked the moment the install returned, the one call failed, and the host was prepared
+        # the slow way for its whole life — a minute of idle accelerator that D57 exists to
+        # remove. A few seconds of patience is cheap next to that; a real silence still falls
+        # back, as before.
+        report = None
+        for attempt in range(self.agent_hold_attempts):
+            if attempt:
+                await asyncio.sleep(self.agent_hold_retry_s)
+            report = await agents.hold(host.agent, tags, "pinned", transport=self._agent_transport)
+            if report is not None:
+                break
         if report is None:
             host.agent_detail = "the agent stopped answering while the model set was loading"
             return None
@@ -2011,10 +2081,12 @@ class Fleet:
                 # Stuck before it ever served anything: the provider is still scheduling or
                 # starting it. Waiting the full preparing window would bill three times as long.
                 self.avoid(host.offer.machine_id, "never started")
+                said = await self.why_it_never_started(host)
                 self.events.record(
                     "host_stuck_starting",
                     f"{host.host_id} has not started after {starting_for:.0f} minutes "
-                    f"(limit {self.rented.teardown.max_starting_minutes:g}); giving it up",
+                    f"(limit {self.rented.teardown.max_starting_minutes:g}); giving it up"
+                    + (f". Its own boot output says: {said}" if said else ""),
                     numbers={"minutes": round(starting_for, 1), "machine": host.offer.machine_id},
                     host_id=host.host_id, lease_id=host.lease_id,
                 )

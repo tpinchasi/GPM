@@ -495,11 +495,15 @@ class SupervisorLock:
             (self.pool, self.owner, os.getpid(), now),
         )
 
-    def beat(self) -> None:
+    def beat(self) -> bool:
+        """Refresh the heartbeat. False when the lock is no longer this supervisor's — another
+        took it while this one was not beating — and this one must stop, not carry on beside it."""
         self.db.execute(
             "UPDATE supervisor_lock SET heartbeat = ? WHERE pool = ? AND owner = ?",
             (time.time(), self.pool, self.owner),
         )
+        rows = self.db.query("SELECT owner FROM supervisor_lock WHERE pool = ?", (self.pool,))
+        return bool(rows) and rows[0]["owner"] == self.owner
 
     def release(self) -> None:
         self.db.execute(
