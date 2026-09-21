@@ -304,7 +304,12 @@ def _status(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="gpm", description="GPM — GPU Hosts Pool Management")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="what this install is: its release tag, or that it is a development tree (D79)",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=False)
 
     serve = subparsers.add_parser("serve", help="run the router, and the supervisor beside it")
     serve.add_argument("--config", "-c", default="pool.yaml")
@@ -410,6 +415,14 @@ def main(argv: list[str] | None = None) -> int:
     down.set_defaults(func=lambda a: _control(a, "POST", "/pool/down"))
 
     args = parser.parse_args(argv)
+    if getattr(args, "version", False):
+        from .version import running
+
+        print(running().describe())
+        return 0
+    if getattr(args, "func", None) is None:
+        parser.print_help(sys.stderr)
+        return 2
     # Only the long-running verbs take --log-level; the rest are one call and an answer.
     level_name = getattr(args, "log_level", "warning")
     logging.basicConfig(
