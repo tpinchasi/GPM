@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 from .config import BiddingConfig, OfferPolicy, ScaleConfig, TeardownConfig
 from .providers.base import Offer
@@ -358,9 +358,20 @@ def score(offer: Offer, bid_hourly: float, hours: float, model_set_gb: float) ->
 
 
 def rank_offers(
-    offers: Sequence[Offer], policy: OfferPolicy, bidding: BiddingConfig, hours: float, model_set_gb: float
+    offers: Sequence[Offer],
+    policy: OfferPolicy,
+    bidding: BiddingConfig,
+    hours: float,
+    model_set_gb: float,
+    history: Optional[dict[str, Any]] = None,
+    history_cfg: Optional[Any] = None,
 ) -> tuple[list[tuple[Offer, float]], dict[str, list[str]]]:
-    """Returns the acceptable offers best-first, and why each rejected one was rejected."""
+    """Returns the acceptable offers best-first, and why each rejected one was rejected.
+
+    Where a machine has a record with this pool, that record moves its score — up for one that
+    has served well here, down for one that has not (D69). It never *admits* an offer the hard
+    filters rejected, and never rejects one they accepted: it only changes the order.
+    """
     accepted: list[tuple[Offer, float]] = []
     rejected: dict[str, list[str]] = {}
     for offer in offers:
@@ -372,9 +383,28 @@ def rank_offers(
         if bid.hourly <= 0:
             rejected[offer.offer_id] = ["bid: " + bid.reasons[-1]]
             continue
-        accepted.append((offer, score(offer, bid.hourly, hours, model_set_gb)))
+        points = score(offer, bid.hourly, hours, model_set_gb)
+        if history_cfg is not None:
+            from .history import adjustment
+
+            factor, _why = adjustment((history or {}).get(offer.machine_id), history_cfg)
+            points *= factor
+        accepted.append((offer, points))
     accepted.sort(key=lambda pair: (-pair[1], pair[0].offer_id))
     return accepted, rejected
+
+
+def history_note(offer: Offer, history: Optional[dict[str, Any]], history_cfg: Optional[Any]) -> Optional[str]:
+    """Why this machine's record moved its score, in one line — or None if it did not."""
+    if history_cfg is None:
+        return None
+    from .history import adjustment
+
+    factor, why = adjustment((history or {}).get(offer.machine_id), history_cfg)
+    if why is None:
+        return None
+    direction = "better" if factor > 1 else "worse"
+    return f"scored {direction} on its record here: {why}"
 
 
 # --- how much to bid (spec §6.1) ---

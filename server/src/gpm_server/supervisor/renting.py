@@ -19,7 +19,7 @@ import uuid
 from pathlib import Path
 from typing import Mapping, Optional
 
-from .. import agentpkg
+from .. import agentpkg, history
 from ..config import BiddingConfig, OfferPolicy, PoolConfig, RentedConfig, TransportConfig
 from ..deadman import heartbeat_command, onstart_script
 from ..engines import get_engine
@@ -204,6 +204,9 @@ class Fleet:
         #: The ramp: how many hosts the last round asked for, and when it landed (D66).
         self.ramp_round = 0
         self.ramp_landed_at = 0.0
+        #: The machine history, rebuilt from the logs every few seconds (D69).
+        self._history: Optional[dict] = None
+        self._history_at = 0.0
         self._offer_backoff_s = 0.0
         self._offer_retry_at = 0.0
 
@@ -428,6 +431,31 @@ class Fleet:
             log.warning("no public key beside %s; rented hosts will only accept the account's keys", self.rented.ssh_key)
             return None
         return pub.read_text().strip()
+
+    def machine_history(self, refresh_after_s: float = 30.0) -> dict:
+        """What each machine has done for this pool (D69), from the logs it already writes.
+
+        Cached for a few seconds: it is read on every market preview and every renting pass,
+        and the logs it folds do not move between them.
+        """
+        now = time.monotonic()
+        if self._history is not None and now - self._history_at < refresh_after_s:
+            return self._history
+        try:
+            events = list(reversed(self.events.recent(2000)))
+            requests = [
+                dict(row)
+                for row in self.events.db.query(
+                    "SELECT host_id, outcome, latency_ms, tokens_out, generate_ms FROM request_log "
+                    "WHERE host_id IS NOT NULL ORDER BY id DESC LIMIT 20000"
+                )
+            ]
+        except Exception as exc:  # noqa: BLE001 - a view is never worth failing a bid for
+            log.warning("could not build the machine history: %s", exc)
+            return {}
+        self._history = history.build(events, requests)
+        self._history_at = now
+        return self._history
 
     def workers_for(self, offer: Offer) -> tuple[int, str]:
         """How many workers a host rented from this offer would run, and why (spec §2.1).
@@ -801,6 +829,7 @@ class Fleet:
             ranked, rejected = rank_offers(
                 offers, self._policy_with_avoided(self.rented.offer_policy), self.rented.bidding,
                 lease.hours_left(), self.rented.model_set_gb,
+                history=self.machine_history(), history_cfg=self.rented.history,
             )
             step["offers_seen"] = len(offers)
             step["offers_rejected"] = {key: value for key, value in list(rejected.items())[:10]}
@@ -852,7 +881,8 @@ class Fleet:
             raise ValueError(f"kinds must be one of {sorted(self._KINDS)}")
         offers = await self._offers(policy, kinds)
         ranked, rejected = rank_offers(
-            offers, self._policy_with_avoided(policy), bid_config, hours, self.rented.model_set_gb
+            offers, self._policy_with_avoided(policy), bid_config, hours, self.rented.model_set_gb,
+            history=self.machine_history(), history_cfg=self.rented.history,
         )
         problem = self.last_offer_error
         by_reason: dict[str, int] = {}
@@ -1783,6 +1813,8 @@ class Fleet:
             self.rented.bidding,
             lease.hours_left(),
             self.rented.model_set_gb,
+            history=self.machine_history(),
+            history_cfg=self.rented.history,
         )
         if offer_id is not None:
             chosen = [pair for pair in ranked if pair[0].offer_id == offer_id]
@@ -1892,6 +1924,10 @@ class Fleet:
                 + f" on {offer.machine_id} ({offer.hardware}), {workers} workers: {workers_why}",
                 numbers={
                     "workers": workers,
+                    # Named here as data, not only in the sentence: the machine history is a
+                    # view over this log, and a view should not have to parse prose (D69).
+                    "machine": offer.machine_id,
+                    "hardware": offer.hardware,
                     "bid": capped,
                     "floor": offer.min_bid_hourly,
                     "all_in": offer.all_in_hourly,

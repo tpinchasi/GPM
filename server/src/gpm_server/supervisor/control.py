@@ -833,6 +833,25 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             return JSONResponse({"host_id": host_id, "deleted": tag})
         return JSONResponse(status_code=status_code, content=answer)
 
+    @app.get("/pool/machines")
+    async def machines() -> JSONResponse:
+        """What each machine has done for this pool (D69) — a view over the logs, not a store."""
+        fleet = supervisor.fleet
+        if fleet is None:
+            return _error(400, "cannot_rent", "this pool has no rented capacity configured")
+        records = fleet.machine_history(refresh_after_s=0)
+        return JSONResponse(
+            {
+                "machines": [
+                    record.as_dict()
+                    for record in sorted(
+                        records.values(), key=lambda r: (-r.rentals, r.machine_id)
+                    )
+                ],
+                "policy": fleet.rented.history.model_dump(),
+            }
+        )
+
     @app.post("/pool/hosts/{host_id}/resize")
     async def resize_host(host_id: str, request: Request) -> JSONResponse:
         """How many requests this host takes at once, changed while it runs (D56).
