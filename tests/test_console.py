@@ -143,6 +143,7 @@ def _a_browser() -> str | None:
     return found or (mac if Path(mac).exists() else None)
 
 
+@pytest.mark.timeout(180)
 def test_a_browser_really_runs_the_page_to_its_last_line():
     """The bracket check is not a parser, and `node` is not on every machine. Twice in one day
     a syntax error reached a running console — once a dropped `)`, once an arrow eaten by an
@@ -166,7 +167,10 @@ def test_a_browser_really_runs_the_page_to_its_last_line():
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         try:
-            dom, complaints = browsing.communicate(timeout=30)
+            # A cold headless browser on a loaded machine (which is when CI runs) takes far
+            # longer than one on an idle laptop, so this waits longer than the 30 s that made
+            # it flaky — and the test's own limit is raised above it, or the two would race.
+            dom, complaints = browsing.communicate(timeout=60)
         except subprocess.TimeoutExpired:
             browsing.kill()
             dom, complaints = browsing.communicate()
@@ -917,3 +921,19 @@ def test_the_preview_says_what_is_saved_so_the_form_is_the_pools_own(console):
     preview = loop.run(supervisor.fleet.market_preview(hours=1))
     assert preview["saved"]["bidding"]["bid_ceiling"] == supervisor.config.rented.bidding.bid_ceiling
     assert "min_gpu_memory_gb" in preview["saved"]["offer_policy"]
+
+
+# --- how capacity is decided, edited where renting is watched (D74) ---
+
+
+def test_the_allocation_panel_is_built_from_what_the_pool_reports():
+    """Like the offer search before it, the fields are the pool's own values — never a copy in
+    the page that can drift from the file."""
+    source = (STATIC / "app.js").read_text()
+
+    assert "allocationSection" in source and "...allocationSection(market)" in source
+    for field in ("target_utilisation", "ramp_factor", "max_round", "min_hosts"):
+        assert field in source, f"{field} is not editable in the console"
+    assert "workers_auto" in source
+    # And it saves through the same path as the search: file, plan, retype.
+    assert "api.setSearch" in source.split("function saveAllocation")[1].split("function ")[0]

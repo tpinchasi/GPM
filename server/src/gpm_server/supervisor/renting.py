@@ -940,6 +940,11 @@ class Fleet:
             "saved": {
                 "offer_policy": self.rented.offer_policy.model_dump(),
                 "bidding": self.rented.bidding.model_dump(),
+                # How capacity is allocated, edited on the same screen (D74): two opt-in
+                # features that spend money should not be visible only in a file.
+                "allocation": self.rented.allocation,
+                "dynamic": self.rented.dynamic.model_dump(),
+                "workers_auto": self.rented.workers_auto.model_dump(),
             },
         }
 

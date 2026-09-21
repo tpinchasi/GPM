@@ -490,6 +490,10 @@ def _as_yaml(value: Any) -> str:
         return "null" if value is None else repr(value)
     if isinstance(value, (list, tuple)):
         return "[" + ", ".join(_as_yaml(item) for item in value) + "]"
+    if isinstance(value, Mapping):
+        # Flow style, on one line: a section the operator never wrote is added whole rather
+        # than guessed at line by line, and `_set_in_flow` can edit it again afterwards.
+        return "{ " + ", ".join(f"{key}: {_as_yaml(item)}" for key, item in value.items()) + " }"
     return json.dumps(str(value))
 
 

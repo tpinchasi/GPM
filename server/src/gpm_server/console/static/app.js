@@ -574,6 +574,7 @@ screens.rented = async (status) => {
       preparePanel(),
     ),
     ...searchSection(market),
+    ...allocationSection(market),
     ...marketSection(market),
     el("h2", {}, "Rented and parked hosts"),
     status.rented.length ? el("table", {},
@@ -620,7 +621,24 @@ const SEARCH_FIELDS = [
   ["bidding", "attempts", "number", "offers to try in one pass before giving up"],
 ];
 
+// How capacity is allocated, editable on the same screen for the same reason (D74): two
+// opt-in features that spend money should be visible and changeable where renting is watched,
+// not only in a file on the supervisor's machine.
+const ALLOCATION_FIELDS = [
+  ["dynamic", "target_utilisation", "number", "rent before saturation, not at it: 0.75 keeps a quarter spare"],
+  ["dynamic", "window_s", "number", "load must hold this long before the first host is bought"],
+  ["dynamic", "ramp_factor", "number", "each round asks for this many times the last: 1, 2, 4 …"],
+  ["dynamic", "ramp_backoff_s", "number", "and waits this long after the last round has landed"],
+  ["dynamic", "max_round", "number", "the most one round may add, however long the load lasts"],
+  ["dynamic", "min_hosts", "number", "a warm floor kept while a lease is open; 0 spends nothing when quiet"],
+  ["workers_auto", "enabled", "checkbox", "each host finds its own worker count while it serves"],
+  ["workers_auto", "max", "number", "the most any host's engine is launched to run at once"],
+  ["workers_auto", "min_gain", "number", "a step up must raise throughput by this much to count"],
+  ["workers_auto", "slow_host_factor", "number", "service time this far over the pool's median steps a host down"],
+];
+
 const search = { inputs: {}, saved: null, message: "" };
+const allocation = { inputs: {}, mode: null, message: "" };
 
 function searchSection(market) {
   const saved = (market.saved || {});
@@ -677,6 +695,106 @@ function searchSection(market) {
         el("button", { class: "small", onclick: () => render() }, "Reset"),
         note)),
   ];
+}
+
+function allocationSection(market) {
+  const saved = market.saved || {};
+  allocation.inputs = {};
+  if (!saved.dynamic) {
+    return [
+      el("h2", {}, "How capacity is decided"),
+      el("p", { class: "muted" }, "This pool's supervisor does not report its allocation settings yet; restart it to edit them here."),
+    ];
+  }
+  allocation.mode = saved.allocation || "lease";
+  const mode = el("select", {},
+    el("option", { value: "lease", ...(allocation.mode === "lease" ? { selected: true } : {}) },
+      "lease — the lease's worker count is the demand"),
+    el("option", { value: "dynamic", ...(allocation.mode === "dynamic" ? { selected: true } : {}) },
+      "dynamic — the traffic is the demand, the lease is the ceiling"),
+  );
+
+  const rows = ALLOCATION_FIELDS.filter(([section]) => saved[section]).map(([section, key, kind, why]) => {
+    const value = saved[section][key];
+    const input = kind === "checkbox"
+      ? el("input", { type: "checkbox", ...(value ? { checked: true } : {}) })
+      : el("input", { type: "number", step: "any", style: "width:9rem",
+                      value: value === null || value === undefined ? "" : String(value) });
+    allocation.inputs[`${section}.${key}`] = { input, kind, section, key, was: value };
+    return el("tr", {},
+      el("td", { class: "mono" }, `${section === "dynamic" ? "" : "workers_auto: "}${key}`),
+      el("td", {}, input),
+      el("td", { class: "muted" }, why));
+  });
+
+  const note = el("span", { class: "muted" }, allocation.message);
+  return [
+    el("h2", {}, "How capacity is decided"),
+    el("div", { class: "panel" },
+      el("div", { class: "row" },
+        el("label", {}, "Allocation"), mode,
+        el("span", { class: "muted" },
+          "Nothing is rented without an open lease and its dollar cap either way.")),
+      el("table", {}, el("tbody", {}, rows)),
+      el("div", { class: "row" },
+        el("button", { class: "primary", onclick: (e) => saveAllocation(e, note, mode) },
+          "Save to configuration"),
+        el("button", { class: "small", onclick: () => render() }, "Reset"),
+        note)),
+  ];
+}
+
+function allocationValues() {
+  const body = { allocation: null, dynamic: {}, workers_auto: {} };
+  for (const { input, kind, section, key } of Object.values(allocation.inputs)) {
+    if (kind === "checkbox") { body[section][key] = input.checked; continue; }
+    const raw = input.value.trim();
+    body[section][key] = raw === "" ? null : Number(raw);
+  }
+  return body;
+}
+
+async function saveAllocation(event, note, mode) {
+  const button = event.target, label = button.textContent;
+  const wanted = allocationValues();
+  const body = { dynamic: {}, workers_auto: {} };
+  for (const { section, key, was } of Object.values(allocation.inputs)) {
+    const now = wanted[section][key];
+    if (JSON.stringify(now) !== JSON.stringify(was ?? null)) body[section][key] = now;
+  }
+  if (mode.value !== allocation.mode) body.allocation = mode.value;
+  if (!body.allocation && !Object.keys(body.dynamic).length && !Object.keys(body.workers_auto).length) {
+    allocation.message = " nothing changed";
+    note.textContent = allocation.message;
+    return;
+  }
+  button.disabled = true; button.textContent = "saving…";
+  try {
+    let answer;
+    try {
+      answer = await api.setSearch(body);
+    } catch (error) {
+      // Switching allocation on can loosen a limit; it comes back refused, with the plan.
+      const changes = error.changes || [];
+      const retype = changes.find((c) => c.requires_retype);
+      if (!retype) throw error;
+      const ok = await confirmAction({
+        title: "This loosens a limit",
+        body: el("div", {}, ...changes.map((c) => el("p", {}, c.detail))),
+        retype: retype.value,
+      });
+      if (!ok) return;
+      answer = await api.setSearch({ ...body, confirm: retype.value });
+    }
+    allocation.message = ` saved · ${(answer.changes || []).length} change(s) applied`;
+    note.textContent = allocation.message;
+    await refresh();
+  } catch (error) {
+    allocation.message = ` ${error.message}`;
+    note.textContent = allocation.message;
+  } finally {
+    button.disabled = false; button.textContent = label;
+  }
 }
 
 function searchValues() {

@@ -381,3 +381,43 @@ def test_resizing_needs_the_admin_key_like_everything_that_changes_the_pool(cont
 
     assert refused.status_code in (401, 403)
     assert host.workers == 3
+
+
+# --- turning dynamic allocation on from the console (D74) ---
+
+
+def test_allocation_can_be_switched_on_from_the_rented_screen(control, tmp_path):
+    """The file stays the source of truth: the change is written into it, validated, planned
+    and applied — and a block the operator never wrote is added whole."""
+    supervisor, url, loop = control
+    written = tmp_path / "pool.yaml"
+    written.write_text(
+        "pool: { name: test, model_set: [m1] }\n"
+        "auth: { app_keys: [k], admin_keys: [a] }\n"
+        "hosts:\n"
+        "  - id: local-1\n"
+        "    kind: local\n"
+        "    transport: { type: http, base_url: 'http://127.0.0.1:1' }\n"
+        "rented:\n"
+        "  provider: fake\n"
+        "  bidding: { bid_ceiling: 0.60 }\n"
+    )
+    from gpm_server.configplan import ConfigStore
+
+    supervisor.config_path = written
+    supervisor.store = ConfigStore(written)
+
+    with client(url) as http:
+        answered = http.patch(
+            "/pool/config/rented",
+            json={"allocation": "dynamic", "dynamic": {"max_round": 3, "window_s": 60}},
+        )
+
+    assert answered.status_code == 200, answered.text
+    text = written.read_text()
+    assert "allocation:" in text and "dynamic:" in text
+    from gpm_server.config import load_config
+
+    reloaded = load_config(written)
+    assert reloaded.rented.allocation == "dynamic"
+    assert reloaded.rented.dynamic.max_round == 3
