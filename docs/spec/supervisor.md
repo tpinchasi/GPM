@@ -25,6 +25,19 @@ its own stops rather than act beside the one that took it (D78). Configuration s
 configuration that references secrets, and the database are created owner-readable only, and
 the pool refuses to start if they are group- or world-readable.
 
+### 1.1 What is running is a release, not a tree (D79)
+
+A pool that spends money runs a **tagged release**: `deploy/gpm-deploy <tag>` builds one from
+`git archive` of that tag into its own directory with its own virtual environment, installed
+non-editable, and `current` is a symlink swapped in one step once the build has proved it can
+name its own tag and pack its agent. Rolling back is activating the previous tag, which is
+still on disk. The packed agent a rented host receives comes from that same install, so the
+agent on a host always matches the release that put it there.
+
+`gpm --version` says which release this is — or says plainly that it is a development tree,
+where every edit changes the running pool. Three separate live failures came from that state
+and none of them announced itself.
+
 ### 1.1 Stopping is explicit — exiting destroys nothing
 
 | What happened | Command | Rented hosts |

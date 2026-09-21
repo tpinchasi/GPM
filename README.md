@@ -103,13 +103,36 @@ behind it. Everything it does is also a CLI verb — `gpm lease`, `gpm host`, `g
 
 ### Deploy
 
-Two processes, one directory, no services to install:
+**A pool that spends money runs a tagged release, not a working tree.** Build one, check it,
+then point `current` at it:
 
 ```sh
-uv run gpm serve -c pool.yaml                  # both halves
-uv run gpm supervise -c pool.yaml              # or: the supervisor alone, on its own machine
-uv run gpm serve -c pool.yaml --router-only    # and the router alone, reading the same database
+deploy/gpm-deploy v0.6.1               # build it: git archive of the tag, its own venv
+deploy/gpm-deploy v0.6.1 --activate    # and make it current
+~/.local/share/gpm/releases/current/venv/bin/gpm --version
 ```
+
+A release is a directory with its own virtual environment, installed **non-editable** from the
+tag — so editing your checkout cannot change what is running. `--activate` is one symlink swap,
+and rolling back is activating the previous tag, still sitting on disk beside it. A build that
+fails to identify itself as its tag, or to pack its agent, is deleted rather than activated.
+
+`gpm --version` tells you which release a process is running, or says plainly that it is a
+development tree. Three live failures — a stale agent shipped to hosts, and twice a fix that
+was committed but not running — all came from that state, and each was found only by a rented
+host failing.
+
+Then two processes, one directory, no services to install:
+
+```sh
+RELEASE=~/.local/share/gpm/releases/current/venv/bin
+$RELEASE/gpm serve -c pool.yaml                  # both halves
+$RELEASE/gpm supervise -c pool.yaml              # or: the supervisor alone, on its own machine
+$RELEASE/gpm serve -c pool.yaml --router-only    # and the router alone, reading the same database
+```
+
+During development, `uv run gpm serve -c pool.yaml` runs the working tree instead — convenient,
+and it will tell you that is what it is doing.
 
 - **Keep the database and `pool.yaml` together**, and back up the database: it holds the host
   table, the leases, the spend ledger and the decision log.

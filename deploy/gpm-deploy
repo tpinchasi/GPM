@@ -33,6 +33,7 @@ import tarfile
 import tempfile
 import time
 from pathlib import Path
+from typing import Optional
 
 DEFAULT_ROOT = Path(os.environ.get("GPM_RELEASES", "~/.local/share/gpm/releases")).expanduser()
 PACKAGES = ("server", "agent", "client")
@@ -69,18 +70,36 @@ def extract(repo: Path, tag: str, into: Path) -> None:
             )
         with tarfile.open(archive) as tar:
             # `filter="data"` refuses absolute paths, `..` and device files in the archive.
-            tar.extractall(into, filter="data")
+            # It arrived in 3.12; on an older interpreter the same rule is applied by hand,
+            # because this script may be run by whatever python3 the machine happens to have.
+            if sys.version_info >= (3, 12):
+                tar.extractall(into, filter="data")
+            else:
+                for member in tar.getmembers():
+                    name = Path(member.name)
+                    if name.is_absolute() or ".." in name.parts:
+                        raise SystemExit(f"the archive holds an unsafe path: {member.name}")
+                    if not (member.isfile() or member.isdir()):
+                        raise SystemExit(f"the archive holds a {member.type!r} entry: {member.name}")
+                tar.extractall(into)
 
 
-def build(release: Path, python: str) -> Path:
-    """A virtual environment holding a non-editable install of every package."""
+def build(release: Path, python: Optional[str]) -> Path:
+    """A virtual environment holding a non-editable install of every package.
+
+    The interpreter is the one the *release* requires, not the one that happens to be running
+    this script: a deploy tool invoked by the system python3 must still build a release that
+    needs a newer one.
+    """
     venv = release / "venv"
+    wanted = python or requires_python(release)
     uv = shutil.which("uv")
     if uv:
-        run([uv, "venv", "--python", python, str(venv)])
+        run([uv, "venv", "--python", wanted, str(venv)])
         pip_install = [uv, "pip", "install", "--python", str(venv / "bin" / "python")]
     else:
-        run([python, "-m", "venv", str(venv)])
+        interpreter = python or find_interpreter(requires_python(release))
+        run([interpreter, "-m", "venv", str(venv)])
         pip_install = [str(venv / "bin" / "python"), "-m", "pip", "install"]
     # Not `-e`: the release must not reference the tree it was built from.
     run([*pip_install, *[str(release / name) for name in PACKAGES]])
@@ -109,6 +128,29 @@ def smoke_check(venv: Path, tag: str, version: str) -> None:
         raise SystemExit(f"the release packed an implausible agent ({packed} bytes)")
 
 
+def requires_python(release: Path) -> str:
+    """The floor the release declares, as uv understands it (e.g. ">=3.11")."""
+    for line in (release / "server" / "pyproject.toml").read_text().splitlines():
+        if line.replace(" ", "").startswith("requires-python="):
+            return line.split('"')[1]
+    return ">=3.11"
+
+
+def find_interpreter(constraint: str) -> str:
+    """Without uv, look for a python that meets the floor rather than assume this one does."""
+    floor = tuple(int(n) for n in constraint.lstrip(">=~^ ").split(".")[:2])
+    if sys.version_info[:2] >= floor:
+        return sys.executable
+    for minor in range(20, floor[1] - 1, -1):
+        found = shutil.which(f"python3.{minor}")
+        if found:
+            return found
+    raise SystemExit(
+        f"this release needs python{constraint} and none was found; install uv, or pass "
+        f"--python /path/to/python3"
+    )
+
+
 def declared_version(release: Path) -> str:
     text = (release / "server" / "pyproject.toml").read_text()
     for line in text.splitlines():
@@ -131,7 +173,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("tag", help="the git tag to deploy, e.g. v0.6.1")
     parser.add_argument("--repo", default=str(Path(__file__).resolve().parent.parent))
     parser.add_argument("--root", default=str(DEFAULT_ROOT), help="where releases are kept")
-    parser.add_argument("--python", default=sys.executable)
+    parser.add_argument("--python", default=None, help="override the interpreter to build with")
     parser.add_argument("--activate", action="store_true", help="point `current` at it once built")
     parser.add_argument("--force", action="store_true", help="rebuild a tag already deployed")
     args = parser.parse_args(argv)
