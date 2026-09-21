@@ -202,9 +202,11 @@ Read [docs/overview.md](docs/overview.md) first, then [docs/decisions.md](docs/d
    it needs to ask which commits a PR holds; the credential guard fired on a *threat-model test
    asserting the key is absent*; and `pip-audit` was auditing the runner's own system Python
    (it tripped on a kernel-tracing package that is not on PyPI) instead of this project's locked
-   dependencies. The tests themselves passed on 3.11, 3.12 and 3.13 throughout. **Six pull
-   requests were merged while it was red, which should not happen again: check CI before
-   merging.**
+   dependencies. The tests themselves passed on 3.11, 3.12 and 3.13 throughout. **Six pull requests were merged while it was red, which should not happen again: check CI
+   before merging.** With the infrastructure fixed, one genuinely flaky test surfaced on the
+   first green run — the interruption drill relied on three quick requests overlapping, which a
+   fast runner serialises, so the rented host saw none. The local host in that drill now answers
+   slowly enough that the overflow is real.
 12. **Release checklist:** two items open, both the adopter-file decision the owner deferred.
    Type-checking in CI is deferred. `NOTICE` says "ClearViews" with no legal suffix.
 

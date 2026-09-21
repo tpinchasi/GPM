@@ -33,7 +33,10 @@ def chat():
 def drill_pool(**overrides):
     rented = {**RENTED, **overrides.pop("rented", {})}
     return pool_harness(
-        [EngineSpec(id="local-1", resident={MODEL}, kind="local", workers=1)],
+        # The local host answers slowly enough that a second request really does overflow.
+        # Without this the drill is a race: on a fast machine one worker can serve three quick
+        # requests one after another, and the rented host — the thing under test — sees none.
+        [EngineSpec(id="local-1", resident={MODEL}, kind="local", workers=1, chunk_delay_s=0.5)],
         rentable=[EngineSpec(id="market-1", resident={MODEL}, workers=2)],
         model_set=[MODEL],
         rented=rented,
