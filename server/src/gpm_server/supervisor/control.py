@@ -483,7 +483,8 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
 
     @app.patch("/pool/config/rented")
     async def set_rented_search(request: Request) -> JSONResponse:
-        """Change the offer policy or the bidding from the Rented capacity screen (D51).
+        """Change what the Rented capacity screen edits: the offer search, the bidding, and how
+        capacity is allocated — D51, extended to allocation by D74.
 
         The file stays the source of truth and the rules are the file's: the change is written
         into it in place — comments, ordering and flow style untouched — then validated,
@@ -494,9 +495,18 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         body = await request.json()
         text, version = store().read()
         try:
-            for section in ("offer_policy", "bidding"):
+            # `allocation` sits directly under `rented`; the rest are its own blocks, and one a
+            # pool never wrote is added whole rather than guessed at line by line.
+            straight = {key: body[key] for key in ("allocation",) if body.get(key) is not None}
+            for section in ("dynamic", "workers_auto"):
                 wanted = body.get(section) or {}
-                if wanted:
+                if wanted and not _has_section(text, section):
+                    straight[section] = wanted
+            if straight:
+                text = set_values(text, ("rented",), straight)
+            for section in ("offer_policy", "bidding", "dynamic", "workers_auto"):
+                wanted = body.get(section) or {}
+                if wanted and section not in straight:
                     text = set_values(text, ("rented", section), wanted)
         except CannotEdit as exc:
             return _error(409, "cannot_edit", str(exc))
@@ -523,6 +533,12 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             return _error(409 if isinstance(exc, StaleVersion) else 400, "not_applied", str(exc))
         supervisor.reload_config()
         return JSONResponse({"version": new_version, "changes": [c.as_dict() for c in changes]})
+
+    def _has_section(text: str, name: str) -> bool:
+        """Is this block already in the file? A missing one is written whole, once."""
+        import re as _re
+
+        return bool(_re.search(rf"^\s+{_re.escape(name)}\s*:", text, _re.M))
 
     @app.get("/pool/config/history")
     async def config_history() -> JSONResponse:
