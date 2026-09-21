@@ -182,3 +182,23 @@ async def test_a_burst_shorter_than_the_window_buys_nothing(tmp_path):
         assert not slow.hosts, "the load has not held long enough to be worth a download"
     finally:
         database.close()
+
+
+async def test_losing_every_host_starts_the_ramp_again_at_once(fleet):
+    """Seen live: a host was outbid three minutes after it was rented, and the pool then sat
+    out its whole back-off — every request refused — because losing the round's only host read
+    as "the round landed, wait before growing". A round whose hosts are gone has no new
+    capacity to wait and see about."""
+    fleet.rented.dynamic = fleet.rented.dynamic.model_copy(update={"ramp_backoff_s": 600})
+    fleet.open_lease(workers=40, max_hours=2, max_spend=50.0, allow_rent=True)
+    await pump(fleet, busy(fleet))
+    assert len(fleet.hosts) == 1
+
+    for host in list(fleet.hosts.values()):  # outbid, and given up
+        await fleet.destroy(host, "evicted; replace")
+    assert not [h for h in fleet.hosts.values() if not h.released]
+
+    await pump(fleet, busy(fleet), passes=1)
+
+    live = [h for h in fleet.hosts.values() if not h.released]
+    assert len(live) == 1, "the ramp should start again at once, not wait out its back-off"

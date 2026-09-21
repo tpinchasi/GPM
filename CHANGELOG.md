@@ -17,7 +17,7 @@ otherwise — and CI refuses a pull request that edits a package's source withou
 
 | Package | Version | What it carries |
 |---|---|---|
-| `gpm-server` | 0.4.0 | Dynamic allocation (D66), buffered delivery (D62), the host agent on rented hosts (D63), per-host worker adjustment (D67, D68), the machine history (D69), allocation edited from the console (D74), and the spending-path fixes D58–D65, D71, D73 |
+| `gpm-server` | 0.5.0 | Dynamic allocation (D66), buffered delivery (D62), the host agent on rented hosts (D63), per-host worker adjustment (D67, D68), the machine history (D69), allocation edited from the console (D74), and the spending-path fixes D58–D65, D71, D73 |
 | `gpm-client` | 0.2.0 | The SDK widens its time budget to the figure the pool publishes, because a held response makes "first byte" the end of the generation (D62) |
 | `gpm-agent` | 0.2.0 | The heartbeat verb, each model loaded as its own download finishes (D57), and engine settings written where the pool installed it (D63) |
 

@@ -636,16 +636,22 @@ class Supervisor:
                 )
                 self._rented_clients[host_id] = client
 
-            if host.agent is None:
-                # Once SSH answers there is a host to work with; the install is never allowed
-                # to fail the preparation, and the download carries on regardless (D63).
-                await self.fleet.install_agent(host)
             await self.fleet.ask_agent(host)
 
             health = await self.engine.health(client)
             if not health.ok:
                 host.mark_preparing()
                 continue
+
+            if host.agent is None:
+                # Only now: an engine that answers is proof the image is up and its filesystem
+                # is usable. SSH answers long before that — seen live, a host rented at 12:01:13
+                # had spent all three of its attempts by 12:01:47, concluding "no python3" from
+                # an image that had not finished starting, and so ran without an agent for its
+                # whole life. The install is still never allowed to fail the preparation, and
+                # the model download carries on regardless (D63).
+                await self.fleet.install_agent(host)
+                await self.fleet.ask_agent(host)
             if host.engine_seen_at is None:
                 host.engine_seen_at = time.time()  # it has started; "stuck starting" is over
             try:

@@ -1162,8 +1162,13 @@ class Fleet:
         return True
 
     async def load_model_set(self, host: RentedHost, engine, client) -> bool:
-        """Pull every tag, then check they are resident **together** — a host that cannot hold
-        the whole set does not join the pool."""
+        """Fetch the set, loading each model as its own download finishes, then check they are
+        resident **together** — a host that cannot hold the whole set does not join the pool.
+
+        Loading as each lands rather than after them all (D57) is worth about a minute of idle
+        accelerator on a billing host, and it holds whether or not this host runs an agent: the
+        agent does the same thing on hosts that have one.
+        """
         tags = sorted(self.required_tags)
         moved = 0
         for tag in tags:
@@ -1181,8 +1186,15 @@ class Fleet:
                 self.avoid(host.offer.machine_id, f"could not download {tag}")
                 return False
             moved += result.bytes_total
+            host.stage = f"loading {tag} while the rest downloads"
+            try:
+                await engine.load_and_pin(client, [tag])
+            except Exception as exc:  # noqa: BLE001 — the whole-set check below is the verdict
+                # Not fatal on its own: what decides is whether the set is resident together,
+                # which is checked once everything has landed.
+                log.info("%s: %s did not load as it landed (%s); trying again with the set", host.host_id, tag, exc)
 
-        host.stage = "loading the model set into memory"
+        host.stage = "checking the model set is resident together"
         try:
             await engine.load_and_pin(client, tags)
         except Exception as exc:  # noqa: BLE001 - the engine says why, and the host does not join
@@ -1678,7 +1690,15 @@ class Fleet:
         if not below_floor and held < self.rented.dynamic.window_s:
             return  # a burst shorter than the window is not worth a model download
 
-        if pending:
+        if not live and self.ramp_round:
+            # Every host the ramp bought is gone — evicted, or given up. There is no new
+            # capacity to wait and see about, so the back-off has nothing to measure: the ramp
+            # starts again from one, at once. Seen live: a host was outbid three minutes after
+            # it was rented, and the pool then sat out its whole back-off while every request
+            # was refused.
+            self.ramp_round = 0
+            self.ramp_landed_at = 0.0
+        elif pending:
             self.ramp_landed_at = 0.0  # the round has not landed while a host is still coming
         elif self.ramp_round and not self.ramp_landed_at:
             self.ramp_landed_at = now
