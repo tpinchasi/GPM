@@ -4,6 +4,7 @@ docs/spec/supervisor.md §8. Overflow-driven renting answers "demand exceeded wh
 preparing answers "get one ready before I start" and "keep one warm between runs".
 """
 
+import asyncio
 import time
 
 import httpx
@@ -755,3 +756,51 @@ async def test_a_parked_host_is_left_alone_rather_than_probed_into_an_eviction(f
     assert host.state == "parked", "a parked host is not probed back into preparing"
     await fleet.handle_evictions()
     assert not host.released, "and so is never read as outbid"
+
+
+async def test_the_agent_is_not_attempted_before_the_image_is_up(fleet, tmp_path):
+    """Seen live: a host rented at 12:01:13 had spent all three of its attempts by 12:01:47,
+    concluding "no python3" from an image that had not finished starting — and so ran without
+    an agent for its whole life. SSH answers long before the image is usable; an engine that
+    answers is the proof that it is."""
+    from gpm_server.supervisor import Supervisor
+
+    supervisor = Supervisor(fleet.config, Database(tmp_path / "early.sqlite3"), provider=fleet.provider)
+    supervisor.fleet = fleet
+    host = await fleet.prepare(max_spend=1.00, max_hours=2)
+    host.dial_url = "http://127.0.0.1:1"  # nothing answers there yet, as on a booting image
+
+    tried = []
+    fleet.install_agent = lambda h: tried.append(h) or asyncio.sleep(0)
+
+    await supervisor._probe_rented()
+
+    assert not tried, "the agent was attempted before the engine had answered"
+    assert host.agent_attempts == 0, "and so none of its attempts were spent"
+
+
+async def test_each_model_is_loaded_as_it_lands_even_without_an_agent(fleet):
+    """D57 was built into the agent — but a host without one falls back to this path, and it
+    was still pulling everything before loading anything. Seen live: the first rental of the
+    day had no agent, so the saving D57 exists for was not made."""
+    loop = BackgroundLoop()
+    engine_fake = FakeOllama(resident=set(), available={"a", "b"})
+    server = ServerHandle(engine_fake.app, loop)
+    try:
+        fleet.config.pool.model_set = ["a", "b"]
+        fleet.provider.engine_urls = [server.base_url]
+        host = await fleet.prepare(max_spend=1.00, max_hours=2)
+        client = build_client(fleet.config.hosts[0].transport, fleet.config.pool, server.base_url)
+        try:
+            await fleet.load_model_set(host, OllamaEngine(), client)
+        finally:
+            await client.aclose()
+    finally:
+        server.stop()
+        loop.stop()
+
+    ordered = [path for path, _body, _headers in engine_fake.received]
+    pulls = [i for i, path in enumerate(ordered) if path == "/api/pull"]
+    loads = [i for i, path in enumerate(ordered) if path in ("/api/generate", "/api/embed")]
+    assert len(pulls) == 2 and loads, "both models pulled, and loading happened"
+    assert min(loads) < max(pulls), "the first model was loaded before the last one downloaded"
