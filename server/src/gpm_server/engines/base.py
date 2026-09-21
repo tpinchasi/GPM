@@ -105,9 +105,16 @@ class Engine(Protocol):
         """Load all the tags and keep them loaded; raise if they cannot all be resident
         together."""
 
-    def launch_settings(self, workers: int, context: int, n_models: int) -> dict[str, str]:
+    def launch_settings(
+        self, workers: int, context: int, n_models: int, listen: Optional[str] = None
+    ) -> dict[str, str]:
         """Environment that makes the engine run `workers` requests in parallel at `context`,
-        holding `n_models` models. Used only on hosts the pool creates."""
+        holding `n_models` models. Used only on hosts the pool creates.
+
+        `listen` is the address the engine binds, and on a host the pool creates it is always
+        loopback: the pool reaches the engine through a forward into the machine, so an engine
+        listening on every interface is reachable by everyone *else* and by the pool no more
+        easily (D77)."""
 
 
 class EngineNotFound(Exception):

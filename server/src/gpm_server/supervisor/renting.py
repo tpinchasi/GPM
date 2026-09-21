@@ -495,6 +495,9 @@ class Fleet:
             workers=workers if workers is not None else self.rented.workers,
             context=self.rented.context_length,
             n_models=len(self.config.pool.model_set),
+            # The pool reaches this engine through a forward into the machine, never across
+            # the network, so it binds loopback and nothing a provider publishes leads to it.
+            listen=f"127.0.0.1:{self.rented.engine_port}",
         )
 
     def max_lease_hours(self) -> Optional[float]:

@@ -327,6 +327,23 @@ async def test_the_engine_is_launched_to_match_the_workers_and_the_model_set(fle
     assert env["OLLAMA_KEEP_ALIVE"] == "-1"         # loaded, all the time
 
 
+async def test_the_engine_on_a_rented_host_listens_on_loopback_only(fleet):
+    """Found live: a rented host's engine was answering strangers on the open internet.
+
+    The provider's image published the engine's port and the engine bound every interface, so
+    anyone who found the address could list the models and use an accelerator the pool was
+    paying for. The pool dials through a forward into the machine, so loopback costs it
+    nothing — and there is no authentication on an engine to fall back on (D77).
+    """
+    host = await fleet.prepare(max_spend=1.00, max_hours=1)
+    env = fleet.provider.instances[host.instance.instance_id].spec.env
+
+    assert env["OLLAMA_HOST"] == "127.0.0.1:11434"
+    assert not any(
+        value.startswith(("0.0.0.0", "::", "*")) for value in env.values()
+    ), f"the engine was launched reachable from off the host: {env}"
+
+
 async def test_an_engine_start_command_runs_after_the_timer_is_armed(tmp_path):
     database = Database(tmp_path / "gpm.sqlite3")
     try:

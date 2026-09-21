@@ -277,6 +277,7 @@ ready from its advertised download speed; hourly rate while preparing; storage r
 | Models | Per-model download progress, gigabytes so far, download cost so far against the estimate. **Each model is loaded and pinned as soon as its own download finishes, while the rest are still downloading** (D57), so the loading of one overlaps the download of the next |
 | Verify | Every model loads; all resident **together**; a short clean generation per model. Readiness is unchanged by D57: a host joins on the whole set, never on a partial one |
 | Size | Worker count for this hardware and model set; engine parallelism set to match |
+| Listen | The engine binds **loopback only** (D77). The pool dials it through a forward into the machine, never across the network, so it has no reason to accept a connection from anywhere else — and a provider image that publishes the engine's port would otherwise leave an unauthenticated engine on the open internet |
 | Ready | Cost to date, hourly cost from here, storage cost if parked |
 
 | When ready | Effect |
