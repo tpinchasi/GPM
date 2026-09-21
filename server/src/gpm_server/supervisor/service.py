@@ -24,6 +24,7 @@ from typing import Optional
 
 import httpx
 
+from .. import strategies
 from ..catalog import ResolvedVariant, variants_for_host
 from ..config import AgentConfig, ConfigError, HostConfig, PoolConfig, load_config
 from ..configplan import ConfigStore
@@ -295,6 +296,7 @@ class Supervisor:
                 idle_seconds=self._idle_seconds(),
                 busy={host_id: counter.busy for host_id, counter in self.counters.all().items()},
                 pressure=self._pressure(),
+                load=self._load() if self.config.rented.allocation == "dynamic" else None,
             )
             if self.config.rented and self.config.rented.workers_auto.enabled:
                 await self._adjust_workers()
@@ -494,6 +496,34 @@ class Supervisor:
                 )
             else:
                 log.info("not resizing %s: %s", reading.host_id, why)
+
+    def _load(self) -> "strategies.Load":
+        """What the traffic is asking of the pool, from what the router already writes (D66)."""
+        counters = self.counters.all()
+        busy = ready = 0
+        for host in self.hosts.values():
+            if host.state is HostState.READY:
+                ready += host.config.workers
+                counter = counters.get(host.host_id)
+                busy += counter.busy if counter else 0
+        if self.fleet is not None:
+            for rented in self.fleet.hosts.values():
+                if not rented.released and rented.state == "ready":
+                    ready += rented.workers
+                    counter = counters.get(rented.host_id)
+                    busy += counter.busy if counter else 0
+        window = (
+            self.config.rented.dynamic.window_s
+            if self.config.rented
+            else 120.0
+        )
+        waiting = len(
+            self.db.query(
+                "SELECT 1 FROM request_log WHERE ts > ? AND (queue_wait_ms >= 1000 OR reason = 'queue_timeout') LIMIT 200",
+                (time.time() - min(window, 60.0),),
+            )
+        )
+        return strategies.Load(busy_workers=busy, ready_workers=ready, waiting=waiting)
 
     def _pressure(self) -> bool:
         """Is load asking for more than the ready hosts give? (D64)

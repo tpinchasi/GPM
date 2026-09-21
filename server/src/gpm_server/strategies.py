@@ -89,6 +89,76 @@ class HostView:
 
 
 @dataclasses.dataclass(frozen=True)
+class Load:
+    """What the traffic is actually asking of the pool right now (D66).
+
+    Measured by the router on the request path's edges, never asked of a client: a client that
+    sizes itself to the capacity it can see never builds a queue, so saturation is watched
+    beside the queue rather than instead of it.
+    """
+
+    busy_workers: int
+    ready_workers: int
+    #: Requests that waited, or were refused for waiting, in the window.
+    waiting: int
+
+    def wanted(self, target_utilisation: float) -> int:
+        """How many workers this load would like, to sit at the target rather than at full."""
+        return math.ceil((self.busy_workers + self.waiting) / max(0.01, target_utilisation))
+
+    @property
+    def saturated(self) -> bool:
+        return self.ready_workers > 0 and self.busy_workers >= self.ready_workers
+
+    @property
+    def present(self) -> bool:
+        """Is the pool being asked for more than it is giving?"""
+        return self.waiting > 0 or self.saturated
+
+
+@dataclasses.dataclass(frozen=True)
+class RampDecision:
+    """How many hosts this round asks for, and why."""
+
+    hosts: int
+    reasons: list[str]
+
+
+def decide_ramp(
+    *,
+    round_size: int,
+    load_present: bool,
+    previous_round_landed: bool,
+    since_last_round_s: float,
+    hosts_pending: int,
+    cfg,
+) -> RampDecision:
+    """The next round of a ramp: one, then a multiple, then a multiple again (D66).
+
+    Waiting for the previous round to land is what separates this from multiplying on a timer:
+    a host takes minutes to become ready, and doubling before it has helped buys capacity the
+    last round was about to supply.
+    """
+    if not load_present:
+        return RampDecision(0, ["the load that started this ramp is gone"])
+    if hosts_pending > 0 and not previous_round_landed:
+        return RampDecision(0, [f"{hosts_pending} host(s) from the last round still coming up"])
+    if round_size and since_last_round_s < cfg.ramp_backoff_s:
+        return RampDecision(
+            0,
+            [f"the last round landed {since_last_round_s:.0f}s ago, inside the "
+             f"{cfg.ramp_backoff_s:.0f}s the ramp waits before growing"],
+        )
+    if round_size <= 0:
+        return RampDecision(1, ["load has held: the first round of the ramp is one host"])
+    grown = min(cfg.max_round, max(1, int(round_size * cfg.ramp_factor)))
+    return RampDecision(
+        grown,
+        [f"load is still there after a round of {round_size}; this round asks for {grown}"],
+    )
+
+
+@dataclasses.dataclass(frozen=True)
 class WorkerReading:
     """One host's measured behaviour over the last window, for deciding its worker count.
 
