@@ -209,13 +209,14 @@ async def test_a_tunnel_that_comes_up_and_dies_backs_off_instead_of_hammering():
     every second — and the provider answers that by throttling authentication, which is what
     keeps the tunnel down. A link must *hold* before its failures are treated as new."""
     port = unused_port()
-    # Comes up, is seen to be up, and dies — the shape that used to forgive the backoff. It
-    # ends when the forward is *probed* rather than after a delay, so a slow machine cannot
-    # turn this into a test that sometimes never sees the tunnel at all.
+    # Comes up, is seen to be up, and dies — the shape that used to forgive the back-off.
+    # It binds *before* it waits, so a slow interpreter start cannot make the tunnel miss it,
+    # and it stays up long enough for both probes (`start` and the supervising loop) to see
+    # it: dying on the first connection made this test a race it sometimes lost.
     flap = [
         sys.executable, "-c",
-        "import socket;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);"
-        f"s.bind(('127.0.0.1',{port}));s.listen(1);s.accept();s.close()",
+        "import socket,time;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);"
+        f"s.bind(('127.0.0.1',{port}));s.listen(5);time.sleep(1.0)",
     ]
     tunnel = SshTunnel(
         "rented-1",
@@ -231,7 +232,9 @@ async def test_a_tunnel_that_comes_up_and_dies_backs_off_instead_of_hammering():
         await real_sleep(0)
 
     with mock.patch("gpm_server.transports.tunnel.asyncio.sleep", remember):
-        await tunnel.start(wait_s=2)
+        # Generous on purpose: under a loaded machine a fresh interpreter can take seconds
+        # to reach its listen(), and this test is about the back-off, not about process start.
+        await tunnel.start(wait_s=15)
         assert tunnel.up  # it really did come up
         for _ in range(400):
             if len(waits) >= 3:

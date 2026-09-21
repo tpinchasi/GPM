@@ -219,6 +219,14 @@ operator who wants a hard limit sets `workers_auto.max`. What a host settles on 
 machine history, so that machine's next rental starts from evidence. This replaces §2.2's "never
 up" for pools that enable it.
 
+**What it measures**, all of it written by the router on the request path's edges: the tokens the
+engine reports it generated, per host and per window; the host's median service time for the model
+it served most, against *the pool's* median for that same model — a pool where everything is slow
+has no slow host, only slower hardware; whether a model the pool requires was seen to leave
+memory; and whether requests are waiting anywhere, since raising a host nobody queues for buys
+nothing. A host already at one worker that still struggles is not lowered further: that it may
+not be worth keeping is the tear-down's decision, not this one.
+
 ## 3. The pool's model set
 
 A pool declares **the set of models it serves**, and every host must be able to serve **all of

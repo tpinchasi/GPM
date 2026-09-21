@@ -1,8 +1,10 @@
 # S5 — Automatic worker adjustment per host
 
-> Status: **decided (D67, D68), not built.** Part of the [feature list](README.md). The owner's
-> answer on the number: **six is the default, not the cap — a host can go higher on load and
-> latency.** The specification now carries it; this page remains as the reasoning and the build plan.
+> Status: **built (D67, D68)**, 2026-09-21. Part of the [feature list](README.md). Off by
+> default: `rented.workers_auto.enabled`. A host starts at six, climbs on evidence within what
+> its engine was launched to run, and steps down when a model leaves memory, when it is far
+> slower than the pool for the same model, or when its last step up did not pay. The controller
+> is a pure function; the measurements come from the request log the router already writes.
 
 ## The story
 

@@ -685,3 +685,45 @@ async def test_an_engine_that_does_not_come_back_does_not_get_the_new_count(flee
 
     assert not done and host.workers == 2
     assert "host_resize_failed" in kinds(fleet)
+
+
+# --- a host finding its own worker count (D67, D68) ---
+
+
+async def test_a_host_climbs_within_what_its_engine_was_launched_for(fleet):
+    """The engine is started at the most the host may be asked for, so climbing to it is the
+    pool using slots that already exist: instant, and nothing restarts (D68)."""
+    host = await fleet.prepare(max_spend=1.00, max_hours=2)
+    host.state = "ready"
+    host.launch_workers = 16
+
+    done, why = await fleet.resize(host, host.workers + 3)
+
+    assert done and host.workers == 5
+    assert host.state == "ready", "nothing was restarted, so nothing has to be re-verified"
+    resized = [e for e in fleet.events.recent() if e["kind"] == "host_resized"][0]
+    assert resized["numbers"]["restarted"] is False
+
+
+async def test_past_that_it_still_takes_an_agent_and_a_relaunch(fleet):
+    host = await fleet.prepare(max_spend=1.00, max_hours=2)
+    host.state = "ready"
+    host.launch_workers = 4
+
+    done, why = await fleet.resize(host, 8)
+
+    assert not done and "relaunching" in why
+    assert host.workers == 2
+
+
+async def test_the_engine_is_launched_for_the_ceiling_only_when_auto_is_on(tmp_path):
+    database = Database(tmp_path / "gpm.sqlite3")
+    try:
+        off = make_fleet(database, FakeProvider())
+        assert off.launch_workers_for(6) == 6, "without auto, launched for what it is given"
+
+        on = make_fleet(database, FakeProvider(), workers_auto={"enabled": True, "max": 16})
+        assert on.launch_workers_for(6) == 16, "with auto, launched for the most it may climb to"
+        assert on.launch_workers_for(24) == 24, "a profile above the ceiling is still honoured"
+    finally:
+        database.close()

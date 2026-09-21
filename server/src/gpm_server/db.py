@@ -43,7 +43,10 @@ CREATE TABLE IF NOT EXISTS request_log (
     latency_ms      REAL,
     status_code     INTEGER,
     outcome         TEXT NOT NULL,
-    reason          TEXT
+    reason          TEXT,
+    -- What the engine reports it generated, and how long it spent generating (D67).
+    tokens_out      INTEGER,
+    generate_ms     REAL
 );
 CREATE INDEX IF NOT EXISTS request_log_session ON request_log (session_id, ts);
 
@@ -158,6 +161,12 @@ def connect(path: str | Path) -> sqlite3.Connection:
 # file alone, so each is added on open when absent; the default is what a row written by an
 # older process would have meant.
 _ADDED_COLUMNS = {
+    "request_log": [
+        # Judging a host by throughput needs what it generated, not only how long it took:
+        # latency alone cannot tell a slow machine from a long answer (D67).
+        ("tokens_out", "INTEGER"),
+        ("generate_ms", "REAL"),
+    ],
     "hosts": [
         ("available", "TEXT NOT NULL DEFAULT '[]'"),
         ("residency", "TEXT NOT NULL DEFAULT 'pinned'"),
@@ -217,6 +226,9 @@ class RequestRecord:
     latency_ms: Optional[float] = None
     status_code: Optional[int] = None
     reason: Optional[str] = None
+    #: What the engine says it generated, where it says so (D67).
+    tokens_out: Optional[int] = None
+    generate_ms: Optional[float] = None
 
 
 class RequestLog:
@@ -229,8 +241,8 @@ class RequestLog:
             INSERT INTO request_log (
                 ts, request_id, session_id, host_id, worker_id, model_requested,
                 model_served, runtime_class, queue_wait_ms, latency_ms, status_code,
-                outcome, reason
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                outcome, reason, tokens_out, generate_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.ts,
@@ -246,6 +258,8 @@ class RequestLog:
                 record.status_code,
                 record.outcome,
                 record.reason,
+                record.tokens_out,
+                record.generate_ms,
             ),
         )
 
