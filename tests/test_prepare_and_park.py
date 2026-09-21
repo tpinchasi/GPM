@@ -896,3 +896,46 @@ async def test_a_download_through_the_agent_is_reported_the_way_the_console_read
     shown = host.progress[tag]
     assert shown["completed"] == 5_000 and shown["total"] == 10_000 and shown["attempt"] == 1
     assert set(host.progress) == {tag}, "keyed by model tag, as the direct path is"
+
+
+async def test_a_host_whose_engine_runs_on_the_processor_is_given_up(fleet):
+    """Found live on an 80GB A100: the image refused the machine's driver, ollama fell back to
+    the CPU, and `nvidia-smi` read 0 MiB used while a 26B model loaded at 100% CPU. It passed
+    every filter, answered every probe, and was worth nothing at an accelerator's price. D81's
+    driver floor refuses that machine before renting; this is the same fault arriving any other
+    way, on a host already paid for."""
+    loop = BackgroundLoop()
+    engine_fake = FakeOllama(resident={MODEL})
+    engine_fake.on_cpu = {MODEL}          # the card is there and the engine is not using it
+    server = ServerHandle(engine_fake.app, loop)
+    try:
+        import httpx as _httpx
+
+        async with _httpx.AsyncClient(base_url=server.base_url, timeout=10) as client:
+            on_cpu = await OllamaEngine().serving_from_cpu(client)
+        assert on_cpu == frozenset({MODEL})
+
+        engine_fake.on_cpu = set()        # and when it is using the card, nothing is reported
+        async with _httpx.AsyncClient(base_url=server.base_url, timeout=10) as client:
+            assert await OllamaEngine().serving_from_cpu(client) == frozenset()
+    finally:
+        server.stop()
+        loop.stop()
+
+
+async def test_an_engine_that_does_not_report_where_it_runs_is_not_accused(fleet):
+    """`size_vram` absent means this engine build does not say — not that it is on the CPU.
+    Guessing would destroy healthy hosts."""
+    import httpx as _httpx
+
+    loop = BackgroundLoop()
+    engine_fake = FakeOllama(resident={MODEL})
+    server = ServerHandle(engine_fake.app, loop)
+    try:
+        # An engine build that does not report `size_vram` at all.
+        engine_fake._model_list = lambda tags: {"models": [{"name": t, "size": 1} for t in sorted(tags)]}
+        async with _httpx.AsyncClient(base_url=server.base_url, timeout=10) as client:
+            assert await OllamaEngine().serving_from_cpu(client) == frozenset()
+    finally:
+        server.stop()
+        loop.stop()

@@ -87,6 +87,17 @@ class Engine(Protocol):
     async def health(self, client: httpx.AsyncClient) -> Health:
         """Is the engine answering?"""
 
+    async def serving_from_cpu(self, client: httpx.AsyncClient) -> Optional[frozenset[str]]:
+        """Resident models the engine is running on the **processor**, not the accelerator.
+
+        None where an engine cannot say. A host that answers, holds its model set and serves
+        every request from the CPU looks healthy by every other measure and is worthless at an
+        accelerator's price — seen live on an 80GB A100 whose driver the image refused (D81).
+        The driver floor refuses that machine before it is rented; this catches whatever else
+        puts an engine on the CPU, on a host already paid for.
+        """
+        return None
+
     async def models_resident(self, client: httpx.AsyncClient) -> frozenset[str]:
         """The tags loaded in memory *now* — not merely present on disk."""
 

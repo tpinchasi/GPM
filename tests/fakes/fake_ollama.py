@@ -42,6 +42,8 @@ class FakeOllama:
         #: Scripted: what a pull reports as its size, and a pause between its progress frames.
         self.pull_bytes = 1_000_000_000
         self.pull_delay_s = 0.0
+        #: Tags this engine is pretending to serve from the processor, not the card.
+        self.on_cpu: set[str] = set()
         #: Scripted: how many pulls are cut partway, with the connection dropped mid-body the
         #: way a real one was — and how many end quietly without the engine saying "success".
         self.pull_cut_times = 0
@@ -83,7 +85,15 @@ class FakeOllama:
         return JSONResponse({"version": "0.0.0-fake"})
 
     def _model_list(self, tags: set[str]) -> dict[str, Any]:
-        return {"models": [{"name": tag, "model": tag, "size": 1} for tag in sorted(tags)]}
+        # `size_vram` is how this engine says where a loaded model actually runs: zero means
+        # the processor is serving it (D81). Scripted, so a host on the CPU can be drilled.
+        return {
+            "models": [
+                {"name": tag, "model": tag, "size": 1,
+                 "size_vram": 0 if tag in self.on_cpu else 1}
+                for tag in sorted(tags)
+            ]
+        }
 
     async def _ps(self, request: Request) -> Response:
         if not self.healthy:

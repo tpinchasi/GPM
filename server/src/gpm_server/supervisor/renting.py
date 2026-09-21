@@ -194,6 +194,11 @@ class Fleet:
         self.avoided: dict[str, tuple[float, str]] = {}
         #: Why the last offer search came back empty, when it was not the market's doing.
         self.last_offer_error: Optional[str] = None
+        #: The provider's own words for why it refused, kept apart from the wait they earned.
+        self._offer_refusal: Optional[str] = None
+        #: The last "nothing passed the policy" written down, so a market that has not changed
+        #: is not written down again on every pass (D82).
+        self._said_nothing_passed: Optional[tuple[int, str]] = None
         #: Why the last attempt to rent rented nothing — for whoever asked, in their words.
         self.last_refusal: Optional[str] = None
         #: A provider that says "too many requests" is answered by asking less often, not by
@@ -1966,20 +1971,29 @@ class Fleet:
                 f"{len(offers)} offers seen, none passed the policy" if offers
                 else (self.last_offer_error or "the market returned no offers")
             )
-            self.events.record(
-                "no_offer",
-                f"{len(offers)} offers seen, none passed the policy; staying paused rather "
-                "than relaxing a filter"
-                if offers
-                else (
-                    f"the market could not be asked: {self.last_offer_error}"
-                    if self.last_offer_error
-                    else "the market returned no offers at all"
-                ),
-                numbers={"seen": len(offers), "rejected": rejected},
-                lease_id=lease.lease_id,
-            )
+            # A market that refuses everything refuses it again ten seconds later, and a
+            # decision log filling with the same line is one an operator stops reading. Said
+            # when it changes — a different count, or a different set of reasons (D82).
+            fingerprint = (len(offers), repr(sorted({r for rs in rejected.values() for r in rs})))
+            if fingerprint != self._said_nothing_passed:
+                self._said_nothing_passed = fingerprint
+                self.events.record(
+                    "no_offer",
+                    f"{len(offers)} offers seen, none passed the policy; staying paused rather "
+                    "than relaxing a filter"
+                    if offers
+                    else (
+                        f"the market could not be asked: {self.last_offer_error}"
+                        if self.last_offer_error
+                        else "the market returned no offers at all"
+                    ),
+                    numbers={"seen": len(offers), "rejected": rejected},
+                    lease_id=lease.lease_id,
+                )
             return None
+
+        # The market is offering something again, so the next dry spell is news once more.
+        self._said_nothing_passed = None
 
         for offer, offer_score in ranked[: self.rented.bidding.attempts]:
             bid = price_bid(offer, self.rented.bidding, lease.bid_ceiling)
@@ -2313,8 +2327,10 @@ class Fleet:
         """
         now = time.monotonic()
         if now < self._offer_retry_at:
+            # The reason is the provider's, said once; only the remaining wait moves. Nesting
+            # this produced "… — not asking again for 60s — not asking again for 44s" live.
             self.last_offer_error = (
-                f"{self.last_offer_error or 'the provider refused'} — not asking again for "
+                f"{self._offer_refusal or 'the provider refused'} — not asking again for "
                 f"{self._offer_retry_at - now:.0f}s"
             )
             return []
@@ -2335,6 +2351,7 @@ class Fleet:
             self._offer_backoff_s = min(max(self._offer_backoff_s * 2, 60.0), 900.0)
             self._offer_retry_at = now + self._offer_backoff_s
             log.warning("offer search rate limited; not asking again for %.0fs", self._offer_backoff_s)
+            self._offer_refusal = str(exc)
             self.last_offer_error = f"{exc} — not asking again for {self._offer_backoff_s:.0f}s"
             return []
         except ProviderError as exc:

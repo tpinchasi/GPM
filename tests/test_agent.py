@@ -10,6 +10,7 @@ import collections
 import pathlib
 import stat
 import time
+from pathlib import Path
 
 import gpm_agent
 import httpx
@@ -878,3 +879,53 @@ async def test_the_agent_holds_an_embedding_model_through_the_endpoint_it_serves
 
     assert set(tags) <= engine.resident, report
     assert not [m for m in report["models"] if m.get("error")], report
+
+
+async def test_a_load_that_never_finishes_is_a_failure_rather_than_a_silent_stall():
+    """Found live: a machine whose engine had fallen back to the processor took a 26B model
+    past sixteen minutes. The agent sat in one `post` with no deadline, and because it works
+    one tag at a time the rest of the model set never started — while it answered every poll
+    with no error at all. A load now has a finite deadline, and exceeding it is a fact."""
+    from gpm_agent import engines
+
+    assert engines.LOAD_TIMEOUT_S and engines.LOAD_TIMEOUT_S < 3600, "a load must have a deadline"
+    source = (Path(engines.__file__)).read_text()
+    hold = source[source.index("async def hold"):]
+    hold = hold[: hold.index("\n    async def ")]
+    # The code, not the prose about it: the comment above the call names the old behaviour.
+    code = "\n".join(line for line in hold.splitlines() if not line.strip().startswith("#"))
+    assert "timeout=None" not in code, "the load can still wait forever"
+    assert "timeout=LOAD_TIMEOUT_S" in code
+
+
+async def test_a_load_that_times_out_is_recorded_against_that_model():
+    """The deadline is only worth having if the pool is told which model failed and why."""
+    with pool_harness([EngineSpec(id="e", resident=set(), available={"a"})], model_set=["a"]) as pool:
+        engine = pool.engines["e"].fake
+        app = agent_app(engine_app=engine.app)
+        from gpm_agent import engines as agent_engines
+
+        async def times_out(self, client, tag, *, pinned):
+            raise httpx.ReadTimeout("the engine never finished loading")
+
+        original = agent_engines.OllamaFacts.hold
+        agent_engines.OllamaFacts.hold = times_out
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://agent") as http:
+                report = None
+                for _ in range(40):
+                    answer = await http.put(
+                        "/agent/v1/models",
+                        headers={"Authorization": f"Bearer {AGENT_KEY}"},
+                        json={"tags": ["a"], "residency": "pinned"},
+                    )
+                    report = answer.json()
+                    failed = [m for m in report["models"] if m.get("error")]
+                    if failed:
+                        break
+                    await asyncio.sleep(0.05)
+        finally:
+            agent_engines.OllamaFacts.hold = original
+
+    assert failed, report
+    assert "never finished loading" in failed[0]["error"] or "timeout" in failed[0]["error"].lower()

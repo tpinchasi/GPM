@@ -669,6 +669,24 @@ class Supervisor:
             except httpx.HTTPError:
                 host.mark_preparing()
                 continue
+
+            # A rented host whose engine is serving from the processor is worthless at an
+            # accelerator's price, and looks healthy by every other measure (D81). The driver
+            # floor refuses that machine before it is rented; this is the same fault arriving
+            # any other way, on a host already being paid for.
+            on_cpu = await self.engine.serving_from_cpu(client)
+            if on_cpu:
+                self.fleet.avoid(host.offer.machine_id, "its engine ran on the processor")
+                self.fleet.events.record(
+                    "engine_without_accelerator",
+                    f"{host.host_id} is serving {', '.join(sorted(on_cpu))} from the processor, "
+                    "not the accelerator it is paid for; giving it up",
+                    numbers={"machine": host.offer.machine_id, "models": sorted(on_cpu)},
+                    host_id=host.host_id,
+                    lease_id=host.lease_id,
+                )
+                await self.fleet.destroy(host, "its engine could not use the accelerator")
+                continue
             required = self._rented_required_tags()
             if host.state == "ready" and (required & host.resident) - resident:
                 # It held the set and no longer does: the engine ran out of memory for what it

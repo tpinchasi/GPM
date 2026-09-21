@@ -6,6 +6,7 @@ lease stops before its dollar cap, and a release counts only once the provider a
 """
 
 import time
+from pathlib import Path
 
 import pytest
 from gpm_server.config import OfferPolicy, PoolConfig
@@ -852,3 +853,44 @@ def test_driver_versions_compare_by_number_and_not_as_text():
     assert driver_below("9.1", "9") is False
     assert driver_below(None, "550") is None
     assert driver_below("not a version", "550") is None
+
+
+def _all_offers_refused(fleet):
+    fleet.rented.offer_policy = OfferPolicy(min_gpu_memory_gb=10_000)  # nothing can pass
+
+
+async def test_a_market_that_refuses_everything_is_recorded_once_not_once_a_pass(fleet):
+    """Live, a pool whose filters rejected every offer wrote the same line every fifteen
+    seconds. A decision log that repeats itself is one an operator stops reading — and the
+    reading of it is the whole point of recording refusals."""
+    _all_offers_refused(fleet)
+    open_lease(fleet, workers=2)
+
+    for _ in range(4):
+        await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+
+    said = [e for e in fleet.events.recent(50) if e["kind"] == "no_offer"]
+    assert len(said) == 1, f"{len(said)} identical refusals written"
+    assert said[0]["numbers"]["seen"] >= 1
+
+
+async def test_a_market_that_changes_its_mind_is_recorded_again(fleet):
+    """Said once per market, not once ever: a different set of reasons is news."""
+    _all_offers_refused(fleet)
+    open_lease(fleet, workers=2)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+
+    fleet.rented.offer_policy = OfferPolicy(min_disk_gb=10_000)  # refused, for another reason
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+
+    said = [e for e in fleet.events.recent(50) if e["kind"] == "no_offer"]
+    assert len(said) == 2, "a market refusing for a new reason was not recorded"
+
+
+def test_a_provider_back_off_note_does_not_nest():
+    """Live: 'rate limited — not asking again for 60s — not asking again for 44s'."""
+    source = (Path(__file__).resolve().parent.parent / "server/src/gpm_server/supervisor/renting.py").read_text()
+    waiting = source[source.index("if now < self._offer_retry_at:"):]
+    waiting = waiting[: waiting.index("return []")]
+    assert "self._offer_refusal" in waiting
+    assert "self.last_offer_error or" not in waiting, "the note is built from itself again"
