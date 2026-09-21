@@ -986,3 +986,65 @@ async def test_only_one_model_loads_at_a_time():
     work = work[: work.index("\n    def ")]
     assert "self._loading is None or self._loading.done()" in work, "a second load can start"
     assert "asyncio.create_task(" in work
+
+
+async def test_a_slow_capability_check_does_not_cost_a_host(monkeypatch):
+    """Exactly what destroyed a live host at 19:02. `/api/show` inherited the agent client's
+    ten-second default while an 18.6GB download ran beside it (D83 put the load there), the
+    agent recorded `gemma4:26b: ReadTimeout`, and the pool read that as "could not hold the
+    model set" and destroyed a host that was perfectly healthy."""
+    from gpm_agent import engines
+
+    calls = []
+
+    class SlowShow:
+        async def post(self, path, json=None, timeout=None):
+            calls.append((path, timeout))
+            if path == "/api/show":
+                raise httpx.ReadTimeout("the engine is busy downloading")
+            return httpx.Response(200, json={}, request=httpx.Request("POST", "http://e" + path))
+
+    await engines.OllamaFacts().hold(SlowShow(), "a-model", pinned=True)
+
+    assert ("/api/show", engines.SHOW_TIMEOUT_S) in calls, "the check still uses the short default"
+    assert any(p == "/api/generate" for p, _ in calls), "the model was never loaded at all"
+
+
+async def test_an_embedding_model_is_still_held_when_the_engine_will_not_say():
+    """The check being optional must not undo the fix it was added for: with no answer, both
+    endpoints are tried, so an embedding model is still loaded."""
+    from gpm_agent import engines
+
+    tried = []
+
+    class Unhelpful:
+        async def post(self, path, json=None, timeout=None):
+            tried.append(path)
+            request = httpx.Request("POST", "http://e" + path)
+            if path == "/api/show":
+                return httpx.Response(500, json={}, request=request)
+            if path == "/api/generate":   # what a real engine answers for an embedding model
+                return httpx.Response(400, json={"error": "does not support generate"}, request=request)
+            return httpx.Response(200, json={}, request=request)
+
+    await engines.OllamaFacts().hold(Unhelpful(), "an-embed-model", pinned=True)
+
+    assert tried == ["/api/show", "/api/generate", "/api/embed"]
+
+
+async def test_a_refusal_that_is_not_about_the_endpoint_is_not_retried_elsewhere():
+    """A 500 is about the model, not the endpoint; trying the other one would hide it."""
+    from gpm_agent import engines
+
+    tried = []
+
+    class Broken:
+        async def post(self, path, json=None, timeout=None):
+            tried.append(path)
+            request = httpx.Request("POST", "http://e" + path)
+            return httpx.Response(200 if path == "/api/show" else 500, json={}, request=request)
+
+    with pytest.raises(engines.EngineRefused, match="500"):
+        await engines.OllamaFacts().hold(Broken(), "a-model", pinned=True)
+
+    assert tried.count("/api/embed") == 0, "a real failure was retried on the wrong endpoint"

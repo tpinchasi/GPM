@@ -86,24 +86,55 @@ class OllamaFacts:
         Either form *loads* the model if it is not loaded, so the caller releases only what is
         loaded now — releasing a cold model would do the opposite of what was meant."""
         keep_alive: Any = -1 if pinned else "5m"
+        body = {"model": tag, "keep_alive": keep_alive}
         # An embedding model refuses `generate` with a 400, so it is held through the endpoint
-        # it does serve; the engine says which kind a tag is. Found live, twice: once in the
-        # pool's own engine code, and again here — where it cost a healthy host, destroyed for
-        # "could not hold the model set" with two of its three models already loaded.
-        path = "/api/generate"
-        shown = await client.post("/api/show", json={"model": tag})
-        if shown.status_code == 200 and "embedding" in (shown.json().get("capabilities") or []):
-            path = "/api/embed"
-        # A **deadline**, not `timeout=None`. Seen live: a machine whose engine had fallen back
-        # to the processor took a 26B model past sixteen minutes, the agent waited in this call
-        # the whole time, and because the loop is one tag after another the rest of the model
-        # set never started. The agent answered every poll cheerfully while nothing moved. A
-        # load that outlasts this is reported as an error, which is a fact the pool can act on.
-        response = await client.post(
-            path, json={"model": tag, "keep_alive": keep_alive}, timeout=LOAD_TIMEOUT_S
+        # it does serve. Asking the engine which kind a tag is, is an **optimisation, never a
+        # requirement** (D84): an engine busy downloading the next model may take its time over
+        # a metadata call, and a host must not be condemned for that. Found live — this call
+        # inherited the client's ten-second default, timed out while an 18.6GB download ran
+        # beside it, and the pool destroyed a healthy host for "could not hold the model set".
+        for path in self._paths_to_try(await self._kind_of(client, tag)):
+            # A **deadline**, not `timeout=None`. Seen live: a machine whose engine had fallen
+            # back to the processor took a 26B model past sixteen minutes, the agent waited in
+            # this call the whole time, and because the loop is one tag after another the rest
+            # of the model set never started. It answered every poll cheerfully while nothing
+            # moved. A load that outlasts this is reported as an error the pool can act on.
+            response = await client.post(path, json=body, timeout=LOAD_TIMEOUT_S)
+            if response.status_code == 200:
+                return
+            # 400 is this engine's way of saying "wrong endpoint for this kind of model"; any
+            # other refusal is about the model itself and trying elsewhere would only hide it.
+            if response.status_code != 400:
+                break
+        raise EngineRefused(
+            f"the engine would not {'pin' if pinned else 'release'} {tag}: {response.status_code}"
         )
-        if response.status_code != 200:
-            raise EngineRefused(f"the engine would not {'pin' if pinned else 'release'} {tag}: {response.status_code}")
+
+    async def _kind_of(self, client: httpx.AsyncClient, tag: str) -> Optional[str]:
+        """"embedding", "completion", or **None when the engine did not say in time**.
+
+        Never fatal: the caller tries both endpoints when it does not know (D84).
+        """
+        try:
+            shown = await client.post("/api/show", json={"model": tag}, timeout=SHOW_TIMEOUT_S)
+        except httpx.HTTPError:
+            return None
+        if shown.status_code != 200:
+            return None
+        try:
+            capabilities = shown.json().get("capabilities") or []
+        except ValueError:
+            return None
+        return "embedding" if "embedding" in capabilities else "completion"
+
+    @staticmethod
+    def _paths_to_try(kind: Optional[str]) -> tuple[str, ...]:
+        """What to load through, most likely first. Unknown means try both rather than guess."""
+        if kind == "embedding":
+            return ("/api/embed",)
+        if kind == "completion":
+            return ("/api/generate",)
+        return ("/api/generate", "/api/embed")
 
     async def delete(self, client: httpx.AsyncClient, tag: str) -> None:
         response = await client.request("DELETE", "/api/delete", json={"model": tag})
@@ -115,6 +146,10 @@ class OllamaFacts:
 #: large model on a healthy accelerator is a matter of a minute or two — and finite, which is
 #: the point: without it one stuck load stalls a host's whole preparation silently.
 LOAD_TIMEOUT_S = 600.0
+
+#: Asking what kind a model is. Generous, because the engine may be saturated downloading the
+#: next model at the time (D83 put a load beside a download); and not fatal when it expires.
+SHOW_TIMEOUT_S = 120.0
 
 
 class EngineRefused(Exception):
