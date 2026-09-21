@@ -11,6 +11,20 @@ version numbers and are reported at runtime, because other people's code depends
 
 ## Unreleased
 
+Nothing is published yet, so these are the versions inside the repository. **Each package's
+version is raised in the same change that alters it** — a consumer cannot tell what it has
+otherwise — and CI refuses a pull request that edits a package's source without raising it.
+
+| Package | Version | What it carries |
+|---|---|---|
+| `gpm-server` | 0.3.0 | Dynamic allocation (D66), buffered delivery (D62), the host agent on rented hosts (D63), per-host worker adjustment (D67, D68), the machine history (D69), and the spending-path fixes D58–D65, D71, D73 |
+| `gpm-client` | 0.2.0 | The SDK widens its time budget to the figure the pool publishes, because a held response makes "first byte" the end of the generation (D62) |
+| `gpm-agent` | 0.2.0 | The heartbeat verb, each model loaded as its own download finishes (D57), and engine settings written where the pool installed it (D63) |
+
+The **app contract stays at 1**: every dialect item added is optional, and no status code
+changed meaning, so an application built against the first version still works untouched.
+
+
 The first release is being prepared; see `docs/release-checklist.md` for what remains.
 
 ### Added
