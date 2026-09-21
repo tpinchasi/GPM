@@ -188,7 +188,8 @@ agent, with the same closed verbs, and **the pool still dials**.
   it, and each one joined agentless with `unrecognized arguments`, silently, because the file
   was present and presence was taken for currency. Packing costs about a second per run.
 - **It is the preparation path.** `PUT /models` works toward the model set and loads each model
-  **as its own download finishes** (D57) rather than pulling everything and then loading
+  **as its own download finishes, while the next one downloads** (D57, completed by D83 — one
+  load at a time, so two large models never contend for accelerator memory) rather than pulling everything and then loading
   everything — which left the accelerator idle through the whole last phase of a billing host,
   measured live at 78 seconds. `POST /engine` changes the worker count (D56). Neither needed a
   new verb.

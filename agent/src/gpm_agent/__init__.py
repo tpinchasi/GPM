@@ -7,4 +7,4 @@ of verbs — there is no "run this".
 
 #: The protocol version this agent speaks, as the first path segment (`/agent/v1/...`).
 PROTOCOL_VERSION = "1"
-__version__ = "0.2.1"
+__version__ = "0.2.2"

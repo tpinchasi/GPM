@@ -75,6 +75,8 @@ class ModelWork:
         self.state_path = state_path
         self.pinned_by_agent: set[str] = self._remembered()
         self._task: Optional[asyncio.Task[None]] = None
+        #: The one load allowed in flight, running beside the next download (D83).
+        self._loading: Optional[asyncio.Task[None]] = None
 
     def _remembered(self) -> set[str]:
         if self.state_path is None:
@@ -137,7 +139,9 @@ class ModelWork:
         return {
             "engine_answers": bool(state.get("answers")),
             "residency": self.desired.residency,
-            "busy": self._task is not None and not self._task.done(),
+            "busy": any(
+                task is not None and not task.done() for task in (self._task, self._loading)
+            ),
             "free_disk_bytes": self.free_disk_bytes(),
             "min_free_disk_bytes": self.floor_bytes,
             "models": [
@@ -170,20 +174,40 @@ class ModelWork:
         on_disk = {m["tag"] for m in state["models_on_disk"]}
         loaded = set(state["models_loaded"])
 
+        def wants_loading(tag: str) -> bool:
+            return (
+                self.desired.residency == "pinned"
+                and tag in on_disk
+                and not (tag in loaded and tag in self.pinned_by_agent)
+                and self._may_retry(tag)
+            )
+
+        # Loaded the moment its own download finishes, **while the next one downloads** (D57,
+        # completed by D83). Awaiting the load inline was the half that was missing: the
+        # accelerator stopped idling through the last phase, but the network then idled through
+        # every load instead — about a minute per large model, on a host that is billing.
+        #
+        # One load at a time. Two large models loading together contend for accelerator memory,
+        # which is the one way this could cost more than it saves; the download it overlaps
+        # costs nothing but disk.
         for tag in self.desired.tags:
             if tag not in on_disk and self._may_retry(tag):
                 if not await self._pull(tag):
                     continue
                 on_disk.add(tag)
-            # Loaded the moment its own download finishes, while the rest are still coming
-            # (D57). The alternative — pull everything, then load everything — leaves the
-            # accelerator idle for the whole of the last phase, on a host that is billing.
-            if (
-                self.desired.residency == "pinned"
-                and tag in on_disk
-                and not (tag in loaded and tag in self.pinned_by_agent)
-                and self._may_retry(tag)
-            ):
+            if wants_loading(tag) and (self._loading is None or self._loading.done()):
+                self._loading = asyncio.create_task(
+                    self._hold(tag, pinned=True), name=f"gpm-agent:load:{tag}"
+                )
+
+        # The downloads are done; finish the loads here rather than leave them to later passes.
+        # A pass that ended with models still to load would need one poll per model — fifteen
+        # seconds each in a live pool — and preparation would come out *slower* than the
+        # sequential version this replaces.
+        if self._loading is not None and not self._loading.done():
+            await self._loading
+        for tag in self.desired.tags:
+            if wants_loading(tag) and tag not in self.pinned_by_agent:
                 await self._hold(tag, pinned=True)
         # A pin does not outlive the engine: a remembered tag that is no longer loaded was
         # unpinned by an engine restart, and is not this agent's to release any more.
@@ -243,6 +267,10 @@ class ModelWork:
             self._remember()
 
     async def aclose(self) -> None:
+        if self._loading is not None and not self._loading.done():
+            self._loading.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._loading
         if self._task is not None and not self._task.done():
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
