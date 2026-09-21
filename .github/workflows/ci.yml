@@ -28,6 +28,20 @@ jobs:
       - run: uv sync --python ${{ matrix.python }}
       - run: uv run pytest -q
 
+  simulation:
+    # A whole pool — real router, real supervisor — against a market that moves under it, for
+    # long enough that hosts are rented, paused, woken and given up. Slower than the unit
+    # suite by design, and the gate a version passes before it is merged.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync
+      - run: uv run pytest -m simulation -q
+
   lint:
     runs-on: ubuntu-latest
     steps:

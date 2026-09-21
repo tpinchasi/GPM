@@ -170,7 +170,14 @@ class FakeOllama:
                 await asyncio.sleep(self.generate_delay_s)
             self.completed += 1
             return JSONResponse(
-                {"model": model, "created_at": _CREATED_AT, "response": content, "done": True}
+                {
+                    "model": model,
+                    "created_at": _CREATED_AT,
+                    "response": content,
+                    "done": True,
+                    "eval_count": 3,
+                    "eval_duration": 30_000_000,
+                }
             )
         return self._stream(model, {"role": "assistant", "content": content}, generate=True)
 
@@ -252,7 +259,10 @@ class FakeOllama:
             "message": message,
             "done": True,
             "done_reason": "stop",
+            # What every engine reports of its own work, and what the pool reads to judge a
+            # host by throughput rather than by latency (D67).
             "eval_count": 3,
+            "eval_duration": 30_000_000,
         }
 
     def _stream(self, model: str, message: dict[str, Any], generate: bool = False) -> StreamingResponse:

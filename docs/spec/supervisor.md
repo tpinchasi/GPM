@@ -270,6 +270,13 @@ ready from its advertised download speed; hourly rate while preparing; storage r
 | **Park it** | Stopped, disk and models kept, storage billed only. The console shows the break-even (`download cost ÷ storage cost per hour`); a parked host is destroyed automatically past `max_park_hours` — parking is never open-ended |
 | **Destroy** | Ends all billing, verified |
 
+**A paused host is woken before anything is bought (D73).** Waking one adds no host to the
+pool, costs no download and takes seconds, so it is tried before the caps are consulted — a pool
+at its host limit with every host paused would otherwise refuse the load it could serve at once.
+A parked host is also left alone by the probe: its engine is stopped because the pool stopped it,
+and probing it finds nothing answering, which once made the eviction handler destroy it seconds
+after it was parked.
+
 **Parked hosts are used first.** When a lease needs rented capacity the supervisor first tries
 restarting a parked host that already holds the models: no download, minutes instead of tens of
 minutes. It must still win the auction on that machine within the lease's ceilings; if it

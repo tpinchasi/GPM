@@ -13,9 +13,11 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
     "integration: needs a real, locally-running Ollama (opt-in, not run by default)",
+    "simulation: a whole pool against a moving market, minutes long (opt-in; its own CI job)",
 ]
-addopts = "-m 'not integration'"
+addopts = "-m 'not integration and not simulation'"
 # Every test here drives real servers over real sockets; a hang must fail loudly, not stall.
+# A simulation runs minutes by design, and sets its own longer limit.
 timeout = 120
 
 [tool.ruff]

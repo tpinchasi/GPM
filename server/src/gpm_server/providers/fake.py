@@ -100,6 +100,9 @@ class FakeProvider:
         self.credential_refused = False
         #: Scripted: the next instance comes up without the start-up material it was given.
         self.drop_startup_material = False
+        #: Hand the same engines out again rather than running out of them, for a long run.
+        self.reuse_engine_urls = False
+        self._engine_turn = 0
         self.calls: list[str] = []
 
     # --- scripting helpers ---
@@ -144,6 +147,15 @@ class FakeProvider:
         self.instances[instance_id].charge_multiplier = multiplier
 
     # --- the interface ---
+
+    def _next_engine_url(self) -> Optional[str]:
+        if not self.engine_urls:
+            return None
+        if self.reuse_engine_urls:
+            url = self.engine_urls[self._engine_turn % len(self.engine_urls)]
+            self._engine_turn += 1
+            return url
+        return self.engine_urls.pop(0)
 
     def _guard(self, call: str) -> None:
         self.calls.append(call)
@@ -197,7 +209,9 @@ class FakeProvider:
             spec=dataclasses.replace(spec, onstart=None) if self.drop_startup_material else spec,
             state=InstanceState.RUNNING,
             running_since=time.time(),
-            engine_url=self.engine_urls.pop(0) if self.engine_urls else None,
+            # Handed out in turn and put back, so a long run does not exhaust the market's
+            # engines and start creating hosts that can never answer.
+            engine_url=self._next_engine_url(),
         )
         return Instance(instance_id=instance_id, label=spec.label, machine_id=offer.machine_id)
 

@@ -614,6 +614,13 @@ class Supervisor:
         for host_id, host in list(self.fleet.hosts.items()):
             if host.released or not host.dial_url:
                 continue
+            if host.state == "parked":
+                # Its engine is stopped because the pool stopped it (D64). Probing a parked
+                # host finds nothing answering and marks it `preparing`, which the eviction
+                # handler then reads as "stopped, and we did not ask" — an eviction — and the
+                # host is destroyed seconds after being parked. Found by the simulation:
+                # parking had never once saved a download.
+                continue
             client = self._rented_clients.get(host_id)
             if client is None or str(client.base_url).rstrip("/") != host.dial_url.rstrip("/"):
                 if client is not None:

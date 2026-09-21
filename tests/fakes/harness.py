@@ -128,6 +128,7 @@ class PoolHarness:
         rentable: Optional[list[EngineSpec]] = None,
         rented: Optional[dict[str, Any]] = None,
         delivery: Optional[dict[str, Any]] = None,
+        extra_config: Optional[dict[str, Any]] = None,
     ):
         self.loop = BackgroundLoop()
         self._tmp = tempfile.TemporaryDirectory()
@@ -205,6 +206,7 @@ class PoolHarness:
                 "catalog": catalog or {},
                 "hosts": host_entries,
                 **({"rented": rented_section} if rented_section else {}),
+                **(extra_config or {}),
             }
         )
         # Tests never touch real ssh: every forward the pool opens runs the stand-in, and
@@ -251,6 +253,34 @@ class PoolHarness:
         """One supervisor pass, then wait for the router to read the result."""
         self.loop.run(self.supervisor.pass_once())
         self.loop.run(self.state.registry.refresh())
+
+    @property
+    def rentable_urls(self) -> list[str]:
+        """Every engine the market can hand out, whether or not it has been handed out yet."""
+        return [engine.server.base_url for engine in self.rentable.values()]
+
+    def restart_supervisor(self) -> None:
+        """What `gpm restart` does: the process is replaced, the hosts stay rented.
+
+        The new supervisor adopts what the old one published, as a fresh process does — this
+        is where a restart under load is actually exercised (D61).
+        """
+        provider = self.supervisor.fleet.provider if self.supervisor.fleet else None
+        # A real restart ends the old process, which releases the single-instance lock and
+        # leaves the rented hosts alone. Stopping the task without closing the supervisor
+        # would leave the lock held, and the new one would refuse to start — correctly.
+        self.stop_supervisor()
+        self.loop.run(self.supervisor.aclose())
+        self.supervisor = Supervisor(self.config, self.database, provider=provider)
+        if self.supervisor.fleet is not None:
+            async def record(host, command):
+                self.commands_on_hosts.append((host.host_id, command))
+                return 0, ""
+
+            self.supervisor.fleet.run_on_host = record
+            self.supervisor.fleet.provider.reuse_engine_urls = True
+        self.loop.run(self.supervisor.start())
+        self._supervisor_task = self.loop.spawn(self.supervisor.run_forever())
 
     def stop_supervisor(self) -> None:
         """Leave the router serving from the last table it saw."""

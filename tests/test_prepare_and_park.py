@@ -593,11 +593,17 @@ async def test_a_host_that_cannot_take_an_agent_still_prepares(fleet):
         return (0, "") if "command -v python3" in command else (0, "")
 
     fleet.run_on_host = no_interpreter
-    await fleet.install_agent(host)
+    for _ in range(fleet.rented.agent_attempts):
+        await fleet.install_agent(host)
 
     assert host.agent is None
     assert "no python3" in (host.agent_detail or "")
     assert "agent_not_installed" in kinds(fleet)
+    # Said once, when the pool gave up — not once a pass, which cost an SSH round trip each
+    # time and filled the log (seen in the simulation).
+    assert kinds(fleet).count("agent_not_installed") == 1
+    await fleet.install_agent(host)
+    assert kinds(fleet).count("agent_not_installed") == 1, "it stopped asking"
     # And the host is still perfectly usable.
     loop = BackgroundLoop()
     engine_fake = FakeOllama(resident=set())
@@ -727,3 +733,25 @@ async def test_the_engine_is_launched_for_the_ceiling_only_when_auto_is_on(tmp_p
         assert on.launch_workers_for(24) == 24, "a profile above the ceiling is still honoured"
     finally:
         database.close()
+
+
+async def test_a_parked_host_is_left_alone_rather_than_probed_into_an_eviction(fleet, tmp_path):
+    """Found by the simulation: parking a host stopped its engine, the probe then found
+    nothing answering and marked it `preparing`, and the eviction handler read "stopped, and
+    we did not ask" as an eviction. Parked hosts were destroyed seconds after being parked, so
+    parking had never once saved a download."""
+    from gpm_server.supervisor import Supervisor
+
+    supervisor = Supervisor(fleet.config, Database(tmp_path / "probe.sqlite3"), provider=fleet.provider)
+    supervisor.fleet = fleet
+    host = await fleet.prepare(max_spend=1.00, max_hours=2)
+    host.state = "ready"
+    host.dial_url = "http://127.0.0.1:1"  # nothing answers there, as on a stopped engine
+    await fleet.park(host, "no traffic")
+    assert host.state == "parked"
+
+    await supervisor._probe_rented()
+
+    assert host.state == "parked", "a parked host is not probed back into preparing"
+    await fleet.handle_evictions()
+    assert not host.released, "and so is never read as outbid"
