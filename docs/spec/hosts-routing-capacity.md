@@ -210,6 +210,12 @@ The engine is launched at the most the machine can really hold: the memory ceili
 workers stay real — they never exceed what the engine runs — and every adjustment is a change of
 router slots: instant, graceful, no restart.
 
+A host that is far worse value than the rest is **given up rather than shrunk** (D75): where its
+cost per unit of work — hourly all-in over tokens a second — stays worse than `replace_above_factor`
+of the pool's median for `replace_after_s`, it is drained, destroyed and its machine avoided, and
+the ordinary allocation path rents the replacement. One at a time, never the last ready host, and
+never without a lease whose budget covers the download.
+
 A host steps **up** by one when it is saturated, requests are waiting, and its last step up raised
 throughput by `min_gain`. It steps **down** by one when throughput stayed flat after its last step
 up, when a resident model was evicted, or when its service time is far above the pool's median
