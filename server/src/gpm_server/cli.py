@@ -380,6 +380,12 @@ def main(argv: list[str] | None = None) -> int:
     host.add_argument("--url", default=None)
     host.set_defaults(func=_host)
 
+    machines = subparsers.add_parser(
+        "machines", help="what each machine has done for this pool; spends nothing"
+    )
+    machines.add_argument("--url", default=None)
+    machines.set_defaults(func=lambda a: _control(a, "GET", "/pool/machines"))
+
     plan = subparsers.add_parser("plan", help="what the supervisor would do; spends nothing")
     plan.add_argument("--url", default=None)
     plan.set_defaults(func=lambda a: _control(a, "GET", "/pool/plan"))

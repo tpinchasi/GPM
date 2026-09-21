@@ -503,6 +503,28 @@ class DynamicAllocationConfig(BaseModel):
     min_hosts: int = Field(default=0, ge=0)
 
 
+class MachineHistoryConfig(BaseModel):
+    """What a machine's record with this pool does to its offer's score (D69).
+
+    Built and judged on its own before any model advises on it: a bounded, deterministic
+    adjustment the advisor has to beat before it is worth its non-determinism.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    #: A machine nobody has tried is not a bad machine. Below this, its record says nothing.
+    min_rentals: int = Field(default=2, ge=1)
+    #: How often a rental of it must have ended up serving.
+    min_reliability: float = Field(default=0.5, ge=0, le=1)
+    #: What a good or poor record multiplies the score by.
+    bonus: float = Field(default=1.25, ge=1)
+    penalty: float = Field(default=0.5, gt=0, le=1)
+    #: Measured throughput that counts as good, and as poor. Unset, only reliability is read.
+    good_tokens_per_s: Optional[float] = Field(default=None, gt=0)
+    poor_tokens_per_s: float = Field(default=0.0, ge=0)
+
+
 class WorkersAutoConfig(BaseModel):
     """Each rented host finding its own worker count while it serves (D67, D68).
 
@@ -593,6 +615,8 @@ class RentedConfig(BaseModel):
     #: one. SSH answers before a machine has settled, so a first failure is not the last word;
     #: a machine with no interpreter, though, is not going to grow one.
     agent_attempts: int = Field(default=3, ge=1)
+    #: What each machine's record with this pool does to its offer's score (D69).
+    history: MachineHistoryConfig = Field(default_factory=MachineHistoryConfig)
     #: Each host finds its own worker count while it serves (D67, D68). Off by default.
     workers_auto: WorkersAutoConfig = Field(default_factory=WorkersAutoConfig)
     offer_policy: OfferPolicy = Field(default_factory=OfferPolicy)

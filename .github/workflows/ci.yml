@@ -42,6 +42,34 @@ jobs:
       - run: uv sync
       - run: uv run pytest -m simulation -q
 
+  versions:
+    # A package whose source changed in a pull request must say so in its version: a consumer
+    # cannot tell what it has otherwise. Doc-only and test-only changes are not packages.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: every package whose source changed has a new version
+        run: |
+          git fetch -q origin "${{ github.base_ref }}"
+          base="origin/${{ github.base_ref }}"
+          missing=""
+          for package in client server agent; do
+            if git diff --quiet "$base"...HEAD -- "$package/src"; then continue; fi
+            if git diff "$base"...HEAD -- "$package/pyproject.toml" | grep -q '^+version'; then
+              echo "$package: source changed, version raised"
+            else
+              echo "$package: source changed and its version did not"
+              missing="$missing $package"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "Raise the version in:$missing (and say what changed in CHANGELOG.md)"
+            exit 1
+          fi
+
   lint:
     runs-on: ubuntu-latest
     steps:

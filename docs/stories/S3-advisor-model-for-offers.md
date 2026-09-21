@@ -1,9 +1,11 @@
 # S3 — An advisor model that picks the machine
 
-> Status: **decided (D69, D70), not built.** Part of the [feature list](README.md). The machine
-> history comes first and is judged on its own; the advisor answers by calling tools from a closed
-> list, may decline within bounds, and is gated by an evaluation suite. The specification carries
-> the decisions; this page remains as the reasoning and the build plan.
+> Status: **the history is built (D69); the advisor is not.** 2026-09-21. Part of the
+> [feature list](README.md). The machine history is a view over the logs the pool already
+> writes, feeding a bounded, deterministic adjustment to the offer score — the simpler mechanism
+> the advisor has to beat. Run against the first live pool's own logs it produced **27 machine
+> records from 62 rentals**, including a machine rented seven times that reached ready twice.
+> Still to come: the evaluation harness, then the advisor itself (D70).
 
 ## The story
 
@@ -178,10 +180,11 @@ advisor stays off rather than quietly becoming a single-prompt stage.
 
 ## Build stages
 
-1. Machine history as a view over the decision log and request log — no new collection — shown
-   on the Rented capacity screen. One gap to close: a rental's machine id is only in its event's
-   text today, so the event gains it as a number.
-2. History in the deterministic score; the preview shows the adjustment and its reason.
+1. ~~Machine history as a view over the two logs.~~ **Built** — `gpm machines` and
+   `GET /pool/machines`. The rental event now names the machine as a number; older rentals are
+   read back out of their sentence, so the 62 already written still count.
+2. ~~History in the deterministic score.~~ **Built** — bounded, explained in one line, and
+   unable to admit an offer the hard filters rejected.
 3. The evaluation harness: replay, hindsight score, decline audit, robustness — with a fake
    advisor, against the recorded rentals.
 4. The advisor stage itself: the four tools, bounded loop, fallback paths, bounded declining,

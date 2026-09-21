@@ -169,7 +169,12 @@ model set. **Parked hosts are tried first** (§8).
    **Never relaxed unattended** — an empty result means stay paused. The filters are applied by
    the pool, not pushed into the provider's own query, so every rejected offer carries the
    reason it was rejected; a market that merely *looks* empty teaches an operator nothing.
-2. **Rank** by throughput proxy per run-dollar, where run-dollars = bid + storage + model
+2. **Rank** by throughput proxy per run-dollar, **moved by what the machine has done for this
+   pool** (D69): a machine whose rentals rarely ended up serving scores worse, one that served
+   well scores better, and a machine nobody has tried is left alone — unknown and bad are
+   different things. The adjustment is deterministic, bounded and explained in one line beside
+   the offer. It changes the order only: it can never admit an offer the hard filters rejected,
+   nor reject one they accepted. Run-dollars = bid + storage + model
    download amortised over the lease's expected hours. *(Post-v1: warm-disk bonus for machines
    holding a parked instance; per-machine memory of evictions and failed starts; avoid list.)*
 3. **Price the bid** with a named strategy:
@@ -315,6 +320,18 @@ interrupted stream.
 **Park or destroy:** destroy ends all billing and loses the disk. Parking keeps the models at
 storage cost, so a restart needs no download but must win the auction again. A parked host is
 kept no longer than `min(max_park_hours, break-even)`. At lease end it is always destroy.
+
+### 6.3 What a machine has done here (D69)
+
+Built from the logs the pool already writes — the decision log joined to the request log — so a
+pool that has been running has this without collecting anything new. Per machine: how many times
+it was rented, how many of those reached `ready`, how long that took, how often it was evicted
+or failed, how many requests it served, its median service time, and its measured throughput
+where the engine reported one.
+
+`GET /pool/machines`, and `gpm machines`, show it. It is judged on its own before any model is
+asked to advise on it (D69's order), and an advisor — when there is one — reads the same view
+through `machine_history` (D70).
 
 ## 10. Strategies are tested without spending
 
