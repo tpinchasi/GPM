@@ -632,6 +632,7 @@ const SEARCH_FIELDS = [
   ["offer_policy", "max_download_per_gb", "number", "the most it will pay per GB downloaded"],
   ["offer_policy", "min_download_mbps", "number", "slower than this and the model set takes too long"],
   ["offer_policy", "min_reliability", "number", "the provider's own score, 0 to 1"],
+  ["offer_policy", "min_driver_version", "text", "the accelerator driver this engine image needs — below it the card sits idle and the CPU serves"],
   ["offer_policy", "verified_only", "checkbox", "only machines the provider has verified"],
   ["offer_policy", "exclude_hardware", "list", "refused by name, case-insensitive"],
   ["offer_policy", "avoid_machines", "list", "machine ids to skip — one that keeps failing, say"],

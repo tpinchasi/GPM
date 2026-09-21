@@ -364,3 +364,39 @@ def test_the_re_assert_loop_is_valid_shell():
     command = install_public_key_command("ssh-ed25519 AAAAPOOL pool")
     checked = subprocess.run(["sh", "-n"], input=command, text=True, capture_output=True)
     assert checked.returncode == 0, checked.stderr
+
+
+def test_the_key_file_is_owned_as_well_as_moded():
+    """Found live, in a host's own sshd log while the key sat in the very file it refused:
+
+        Authentication refused: bad ownership or modes for file /root/.ssh/authorized_keys
+
+    An sshd refuses a key file it cannot see the user own, whatever its mode is. The script set
+    the mode and never the owner, so on an image whose boot syncs home directories — leaving
+    them owned by another uid — the pool was locked out for the host's whole life, and the
+    re-assert loop (D76) rewrote the same unusable file every ten seconds.
+    """
+    command = install_public_key_command("ssh-ed25519 AAAAKEY tester", "root", keep_for_s=0)
+
+    assert "chown" in command, "the owner is never set, so the mode cannot save it"
+    assert "chown -R root /root/.ssh" in command
+    assert "chmod 600 /root/.ssh/authorized_keys" in command
+    assert "chmod 700 /root/.ssh" in command
+    assert "chmod go-w /root" in command, "a writable home directory is refused too"
+
+
+def test_a_non_root_user_gets_its_own_home_owned_correctly():
+    command = install_public_key_command("ssh-ed25519 AAAAKEY tester", "ubuntu", keep_for_s=0)
+
+    assert "chown -R ubuntu /home/ubuntu/.ssh" in command
+    assert "chmod go-w /home/ubuntu" in command
+
+
+def test_the_loop_repairs_ownership_every_time_not_just_the_first():
+    """The point of re-asserting is that the machine may undo it — and what it undoes is the
+    ownership, so putting the key back without the chown puts back a file sshd still refuses."""
+    command = install_public_key_command("ssh-ed25519 AAAAKEY tester", "root", keep_for_s=600)
+    loop = command[command.index("keep-key.sh <<"):]
+
+    assert loop.count("chown -R root /root/.ssh") >= 1, "the loop re-adds the key but not its owner"
+    assert "sleep 10" in loop and "UNTIL" in loop

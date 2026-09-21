@@ -117,6 +117,7 @@ Ordered by value — idle time, not the hourly rate, dominates cost.
 | Orphan sweep | Any provider instance carrying this pool's label that the database does not know → alert, destroy after a grace period. Covers instances that bill storage while never running |
 | Verified release | A release counts only once the provider's listing no longer shows the instance; retried with back-off |
 | Rate caps | Maximum rented hosts at once; maximum hourly burn; per-offer bid, all-in and download-price ceilings |
+| Driver floor | `offer_policy.min_driver_version`: a machine whose accelerator driver is below what the engine image needs is refused **before renting** (D81). Below it the engine finds the card unusable and serves from the CPU — at the accelerator's price, with every other filter passed |
 | Replace only when it is cheaper | Re-bidding in place beats replacing whenever the download cost of a new host exceeds the price difference over the hours left (§6) |
 | Spend ledger | Append-only cost events per host and lease |
 

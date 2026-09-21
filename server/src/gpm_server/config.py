@@ -371,6 +371,11 @@ class OfferPolicy(BaseModel):
     max_download_per_gb: Optional[float] = None
     min_download_mbps: float = 0.0
     min_reliability: float = 0.0
+    #: The accelerator driver an engine image needs, as "major" or "major.minor"
+    #: (D81). Below it the engine finds the card unusable and runs on the CPU — at the
+    #: accelerator's price. Seen live: an A100-80GB on driver 535 under an image wanting
+    #: 550, which loaded a 26B model at 100% CPU and was given up 30 minutes later.
+    min_driver_version: Optional[str] = None
     verified_only: bool = True
     avoid_machines: list[str] = Field(default_factory=list)
     #: Hardware names to refuse by substring, case-insensitive — a mining card passes every

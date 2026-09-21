@@ -241,10 +241,17 @@ def install_public_key_command(
     home = "/root" if ssh_user == "root" else f"/home/{ssh_user}"
     key = public_key.strip().replace("'", "")
     put_it_there = (
-        f"mkdir -p {home}/.ssh && chmod 700 {home}/.ssh && "
+        f"mkdir -p {home}/.ssh && "
         f"{{ grep -qxF '{key}' {home}/.ssh/authorized_keys 2>/dev/null || "
         f"echo '{key}' >> {home}/.ssh/authorized_keys; }}; "
-        f"chmod 600 {home}/.ssh/authorized_keys"
+        # Mode **and owner**, on the file and on both directories above it: an engine's sshd
+        # refuses a key file it cannot see the user own, whatever its mode is, and says so only
+        # in the machine's own log — `bad ownership or modes for file …/authorized_keys`, seen
+        # live while the key sat in that very file. A provider whose boot syncs home directories
+        # leaves them owned by another uid, so setting the mode alone can never recover it.
+        f"chmod 700 {home}/.ssh; chmod 600 {home}/.ssh/authorized_keys; "
+        f"chmod go-w {home}; "
+        f"chown -R {ssh_user} {home}/.ssh 2>/dev/null || true"
     )
     if keep_for_s <= 0:
         return put_it_there

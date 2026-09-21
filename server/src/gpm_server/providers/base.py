@@ -81,6 +81,10 @@ class Offer:
     storage_hourly: float = 0.0
     download_per_gb: float = 0.0
     download_mbps: float = 0.0
+    #: The machine's accelerator driver, as the provider reports it ("595.84"). None
+    #: where a provider does not say. An engine image needs a floor, and a machine below
+    #: it runs on the CPU instead of the accelerator being paid for (D81).
+    driver_version: Optional[str] = None
     reliability: float = 0.0
     verified: bool = False
     #: A rough throughput proxy for ranking — never presented as a benchmark.

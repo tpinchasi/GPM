@@ -239,6 +239,8 @@ class VastProvider:
             storage_hourly=storage_monthly_per_gb * disk_gb / _HOURS_PER_MONTH,
             download_per_gb=float(entry.get("inet_down_cost") or 0),
             download_mbps=float(entry.get("inet_down") or 0),
+            # What the engine image will find when it looks for the card (D81).
+            driver_version=str(entry["driver_version"]) if entry.get("driver_version") else None,
             reliability=float(entry.get("reliability") or entry.get("reliability2") or 0),
             verified=str(entry.get("verification", "")).lower() == "verified",
             # `dlperf` is the provider's own throughput index; it ranks, it does not benchmark.

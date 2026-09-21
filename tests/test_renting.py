@@ -8,10 +8,11 @@ lease stops before its dollar cap, and a release counts only once the provider a
 import time
 
 import pytest
-from gpm_server.config import PoolConfig
+from gpm_server.config import OfferPolicy, PoolConfig
 from gpm_server.db import Database
 from gpm_server.ledger import EventLog, LeaseRefused, LeaseStore, SpendLedger
 from gpm_server.providers import FakeProvider, default_offer
+from gpm_server.strategies import reject_reasons
 from gpm_server.supervisor.renting import Fleet
 
 MODEL = "m1"
@@ -806,3 +807,48 @@ async def test_boot_output_that_cannot_be_read_never_delays_giving_a_host_up(fle
     await fleet.tear_down([], {}, 0)
 
     assert host.released
+
+
+# --- a machine whose driver the engine cannot use (D81) ---
+
+
+def _offer_with_driver(version, **rest):
+    return default_offer(driver_version=version, **rest)
+
+
+def test_a_driver_too_old_for_the_engine_image_is_refused_before_it_is_rented():
+    """Found live, in the engine's own log on a billing host:
+
+        WARN "NVIDIA driver too old" device="NVIDIA A100-SXM4-80GB"
+             compute=8.0 driver=535 required_driver="550 or newer"
+        INFO "inference compute" id=cpu library=cpu
+
+    It loaded a 26B model at 100% CPU, never finished the model set, and was given up half an
+    hour later — an A100-80GB rented at $1.06/h that never touched the accelerator.
+    """
+    policy = OfferPolicy(min_driver_version="550")
+
+    refused = reject_reasons(_offer_with_driver("535.183.01"), policy)
+    assert any(r.startswith("driver:") for r in refused), refused
+    assert "535.183.01" in refused[0] and "550" in refused[0]
+
+    assert not reject_reasons(_offer_with_driver("595.84"), policy)
+    assert not reject_reasons(_offer_with_driver("550"), policy)
+
+
+def test_a_machine_that_does_not_say_its_driver_is_not_assumed_to_pass():
+    """The filter exists because the cost of being wrong is a whole rental."""
+    assert reject_reasons(_offer_with_driver(None), OfferPolicy(min_driver_version="550"))
+    assert not reject_reasons(_offer_with_driver(None), OfferPolicy())  # nothing asked, nothing refused
+
+
+def test_driver_versions_compare_by_number_and_not_as_text():
+    """"595.84" is above "550"; as text it is below it."""
+    from gpm_server.strategies import driver_below
+
+    assert driver_below("535", "550") is True
+    assert driver_below("595.84", "550") is False
+    assert driver_below("550", "550") is False
+    assert driver_below("9.1", "9") is False
+    assert driver_below(None, "550") is None
+    assert driver_below("not a version", "550") is None
