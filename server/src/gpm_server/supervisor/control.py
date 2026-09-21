@@ -497,7 +497,11 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         try:
             # `allocation` sits directly under `rented`; the rest are its own blocks, and one a
             # pool never wrote is added whole rather than guessed at line by line.
-            straight = {key: body[key] for key in ("allocation",) if body.get(key) is not None}
+            # `mode` decides which listings are even searched, so a pool left on the default
+            # never sees an on-demand offer at all — live, an operator watching a fixed-price
+            # host sit there could not say why it was never rented, and the only way to change
+            # it was the raw configuration file (D80).
+            straight = {key: body[key] for key in ("allocation", "mode") if body.get(key) is not None}
             for section in ("dynamic", "workers_auto"):
                 wanted = body.get(section) or {}
                 if wanted and not _has_section(text, section):

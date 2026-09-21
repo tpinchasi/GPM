@@ -997,6 +997,11 @@ class Fleet:
             "saved": {
                 "offer_policy": self.rented.offer_policy.model_dump(),
                 "bidding": self.rented.bidding.model_dump(),
+                # Which listings are searched at all (D80). Not a filter: an offer in a listing
+                # this pool never asks for is not rejected, it is never seen — so it cannot
+                # appear among the reasons below, and an operator looking at a fixed-price host
+                # in the market had no way to learn why it was never rented.
+                "mode": self.rented.mode,
                 # How capacity is allocated, edited on the same screen (D74): two opt-in
                 # features that spend money should not be visible only in a file.
                 "allocation": self.rented.allocation,

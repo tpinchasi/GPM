@@ -318,8 +318,15 @@ const leaseActions = (lease) => (lease.state && lease.state !== "open") ? null :
   el("button", { class: "small", onclick: (e) => run(e.target, () => api.closeLease(lease.lease_id)) }, "Close"));
 
 // Extending a lease in flight: more hours for a host worth keeping, more dollars to pay for
-// them. Raising a limit is loosening wherever it appears, so it is typed again (D49) — and the
-// worst case is stated first, because that is what the operator is really agreeing to.
+// them, more workers for load the lease is holding back. Raising a limit is loosening wherever
+// it appears, so it is typed again (D49) — and the worst case is stated first, because that is
+// what the operator is really agreeing to.
+//
+// **Workers belongs here** (D80). Under dynamic allocation the lease's worker count is the
+// ceiling on measured demand, so it is the number that decides whether another host is ever
+// rented — and it was the one field this dialog could not change. Live, a pool refusing 70% of
+// its requests sat at "the load has cleared" because its lease allowed 5 workers and one
+// rented host already supplied 6; the only way to raise it was the CLI.
 async function extendLease(event, lease) {
   const hours = prompt("Run this lease for how many hours in total?", String(lease.max_hours));
   if (hours === null) return;
@@ -329,17 +336,30 @@ async function extendLease(event, lease) {
   if (dollars === null) return;
   const wantedSpend = Number(dollars);
   if (!Number.isFinite(wantedSpend) || wantedSpend <= 0) return;
+  const workers = prompt(
+    "And how many workers may it reach?\n\nUnder dynamic allocation this is the ceiling on "
+    + "how much capacity the traffic can ask for — no host is rented past it.",
+    String(lease.workers),
+  );
+  if (workers === null) return;
+  const wantedWorkers = Number(workers);
+  if (!Number.isInteger(wantedWorkers) || wantedWorkers <= 0) return;
 
   const raised = [];
   if (wantedHours > lease.max_hours) raised.push(["max_hours", wantedHours]);
   if (wantedSpend > lease.max_spend) raised.push(["max_spend", wantedSpend]);
-  const body = { max_hours: wantedHours, max_spend: wantedSpend };
+  if (wantedWorkers > lease.workers) raised.push(["workers", wantedWorkers]);
+  const body = { max_hours: wantedHours, max_spend: wantedSpend, workers: wantedWorkers };
   if (raised.length) {
     const ok = await confirmAction({
       title: `Extend ${lease.lease_id}?`,
       body: el("div", {},
-        el("p", {}, `Worst case becomes ${money(wantedSpend)} over ${wantedHours}h — it is spending authority, and hosts held under it keep running.`),
-        el("p", { class: "muted" }, raised.map(([k, v]) => `${k}: ${k === "max_spend" ? money(lease[k]) + " → " + money(v) : lease[k] + "h → " + v + "h"}`).join(" · "))),
+        el("p", {}, `Worst case becomes ${money(wantedSpend)} over ${wantedHours}h, up to ${wantedWorkers} workers — it is spending authority, and hosts held under it keep running.`),
+        el("p", { class: "muted" }, raised.map(([k, v]) => {
+          if (k === "max_spend") return `${k}: ${money(lease[k])} → ${money(v)}`;
+          if (k === "workers") return `${k}: ${lease[k]} → ${v}`;
+          return `${k}: ${lease[k]}h → ${v}h`;
+        }).join(" · "))),
       retype: String(raised[0][1]),
     });
     if (!ok) return;
@@ -637,13 +657,25 @@ const ALLOCATION_FIELDS = [
   ["workers_auto", "slow_host_factor", "number", "service time this far over the pool's median steps a host down"],
 ];
 
-const search = { inputs: {}, saved: null, message: "" };
+const search = { inputs: {}, saved: null, message: "", mode: null };
 const allocation = { inputs: {}, mode: null, message: "" };
+
+// Which listings the pool searches by itself (D80). Not a filter — a pool on `interruptible`
+// never asks the on-demand listing, so a fixed-price host is not rejected, it is never seen.
+// That was invisible here: the rejection list only names offers that were looked at.
+const MODES = [
+  ["interruptible", "interruptible — bid, and accept being outbid"],
+  ["on_demand", "on demand — fixed price, cannot be outbid"],
+  ["cheaper", "cheaper — search both listings, take whichever costs less"],
+];
 
 function searchSection(market) {
   const saved = (market.saved || {});
   search.saved = saved;
   search.inputs = {};
+  search.mode = saved.mode || "interruptible";
+  const modeSelect = el("select", {}, ...MODES.map(([value, label]) =>
+    el("option", { value, ...(search.mode === value ? { selected: true } : {}) }, label)));
   const rows = SEARCH_FIELDS.filter(([section]) => saved[section]).map(([section, key, kind, why]) => {
     const value = saved[section][key];
     const input = kind === "checkbox"
@@ -669,6 +701,11 @@ function searchSection(market) {
   return [
     el("h2", {}, "What the pool looks for"),
     el("div", { class: "panel" },
+      el("div", { class: "row" },
+        el("label", {}, "Rent by"), modeSelect,
+        el("span", { class: "muted" },
+          "which listings are searched at all — an offer in a listing the pool does not ask for "
+          + "is never seen, and so never appears among the rejections below")),
       el("table", {}, el("tbody", {}, rows)),
       el("div", { class: "row" },
         // Deliberately not through `run`: that refreshes the screen, which would rebuild this
@@ -691,7 +728,7 @@ function searchSection(market) {
             button.disabled = false; button.textContent = label;
           }
         } }, "Try these"),
-        el("button", { onclick: (e) => saveSearch(e, note) }, "Save to configuration"),
+        el("button", { onclick: (e) => saveSearch(e, note, modeSelect) }, "Save to configuration"),
         el("button", { class: "small", onclick: () => render() }, "Reset"),
         note)),
   ];
@@ -808,19 +845,22 @@ function searchValues() {
   return body;
 }
 
-function changedValues() {
+function changedValues(mode) {
   const body = { offer_policy: {}, bidding: {} };
   const wanted = searchValues();
   for (const { section, key, was } of Object.values(search.inputs)) {
     const now = wanted[section][key];
     if (JSON.stringify(now) !== JSON.stringify(was ?? null)) body[section][key] = now;
   }
+  // `mode` sits directly under `rented`, beside the policy rather than inside it.
+  if (mode && mode.value !== search.mode) body.mode = mode.value;
   return body;
 }
 
-async function saveSearch(event, note) {
-  const body = changedValues();
-  const count = Object.values(body).reduce((n, section) => n + Object.keys(section).length, 0);
+async function saveSearch(event, note, mode) {
+  const body = changedValues(mode);
+  const count = Object.values(body).reduce(
+    (n, section) => n + (typeof section === "object" ? Object.keys(section).length : 1), 0);
   if (!count) { search.message = " nothing changed"; note.textContent = search.message; return; }
   const button = event.target;
   button.disabled = true;
