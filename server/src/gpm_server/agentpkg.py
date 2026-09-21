@@ -160,13 +160,28 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
 
 
+#: Destinations already packed by *this* process, so the build happens once a run and not
+#: once a host. Deliberately not a file check: see below.
+_packed_this_run: set[Path] = set()
+
+
 def cached(state_dir: Path, *, root: str = ROOT_DISTRIBUTION) -> Optional[Path]:
-    """The packed agent, built once per supervisor run. None where it cannot be built."""
+    """The packed agent, built once per supervisor run. None where it cannot be built.
+
+    **Once per run, not once per state directory.** An archive left by an earlier run is not
+    reused: a supervisor running today's agent would otherwise ship a file packed weeks ago,
+    which is exactly what happened — hosts were given an agent whose `init` predated the
+    options the pool had started sending it, and every one of them joined agentless with
+    "unrecognized arguments". The build reads this machine's installed package and takes about
+    a second; a stale one costs a host its agent and says nothing useful about why.
+    """
     destination = state_dir / "gpm-agent.pyz"
-    if destination.exists():
+    if destination in _packed_this_run and destination.exists():
         return destination
     try:
-        return build(destination, root=root)
+        packed = build(destination, root=root)
     except (AgentPackageUnavailable, OSError) as exc:
         log.warning("the host agent cannot be packed here, so rented hosts will run without one: %s", exc)
         return None
+    _packed_this_run.add(destination)
+    return packed

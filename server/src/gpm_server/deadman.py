@@ -223,18 +223,46 @@ def heartbeat_command(state_dir: str = STATE_DIR) -> str:
     return f"mkdir -p {state_dir} && touch {state_dir}/heartbeat"
 
 
-def install_public_key_command(public_key: str, ssh_user: str = "root") -> str:
+def install_public_key_command(
+    public_key: str, ssh_user: str = "root", *, keep_for_s: int = 600, state_dir: str = STATE_DIR
+) -> str:
     """Let the pool's own key open the host, whatever keys the account has registered.
 
     A public key is not a secret, so it may travel in the start-up script; the private half
     never leaves the supervisor's machine.
+
+    **Put back, not merely put there (D76).** A provider's own boot may rewrite the file this
+    writes, or move the directory out from under it, long after a start-up script has run —
+    seen live: one image relocates `/root/.ssh` during first boot, and every host rented from
+    it refused the pool's key, was unreachable for its whole life, and was given up ten
+    minutes later having billed for nothing. So the key is re-asserted for the first few
+    minutes, in the background, and the loop ends as soon as the machine settles.
     """
     home = "/root" if ssh_user == "root" else f"/home/{ssh_user}"
     key = public_key.strip().replace("'", "")
-    return (
+    put_it_there = (
         f"mkdir -p {home}/.ssh && chmod 700 {home}/.ssh && "
-        f"grep -qxF '{key}' {home}/.ssh/authorized_keys 2>/dev/null || "
-        f"echo '{key}' >> {home}/.ssh/authorized_keys; chmod 600 {home}/.ssh/authorized_keys"
+        f"{{ grep -qxF '{key}' {home}/.ssh/authorized_keys 2>/dev/null || "
+        f"echo '{key}' >> {home}/.ssh/authorized_keys; }}; "
+        f"chmod 600 {home}/.ssh/authorized_keys"
+    )
+    if keep_for_s <= 0:
+        return put_it_there
+    return (
+        f"{put_it_there}\n"
+        f"mkdir -p {state_dir}\n"
+        f"cat > {state_dir}/keep-key.sh <<'GPM_KEY_EOF'\n"
+        "#!/bin/sh\n"
+        "# GPM: put the pool's key back if the machine's own boot takes it away (D76).\n"
+        "set -u\n"
+        f"UNTIL=$(( $(date +%s) + {int(keep_for_s)} ))\n"
+        "while [ \"$(date +%s)\" -lt \"$UNTIL\" ]; do\n"
+        f"    {put_it_there}\n"
+        "    sleep 10\n"
+        "done\n"
+        "GPM_KEY_EOF\n"
+        f"chmod +x {state_dir}/keep-key.sh\n"
+        f"nohup {state_dir}/keep-key.sh >/dev/null 2>&1 &"
     )
 
 

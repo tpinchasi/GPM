@@ -17,7 +17,12 @@ import pytest
 from fakes.fake_ollama import unused_port
 from gpm_server.config import PoolConfig
 from gpm_server.db import Database
-from gpm_server.deadman import build_script, heartbeat_command, onstart_script
+from gpm_server.deadman import (
+    build_script,
+    heartbeat_command,
+    install_public_key_command,
+    onstart_script,
+)
 from gpm_server.ledger import EventLog, LeaseStore, SpendLedger
 from gpm_server.providers import FakeProvider
 from gpm_server.providers.base import ProviderCapabilities, SelfTerminateRequest
@@ -330,4 +335,32 @@ def test_the_call_travels_as_data_not_as_a_command_line():
 def test_the_script_is_valid_shell_for_a_plain_posix_sh():
     script = build_script(_request("https://provider.example/x"), window_s=60)
     checked = subprocess.run(["sh", "-n"], input=script, text=True, capture_output=True)
+    assert checked.returncode == 0, checked.stderr
+
+
+# --- the key is put back, not merely put there (D76) ---
+
+
+def test_the_pools_key_is_re_asserted_while_the_machine_settles():
+    """Seen live: an image relocates /root/.ssh during its own first boot, so a key appended
+    once by the start-up script was gone before anything could use it. Every host rented from
+    that image refused the pool, was unreachable for its whole life, and was given up ten
+    minutes later having billed for nothing."""
+    command = install_public_key_command("ssh-ed25519 AAAAPOOL pool", keep_for_s=600)
+
+    assert "authorized_keys" in command
+    assert "keep-key.sh" in command, "the key is only put there once"
+    assert "sleep 10" in command and "nohup" in command, "and not re-asserted in the background"
+    # It ends: a loop that never stops is a process left running on a machine for no reason.
+    assert "UNTIL=" in command
+
+
+def test_re_asserting_can_be_switched_off():
+    once = install_public_key_command("ssh-ed25519 AAAAPOOL pool", keep_for_s=0)
+    assert "keep-key.sh" not in once and "authorized_keys" in once
+
+
+def test_the_re_assert_loop_is_valid_shell():
+    command = install_public_key_command("ssh-ed25519 AAAAPOOL pool")
+    checked = subprocess.run(["sh", "-n"], input=command, text=True, capture_output=True)
     assert checked.returncode == 0, checked.stderr

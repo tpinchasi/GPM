@@ -242,6 +242,16 @@ Where a machine has none, it records that it has none and the timer falls back t
 container** — the accelerator stops billing, the instance shows as stopped, and a live pool
 destroys it on its next pass. The first engine image carries no HTTP client at all, so a timer
 that named one would have armed, looked healthy, and failed only after the pool had died.
+
+**The way in is put back, not merely put there (D76).** The start-up script writes the pool's
+public key to the host's `authorized_keys`, and then goes on re-asserting it every ten seconds
+for the first ten minutes, from a small background script beside the timer's own state. A
+provider's boot runs after the start-up script and may rewrite that file or move the directory
+containing it; a host this happens to refuses the pool for its whole life, and the pool can
+neither probe it, install an agent, nor end it early — it bills until the giving-up window
+closes. Writing the key once is a guess about boot ordering on somebody else's image; putting
+it back for as long as the machine is still settling is not. The loop ends on its own, so a
+long-lived host carries nothing extra.
 ## 8. Preparing a rented host on request
 
 Overflow-driven renting answers "demand exceeded what I have". **Prepare a host** answers "get
