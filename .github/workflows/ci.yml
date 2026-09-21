@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
 
+# Read-only, and stated rather than inherited: the secret scan asks GitHub which commits a pull
+# request contains, and without this it is refused and the job fails on every run.
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   tests:
     # The whole default suite runs with no GPU and no cloud account — that is the point of the
@@ -53,9 +59,25 @@ jobs:
           PY
       - name: no provider credential is read anywhere in the default suite
         run: |
-          ! grep -rn "VAST_API_KEY" tests/ --include="*.py" \
-            | grep -v "test_vast_provider.py" \
-            | grep -v "monkeypatch.delenv"
+          uv run python - <<'PY'
+          import pathlib, re, sys
+
+          # A test may *assert* the account credential is absent — that is the threat model
+          # holding itself to account. What must never appear is a test that **supplies** one:
+          # anything that sets it, or reads it out of the environment.
+          supplies = re.compile(r"(setenv|environ\s*\[|environ\.get|getenv|putenv)[^\n]*VAST_API_KEY")
+          offenders = []
+          for path in pathlib.Path("tests").rglob("*.py"):
+              if path.name == "test_vast_provider.py":
+                  continue  # the provider's own unit tests, which never reach a network
+              for number, line in enumerate(path.read_text().splitlines(), 1):
+                  if supplies.search(line) and "delenv" not in line:
+                      offenders.append(f"{path}:{number}: {line.strip()}")
+          if offenders:
+              print("a default test supplies a provider credential:", *offenders, sep="\n  ")
+              sys.exit(1)
+          print("no default test supplies a provider credential")
+          PY
 
   secrets:
     runs-on: ubuntu-latest
@@ -72,6 +94,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync
-      - run: uv run pip install pip-audit
-      - run: uv run pip-audit --strict
+      # What this project actually depends on, from the lock file — not whatever the runner's
+      # own python happens to carry, which is what `pip-audit` finds when pointed at a system
+      # interpreter (and which failed here on a kernel-tracing package that is not on PyPI).
+      - run: uv export --no-dev --no-emit-workspace --format requirements-txt > locked.txt
+      - run: uvx pip-audit --strict -r locked.txt
