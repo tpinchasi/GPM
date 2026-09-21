@@ -837,6 +837,10 @@ async def test_a_model_is_loaded_as_soon_as_its_own_download_finishes():
     whole last phase, on a host that is billing (measured live: 78 seconds)."""
     with pool_harness([EngineSpec(id="e", resident=set(), available=set())], model_set=["a", "b"]) as pool:
         engine = pool.engines["e"].fake
+        # Both slow enough to be seen: an instant download and an instant load overlap
+        # trivially and prove nothing about the order they were asked for in.
+        engine.pull_delay_s = 0.05
+        engine.load_delay_s = 0.15
         app = agent_app(engine_app=engine.app)
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://agent") as http:
             await http.put(
@@ -844,7 +848,7 @@ async def test_a_model_is_loaded_as_soon_as_its_own_download_finishes():
                 headers={"Authorization": f"Bearer {AGENT_KEY}"},
                 json={"tags": ["a", "b"], "residency": "pinned"},
             )
-            for _ in range(40):
+            for _ in range(200):
                 await asyncio.sleep(0.05)
                 if {"a", "b"} <= engine.resident:
                     break
@@ -853,7 +857,10 @@ async def test_a_model_is_loaded_as_soon_as_its_own_download_finishes():
     pulls = [i for i, path in enumerate(ordered) if path == "/api/pull"]
     loads = [i for i, path in enumerate(ordered) if path != "/api/pull"]
     assert len(pulls) == 2 and loads, "both models pulled, and loading happened"
-    assert min(loads) < max(pulls), "the first model was loaded before the last one downloaded"
+    # Measured inside the engine rather than inferred from the order requests arrived in. That
+    # order was the old proxy for this, and it cannot tell "loaded while the next downloads"
+    # (D83) from "loaded after every download" — both put the loads last. Overlap can.
+    assert engine.both_at_once, "no load ran while a download was still going"
 
 
 async def test_the_agent_holds_an_embedding_model_through_the_endpoint_it_serves():
@@ -929,3 +936,53 @@ async def test_a_load_that_times_out_is_recorded_against_that_model():
 
     assert failed, report
     assert "never finished loading" in failed[0]["error"] or "timeout" in failed[0]["error"].lower()
+
+
+async def test_a_model_loads_while_the_next_one_downloads():
+    """D57 only ever half-delivered, and the owner spotted the other half live: a model was
+    loaded as soon as its own download finished, but the load then blocked the next download,
+    so the network idled through every load — about a minute per large model on a billing host.
+
+    Proven by the clock, not by reading the code: with a load slower than a pull, a sequential
+    agent cannot finish in less than the sum of them.
+    """
+    tags = ["a", "b", "c"]
+    with pool_harness([EngineSpec(id="e", resident=set(), available=set())], model_set=tags) as pool:
+        engine = pool.engines["e"].fake
+        # A download is the long pole on a real host; a load is a matter of a minute. The
+        # fake sleeps per chunk, so these are small.
+        engine.pull_delay_s = 0.05
+        engine.load_delay_s = 0.15
+        app = agent_app(engine_app=engine.app)
+
+        deadline = time.monotonic() + 30
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://agent") as http:
+            while time.monotonic() < deadline:
+                await http.put(
+                    "/agent/v1/models",
+                    headers={"Authorization": f"Bearer {AGENT_KEY}"},
+                    json={"tags": tags, "residency": "pinned"},
+                )
+                if set(tags) <= engine.resident:
+                    break
+                await asyncio.sleep(0.02)
+
+    assert set(tags) <= engine.resident, "the model set never landed"
+    # The claim itself, watched from inside the engine: a download and a load in flight at the
+    # same moment. Timing alone is a benchmark, and benchmarks are flaky on a loaded machine.
+    assert engine.both_at_once, "every load still had the downloads waiting on it"
+    # The fake sleeps per chunk, so the absolute numbers are its business, not a benchmark.
+    # What is asserted is the overlap itself, above.
+
+
+async def test_only_one_model_loads_at_a_time():
+    """Overlapping a load with a *download* costs nothing but disk. Overlapping two loads would
+    have them contend for accelerator memory, which is the one way this could cost more than it
+    saves."""
+    from gpm_agent import models as agent_models
+
+    source = Path(agent_models.__file__).read_text()
+    work = source[source.index("async def _work"):]
+    work = work[: work.index("\n    def ")]
+    assert "self._loading is None or self._loading.done()" in work, "a second load can start"
+    assert "asyncio.create_task(" in work

@@ -42,6 +42,12 @@ class FakeOllama:
         #: Scripted: what a pull reports as its size, and a pause between its progress frames.
         self.pull_bytes = 1_000_000_000
         self.pull_delay_s = 0.0
+        #: How long a load takes, so an overlap can be seen.
+        self.load_delay_s = 0.0
+        #: Whether a download and a load were ever in flight together (D83).
+        self.pulling_now = 0
+        self.loading_now = 0
+        self.both_at_once = False
         #: Tags this engine is pretending to serve from the processor, not the card.
         self.on_cpu: set[str] = set()
         #: Scripted: how many pulls are cut partway, with the connection dropped mid-body the
@@ -160,6 +166,15 @@ class FakeOllama:
     async def _generate(self, request: Request) -> Response:
         _, parsed = await self._record(request)
         model = parsed.get("model", "")
+        if self.load_delay_s:
+            # A load takes real time on a real host — about a minute for a large model — and a
+            # test that loads instantly cannot show whether anything overlapped it.
+            self.loading_now += 1
+            self.both_at_once = self.both_at_once or (self.pulling_now > 0)
+            try:
+                await asyncio.sleep(self.load_delay_s)
+            finally:
+                self.loading_now -= 1
         if _is_embedding(model):
             # What the real engine answers (seen live).
             return JSONResponse({"error": f'"{model}" does not support generate'}, status_code=400)
@@ -247,7 +262,12 @@ class FakeOllama:
                 frame = {"status": "pulling", "digest": "sha256:layer", "total": size, "completed": done}
                 yield (json.dumps(frame) + "\n").encode()
                 if self.pull_delay_s:
-                    await asyncio.sleep(self.pull_delay_s)
+                    self.pulling_now += 1
+                    self.both_at_once = self.both_at_once or (self.loading_now > 0)
+                    try:
+                        await asyncio.sleep(self.pull_delay_s)
+                    finally:
+                        self.pulling_now -= 1
             self.available.add(tag)
             yield (json.dumps({"status": "success"}) + "\n").encode()
 
