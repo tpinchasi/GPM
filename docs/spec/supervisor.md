@@ -123,7 +123,7 @@ A host is rented when all of these hold:
 | Caps allow it | hosts, hourly burn, lease dollars ≥ start-up cost + one hour of burn | §4 |
 | Nothing is already on its way | no host `scheduling` or `preparing` | **One at a time** — a bad market yields one failed bid, not five |
 
-### 5.1 Dynamic allocation (D66) — decided, not built
+### 5.1 Dynamic allocation (D66)
 
 Opt-in: `rented.allocation: dynamic`. The lease stays the only spending authority and becomes
 the ceiling; the **demand** is measured — the load signal of §9 — instead of read from the lease.
@@ -136,10 +136,22 @@ doubling before it has helped buys capacity the first round was about to supply.
 every round is chosen by the offer rules of §6 and re-checked against every cap on its own; a
 round that loses its bids does not grow the next. Shrinking is §9's pause-then-destroy.
 
+**The demand is measured, not declared**: `wanted = (busy workers + waiting requests) ÷
+target_utilisation`, clamped to the lease's `workers`. Waiting is counted from requests that
+queued or were refused for queuing; saturation is watched beside the queue, because a client
+that sizes itself to the capacity it can see never builds one. Load must *hold* for `window_s`
+before the first round — a burst shorter than a model download is pure cost.
+
 ```yaml
 rented:
   allocation: dynamic            # lease (default) | dynamic
-  dynamic: { ramp_factor: 2, ramp_backoff_s: 300, max_round: 8, min_hosts: 0 }
+  dynamic:
+    target_utilisation: 0.75     # rent before saturation, not at it
+    window_s: 120                # how long load must hold before the first round
+    ramp_factor: 2               # each round asks for this many times the last
+    ramp_backoff_s: 300          # and waits this long after the last round landed
+    max_round: 8
+    min_hosts: 0                 # a warm floor, kept while a lease is open
 ```
 
 Count: `ceil(overflow / workers of the chosen offer)`. Each host must hold the pool's whole

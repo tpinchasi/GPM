@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import math
 import time
 import uuid
 from pathlib import Path
@@ -41,7 +42,9 @@ from ..strategies import (
     Demand,
     HostView,
     LeaseView,
+    Load,
     decide_eviction,
+    decide_ramp,
     decide_rent,
     decide_teardown,
     filter_name,
@@ -196,6 +199,9 @@ class Fleet:
         #: Set when a host is given up for idleness: from then on the lease's standing demand
         #: does not bring capacity back by itself — measured load does (D64).
         self.idle_gate = False
+        #: The ramp: how many hosts the last round asked for, and when it landed (D66).
+        self.ramp_round = 0
+        self.ramp_landed_at = 0.0
         self._offer_backoff_s = 0.0
         self._offer_retry_at = 0.0
 
@@ -265,6 +271,7 @@ class Fleet:
         idle_seconds: dict[str, float],
         busy: Optional[Mapping[str, int]] = None,
         pressure: bool = False,
+        load: Optional[Load] = None,
     ) -> None:
         open_leases = self.leases.open_leases()
         await self.finish_draining(busy or {})
@@ -279,7 +286,7 @@ class Fleet:
 
         await self.handle_evictions()
         await self.tear_down(open_leases, idle_seconds, ready_workers_higher_tiers)
-        await self.acquire(open_leases, ready_workers_higher_tiers, pressure=pressure)
+        await self.acquire(open_leases, ready_workers_higher_tiers, pressure=pressure, load=load)
 
     async def enforce_lease_limits(self, lease: Lease) -> bool:
         """Time or dollars reached → release everything the lease holds. Returns True when
@@ -1515,9 +1522,16 @@ class Fleet:
     # --- acquire what is missing ---
 
     async def acquire(
-        self, open_leases: list[Lease], ready_workers_higher_tiers: int, pressure: bool = False
+        self,
+        open_leases: list[Lease],
+        ready_workers_higher_tiers: int,
+        pressure: bool = False,
+        load: Optional[Load] = None,
     ) -> None:
         lease = next((lease for lease in open_leases if lease.allow_rent), None)
+        if self.rented.allocation == "dynamic" and lease is not None:
+            await self._acquire_dynamically(lease, ready_workers_higher_tiers, load)
+            return
         if self.idle_gate:
             # A host was given up because nothing was using it. The lease says what may be
             # spent, not that it must be: capacity comes back when load asks for it (D64).
@@ -1573,6 +1587,106 @@ class Fleet:
 
         assert lease is not None
         await self.rent_one(lease, decision.reasons)
+
+    async def _acquire_dynamically(
+        self, lease: Lease, ready_workers_higher_tiers: int, load: Optional[Load]
+    ) -> None:
+        """Hosts added from measured load, in rounds that grow while it lasts (D66).
+
+        The lease is still the only spending authority, and still the ceiling: its `workers` is
+        the most this pool may reach, its dollars and hours the most it may spend. What it is
+        no longer is the *demand* — that is what the traffic asks for.
+        """
+        now = time.time()
+        if load is None:
+            return
+        live = [h for h in self.hosts.values() if not h.released]
+        ready = [h for h in live if h.state == "ready"]
+        pending = [h for h in live if h.state in ("scheduling", "preparing")]
+        rented_workers = sum(h.workers for h in ready)
+
+        wanted = min(lease.workers, load.wanted(self.rented.dynamic.target_utilisation))
+        below_floor = len(live) < self.rented.dynamic.min_hosts
+        overflow = max(0, wanted - ready_workers_higher_tiers - rented_workers)
+
+        if overflow > 0 and self.overflow_since is None:
+            self.overflow_since = now
+        elif overflow <= 0 and not below_floor:
+            self.overflow_since = None
+            if self.ramp_round:
+                # The load that started this ramp is gone: the next one starts from one again.
+                self.events.record(
+                    "ramp_reset",
+                    "the load has cleared; the ramp starts from one host again",
+                    numbers={"was": self.ramp_round},
+                    lease_id=lease.lease_id,
+                )
+                self.ramp_round = 0
+            return
+
+        held = (now - self.overflow_since) if self.overflow_since else 0.0
+        if not below_floor and held < self.rented.dynamic.window_s:
+            return  # a burst shorter than the window is not worth a model download
+
+        if pending:
+            self.ramp_landed_at = 0.0  # the round has not landed while a host is still coming
+        elif self.ramp_round and not self.ramp_landed_at:
+            self.ramp_landed_at = now
+
+        ramp = decide_ramp(
+            round_size=self.ramp_round,
+            load_present=load.present or below_floor,
+            previous_round_landed=not pending,
+            since_last_round_s=(now - self.ramp_landed_at) if self.ramp_landed_at else 0.0,
+            hosts_pending=len(pending),
+            cfg=self.rented.dynamic,
+        )
+        if ramp.hosts <= 0:
+            return
+
+        # Never more than the gap itself asks for: a ramp is a rate, not a target.
+        by_overflow = max(1, math.ceil(overflow / max(1, self.rented.workers)))
+        asked = max(1, min(ramp.hosts, by_overflow)) if not below_floor else ramp.hosts
+        self.events.record(
+            "ramp_round",
+            f"{ramp.reasons[0]}; renting {asked} of them",
+            numbers={
+                "round": asked,
+                "wanted_workers": wanted,
+                "ready_workers": rented_workers + ready_workers_higher_tiers,
+                "waiting": load.waiting,
+                "busy": load.busy_workers,
+            },
+            lease_id=lease.lease_id,
+        )
+
+        rented_now = 0
+        for _ in range(asked):
+            demand = Demand(
+                wanted_workers=wanted,
+                ready_workers_higher_tiers=ready_workers_higher_tiers,
+                rented_workers=rented_workers,
+                overflow_age_s=held,
+                hosts_pending=0,  # the ramp decides how many at once, not the one-at-a-time rule
+                rented_hosts=len([h for h in self.hosts.values() if not h.released]),
+            )
+            # Every host in a round is re-checked on its own: a round is a number of attempts,
+            # never a bulk purchase (D66).
+            refusal = self._refuse_for_caps(demand, lease)
+            if refusal is not None:
+                self.events.record(
+                    "rent_refused", refusal, numbers={"round": asked, "rented_so_far": rented_now},
+                    lease_id=lease.lease_id,
+                )
+                break
+            host = await self.rent_one(lease, [f"dynamic allocation: {ramp.reasons[0]}"])
+            if host is None:
+                break  # a round that loses its bids does not grow the next one
+            rented_now += 1
+
+        if rented_now:
+            self.ramp_round = asked
+            self.ramp_landed_at = 0.0
 
     def _refuse_for_caps_quietly(self, lease: Lease) -> Optional[str]:
         """The dollar check alone: a parked host is already counted among the pool's hosts."""

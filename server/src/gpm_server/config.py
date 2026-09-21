@@ -477,6 +477,32 @@ class CapacityMatch(BaseModel):
     capability: Optional[str] = None
 
 
+class DynamicAllocationConfig(BaseModel):
+    """Adding hosts from measured load, gradually (D66).
+
+    Not one at a time, which took half an hour to reach six live; and not the whole gap at
+    once, which would buy a fleet of downloads for a short spike. One, then a multiple, then a
+    multiple again, each round waiting for the last to land.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Rent before saturation, not at it: a pool held at exactly full is a pool that queues.
+    target_utilisation: float = Field(default=0.75, gt=0, le=1)
+    #: How long load must hold before the first round, and the window measurements cover.
+    #: Zero acts on the first pass that sees load — honest, and aggressive: a spike shorter
+    #: than a model download then costs a host that arrives after it is over.
+    window_s: float = Field(default=120.0, ge=0)
+    #: Each round asks for this many times the last.
+    ramp_factor: float = Field(default=2.0, ge=1)
+    #: And waits this long after the previous round has landed before growing.
+    ramp_backoff_s: float = Field(default=300.0, ge=0)
+    #: The most one round may add, however long the load lasts.
+    max_round: int = Field(default=8, ge=1)
+    #: A warm floor kept while a lease is open. Zero spends nothing without traffic.
+    min_hosts: int = Field(default=0, ge=0)
+
+
 class WorkersAutoConfig(BaseModel):
     """Each rented host finding its own worker count while it serves (D67, D68).
 
@@ -558,6 +584,11 @@ class RentedConfig(BaseModel):
     #: doing, and later manages its models and worker count. A host with no interpreter gets no
     #: agent and joins without one, so this is safe to leave on.
     agent_on_rented_hosts: bool = True
+    #: Where the pool's demand comes from: the lease's worker count, as it always has, or what
+    #: the traffic is actually asking for (D66). A dynamic pool still rents nothing without an
+    #: open lease and its dollar cap — the lease stops being the demand and becomes the ceiling.
+    allocation: Literal["lease", "dynamic"] = "lease"
+    dynamic: DynamicAllocationConfig = Field(default_factory=DynamicAllocationConfig)
     #: Each host finds its own worker count while it serves (D67, D68). Off by default.
     workers_auto: WorkersAutoConfig = Field(default_factory=WorkersAutoConfig)
     offer_policy: OfferPolicy = Field(default_factory=OfferPolicy)

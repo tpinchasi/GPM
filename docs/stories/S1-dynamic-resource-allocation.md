@@ -1,8 +1,11 @@
 # S1 — Dynamic resource allocation
 
-> Status: **decided (D66), not built.** Part of the [feature list](README.md). The owner's answer to the open questions:
-> *add hosts gradually — one, then multiply by a factor, again and again, with a back-off between rounds.*
-> The specification now carries it; this page remains as the reasoning and the build plan.
+> Status: **built (D66)**, 2026-09-21. Part of the [feature list](README.md). Off by default:
+> `rented.allocation: dynamic`. The demand becomes what the traffic asks for — busy workers plus
+> what is waiting, against a target utilisation — and hosts arrive in rounds of 1, then 2, then
+> 4, each round waiting for the last to land. The lease stays the only spending authority and
+> becomes the ceiling. Machines are still chosen by the configured offer rules, and every host
+> in a round is re-checked against every cap on its own.
 
 ## The story
 
@@ -131,9 +134,11 @@ that cannot wait.
 
 ## Build stages
 
-1. The router publishes a queue gauge — waiting count and oldest wait — beside its counters.
-2. `Demand` carries the measured signals; `dynamic` demand in the rent strategy; plan shows it.
-3. Shrink ordering; console chart of signal against capacity; the decision log entries.
+1. ~~The measured signal.~~ **Built** — read from the request log the router already writes.
+2. ~~Measured demand and the ramp.~~ **Built**, with the decision log carrying each round's
+   numbers (`ramp_round`, `ramp_reset`).
+3. Shrink ordering by measured cost, and a console chart of signal against capacity — **later**;
+   shrinking today is D64's pause-then-destroy, idle hosts first.
 
 ## Tests
 
