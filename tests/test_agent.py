@@ -853,3 +853,28 @@ async def test_a_model_is_loaded_as_soon_as_its_own_download_finishes():
     loads = [i for i, path in enumerate(ordered) if path != "/api/pull"]
     assert len(pulls) == 2 and loads, "both models pulled, and loading happened"
     assert min(loads) < max(pulls), "the first model was loaded before the last one downloaded"
+
+
+async def test_the_agent_holds_an_embedding_model_through_the_endpoint_it_serves():
+    """Found live, at the cost of a healthy host: the agent pinned every model through
+    `generate`, the engine refused the embedding model with a 400, and the pool destroyed the
+    host for "could not hold the model set" with the other two models already loaded."""
+    tags = ["a-chat-model", "an-embed-model"]
+    with pool_harness([EngineSpec(id="e", resident=set(), available=set())], model_set=tags) as pool:
+        engine = pool.engines["e"].fake
+        app = agent_app(engine_app=engine.app)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://agent") as http:
+            report = None
+            for _ in range(60):
+                answer = await http.put(
+                    "/agent/v1/models",
+                    headers={"Authorization": f"Bearer {AGENT_KEY}"},
+                    json={"tags": tags, "residency": "pinned"},
+                )
+                report = answer.json()
+                if set(tags) <= engine.resident:
+                    break
+                await asyncio.sleep(0.05)
+
+    assert set(tags) <= engine.resident, report
+    assert not [m for m in report["models"] if m.get("error")], report

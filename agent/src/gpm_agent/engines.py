@@ -86,7 +86,15 @@ class OllamaFacts:
         Either form *loads* the model if it is not loaded, so the caller releases only what is
         loaded now — releasing a cold model would do the opposite of what was meant."""
         keep_alive: Any = -1 if pinned else "5m"
-        response = await client.post("/api/generate", json={"model": tag, "keep_alive": keep_alive}, timeout=None)
+        # An embedding model refuses `generate` with a 400, so it is held through the endpoint
+        # it does serve; the engine says which kind a tag is. Found live, twice: once in the
+        # pool's own engine code, and again here — where it cost a healthy host, destroyed for
+        # "could not hold the model set" with two of its three models already loaded.
+        path = "/api/generate"
+        shown = await client.post("/api/show", json={"model": tag})
+        if shown.status_code == 200 and "embedding" in (shown.json().get("capabilities") or []):
+            path = "/api/embed"
+        response = await client.post(path, json={"model": tag, "keep_alive": keep_alive}, timeout=None)
         if response.status_code != 200:
             raise EngineRefused(f"the engine would not {'pin' if pinned else 'release'} {tag}: {response.status_code}")
 

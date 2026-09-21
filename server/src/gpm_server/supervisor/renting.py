@@ -1164,6 +1164,37 @@ class Fleet:
         except TypeError:
             return await engine.pull(client, tag)
 
+    def _progress_from_agent(self, host: RentedHost, tags: list[str], held: dict) -> dict:
+        """The agent's report, in the one shape everything downstream reads.
+
+        Both preparation paths feed the same console and the same slow-download check, so they
+        must say the same thing: `{tag: {completed, total, attempt, mbps}}`. Found live, the
+        first time a rented host was ever prepared through its agent: the agent's own words
+        were passed along as they came, and the console drew an empty bar for a download that
+        was running at a gigabit.
+        """
+        now = time.time()
+        progress: dict = {}
+        for tag in tags:
+            model = held.get(tag) or {}
+            pulling = model.get("pulling") or {}
+            size = int(model.get("size_bytes") or 0)
+            if pulling:
+                completed = int(pulling.get("completed_bytes") or 0)
+                total = int(pulling.get("total_bytes") or 0)
+            elif size and (model.get("on_disk") or model.get("loaded")):
+                completed = total = size
+            else:
+                continue
+            entry = {"completed": completed, "total": total, "attempt": 1}
+            before = (host.progress or {}).get(tag) or {}
+            seen_at = before.get("seen_at")
+            if pulling and seen_at and now > seen_at and completed >= before.get("completed", 0):
+                entry["mbps"] = (completed - before["completed"]) * 8 / 1e6 / (now - seen_at)
+            entry["seen_at"] = now
+            progress[tag] = entry
+        return progress
+
     #: How long a just-installed agent is given to start answering before the pool prepares
     #: the host without it.
     agent_hold_attempts = 5
@@ -1216,11 +1247,8 @@ class Fleet:
                 lease_id=host.lease_id,
             )
             return False
+        host.progress = self._progress_from_agent(host, tags, held)
         if not all(held.get(tag, {}).get("loaded") for tag in tags):
-            pulling = next(
-                (held[tag]["pulling"] for tag in tags if held.get(tag, {}).get("pulling")), None
-            )
-            host.progress = pulling or host.progress
             return False
         host.download_cost = host.offer.download_per_gb * (
             sum(int(model.get("size_bytes") or 0) for model in held.values()) / 1e9

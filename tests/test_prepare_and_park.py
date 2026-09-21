@@ -875,3 +875,24 @@ async def test_a_freshly_installed_agent_is_given_a_moment_before_the_slow_path(
     monkeypatch.setattr(agents, "hold", never)
     assert await fleet.load_model_set_through_agent(host) is None   # a real silence falls back
     assert len(calls) == fleet.agent_hold_attempts
+
+
+async def test_a_download_through_the_agent_is_reported_the_way_the_console_reads_it(fleet, monkeypatch):
+    """Found live: the agent's own words were passed straight to the console, which drew an
+    empty bar for a download that was running. Both paths must speak one shape."""
+    from gpm_server.supervisor import agents, hostagent
+
+    host = await fleet.prepare(max_spend=1.00, max_hours=1)
+    host.agent = hostagent.RentedAgent(url="http://127.0.0.1:1", secret="gpmg_" + "0" * 64)
+    (tag,) = sorted(fleet.required_tags)
+
+    async def halfway(agent, tags, residency, transport=None):
+        return {"models": [{"tag": tag, "on_disk": False, "loaded": False, "size_bytes": None,
+                            "pulling": {"tag": tag, "completed_bytes": 5_000, "total_bytes": 10_000}}]}
+
+    monkeypatch.setattr(agents, "hold", halfway)
+    assert await fleet.load_model_set_through_agent(host) is False
+
+    shown = host.progress[tag]
+    assert shown["completed"] == 5_000 and shown["total"] == 10_000 and shown["attempt"] == 1
+    assert set(host.progress) == {tag}, "keyed by model tag, as the direct path is"
