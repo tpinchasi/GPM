@@ -477,6 +477,28 @@ class CapacityMatch(BaseModel):
     capability: Optional[str] = None
 
 
+class WorkersAutoConfig(BaseModel):
+    """Each rented host finding its own worker count while it serves (D67, D68).
+
+    Off by default. On, a host starts at its capacity profile's number — six where none
+    matches — and moves from there on what it measures, never above what its engine was
+    launched to run.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    #: How long a host's behaviour is measured before it is judged on it.
+    window_s: float = Field(default=120.0, gt=0)
+    #: A step up has to have raised throughput by this much to count as having paid.
+    min_gain: float = Field(default=0.10, ge=0)
+    #: Service time this far over the pool's median for the same model steps a host down.
+    slow_host_factor: float = Field(default=2.0, gt=1)
+    #: The most any rented host's engine is launched to run at once. Six is where a host
+    #: *starts* (D68); this is the ceiling it may climb to, bounded by what memory allows.
+    max: int = Field(default=16, ge=1, le=64)
+
+
 class CapacityProfile(BaseModel):
     """How many workers a class of hardware runs (docs/spec/hosts-routing-capacity.md §2.1).
 
@@ -536,6 +558,8 @@ class RentedConfig(BaseModel):
     #: doing, and later manages its models and worker count. A host with no interpreter gets no
     #: agent and joins without one, so this is safe to leave on.
     agent_on_rented_hosts: bool = True
+    #: Each host finds its own worker count while it serves (D67, D68). Off by default.
+    workers_auto: WorkersAutoConfig = Field(default_factory=WorkersAutoConfig)
     offer_policy: OfferPolicy = Field(default_factory=OfferPolicy)
     scale: ScaleConfig = Field(default_factory=ScaleConfig)
     bidding: BiddingConfig

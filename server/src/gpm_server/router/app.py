@@ -28,6 +28,9 @@ from ..models import HostState
 from ..state import RouterState, open_database
 from .dispatch import Assignment, Need, NoEligibleHost, NoReadyHost, QueueTimeout
 
+#: How much of a response's end is held to read the engine's own counts out of it (D67).
+_USAGE_TAIL_BYTES = 4096
+
 log = logging.getLogger("gpm.router")
 
 #: Never forwarded upstream: hop-by-hop headers, the app's own credentials, and anything the
@@ -474,6 +477,7 @@ def create_app(
             with anyio.CancelScope(shield=True):
                 await upstream.aclose()
                 await state.dispatcher.release(held)
+                tokens_out, generate_ms = engine.usage(path, prefix[-_USAGE_TAIL_BYTES:])
                 await record(
                     "ok",
                     host_id=held.host.host_id,
@@ -483,6 +487,8 @@ def create_app(
                     queue_wait_ms=wait_s * 1000,
                     latency_ms=(time.monotonic() - dispatched_at) * 1000,
                     status_code=upstream.status_code,
+                    tokens_out=tokens_out,
+                    generate_ms=generate_ms,
                 )
             return Response(
                 content=prefix,
@@ -492,12 +498,17 @@ def create_app(
 
         async def stream() -> AsyncIterator[bytes]:
             outcome = "ok"
+            # The counts live in the final frame, so a few kilobytes of tail is all it takes —
+            # and nothing of what was generated is kept beyond the moment it is read (D67).
+            tail = bytearray()
             try:
                 if prefix:
                     # What was buffered before the response outgrew the pool's limit; the rest
                     # continues from the same iterator, never a second pass over the stream.
                     yield prefix
                 async for chunk in rest:
+                    tail.extend(chunk)
+                    del tail[:-_USAGE_TAIL_BYTES]
                     yield chunk
             except asyncio.CancelledError:
                 outcome = "cancelled"
@@ -515,6 +526,7 @@ def create_app(
                 with anyio.CancelScope(shield=True):
                     await upstream.aclose()
                     await state.dispatcher.release(held)
+                    tokens_out, generate_ms = engine.usage(path, bytes(tail))
                     await record(
                         outcome,
                         host_id=held.host.host_id,
@@ -524,6 +536,8 @@ def create_app(
                         queue_wait_ms=wait_s * 1000,
                         latency_ms=(time.monotonic() - dispatched_at) * 1000,
                         status_code=upstream.status_code,
+                        tokens_out=tokens_out,
+                        generate_ms=generate_ms,
                     )
 
         return StreamingResponse(

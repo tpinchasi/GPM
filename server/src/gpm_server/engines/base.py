@@ -60,6 +60,16 @@ class Engine(Protocol):
     def is_streaming(self, path: str, body: bytes) -> bool:
         """True when the response will be streamed."""
 
+    def usage(self, path: str, tail: bytes) -> tuple[Optional[int], Optional[float]]:
+        """Tokens generated and milliseconds spent generating, from the end of a response.
+
+        Latency alone cannot tell a slow machine from a long answer, and that distinction is
+        what deciding a host's worker count turns on (D67). Every engine reports this somewhere
+        in its final frame; one that does not returns (None, None) and the pool judges hosts by
+        what it can measure itself.
+        """
+        return None, None
+
     def keepalive_frame(self, path: str) -> Optional[bytes]:
         """A frame that is *harmless* in this engine's stream format, or None (D62).
 

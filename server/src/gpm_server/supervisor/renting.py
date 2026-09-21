@@ -82,6 +82,13 @@ class RentedHost:
     #: True once this host's agent has answered a heartbeat, so an operator can see the verb
     #: working before the ssh beat beside it is retired.
     agent_beats: bool = False
+    #: What this host's engine was launched to run at once. A change up to it is the pool
+    #: using slots the engine already has; past it, the engine has to be relaunched (D68).
+    launch_workers: int = 0
+    #: Which way this host's count last moved, so a step is judged against its own evidence.
+    last_worker_change: int = 0
+    #: True when a model the pool requires was seen to leave this host's memory.
+    lost_a_model: bool = False
     agent_detail: Optional[str] = None
     #: When this host was parked for having no traffic, the moment its idleness began — so the
     #: destroy limit is counted from its last request, not from the park (D64).
@@ -431,6 +438,19 @@ class Fleet:
             return profile.max_workers, why + (f" ({profile.note})" if profile.note else "")
         return self.rented.workers, "the rented default; no capacity profile matches this hardware"
 
+    def launch_workers_for(self, starts_at: int) -> int:
+        """What the engine is *launched* to run at once (D68).
+
+        Under automatic adjustment a host starts at its profile's number and climbs from there,
+        and climbing is only free while the engine already has the slots — so the engine is
+        started at the most the machine may be asked for. Without it, the engine is launched
+        with exactly what the host will be given, as before.
+        """
+        auto = self.rented.workers_auto
+        if not auto.enabled:
+            return starts_at
+        return max(starts_at, auto.max)
+
     def instance_env(self, workers: Optional[int] = None) -> dict[str, str]:
         """What makes the engine run this many workers at this context, holding the whole
         model set — set at creation on hosts the pool creates (spec §2.2)."""
@@ -623,10 +643,26 @@ class Fleet:
             )
             return True, f"{host.host_id} now takes {workers} at once"
 
+        if workers <= (host.launch_workers or 0):
+            # Its engine was already launched to run this many, so the pool is simply using
+            # slots that exist: instant, graceful, and nothing is restarted (D68).
+            was = host.workers
+            host.workers = workers
+            self.events.record(
+                "host_resized",
+                f"{host.host_id} now takes {workers} requests at once, up from {was}; its "
+                f"engine was launched for {host.launch_workers}, so nothing restarted",
+                numbers={"workers": workers, "was": was, "restarted": False},
+                host_id=host.host_id,
+                lease_id=host.lease_id,
+            )
+            return True, f"{host.host_id} now takes {workers} at once"
+
         if host.agent is None:
             return False, (
-                f"{host.host_id} has no agent, and raising its workers means relaunching its "
-                "engine — which only an agent on that host can do"
+                f"{host.host_id} has no agent, and raising its workers past the "
+                f"{host.launch_workers} its engine was launched for means relaunching it — "
+                "which only an agent on that host can do"
             )
         settings = agents.wanted_engine_settings(workers, len(self.required_tags))
         status, answer = await agents.restart_engine(
@@ -1209,6 +1245,7 @@ class Fleet:
             "state": host.state,
             "parked_at": host.parked_at,
             "idle_since": host.idle_since,
+            "launch_workers": host.launch_workers,
             "offer": dataclasses.asdict(dataclasses.replace(host.offer, raw={})),
         }
 
@@ -1262,6 +1299,7 @@ class Fleet:
                 download_cost=float(ref.get("download_cost") or 0.0),
                 parked_at=ref.get("parked_at"),
                 idle_since=ref.get("idle_since"),
+                launch_workers=int(ref.get("launch_workers") or 0),
                 # What its engine was launched with. A row from before profiles existed was
                 # launched with the rented default of the day.
                 workers=int(ref.get("workers") or self.rented.workers),
@@ -1657,11 +1695,13 @@ class Fleet:
 
             host_id = f"rented-{uuid.uuid4().hex[:6]}"
             workers, workers_why = self.workers_for(offer)
+            launch_workers = self.launch_workers_for(workers)
             spec = InstanceSpec(
                 label=f"{self.label_prefix}{host_id}",
                 image=self.rented.image,
                 disk_gb=self.rented.disk_gb,
-                env=self.instance_env(workers),
+                # Launched at what it may be asked for, used at what it is given (D68).
+                env=self.instance_env(launch_workers),
                 # Armed before anything else runs, and carrying no account credential.
                 onstart=self.deadman_onstart(),
             )
@@ -1699,6 +1739,7 @@ class Fleet:
                 bid_hourly=capped,
                 lease_id=lease.lease_id,
                 workers=workers,
+                launch_workers=launch_workers,
                 interruptible=offer.interruptible,
             )
             connection = await self.provider.connection(instance)

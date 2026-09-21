@@ -88,6 +88,98 @@ class HostView:
     hours_held: float = 0.0
 
 
+@dataclasses.dataclass(frozen=True)
+class WorkerReading:
+    """One host's measured behaviour over the last window, for deciding its worker count.
+
+    Everything here is written by the router on the request path's edges, or read from the
+    host's own agent — nothing is asked of the engine to produce it.
+    """
+
+    host_id: str
+    #: How many requests it is given at once now, and the most its engine could run.
+    workers: int
+    launch_workers: int
+    busy_workers: int
+    #: Requests waiting anywhere in the pool: raising a host that nobody is queuing for buys
+    #: nothing.
+    waiting: int
+    #: Tokens a second across everything it served in the window, and in the window before it.
+    throughput: Optional[float] = None
+    throughput_before: Optional[float] = None
+    #: Its median service time for the model it served most, and the pool's for the same model.
+    service_s: Optional[float] = None
+    pool_service_s: Optional[float] = None
+    #: True when a model the pool requires was seen to leave memory — the engine ran out of it.
+    evicted_a_model: bool = False
+    #: What the last change to this host was, so a step is judged against its own evidence.
+    last_change: int = 0
+
+
+@dataclasses.dataclass(frozen=True)
+class WorkerDecision:
+    host_id: str
+    workers: int
+    reasons: list[str]
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.reasons)
+
+
+def decide_workers(reading: WorkerReading, cfg) -> WorkerDecision:
+    """How many requests this host should be given at once (D67, D68).
+
+    Down on evidence that it is struggling; up on evidence that it paid. A host starts at its
+    profile's number — six where none matches — and climbs from there, bounded by what its
+    engine was actually launched to run, because a worker the engine cannot serve is a queue
+    slot pretending to be capacity.
+    """
+    workers = reading.workers
+    at_most = max(1, reading.launch_workers)
+
+    # Evidence that this host is struggling. Any of it settles the pass: a host being asked to
+    # do less is never also a candidate for doing more, even when it cannot go lower.
+    struggling: Optional[str] = None
+    if reading.evicted_a_model:
+        struggling = f"a model the pool requires left memory at {workers} workers"
+    elif (
+        reading.service_s is not None
+        and reading.pool_service_s
+        and reading.service_s > reading.pool_service_s * cfg.slow_host_factor
+    ):
+        struggling = (
+            f"its {reading.service_s:.1f}s is over {cfg.slow_host_factor:g}x the pool's "
+            f"{reading.pool_service_s:.1f}s for the same model"
+        )
+    elif (
+        reading.last_change > 0
+        and reading.throughput is not None
+        and reading.throughput_before
+        and reading.throughput < reading.throughput_before * (1 + cfg.min_gain)
+    ):
+        struggling = (
+            f"the last step up did not pay: {reading.throughput:.0f} tokens/s against "
+            f"{reading.throughput_before:.0f} before it"
+        )
+
+    if struggling is not None:
+        if workers <= 1:
+            # Already at the floor. A host that cannot be given less and still struggles is a
+            # machine not worth keeping — which is the tear-down's decision, not this one.
+            return WorkerDecision(reading.host_id, workers, [])
+        return WorkerDecision(reading.host_id, workers - 1, [struggling])
+
+    # Up, and only on evidence: full, with work actually waiting, and inside what the engine
+    # was launched to run.
+    if workers >= at_most or reading.busy_workers < workers or reading.waiting <= 0:
+        return WorkerDecision(reading.host_id, workers, [])
+    return WorkerDecision(
+        reading.host_id, workers + 1,
+        [f"every worker busy with {reading.waiting} waiting, and the last step up paid"],
+    )
+
+
 # --- when to rent, and how many (spec §5) ---
 
 

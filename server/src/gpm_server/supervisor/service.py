@@ -16,6 +16,7 @@ import dataclasses
 import logging
 import os
 import socket
+import statistics
 import time
 import uuid
 from pathlib import Path
@@ -295,6 +296,8 @@ class Supervisor:
                 busy={host_id: counter.busy for host_id, counter in self.counters.all().items()},
                 pressure=self._pressure(),
             )
+            if self.config.rented and self.config.rented.workers_auto.enabled:
+                await self._adjust_workers()
             self._publish_rented()
 
         self.lock.beat()
@@ -398,6 +401,99 @@ class Supervisor:
             for host in self.hosts.values()
             if host.state is HostState.READY
         )
+
+    def _worker_readings(self) -> list:
+        """What each rented host has just done, for deciding its worker count (D67).
+
+        Read from the request log the router already writes — tokens generated, service time,
+        per host and per model — so nothing is asked of a host to produce it.
+        """
+        from ..strategies import WorkerReading
+
+        if self.fleet is None or not self.config.rented or not self.config.rented.workers_auto.enabled:
+            return []
+        window = self.config.rented.workers_auto.window_s
+        now = time.time()
+        counters = self.counters.all()
+        rows = self.db.query(
+            "SELECT host_id, model_served, tokens_out, generate_ms, latency_ms, ts "
+            "FROM request_log WHERE outcome = 'ok' AND ts > ?",
+            (now - window * 2,),
+        )
+        waiting = len(
+            self.db.query(
+                "SELECT 1 FROM request_log WHERE ts > ? AND (queue_wait_ms >= 1000 OR reason = 'queue_timeout') LIMIT 50",
+                (now - window,),
+            )
+        )
+        recent = [r for r in rows if r["ts"] > now - window]
+        before = [r for r in rows if r["ts"] <= now - window]
+
+        def throughput(rows_in: list, host_id: str) -> Optional[float]:
+            tokens = sum(r["tokens_out"] or 0 for r in rows_in if r["host_id"] == host_id)
+            return (tokens / window) if tokens else None
+
+        # The pool's own median for a model is the yardstick: a pool where everything is slow
+        # has no slow host, only slower hardware.
+        by_model: dict[str, list[float]] = {}
+        for row in recent:
+            if row["latency_ms"] is not None:
+                by_model.setdefault(row["model_served"], []).append(row["latency_ms"] / 1000)
+
+        readings = []
+        for host_id, host in self.fleet.hosts.items():
+            if host.released or host.state != "ready":
+                continue
+            mine = [r for r in recent if r["host_id"] == host_id and r["latency_ms"] is not None]
+            busiest = max(
+                ({r["model_served"] for r in mine} or {""}),
+                key=lambda model: sum(1 for r in mine if r["model_served"] == model),
+            )
+            service = [r["latency_ms"] / 1000 for r in mine if r["model_served"] == busiest]
+            pool_service = by_model.get(busiest) or []
+            counter = counters.get(host_id)
+            readings.append(
+                WorkerReading(
+                    host_id=host_id,
+                    workers=host.workers,
+                    launch_workers=host.launch_workers or host.workers,
+                    busy_workers=counter.busy if counter else 0,
+                    waiting=waiting,
+                    throughput=throughput(recent, host_id),
+                    throughput_before=throughput(before, host_id),
+                    service_s=statistics.median(service) if service else None,
+                    pool_service_s=statistics.median(pool_service) if pool_service else None,
+                    evicted_a_model=host.lost_a_model,
+                    last_change=host.last_worker_change,
+                )
+            )
+        return readings
+
+    async def _adjust_workers(self) -> None:
+        """Move each host toward the count its own measurements ask for (D67, D68)."""
+        from ..strategies import decide_workers
+
+        assert self.fleet is not None
+        cfg = self.config.rented.workers_auto
+        for reading in self._worker_readings():
+            decision = decide_workers(reading, cfg)
+            if not decision.changed:
+                continue
+            host = self.fleet.hosts.get(reading.host_id)
+            if host is None:
+                continue
+            done, why = await self.fleet.resize(host, decision.workers)
+            if done:
+                host.last_worker_change = decision.workers - reading.workers
+                host.lost_a_model = False
+                self.events.record(
+                    "workers_auto",
+                    f"{reading.host_id}: {decision.reasons[0]}",
+                    numbers={"workers": decision.workers, "was": reading.workers},
+                    host_id=reading.host_id,
+                )
+            else:
+                log.info("not resizing %s: %s", reading.host_id, why)
 
     def _pressure(self) -> bool:
         """Is load asking for more than the ready hosts give? (D64)
@@ -521,6 +617,11 @@ class Supervisor:
                 host.mark_preparing()
                 continue
             required = self._rented_required_tags()
+            if host.state == "ready" and (required & host.resident) - resident:
+                # It held the set and no longer does: the engine ran out of memory for what it
+                # was asked to keep, which is the clearest evidence a host has too many
+                # workers (D67). Cleared when the count is changed on the strength of it.
+                host.lost_a_model = True
             host.resident = resident
             if required <= resident:
                 if host.state != "ready":

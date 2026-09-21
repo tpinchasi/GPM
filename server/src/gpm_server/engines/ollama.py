@@ -55,6 +55,27 @@ class OllamaEngine:
             return False
         return bool(_decode(body).get("stream", True))
 
+    def usage(self, path: str, tail: bytes) -> tuple[Optional[int], Optional[float]]:
+        """This engine puts its counts in the last frame, streamed or not: `eval_count` is the
+        tokens it generated and `eval_duration` the nanoseconds it spent doing so."""
+        for line in reversed(tail.splitlines()):
+            line = line.strip()
+            if not line.startswith(b"{"):
+                continue
+            try:
+                frame = json.loads(line)
+            except ValueError:
+                continue  # a frame cut in half by where the tail begins
+            if not isinstance(frame, dict) or "eval_count" not in frame:
+                continue
+            count = frame.get("eval_count")
+            nanos = frame.get("eval_duration")
+            return (
+                int(count) if isinstance(count, (int, float)) else None,
+                float(nanos) / 1e6 if isinstance(nanos, (int, float)) else None,
+            )
+        return None, None
+
     def keepalive_frame(self, path: str) -> Optional[bytes]:
         """None: this engine answers in newline-delimited JSON, where every line a client
         reads is a frame it will try to parse. There is no harmless one to send."""
