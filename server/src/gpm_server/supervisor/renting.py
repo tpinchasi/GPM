@@ -292,7 +292,11 @@ class Fleet:
         busy: Optional[Mapping[str, int]] = None,
         pressure: bool = False,
         load: Optional[Load] = None,
+        waiting_by_model: Optional[Mapping[str, int]] = None,
     ) -> None:
+        # What each model's traffic is waiting on, for deciding which model to buy for (D95).
+        # Held for this pass only: it is a measurement, not state.
+        self._waiting_by_model = dict(waiting_by_model or {})
         open_leases = self.leases.open_leases()
         await self.finish_draining(busy or {})
         await self.beat_deadman_timers()
@@ -557,16 +561,23 @@ class Fleet:
         )
 
     def models_for_new_host(self) -> tuple[str, ...]:
-        """Which models the next machine is bought to serve (D94).
+        """Which models the next machine is bought to serve (D94, D95).
 
-        Where a host holds one, it is bought for whatever the pool is **shortest of**: the model
-        with the fewest hosts already serving it, ties broken by the order the operator listed
-        them. Without this every host would be bought for the same model and the rest of the set
-        would never be covered however much was spent.
+        Where a host holds one, two questions are asked in order, and the order is the point:
+
+        1. **Is any model served by nothing?** Then buy for that one. A model with no host
+           cannot be served at all, and no amount of throughput elsewhere makes up for it —
+           availability comes before capacity.
+        2. **Otherwise, which model's traffic is waiting most?** Measured the same way the pool
+           measures whether to rent at all: requests that queued or were refused for queueing.
+           Buying for coverage alone would keep adding hosts to a model nobody is asking for.
+
+        Ties go to the order the operator listed them, so the answer is stable and explainable.
         """
         candidates = self.rented_models
         if not self.one_model_per_host or not candidates:
             return tuple(candidates)
+
         serving: dict[str, int] = {name: 0 for name in candidates}
         for host in self.hosts.values():
             if host.released:
@@ -574,8 +585,39 @@ class Fleet:
             for name in host.models:
                 if name in serving:
                     serving[name] += 1
+
+        uncovered = [name for name in candidates if serving[name] == 0]
+        if uncovered:
+            return (uncovered[0],)
+
+        waiting = getattr(self, "_waiting_by_model", {})
+        if any(waiting.get(name) for name in candidates):
+            busiest = max(candidates, key=lambda name: (waiting.get(name, 0), -candidates.index(name)))
+            return (busiest,)
+
         fewest = min(candidates, key=lambda name: (serving[name], candidates.index(name)))
         return (fewest,)
+
+    def last_host_serving(self, host: RentedHost) -> bool:
+        """Would taking this host leave one of its models with no host at all (D95)?
+
+        Only where a host holds a single model: with the whole set on every host, any remaining
+        host still serves everything, and the question does not arise. A host that is being
+        released, or is not serving, does not count as cover.
+        """
+        if not self.one_model_per_host or not host.models:
+            return False
+        for name in host.models:
+            others = [
+                other for other in self.hosts.values()
+                if other.host_id != host.host_id
+                and not other.released
+                and other.state in ("ready", "preparing")
+                and name in other.models
+            ]
+            if not others:
+                return True
+        return False
 
     def models_of(self, host: RentedHost) -> list[str]:
         """What this host was bought to serve, falling back to the rented set for one bought
@@ -2332,6 +2374,17 @@ class Fleet:
         ):
             host = self.hosts.get(action.host_id)
             if host is None or host.released:
+                continue
+            if self.last_host_serving(host):
+                # Taking it would leave a model with nowhere to go, and every request for it
+                # would be refused until another machine was bought and prepared — minutes at
+                # best (D95). A host doing nothing is cheaper than a model that cannot be
+                # served at all; the lease's caps still bound what this costs.
+                self.events.record(
+                    "teardown_declined",
+                    f"{host.host_id}: kept — the only host serving {', '.join(host.models)}",
+                    host_id=host.host_id,
+                )
                 continue
             idle = action.reasons[0].startswith("idle")
             if action.host_id in held and not idle:

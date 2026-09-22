@@ -180,3 +180,93 @@ async def test_the_purchase_says_what_the_machine_was_bought_to_serve(make_fleet
 
     (host,) = fleet.hosts.values()
     assert host.models == (BIG,)
+
+
+# --- buying for the model that is actually waiting (D95) ---
+
+
+def test_a_model_nothing_serves_is_bought_for_first(make_fleet):
+    """Availability before capacity: a model with no host cannot be served at all, and no
+    amount of throughput elsewhere makes up for it."""
+    fleet = make_fleet(config(), [])
+    fleet.hosts["h1"] = _serving(fleet, "h1", BIG)
+    fleet._waiting_by_model = {BIG: 50}   # the covered model is the busy one
+
+    assert fleet.models_for_new_host() == (SMALL,), "the uncovered model still wins"
+
+
+def test_once_every_model_is_covered_the_busiest_is_bought_for(make_fleet):
+    """Coverage alone would keep adding hosts to a model nobody is asking for."""
+    fleet = make_fleet(config(), [])
+    fleet.hosts["h1"] = _serving(fleet, "h1", BIG)
+    fleet.hosts["h2"] = _serving(fleet, "h2", SMALL)
+    fleet.hosts["h3"] = _serving(fleet, "h3", SMALL)
+    fleet._waiting_by_model = {SMALL: 40, BIG: 2}
+
+    # By coverage alone this would be BIG, which has fewer hosts. The waiting says otherwise.
+    assert fleet.models_for_new_host() == (SMALL,)
+
+
+def test_with_nothing_waiting_it_falls_back_to_coverage(make_fleet):
+    fleet = make_fleet(config(), [])
+    fleet.hosts["h1"] = _serving(fleet, "h1", BIG)
+    fleet.hosts["h2"] = _serving(fleet, "h2", BIG)
+    fleet.hosts["h3"] = _serving(fleet, "h3", SMALL)
+    fleet._waiting_by_model = {}
+
+    assert fleet.models_for_new_host() == (SMALL,)
+
+
+# --- the last host of a model is never torn down (D95) ---
+
+
+def test_the_only_host_serving_a_model_is_kept(make_fleet):
+    """Every request for it would be refused until another machine was bought and prepared —
+    minutes at best. A host doing nothing is cheaper than a model that cannot be served."""
+    fleet = make_fleet(config(), [])
+    only = _serving(fleet, "h1", BIG)
+    fleet.hosts["h1"] = only
+
+    assert fleet.last_host_serving(only) is True
+
+
+def test_a_host_with_a_twin_may_go(make_fleet):
+    fleet = make_fleet(config(), [])
+    first = _serving(fleet, "h1", BIG)
+    fleet.hosts["h1"] = first
+    fleet.hosts["h2"] = _serving(fleet, "h2", BIG)
+
+    assert fleet.last_host_serving(first) is False
+
+
+def test_a_host_on_its_way_out_does_not_count_as_cover(make_fleet):
+    fleet = make_fleet(config(), [])
+    first = _serving(fleet, "h1", BIG)
+    fleet.hosts["h1"] = first
+    twin = _serving(fleet, "h2", BIG)
+    twin.released = True
+    fleet.hosts["h2"] = twin
+
+    assert fleet.last_host_serving(first) is True
+
+
+def test_a_host_still_preparing_does_count_as_cover(make_fleet):
+    """It was bought for that model and is on its way; holding the old one until it lands is
+    the difference between a gap and no gap."""
+    fleet = make_fleet(config(), [])
+    first = _serving(fleet, "h1", BIG)
+    fleet.hosts["h1"] = first
+    coming = _serving(fleet, "h2", BIG)
+    coming.state = "preparing"
+    fleet.hosts["h2"] = coming
+
+    assert fleet.last_host_serving(first) is False
+
+
+def test_where_every_host_holds_the_whole_set_the_question_does_not_arise(make_fleet):
+    """Any remaining host still serves everything, so nothing needs protecting."""
+    fleet = make_fleet(config(engine="ollama", per_host="all"), [])
+    host = _serving(fleet, "h1", BIG)
+    fleet.hosts["h1"] = host
+
+    assert fleet.last_host_serving(host) is False

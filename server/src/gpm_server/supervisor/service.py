@@ -312,6 +312,7 @@ class Supervisor:
                 busy={host_id: counter.busy for host_id, counter in self.counters.all().items()},
                 pressure=self._pressure(),
                 load=self._load() if self.config.rented.allocation == "dynamic" else None,
+                waiting_by_model=self._waiting_by_model(),
             )
             if self.config.rented and self.config.rented.workers_auto.enabled:
                 await self._adjust_workers()
@@ -540,6 +541,19 @@ class Supervisor:
             )
         )
         return strategies.Load(busy_workers=busy, ready_workers=ready, waiting=waiting)
+
+    def _waiting_by_model(self) -> dict[str, int]:
+        """Which models the waiting is for (D95), over the same window and the same test as the
+        pool's own decision to rent at all — so "we need more" and "more of what" cannot
+        disagree about what waiting means."""
+        window = self.config.rented.dynamic.window_s if self.config.rented else 120.0
+        rows = self.db.query(
+            "SELECT model_requested AS model, COUNT(*) AS n FROM request_log "
+            "WHERE ts > ? AND (queue_wait_ms >= 1000 OR reason = 'queue_timeout') "
+            "AND model_requested IS NOT NULL GROUP BY model_requested",
+            (time.time() - min(window, 60.0),),
+        )
+        return {row["model"]: int(row["n"]) for row in rows}
 
     def _pressure(self) -> bool:
         """Is load asking for more than the ready hosts give? (D64)

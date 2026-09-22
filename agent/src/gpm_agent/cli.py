@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Any
 
+from . import proxy as proxy_module
 from .settings import DEFAULT_PATH, Settings, SettingsError, fingerprint, load, mint_key, save
 
 
@@ -53,6 +55,11 @@ def _serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _proxy(args: Any) -> int:
+    proxy_module.serve(args.upstreams, host=args.host, port=args.port)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="gpm-agent", description="The GPM host agent.")
     parser.add_argument("-c", "--config", default=DEFAULT_PATH)
@@ -72,6 +79,15 @@ def main(argv: list[str] | None = None) -> int:
     serve = verbs.add_parser("serve", help="answer the pool")
     serve.add_argument("--log-level", default="warning")
     serve.set_defaults(run=_serve)
+
+    # A separate process from the agent, carrying inference traffic and nothing else (D96).
+    # It ships here because this archive is already on every host the pool creates; it is not
+    # the agent, and the agent is still never on the request path.
+    proxy = verbs.add_parser(
+        "proxy", help="one endpoint in front of several engine processes on this machine"
+    )
+    proxy_module.add_arguments(proxy)
+    proxy.set_defaults(run=_proxy)
 
     args = parser.parse_args(argv)
     try:

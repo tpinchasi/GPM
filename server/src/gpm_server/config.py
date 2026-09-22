@@ -638,6 +638,16 @@ class EngineImage(BaseModel):
 class RentedConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    #: Whether the machines this pool rents put a router in front of several engine processes
+    #: (D96). With it, an engine serving one model per process can still hold a whole set on one
+    #: machine: each model gets its own process and the router chooses between them by name, so
+    #: the pool still dials one URL. Off by default, because it is the machine's start-up that
+    #: has to run it — the pool never sends a command.
+    #:
+    #: It costs what it sounds like it costs: the accelerator's memory is split between the
+    #: processes at launch, so the largest model gets a fraction of the cache it would have had
+    #: to itself, and cache is where a batching engine's throughput comes from.
+    engine_proxy: bool = False
     #: The engine on hosts the pool rents, when it is not the pool's (D93). This is the one that
     #: matters in practice: the machines worth renting run a different engine from the machine
     #: on the operator's desk.
@@ -870,7 +880,10 @@ class PoolConfig(BaseModel):
         """
         from .engines import EngineNotFound, get_engine
 
-        def holds_one(name: str) -> bool:
+        def holds_one(name: str, *, behind_proxy: bool = False) -> bool:
+            if behind_proxy:
+                # Several processes behind a router on the machine: one URL, many models (D96).
+                return False
             try:
                 return bool(getattr(get_engine(name), "serves_one_model", False))
             except EngineNotFound:
@@ -894,14 +907,15 @@ class PoolConfig(BaseModel):
         if self.rented is not None and self.pool.models_per_host == "all":
             asked = list(self.pool.model_set)
             engine = self.rented_engine()
-            if len(asked) > 1 and holds_one(engine):
+            if len(asked) > 1 and holds_one(engine, behind_proxy=self.rented.engine_proxy):
                 raise ValueError(
                     f"rented hosts run {engine!r}, which serves one model per process, but with "
                     f"pool.models_per_host 'all' every one of them is asked to hold "
-                    f"{len(asked)} models ({asked}). Set pool.models_per_host to 'declared' and "
-                    f"the pool will buy a host per model instead. (Holding several on one "
-                    f"machine would need a process in front of several engines, choosing between "
-                    f"them by model name; the pool does not ship one.)"
+                    f"{len(asked)} models ({asked}). Either set pool.models_per_host to "
+                    f"'declared', and the pool will buy a host per model; or set "
+                    f"rented.engine_proxy and have the machine's own start-up run one engine "
+                    f"per model behind the router the agent ships (D96) — which splits the "
+                    f"accelerator's memory between them."
                 )
 
     def _rented_models(self) -> list[str]:
