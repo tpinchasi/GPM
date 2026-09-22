@@ -165,3 +165,61 @@ async def test_the_market_preview_says_what_each_offer_would_run(make_fleet):
     by_hardware = {o["hardware"]: o for o in preview["best"]}
     assert by_hardware[MAX_Q]["workers"] == 6 and "capacity profile" in by_hardware[MAX_Q]["workers_from"]
     assert by_hardware["1x A100 PCIE"]["workers"] == 2
+
+
+def test_a_profile_can_name_the_card_whatever_the_machine_holds_of_it(make_fleet):
+    """Found live (D88): the owner set "9 workers for RTX PRO 6000 WS", the pool kept running
+    six, and nothing said why. The market lists hardware as "1x RTX PRO 6000 WS" and a profile's
+    `hardware` is compared **whole**, so a profile naming the card alone silently never fires.
+    What a card runs at once is a fact about the card, not about how many are in the box."""
+    fleet = make_fleet(config([
+        {"match": {"gpu": "RTX PRO 6000 WS"}, "max_workers": 9},
+        {"match": {"gpu": "RTX PRO 6000 S"}, "max_workers": 6},
+    ]), [])
+
+    assert fleet.workers_for(default_offer(hardware="1x RTX PRO 6000 WS", gpus=1))[0] == 9
+    assert fleet.workers_for(default_offer(hardware="1x RTX PRO 6000 S", gpus=1))[0] == 6
+    # Nothing it does not name falls through to the rented default, as before.
+    count, why = fleet.workers_for(default_offer(hardware="1x A100 SXM4"))
+    assert "no capacity profile" in why
+
+
+def test_a_whole_hardware_match_still_distinguishes_the_count(make_fleet):
+    """`hardware` keeps its old meaning: a 2-card machine is a different profile if you say so."""
+    fleet = make_fleet(config([
+        {"match": {"hardware": "2x RTX PRO 6000 WS"}, "max_workers": 12},
+        {"match": {"gpu": "RTX PRO 6000 WS"}, "max_workers": 9},
+    ]), [])
+
+    assert fleet.workers_for(default_offer(hardware="2x RTX PRO 6000 WS"))[0] == 12
+    assert fleet.workers_for(default_offer(hardware="1x RTX PRO 6000 WS"))[0] == 9
+
+
+def test_a_per_card_profile_is_multiplied_by_the_cards_the_machine_has(make_fleet):
+    """The owner, on seeing the card match: "if I rent 2x RTX PRO 6000 WS, I expect 2x the
+    worker count that 1x gets." Matching by card means the number is per card — and a second
+    card left idle is exactly what its price was not paid for."""
+    fleet = make_fleet(config([{"match": {"gpu": "RTX PRO 6000 WS"}, "max_workers": 7}]), [])
+
+    one, why = fleet.workers_for(default_offer(hardware="1x RTX PRO 6000 WS", gpus=1))
+    two, why_two = fleet.workers_for(default_offer(hardware="2x RTX PRO 6000 WS", gpus=2))
+    four, _ = fleet.workers_for(default_offer(hardware="4x RTX PRO 6000 WS", gpus=4))
+
+    assert (one, two, four) == (7, 14, 28)
+    assert "7 per card x 2 card(s)" in why_two, why_two
+
+
+def test_a_whole_hardware_profile_is_the_machine_total_not_per_card(make_fleet):
+    """`hardware` keeps its old meaning exactly: the number is what that machine runs."""
+    fleet = make_fleet(config([{"match": {"hardware": "2x RTX PRO 6000 WS"}, "max_workers": 10}]), [])
+
+    assert fleet.workers_for(default_offer(hardware="2x RTX PRO 6000 WS", gpus=2))[0] == 10
+
+
+def test_a_machine_with_many_cards_is_still_held_to_something_measured(make_fleet):
+    """The arithmetic is sound and an eight-card machine would otherwise ask an engine for a
+    number nobody has measured it at."""
+    fleet = make_fleet(config([{"match": {"gpu": "H200"}, "max_workers": 12}]), [])
+
+    workers, why = fleet.workers_for(default_offer(hardware="8x H200", gpus=8))
+    assert workers == 64 and "held at 64" in why

@@ -501,14 +501,31 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             # never sees an on-demand offer at all — live, an operator watching a fixed-price
             # host sit there could not say why it was never rented, and the only way to change
             # it was the raw configuration file (D80).
-            straight = {key: body[key] for key in ("allocation", "mode") if body.get(key) is not None}
-            for section in ("dynamic", "workers_auto"):
+            straight = {key: body[key] for key in ("allocation", "mode", "search_profile") if body.get(key) is not None}
+            # Save the values on the screen under a name, and switch to it (D87).
+            save_as = body.get("save_profile_as")
+            if save_as:
+                wanted = {k: v for k, v in (body.get("offer_policy") or {}).items() if v is not None}
+                base = supervisor.config.rented.policy_in_force.model_dump()
+                profile = {k: v for k, v in {**base, **wanted}.items() if v is not None}
+                if _has_section(text, "search_profiles"):
+                    text = set_values(text, ("rented", "search_profiles"), {str(save_as): profile})
+                else:
+                    # A block this pool never wrote is added whole, once — the same rule the
+                    # allocation blocks follow, rather than guessing at it line by line.
+                    straight["search_profiles"] = {str(save_as): profile}
+                straight["search_profile"] = str(save_as)
+            for section in ("dynamic", "workers_auto", "teardown"):
                 wanted = body.get(section) or {}
                 if wanted and not _has_section(text, section):
                     straight[section] = wanted
             if straight:
                 text = set_values(text, ("rented",), straight)
-            for section in ("offer_policy", "bidding", "dynamic", "workers_auto"):
+            for section in ("offer_policy", "bidding", "dynamic", "workers_auto", "teardown"):
+                # Saving under a name puts those filter values in the *profile*; writing them
+                # to the live policy as well would edit the very thing being saved away from.
+                if section == "offer_policy" and save_as:
+                    continue
                 wanted = body.get(section) or {}
                 if wanted and section not in straight:
                     text = set_values(text, ("rented", section), wanted)

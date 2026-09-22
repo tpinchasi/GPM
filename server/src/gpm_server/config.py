@@ -368,6 +368,11 @@ class OfferPolicy(BaseModel):
     min_gpu_memory_gb: float = 0.0
     min_disk_gb: float = 0.0
     max_all_in_hourly: Optional[float] = None
+    #: The same ceiling, per accelerator (D85). A machine-level cap refuses every
+    #: multi-GPU offer on its total price, however good its value: a 2-card machine at
+    #: $2.80 is cheaper per card than a single at $1.47, and the machine cap cannot see
+    #: that. Both may be set; an offer must pass whichever are set.
+    max_all_in_per_gpu: Optional[float] = None
     max_download_per_gb: Optional[float] = None
     min_download_mbps: float = 0.0
     min_reliability: float = 0.0
@@ -478,6 +483,16 @@ class CapacityMatch(BaseModel):
     #: The hardware as the market lists it, e.g. "1x RTX PRO 6000 Max-Q" — compared whole and
     #: case-insensitively, so "2x …" of the same card is a different profile, as it should be.
     hardware: Optional[str] = None
+    #: The **card**, whatever the machine holds of it: "RTX PRO 6000 WS" matches both
+    #: "1x RTX PRO 6000 WS" and "2x …" (D88). What a card can run at once is a fact about the
+    #: card, and writing it as a whole-string match means one profile per possible count — and
+    #: a profile that silently never fires if the count is wrong, which is how a pool ran six
+    #: workers on a card its operator had given nine.
+    #:
+    #: Matched this way, `max_workers` is **per card** and multiplied by how many the machine
+    #: has: two cards run twice the work, and paying for the second one to sit idle is the
+    #: whole reason a multi-GPU machine was worth renting.
+    gpu: Optional[str] = None
     min_gpu_memory_gb: Optional[float] = None
     capability: Optional[str] = None
 
@@ -584,6 +599,24 @@ class LimitsConfig(BaseModel):
 class RentedConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    @model_validator(mode="after")
+    def _profile_exists(self) -> "RentedConfig":
+        """A named profile that is not there would silently fall back to the default policy —
+        and the operator would watch the pool buy from a market they thought they had left."""
+        if self.search_profile and self.search_profile not in self.search_profiles:
+            known = ", ".join(sorted(self.search_profiles)) or "none are defined"
+            raise ValueError(
+                f"search_profile {self.search_profile!r} is not among the search_profiles ({known})"
+            )
+        return self
+
+    @property
+    def policy_in_force(self) -> OfferPolicy:
+        """The offer policy this pool is actually searching with (D87)."""
+        if self.search_profile:
+            return self.search_profiles[self.search_profile]
+        return self.offer_policy
+
     provider: str
     provider_settings: dict[str, Any] = Field(default_factory=dict)
     #: How hosts are rented (D52). `interruptible`: bid, cheaper, can be outbid at any moment.
@@ -625,6 +658,13 @@ class RentedConfig(BaseModel):
     #: Each host finds its own worker count while it serves (D67, D68). Off by default.
     workers_auto: WorkersAutoConfig = Field(default_factory=WorkersAutoConfig)
     offer_policy: OfferPolicy = Field(default_factory=OfferPolicy)
+    #: Named alternatives to `offer_policy`, chosen by name (D87). One pool wants a
+    #: different market on different days — cheap and slow for an overnight batch, fast
+    #: and dear for a demo — and rewriting nine filters by hand each time is how a filter
+    #: gets left behind. `search_profile` names the one in force; unset means the
+    #: `offer_policy` above, so a pool that never names one behaves exactly as before.
+    search_profiles: dict[str, OfferPolicy] = Field(default_factory=dict)
+    search_profile: Optional[str] = None
     scale: ScaleConfig = Field(default_factory=ScaleConfig)
     bidding: BiddingConfig
     spend: SpendConfig = Field(default_factory=SpendConfig)

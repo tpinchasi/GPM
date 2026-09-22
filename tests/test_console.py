@@ -970,8 +970,11 @@ def test_the_extend_dialog_asks_for_the_worker_ceiling():
     dialog = dialog[: dialog.index("\n}")]
 
     assert "lease.workers" in dialog, "the dialog does not offer the current ceiling"
-    assert "wantedWorkers" in dialog and "workers: wantedWorkers" in dialog
-    assert '"workers", wantedWorkers' in dialog, "raising workers is not confirmed like the rest"
+    assert "Workers it may reach" in dialog, "the operator is never asked for it"
+    assert "workers: Number(workers.input.value)" in dialog, "the chosen ceiling is never sent"
+    assert '"workers", Number(workers.input.value)' in dialog, "raising it is not confirmed like the rest"
+    # One form, not a chain of browser prompts (D86).
+    assert "prompt(" not in dialog, "the dialog still asks one question at a time"
 
 
 async def test_how_the_pool_rents_is_set_where_renting_is_watched(console):
@@ -1000,3 +1003,74 @@ def test_the_rented_screen_offers_every_way_of_renting():
     for mode in ("interruptible", "on_demand", "cheaper"):
         assert f'["{mode}"' in script, f"{mode} cannot be chosen in the console"
     assert "body.mode = mode.value" in script, "the chosen mode is never sent"
+
+
+async def test_every_teardown_lever_is_editable_in_the_console(console):
+    """D86: the whole `teardown` block was missing from the console — fifteen fields deciding
+    how long a host that is not working still bills. Changing how long a stuck host is given
+    before it is dropped meant editing the supervisor's own file."""
+    supervisor, url, _, loop = console
+
+    with client(url) as http:
+        before = http.get("/pool/market/preview?hours=1").json()
+        answer = http.patch("/pool/config/rented", json={"teardown": {"max_starting_minutes": 4}})
+        after = http.get("/pool/market/preview?hours=1").json()
+
+    assert "teardown" in before["saved"], "the console is never told the tear-down settings"
+    assert answer.status_code == 200, answer.text
+    assert supervisor.config.rented.teardown.max_starting_minutes == 4
+    assert after["saved"]["teardown"]["max_starting_minutes"] == 4
+
+
+def test_the_teardown_levers_are_offered_as_sliders_and_dropdowns():
+    """The owner asked for sliders and dropdowns, not empty number boxes: a bare box does not
+    say whether 30 is high or low for a field you have never set."""
+    script = (STATIC / "app.js").read_text()
+    from gpm_server.config import TeardownConfig
+
+    for field in TeardownConfig.model_fields:
+        assert f'"{field}"' in script, f"teardown.{field} cannot be changed in the console"
+    assert "function slider(" in script, "no slider control exists"
+    assert '"deadman_action", "choice"' in script, "an enum is not offered as a dropdown"
+    assert '"park_when_idle", "checkbox"' in script
+
+
+async def test_a_search_can_be_saved_under_a_name_and_chosen_again(console):
+    """The owner: "I want to be able to save a profile of search, name it and select it from a
+    drop down" (D87). One pool wants a different market on different days — cheap and slow for
+    an overnight batch, fast and dear for a demo — and rewriting nine filters by hand each time
+    is how a filter gets left behind."""
+    supervisor, url, _, loop = console
+
+    with client(url) as http:
+        saved = http.patch("/pool/config/rented", json={
+            "save_profile_as": "cheap-and-slow",
+            "offer_policy": {"max_all_in_hourly": 0.40, "min_download_mbps": 10},
+        })
+        after = http.get("/pool/market/preview?hours=1").json()
+
+    assert saved.status_code == 200, saved.text
+    rented = supervisor.config.rented
+    assert "cheap-and-slow" in rented.search_profiles
+    assert rented.search_profile == "cheap-and-slow", "saving it did not select it"
+    assert rented.policy_in_force.max_all_in_hourly == 0.40, "the pool is not searching with it"
+    assert after["saved"]["search_profile"] == "cheap-and-slow"
+    assert "cheap-and-slow" in after["saved"]["search_profiles"]
+
+
+def test_a_profile_that_does_not_exist_is_refused_at_load():
+    """Falling back to the default policy silently would have the operator watch the pool buy
+    from a market they thought they had left."""
+    import pytest as _pytest
+    from gpm_server.config import RentedConfig
+
+    with _pytest.raises(ValueError, match="not among the search_profiles"):
+        RentedConfig(provider="fake", bidding={"bid_ceiling": 1.0}, search_profile="no-such-thing")
+
+
+def test_the_search_profile_is_chosen_from_a_dropdown():
+    script = (STATIC / "app.js").read_text()
+    assert "Search profile" in script, "there is no way to pick one"
+    assert "saved.search_profiles" in script, "the saved names are never listed"
+    assert "save these as" in script, "there is no way to save one"
+    assert "body.save_profile_as" in script
