@@ -35,10 +35,39 @@ class PullResult:
     retryable: bool = False
 
 
+@dataclasses.dataclass(frozen=True)
+class Occupancy:
+    """How full an engine actually is, in its own terms (D91).
+
+    The pool's own measure of "busy" is worker slots occupied, which is exact for an engine
+    that serves one request per slot and misleading for one that batches: a batching engine
+    admitted at a hundred slots is rarely *all* busy, and queues the overflow internally where
+    the pool cannot see it. An engine that can say what it is holding says so here, and the
+    pool believes the engine over its own slot count.
+    """
+
+    #: Requests the engine is generating for right now.
+    running: int
+    #: Requests the engine has accepted and is not yet working on — its own queue, the one the
+    #: pool would otherwise never learn about.
+    waiting: int
+    #: How full the key-value cache is, 0.0–1.0. The real ceiling on a batching engine: it
+    #: saturates here long before it runs out of slots.
+    cache_used: Optional[float] = None
+
+
 @runtime_checkable
 class Engine(Protocol):
     interface_version: ClassVar[str]
     name: ClassVar[str]
+
+    #: Whether one server process serves exactly one model (D89).
+    #:
+    #: Declared, not inferred: it decides whether this engine can satisfy a pool whose
+    #: `models_per_host` is `all`, and the pool refuses that combination at load rather than
+    #: renting a machine that could never become ready. An engine that holds several models in
+    #: one process leaves this False.
+    serves_one_model: ClassVar[bool] = False
 
     # --- request path: cheap, synchronous, no I/O ---
 
@@ -95,6 +124,14 @@ class Engine(Protocol):
         accelerator's price — seen live on an 80GB A100 whose driver the image refused (D81).
         The driver floor refuses that machine before it is rented; this catches whatever else
         puts an engine on the CPU, on a host already paid for.
+        """
+        return None
+
+    async def occupancy(self, client: httpx.AsyncClient) -> Optional[Occupancy]:
+        """What the engine is actually holding, or None where it cannot say (D91).
+
+        Called by the supervisor on its own pass, never on the request path. An engine that
+        returns None is judged by the pool's worker slots exactly as before.
         """
         return None
 

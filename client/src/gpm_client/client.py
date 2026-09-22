@@ -34,11 +34,62 @@ class Reply:
     raw: dict = dataclasses.field(default_factory=dict, repr=False)
 
 
+#: The two request shapes a pool can speak, and where each keeps its paths and its answer.
+#:
+#: `openai` is what both shipped engines serve, so it is what these convenience methods use by
+#: default: the same call reaches a pool of Ollama hosts and a pool of vLLM hosts unchanged
+#: (D89). `ollama` is that engine's own API, kept for callers written against it — the pool
+#: still passes those paths through untouched.
+DIALECTS = {
+    "openai": {"chat": "/v1/chat/completions", "embed": "/v1/embeddings"},
+    "ollama": {"chat": "/api/chat", "embed": "/api/embed"},
+}
+
+
+def _content_of(data: dict) -> str:
+    """The generated text, in whichever shape answered.
+
+    Read rather than translated: the SDK understands both replies, and the pool never rewrites
+    one into the other — that is the passthrough rule the contract rests on.
+    """
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, dict):
+            message = first.get("message")
+            if isinstance(message, dict) and isinstance(message.get("content"), str):
+                return message["content"]
+            if isinstance(first.get("text"), str):
+                return first["text"]
+    message = data.get("message")
+    if isinstance(message, dict) and isinstance(message.get("content"), str):
+        return message["content"]
+    return data.get("response", "") if isinstance(data.get("response"), str) else ""
+
+
+def _embeddings_of(data: dict) -> list[list[float]]:
+    if isinstance(data.get("embeddings"), list):
+        return data["embeddings"]
+    rows = data.get("data")
+    if isinstance(rows, list):
+        return [row["embedding"] for row in rows if isinstance(row, dict) and "embedding" in row]
+    return []
+
+
+def _schema_field(api: str) -> str:
+    """What a structured-output request is called in each dialect.
+
+    Only the *field name* differs; the schema itself is passed through as the caller wrote it.
+    Naming it here keeps the two dialects in one place rather than scattering an `if` through
+    every call.
+    """
+    return "response_format" if api == "openai" else "format"
+
+
 def _reply_from_response(response: httpx.Response) -> Reply:
     data = response.json()
-    message = data.get("message", {})
     return Reply(
-        content=message.get("content", data.get("response", "")),
+        content=_content_of(data),
         served_model=response.headers.get("X-GPM-Served-Model", data.get("model")),
         host=response.headers.get("X-GPM-Host"),
         runtime_class=response.headers.get("X-GPM-Runtime-Class"),
@@ -77,9 +128,14 @@ class PoolClient:
         retry_policy: Optional[RetryPolicy] = None,
         transport: Optional[httpx.BaseTransport] = None,
         timeout: httpx.Timeout = _DEFAULT_TIMEOUT,
+        api: str = "openai",
     ):
+        if api not in DIALECTS:
+            raise ValueError(f"api must be one of {sorted(DIALECTS)}, not {api!r}")
         self.base_url = base_url or env_url()
         self.api_key = api_key or env_api_key()
+        self._paths = DIALECTS[api]
+        self._api = api
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         self._client = httpx.Client(
             base_url=self.base_url,
@@ -100,19 +156,19 @@ class PoolClient:
     ) -> Reply:
         body: dict[str, Any] = {"model": model, "messages": messages, "stream": False}
         if format is not None:
-            body["format"] = format
+            body[_schema_field(self._api)] = format
         if tools is not None:
             body["tools"] = tools
         body.update(kwargs)
         headers = {"X-GPM-Session": session_id} if session_id else {}
-        response = self._client.post("/api/chat", json=body, headers=headers)
+        response = self._client.post(self._paths["chat"], json=body, headers=headers)
         return _reply_from_response(response)
 
     def embed(self, model: str, texts: list[str], *, session_id: Optional[str] = None) -> list[list[float]]:
         body = {"model": model, "input": texts}
         headers = {"X-GPM-Session": session_id} if session_id else {}
-        response = self._client.post("/api/embed", json=body, headers=headers)
-        return response.json().get("embeddings", [])
+        response = self._client.post(self._paths["embed"], json=body, headers=headers)
+        return _embeddings_of(response.json())
 
     def wait_until_ready(self, timeout: Optional[float] = None) -> None:
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -145,9 +201,14 @@ class AsyncPoolClient:
         retry_policy: Optional[RetryPolicy] = None,
         transport: Optional[httpx.AsyncBaseTransport] = None,
         timeout: httpx.Timeout = _DEFAULT_TIMEOUT,
+        api: str = "openai",
     ):
+        if api not in DIALECTS:
+            raise ValueError(f"api must be one of {sorted(DIALECTS)}, not {api!r}")
         self.base_url = base_url or env_url()
         self.api_key = api_key or env_api_key()
+        self._paths = DIALECTS[api]
+        self._api = api
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
@@ -168,19 +229,19 @@ class AsyncPoolClient:
     ) -> Reply:
         body: dict[str, Any] = {"model": model, "messages": messages, "stream": False}
         if format is not None:
-            body["format"] = format
+            body[_schema_field(self._api)] = format
         if tools is not None:
             body["tools"] = tools
         body.update(kwargs)
         headers = {"X-GPM-Session": session_id} if session_id else {}
-        response = await self._client.post("/api/chat", json=body, headers=headers)
+        response = await self._client.post(self._paths["chat"], json=body, headers=headers)
         return _reply_from_response(response)
 
     async def embed(self, model: str, texts: list[str], *, session_id: Optional[str] = None) -> list[list[float]]:
         body = {"model": model, "input": texts}
         headers = {"X-GPM-Session": session_id} if session_id else {}
-        response = await self._client.post("/api/embed", json=body, headers=headers)
-        return response.json().get("embeddings", [])
+        response = await self._client.post(self._paths["embed"], json=body, headers=headers)
+        return _embeddings_of(response.json())
 
     async def wait_until_ready(self, timeout: Optional[float] = None) -> None:
         deadline = None if timeout is None else time.monotonic() + timeout

@@ -193,6 +193,12 @@ class HostConfig(BaseModel):
     #: it when memory is wanted elsewhere — for a laptop that is also used for other work.
     #: Either way nothing is ever downloaded because a request asked for it (spec §3).
     residency: Literal["pinned", "on_demand"] = "pinned"
+    #: Which of the pool's models this host holds, when the pool spreads its set across hosts
+    #: (`pool.models_per_host: declared`, D89). Absent there means the first model in the set this
+    #: host can serve — deterministic, and reported, rather than left to chance. Meaningless
+    #: when every host holds everything, and refused there so it cannot read as a restriction
+    #: the pool is quietly ignoring.
+    models: Optional[list[str]] = None
     #: Optional. With an agent the pool learns what the machine is, rather than being told.
     agent: Optional[AgentConfig] = None
 
@@ -331,6 +337,16 @@ class PoolSettings(BaseModel):
 
     name: str = "default"
     model_set: list[str] = Field(min_length=1)
+    #: How the pool's model set is spread over its hosts (D89).
+    #:
+    #: `all` is the original rule (D23): every host holds the whole set, loaded permanently, so
+    #: any ready host can serve any request and nothing is ever swapped. `declared` keeps the second
+    #: half of that promise and drops the first — a host holds a single model, permanently, and
+    #: the *pool* covers the set rather than each machine. Nothing swaps under either.
+    #:
+    #: `declared` exists because some engines serve exactly one model per process, and because a
+    #: 0.3 GB embedding model does not need to sit on the card that was rented for a 26B one.
+    models_per_host: Literal["all", "declared"] = "all"
     queue_timeout_s: float = 30.0
     probe_interval_s: float = 10.0
     #: How often the router re-reads the host table the supervisor publishes.
@@ -599,6 +615,13 @@ class LimitsConfig(BaseModel):
 class RentedConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    #: Which of the pool's models a rented host holds, when the pool spreads its set across
+    #: hosts (`pool.models_per_host: declared`, D89). This is where the money decision lives: a
+    #: 0.3 GB embedding model does not need the card that was rented for a 26 B one, so a pool
+    #: can rent only for the models that justify the price and serve the rest from machines it
+    #: already has. Absent there means rented hosts may hold any model the pool still needs.
+    models: Optional[list[str]] = None
+
     @model_validator(mode="after")
     def _profile_exists(self) -> "RentedConfig":
         """A named profile that is not there would silently fall back to the default policy —
@@ -699,21 +722,149 @@ class PoolConfig(BaseModel):
         unknown = set(self.catalog) - set(self.pool.model_set)
         if unknown:
             raise ValueError(f"catalog names not in the pool's model set: {sorted(unknown)}")
-        # Every host serves the pool's whole model set, so every host must have at least one
-        # usable variant of every model in it (spec §3).
+        self._engine_can_hold_what_the_pool_asks()
+        self._hosts_can_serve_what_they_are_asked_for()
+        self._declared_models_are_in_the_set()
+        self._every_model_is_held_by_somebody()
+        return self
+
+    def models_held_by(self, host: "HostConfig") -> list[str]:
+        """Which of the pool's models this configured host holds (D89).
+
+        With `all`, the whole set — that is what the setting means. With `declared`, what the host
+        declared, or the first model in the set it can serve. "First it can serve" is chosen so
+        the answer is stable across restarts and explainable in one sentence; a pool that wants
+        a different split says so per host.
+        """
+        if self.pool.models_per_host == "all":
+            return list(self.pool.model_set)
+        if host.models:
+            return list(host.models)
+        servable = self._servable_by(host)
+        return servable[:1]
+
+    def _servable_by(self, host: "HostConfig") -> list[str]:
+        caps = set(host.capabilities)
+        servable = []
+        for name in self.pool.model_set:
+            entry = self.catalog.get(name)
+            if entry is None or any(set(v.requires) <= caps for v in entry.variants):
+                servable.append(name)
+        return servable
+
+    def _declared_models_are_in_the_set(self) -> None:
+        """A declared model the pool does not serve is a typo, and a silent one: the host would
+        simply never be eligible for anything, with nothing said about why."""
+        known = set(self.pool.model_set)
+        spread = self.pool.models_per_host == "declared"
+        for host in self.hosts:
+            if host.models is None:
+                continue
+            if not spread:
+                raise ValueError(
+                    f"host {host.id!r} names the models it holds, but pool.models_per_host is "
+                    f"'all', which means every host holds the whole set. Remove the host's "
+                    f"`models`, or set pool.models_per_host to 'declared'."
+                )
+            if not host.models:
+                raise ValueError(f"host {host.id!r} declares an empty `models`: it could serve nothing")
+            unknown = set(host.models) - known
+            if unknown:
+                raise ValueError(
+                    f"host {host.id!r} names models that are not in the pool's set: {sorted(unknown)}"
+                )
+            cannot = set(host.models) - set(self._servable_by(host))
+            if cannot:
+                raise ValueError(
+                    f"host {host.id!r} is asked to hold {sorted(cannot)}, but its capabilities "
+                    f"{sorted(set(host.capabilities))} meet no variant's requirements for them"
+                )
+        if self.rented is not None and self.rented.models is not None:
+            if not spread:
+                raise ValueError(
+                    "rented.models names the models rented hosts hold, but pool.models_per_host "
+                    "is 'all', which means every host holds the whole set"
+                )
+            unknown = set(self.rented.models) - known
+            if unknown:
+                raise ValueError(f"rented.models names models not in the pool's set: {sorted(unknown)}")
+
+    def _every_model_is_held_by_somebody(self) -> None:
+        """With the set spread across hosts, a model nobody holds can never be served — and the
+        only symptom would be a 503 for that model alone, long after the pool looked healthy.
+
+        Renting counts as holding only when the pool may actually rent for that model: a lease
+        is what decides whether renting happens at all, but a configuration that could never
+        cover a model however many hosts it bought is wrong on its face.
+        """
+        if self.pool.models_per_host != "declared":
+            return
+        covered: set[str] = set()
+        for host in self.hosts:
+            if not host.disabled:
+                covered.update(self.models_held_by(host))
+        if self.rented is not None:
+            covered.update(self.rented.models if self.rented.models is not None else self.pool.model_set)
+        missing = [name for name in self.pool.model_set if name not in covered]
+        if missing:
+            raise ValueError(
+                f"with pool.models_per_host 'declared', the pool's hosts must between them hold every "
+                f"model in its set, and {missing} would be held by none. Name them on a host's "
+                f"`models`, add a host that holds them, or let rented hosts hold them."
+            )
+
+    def _engine_can_hold_what_the_pool_asks(self) -> None:
+        """An engine that serves one model per process cannot hold the whole set on one host.
+
+        Refused here, at load, rather than discovered after a machine has been rented and can
+        never reach `ready` (D89). An engine the pool cannot resolve is left alone: naming an
+        uninstalled engine is its own error, reported where engines are loaded.
+        """
+        from .engines import EngineNotFound, get_engine
+
+        if self.pool.models_per_host != "all":
+            return
+        try:
+            engine = get_engine(self.engine)
+        except EngineNotFound:
+            return
+        if getattr(engine, "serves_one_model", False):
+            raise ValueError(
+                f"engine {self.engine!r} serves one model per process, so no single host can "
+                f"hold this pool's whole model set. Set pool.models_per_host to 'declared' and the "
+                f"pool will cover the set across its hosts instead. (Holding the set on one "
+                f"machine would need a process in front of several engines, choosing between "
+                f"them by model name; the pool does not ship one.)"
+            )
+
+    def _hosts_can_serve_what_they_are_asked_for(self) -> None:
+        """Every configured host must be able to serve something the pool needs (spec §3).
+
+        With `models_per_host: all` that means a usable variant of *every* model, because the
+        host is asked to hold the whole set. With `declared` it means a usable variant of *at least
+        one* model — a host that can serve nothing in the set is still a mistake worth
+        refusing, but one that can serve only the embedding model is now perfectly good.
+        """
+        whole_set = self.pool.models_per_host == "all"
         for host in self.hosts:
             caps = set(host.capabilities)
+            servable = []
             for name in self.pool.model_set:
                 entry = self.catalog.get(name)
-                if entry is None:
-                    continue
-                if not any(set(v.requires) <= caps for v in entry.variants):
+                if entry is None or any(set(v.requires) <= caps for v in entry.variants):
+                    servable.append(name)
+                elif whole_set:
                     raise ValueError(
                         f"host {host.id!r} has no usable variant of {name!r}: its capabilities "
                         f"{sorted(caps)} meet no variant's requirements. Give it the capability, "
                         f"add a fallback variant with no requirements, or remove the host."
                     )
-        return self
+            if not servable:
+                raise ValueError(
+                    f"host {host.id!r} has no usable variant of any model in the pool's set: its "
+                    f"capabilities {sorted(caps)} meet no variant's requirements. Give it the "
+                    f"capability, add a fallback variant with no requirements, or remove the host."
+                )
 
 
 def load_config(path: str | Path) -> PoolConfig:

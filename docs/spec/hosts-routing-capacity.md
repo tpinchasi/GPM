@@ -243,8 +243,23 @@ not be worth keeping is the tear-down's decision, not this one.
 
 ## 3. The pool's model set
 
-A pool declares **the set of models it serves**, and every host must be able to serve **all of
-them**. How a host holds them is its **residency** policy, set per host:
+A pool declares **the set of models it serves**. How that set is spread over its hosts is
+`pool.models_per_host` (D89):
+
+| `models_per_host` | What each host holds | For |
+|---|---|---|
+| `all` (default) | The pool's whole set. Any ready host can serve any request | The original rule (D23). One engine process holding everything, nothing ever swapped |
+| `declared` | The models that host declares — `models:` on a configured host, `rented.models` for hosts the pool buys. **A host may declare several**; absent, it holds the first model in the set it can serve | An engine that serves **one model per process**; and keeping a 0.3 GB embedding model off a card rented for a 26 B one |
+
+Both keep the property the original rule was bought for: **a host holds its models permanently
+and nothing is ever swapped out.** What `declared` changes is only that the set is whole across
+the pool rather than on every machine.
+
+With `declared`, the pool **refuses at load** any configuration where some model in its set would
+be held by no host — the only other symptom would be a 503 for that one model, long after the pool
+looked healthy, with nothing saying why. A disabled host covers nothing.
+
+How a host holds what it was given is its **residency** policy, set per host:
 
 | `residency` | `ready` means | A model found evicted | For |
 |---|---|---|---|
@@ -255,9 +270,10 @@ Hosts the pool creates are always `pinned`: it configures them, so it sets this 
 On the others the policy is verified by test-connection and every probe.
 
 - The model set belongs to the pool, with its hosts, key and budget. **Leases do not name models.**
-- **A host that cannot hold the full set does not join the pool**, whatever its kind — not
-  loaded on a pinned host, not on disk on an on-demand one. The console says which host fails
-  and by how much. The set, the context length and the smallest host have to agree.
+- **A host that cannot hold what it was given does not join the pool**, whatever its kind — not
+  loaded on a pinned host, not on disk on an on-demand one. Under `all` that is the whole set;
+  under `declared` it is the models that host declares. The console says which host fails and by how
+  much. The set, the context length and the smallest host have to agree.
 - **A request for a model outside the set is refused** (`404 model_not_in_pool`), never loaded.
   Adding a model is a configuration change applied by re-preparing hosts.
 - **Nothing is ever downloaded because a request asked**, on either policy. A tag that is not
@@ -375,8 +391,8 @@ Strict tiers. A lower tier is touched only when every eligible worker above it i
 
 Per request:
 
-1. **Eligible hosts** = state `ready` (the whole model set loaded on a pinned host, on disk on
-   an on-demand one); a usable variant of the requested model for this request (§4.1, including
+1. **Eligible hosts** = state `ready` (everything that host holds loaded on a pinned host, on
+   disk on an on-demand one); a usable variant of the requested model for this request (§4.1, including
    the schema rule) — one that is loaded, or on disk where the host is on-demand; runtime class
    acceptable if the request pinned one. Priority only orders eligible hosts.
 2. Take the **highest-priority tier with an idle worker**.

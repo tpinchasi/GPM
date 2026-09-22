@@ -519,13 +519,21 @@ class Fleet:
             return starts_at
         return max(starts_at, auto.max)
 
+    @property
+    def rented_models(self) -> list[str]:
+        """What a rented host is asked to hold (D89): the pool's whole set, or — where the pool
+        spreads its set across hosts — what the rented configuration names."""
+        if self.config.pool.models_per_host == "all" or self.rented.models is None:
+            return list(self.config.pool.model_set)
+        return list(self.rented.models)
+
     def instance_env(self, workers: Optional[int] = None) -> dict[str, str]:
-        """What makes the engine run this many workers at this context, holding the whole
-        model set — set at creation on hosts the pool creates (spec §2.2)."""
+        """What makes the engine run this many workers at this context, holding the models this
+        host is asked for — set at creation on hosts the pool creates (spec §2.2)."""
         return self.engine.launch_settings(
             workers=workers if workers is not None else self.rented.workers,
             context=self.rented.context_length,
-            n_models=len(self.config.pool.model_set),
+            n_models=len(self.rented_models),
             # The pool reaches this engine through a forward into the machine, never across
             # the network, so it binds loopback and nothing a provider publishes leads to it.
             listen=f"127.0.0.1:{self.rented.engine_port}",
@@ -1369,7 +1377,7 @@ class Fleet:
         from ..catalog import variants_for_host
 
         variants = variants_for_host(
-            self.config.pool.model_set,
+            self.rented_models,
             self.config.catalog,
             frozenset(self.rented.capabilities),
             self.config.engine,

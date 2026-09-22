@@ -104,6 +104,7 @@ engine type.
 class Engine(Protocol):
     interface_version: ClassVar[str] = "1"
     name: ClassVar[str]
+    serves_one_model: ClassVar[bool] = False    # one process, one model?
 
     # --- used by the router, on the request path: must be cheap and never block ---
     def inference_paths(self) -> set[str]: ...                      # paths that take a worker
@@ -116,6 +117,7 @@ class Engine(Protocol):
     async def health(self, conn: Connection) -> Health: ...
     async def models_present(self, conn: Connection) -> set[str]: ...
     async def models_resident(self, conn: Connection) -> set[str]: ...
+    async def occupancy(self, conn: Connection) -> Occupancy | None: ...
     async def pull(self, conn: Connection, tag: str) -> AsyncIterator[PullProgress]: ...
     async def load_and_pin(self, conn: Connection, tags: list[str]) -> None: ...
     async def smoke_test(self, conn: Connection, tag: str, schema: bool) -> SmokeResult: ...
@@ -133,9 +135,36 @@ class Engine(Protocol):
 | `launch_settings` | Environment or flags that make the engine run `workers` requests in parallel at `context`, holding `n_models` models — used only on hosts the pool creates |
 | `smoke_test` | A short fixed generation; with `schema=True`, reports whether a structured-output schema was actually **enforced**, not merely accepted |
 | `looks_corrupt` | Engine-specific signs of a degraded back-end (reserved tokens leaking, repetition collapse); feeds quarantine |
+| `occupancy` | Requests running, requests **waiting inside the engine**, and cache used — or `None` where the engine cannot say, which means "judge me by worker slots". Read by the supervisor on its own pass, never on the request path (D91) |
+| `serves_one_model` | Declared, not inferred. `True` refuses a pool whose `models_per_host` is `all` **at load**, rather than after a machine has been rented that could never become ready (D89) |
 
-The first engine is Ollama. Servers exposing an OpenAI-compatible API (vLLM, llama.cpp's server
-and others) are the natural second adapter: the same interface, different paths and body shapes.
+### Why occupancy exists
+
+Worker slots are exact for an engine that serves one request per slot, and misleading for one
+that batches. A batching engine admitted at a hundred slots is rarely *all* busy and queues the
+overflow internally, so "all workers busy" — which drives queueing, scale-up and the
+`$/h ÷ tokens per second` ranking — would read as headroom while requests piled up somewhere
+the pool cannot see. An engine that knows says so; one that does not is judged as before.
+
+### The wire API
+
+Both shipped engines serve the **OpenAI-shaped `/v1` paths**, and the SDK speaks them by
+default (D89). The router still never translates between APIs: these are the same paths and the
+same bodies on both engines, which is what lets a pool of either answer the same request. Ollama
+also serves its own native API, and those paths keep working; a request arrives on whichever
+surface the app used and is passed through on that surface.
+
+The first engine is Ollama. **The second is vLLM** (D90), which differs in three ways the
+interface had to accommodate:
+
+- **It serves one model per process.** `serves_one_model` is `True`, and such a pool spreads its
+  set across hosts (`models_per_host: declared`).
+- **It cannot fetch a model over its own API.** `pull` refuses, **unretryably** — weights arrive
+  from a model hub before the engine starts, so a vLLM host is prepared through the pool's agent
+  or by its owner. A retryable refusal would have the supervisor retry a download that cannot
+  happen and give up on the host for the wrong reason.
+- **It is launched with its model and holds it for the process's life**, so `load_and_pin`
+  verifies rather than acts, and `models_resident` and `models_available` are the same set.
 
 ---
 

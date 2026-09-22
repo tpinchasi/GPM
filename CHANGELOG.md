@@ -17,9 +17,18 @@ otherwise — and CI refuses a pull request that edits a package's source withou
 
 | Package | Version | What it carries |
 |---|---|---|
-| `gpm-server` | 0.5.0 | Dynamic allocation (D66), buffered delivery (D62), the host agent on rented hosts (D63), per-host worker adjustment (D67, D68), the machine history (D69), allocation edited from the console (D74), and the spending-path fixes D58–D65, D71, D73 |
-| `gpm-client` | 0.2.0 | The SDK widens its time budget to the figure the pool publishes, because a held response makes "first byte" the end of the generation (D62) |
-| `gpm-agent` | 0.2.0 | The heartbeat verb, each model loaded as its own download finishes (D57), and engine settings written where the pool installed it (D63) |
+| `gpm-server` | 0.7.0 | **vLLM as a second engine (D90)**, the OpenAI-shaped `/v1` surface both engines serve (D89), `Engine.occupancy()` (D91), and `pool.models_per_host` — the pool's set may be spread across hosts rather than held on each one (D89). Previously: dynamic allocation (D66), buffered delivery (D62), the host agent on rented hosts (D63), per-host worker adjustment (D67, D68), the machine history (D69), allocation edited from the console (D74), per-GPU pricing and the console levers (D85–D88), and the spending-path fixes D58–D65, D71, D73, D84 |
+| `gpm-client` | 0.3.0 | **`PoolClient` and `AsyncPoolClient` call the `/v1` paths by default** (D89), so one call reaches a pool of either engine; both reply shapes are understood. Previously: the SDK widens its time budget to the figure the pool publishes (D62) |
+| `gpm-agent` | 0.3.0 | **Fetches model weights from a hub itself**, over plain HTTP and resumable by range request, for engines that have no pull of their own (D90); vLLM joins Ollama in its engine registry, with no new protocol verbs. Previously: the heartbeat verb, each model loaded as its own download finishes (D57, D83), and engine settings written where the pool installed it (D63) |
+
+### One change a caller can see
+
+`PoolClient.chat()` and `.embed()` now post to `/v1/chat/completions` and `/v1/embeddings`
+rather than Ollama's native paths. Ollama serves both, so a pool of Ollama hosts answers either
+— but the **reply shape differs**, and `format=` is sent as `response_format`. Code reading
+`reply.content` is unaffected: the SDK understands both shapes. Code reading `reply.raw` should
+either expect the OpenAI shape or construct the client with `api="ollama"` to keep the previous
+behaviour exactly. **`pool_transport()` is unchanged** — it carries whatever the app sends.
 
 The **app contract stays at 1**: every dialect item added is optional, and no status code
 changed meaning, so an application built against the first version still works untouched.

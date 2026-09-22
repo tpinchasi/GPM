@@ -8,13 +8,22 @@ the agent's settings name which.
 from __future__ import annotations
 
 import json
+import shutil
+from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
 import httpx
 
+from . import modelhub
+
 
 class OllamaFacts:
     name = "ollama"
+
+    def __init__(self, settings: Any = None) -> None:
+        #: Unused here — this engine answers every question about itself over its own API.
+        #: Accepted so that every engine in the registry is built the same way.
+        self.settings = settings
 
     async def describe(self, client: httpx.AsyncClient) -> dict[str, Any]:
         """Version, models on disk with sizes, models loaded. An engine that does not answer
@@ -156,9 +165,156 @@ class EngineRefused(Exception):
     """The engine said no. The message is the engine's, passed on to the operator."""
 
 
-_ENGINES = {"ollama": OllamaFacts}
+class VllmFacts:
+    """vLLM, which differs from the first engine in three ways the agent has to know about.
+
+    **Weights do not arrive through the engine.** There is no pull endpoint; the engine is
+    started with a directory and serves what is in it. So a fetch here is an HTTP transfer from
+    a model hub into the machine's models directory, which is what `modelhub` does.
+
+    **A model becomes servable only when the engine restarts.** Downloading is not loading.
+    `hold` therefore reports honestly whether the engine is serving the tag, and says what is
+    missing when it is not, rather than pretending a fetched model is a held one.
+
+    **The pool's text never reaches the start command.** The engine needs to know which model to
+    serve, and that name came from the pool — so it is never written into the engine's
+    environment. The host's own start command reads the models directory instead and serves
+    what it finds, taking the served name from the directory the agent created (D41 stands:
+    the pool sends numbers, the owner's command supplies everything else).
+    """
+
+    name = "vllm"
+
+    def __init__(self, settings: Any = None) -> None:
+        self.settings = settings
+
+    @property
+    def _models_dir(self) -> str:
+        return getattr(self.settings, "models_path", None) or "~/.cache/gpm-models"
+
+    async def describe(self, client: httpx.AsyncClient) -> dict[str, Any]:
+        """What this engine is serving, and what is on disk waiting for a restart.
+
+        The two are different sets here, and reporting them as one would hide the state a vLLM
+        host spends its whole preparation in: weights present, engine not yet serving them.
+        """
+        try:
+            version = (await client.get("/version")).json().get("version")
+        except (httpx.HTTPError, ValueError):
+            version = None
+        try:
+            served = (await client.get("/v1/models")).raise_for_status().json().get("data", [])
+        except (httpx.HTTPError, ValueError) as exc:
+            return {"name": self.name, "answers": False, "detail": str(exc) or type(exc).__name__}
+        return {
+            "name": self.name,
+            "answers": True,
+            "version": version,
+            "models_on_disk": self._on_disk(),
+            "models_loaded": sorted(
+                entry["id"] for entry in served if isinstance(entry, dict) and entry.get("id")
+            ),
+        }
+
+    def _on_disk(self) -> list[dict[str, Any]]:
+        root = Path(self._models_dir).expanduser()
+        found = []
+        if not root.is_dir():
+            return found
+        for directory in sorted(p for p in root.iterdir() if p.is_dir()):
+            size = sum(f.stat().st_size for f in directory.rglob("*") if f.is_file())
+            found.append({"tag": directory.name.replace("__", "/"), "size_bytes": size})
+        return found
+
+    async def pull(self, client: httpx.AsyncClient, tag: str) -> AsyncIterator[tuple[int, int]]:
+        """Fetch from the model hub, not from the engine — so the engine's client is unused."""
+        try:
+            async for completed, total in modelhub.fetch(tag, self._models_dir):
+                yield completed, total
+        except modelhub.HubRefused as no:
+            raise EngineRefused(str(no)) from no
+
+    async def hold(self, client: httpx.AsyncClient, tag: str, *, pinned: bool) -> None:
+        """Serving a model here is a property of how the engine was started, not something that
+        can be asked of it while it runs. So this reports rather than acts: a tag the engine
+        serves is held — permanently, by construction, which is what the pool wanted — and a
+        tag it does not serve needs the engine restarted, which only an operator causes (D41).
+        """
+        if not pinned:
+            # Nothing to release: this engine holds one model for the life of the process, and
+            # handing its lifetime back is not something it offers.
+            return
+        try:
+            served = (await client.get("/v1/models")).raise_for_status().json().get("data", [])
+        except (httpx.HTTPError, ValueError) as exc:
+            raise EngineRefused(f"the engine did not say what it serves: {exc}") from exc
+        if tag in {e.get("id") for e in served if isinstance(e, dict)}:
+            return
+        on_disk = {m["tag"] for m in self._on_disk()}
+        raise EngineRefused(
+            f"the engine is not serving {tag}: it serves "
+            f"{sorted(e.get('id') for e in served if isinstance(e, dict)) or 'nothing'}. "
+            + (
+                "The weights are on disk; this engine picks up a model only when it is restarted."
+                if tag in on_disk
+                else "The weights are not on disk either."
+            )
+        )
+
+    async def delete(self, client: httpx.AsyncClient, tag: str) -> None:
+        """Remove the weights from disk. The engine is not asked: it has no delete, and a model
+        it is currently serving is held open by the process until that process restarts."""
+        try:
+            directory = modelhub.directory_for(self._models_dir, tag)
+        except modelhub.HubRefused as no:
+            raise EngineRefused(str(no)) from no
+        if not directory.is_dir():
+            return
+        try:
+            shutil.rmtree(directory)
+        except OSError as exc:
+            raise EngineRefused(f"could not remove {tag} from disk: {exc}") from exc
+
+    def launch_environment(
+        self, workers: int, models_held: int, context: Optional[int] = None
+    ) -> dict[str, str]:
+        """The pool's numbers under this engine's names — numbers only, as always.
+
+        `models_held` is deliberately not passed on: one process serves one model here, so a
+        count of the pool's whole set is a number this engine could not honour.
+        """
+        environment = {
+            "GPM_VLLM_MAX_NUM_SEQS": str(workers),
+            # The engine refuses to start with a batch smaller than the number of sequences it
+            # is told to run, so this is a floor before it is anything else.
+            "GPM_VLLM_MAX_NUM_BATCHED_TOKENS": str(max(workers, workers * 256)),
+        }
+        if context is not None:
+            environment["GPM_VLLM_MAX_MODEL_LEN"] = str(context)
+        return environment
+
+    def settings_from_environment(
+        self, environment: Optional[dict[str, str]]
+    ) -> Optional[dict[str, Optional[int]]]:
+        if not environment:
+            return None
+
+        def number(name: str) -> Optional[int]:
+            value = environment.get(name, "")
+            return int(value) if value.isdigit() else None
+
+        return {
+            "workers": number("GPM_VLLM_MAX_NUM_SEQS"),
+            # Always one, and said rather than left blank: the pool compares what it asked for
+            # with what was applied, and a missing number reads as "not applied yet".
+            "models_held": 1,
+            "context": number("GPM_VLLM_MAX_MODEL_LEN"),
+        }
 
 
-def engine_facts(name: str) -> Optional[OllamaFacts]:
+_ENGINES = {"ollama": OllamaFacts, "vllm": VllmFacts}
+
+
+def engine_facts(name: str, settings: Any = None) -> Optional[Any]:
     factory = _ENGINES.get(name)
-    return factory() if factory else None
+    return factory(settings) if factory else None
