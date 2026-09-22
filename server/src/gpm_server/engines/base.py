@@ -69,6 +69,15 @@ class Engine(Protocol):
     #: one process leaves this False.
     serves_one_model: ClassVar[bool] = False
 
+    #: Where this engine listens by default, so a pool need not state a port it cannot choose.
+    default_port: ClassVar[int] = 0
+
+    #: Words that appear in an image built for this engine. Used only to catch a configuration
+    #: that names one engine and an image built for a *different* one — a mistake that is not
+    #: found until a machine has been rented, started, and never answered (D92). An image whose
+    #: name matches no engine is left alone: a private build may be called anything.
+    image_words: ClassVar[tuple[str, ...]] = ()
+
     # --- request path: cheap, synchronous, no I/O ---
 
     def inference_paths(self) -> set[str]:

@@ -612,6 +612,20 @@ class LimitsConfig(BaseModel):
     max_hourly_burn: Optional[float] = Field(default=None, gt=0)
 
 
+class EngineImage(BaseModel):
+    """One build of the engine, and the accelerator driver it needs (D92)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Pinned, never a floating tag (threat model T10).
+    image: str
+    #: The driver this build needs, as "major" or "major.minor". Compared part by part, so
+    #: "580" admits "580.65" and refuses "550.144".
+    min_driver: str
+    #: Optional: what this build is for, shown beside the choice the pool made.
+    note: Optional[str] = None
+
+
 class RentedConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -648,6 +662,16 @@ class RentedConfig(BaseModel):
     mode: Literal["interruptible", "on_demand", "cheaper"] = "interruptible"
     #: Pinned, never a floating tag (threat model T10).
     image: str = "ollama/ollama:0.34.2"
+    #: Builds of the same engine for different accelerator generations, **chosen per machine**
+    #: (D92). An engine is commonly published once per CUDA line — a newer one is smaller and
+    #: faster but needs a newer driver — and a pool with a single image must either refuse every
+    #: older machine or fail on it after paying for it. Given these, the pool takes the **first
+    #: whose driver floor the machine meets**, so list them newest first; a machine that meets
+    #: none is refused before it is bid on, with the reason.
+    #:
+    #: This replaces `image` when present. `offer_policy.min_driver_version` still applies and
+    #: is the floor below which no machine is wanted at all, whatever image would run on it.
+    images: list["EngineImage"] = Field(default_factory=list)
     disk_gb: float = 60.0
     workers: int = Field(default=1, ge=1)
     capabilities: list[str] = Field(default_factory=list)
@@ -656,8 +680,9 @@ class RentedConfig(BaseModel):
     ssh_key: Optional[str] = None
     ssh_user: str = "root"
     known_hosts: str = "~/.config/gpm/known_hosts"
-    #: Where the engine listens inside the instance. Not guessed: state it.
-    engine_port: int = 11434
+    #: Where the engine listens inside the instance. Unset means the engine's own default —
+    #: 11434 for Ollama, 8000 for vLLM — so a pool need not state a port it cannot choose.
+    engine_port: Optional[int] = None
     #: Context length the engine is launched with on hosts the pool creates.
     context_length: int = 8192
     #: Runs after the dead-man timer is armed, for images whose entrypoint the provider's
@@ -723,6 +748,7 @@ class PoolConfig(BaseModel):
         if unknown:
             raise ValueError(f"catalog names not in the pool's model set: {sorted(unknown)}")
         self._engine_can_hold_what_the_pool_asks()
+        self._images_are_built_for_this_engine()
         self._hosts_can_serve_what_they_are_asked_for()
         self._declared_models_are_in_the_set()
         self._every_model_is_held_by_somebody()
@@ -836,6 +862,61 @@ class PoolConfig(BaseModel):
                 f"machine would need a process in front of several engines, choosing between "
                 f"them by model name; the pool does not ship one.)"
             )
+
+    def engine_port(self) -> int:
+        """Where the engine listens on a host the pool creates (D92).
+
+        Stated wins; otherwise the engine's own default. A pool that changed engine and kept the
+        previous engine's port would dial a closed door on every host it rented.
+        """
+        if self.rented is not None and self.rented.engine_port is not None:
+            return self.rented.engine_port
+        from .engines import EngineNotFound, get_engine
+
+        try:
+            return get_engine(self.engine).default_port or 11434
+        except EngineNotFound:
+            return 11434
+
+    def _images_are_built_for_this_engine(self) -> None:
+        """Refuse an image built for a *different* engine than the one configured (D92).
+
+        A pool set to vLLM with an Ollama image rents a machine, starts the wrong server, never
+        reaches `ready`, and pays until the give-up window closes — and nothing before this said
+        anything was wrong. Only a clash is refused: an image matching no known engine is left
+        alone, because a private build may be called anything.
+        """
+        if self.rented is None:
+            return
+        from .engines import EngineNotFound, available_engines, get_engine
+
+        try:
+            mine = get_engine(self.engine)
+        except EngineNotFound:
+            return
+        others = {}
+        for name in available_engines():
+            if name == self.engine:
+                continue
+            try:
+                others[name] = get_engine(name).image_words
+            except EngineNotFound:
+                continue
+        # `images` replaces `image`, so only what would actually be used is checked — the
+        # unused default must not refuse a configuration that never names it.
+        named = [i.image for i in self.rented.images] or [self.rented.image]
+        for image in named:
+            lowered = image.lower()
+            if any(word in lowered for word in mine.image_words):
+                continue
+            for other, words in others.items():
+                if any(word in lowered for word in words):
+                    raise ValueError(
+                        f"engine is {self.engine!r} but the image {image!r} is built for "
+                        f"{other!r}. A host rented from it would start the wrong server, never "
+                        f"answer, and be paid for until it was given up. Name an image for "
+                        f"{self.engine!r}, or change the engine."
+                    )
 
     def _hosts_can_serve_what_they_are_asked_for(self) -> None:
         """Every configured host must be able to serve something the pool needs (spec §3).

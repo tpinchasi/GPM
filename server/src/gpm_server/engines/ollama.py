@@ -28,6 +28,8 @@ def _decode(body: bytes) -> dict[str, Any]:
 class OllamaEngine:
     interface_version: ClassVar[str] = "1"
     name: ClassVar[str] = "ollama"
+    default_port: ClassVar[int] = 11434
+    image_words: ClassVar[tuple[str, ...]] = ("ollama",)
 
     def inference_paths(self) -> set[str]:
         """Both surfaces: this engine's own API, and the OpenAI-shaped one it also serves.

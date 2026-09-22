@@ -49,6 +49,7 @@ from ..strategies import (
     decide_rent,
     decide_teardown,
     filter_name,
+    image_for,
     price_bid,
     rank_offers,
 )
@@ -418,7 +419,7 @@ class Fleet:
         return onstart_script(
             self.provider.self_terminate_request(self.rented.teardown.deadman_action),
             window_s=int(self.rented.teardown.deadman_minutes * 60),
-            engine_port=self.rented.engine_port,
+            engine_port=self.engine_port,
             public_key=self.pool_public_key(),
             ssh_user=self.rented.ssh_user,
             extra=self.rented.engine_start,
@@ -520,12 +521,42 @@ class Fleet:
         return max(starts_at, auto.max)
 
     @property
+    def engine_port(self) -> int:
+        """Where this pool's engine listens on a host it creates — stated, or the engine's own
+        default (D92). Keeping the previous engine's port after changing engine would have the
+        pool dial a closed door on every machine it rented."""
+        return self.config.engine_port()
+
+    @property
     def rented_models(self) -> list[str]:
         """What a rented host is asked to hold (D89): the pool's whole set, or — where the pool
         spreads its set across hosts — what the rented configuration names."""
         if self.config.pool.models_per_host == "all" or self.rented.models is None:
             return list(self.config.pool.model_set)
         return list(self.rented.models)
+
+    def image_for(self, offer) -> tuple[Optional[str], str]:
+        """Which build of the engine this machine gets, and why (D92).
+
+        With a single `image` the answer never varies, and the driver floor in the offer policy
+        is what keeps an unusable machine out. With several, the pool takes the first whose
+        driver floor this machine meets — so a newer, faster build is used where it can be, and
+        an older machine still gets a build that runs rather than being refused outright.
+        """
+        images = self.rented.images
+        if not images:
+            return self.rented.image, "the pool's only image"
+        chosen = image_for(offer, images)
+        if chosen is None:
+            wanted = ", ".join(f"{i.image} needs {i.min_driver}" for i in images)
+            return None, (
+                f"driver: this machine reports {offer.driver_version or 'nothing'}, and no build "
+                f"of the engine runs on it ({wanted})"
+            )
+        return chosen.image, (
+            f"driver {offer.driver_version} meets {chosen.min_driver}"
+            + (f" — {chosen.note}" if chosen.note else "")
+        )
 
     def instance_env(self, workers: Optional[int] = None) -> dict[str, str]:
         """What makes the engine run this many workers at this context, holding the models this
@@ -536,7 +567,7 @@ class Fleet:
             n_models=len(self.rented_models),
             # The pool reaches this engine through a forward into the machine, never across
             # the network, so it binds loopback and nothing a provider publishes leads to it.
-            listen=f"127.0.0.1:{self.rented.engine_port}",
+            listen=f"127.0.0.1:{self.engine_port}",
         )
 
     def max_lease_hours(self) -> Optional[float]:
@@ -582,7 +613,7 @@ class Fleet:
             ssh_port=connection.ssh_port or 22,
             ssh_user=connection.ssh_user or self.rented.ssh_user,
             ssh_key=self.rented.ssh_key,
-            remote_port=self.rented.engine_port,
+            remote_port=self.engine_port,
             known_hosts=self.rented.known_hosts,
         )
         tunnel = SshTunnel(host_id, transport)
@@ -672,7 +703,7 @@ class Fleet:
                 run=lambda command: self.run_on_host(host, command),
                 push=lambda data, path: self.push_to_host(host, data, path),
                 archive=archive,
-                engine_port=self.rented.engine_port,
+                engine_port=self.engine_port,
             )
         except hostagent.AgentInstallFailed as exc:
             host.agent_attempts += 1
@@ -2051,12 +2082,22 @@ class Fleet:
                 )
                 continue
 
+            image, image_why = self.image_for(offer)
+            if image is None:
+                # Refused *before* the bid: renting a machine whose driver cannot run any build
+                # of the engine buys a host that can never answer, and pays for it until the
+                # give-up window closes (D92).
+                self.events.record(
+                    "offer_refused", f"{offer.machine_id}: {image_why}", lease_id=lease.lease_id
+                )
+                continue
+
             host_id = f"rented-{uuid.uuid4().hex[:6]}"
             workers, workers_why = self.workers_for(offer)
             launch_workers = self.launch_workers_for(workers)
             spec = InstanceSpec(
                 label=f"{self.label_prefix}{host_id}",
-                image=self.rented.image,
+                image=image,
                 disk_gb=self.rented.disk_gb,
                 # Launched at what it may be asked for, used at what it is given (D68).
                 env=self.instance_env(launch_workers),

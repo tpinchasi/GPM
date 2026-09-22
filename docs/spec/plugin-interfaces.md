@@ -166,6 +166,48 @@ interface had to accommodate:
 - **It is launched with its model and holds it for the process's life**, so `load_and_pin`
   verifies rather than acts, and `models_resident` and `models_available` are the same set.
 
+### Starting vLLM on a host the pool creates
+
+The pool sends **numbers**, never a command (D41). It writes them into the host's engine
+environment file, and the host's own `engine_start` reads them — which is why the example below
+lives in an operator's configuration and not in the pool:
+
+```yaml
+rented:
+  engine_start: |
+    D=$(ls -d /models/*/ | head -1); N=$(basename "$D" | sed 's|__|/|')
+    nohup vllm serve "$D" --served-model-name "$N" \
+      --host 127.0.0.1 --port 8000 \
+      --max-num-seqs "${GPM_VLLM_MAX_NUM_SEQS:-64}" \
+      --max-num-batched-tokens "${GPM_VLLM_MAX_NUM_BATCHED_TOKENS:-16384}" \
+      --max-model-len "${GPM_VLLM_MAX_MODEL_LEN:-32768}" \
+      --gpu-memory-utilization 0.90 >/var/log/vllm.log 2>&1 &
+```
+
+Two things it does that are not obvious:
+
+- **It reads the model from disk rather than being told.** The agent fetched it and named the
+  directory after the repository, with the owner's `/` flattened to `__`; the command turns that
+  back into the served name. So the model's name never travels from the pool into a command.
+- **It binds loopback.** The pool reaches the engine through a forward into the machine, so
+  anything wider only exposes it (D77).
+
+### Choosing the build per machine
+
+An engine published once per accelerator generation is configured as a list, newest first, and
+the pool takes the first build a machine's driver can run (D92):
+
+```yaml
+rented:
+  images:
+    - { image: "vastai/vllm:v0.29.0-cuda-13.0", min_driver: "580" }
+    - { image: "vastai/vllm:v0.29.0-cuda-12.9", min_driver: "550" }
+```
+
+A machine that can run none is refused **before it is bid on**. `image:` alone still means one
+build for every machine, and the driver floor in the offer policy is then what keeps an unusable
+machine out.
+
 ---
 
 ## 3. Strategy interface (v1)

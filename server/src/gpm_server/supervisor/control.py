@@ -330,6 +330,24 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     if fleet is not None
                     else None
                 ),
+                # What would actually be started on a machine this pool rents (D92). Together
+                # these decide whether a rental can work at all, and until now neither was
+                # visible anywhere: an engine and an image for a different engine looked
+                # exactly like a correct pool until a host was bought and never answered.
+                "engine": {
+                    "name": supervisor.config.engine,
+                    "models_per_host": supervisor.config.pool.models_per_host,
+                    "port": supervisor.config.engine_port(),
+                    "images": (
+                        [
+                            {"image": i.image, "min_driver": i.min_driver, "note": i.note}
+                            for i in supervisor.config.rented.images
+                        ]
+                        or [{"image": supervisor.config.rented.image, "min_driver": None, "note": None}]
+                    )
+                    if supervisor.config.rented is not None
+                    else [],
+                },
             }
 
     @app.get("/pool/status")

@@ -15,7 +15,7 @@ import math
 import re
 from typing import Any, Optional, Sequence
 
-from .config import BiddingConfig, OfferPolicy, ScaleConfig, TeardownConfig
+from .config import BiddingConfig, EngineImage, OfferPolicy, ScaleConfig, TeardownConfig
 from .providers.base import Offer
 
 
@@ -317,6 +317,21 @@ def driver_below(reported: Optional[str], floor: str) -> Optional[bool]:
         return None
     width = max(len(got), len(want))
     return got + (0,) * (width - len(got)) < want + (0,) * (width - len(want))
+
+
+def image_for(offer: Offer, images: Sequence[EngineImage]) -> Optional[EngineImage]:
+    """The first build this machine's driver can run, or None if it can run none (D92).
+
+    Listed newest first, so "first that fits" is also "best that fits". A machine whose driver
+    the provider does not report is **not** given the benefit of the doubt: the same reasoning
+    as the driver floor itself (D81), where an unknown driver on an 80GB card turned out to be
+    an engine quietly serving from the processor at an accelerator's price.
+    """
+    for candidate in images:
+        below = driver_below(offer.driver_version, candidate.min_driver)
+        if below is False:
+            return candidate
+    return None
 
 
 def reject_reasons(offer: Offer, policy: OfferPolicy, model_set_gb: float = 0.0) -> list[str]:

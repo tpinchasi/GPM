@@ -191,7 +191,8 @@ def test_that_same_engine_is_fine_once_the_set_is_spread():
         pool={"models_per_host": "declared"},
         hosts=[{"id": "gpu-1", "kind": "local", "workers": 1, "models": [BIG],
                 "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}}],
-        rented=rented(),
+        # An image built for this engine: naming one built for another is refused (D92).
+        rented=rented(image="vastai/vllm:v0.29.0-cuda-12.9"),
     )
     assert cfg.engine == "vllm" and cfg.models_held_by(cfg.hosts[0]) == [BIG]
 
