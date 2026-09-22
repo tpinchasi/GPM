@@ -158,7 +158,7 @@ The first engine is Ollama. **The second is vLLM** (D90), which differs in three
 interface had to accommodate:
 
 - **It serves one model per process.** `serves_one_model` is `True`, and such a pool spreads its
-  set across hosts (`models_per_host: one`).
+  set across hosts (`models_per_host: declared`).
 - **It cannot fetch a model over its own API.** `pull` refuses, **unretryably** — weights arrive
   from a model hub before the engine starts, so a vLLM host is prepared through the pool's agent
   or by its owner. A retryable refusal would have the supervisor retry a download that cannot

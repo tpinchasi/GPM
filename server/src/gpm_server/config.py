@@ -194,7 +194,7 @@ class HostConfig(BaseModel):
     #: Either way nothing is ever downloaded because a request asked for it (spec §3).
     residency: Literal["pinned", "on_demand"] = "pinned"
     #: Which of the pool's models this host holds, when the pool spreads its set across hosts
-    #: (`pool.models_per_host: one`, D89). Absent there means the first model in the set this
+    #: (`pool.models_per_host: declared`, D89). Absent there means the first model in the set this
     #: host can serve — deterministic, and reported, rather than left to chance. Meaningless
     #: when every host holds everything, and refused there so it cannot read as a restriction
     #: the pool is quietly ignoring.
@@ -340,13 +340,13 @@ class PoolSettings(BaseModel):
     #: How the pool's model set is spread over its hosts (D89).
     #:
     #: `all` is the original rule (D23): every host holds the whole set, loaded permanently, so
-    #: any ready host can serve any request and nothing is ever swapped. `one` keeps the second
+    #: any ready host can serve any request and nothing is ever swapped. `declared` keeps the second
     #: half of that promise and drops the first — a host holds a single model, permanently, and
     #: the *pool* covers the set rather than each machine. Nothing swaps under either.
     #:
-    #: `one` exists because some engines serve exactly one model per process, and because a
+    #: `declared` exists because some engines serve exactly one model per process, and because a
     #: 0.3 GB embedding model does not need to sit on the card that was rented for a 26B one.
-    models_per_host: Literal["all", "one"] = "all"
+    models_per_host: Literal["all", "declared"] = "all"
     queue_timeout_s: float = 30.0
     probe_interval_s: float = 10.0
     #: How often the router re-reads the host table the supervisor publishes.
@@ -616,7 +616,7 @@ class RentedConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     #: Which of the pool's models a rented host holds, when the pool spreads its set across
-    #: hosts (`pool.models_per_host: one`, D89). This is where the money decision lives: a
+    #: hosts (`pool.models_per_host: declared`, D89). This is where the money decision lives: a
     #: 0.3 GB embedding model does not need the card that was rented for a 26 B one, so a pool
     #: can rent only for the models that justify the price and serve the rest from machines it
     #: already has. Absent there means rented hosts may hold any model the pool still needs.
@@ -731,7 +731,7 @@ class PoolConfig(BaseModel):
     def models_held_by(self, host: "HostConfig") -> list[str]:
         """Which of the pool's models this configured host holds (D89).
 
-        With `all`, the whole set — that is what the setting means. With `one`, what the host
+        With `all`, the whole set — that is what the setting means. With `declared`, what the host
         declared, or the first model in the set it can serve. "First it can serve" is chosen so
         the answer is stable across restarts and explainable in one sentence; a pool that wants
         a different split says so per host.
@@ -756,7 +756,7 @@ class PoolConfig(BaseModel):
         """A declared model the pool does not serve is a typo, and a silent one: the host would
         simply never be eligible for anything, with nothing said about why."""
         known = set(self.pool.model_set)
-        spread = self.pool.models_per_host == "one"
+        spread = self.pool.models_per_host == "declared"
         for host in self.hosts:
             if host.models is None:
                 continue
@@ -764,7 +764,7 @@ class PoolConfig(BaseModel):
                 raise ValueError(
                     f"host {host.id!r} names the models it holds, but pool.models_per_host is "
                     f"'all', which means every host holds the whole set. Remove the host's "
-                    f"`models`, or set pool.models_per_host to 'one'."
+                    f"`models`, or set pool.models_per_host to 'declared'."
                 )
             if not host.models:
                 raise ValueError(f"host {host.id!r} declares an empty `models`: it could serve nothing")
@@ -797,7 +797,7 @@ class PoolConfig(BaseModel):
         is what decides whether renting happens at all, but a configuration that could never
         cover a model however many hosts it bought is wrong on its face.
         """
-        if self.pool.models_per_host != "one":
+        if self.pool.models_per_host != "declared":
             return
         covered: set[str] = set()
         for host in self.hosts:
@@ -808,7 +808,7 @@ class PoolConfig(BaseModel):
         missing = [name for name in self.pool.model_set if name not in covered]
         if missing:
             raise ValueError(
-                f"with pool.models_per_host 'one', the pool's hosts must between them hold every "
+                f"with pool.models_per_host 'declared', the pool's hosts must between them hold every "
                 f"model in its set, and {missing} would be held by none. Name them on a host's "
                 f"`models`, add a host that holds them, or let rented hosts hold them."
             )
@@ -831,7 +831,7 @@ class PoolConfig(BaseModel):
         if getattr(engine, "serves_one_model", False):
             raise ValueError(
                 f"engine {self.engine!r} serves one model per process, so no single host can "
-                f"hold this pool's whole model set. Set pool.models_per_host to 'one' and the "
+                f"hold this pool's whole model set. Set pool.models_per_host to 'declared' and the "
                 f"pool will cover the set across its hosts instead. (Holding the set on one "
                 f"machine would need a process in front of several engines, choosing between "
                 f"them by model name; the pool does not ship one.)"
@@ -841,7 +841,7 @@ class PoolConfig(BaseModel):
         """Every configured host must be able to serve something the pool needs (spec §3).
 
         With `models_per_host: all` that means a usable variant of *every* model, because the
-        host is asked to hold the whole set. With `one` it means a usable variant of *at least
+        host is asked to hold the whole set. With `declared` it means a usable variant of *at least
         one* model — a host that can serve nothing in the set is still a mistake worth
         refusing, but one that can serve only the embedding model is now perfectly good.
         """

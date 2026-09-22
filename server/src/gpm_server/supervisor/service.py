@@ -737,7 +737,7 @@ class Supervisor:
 
     def _rented_models(self) -> list[str]:
         """What a rented host is asked to hold (D89). With `all`, the pool's whole set; with
-        `one`, what the rented configuration names, or anything the pool still needs."""
+        `declared`, what the rented configuration names, or anything the pool still needs."""
         rented = self.config.rented
         if self.config.pool.models_per_host == "all" or rented is None or rented.models is None:
             return list(self.config.pool.model_set)

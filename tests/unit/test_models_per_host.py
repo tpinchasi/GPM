@@ -1,8 +1,10 @@
 """How the pool's model set is spread over its hosts (D89).
 
-`all` is the original rule (D23): every host holds everything. `one` spreads the set across
-hosts — which is what an engine serving a single model per process needs, and what lets a
-0.3 GB embedding model stay off a card rented for a 26 B one.
+`all` is the original rule (D23): every host holds everything. `declared` spreads the set
+across hosts — which is what an engine serving a single model per process needs, and what lets
+a 0.3 GB embedding model stay off a card rented for a 26 B one. Note that `declared` does not
+mean *one* model: a host may declare several, which is how a laptop keeps the whole set while
+rented hosts each hold the one that justifies their price.
 """
 
 import pytest
@@ -51,7 +53,7 @@ def test_by_default_every_host_holds_the_whole_set():
 
 def test_a_host_holds_what_it_declares():
     cfg = config(
-        pool={"models_per_host": "one"},
+        pool={"models_per_host": "declared"},
         hosts=[
             {"id": "gpu-1", "kind": "local", "workers": 1, "models": [BIG],
              "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}},
@@ -66,7 +68,7 @@ def test_a_host_holds_what_it_declares():
 def test_a_host_that_declares_nothing_takes_the_first_model_it_can_serve():
     """Stable across restarts and explainable in one sentence — rather than left to chance."""
     cfg = config(
-        pool={"models_per_host": "one"},
+        pool={"models_per_host": "declared"},
         hosts=[{"id": "gpu-1", "kind": "local", "workers": 1,
                 "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}}],
         rented=rented(),
@@ -78,7 +80,7 @@ def test_rented_hosts_can_be_bought_for_only_the_models_that_justify_the_price()
     """The money decision: a 0.3 GB embedding model does not need the card rented for a 26 B
     one, so the pool rents for the big model and serves the rest from machines it has."""
     cfg = config(
-        pool={"models_per_host": "one"},
+        pool={"models_per_host": "declared"},
         hosts=[{"id": "laptop", "kind": "local", "workers": 1, "models": [SMALL, EMBED],
                 "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}}],
         rented=rented(models=[BIG]),
@@ -94,7 +96,7 @@ def test_a_model_no_host_would_hold_is_refused_at_load():
     healthy — and nothing would say why."""
     with pytest.raises(ValueError, match="would be held by none"):
         config(
-            pool={"models_per_host": "one"},
+            pool={"models_per_host": "declared"},
             hosts=[{"id": "gpu-1", "kind": "local", "workers": 1, "models": [BIG],
                     "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}}],
         )
@@ -102,7 +104,7 @@ def test_a_model_no_host_would_hold_is_refused_at_load():
 
 def test_renting_covers_what_configured_hosts_do_not():
     config(
-        pool={"models_per_host": "one"},
+        pool={"models_per_host": "declared"},
         hosts=[{"id": "gpu-1", "kind": "local", "workers": 1, "models": [BIG],
                 "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}}],
         rented=rented(),
@@ -112,7 +114,7 @@ def test_renting_covers_what_configured_hosts_do_not():
 def test_renting_for_one_model_does_not_cover_the_others():
     with pytest.raises(ValueError, match="would be held by none"):
         config(
-            pool={"models_per_host": "one"},
+            pool={"models_per_host": "declared"},
             hosts=[{"id": "gpu-1", "kind": "local", "workers": 1, "models": [BIG],
                     "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}}],
             rented=rented(models=[BIG]),
@@ -123,7 +125,7 @@ def test_a_disabled_host_covers_nothing():
     """It is not serving, so counting it would have the pool pass a check it fails in fact."""
     with pytest.raises(ValueError, match="would be held by none"):
         config(
-            pool={"models_per_host": "one"},
+            pool={"models_per_host": "declared"},
             hosts=[
                 {"id": "gpu-1", "kind": "local", "workers": 1, "models": [BIG],
                  "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}},
@@ -144,7 +146,7 @@ def test_naming_models_while_every_host_holds_everything_is_refused_not_ignored(
 def test_a_model_outside_the_pools_set_is_a_typo_worth_naming():
     with pytest.raises(ValueError, match="not in the pool's set"):
         config(
-            pool={"models_per_host": "one"},
+            pool={"models_per_host": "declared"},
             hosts=[{"id": "gpu-1", "kind": "local", "workers": 1, "models": ["gemma4:31b"],
                     "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}}],
             rented=rented(),
@@ -154,7 +156,7 @@ def test_a_model_outside_the_pools_set_is_a_typo_worth_naming():
 def test_a_host_declaring_no_models_at_all_is_refused():
     with pytest.raises(ValueError, match="could serve nothing"):
         config(
-            pool={"models_per_host": "one"},
+            pool={"models_per_host": "declared"},
             hosts=[{"id": "gpu-1", "kind": "local", "workers": 1, "models": [],
                     "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}}],
             rented=rented(),
@@ -164,7 +166,7 @@ def test_a_host_declaring_no_models_at_all_is_refused():
 def test_a_host_asked_for_a_build_its_platform_cannot_run_is_refused():
     with pytest.raises(ValueError, match="meet no variant's requirements"):
         config(
-            pool={"models_per_host": "one"},
+            pool={"models_per_host": "declared"},
             catalog={BIG: {"variants": [{"tag": "gemma4:26b-mlx", "requires": ["apple-silicon"]}]}},
             hosts=[{"id": "cuda-1", "kind": "local", "workers": 1, "models": [BIG],
                     "capabilities": ["cuda"],
@@ -186,7 +188,7 @@ def test_an_engine_that_serves_one_model_cannot_be_asked_to_hold_the_whole_set()
 def test_that_same_engine_is_fine_once_the_set_is_spread():
     cfg = config(
         engine="vllm",
-        pool={"models_per_host": "one"},
+        pool={"models_per_host": "declared"},
         hosts=[{"id": "gpu-1", "kind": "local", "workers": 1, "models": [BIG],
                 "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}}],
         rented=rented(),
