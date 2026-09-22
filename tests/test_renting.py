@@ -894,3 +894,35 @@ def test_a_provider_back_off_note_does_not_nest():
     waiting = waiting[: waiting.index("return []")]
     assert "self._offer_refusal" in waiting
     assert "self.last_offer_error or" not in waiting, "the note is built from itself again"
+
+
+# --- a ceiling per accelerator, not per machine (D85) ---
+
+
+def test_a_multi_gpu_machine_is_judged_by_the_card_not_the_bill():
+    """The owner, looking at a market the pool could not buy from: "some of the hosts we rent
+    have more than one GPU and the price is accordingly, but since I cap it at machine level I
+    can't get them." Measured on the live market the same day: 19 of 64 suitable offers were
+    multi-GPU and every one was refused, including 2x RTX PRO 6000 S at $1.335 a card, while
+    the pool was running single cards of that model at $1.214 and $1.469."""
+    policy = OfferPolicy(max_all_in_per_gpu=1.60)
+
+    assert not reject_reasons(default_offer(gpus=2, all_in_hourly=2.80), policy)   # $1.40/card
+    assert not reject_reasons(default_offer(gpus=4, all_in_hourly=5.60), policy)   # $1.40/card
+    refused = reject_reasons(default_offer(gpus=2, all_in_hourly=3.90), policy)    # $1.95/card
+    assert any(r.startswith("per-GPU ceiling:") for r in refused), refused
+    assert "2x" in refused[0] and "1.950" in refused[0], "the reason must show the arithmetic"
+
+
+def test_both_ceilings_apply_when_both_are_set():
+    """They answer different questions — what a host may cost, and what a card may cost — so
+    an offer passes only if it satisfies each one that is set."""
+    both = OfferPolicy(max_all_in_hourly=2.00, max_all_in_per_gpu=1.60)
+
+    assert reject_reasons(default_offer(gpus=2, all_in_hourly=2.80), both), "the machine cap still binds"
+    assert reject_reasons(default_offer(gpus=1, all_in_hourly=1.75), both), "the per-card cap still binds"
+    assert not reject_reasons(default_offer(gpus=1, all_in_hourly=1.50), both)
+
+
+def test_a_per_gpu_ceiling_nobody_set_refuses_nothing():
+    assert not reject_reasons(default_offer(gpus=8, all_in_hourly=40.0), OfferPolicy())

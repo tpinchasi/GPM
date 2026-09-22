@@ -133,6 +133,14 @@ workers(host) = min( capacity profile maximum   — what this hardware class can
 1. **Capacity profile** — a table matched on what the host reports (chip, or accelerator name
    and memory). First match wins; a host may name a profile outright. *Illustrative:* a
    laptop-class Apple-silicon machine → up to 3; an ~80 GB datacentre card → up to 6.
+   A profile matches **either** way (D88):
+   - `match.hardware` — the market's whole string, e.g. `"2x RTX PRO 6000 WS"`, compared whole
+     and case-insensitively. `max_workers` is that machine's total.
+   - `match.gpu` — the **card**, e.g. `"RTX PRO 6000 WS"`, whatever the machine holds of it.
+     `max_workers` is then **per card**, multiplied by how many there are and held at 64 per
+     host: two cards run twice the work, and a second card left idle is what its price was not
+     paid for. Naming a card in `hardware` matches nothing, silently — which is why `gpu`
+     exists.
 2. **Memory ceiling** — engines typically reserve worst-case context memory for every parallel
    slot and evict a model when the *predicted* total exceeds memory, regardless of actual use.
    The ceiling therefore depends on the model set and context length, not only the card:

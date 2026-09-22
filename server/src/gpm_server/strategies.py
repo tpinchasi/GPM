@@ -334,6 +334,13 @@ def reject_reasons(offer: Offer, policy: OfferPolicy, model_set_gb: float = 0.0)
         reasons.append(
             f"all-in ceiling: ${offer.all_in_hourly:.3f}/h above ${policy.max_all_in_hourly:.3f}"
         )
+    if policy.max_all_in_per_gpu is not None and offer.gpus:
+        per_gpu = offer.all_in_hourly / offer.gpus
+        if per_gpu > policy.max_all_in_per_gpu:
+            reasons.append(
+                f"per-GPU ceiling: ${per_gpu:.3f}/h per card "
+                f"({offer.gpus}x ${offer.all_in_hourly:.3f}) above ${policy.max_all_in_per_gpu:.3f}"
+            )
     if policy.max_download_per_gb is not None and offer.download_per_gb > policy.max_download_per_gb:
         reasons.append(
             f"download price: ${offer.download_per_gb:.4f}/GB above "

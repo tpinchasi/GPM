@@ -328,41 +328,68 @@ const leaseActions = (lease) => (lease.state && lease.state !== "open") ? null :
 // its requests sat at "the load has cleared" because its lease allowed 5 workers and one
 // rented host already supplied 6; the only way to raise it was the CLI.
 async function extendLease(event, lease) {
-  const hours = prompt("Run this lease for how many hours in total?", String(lease.max_hours));
-  if (hours === null) return;
-  const wantedHours = Number(hours);
-  if (!Number.isFinite(wantedHours) || wantedHours <= 0) return;
-  const dollars = prompt("And its dollar cap in total?", String(lease.max_spend));
-  if (dollars === null) return;
-  const wantedSpend = Number(dollars);
-  if (!Number.isFinite(wantedSpend) || wantedSpend <= 0) return;
-  const workers = prompt(
-    "And how many workers may it reach?\n\nUnder dynamic allocation this is the ceiling on "
-    + "how much capacity the traffic can ask for — no host is rented past it.",
-    String(lease.workers),
-  );
-  if (workers === null) return;
-  const wantedWorkers = Number(workers);
-  if (!Number.isInteger(wantedWorkers) || wantedWorkers <= 0) return;
+  // One form, not a chain of prompts (D86). Three browser prompts in a row is how the worker
+  // ceiling stayed invisible for an hour: an operator answering "hours?" then "dollars?" has
+  // no way to see what the lease holds now, or that a third question is coming.
+  const field = (label, value, step, why) => {
+    const input = el("input", { type: "number", value: String(value), step, style: "width:8rem" });
+    return { input, row: el("div", { class: "row" },
+      el("label", { style: "min-width:11rem" }, label), input,
+      el("span", { class: "muted" }, `now ${value}${why}`)) };
+  };
+  const hours = field("Run for, in total", lease.max_hours, "0.5", "h");
+  const dollars = field("Dollar cap, in total", lease.max_spend, "0.01", "");
+  const workers = field("Workers it may reach", lease.workers, "1", "");
 
-  const raised = [];
-  if (wantedHours > lease.max_hours) raised.push(["max_hours", wantedHours]);
-  if (wantedSpend > lease.max_spend) raised.push(["max_spend", wantedSpend]);
-  if (wantedWorkers > lease.workers) raised.push(["workers", wantedWorkers]);
-  const body = { max_hours: wantedHours, max_spend: wantedSpend, workers: wantedWorkers };
+  const raisedNote = el("p", { class: "muted" }, "");
+  const redraw = () => {
+    const raised = [];
+    if (Number(hours.input.value) > lease.max_hours) raised.push("hours");
+    if (Number(dollars.input.value) > lease.max_spend) raised.push("dollars");
+    if (Number(workers.input.value) > lease.workers) raised.push("workers");
+    raisedNote.textContent = raised.length
+      ? `Raising ${raised.join(", ")} — worst case becomes ${money(Number(dollars.input.value))} over ${hours.input.value}h, up to ${workers.input.value} workers.`
+      : "Tightening only. This needs no confirmation.";
+  };
+  [hours, dollars, workers].forEach((f) => { f.input.oninput = redraw; });
+  redraw();
+
+  const raisedValues = () => {
+    const out = [];
+    if (Number(hours.input.value) > lease.max_hours) out.push(["max_hours", Number(hours.input.value)]);
+    if (Number(dollars.input.value) > lease.max_spend) out.push(["max_spend", Number(dollars.input.value)]);
+    if (Number(workers.input.value) > lease.workers) out.push(["workers", Number(workers.input.value)]);
+    return out;
+  };
+
+  // The retype guard has to know the value before the dialog opens, so a raise is confirmed in
+  // a second step — the form first, then the retype, which is also where the number is stated.
+  const ok = await confirmAction({
+    title: `Change ${lease.lease_id}`,
+    body: el("div", {}, hours.row, dollars.row, workers.row, raisedNote),
+  });
+  if (!ok) return;
+
+  const body = {
+    max_hours: Number(hours.input.value),
+    max_spend: Number(dollars.input.value),
+    workers: Number(workers.input.value),
+  };
+  if (![body.max_hours, body.max_spend, body.workers].every((n) => Number.isFinite(n) && n > 0)) return;
+
+  const raised = raisedValues();
   if (raised.length) {
-    const ok = await confirmAction({
-      title: `Extend ${lease.lease_id}?`,
+    const agreed = await confirmAction({
+      title: "This loosens a limit",
       body: el("div", {},
-        el("p", {}, `Worst case becomes ${money(wantedSpend)} over ${wantedHours}h, up to ${wantedWorkers} workers — it is spending authority, and hosts held under it keep running.`),
-        el("p", { class: "muted" }, raised.map(([k, v]) => {
-          if (k === "max_spend") return `${k}: ${money(lease[k])} → ${money(v)}`;
-          if (k === "workers") return `${k}: ${lease[k]} → ${v}`;
-          return `${k}: ${lease[k]}h → ${v}h`;
-        }).join(" · "))),
+        el("p", {}, `Worst case becomes ${money(body.max_spend)} over ${body.max_hours}h, up to ${body.workers} workers — it is spending authority, and hosts held under it keep running.`),
+        el("p", { class: "muted" }, raised.map(([k, v]) =>
+          k === "max_spend" ? `${k}: ${money(lease[k])} → ${money(v)}`
+          : k === "workers" ? `${k}: ${lease[k]} → ${v}`
+          : `${k}: ${lease[k]}h → ${v}h`).join(" · "))),
       retype: String(raised[0][1]),
     });
-    if (!ok) return;
+    if (!agreed) return;
     body.confirm = String(raised[0][1]);
   }
   run(event.target, () => api.tightenLease(lease.lease_id, body));
@@ -595,6 +622,7 @@ screens.rented = async (status) => {
     ),
     ...searchSection(market),
     ...allocationSection(market),
+    ...teardownSection(market),
     ...marketSection(market),
     el("h2", {}, "Rented and parked hosts"),
     status.rented.length ? el("table", {},
@@ -629,6 +657,7 @@ const SEARCH_FIELDS = [
   ["offer_policy", "min_gpu_memory_gb", "number", "the card must have at least this much memory"],
   ["offer_policy", "min_disk_gb", "number", "the machine must offer at least this much disk"],
   ["offer_policy", "max_all_in_hourly", "number", "the most this pool will pay per host, per hour"],
+  ["offer_policy", "max_all_in_per_gpu", "number", "and per accelerator — a multi-GPU machine is judged by the card, not the bill"],
   ["offer_policy", "max_download_per_gb", "number", "the most it will pay per GB downloaded"],
   ["offer_policy", "min_download_mbps", "number", "slower than this and the model set takes too long"],
   ["offer_policy", "min_reliability", "number", "the provider's own score, 0 to 1"],
@@ -658,7 +687,121 @@ const ALLOCATION_FIELDS = [
   ["workers_auto", "slow_host_factor", "number", "service time this far over the pool's median steps a host down"],
 ];
 
+// When a host is given up, and how hard the pool tries first (D86). Sliders, because every
+// one of these is a quantity with a sane range and an operator should see where in that range
+// they are — not type a number into an empty box and hope.
+//   [section, key, kind, why, min, max, step]
+const TEARDOWN_FIELDS = [
+  ["teardown", "idle_minutes", "range", "no traffic for this long and a host is paused", 0.5, 30, 0.5],
+  ["teardown", "destroy_idle_minutes", "range", "and destroyed at this; blank means 2.5x the pause", 0, 120, 1],
+  ["teardown", "max_starting_minutes", "range", "its engine never answered — give it up rather than bill for the whole window", 1, 30, 1],
+  ["teardown", "max_preparing_minutes", "range", "started, but never finished its model set", 5, 90, 5],
+  ["teardown", "drain_timeout_s", "range", "how long in-flight requests get once a host is going", 30, 900, 30],
+  ["teardown", "deadman_minutes", "range", "the host ends itself after this with no heartbeat and no traffic", 5, 120, 5],
+  ["teardown", "deadman_action", "choice", "what it does when it fires", ["destroy", "stop"]],
+  ["teardown", "park_when_idle", "checkbox", "pause an unused host rather than destroy it, keeping its models"],
+  ["teardown", "max_park_hours", "range", "a parked host is never kept longer than this", 1, 168, 1],
+  ["teardown", "min_pull_mbps", "range", "a download slower than this gives the host up", 0, 500, 10],
+  ["teardown", "slow_pull_grace_s", "range", "after it has been that slow for this long", 30, 600, 30],
+  ["teardown", "pull_attempts", "range", "tries per model before the host is given up", 1, 10, 1],
+  ["teardown", "pull_retry_after_s", "range", "wait before the second try; it doubles after", 1, 120, 1],
+  ["teardown", "avoid_failed_machine_minutes", "range", "a machine that just failed is skipped for this long", 0, 240, 10],
+  ["teardown", "max_hours_without_deadman", "range", "the longest lease allowed where nothing on the host can stop it billing", 0.5, 12, 0.5],
+];
+
 const search = { inputs: {}, saved: null, message: "", mode: null };
+const teardown = { inputs: {}, saved: null, message: "" };
+
+// A slider an operator can also type into: the handle shows where in the range a value sits,
+// the box says exactly what it is. Neither alone is enough — a slider cannot express 12.5 and
+// a bare number box does not say whether 30 is high or low.
+function slider(value, min, max, step, onchange) {
+  const shown = value === null || value === undefined ? "" : String(value);
+  const range = el("input", { type: "range", min: String(min), max: String(max), step: String(step),
+                              value: shown === "" ? String(min) : shown, style: "width:11rem" });
+  const box = el("input", { type: "number", step: String(step), value: shown, style: "width:6rem" });
+  range.oninput = () => { box.value = range.value; onchange && onchange(); };
+  box.oninput = () => { if (box.value !== "") range.value = box.value; onchange && onchange(); };
+  return { row: el("span", { class: "row" }, range, box), read: () => (box.value === "" ? null : Number(box.value)) };
+}
+
+function teardownSection(market) {
+  const saved = (market.saved || {}).teardown;
+  teardown.saved = saved;
+  teardown.inputs = {};
+  if (!saved) {
+    return [
+      el("h2", {}, "When a host is given up"),
+      el("p", { class: "muted" }, "This pool's supervisor does not report its tear-down settings yet; restart it to edit them here."),
+    ];
+  }
+  const rows = TEARDOWN_FIELDS.map(([section, key, kind, why, a, b, c]) => {
+    const value = saved[key];
+    let control, read;
+    if (kind === "checkbox") {
+      const input = el("input", { type: "checkbox", ...(value ? { checked: true } : {}) });
+      control = input; read = () => input.checked;
+    } else if (kind === "choice") {
+      const input = el("select", {}, ...a.map((v) =>
+        el("option", { value: v, ...(String(value) === v ? { selected: true } : {}) }, v)));
+      control = input; read = () => input.value;
+    } else {
+      const made = slider(value, a, b, c);
+      control = made.row; read = made.read;
+    }
+    teardown.inputs[key] = { read, was: value === undefined ? null : value };
+    return el("tr", {},
+      el("td", { class: "mono" }, key),
+      el("td", {}, control),
+      el("td", { class: "muted" }, why));
+  });
+  const note = el("span", { class: "muted" }, teardown.message);
+  return [
+    el("h2", {}, "When a host is given up"),
+    el("div", { class: "panel" },
+      el("p", { class: "muted" }, "Every one of these decides how long a host that is not working still bills."),
+      el("table", {}, el("tbody", {}, rows)),
+      el("div", { class: "row" },
+        el("button", { class: "primary", onclick: (e) => saveTeardown(e, note) }, "Save to configuration"),
+        el("button", { class: "small", onclick: () => render() }, "Reset"),
+        note)),
+  ];
+}
+
+async function saveTeardown(event, note) {
+  const body = { teardown: {} };
+  for (const [key, { read, was }] of Object.entries(teardown.inputs)) {
+    const now = read();
+    if (JSON.stringify(now) !== JSON.stringify(was)) body.teardown[key] = now;
+  }
+  if (!Object.keys(body.teardown).length) { teardown.message = " nothing changed"; note.textContent = teardown.message; return; }
+  const button = event.target;
+  button.disabled = true;
+  try {
+    let answer;
+    try {
+      answer = await api.setSearch(body);
+    } catch (error) {
+      const changes = error.changes || [];
+      const retype = changes.find((c) => c.requires_retype);
+      if (!retype) throw error;
+      const ok = await confirmAction({
+        title: "This loosens a limit",
+        body: el("div", {}, ...changes.map((c) => el("p", {}, c.detail))),
+        retype: retype.value,
+      });
+      if (!ok) return;
+      answer = await api.setSearch({ ...body, confirm: retype.value });
+    }
+    teardown.message = ` saved as version ${String(answer.version).slice(0, 8)}`;
+  } catch (error) {
+    teardown.message = ` ${error.message}`;
+  } finally {
+    note.textContent = teardown.message;
+    button.disabled = false;
+    setTimeout(render, 600);
+  }
+}
 const allocation = { inputs: {}, mode: null, message: "" };
 
 // Which listings the pool searches by itself (D80). Not a filter — a pool on `interruptible`
@@ -675,6 +818,16 @@ function searchSection(market) {
   search.saved = saved;
   search.inputs = {};
   search.mode = saved.mode || "interruptible";
+  search.profile = saved.search_profile || "";
+  search.saveAs = "";
+  const profileSelect = el("select", { onchange: (e) => {
+    const chosen = e.target.value;
+    run(e.target, async () => { await api.setSearch({ search_profile: chosen }); render(); });
+  } },
+    el("option", { value: "", ...(search.profile ? {} : { selected: true }) },
+      "(the pool's own offer_policy)"),
+    ...(saved.search_profiles || []).map((name) =>
+      el("option", { value: name, ...(search.profile === name ? { selected: true } : {}) }, name)));
   const modeSelect = el("select", {}, ...MODES.map(([value, label]) =>
     el("option", { value, ...(search.mode === value ? { selected: true } : {}) }, label)));
   const rows = SEARCH_FIELDS.filter(([section]) => saved[section]).map(([section, key, kind, why]) => {
@@ -702,6 +855,12 @@ function searchSection(market) {
   return [
     el("h2", {}, "What the pool looks for"),
     el("div", { class: "panel" },
+      el("div", { class: "row" },
+        el("label", {}, "Search profile"), profileSelect,
+        el("input", { type: "text", placeholder: "save these as…", style: "width:11rem",
+                      oninput: (e) => { search.saveAs = e.target.value.trim(); } }),
+        el("span", { class: "muted" },
+          "a named set of these filters (D87) — save the values below under a name, and pick it here later")),
       el("div", { class: "row" },
         el("label", {}, "Rent by"), modeSelect,
         el("span", { class: "muted" },
@@ -855,6 +1014,9 @@ function changedValues(mode) {
   }
   // `mode` sits directly under `rented`, beside the policy rather than inside it.
   if (mode && mode.value !== search.mode) body.mode = mode.value;
+  // A name typed into "save these as" sends the whole form as a new profile, not as an edit
+  // to the one in force: saving is how you branch away from what you are looking at.
+  if (search.saveAs) { body.save_profile_as = search.saveAs; body.offer_policy = searchValues().offer_policy; }
   return body;
 }
 
@@ -1147,23 +1309,60 @@ screens.leases = async () => {
           }
           run(e.target, () => api.openLease(body));
         } }, "Open lease"))),
-    el("h2", {}, "All leases"),
-    el("table", {},
-      el("thead", {}, el("tr", {},
-        el("th", {}, "Lease"), el("th", {}, "State"), el("th", { class: "num" }, "Workers"),
-        el("th", { class: "num" }, "Spent (enforced)"), el("th", { class: "num" }, "Estimated"),
-        el("th", { class: "num" }, "Cap"), el("th", { class: "num" }, "Left"), el("th", {}, ""))),
-      el("tbody", {}, leases.map((lease) => el("tr", {},
-        el("td", { class: "mono" }, lease.lease_id),
-        el("td", {}, pill(lease.state, lease.state === "open" ? "ok" : ""), lease.closed_reason ? el("div", { class: "muted" }, lease.closed_reason) : null),
-        el("td", { class: "num" }, lease.workers),
-        el("td", { class: "num" }, money(lease.spent_enforced_on)),
-        el("td", { class: "num" }, money(lease.estimated_spend)),
-        el("td", { class: "num" }, money(lease.max_spend)),
-        el("td", { class: "num" }, money(lease.dollars_left)),
-        el("td", {}, leaseActions(lease)))))),
+    ...leaseTables(leases),
   ];
 };
+
+// Open leases first and always; the closed ones behind a filter (D86). A pool that has run for
+// a day has dozens of closed leases, and the one that matters — the one spending money now —
+// was at the bottom of an unfiltered list.
+const leaseFilter = { show: "closed-recent", text: "" };
+
+function leaseTables(leases) {
+  const open = leases.filter((l) => l.state === "open");
+  const closed = leases.filter((l) => l.state !== "open");
+
+  const matches = (l) => {
+    if (leaseFilter.text && !JSON.stringify(l).toLowerCase().includes(leaseFilter.text.toLowerCase())) return false;
+    if (leaseFilter.show === "closed-none") return false;
+    if (leaseFilter.show === "closed-spent") return (l.spent_enforced_on || 0) > 0;
+    return true;
+  };
+  const showing = closed.filter(matches).slice(0, leaseFilter.show === "closed-all" ? 500 : 10);
+
+  const search = el("input", {
+    type: "search", placeholder: "filter by id or reason…", value: leaseFilter.text,
+    style: "width:16rem", oninput: (e) => { leaseFilter.text = e.target.value; render(); },
+  });
+  const which = el("select", { onchange: (e) => { leaseFilter.show = e.target.value; render(); } },
+    ...[["closed-recent", "the last 10"], ["closed-spent", "only those that spent"],
+        ["closed-all", "all of them"], ["closed-none", "none"]].map(([v, label]) =>
+      el("option", { value: v, ...(leaseFilter.show === v ? { selected: true } : {}) }, label)));
+
+  return [
+    el("h2", {}, `Open (${open.length})`),
+    open.length ? leaseRows(open) : el("p", { class: "muted" }, "No open lease, so nothing can be rented."),
+    el("h2", {}, `Closed (${closed.length})`),
+    el("div", { class: "row" }, el("label", {}, "Show "), which, search,
+      el("span", { class: "muted" }, `${showing.length} shown`)),
+    showing.length ? leaseRows(showing) : el("p", { class: "muted" }, "Nothing matches."),
+  ];
+}
+
+const leaseRows = (leases) => el("table", {},
+  el("thead", {}, el("tr", {},
+    el("th", {}, "Lease"), el("th", {}, "State"), el("th", { class: "num" }, "Workers"),
+    el("th", { class: "num" }, "Spent (enforced)"), el("th", { class: "num" }, "Estimated"),
+    el("th", { class: "num" }, "Cap"), el("th", { class: "num" }, "Left"), el("th", {}, ""))),
+  el("tbody", {}, leases.map((lease) => el("tr", {},
+    el("td", { class: "mono" }, lease.lease_id),
+    el("td", {}, pill(lease.state, lease.state === "open" ? "ok" : ""), lease.closed_reason ? el("div", { class: "muted" }, lease.closed_reason) : null),
+    el("td", { class: "num" }, lease.workers),
+    el("td", { class: "num" }, money(lease.spent_enforced_on)),
+    el("td", { class: "num" }, money(lease.estimated_spend)),
+    el("td", { class: "num" }, money(lease.max_spend)),
+    el("td", { class: "num" }, money(lease.dollars_left)),
+    el("td", {}, leaseActions(lease))))));
 
 screens.decisions = async () => {
   const { events } = await api.events(200);

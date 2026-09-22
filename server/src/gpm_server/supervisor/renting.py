@@ -14,6 +14,7 @@ import asyncio
 import dataclasses
 import logging
 import math
+import re
 import time
 import uuid
 from pathlib import Path
@@ -462,6 +463,17 @@ class Fleet:
         self._history_at = now
         return self._history
 
+    #: However many cards a machine has, one engine is not launched past this. The per-card
+    #: arithmetic is sound and an eight-card machine would otherwise ask for a number no engine
+    #: has been measured at.
+    MOST_WORKERS_A_HOST_MAY_RUN = 64
+
+    @staticmethod
+    def _card_of(hardware: str) -> str:
+        """"2x RTX PRO 6000 WS" -> "rtx pro 6000 ws". The count is a fact about the machine;
+        what one card runs at once is a fact about the card (D88)."""
+        return re.sub(r"^\s*\d+\s*x\s*", "", hardware or "", count=1).strip().lower()
+
     def workers_for(self, offer: Offer) -> tuple[int, str]:
         """How many workers a host rented from this offer would run, and why (spec §2.1).
 
@@ -472,10 +484,24 @@ class Fleet:
             match = profile.match
             if match.hardware is not None and match.hardware.strip().lower() != offer.hardware.strip().lower():
                 continue
+            if match.gpu is not None and match.gpu.strip().lower() != self._card_of(offer.hardware):
+                continue
             if match.min_gpu_memory_gb is not None and offer.gpu_memory_gb < match.min_gpu_memory_gb:
                 continue
             if match.capability is not None and match.capability not in capabilities:
                 continue
+            if match.gpu is not None:
+                # Per card, times the cards (D88). A machine with two of them runs twice the
+                # work; the second card idling is not what its price was paid for.
+                cards = max(1, offer.gpus or 1)
+                workers = min(profile.max_workers * cards, self.MOST_WORKERS_A_HOST_MAY_RUN)
+                why = (
+                    f"capacity profile for {match.gpu}: {profile.max_workers} per card "
+                    f"x {cards} card(s)"
+                )
+                if workers < profile.max_workers * cards:
+                    why += f", held at {self.MOST_WORKERS_A_HOST_MAY_RUN}"
+                return workers, why + (f" ({profile.note})" if profile.note else "")
             why = f"capacity profile for {match.hardware or 'this hardware'}"
             return profile.max_workers, why + (f" ({profile.note})" if profile.note else "")
         return self.rented.workers, "the rented default; no capacity profile matches this hardware"
@@ -889,7 +915,7 @@ class Fleet:
         if decision.rent and refusal is None and lease is not None:
             offers = await self._offers()
             ranked, rejected = rank_offers(
-                offers, self._policy_with_avoided(self.rented.offer_policy), self.rented.bidding,
+                offers, self._policy_with_avoided(self.rented.policy_in_force), self.rented.bidding,
                 lease.hours_left(), self.rented.model_set_gb,
                 history=self.machine_history(), history_cfg=self.rented.history,
             )
@@ -932,7 +958,7 @@ class Fleet:
         """
         # Unsaved values from the console's form, merged over what is configured. Validated
         # here, so a typo in the form is a 400 and never something the pool acts on.
-        policy = self.rented.offer_policy
+        policy = self.rented.policy_in_force
         bid_config = self.rented.bidding
         if offer_policy:
             policy = OfferPolicy.model_validate({**policy.model_dump(), **offer_policy})
@@ -1000,7 +1026,11 @@ class Fleet:
             "offer_policy": policy.model_dump(),
             "bidding": bid_config.model_dump(),
             "saved": {
-                "offer_policy": self.rented.offer_policy.model_dump(),
+                # What is *in force* — the named profile where one is chosen (D87), so the
+                # console shows the filters the pool is really searching with.
+                "offer_policy": self.rented.policy_in_force.model_dump(),
+                "search_profile": self.rented.search_profile,
+                "search_profiles": sorted(self.rented.search_profiles),
                 "bidding": self.rented.bidding.model_dump(),
                 # Which listings are searched at all (D80). Not a filter: an offer in a listing
                 # this pool never asks for is not rejected, it is never seen — so it cannot
@@ -1012,6 +1042,10 @@ class Fleet:
                 "allocation": self.rented.allocation,
                 "dynamic": self.rented.dynamic.model_dump(),
                 "workers_auto": self.rented.workers_auto.model_dump(),
+                # Every lever that decides when a host is given up (D86). The whole block was
+                # missing from the console, so an operator wanting to change how long a stuck
+                # host bills had to edit the supervisor's own file.
+                "teardown": self.rented.teardown.model_dump(),
             },
         }
 
@@ -1945,7 +1979,7 @@ class Fleet:
         offers = await self._offers(kinds=kind or ("both" if offer_id else None))
         ranked, rejected = rank_offers(
             offers,
-            self._policy_with_avoided(self.rented.offer_policy),
+            self._policy_with_avoided(self.rented.policy_in_force),
             self.rented.bidding,
             lease.hours_left(),
             self.rented.model_set_gb,
@@ -2340,7 +2374,7 @@ class Fleet:
             bids, fixed = self._KINDS[kinds or self.rented.mode]
             offers = await self.provider.search_offers(
                 OfferQuery(
-                    verified_only=(policy or self.rented.offer_policy).verified_only,
+                    verified_only=(policy or self.rented.policy_in_force).verified_only,
                     interruptible=bids,
                     on_demand=fixed,
                 )
