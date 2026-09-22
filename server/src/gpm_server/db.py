@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS hosts (
     resident       TEXT NOT NULL,   -- JSON array of tags loaded right now
     available      TEXT NOT NULL DEFAULT '[]',       -- JSON array of tags on disk
     residency      TEXT NOT NULL DEFAULT 'pinned',   -- pinned | on_demand
+    engine         TEXT NOT NULL DEFAULT 'ollama',    -- which engine this machine runs (D93)
     lease_id       TEXT,
     provider_ref   TEXT,            -- JSON, rented hosts only
     hourly_rate    REAL,
@@ -170,6 +171,9 @@ _ADDED_COLUMNS = {
     "hosts": [
         ("available", "TEXT NOT NULL DEFAULT '[]'"),
         ("residency", "TEXT NOT NULL DEFAULT 'pinned'"),
+        # A pool may run more than one engine (D93). The default is the engine every pool ran
+        # before this column existed, so a table written by an older version reads correctly.
+        ("engine", "TEXT NOT NULL DEFAULT 'ollama'"),
     ],
 }
 
@@ -289,6 +293,9 @@ class HostRow:
     resident: frozenset[str]
     available: frozenset[str] = frozenset()
     residency: str = "pinned"
+    #: Which engine this machine runs (D93). Published so the router can refuse to send a
+    #: request to a host whose engine does not serve the path it arrived on.
+    engine: str = "ollama"
     lease_id: Optional[str] = None
     provider_ref: Optional[dict[str, Any]] = None
     hourly_rate: Optional[float] = None
@@ -313,6 +320,7 @@ def _row_to_host(row: sqlite3.Row) -> HostRow:
         resident=frozenset(json.loads(row["resident"])),
         available=frozenset(json.loads(row["available"])),
         residency=row["residency"],
+        engine=row["engine"],
         lease_id=row["lease_id"],
         provider_ref=json.loads(row["provider_ref"]) if row["provider_ref"] else None,
         hourly_rate=row["hourly_rate"],
@@ -330,16 +338,17 @@ class HostTable:
             """
             INSERT INTO hosts (
                 host_id, kind, transport_type, priority, dial_url, state, workers,
-                capabilities, variants, resident, available, residency, lease_id,
+                capabilities, variants, resident, available, residency, engine, lease_id,
                 provider_ref, hourly_rate, last_error, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(host_id) DO UPDATE SET
                 kind=excluded.kind, transport_type=excluded.transport_type,
                 priority=excluded.priority, dial_url=excluded.dial_url,
                 state=excluded.state, workers=excluded.workers,
                 capabilities=excluded.capabilities, variants=excluded.variants,
                 resident=excluded.resident, available=excluded.available,
-                residency=excluded.residency, lease_id=excluded.lease_id,
+                residency=excluded.residency, engine=excluded.engine,
+                lease_id=excluded.lease_id,
                 provider_ref=excluded.provider_ref, hourly_rate=excluded.hourly_rate,
                 last_error=excluded.last_error, updated_at=excluded.updated_at
             """,
@@ -356,6 +365,7 @@ class HostTable:
                 json.dumps(sorted(host.resident)),
                 json.dumps(sorted(host.available)),
                 host.residency,
+                host.engine,
                 host.lease_id,
                 json.dumps(host.provider_ref) if host.provider_ref is not None else None,
                 host.hourly_rate,

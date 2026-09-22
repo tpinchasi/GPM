@@ -97,8 +97,22 @@ cloud account.**
 An engine adapter tells the pool how to talk to one kind of inference server. The router
 **passes requests through in the engine's own API and never translates between APIs** — an app
 written for engine X talks to a pool of engine-X hosts. (Translation is where tool-calling and
-structured-output fidelity get lost; the pool does not take that risk on.) A pool has one
-engine type.
+structured-output fidelity get lost; the pool does not take that risk on.)
+
+**A pool may run a different engine on each host** (D93) — `engine:` on a host, `rented.engine`
+for the machines it buys, the pool's own where neither says. What makes this safe is that both
+shipped engines serve one wire API (D89), so a request is read the same way wherever it goes:
+
+- **The path chooses how a request is read**, not the host: it must be understood before the
+  pool knows where it will go. Engines serving the same path read it identically, by
+  construction — they share one module for it.
+- **A request only reaches a host whose engine serves its path.** Ollama serves its own API
+  beside the shared one and vLLM does not, so an `/api/*` request is eligible only on Ollama
+  hosts. Without this the pool would hand a request to a machine that answers 404 to it.
+- **A catalog variant may name the engine it is for**, and is then offered only to hosts running
+  it — the same model is a plain tag to one engine and a model-hub repository to another. A
+  variant naming no engine works anywhere, which is what every catalog written before this
+  means.
 
 ```python
 class Engine(Protocol):

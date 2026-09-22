@@ -704,6 +704,7 @@ class Fleet:
                 push=lambda data, path: self.push_to_host(host, data, path),
                 archive=archive,
                 engine_port=self.engine_port,
+                engine=self.config.rented_engine(),
             )
         except hostagent.AgentInstallFailed as exc:
             host.agent_attempts += 1
@@ -1411,7 +1412,7 @@ class Fleet:
             self.rented_models,
             self.config.catalog,
             frozenset(self.rented.capabilities),
-            self.config.engine,
+            self.config.rented_engine(),
         )
         return frozenset(group[0].tag for group in variants.values() if group)
 

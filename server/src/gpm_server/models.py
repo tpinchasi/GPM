@@ -67,6 +67,10 @@ class Host:
     #: Every tag the pool knows by name, for requests that name a build explicitly.
     literal_variants: dict[str, ResolvedVariant]
     transport_type: str = "http"
+    #: The engine on this machine (D93). A pool may run more than one — a laptop on one, rented
+    #: hosts on another — and a request that arrived on a path this host's engine does not serve
+    #: must never reach it.
+    engine: str = "ollama"
     state: HostState = HostState.UNREACHABLE
     #: Tags the engine reports loaded right now. Empty until the first successful probe.
     resident: frozenset[str] = frozenset()

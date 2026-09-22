@@ -21,6 +21,11 @@ class Need:
     model: str
     wants_schema: bool = False
     runtime_class_pin: Optional[str] = None
+    #: Engines that can serve the path this request arrived on (D93). Empty means "any" — which
+    #: is every pool running one engine, and is what this meant before pools could run two.
+    #: A request on an engine's own API must never reach a host running a different engine: the
+    #: path is not there, and the host would answer 404 to a request the pool called eligible.
+    engines: frozenset[str] = frozenset()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -65,6 +70,8 @@ class Dispatcher:
         found = []
         for host in self.hosts:
             if host.state is not HostState.READY or host.host_id in exclude:
+                continue
+            if need.engines and host.engine not in need.engines:
                 continue
             variant = self.variant_for(host, need)
             if variant is not None:

@@ -21,6 +21,7 @@ def _init(args: argparse.Namespace) -> int:
     else:
         settings = Settings(
             key_hash=fingerprint(key), host=args.host, port=args.port,
+            engine=args.engine,
             engine_url=args.engine_url, heartbeat_file=args.heartbeat_file,
             restart_command=([args.restart_command] if args.restart_command else None),
             engine_env_file=args.engine_env_file,
@@ -60,6 +61,7 @@ def main(argv: list[str] | None = None) -> int:
     init = verbs.add_parser("init", help="mint the agent key and write this machine's settings")
     init.add_argument("--host", default="127.0.0.1")
     init.add_argument("--port", type=int, default=8095)
+    init.add_argument("--engine", default="ollama", help="which engine this machine runs")
     init.add_argument("--engine-url", default="http://127.0.0.1:11434")
     init.add_argument("--heartbeat-file", default=None, help="the dead-man timer's file, where the pool created this host")
     init.add_argument("--restart-command", default=None, help="how the engine is restarted here (a program to run)")
