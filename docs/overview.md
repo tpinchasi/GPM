@@ -6,6 +6,8 @@
 > the header prefix `X-GPM-*` (D36). Decisions and their reasons are in
 > [decisions.md](decisions.md); this page only states how things are.
 
+> **What it costs, honestly:** [economics.md](economics.md) measures cost per million tokens against a managed API, where a pool wins, and what would close the gap.
+
 ## What it is
 
 A layer that **serves GPU inference to applications without the applications knowing where the
