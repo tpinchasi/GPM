@@ -859,28 +859,67 @@ class PoolConfig(BaseModel):
             )
 
     def _engine_can_hold_what_the_pool_asks(self) -> None:
-        """An engine that serves one model per process cannot hold the whole set on one host.
+        """No host may be asked for more models than its engine can hold at once (D89, D94).
 
-        Refused here, at load, rather than discovered after a machine has been rented and can
-        never reach `ready` (D89). An engine the pool cannot resolve is left alone: naming an
-        uninstalled engine is its own error, reported where engines are loaded.
+        An engine that serves one model per process holds exactly one. What each host is *asked*
+        for depends on the placement: with `all` that is the pool's whole set, with `declared` it
+        is what that host declares — and a host declaring two is over the line just as surely.
+
+        Refused here, at load, rather than after a machine has been rented that can never reach
+        `ready` and is paid for until the give-up window closes.
         """
         from .engines import EngineNotFound, get_engine
 
-        if self.pool.models_per_host != "all":
-            return
-        try:
-            engine = get_engine(self.engine)
-        except EngineNotFound:
-            return
-        if getattr(engine, "serves_one_model", False):
-            raise ValueError(
-                f"engine {self.engine!r} serves one model per process, so no single host can "
-                f"hold this pool's whole model set. Set pool.models_per_host to 'declared' and the "
-                f"pool will cover the set across its hosts instead. (Holding the set on one "
-                f"machine would need a process in front of several engines, choosing between "
-                f"them by model name; the pool does not ship one.)"
-            )
+        def holds_one(name: str) -> bool:
+            try:
+                return bool(getattr(get_engine(name), "serves_one_model", False))
+            except EngineNotFound:
+                return False  # naming an uninstalled engine is its own error, reported elsewhere
+
+        for host in self.hosts:
+            if host.disabled:
+                continue
+            asked = self.models_held_by(host)
+            engine = self.engine_of(host)
+            if len(asked) > 1 and holds_one(engine):
+                raise ValueError(
+                    f"host {host.id!r} runs {engine!r}, which serves one model per process, but "
+                    f"is asked to hold {len(asked)}: {asked}. Give it a single model in its "
+                    f"`models`, or run an engine that holds several at once."
+                )
+
+        # Rented hosts differ from configured ones: with the set spread across hosts,
+        # `rented.models` is the set the pool may rent **for**, and each host it buys is given
+        # one of them (D94). Only `all` asks a single rented machine for the lot.
+        if self.rented is not None and self.pool.models_per_host == "all":
+            asked = list(self.pool.model_set)
+            engine = self.rented_engine()
+            if len(asked) > 1 and holds_one(engine):
+                raise ValueError(
+                    f"rented hosts run {engine!r}, which serves one model per process, but with "
+                    f"pool.models_per_host 'all' every one of them is asked to hold "
+                    f"{len(asked)} models ({asked}). Set pool.models_per_host to 'declared' and "
+                    f"the pool will buy a host per model instead. (Holding several on one "
+                    f"machine would need a process in front of several engines, choosing between "
+                    f"them by model name; the pool does not ship one.)"
+                )
+
+    def _rented_models(self) -> list[str]:
+        """What a rented host is asked to hold: the pool's whole set, or what `rented.models`
+        names where the set is spread across hosts."""
+        if self.pool.models_per_host == "all" or self.rented is None or self.rented.models is None:
+            return list(self.pool.model_set)
+        return list(self.rented.models)
+
+    def _engines_and_where(self) -> list[tuple[str, str]]:
+        """Each engine this pool runs, with something an operator can go and look at."""
+        found = [(self.engine, "this pool")]
+        for host in self.hosts:
+            if host.engine:
+                found.append((host.engine, f"host {host.id!r}"))
+        if self.rented is not None and self.rented.engine:
+            found.append((self.rented.engine, "rented hosts"))
+        return found
 
     def engine_of(self, host: "HostConfig") -> str:
         """Which engine this host runs (D93): its own, or the pool's where it says nothing."""

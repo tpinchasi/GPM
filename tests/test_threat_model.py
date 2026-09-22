@@ -85,8 +85,24 @@ def test_only_the_supervisor_pulls_and_only_for_configured_tags():
     text = source_of(renting)
     assert "engine.pull(client, tag)" in text
     # The tags come from the pool's own model set resolved through the catalog, never from a
-    # request and never from a guessed name.
-    assert "tags = sorted(self.required_tags)" in text
+    # request and never from a guessed name. Since D94 each host is prepared for the models it
+    # was bought for, which are chosen from configuration at purchase — so what is asserted is
+    # that every pull loop takes its tags from that resolution and from nowhere else.
+    assert "tags = sorted(self.tags_for(host))" in text
+    assert text.count("tags = sorted(") == text.count("tags = sorted(self.tags_for(host))")
+
+    # And that the resolution itself is the catalog's, against the models the pool assigned.
+    tree = ast.parse(text)
+    resolver = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "tags_for"
+    )
+    called = {
+        node.func.id
+        for node in ast.walk(resolver)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "variants_for_host" in called
 
 
 # --- T11: a strategy cannot spend past the limits ---

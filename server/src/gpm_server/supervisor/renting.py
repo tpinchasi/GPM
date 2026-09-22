@@ -77,6 +77,11 @@ class RentedHost:
     estimated_spend: float = 0.0
     reported_spend: float = 0.0
     connection: Optional[ConnectionInfo] = None
+    #: The models this host was bought to serve (D94). With the set spread across hosts and an
+    #: engine that holds one model per process, that is a single model, chosen when the machine
+    #: was bought from whatever the pool was shortest of. Empty means the whole rented set, which
+    #: is what every host meant before the pool could buy one per model.
+    models: tuple[str, ...] = ()
     ready_at: Optional[float] = None
     parked_at: Optional[float] = None
     #: The agent the pool installed here, if any, and what it reported. A host without one is
@@ -186,7 +191,10 @@ class Fleet:
         self.state_dir = Path(config.request_log).expanduser().resolve().parent
         #: Tests dial the agent through their own transport; nothing else sets this.
         self._agent_transport = None
-        self.engine = get_engine(config.engine)
+        # The engine on the machines this fleet buys — not necessarily the pool's default
+        # (D93). Everything here is about rented hosts, so launch settings and "how many models
+        # can one of these hold" must both come from the engine those machines actually run.
+        self.engine = get_engine(config.rented_engine())
         #: A second forward per host, to the agent on its loopback (D63).
         self.agent_tunnels: dict[str, SshTunnel] = {}
         #: Forwards to rented hosts the provider cannot expose directly, keyed by host id.
@@ -529,11 +537,50 @@ class Fleet:
 
     @property
     def rented_models(self) -> list[str]:
-        """What a rented host is asked to hold (D89): the pool's whole set, or — where the pool
-        spreads its set across hosts — what the rented configuration names."""
+        """The models the pool may rent **for** (D89, D94).
+
+        With `all` that is the whole set and every host holds it. With `declared` it is what
+        `rented.models` names, or the whole set where it names nothing — and each host the pool
+        buys is given one of them, not all of them.
+        """
         if self.config.pool.models_per_host == "all" or self.rented.models is None:
             return list(self.config.pool.model_set)
         return list(self.rented.models)
+
+    @property
+    def one_model_per_host(self) -> bool:
+        """Does a rented host hold a single model (D94)? True where the set is spread across
+        hosts and this engine serves one model per process."""
+        return (
+            self.config.pool.models_per_host != "all"
+            and bool(getattr(self.engine, "serves_one_model", False))
+        )
+
+    def models_for_new_host(self) -> tuple[str, ...]:
+        """Which models the next machine is bought to serve (D94).
+
+        Where a host holds one, it is bought for whatever the pool is **shortest of**: the model
+        with the fewest hosts already serving it, ties broken by the order the operator listed
+        them. Without this every host would be bought for the same model and the rest of the set
+        would never be covered however much was spent.
+        """
+        candidates = self.rented_models
+        if not self.one_model_per_host or not candidates:
+            return tuple(candidates)
+        serving: dict[str, int] = {name: 0 for name in candidates}
+        for host in self.hosts.values():
+            if host.released:
+                continue
+            for name in host.models:
+                if name in serving:
+                    serving[name] += 1
+        fewest = min(candidates, key=lambda name: (serving[name], candidates.index(name)))
+        return (fewest,)
+
+    def models_of(self, host: RentedHost) -> list[str]:
+        """What this host was bought to serve, falling back to the rented set for one bought
+        before the pool assigned models."""
+        return list(host.models) if host.models else self.rented_models
 
     def image_for(self, offer) -> tuple[Optional[str], str]:
         """Which build of the engine this machine gets, and why (D92).
@@ -842,7 +889,7 @@ class Fleet:
                 f"{host.launch_workers} its engine was launched for means relaunching it — "
                 "which only an agent on that host can do"
             )
-        settings = agents.wanted_engine_settings(workers, len(self.required_tags))
+        settings = agents.wanted_engine_settings(workers, len(self.tags_for(host)))
         status, answer = await agents.restart_engine(
             host.agent, settings, transport=self._agent_transport
         )
@@ -1296,7 +1343,7 @@ class Fleet:
         """
         if host.agent is None or not host.agent.manage_models:
             return None
-        tags = sorted(self.required_tags)
+        tags = sorted(self.tags_for(host))
         # An agent that was started a second ago may not be listening yet. Seen live: the pool
         # asked the moment the install returned, the one call failed, and the host was prepared
         # the slow way for its whole life — a minute of idle accelerator that D57 exists to
@@ -1354,7 +1401,7 @@ class Fleet:
         accelerator on a billing host, and it holds whether or not this host runs an agent: the
         agent does the same thing on hosts that have one.
         """
-        tags = sorted(self.required_tags)
+        tags = sorted(self.tags_for(host))
         moved = 0
         for tag in tags:
             result = await self._pull_with_retries(host, engine, client, tag)
@@ -1406,10 +1453,17 @@ class Fleet:
 
     @property
     def required_tags(self) -> frozenset[str]:
+        """Every build the pool may be asked to put on a rented host. Where each host holds one
+        model this is the union across them, not what any single machine carries."""
+        return self.tags_for(None)
+
+    def tags_for(self, host: Optional[RentedHost]) -> frozenset[str]:
+        """The builds one host must hold (D94) — what it was bought for, or the whole rented set
+        for a host bought before the pool assigned models."""
         from ..catalog import variants_for_host
 
         variants = variants_for_host(
-            self.rented_models,
+            self.models_of(host) if host is not None else self.rented_models,
             self.config.catalog,
             frozenset(self.rented.capabilities),
             self.config.rented_engine(),
@@ -1549,6 +1603,7 @@ class Fleet:
                 ready_at=ref.get("ready_at"),
                 prepared=bool(ref.get("prepared")),
                 hold_until=ref.get("hold_until"),
+                models=tuple(ref.get("models") or ()),
                 when_ready=ref.get("when_ready") or "join",
                 download_cost=float(ref.get("download_cost") or 0.0),
                 parked_at=ref.get("parked_at"),
@@ -2094,6 +2149,9 @@ class Fleet:
                 continue
 
             host_id = f"rented-{uuid.uuid4().hex[:6]}"
+            # Which models this machine is bought for, decided before the bid so the event that
+            # records the purchase can say what it was bought to serve (D94).
+            for_this_host = self.models_for_new_host()
             workers, workers_why = self.workers_for(offer)
             launch_workers = self.launch_workers_for(workers)
             spec = InstanceSpec(
@@ -2141,6 +2199,7 @@ class Fleet:
                 workers=workers,
                 launch_workers=launch_workers,
                 interruptible=offer.interruptible,
+                models=for_this_host,
             )
             connection = await self.provider.connection(instance)
             host.connection = connection

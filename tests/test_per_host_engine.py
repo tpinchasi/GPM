@@ -110,6 +110,41 @@ def test_a_host_with_no_build_its_engine_can_read_is_refused_at_load():
         )
 
 
+def test_a_rented_engine_that_holds_one_model_cannot_be_asked_for_the_whole_set():
+    """The guard has to look at **every** engine the pool runs, not just its default. A pool
+    whose default holds many models per process, renting hosts that run one that does not, would
+    otherwise pass at load and buy machines that can never reach `ready` — the exact failure the
+    guard exists to prevent, reintroduced by per-host engines and caught here."""
+    with pytest.raises(ValueError, match="one model per process"):
+        config(pool={"name": "t", "model_set": [BIG, EMBED], "models_per_host": "all"})
+
+
+def test_the_message_says_which_host_runs_it():
+    with pytest.raises(ValueError, match="rented hosts"):
+        config(pool={"name": "t", "model_set": [BIG, EMBED], "models_per_host": "all"})
+
+    with pytest.raises(ValueError, match="host 'gpu-box'"):
+        config(
+            pool={"name": "t", "model_set": [BIG, EMBED], "models_per_host": "all"},
+            hosts=[{"id": "gpu-box", "kind": "local", "workers": 1, "engine": "vllm",
+                    "capabilities": ["cuda"],
+                    "transport": {"type": "http", "base_url": "http://127.0.0.1:8000"}}],
+            rented=None,
+        )
+
+
+def test_a_single_model_pool_is_fine_on_an_engine_that_holds_one():
+    """One model is a whole set of one: nothing here is beyond what such an engine can hold."""
+    config(
+        pool={"name": "t", "model_set": [BIG], "models_per_host": "all"},
+        catalog={BIG: {"variants": [{"tag": "nvidia/Gemma-4-26B-A4B-NVFP4", "engine": "vllm"}]}},
+        hosts=[{"id": "gpu-box", "kind": "local", "workers": 1, "engine": "vllm",
+                "capabilities": ["cuda"],
+                "transport": {"type": "http", "base_url": "http://127.0.0.1:8000"}}],
+        rented=None,
+    )
+
+
 # --- routing: a request must not reach a host whose engine cannot serve its path ---
 
 

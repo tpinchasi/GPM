@@ -255,6 +255,15 @@ Both keep the property the original rule was bought for: **a host holds its mode
 and nothing is ever swapped out.** What `declared` changes is only that the set is whole across
 the pool rather than on every machine.
 
+With `declared`, `rented.models` is the set the pool may rent **for**, and each machine it buys
+is given **one** of them where its engine serves one model per process — whichever model has the
+fewest hosts serving it, ties going to the order the operator listed them (D94). A host is
+prepared only for what it was bought for; one bought before the pool assigned models keeps the
+whole rented set.
+
+A host *asked* for more models than its engine can hold at once is refused at load, whether that
+comes from `all` or from naming several in a host's own `models`.
+
 With `declared`, the pool **refuses at load** any configuration where some model in its set would
 be held by no host — the only other symptom would be a 503 for that one model, long after the pool
 looked healthy, with nothing saying why. A disabled host covers nothing.
