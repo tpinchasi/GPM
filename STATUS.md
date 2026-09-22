@@ -4,7 +4,7 @@
 > session** (current state, open decisions, session log) so the next session can resume without
 > re-reading everything.
 
-## Current state — 2026-09-19
+## Current state — 2026-09-22
 
 **Phases 1–4 are effectively complete.** The router and SDK, the supervisor with leases and
 renting (proven on a real marketplace for $0.008), the operator console, and the release work:
@@ -166,13 +166,26 @@ Read [docs/overview.md](docs/overview.md) first, then [docs/decisions.md](docs/d
    and edits to the working tree cannot reach the running pool. PR #15 is green and unmerged;
    the later commits are on the same branch.
 
-1. **Open: a batching engine adapter is the biggest lever on cost.** Measured over three live
-   days ([docs/economics.md](docs/economics.md)): the best host reached **175 aggregate
-   tokens/second** and cost **$2.33 per million tokens**, against roughly $0.20-0.90 for a
-   managed API. Most of the gap is the serving stack, not procurement — a continuous-batching
-   server on the same card is commonly reported at 1,000-3,000 tok/s. The engine is already a
-   plug-in, so this is an adapter, not a redesign. **Nothing else on this list has a comparable
-   effect on cost.**
+1. **Built, unproven: the vLLM adapter (D89-D91). The benchmark is now the next thing.**
+   The adapter, the shared `/v1` surface, the agent's hub fetch and `models_per_host: one` are
+   written and green — but **every throughput figure behind them is still an estimate**. The
+   measurement plan is a same-machine A/B/B′: ollama at 7 workers, vLLM at 7, vLLM at its
+   reported maximum, one host, back to back, prefix caching off, aggregate tokens/second only.
+   Roughly $6 on one `1x RTX PRO 6000 WS`. **Pre-registered decision rule: ≥6x the same
+   machine's ollama figure means build on it; 2-6x means correct the claim in
+   [docs/economics.md](docs/economics.md); below 2x means the estimate was wrong and this
+   should not be pursued.** The owner has approved building first and measuring after; the
+   spend is still unasked.
+
+   Still open in the same area:
+   - **`vllm` + `models_per_host: all` is refused at load**, because holding several models on
+     one machine needs a model-routing process in front of several engines, which the pool does
+     not ship. The owner wants this combination eventually; it is the one piece of the design
+     deliberately left out, and `one`'s data model already contains it.
+   - **Renting does not yet choose *which* model** a new rented host is for. `rented.models`
+     names it; coverage-driven assignment from per-model demand is not built.
+   - **Occupancy is reported but not yet acted on**: `Engine.occupancy()` returns the engine's
+     running/waiting/cache figures, and nothing yet ranks, scales or tears down by them.
 
 2. **Open, and the owner's to decide: a lease counts hosts, not workers.** Raised by the owner
    after D80 — with `workers_auto` on, a host's worker count moves, so a worker-denominated
@@ -336,6 +349,7 @@ In `~/workspace/Aletheia`: backlog entries `GPU-POOL-01` and `GPU-CLOUD-01` in
 
 | Date | What happened |
 |---|---|
+| 2026-09-22 | **vLLM built as the second engine (D89-D91), on the owner's instruction to build first and benchmark after.** Investigating what an adapter would need turned up a collision the owner settled: a vLLM process serves **one model**, a host row has one dial URL, so a vLLM host serves one model — which D23 forbids. The owner asked for both shapes, selectable. Built as one mechanism rather than two pool types: `pool.models_per_host` is `all` (D23 unchanged, default) or `one`, where each host declares what it holds and the pool **refuses at load** any set a host would leave uncovered. D23's purpose survives intact — nothing swaps under either. The proxy that would let vLLM hold a whole set is deliberately **not** built, and that combination is refused with a message saying why. Also built: `engines/openai_api.py`, the `/v1` surface both engines now serve, with Ollama's native paths untouched — which caught a trap worth naming, **`stream` defaults to false on `/v1` and true on Ollama's own API**, so an adapter serving both must not apply one default to the other. `Engine.occupancy()` (D91) reads vLLM's own running/waiting/cache figures, because worker slots are exact for an engine serving one request per slot and misleading for one that batches. The agent fetches weights itself over plain HTTP, resumable by range request — no CLI, no new dependency, and the pool names a *repository*, never a path. The SDK speaks `/v1` by default and still understands both reply shapes. The fake Ollama grew a `/v1` surface, without which a pool could have shipped that could not answer the SDK's own default call. **714 tests pass, lint clean.** Two things the owner should know: an earlier claim of mine that NVFP4 "dissolves" the D23 problem was **wrong** — it solves memory, not addressing — and the 5-15x throughput estimate remains unmeasured. |
 | 2026-09-17 | Design drafted in the Aletheia repo: host kinds, router, supervisor, leases. Extended by owner requirements: pool/app decoupling and tunnel/http/https transports; client SDK with default wait-and-retry; routing priority; logical model names (Apple-optimised vs standard builds); rent / bid / hold / tear-down strategies; operator console; workers per host. |
 | 2026-09-17 | Architecture review written (18 findings). Decided one by one with the owner: F1 record-and-measure; F2 two processes; F3 time budget; F4 pool API key as the isolation unit; F5 deferred; F6 v1 cut line with three owner musts; F7 phase re-order; F9 catalog-only resolution; F11 whole model set resident + FCFS; F13 spend reconciliation + provider API. Owner added: public-framework intent; current scripts are not design inputs; prepare-a-host from the console. Verified: the first provider's per-instance restricted key makes the dead-man timer possible without the account key. |
 | 2026-09-17 | F14–F18 delegated and done: docs split into generic core + adopter guide; plug-in interfaces; capability-keyed variants; threat model; release checklist. Owner created this repository (GPM, private); docs moved here; this file, the README and `CLAUDE.md` written for handoff. **Not committed.** |

@@ -50,6 +50,33 @@ supervisor ──(the host's own transport: http on loopback · https + bearer �
   is forgotten, not re-asserted. Desired state lives in the pool's configuration, the single
   source of truth, and is said again every pass.
 
+## 2.1 Engines the agent knows
+
+The agent carries a small class per engine, named by its own settings — it installs on hosts
+without the pool's server package, so it cannot share the pool's adapters.
+
+| Engine | Fetching a model | Holding one |
+|---|---|---|
+| `ollama` | The engine's own pull, watched for progress | Loaded and pinned through the engine |
+| `vllm` | **The agent fetches it**, over plain HTTP from a model hub, into one directory per repository under the machine's models path (D90) | Nothing to do: the engine is started with its model and holds it for the life of the process |
+
+For vLLM the agent reports **models on disk and models served as different sets**, because they
+are: weights present with the engine not yet serving them is the state a vLLM host spends its
+whole preparation in, and folding them into one number would hide it. A model becomes servable
+only when the engine restarts, which only an operator causes (§4).
+
+Three rules the hub fetch keeps:
+
+- **The pool names a repository, never a path.** The agent decides what that means and where it
+  lands; a name that is not `owner/name` is refused, so nothing the pool can say escapes the
+  models directory.
+- **An HTTP client, not a command.** No CLI, no subprocess — the agent ships as a zipapp with
+  `httpx` and must work in whatever image the engine came in. It also yields real byte counts
+  for progress, and resumes a cut transfer with a range request rather than starting a 19 GB
+  file again.
+- **A hub credential is the machine's.** Read from the environment its owner started it in;
+  never accepted from the pool, written to disk, or returned in any answer.
+
 ## 3. What it reports — facts
 
 Read-only, cheap, no privileges: operating system and architecture; accelerators (kind, name,

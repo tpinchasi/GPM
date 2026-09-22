@@ -38,7 +38,7 @@ def create_app(
     state_path: Optional[Path] = None,
 ) -> Starlette:
     probes = probes or Probes()
-    engine = engine_facts(settings.engine)
+    engine = engine_facts(settings.engine, settings)
 
     # Made here rather than at start-up so the app answers the same however it is served.
     engine_client = httpx.AsyncClient(base_url=settings.engine_url, timeout=10, transport=engine_transport)

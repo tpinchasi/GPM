@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -80,6 +80,12 @@ class FakeOllama:
                 Route("/api/show", self._show, methods=["POST"]),
                 Route("/api/pull", self._pull, methods=["POST"]),
                 Route("/api/delete", self._delete, methods=["DELETE"]),
+                # The real engine serves an OpenAI-shaped surface beside its own, and the pool
+                # now routes over it (D89). A fake that offered only the native paths would let
+                # a pool ship that could not answer the SDK's default call.
+                Route("/v1/models", self._v1_models, methods=["GET"]),
+                Route("/v1/chat/completions", self._v1_chat, methods=["POST"]),
+                Route("/v1/embeddings", self._v1_embeddings, methods=["POST"]),
             ]
         )
 
@@ -205,6 +211,80 @@ class FakeOllama:
                 }
             )
         return self._stream(model, {"role": "assistant", "content": content}, generate=True)
+
+    # --- the OpenAI-shaped surface (D89) ---
+
+    async def _v1_models(self, request: Request) -> Response:
+        return JSONResponse({
+            "object": "list",
+            "data": [{"id": tag, "object": "model"} for tag in sorted(self.available | self.resident)],
+        })
+
+    async def _v1_chat(self, request: Request) -> Response:
+        """The same generation as the native path, in this protocol's shape — and with this
+        protocol's opposite default: whole unless the request asked for a stream."""
+        _, parsed = await self._record(request)
+        if "messages" not in parsed:
+            return JSONResponse({"error": {"message": "messages must be provided"}}, status_code=400)
+        model = parsed.get("model", "")
+        refused = self._use(model)
+        if refused is not None:
+            return refused
+        message = self._message(parsed)
+        if parsed.get("stream", False):
+            return self._v1_stream(model, message)
+        self.started += 1
+        if self.chunk_delay_s:
+            await asyncio.sleep(self.chunk_delay_s)
+        self.completed += 1
+        return JSONResponse({
+            "id": "chatcmpl-fake",
+            "object": "chat.completion",
+            "model": model,
+            "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 7, "total_tokens": 10},
+        })
+
+    def _v1_stream(self, model: str, message: dict[str, Any]) -> Response:
+        async def frames() -> AsyncIterator[bytes]:
+            self.started += 1
+            try:
+                for piece in (message.get("content") or "").split(" "):
+                    if self.chunk_delay_s:
+                        await asyncio.sleep(self.chunk_delay_s)
+                    frame = {"id": "chatcmpl-fake", "object": "chat.completion.chunk", "model": model,
+                             "choices": [{"index": 0, "delta": {"content": piece + " "}}]}
+                    yield b"data: " + json.dumps(frame).encode() + b"\n\n"
+                yield (b"data: " + json.dumps({
+                    "id": "chatcmpl-fake", "object": "chat.completion.chunk", "model": model,
+                    "choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 7},
+                }).encode() + b"\n\n")
+                yield b"data: [DONE]\n\n"
+                self.completed += 1
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                raise
+
+        return StreamingResponse(frames(), media_type="text/event-stream")
+
+    async def _v1_embeddings(self, request: Request) -> Response:
+        _, parsed = await self._record(request)
+        texts = parsed.get("input") or []
+        if isinstance(texts, str):
+            texts = [texts]
+        model = parsed.get("model", "")
+        refused = self._use(model)
+        if refused is not None:
+            return refused
+        return JSONResponse({
+            "object": "list",
+            "model": model,
+            "data": [
+                {"object": "embedding", "index": i, "embedding": [0.1, 0.2, 0.3]}
+                for i, _ in enumerate(texts)
+            ],
+            "usage": {"prompt_tokens": 3, "total_tokens": 3},
+        })
 
     async def _embed(self, request: Request) -> Response:
         _, parsed = await self._record(request)

@@ -1,15 +1,16 @@
 import json
 
 import pytest
-from gpm_server.engines import EngineNotFound, OllamaEngine, get_engine
+from gpm_server.engines import EngineNotFound, OllamaEngine, VllmEngine, get_engine
 
 engine = OllamaEngine()
 
 
 def test_get_engine_by_name():
     assert isinstance(get_engine("ollama"), OllamaEngine)
+    assert isinstance(get_engine("vllm"), VllmEngine)
     with pytest.raises(EngineNotFound):
-        get_engine("vllm")
+        get_engine("an-engine-nobody-installed")
 
 
 def test_requested_model():

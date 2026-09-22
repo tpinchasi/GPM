@@ -21,6 +21,7 @@ vast = "gpm_server.providers.vast:VastProvider"
 
 [project.entry-points."gpm.engines"]
 ollama = "gpm_server.engines.ollama:OllamaEngine"
+vllm = "gpm_server.engines.vllm:VllmEngine"
 
 [build-system]
 requires = ["hatchling"]

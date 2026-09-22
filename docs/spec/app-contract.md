@@ -30,6 +30,19 @@ Rules that keep the boundary real:
 Requests and responses are the **inference engine's own HTTP API, passed through untouched**.
 On top of it the pool adds a short, named dialect. Nothing else is added silently.
 
+**Both shipped engines serve the OpenAI-shaped `/v1` paths** — `/v1/chat/completions`,
+`/v1/completions`, `/v1/embeddings` — and the SDK's convenience methods use them by default
+(D89). That is not translation: both engines genuinely speak these paths, so the same call
+reaches a pool of either unchanged. Ollama also serves its own native `/api/*` paths, and apps
+written against them keep working; a request is passed through on whichever surface it arrived.
+
+Two differences between the surfaces matter to an app:
+
+| | `/v1/*` | Ollama's `/api/*` |
+|---|---|---|
+| Streaming | **Off** unless `"stream": true` | **On** unless `"stream": false` |
+| Structured output | `response_format` | `format` |
+
 | Dialect item | Required? | Meaning |
 |---|---|---|
 | `Authorization: Bearer <app key>` | **Required**, loopback included | Admits the app to this pool (§3) |

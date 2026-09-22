@@ -8,7 +8,8 @@ from typing import Any, ClassVar, Optional
 
 import httpx
 
-from .base import Health, PullResult
+from . import openai_api
+from .base import Health, Occupancy, PullResult
 
 # Matches the first `"model": "<value>"` pair, including escaped characters in the value.
 _MODEL_FIELD = re.compile(rb'("model"\s*:\s*)"(?:[^"\\]|\\.)*"')
@@ -29,7 +30,16 @@ class OllamaEngine:
     name: ClassVar[str] = "ollama"
 
     def inference_paths(self) -> set[str]:
-        return {"/api/chat", "/api/generate", "/api/embed", "/api/embeddings"}
+        """Both surfaces: this engine's own API, and the OpenAI-shaped one it also serves.
+
+        The second is what lets a pool of these hosts and a pool of vLLM hosts answer the same
+        requests, and it is what the SDK now speaks (D89). The native paths stay: apps written
+        against them keep working, and nothing here translates between the two — each is passed
+        through to the engine as it arrived.
+        """
+        return {"/api/chat", "/api/generate", "/api/embed", "/api/embeddings"} | set(
+            openai_api.INFERENCE_PATHS
+        )
 
     def requested_model(self, path: str, body: bytes) -> Optional[str]:
         model = _decode(body).get("model")
@@ -46,18 +56,30 @@ class OllamaEngine:
         return rewritten if count else body
 
     def wants_schema(self, path: str, body: bytes) -> bool:
+        if path in openai_api.INFERENCE_PATHS:
+            return openai_api.wants_schema(path, body)
         # A JSON schema object enforces structure; the bare string "json" is loose JSON mode,
         # which guarantees nothing about shape.
         return isinstance(_decode(body).get("format"), dict)
 
     def is_streaming(self, path: str, body: bytes) -> bool:
+        if path in openai_api.INFERENCE_PATHS:
+            # Note the opposite default: whole unless asked to stream, where this engine's own
+            # API streams unless asked not to.
+            return openai_api.is_streaming(path, body)
         if path not in _STREAMING_PATHS:
             return False
         return bool(_decode(body).get("stream", True))
 
     def usage(self, path: str, tail: bytes) -> tuple[Optional[int], Optional[float]]:
         """This engine puts its counts in the last frame, streamed or not: `eval_count` is the
-        tokens it generated and `eval_duration` the nanoseconds it spent doing so."""
+        tokens it generated and `eval_duration` the nanoseconds it spent doing so.
+
+        On the OpenAI-shaped surface it reports that protocol's counts instead, which carry no
+        duration — the pool measures that itself there.
+        """
+        if path in openai_api.INFERENCE_PATHS:
+            return openai_api.usage(path, tail)
         for line in reversed(tail.splitlines()):
             line = line.strip()
             if not line.startswith(b"{"):
@@ -77,8 +99,12 @@ class OllamaEngine:
         return None, None
 
     def keepalive_frame(self, path: str) -> Optional[bytes]:
-        """None: this engine answers in newline-delimited JSON, where every line a client
-        reads is a frame it will try to parse. There is no harmless one to send."""
+        """None on this engine's own paths: it answers in newline-delimited JSON, where every
+        line a client reads is a frame it will try to parse, so there is no harmless one to
+        send. On its OpenAI-shaped paths the answer is server-sent events, which do define an
+        ignorable frame (D62)."""
+        if path in openai_api.INFERENCE_PATHS:
+            return openai_api.keepalive_frame(path)
         return None
 
     async def health(self, client: httpx.AsyncClient) -> Health:
@@ -170,6 +196,12 @@ class OllamaEngine:
             # the pool nothing (D77).
             settings["OLLAMA_HOST"] = listen
         return settings
+
+    async def occupancy(self, client: httpx.AsyncClient) -> Optional[Occupancy]:
+        """None: this engine serves one request per worker slot and publishes no queue of its
+        own, so the pool's own count of busy workers is already exact for it (D91). Saying
+        nothing here means "judge me by the slots", which is what the pool did before."""
+        return None
 
     async def models_resident(self, client: httpx.AsyncClient) -> frozenset[str]:
         response = await client.get("/api/ps")

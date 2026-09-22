@@ -153,7 +153,7 @@ class Supervisor:
             config=host_config,
             client=build_client(host_config.transport, self.config.pool, dial_url),
             variants=variants_for_host(
-                self.config.pool.model_set,
+                self.config.models_held_by(host_config),
                 self.config.catalog,
                 capabilities,
                 self.engine.name,
@@ -374,7 +374,7 @@ class Supervisor:
             else:
                 existing.config = host_config
                 existing.variants = variants_for_host(
-                    new.pool.model_set, new.catalog, existing.capabilities, self.engine.name
+                    new.models_held_by(host_config), new.catalog, existing.capabilities, self.engine.name
                 )
                 if host_config.disabled and existing.state is not HostState.DISABLED:
                     existing.state = HostState.DISABLED
@@ -597,7 +597,8 @@ class Supervisor:
             )
         if host.capabilities != before:
             host.variants = variants_for_host(
-                self.config.pool.model_set, self.config.catalog, host.capabilities, self.engine.name
+                self.config.models_held_by(host.config), self.config.catalog, host.capabilities,
+                self.engine.name,
             )
             self.events.record(
                 "capabilities_derived",
@@ -734,11 +735,19 @@ class Supervisor:
         finally:
             self._preparing.pop(host_id, None)
 
+    def _rented_models(self) -> list[str]:
+        """What a rented host is asked to hold (D89). With `all`, the pool's whole set; with
+        `one`, what the rented configuration names, or anything the pool still needs."""
+        rented = self.config.rented
+        if self.config.pool.models_per_host == "all" or rented is None or rented.models is None:
+            return list(self.config.pool.model_set)
+        return list(rented.models)
+
     def _rented_required_tags(self) -> frozenset[str]:
         rented = self.config.rented
         capabilities = frozenset(rented.capabilities) if rented else frozenset()
         variants = variants_for_host(
-            self.config.pool.model_set, self.config.catalog, capabilities, self.engine.name
+            self._rented_models(), self.config.catalog, capabilities, self.engine.name
         )
         return frozenset(v[0].tag for v in variants.values() if v)
 
@@ -748,7 +757,7 @@ class Supervisor:
         rented = self.config.rented
         capabilities = frozenset(rented.capabilities)
         variants = variants_for_host(
-            self.config.pool.model_set, self.config.catalog, capabilities, self.engine.name
+            self._rented_models(), self.config.catalog, capabilities, self.engine.name
         )
         live = set()
         for host_id, host in self.fleet.hosts.items():
