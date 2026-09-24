@@ -848,6 +848,10 @@ class Fleet:
                 # the same directory its start command reads (D97).
                 models_path=hostagent.MODELS_DIR if self.engine_of(host).loads_by_restart else None,
             )
+        except hostagent.HostNotReachable as exc:
+            # Not an attempt: nothing was learned about the machine, only that it is not up yet.
+            host.agent_detail = f"waiting for the machine to accept SSH ({exc})"
+            return
         except hostagent.AgentInstallFailed as exc:
             host.agent_attempts += 1
             host.agent_detail = str(exc)
