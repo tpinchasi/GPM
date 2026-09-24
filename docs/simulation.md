@@ -14,7 +14,10 @@ uv run python tests/simulation/scenarios.py             # the same, with timelin
 uv run python tests/simulation/scenarios.py market_day  # one of them
 ```
 
-**It is a merge gate.** CI runs it as its own job on every pull request, beside the unit suite.
+**It is a merge gate for the changes it exists to catch.** CI runs it as its own job on a pull
+request that carries the `simulation` label — put it on any change to the supervisor's renting,
+allocation or recovery — and on the weekly and on-request runs. It takes ten minutes, so it does
+not run on every pull request.
 A version is not merged until both are green.
 
 ## What it is not

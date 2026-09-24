@@ -1,9 +1,29 @@
 name: CI
 
+# What runs when — kept deliberately cheap, because the minutes are metered (the account hit
+# 90% of its allowance in one evening of small fixes, at ~21 minutes a run, twice a change):
+#
+# - every pull request: the default suite on one Python, lint, the version check, the secret
+#   scan, the dependency audit, and the no-spending guard — about five minutes;
+# - a pull request labelled `simulation`: the whole-pool simulation as well — the gate for a
+#   change to the supervisor's renting, allocation or recovery, which is where a long run finds
+#   what a unit test cannot;
+# - every Monday, and on request: everything, on every supported Python.
+#
+# main is only ever changed by merging a pull request, and a pull request is tested on its
+# merge with main, so there is no separate run on push: it would be the same run again.
 on:
-  push:
-    branches: [main]
   pull_request:
+    # `labeled`, so that putting the `simulation` label on an open pull request runs it.
+    types: [opened, synchronize, reopened, labeled]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+# A new push to the same pull request supersedes the run in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 # Read-only, and stated rather than inherited: the secret scan asks GitHub which commits a pull
 # request contains, and without this it is refused and the job fails on every run.
@@ -14,11 +34,12 @@ permissions:
 jobs:
   tests:
     # The whole default suite runs with no GPU and no cloud account — that is the point of the
-    # fake provider and the fake engine, and CI is where it stays true.
+    # fake provider and the fake engine, and CI is where it stays true. One Python per pull
+    # request; every supported one on the weekly run.
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python: ["3.11", "3.12", "3.13"]
+        python: ${{ github.event_name == 'pull_request' && fromJSON('["3.12"]') || fromJSON('["3.11", "3.12", "3.13"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -31,7 +52,10 @@ jobs:
   simulation:
     # A whole pool — real router, real supervisor — against a market that moves under it, for
     # long enough that hosts are rented, paused, woken and given up. Slower than the unit
-    # suite by design, and the gate a version passes before it is merged.
+    # suite by design (ten minutes), so it runs on the weekly and on-request runs, and on a
+    # pull request only when it carries the `simulation` label — the gate for a change to
+    # renting, allocation or recovery.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'simulation')
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
