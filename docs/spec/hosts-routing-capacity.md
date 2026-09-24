@@ -158,8 +158,13 @@ market lists it, compared whole (so two of a card is not one of it), its memory,
 capabilities — and is decided **before the bid**, so the engine is launched with that
 parallelism and the number is real. The number is then stored with the host and survives a
 supervisor restart; editing the profiles later does not reach a host already running. It changes
-only when an operator resizes that host (§2.3). With no match, a rented host runs `rented.workers`, marked as
-the default wherever it is shown. The market preview shows what each offer would run.
+only when an operator resizes that host (§2.3). With no match, a rented host runs `rented.workers`
+**per card** — times the cards the offer lists, held at 64, like a profile that names the card
+(D107) — marked as the default wherever it is shown. The market preview shows what each offer
+would run. For vLLM the launcher runs a copy of every model on each card, so the number is real
+for every model. **For Ollama it is not yet:** Ollama keeps one instance of a model, on one card
+when it fits, so a two-card Ollama host runs twice the work only when its traffic is spread over
+models on different cards.
 
 Worker counts are recomputed when the pool's model set or context length changes — never per
 request.

@@ -696,6 +696,8 @@ class RentedConfig(BaseModel):
     #: is the floor below which no machine is wanted at all, whatever image would run on it.
     images: list["EngineImage"] = Field(default_factory=list)
     disk_gb: float = 60.0
+    #: Workers **per card** for a machine no capacity profile matches (D107): two cards run
+    #: twice the work, as under a profile that names the card (D88), held at 64 per host.
     workers: int = Field(default=1, ge=1)
     capabilities: list[str] = Field(default_factory=list)
     model_set_gb: float = 0.0

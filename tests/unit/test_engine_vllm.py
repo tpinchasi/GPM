@@ -154,6 +154,21 @@ async def test_occupancy_reports_what_the_engine_is_holding():
         assert await engine.occupancy(client) == Occupancy(running=64, waiting=11, cache_used=0.87)
 
 
+async def test_behind_the_hosts_router_every_engine_is_counted_not_the_last():
+    """The router offers one set of metrics per engine process — a model each, and a copy of each
+    per card (D96, D107). Keeping only the last had a two-card host look half as busy as it was."""
+    behind_router = (
+        "# gpm-proxy upstream big http://127.0.0.1:8001\n" + METRICS
+        + "# gpm-proxy upstream big http://127.0.0.1:8002\n"
+        + 'vllm:num_requests_running{model_name="gemma"} 5.0\n'
+        + 'vllm:num_requests_waiting{model_name="gemma"} 1.0\n'
+        + 'vllm:kv_cache_usage_perc{model_name="gemma"} 0.20\n'
+    )
+    async with answering({"/metrics": behind_router}) as client:
+        assert await engine.occupancy(client) == Occupancy(running=69, waiting=12, cache_used=0.87), \
+            "requests summed; the cache is the fullest engine's"
+
+
 async def test_the_queue_inside_the_engine_is_what_the_pool_could_not_otherwise_see():
     """A host admitted at a hundred workers with ninety-nine in flight looks idle by slot count
     while requests pile up inside the engine. `waiting` is the whole point of asking."""

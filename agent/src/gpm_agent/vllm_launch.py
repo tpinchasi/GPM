@@ -13,6 +13,13 @@ Two shapes, matching the pool's placement (D94, D96):
   the accelerator's memory split between them by the size of each model's weights (with a floor,
   so a small model still has room to run), and the router on the engine port in front of them.
 
+**On a machine with several cards, every model runs once on each** (D107): a copy per card,
+pinned to it, each given its share of that card and its share of the host's workers, with the
+router in front choosing the least busy copy. The router is started for copies even where the
+pool placed one model, because the pool still dials one port. The copies share nothing, so a
+model of any kind — dense, mixture-of-experts, embedding — runs the same way on any number of
+cards, and the set must fit on one card, as it already had to.
+
 It stops whatever it started last time before starting anything, so calling it twice is a
 restart and not a second copy fighting the first for the same memory.
 """
@@ -21,6 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import signal
 import subprocess
@@ -173,6 +181,20 @@ def card_memory_bytes(run: Callable[..., Any] = subprocess.run) -> Optional[int]
     return min(sizes) * 1024 * 1024 if sizes else None
 
 
+def card_devices(env: Mapping[str, str], run: Callable[..., Any] = subprocess.run) -> list[str]:
+    """The cards to put a copy on: those the machine's own environment limits it to, or every
+    card the driver lists — or none, where neither says, and one copy runs where CUDA puts it."""
+    visible = env.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible:
+        return [d.strip() for d in visible.split(",") if d.strip()]
+    try:
+        out = run(["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+                  capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip().isdigit()]
+
+
 def memory_plan(sizes: Sequence[int], card_bytes: Optional[int]) -> tuple[list[float], Optional[str]]:
     """Each model's share of the card, or why the set cannot run on it.
 
@@ -202,11 +224,19 @@ def memory_plan(sizes: Sequence[int], card_bytes: Optional[int]) -> tuple[list[f
     return [round(share, 3) for share in shares], None
 
 
-def number_flags(env: Mapping[str, str]) -> list[str]:
+#: The pool's numbers that are the host's whole, to be split between its copies: the workers
+#: the pool sends a host are for all its cards, and vLLM's limit is per process (D107).
+SPLIT_BETWEEN_COPIES = {"GPM_VLLM_MAX_NUM_SEQS"}
+
+
+def number_flags(env: Mapping[str, str], copies: int = 1) -> list[str]:
     flags: list[str] = []
     for variable, flag in NUMBER_FLAGS:
         value = env.get(variable, "").strip()
         if value.isdigit():
+            if variable in SPLIT_BETWEEN_COPIES and copies > 1:
+                # Rounded up: a host of 13 on two cards runs 7 and 7, never 6 and 6.
+                value = str(max(1, math.ceil(int(value) / copies)))
             flags += [flag, value]
     return flags
 
@@ -294,6 +324,8 @@ def launch(
     alive: Optional[Callable[[int], bool]] = None,
     card_bytes: Optional[int] = None,
     probe_card: Callable[[], Optional[int]] = card_memory_bytes,
+    devices: Optional[Sequence[str]] = None,
+    probe_devices: Callable[[Mapping[str, str]], list[str]] = card_devices,
 ) -> Started:
     """Stop what ran before, then start vLLM for every complete model on disk.
 
@@ -320,10 +352,17 @@ def launch(
     logs = models_dir / ".gpm-logs"
     logs.mkdir(parents=True, exist_ok=True)
     sizes = [size_of(d) for d in found]
+    # The smallest card, when they differ: every copy is planned for the card it might get.
     card = card_bytes if card_bytes is not None else probe_card()
     shares, refused = memory_plan(sizes, card)
+    cards = list(devices) if devices is not None else probe_devices(env)
+    # One card, or none known: no pinning, exactly as before. Several: a copy on each.
+    placements: list[Optional[str]] = list(cards) if len(cards) > 1 else [None]
+    copies = len(placements)
+    router = proxy or copies > 1
     started.plan = {
         "card_bytes": card,
+        "cards": cards,
         "models": {served_name(d): {"weights_bytes": s} for d, s in zip(found, sizes, strict=True)},
     }
     if refused:
@@ -333,35 +372,43 @@ def launch(
         log.error("not starting vLLM: %s", refused)
         _record(models_dir, started)
         return started
-    upstreams: dict[str, str] = {}
+    upstreams: dict[str, list[str]] = {}
 
-    for index, (directory, share) in enumerate(zip(found, shares, strict=True)):
-        name = served_name(directory)
-        engine_port = port if not proxy else port + 1 + index
-        family = family_of(directory)
-        extra, missing = option_flags(options, family)
-        for option in missing:
-            started.not_applied.append(f"{option} for {name} (family {family or 'unknown'})")
-            log.warning("%s has no %s in its family (%s); started without it", name, option, family)
-        argv = [
-            vllm, "serve", str(directory),
-            "--served-model-name", name,
-            # Loopback, always: the pool reaches the machine through a forward, and binding
-            # anything wider only exposes the engine (D77).
-            "--host", "127.0.0.1",
-            "--port", str(engine_port),
-            "--gpu-memory-utilization", str(share),
-            *number_flags(env),
-            *extra,
-        ]
-        log_path = logs / f"{directory.name}.log"
-        out = open(log_path, "ab")
-        process = popen(argv, stdout=out, stderr=subprocess.STDOUT, env=env, start_new_session=True)
-        started.engines.append({"model": name, "port": engine_port, "memory_share": share,
-                                "pid": getattr(process, "pid", None), "argv": argv, "log": str(log_path)})
-        upstreams[name] = f"http://127.0.0.1:{engine_port}"
+    index = 0
+    for device in placements:
+        for directory, share in zip(found, shares, strict=True):
+            name = served_name(directory)
+            engine_port = port if not router else port + 1 + index
+            index += 1
+            family = family_of(directory)
+            extra, missing = option_flags(options, family)
+            if device is None or device == placements[0]:
+                for option in missing:
+                    started.not_applied.append(f"{option} for {name} (family {family or 'unknown'})")
+                    log.warning("%s has no %s in its family (%s); started without it", name, option, family)
+            argv = [
+                vllm, "serve", str(directory),
+                "--served-model-name", name,
+                # Loopback, always: the pool reaches the machine through a forward, and binding
+                # anything wider only exposes the engine (D77).
+                "--host", "127.0.0.1",
+                "--port", str(engine_port),
+                "--gpu-memory-utilization", str(share),
+                *number_flags(env, copies),
+                *extra,
+            ]
+            process_env = env if device is None else {**env, "CUDA_VISIBLE_DEVICES": device}
+            log_path = logs / (f"{directory.name}.log" if device is None
+                               else f"{directory.name}.card{device}.log")
+            out = open(log_path, "ab")
+            process = popen(argv, stdout=out, stderr=subprocess.STDOUT, env=process_env,
+                            start_new_session=True)
+            started.engines.append({"model": name, "port": engine_port, "memory_share": share,
+                                    "card": device, "pid": getattr(process, "pid", None),
+                                    "argv": argv, "log": str(log_path)})
+            upstreams.setdefault(name, []).append(f"http://127.0.0.1:{engine_port}")
 
-    if proxy:
+    if router:
         map_file = models_dir / UPSTREAMS_FILE
         draft = map_file.with_suffix(".new")
         draft.write_text(json.dumps(upstreams, indent=2, sort_keys=True))
@@ -411,7 +458,8 @@ def main(args: Any) -> int:
         print("gpm-agent vllm-start: no complete model on disk yet; nothing started")
         return 0
     for engine in started.engines:
-        print(f"started {engine['model']} on {engine['port']} (memory {engine['memory_share']})")
+        on = f", card {engine['card']}" if engine.get("card") is not None else ""
+        print(f"started {engine['model']} on {engine['port']} (memory {engine['memory_share']}{on})")
     if started.proxy:
         print(f"started the router on {started.proxy['port']}")
     for name in started.skipped:

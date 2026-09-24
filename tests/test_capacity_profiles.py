@@ -74,6 +74,18 @@ def test_no_matching_profile_falls_back_to_the_rented_default_and_says_so(make_f
     assert workers == 2 and "no capacity profile" in why
 
 
+def test_the_rented_default_is_per_card(make_fleet):
+    """Found live (D107): a 2x H100 host matched no profile and ran the default of six — the
+    same as one card, with the second paid for and idle."""
+    fleet = make_fleet(config([PROFILE], rented_workers=6), [])
+    one, _ = fleet.workers_for(default_offer(hardware="1x H100 PCIE", gpus=1))
+    two, why = fleet.workers_for(default_offer(hardware="2x H100 PCIE", gpus=2))
+    many, why_many = fleet.workers_for(default_offer(hardware="16x H100 PCIE", gpus=16))
+    assert (one, two) == (6, 12)
+    assert "6 per card x 2 card(s)" in why and "no capacity profile" in why
+    assert many == 64 and "held at 64" in why_many
+
+
 def test_the_first_matching_profile_wins(make_fleet):
     broad = {"match": {"min_gpu_memory_gb": 80}, "max_workers": 4}
     fleet = make_fleet(config([PROFILE, broad]), [])

@@ -523,7 +523,8 @@ class Fleet:
     def workers_for(self, offer: Offer) -> tuple[int, str]:
         """How many workers a host rented from this offer would run, and why (spec §2.1).
 
-        The first capacity profile the offer matches decides; with none, the rented default.
+        The first capacity profile the offer matches decides; with none, the rented default,
+        which is per card like a profile that names the card (D88, D107).
         """
         capabilities = set(self.rented.capabilities)
         for profile in self.config.capacity_profiles:
@@ -550,7 +551,14 @@ class Fleet:
                 return workers, why + (f" ({profile.note})" if profile.note else "")
             why = f"capacity profile for {match.hardware or 'this hardware'}"
             return profile.max_workers, why + (f" ({profile.note})" if profile.note else "")
-        return self.rented.workers, "the rented default; no capacity profile matches this hardware"
+        # Per card, like a profile that names the card: a second card left idle is what its
+        # price was not paid for, and the engine runs a copy on each (D107).
+        cards = max(1, offer.gpus or 1)
+        workers = min(self.rented.workers * cards, self.MOST_WORKERS_A_HOST_MAY_RUN)
+        why = f"the rented default, {self.rented.workers} per card x {cards} card(s)"
+        if workers < self.rented.workers * cards:
+            why += f", held at {self.MOST_WORKERS_A_HOST_MAY_RUN}"
+        return workers, why + "; no capacity profile matches this hardware"
 
     def launch_workers_for(self, starts_at: int) -> int:
         """What the engine is *launched* to run at once (D68).
