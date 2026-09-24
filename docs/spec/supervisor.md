@@ -222,6 +222,12 @@ Choose by cost over the hours the lease still has, not by habit:
 | **Replace** on another machine | model download at that host's price + time to ready | yes |
 | **Wait it out**, instance stopped, storage only, time-boxed | storage, plus the run pausing unless higher tiers cover demand | post-v1 |
 
+A re-bid asks the provider to start the instance again, and the provider takes longer than a
+pass to do it. For a grace period after the re-bid (`REBID_GRACE_S`, 120 s) a stopped instance
+is that restart in flight, not a new eviction; the grace ends the moment the instance is seen
+running, and a stop that outlasts it is judged again (D106). Without this the machine's floor —
+the pool's own bid, once it is the top bidder — plus the premium was bid again every pass.
+
 *(Also post-v1: sampling each rented machine's floor every pass, proactive re-bid before being
 outbid, re-bidding downward once it is verified the provider charges the bid rather than a
 clearing price, and a thrash guard per machine and per hardware class.)*

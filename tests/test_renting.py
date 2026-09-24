@@ -354,6 +354,51 @@ async def test_an_eviction_inside_a_lease_is_recovered_unattended(fleet):
     assert not fleet.hosts or next(iter(fleet.hosts.values())).state != "stopped"
 
 
+async def test_a_stop_seen_while_the_pools_own_re_bid_restarts_is_not_a_second_eviction(fleet, monkeypatch):
+    """Found live: sixteen seconds after re-bidding in place, the instance still read "stopped"
+    — the provider takes longer than a pass to bring a container back — and the pool judged a
+    second eviction. The machine's floor was by then the pool's own bid, as the top bidder, so
+    floor plus premium outbid itself by ten cents an hour, and would have again every pass
+    until the ceiling (D106)."""
+    import time
+
+    open_lease(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    host = next(iter(fleet.hosts.values()))
+    first_bid = host.bid_hourly
+
+    # The provider accepts the start and takes its time: the instance still reads "stopped".
+    async def slow_start(instance):
+        pass
+
+    monkeypatch.setattr(fleet.provider, "start", slow_start)
+    fleet.provider.evict(host.instance.instance_id)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    assert kinds(fleet).count("eviction") == 1
+    assert host.host_id in fleet.hosts, "re-bid in place, not replaced"
+    rebid = host.bid_hourly
+    assert rebid >= first_bid and host.rebid_at is not None
+
+    for _ in range(3):
+        await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    assert kinds(fleet).count("eviction") == 1, "the pool's own restart in flight is not an eviction"
+    assert host.bid_hourly == rebid
+
+    # It comes up: the grace ends the moment it is seen running, and a later stop is an
+    # eviction once more.
+    fleet.provider.bring_up(host.instance.instance_id)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    assert host.rebid_at is None
+    fleet.provider.evict(host.instance.instance_id)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    assert kinds(fleet).count("eviction") == 2
+
+    # A start that never happens is judged again once the grace has run out.
+    host.rebid_at = time.time() - fleet.REBID_GRACE_S - 1
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    assert kinds(fleet).count("eviction") == 3
+
+
 async def test_an_eviction_outside_a_lease_rents_nothing_back(fleet):
     lease = open_lease(fleet)
     await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})

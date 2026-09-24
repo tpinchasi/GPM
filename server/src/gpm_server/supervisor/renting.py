@@ -94,6 +94,10 @@ class RentedHost:
     #: takes minutes, and asking again every pass would only ever interrupt it.
     restarted_for: Optional[frozenset] = None
     restart_asked_at: Optional[float] = None
+    #: When the pool last re-bid for this host and asked the provider to start it again. While
+    #: that start is in flight the instance still reads "stopped", and read as a fresh
+    #: eviction the pool bids against itself (D106).
+    rebid_at: Optional[float] = None
     restart_task: Optional[asyncio.Task] = dataclasses.field(default=None, repr=False, compare=False)
     #: True once this host's agent has answered a heartbeat, so an operator can see the verb
     #: working before the ssh beat beside it is retired.
@@ -1497,6 +1501,10 @@ class Fleet:
     #: How long before a failed restart request is tried again. The agent answers fast when it
     #: refuses, so without a pause a machine that cannot restart would be asked every pass.
     RESTART_RETRY_S = 120.0
+    #: How long after a re-bid a "stopped" instance is the pool's own restart in flight rather
+    #: than a new eviction (D106). Long enough for a provider to bring a container back; short
+    #: enough that a start that never happens is judged within the pass or two after.
+    REBID_GRACE_S = 120.0
 
     def _restart_when_downloaded(
         self, host: RentedHost, tags: list[str], held: dict[str, dict], report: dict
@@ -1924,10 +1932,19 @@ class Fleet:
                 continue
 
             if status.state != InstanceState.STOPPED:
+                if status.state == InstanceState.RUNNING:
+                    host.rebid_at = None  # the start the last re-bid asked for has landed
                 continue
             if host.state == "parked":
                 # Stopped because the pool parked it. Read as an eviction, it would be re-bid
                 # and restarted the moment it was parked (D64).
+                continue
+            if host.rebid_at is not None and time.time() - host.rebid_at < self.REBID_GRACE_S:
+                # Stopped because the provider has not yet restarted it after the pool's own
+                # re-bid — one pass is not long enough. Found live: sixteen seconds after a
+                # re-bid the instance still read "stopped", the pool judged a second eviction,
+                # took the machine's floor — now its own bid, as the top bidder — added the
+                # premium, and paid ten cents an hour more to outbid itself (D106).
                 continue
 
             if not host.interruptible:
@@ -1988,6 +2005,7 @@ class Fleet:
                     await self.provider.start(host.instance)
                     host.bid_hourly = capped
                     host.state = "scheduling"
+                    host.rebid_at = time.time()
                 except ProviderError as exc:
                     log.warning("re-bid for %s failed: %s", host.host_id, exc)
             else:
