@@ -17,6 +17,7 @@ import contextlib
 import json
 import os
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -137,11 +138,16 @@ def open_page(url: str) -> Iterator[Page]:
     if browser is None:
         raise RuntimeError("no browser here")
     port = _free_port()
-    with tempfile.TemporaryDirectory() as profile:
+    # Leftovers in a profile that is only being thrown away are not a failure: Chrome's helper
+    # processes can still be writing to it for a moment after the browser itself has gone. Seen
+    # in CI, where the test passed and then failed deleting the profile — once in three runs.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as profile:
         process = subprocess.Popen(
             [browser, "--headless=new", "--disable-gpu", "--no-first-run", f"--user-data-dir={profile}",
              f"--remote-debugging-port={port}", "about:blank"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            # Its own process group, so stopping it stops its renderer and GPU helpers too.
+            start_new_session=True,
         )
         page = None
         try:
@@ -162,5 +168,6 @@ def open_page(url: str) -> Iterator[Page]:
         finally:
             if page is not None:
                 page.close()
-            process.kill()
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(process.pid, signal.SIGKILL)
             process.wait(timeout=10)
