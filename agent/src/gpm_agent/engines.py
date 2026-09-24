@@ -164,6 +164,13 @@ LOAD_TIMEOUT_S = 600.0
 #: next model at the time (D83 put a load beside a download); and not fatal when it expires.
 SHOW_TIMEOUT_S = 120.0
 
+#: vLLM's batch, from the pool's worker count: the same two numbers the pool's own start
+#: command uses, kept here in the same words because the restart the pool asks for writes them
+#: from here. Below the engine's own default the pool's figure could only ever hurt (found
+#: live: 1,536 tokens for six workers, and a multimodal model that refused to start on it).
+TOKENS_PER_SEQUENCE = 256
+MIN_BATCHED_TOKENS = 8192
+
 
 class EngineRefused(Exception):
     """The engine said no. The message is the engine's, passed on to the operator."""
@@ -314,9 +321,13 @@ class VllmFacts:
         """
         environment = {
             "GPM_VLLM_MAX_NUM_SEQS": str(workers),
-            # The engine refuses to start with a batch smaller than the number of sequences it
-            # is told to run, so this is a floor before it is anything else.
-            "GPM_VLLM_MAX_NUM_BATCHED_TOKENS": str(max(workers, workers * 256)),
+            # Never below the engine's own default. The pool's start command has had this floor
+            # since a multimodal model refused to start on six workers' 1,536 tokens — but the
+            # restart the pool asks for once the weights have landed writes *these* numbers,
+            # and without the same floor here it undid the fix (found live: the same refusal,
+            # "max_tokens_per_mm_item (2496) is larger than max_num_batched_tokens (1536)",
+            # on the next host). The engine's own floor is `max_num_seqs`, which is lower.
+            "GPM_VLLM_MAX_NUM_BATCHED_TOKENS": str(max(MIN_BATCHED_TOKENS, workers * TOKENS_PER_SEQUENCE)),
         }
         if context is not None:
             environment["GPM_VLLM_MAX_MODEL_LEN"] = str(context)

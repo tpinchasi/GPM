@@ -820,6 +820,22 @@ def test_the_stage_is_said_in_words_and_derived_from_what_is_known(detail, expec
     assert expected in _stage_of(detail)
 
 
+def test_what_the_agent_holds_on_disk_counts_as_on_disk():
+    """An engine launched with its models can only name what it serves, so while its processes
+    load it says nothing is on disk. Found live: three fetched models read "still to download"
+    in the console until the engine came up — or, that time, died. The agent's report is the
+    fact the engine cannot give."""
+    from gpm_server.supervisor.control import _held_on_disk
+
+    assert _held_on_disk(None) == frozenset()
+    assert _held_on_disk({"models": [
+        {"tag": "a/one", "on_disk": True, "loaded": False},
+        {"tag": "a/two", "on_disk": False, "pulling": {"tag": "a/two"}},
+        {"tag": "a/three", "on_disk": True, "loaded": True},
+        {"on_disk": True},
+    ]}) == frozenset({"a/one", "a/three"})
+
+
 def test_the_console_opens_a_host_and_follows_it():
     """Structural: the page must ask for one host and keep asking while the panel is open."""
     script = (STATIC / "app.js").read_text()

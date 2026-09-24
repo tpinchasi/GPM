@@ -65,6 +65,17 @@ def _same_origin(request: Request, allowed_hosts: set[str]) -> bool:
     return host in allowed_hosts
 
 
+def _held_on_disk(agent_models: Optional[dict[str, Any]]) -> frozenset[str]:
+    """The tags a host's agent reports as on its disk — the fact the engine's own list cannot
+    give for an engine that is launched with its models."""
+    if not agent_models:
+        return frozenset()
+    return frozenset(
+        entry["tag"] for entry in agent_models.get("models") or []
+        if isinstance(entry, dict) and entry.get("on_disk") and isinstance(entry.get("tag"), str)
+    )
+
+
 def _stage_of(detail: dict[str, Any]) -> str:
     """Where preparing this host has got to, in words, from what is known about it.
 
@@ -1177,11 +1188,16 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 engine = supervisor.engine_for(rented)
                 resident = await engine.models_resident(client)
                 available = await engine.models_available(client)
+                # What the agent holds on disk counts too. An engine launched with its models
+                # (vLLM) can only name what it is serving, so while its processes are still
+                # loading it says nothing is here — and the operator watching three fetched
+                # models read "still to download" beside a 16 GB file that had landed.
+                on_disk = available | resident | _held_on_disk(rented.agent_models)
                 detail["engine"] = {
                     "answers": True,
                     "loaded": sorted(resident),
-                    "on_disk": sorted(available | resident),
-                    "missing_from_disk": sorted(required - (available | resident)),
+                    "on_disk": sorted(on_disk),
+                    "missing_from_disk": sorted(required - on_disk),
                     "not_loaded": sorted(required - resident),
                 }
             except Exception as exc:  # noqa: BLE001 - say it is not answering, do not 500
