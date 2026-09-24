@@ -183,6 +183,13 @@ class PoolClient:
                 raise PoolUnavailable(reason="no_ready_host", detail="no host became ready before the timeout")
             time.sleep(1.0)
 
+    def directory(self, query: Optional[str] = None) -> dict[str, Any]:
+        """What this pool could serve, beyond its model set: the directory its operator keeps
+        (app contract §2). Each entry's `in_pool` says whether a request may name it today."""
+        response = self._client.get("/pool/directory", params={"q": query} if query else None)
+        response.raise_for_status()
+        return response.json()
+
     def close(self) -> None:
         self._client.close()
 
@@ -256,6 +263,12 @@ class AsyncPoolClient:
             if deadline is not None and time.monotonic() >= deadline:
                 raise PoolUnavailable(reason="no_ready_host", detail="no host became ready before the timeout")
             await asyncio.sleep(1.0)
+
+    async def directory(self, query: Optional[str] = None) -> dict[str, Any]:
+        """See `PoolClient.directory`."""
+        response = await self._client.get("/pool/directory", params={"q": query} if query else None)
+        response.raise_for_status()
+        return response.json()
 
     async def aclose(self) -> None:
         await self._client.aclose()

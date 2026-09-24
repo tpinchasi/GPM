@@ -56,6 +56,19 @@ class Occupancy:
     cache_used: Optional[float] = None
 
 
+@dataclasses.dataclass(frozen=True)
+class EngineOption:
+    """A named switch in an engine's own start, offered to the operator as a checkbox (D100).
+
+    The pool writes only the name into a machine's start; the machine turns it into the
+    engine's flags for each model, by that model's family. `families` is what the operator is
+    shown — which models the option does anything for — and must match the machine's table.
+    """
+
+    label: str
+    families: tuple[str, ...]
+
+
 @runtime_checkable
 class Engine(Protocol):
     interface_version: ClassVar[str]
@@ -77,12 +90,22 @@ class Engine(Protocol):
     #: anything; on a host the pool created, the pool restarts it once the models are on disk.
     loads_by_restart: ClassVar[bool] = False
 
+    #: Named options of this engine's own start, by name (D100). Empty for an engine whose
+    #: start takes none; `rented.engine_options` may only name these.
+    options: ClassVar[dict[str, EngineOption]] = {}
+
+    #: Whether this engine's builds are repositories on a model hub, so the pool can look them
+    #: up for the operator (D100). An engine with its own library of names leaves this False.
+    builds_on_hub: ClassVar[bool] = False
+
     def default_start_command(
-        self, *, port: int, models_dir: str, agent_archive: str, proxy: bool
+        self, *, port: int, models_dir: str, agent_archive: str, proxy: bool,
+        options: tuple[str, ...] = (),
     ) -> Optional[str]:
         """How to start this engine on a host the pool creates, when the operator gave no
         `engine_start` — or None to require one. It runs in the pool's own restart script,
-        after the settings file is loaded, and must return once the engine is on its way."""
+        after the settings file is loaded, and must return once the engine is on its way.
+        `options` are names from `options`, already checked against it."""
         return None
 
     #: Words that appear in an image built for this engine. Used only to catch a configuration

@@ -222,3 +222,66 @@ async def test_a_fetch_that_starts_again_is_not_complete_until_it_finishes(tmp_p
             async for _ in modelhub.fetch(BIG, tmp_path, client=client):
                 pass
     assert not (into / modelhub.COMPLETE_MARKER).exists()
+
+
+# --- named options (D100) ---
+
+
+def with_family(directory, family):
+    (directory / "config.json").write_text(json.dumps({"model_type": family}))
+    return directory
+
+
+def test_tool_calling_on_gemma_4_starts_its_parser(tmp_path):
+    with_family(downloaded(tmp_path, BIG, 100), "gemma4")
+    processes = Processes()
+    started = processes.launch(tmp_path, options=["tool_calling", "reasoning"])
+    argv = processes.started[0]
+    assert argv[-5:] == ["--enable-auto-tool-choice", "--tool-call-parser", "gemma4",
+                         "--reasoning-parser", "gemma4"]
+    assert started.not_applied == []
+
+
+def test_each_model_gets_its_own_familys_flags_behind_the_router(tmp_path):
+    with_family(downloaded(tmp_path, BIG, 100), "gemma4")
+    with_family(downloaded(tmp_path, "Qwen/Qwen3-8B", 100), "qwen3")
+    processes = Processes()
+    processes.launch(tmp_path, proxy=True, options=["tool_calling"])
+    by_model = {argv[4]: argv for argv in processes.started if "serve" in argv}
+    assert by_model["Qwen/Qwen3-8B"][-2:] == ["--tool-call-parser", "hermes"]
+    assert by_model[BIG][-2:] == ["--tool-call-parser", "gemma4"]
+
+
+def test_a_family_without_the_option_starts_without_it_and_says_so(tmp_path):
+    """An embedding model has no tool calling; refusing to start it would take down the rest."""
+    with_family(downloaded(tmp_path, EMBED, 100), "nomic_bert")
+    processes = Processes()
+    started = processes.launch(tmp_path, options=["tool_calling"])
+    assert "--enable-auto-tool-choice" not in processes.started[0]
+    assert started.not_applied == [f"tool_calling for {EMBED} (family nomic_bert)"]
+
+
+def test_a_model_with_no_readable_family_starts_without_options(tmp_path):
+    downloaded(tmp_path, BIG, 100)  # no config.json
+    processes = Processes()
+    started = processes.launch(tmp_path, options=["reasoning"])
+    assert "--reasoning-parser" not in processes.started[0]
+    assert "family unknown" in started.not_applied[0]
+
+
+def test_an_option_the_launcher_does_not_know_is_refused(tmp_path):
+    with_family(downloaded(tmp_path, BIG, 100), "gemma4")
+    with pytest.raises(ValueError, match="unknown option"):
+        Processes().launch(tmp_path, options=["--trust-remote-code"])
+
+
+def test_the_command_line_accepts_only_the_named_options():
+    """What the pool writes into the machine's start is a name from a closed list, never a flag."""
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    vllm_launch.add_arguments(parser)
+    ok = parser.parse_args(["--models-dir", "/m", "--port", "8000", "--option", "tool_calling"])
+    assert ok.option == ["tool_calling"]
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--models-dir", "/m", "--port", "8000", "--option", "--chat-template=/etc/x"])

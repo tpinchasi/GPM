@@ -59,6 +59,28 @@ NUMBER_FLAGS = (
     ("GPM_VLLM_MAX_MODEL_LEN", "--max-model-len"),
 )
 
+#: The named options the pool may ask for (D100), and what each means for each model family —
+#: the family read from the model's own `config.json` (`model_type`), on this machine. The pool
+#: sends only a name from this table; the flags are written here and nowhere else, so nothing the
+#: pool says becomes part of a command (D41). A family missing from an option's row starts
+#: without it, and says so. Parser names checked against vLLM v0.29.0's registries.
+OPTIONS: dict[str, dict[str, tuple[str, ...]]] = {
+    # Lets an app send `tools` and get tool calls back as structured `tool_calls`.
+    "tool_calling": {
+        "gemma4": ("--enable-auto-tool-choice", "--tool-call-parser", "gemma4"),
+        "qwen2": ("--enable-auto-tool-choice", "--tool-call-parser", "hermes"),
+        "qwen3": ("--enable-auto-tool-choice", "--tool-call-parser", "hermes"),
+        "qwen3_moe": ("--enable-auto-tool-choice", "--tool-call-parser", "hermes"),
+        "gpt_oss": ("--enable-auto-tool-choice", "--tool-call-parser", "openai"),
+    },
+    # Returns a thinking model's reasoning apart from its answer, as `reasoning_content`.
+    "reasoning": {
+        "gemma4": ("--reasoning-parser", "gemma4"),
+        "qwen3": ("--reasoning-parser", "qwen3"),
+        "qwen3_moe": ("--reasoning-parser", "qwen3"),
+    },
+}
+
 
 @dataclass
 class Started:
@@ -67,6 +89,8 @@ class Started:
     engines: list[dict[str, Any]] = field(default_factory=list)
     proxy: Optional[dict[str, Any]] = None
     skipped: list[str] = field(default_factory=list)
+    #: Options asked for that a model's family does not have, said out loud.
+    not_applied: list[str] = field(default_factory=list)
 
     def pids(self) -> list[int]:
         found = [e["pid"] for e in self.engines if e.get("pid")]
@@ -124,6 +148,34 @@ def number_flags(env: Mapping[str, str]) -> list[str]:
     return flags
 
 
+def family_of(directory: Path) -> Optional[str]:
+    """The model's family, as its own configuration names it — or None if it does not."""
+    try:
+        found = json.loads((directory / "config.json").read_text()).get("model_type")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return found if isinstance(found, str) else None
+
+
+def option_flags(options: Sequence[str], family: Optional[str]) -> tuple[list[str], list[str]]:
+    """The flags for `options` on a model of `family`, and the options that do not apply to it.
+
+    A name not in the table is refused, not skipped: the command line's own choices already
+    stop one arriving, so reaching here with one is a bug worth hearing about.
+    """
+    flags: list[str] = []
+    missing: list[str] = []
+    for option in options:
+        if option not in OPTIONS:
+            raise ValueError(f"unknown option {option!r}; known: {sorted(OPTIONS)}")
+        row = OPTIONS[option].get(family or "")
+        if row is None:
+            missing.append(option)
+            continue
+        flags += row
+    return flags, missing
+
+
 def stop_previous(models_dir: Path, *, kill: Callable[[int, int], None] = os.kill,
                   alive: Optional[Callable[[int], bool]] = None, grace_s: float = 30.0) -> list[int]:
     """Stop what the last call started. A process already gone is not an error."""
@@ -169,6 +221,7 @@ def launch(
     port: int,
     *,
     proxy: bool = False,
+    options: Sequence[str] = (),
     vllm: str = "vllm",
     agent: Optional[str] = None,
     python: str = sys.executable,
@@ -206,6 +259,11 @@ def launch(
     for index, (directory, share) in enumerate(zip(found, shares, strict=True)):
         name = served_name(directory)
         engine_port = port if not proxy else port + 1 + index
+        family = family_of(directory)
+        extra, missing = option_flags(options, family)
+        for option in missing:
+            started.not_applied.append(f"{option} for {name} (family {family or 'unknown'})")
+            log.warning("%s has no %s in its family (%s); started without it", name, option, family)
         argv = [
             vllm, "serve", str(directory),
             "--served-model-name", name,
@@ -215,6 +273,7 @@ def launch(
             "--port", str(engine_port),
             "--gpu-memory-utilization", str(share),
             *number_flags(env),
+            *extra,
         ]
         out = open(logs / f"{directory.name}.log", "ab")
         process = popen(argv, stdout=out, stderr=subprocess.STDOUT, env=env, start_new_session=True)
@@ -242,12 +301,14 @@ def add_arguments(parser: Any) -> None:
     parser.add_argument("--port", type=int, required=True, help="the port the pool dials")
     parser.add_argument("--proxy", action="store_true",
                         help="one engine per model, with the router on --port in front of them")
+    parser.add_argument("--option", action="append", default=[], choices=sorted(OPTIONS),
+                        help="a named option; each model gets it if its family has it (D100)")
     # Deliberately no way to name another program: this runs `vllm` and the agent's own router,
     # as fixed argument lists, and nothing on its command line can change which.
 
 
 def main(args: Any) -> int:
-    started = launch(args.models_dir, args.port, proxy=args.proxy)
+    started = launch(args.models_dir, args.port, proxy=args.proxy, options=args.option)
     if not started.engines:
         print("gpm-agent vllm-start: no complete model on disk yet; nothing started")
         return 0
@@ -257,4 +318,6 @@ def main(args: Any) -> int:
         print(f"started the router on {started.proxy['port']}")
     for name in started.skipped:
         print(f"not started: {name} (several models on disk and no router)")
+    for what in started.not_applied:
+        print(f"not applied: {what}")
     return 0

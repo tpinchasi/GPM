@@ -29,6 +29,7 @@ from ..catalog import ResolvedVariant, variants_for_host
 from ..config import AgentConfig, ConfigError, HostConfig, PoolConfig, load_config
 from ..configplan import ConfigStore
 from ..db import Database, HostCounters, HostRow, HostTable, SupervisorLock
+from ..directory import Directory
 from ..engines import Engine, get_engine
 from ..ledger import EventLog, LeaseStore, SpendLedger
 from ..models import RENTED_KINDS, HostState
@@ -120,6 +121,8 @@ class Supervisor:
         self.events = EventLog(database)
         self.spend = SpendLedger(database)
         self.hosts: dict[str, SupervisedHost] = {}
+        # The model directory (D101), refreshed from here and read by both processes.
+        self.directory = Directory(database, lambda: self.config)
         self.passes = 0
         #: True while the provider could not be asked which rented hosts still exist (D61).
         self._adoption_pending = False
@@ -271,9 +274,12 @@ class Supervisor:
                 await self.pass_once()
             except Exception:  # a bad pass must never take the supervisor down
                 log.exception("control loop pass failed")
+            # In the background: a refresh reads hundreds of pages and must never hold a pass.
+            self.directory.maybe_start()
 
     async def aclose(self) -> None:
         self._stopping = True
+        await self.directory.aclose()
         for host in self.hosts.values():
             if host.tunnel is not None:
                 await host.tunnel.stop()

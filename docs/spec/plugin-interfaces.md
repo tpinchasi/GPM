@@ -119,6 +119,8 @@ class Engine(Protocol):
     interface_version: ClassVar[str] = "1"
     name: ClassVar[str]
     serves_one_model: ClassVar[bool] = False    # one process, one model?
+    builds_on_hub: ClassVar[bool] = False       # are its builds model-hub repositories? (D100)
+    options: ClassVar[dict[str, EngineOption]] = {}   # named options of its own start (D100)
 
     # --- used by the router, on the request path: must be cheap and never block ---
     def inference_paths(self) -> set[str]: ...                      # paths that take a worker
@@ -195,6 +197,36 @@ which does nothing at boot (no models yet), and once the pool asks for the resta
 what the agent fetched — reading numbers from the environment file the agent writes, and names
 from the directories it made, so no text from the pool reaches a command (D41). An operator may
 still set `engine_start`; one written for a *different* engine is refused at load.
+
+### Named options of an engine's own start (D100)
+
+An engine may declare **named options** — `EngineOption(label, families)` — that its own start
+can switch on. vLLM offers two:
+
+| Option | What an app gets | Families (`model_type`) |
+|---|---|---|
+| `tool_calling` | `tools` in a request, `tool_calls` in the reply | `gemma4`, `gpt_oss`, `qwen2`, `qwen3`, `qwen3_moe` |
+| `reasoning` | a thinking model's reasoning apart from its answer | `gemma4`, `qwen3`, `qwen3_moe` |
+
+`rented.engine_options` names the ones in force; a name the engine does not offer is refused at
+load, and so is naming any beside an `engine_start` (which replaces the engine's own start). The
+pool writes each **name** into the machine's start (`vllm-start … --option tool_calling`); the
+agent's launcher holds the flags, and chooses them per model by the family in that model's own
+`config.json`. A model whose family has no such option starts without it, and the launcher says
+so. The two tables — the engine's families and the launcher's flags — are kept equal by a test.
+
+### Finding builds on the model hub (D100)
+
+An engine that declares **`builds_on_hub`** has builds that are model-hub repositories, and the
+pool looks them up for the operator: `GET /pool/builds?model=` searches the hub for the pool's
+name in both spellings publishers use, most downloaded first, and sorts the answer — the
+**original** (carrying the searched name, the most linked-to first, with the same publisher's other
+originals of the same family) and each one's **builds** (quantisations, by the hub's own link) offered; files for other
+engines (GGUF, MLX, no safetensors) and different models (fine-tunes, merges, quantisations of
+something else) left out and counted. Each build carries its precision, its weight files' size,
+the cards it runs on and runs at full speed on, its family and the options that apply to it, and
+whether a rented host can fetch it: a **gated** repository cannot be picked, because the hub is
+asked — and a rented host fetches — with no account.
 
 ### Choosing the build per machine
 

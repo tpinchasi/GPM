@@ -1,6 +1,6 @@
 [project]
 name = "gpm-client"
-version = "0.3.0"
+version = "0.4.0"
 description = "Client SDK for a GPM pool: an httpx transport that waits and retries for capacity by default."
 readme = "README.md"
 requires-python = ">=3.11"

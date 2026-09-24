@@ -76,6 +76,12 @@ whole preparation in, and folding them into one number would hide it (D97):
   so a small model can still start) and the router on the engine port. It stops what it started
   last time first, so starting again is a restart. On a host the pool created, the pool asks
   for that restart once every model the host was bought for is on disk (§4).
+- It takes **named options** (`--option tool_calling`, `--option reasoning`, D100) from a closed
+  list its command line enforces, and turns each into vLLM's flags per model, by the family in
+  that model's own `config.json` — `gemma4` gets the `gemma4` parsers, `qwen3` the `hermes` tool
+  parser and the `qwen3` reasoning parser. A family with no such option starts without it and
+  the launcher says so; an unknown name is refused. The flags are written in the launcher and
+  nowhere else, so the pool still sends no text that becomes part of a command (D41).
 
 Three rules the hub fetch keeps:
 

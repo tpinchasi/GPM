@@ -119,6 +119,27 @@ CREATE TABLE IF NOT EXISTS spend (
     amount   REAL NOT NULL
 );
 
+-- The model directory (D101): what the pool could serve, cached by the supervisor from where
+-- models are published, and read by both processes. `source` is 'ollama' or 'hub'.
+CREATE TABLE IF NOT EXISTS model_directory (
+    source      TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    data        TEXT NOT NULL,
+    fetched_at  REAL NOT NULL,
+    PRIMARY KEY (source, name)
+);
+
+-- How each source's last refresh went, so a stale or failed one says so.
+CREATE TABLE IF NOT EXISTS directory_refresh (
+    source        TEXT PRIMARY KEY,
+    started_at    REAL,
+    finished_at   REAL,
+    ok            INTEGER,
+    detail        TEXT,
+    count         INTEGER,
+    last_success  REAL
+);
+
 -- One row per pool. Exactly one supervisor runs at a time (supervisor.md §1).
 CREATE TABLE IF NOT EXISTS supervisor_lock (
     pool       TEXT PRIMARY KEY,

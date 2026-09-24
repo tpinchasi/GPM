@@ -459,6 +459,7 @@ class Fleet:
             models_dir=hostagent.MODELS_DIR,
             agent_archive=hostagent.ARCHIVE,
             proxy=self.rented.engine_proxy,
+            options=tuple(self.rented.engine_options),
         )
 
     def pool_public_key(self) -> Optional[str]:

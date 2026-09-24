@@ -56,6 +56,16 @@ Two differences between the surfaces matter to an app:
 | `X-GPM-Delivery`, `X-GPM-Attempts` (response) | Always reported | How the response reached the app — `stream`, `buffered`, or `stream-after-overflow` — and how many hosts were tried (§5.1) |
 | `X-GPM-Delivery: stream` (request) | Optional, if the operator allows | Asks for tokens as they come from a host that can be interrupted, accepting that the stream may break (§5.1) |
 
+### What else the pool could serve (D101)
+
+`GET /pool/directory?q=` — with the app key, on the pool's one URL — returns the directory the
+operator's pool keeps: every model in Ollama's library with its tags, and each one's builds on
+the model hub where they have been looked up, each with the engine options its family has. Each
+tag carries **`in_pool`**: whether a request may name it today. It is read-only and informational
+— an app cannot add a model, and nothing it reads changes the pool; the operator adds models.
+It is served from a cached copy, never by asking a third party while the app waits. The SDK's
+`PoolClient.directory(query)` returns it. An optional addition: the contract version is unchanged.
+
 ### Status codes an app will see
 
 | Code | Reason field | Meaning | SDK default |

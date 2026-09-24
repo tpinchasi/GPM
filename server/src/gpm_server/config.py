@@ -711,6 +711,11 @@ class RentedConfig(BaseModel):
     #: Runs after the dead-man timer is armed, for images whose entrypoint the provider's
     #: launch mode does not run. Image-specific, so it lives next to `image`.
     engine_start: Optional[str] = None
+    #: Named options of the engine's own start (D100) — `tool_calling`, `reasoning` for vLLM —
+    #: from the closed list the engine declares. Names, never flags: the machine's launcher turns
+    #: each into the engine's flags for each model by its family. Ignored under `engine_start`,
+    #: which replaces the engine's own start, so naming both is refused.
+    engine_options: list[str] = Field(default_factory=list)
     #: Put the pool's own agent on hosts it rents (D63): it reports what the machine is really
     #: doing, and later manages its models and worker count. A host with no interpreter gets no
     #: agent and joins without one, so this is safe to leave on.
@@ -742,6 +747,29 @@ class RentedConfig(BaseModel):
     teardown: TeardownConfig = Field(default_factory=TeardownConfig)
 
 
+class DirectoryConfig(BaseModel):
+    """The model directory: what the pool could serve, cached from where models are published
+    (D101). Reading it spends nothing and changes nothing; adding a model from it is an edit to
+    this file like any other."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: How often the supervisor refreshes it on its own. 0: only when the operator asks, from
+    #: the console — the pool makes no outbound request nobody asked for.
+    refresh_hours: float = Field(default=0.0, ge=0)
+    #: Read Ollama's library (its pages; there is no listing to ask for).
+    ollama_library: bool = True
+    #: Whose vLLM builds a refresh looks up on the model hub: the pool's own models, every size
+    #: in Ollama's library, or none. Any model can still be looked up on its own, at any time.
+    hub_builds: Literal["pool", "all", "none"] = "pool"
+    #: The pace of requests to the hub, a refresh's and the operator's together. One model's
+    #: lookup is about fifteen: a search per spelling, then each shown build's file listing for
+    #: its size. It is someone else's service.
+    hub_requests_per_minute: int = Field(default=60, ge=1, le=6000)
+    #: How long a model's looked-up builds are served from the cache before being asked again.
+    hub_max_age_hours: float = Field(default=168.0, gt=0)
+
+
 class PoolConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -757,6 +785,7 @@ class PoolConfig(BaseModel):
     #: Absent means the pool cannot rent at all — there is nothing to spend with.
     rented: Optional[RentedConfig] = None
     request_log: str = "gpm.sqlite3"
+    directory: DirectoryConfig = Field(default_factory=DirectoryConfig)
 
     @model_validator(mode="after")
     def _coherent(self) -> "PoolConfig":
@@ -773,6 +802,7 @@ class PoolConfig(BaseModel):
         self._engine_can_hold_what_the_pool_asks()
         self._rented_hosts_have_a_build_of_what_they_rent_for()
         self._images_are_built_for_this_engine()
+        self._engine_options_are_the_engines()
         self._hosts_can_serve_what_they_are_asked_for()
         self._declared_models_are_in_the_set()
         self._every_model_is_held_by_somebody()
@@ -1004,6 +1034,33 @@ class PoolConfig(BaseModel):
             return get_engine(self.rented_engine()).default_port or 11434
         except EngineNotFound:
             return 11434
+
+    def _engine_options_are_the_engines(self) -> None:
+        """Only names the rented engine's own start offers (D100), and only with that start.
+
+        An unknown name would reach the machine and stop its start; one written beside an
+        `engine_start` would be silently ignored, and the operator would believe tool calling
+        was on when nothing had asked for it.
+        """
+        if self.rented is None or not self.rented.engine_options:
+            return
+        from .engines import EngineNotFound, get_engine
+
+        try:
+            offered = get_engine(self.rented_engine()).options
+        except EngineNotFound:
+            return
+        unknown = [o for o in self.rented.engine_options if o not in offered]
+        if unknown:
+            raise ValueError(
+                f"rented.engine_options names {unknown}, which {self.rented_engine()!r} does not "
+                f"offer; it offers {sorted(offered) or 'none'}"
+            )
+        if self.rented.engine_start:
+            raise ValueError(
+                "rented.engine_options apply to the engine's own start, and rented.engine_start "
+                "replaces it; remove one of them"
+            )
 
     def _images_are_built_for_this_engine(self) -> None:
         """Refuse an image built for a *different* engine than the one configured (D92).

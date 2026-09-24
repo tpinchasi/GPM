@@ -9,7 +9,7 @@ from typing import Any, ClassVar, Optional
 import httpx
 
 from . import openai_api
-from .base import Health, Occupancy, PullResult
+from .base import EngineOption, Health, Occupancy, PullResult
 
 # Matches the first `"model": "<value>"` pair, including escaped characters in the value.
 _MODEL_FIELD = re.compile(rb'("model"\s*:\s*)"(?:[^"\\]|\\.)*"')
@@ -31,9 +31,13 @@ class OllamaEngine:
     default_port: ClassVar[int] = 11434
     image_words: ClassVar[tuple[str, ...]] = ("ollama",)
     loads_by_restart: ClassVar[bool] = False
+    #: Ollama's start takes no named options, and its builds are its own library's names.
+    options: ClassVar[dict[str, EngineOption]] = {}
+    builds_on_hub: ClassVar[bool] = False
 
     def default_start_command(
-        self, *, port: int, models_dir: str, agent_archive: str, proxy: bool
+        self, *, port: int, models_dir: str, agent_archive: str, proxy: bool,
+        options: tuple[str, ...] = (),
     ) -> Optional[str]:
         """None: images of this engine start it themselves, and where a provider's launch mode
         skips that, the operator's `engine_start` names the image's own way (D71)."""

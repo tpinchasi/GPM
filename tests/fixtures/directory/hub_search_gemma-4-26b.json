@@ -1,0 +1,1707 @@
+[
+ {
+  "_id": "69b1dde5d77b87bf05eff3f9",
+  "id": "google/gemma-4-26B-A4B-it",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 10715414,
+  "safetensors": {
+   "parameters": {
+    "BF16": 25805936206
+   },
+   "total": 25805936206
+  },
+  "tags": [
+   "transformers",
+   "safetensors",
+   "gemma4",
+   "image-text-to-text",
+   "conversational",
+   "arxiv:2607.02770",
+   "base_model:google/gemma-4-26B-A4B",
+   "base_model:finetune:google/gemma-4-26B-A4B",
+   "license:apache-2.0",
+   "eval-results",
+   "endpoints_compatible",
+   "deploy:sagemaker",
+   "deploy:azure",
+   "region:us"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "69f4012e5ca44f21b8ac75a1",
+  "id": "nvidia/Gemma-4-26B-A4B-NVFP4",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "quantization_config": {
+    "config_groups": {
+     "group_0": {
+      "weights": {
+       "num_bits": 4
+      },
+      "targets": [
+       "Linear"
+      ]
+     }
+    },
+    "quant_method": "modelopt"
+   },
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 1631478,
+  "safetensors": {
+   "parameters": {
+    "BF16": 2967950926,
+    "F8_E4M3": 1427374080,
+    "U8": 11418992640
+   },
+   "total": 14386941232
+  },
+  "tags": [
+   "Model Optimizer",
+   "safetensors",
+   "gemma4",
+   "nvidia",
+   "ModelOpt",
+   "quantized",
+   "NVFP4",
+   "nvfp4",
+   "gemma4-26b-A4B-it",
+   "text-generation",
+   "conversational",
+   "base_model:google/gemma-4-26B-A4B-it",
+   "base_model:quantized:google/gemma-4-26B-A4B-it",
+   "license:apache-2.0",
+   "8-bit",
+   "modelopt",
+   "region:us"
+  ],
+  "library_name": "Model Optimizer"
+ },
+ {
+  "_id": "69cf09a393e9467460f527d5",
+  "id": "cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "quantization_config": {
+    "config_groups": {
+     "group_0": {
+      "format": "pack-quantized",
+      "targets": [
+       "Linear"
+      ],
+      "weights": {
+       "num_bits": 4
+      }
+     }
+    },
+    "format": "pack-quantized",
+    "ignore": [
+     "model.language_model.layers.0.mlp.gate_proj",
+     "model.language_model.layers.0.mlp.up_proj"
+    ],
+    "quant_method": "compressed-tensors"
+   },
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 1283325,
+  "safetensors": {
+   "parameters": {
+    "I32": 23948165120,
+    "F16": 1857771086
+   },
+   "total": 25805936206
+  },
+  "tags": [
+   "transformers",
+   "safetensors",
+   "gemma4",
+   "image-text-to-text",
+   "conversational",
+   "base_model:google/gemma-4-26B-A4B-it",
+   "base_model:quantized:google/gemma-4-26B-A4B-it",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "compressed-tensors",
+   "region:us"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "69d3bd6fbbf83b1a4bd536b1",
+  "id": "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "quantization_config": {
+    "config_groups": {
+     "group_0": {
+      "format": "float-quantized",
+      "targets": [
+       "Linear"
+      ],
+      "weights": {
+       "num_bits": 8
+      }
+     }
+    },
+    "format": "float-quantized",
+    "ignore": [
+     "model.language_model.layers.0.router.proj",
+     "model.language_model.layers.1.router.proj"
+    ],
+    "quant_method": "compressed-tensors"
+   },
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 948408,
+  "safetensors": {
+   "parameters": {
+    "BF16": 2060703310,
+    "F8_E4M3": 24483430400
+   },
+   "total": 26544133710
+  },
+  "tags": [
+   "transformers",
+   "safetensors",
+   "gemma4",
+   "image-text-to-text",
+   "fp8",
+   "vllm",
+   "llm-compressor",
+   "compressed-tensors",
+   "conversational",
+   "base_model:google/gemma-4-26B-A4B-it",
+   "base_model:quantized:google/gemma-4-26B-A4B-it",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "region:us"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "6a22a67ead0cc74d1d5bb5ad",
+  "id": "unsloth/gemma-4-26B-A4B-it-qat-GGUF",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 629898,
+  "tags": [
+   "transformers",
+   "gguf",
+   "gemma4",
+   "image-text-to-text",
+   "unsloth",
+   "gemma",
+   "google",
+   "base_model:google/gemma-4-26B-A4B-it-qat-q4_0-unquantized",
+   "base_model:quantized:google/gemma-4-26B-A4B-it-qat-q4_0-unquantized",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "region:us",
+   "conversational"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "69cd2ed58fcb50f877e8912d",
+  "id": "unsloth/gemma-4-26B-A4B-it-GGUF",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 562770,
+  "tags": [
+   "gguf",
+   "gemma4",
+   "unsloth",
+   "gemma",
+   "google",
+   "image-text-to-text",
+   "base_model:google/gemma-4-26B-A4B-it",
+   "base_model:quantized:google/gemma-4-26B-A4B-it",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "region:us",
+   "imatrix",
+   "conversational"
+  ]
+ },
+ {
+  "_id": "69f42b6650e9e725ecb7f671",
+  "id": "google/gemma-4-26B-A4B-it-qat-q4_0-gguf",
+  "gated": false,
+  "config": {},
+  "downloads": 544944,
+  "tags": [
+   "transformers",
+   "gguf",
+   "image-text-to-text",
+   "arxiv:2607.02770",
+   "base_model:google/gemma-4-26B-A4B-it-qat-q4_0-unquantized",
+   "base_model:quantized:google/gemma-4-26B-A4B-it-qat-q4_0-unquantized",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "region:us",
+   "conversational"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "6a220ba20e25237511465b32",
+  "id": "lmstudio-community/gemma-4-26B-A4B-it-QAT-MLX-4bit",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "quantization_config": {
+    "bits": 4
+   },
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 379546,
+  "safetensors": {
+   "parameters": {
+    "U32": 25235685376,
+    "BF16": 570250830
+   },
+   "total": 25805936206
+  },
+  "tags": [
+   "transformers",
+   "safetensors",
+   "gemma4",
+   "image-text-to-text",
+   "mlx",
+   "conversational",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "4-bit",
+   "region:us"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "6a3c6bacea38e2f7f216ce43",
+  "id": "HauhauCS/Gemma4-26B-A4B-QAT-Uncensored-HauhauCS-Balanced-MTP",
+  "gated": false,
+  "config": {},
+  "downloads": 357650,
+  "tags": [
+   "gguf",
+   "uncensored",
+   "gemma4",
+   "moe",
+   "vision",
+   "multimodal",
+   "agentic",
+   "coding",
+   "creative-writing",
+   "roleplay",
+   "rp",
+   "conversational",
+   "image-text-to-text",
+   "en",
+   "base_model:google/gemma-4-26B-A4B-it",
+   "base_model:quantized:google/gemma-4-26B-A4B-it",
+   "license:gemma",
+   "endpoints_compatible",
+   "region:us"
+  ]
+ },
+ {
+  "_id": "69ccf47089c66121f3470bbf",
+  "id": "ggml-org/gemma-4-26B-A4B-it-GGUF",
+  "gated": false,
+  "config": {},
+  "downloads": 355642,
+  "tags": [
+   "gguf",
+   "quantized",
+   "image-text-to-text",
+   "base_model:google/gemma-4-26B-A4B-it",
+   "base_model:quantized:google/gemma-4-26B-A4B-it",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "region:us",
+   "conversational"
+  ]
+ },
+ {
+  "_id": "69f27e68c803e17130bc953f",
+  "id": "google/gemma-4-26B-A4B-it-qat-q4_0-unquantized",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 342869,
+  "safetensors": {
+   "parameters": {
+    "BF16": 25805936206
+   },
+   "total": 26544131376
+  },
+  "tags": [
+   "transformers",
+   "safetensors",
+   "gemma4",
+   "image-text-to-text",
+   "conversational",
+   "arxiv:2607.02770",
+   "base_model:google/gemma-4-26B-A4B-it",
+   "base_model:finetune:google/gemma-4-26B-A4B-it",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "region:us"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "69ceb2d32437b4cbfaf1a8d2",
+  "id": "mudler/gemma-4-26B-A4B-it-APEX-GGUF",
+  "gated": false,
+  "config": {},
+  "downloads": 250044,
+  "tags": [
+   "gguf",
+   "quantized",
+   "apex",
+   "moe",
+   "mixture-of-experts",
+   "gemma4",
+   "vlm",
+   "vision",
+   "base_model:google/gemma-4-26B-A4B-it",
+   "base_model:quantized:google/gemma-4-26B-A4B-it",
+   "license:gemma",
+   "endpoints_compatible",
+   "region:us",
+   "conversational"
+  ]
+ },
+ {
+  "_id": "69dc955d7f1cb55aac83751e",
+  "id": "mradermacher/gemma-4-26B-A4B-it-ultra-uncensored-heretic-i1-GGUF",
+  "gated": false,
+  "config": {},
+  "downloads": 167604,
+  "tags": [
+   "transformers",
+   "gguf",
+   "heretic",
+   "uncensored",
+   "decensored",
+   "abliterated",
+   "ara",
+   "en",
+   "base_model:llmfan46/gemma-4-26B-A4B-it-ultra-uncensored-heretic",
+   "base_model:quantized:llmfan46/gemma-4-26B-A4B-it-ultra-uncensored-heretic",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "region:us",
+   "imatrix",
+   "conversational"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "6a2091727b5bbb44b3f199c5",
+  "id": "lmstudio-community/gemma-4-26B-A4B-it-QAT-GGUF",
+  "gated": false,
+  "config": {},
+  "downloads": 147458,
+  "tags": [
+   "gguf",
+   "base_model:google/gemma-4-26B-A4B-it-qat-q4_0-unquantized",
+   "base_model:quantized:google/gemma-4-26B-A4B-it-qat-q4_0-unquantized",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "region:us",
+   "conversational"
+  ]
+ },
+ {
+  "_id": "69cfdccf0e06574c7f4b39cc",
+  "id": "lmstudio-community/gemma-4-26B-A4B-it-MLX-4bit",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "quantization_config": {
+    "bits": 4
+   },
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 133435,
+  "safetensors": {
+   "parameters": {
+    "U32": 25235685376,
+    "BF16": 570250830
+   },
+   "total": 25805936206
+  },
+  "tags": [
+   "transformers",
+   "safetensors",
+   "gemma4",
+   "image-text-to-text",
+   "mlx",
+   "conversational",
+   "base_model:google/gemma-4-26B-A4B-it",
+   "base_model:quantized:google/gemma-4-26B-A4B-it",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "4-bit",
+   "region:us"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "69d2ca733df99c948490acda",
+  "id": "RedHatAI/gemma-4-26B-A4B-it-NVFP4",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "quantization_config": {
+    "config_groups": {
+     "group_0": {
+      "format": "nvfp4-pack-quantized",
+      "targets": [
+       "Linear"
+      ],
+      "weights": {
+       "num_bits": 4
+      }
+     }
+    },
+    "format": "nvfp4-pack-quantized",
+    "ignore": [
+     "model.language_model.layers.0.router.proj",
+     "model.language_model.layers.1.router.proj"
+    ],
+    "quant_method": "compressed-tensors"
+   },
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 132760,
+  "safetensors": {
+   "parameters": {
+    "BF16": 1322505806,
+    "U8": 24483430400
+   },
+   "total": 25805936206
+  },
+  "tags": [
+   "transformers",
+   "safetensors",
+   "gemma4",
+   "image-text-to-text",
+   "fp4",
+   "nvfp4",
+   "vllm",
+   "llm-compressor",
+   "compressed-tensors",
+   "conversational",
+   "base_model:google/gemma-4-26B-A4B-it",
+   "base_model:quantized:google/gemma-4-26B-A4B-it",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "8-bit",
+   "region:us"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "69cfdeab0689e4caa5c0bf58",
+  "id": "lmstudio-community/gemma-4-26B-A4B-it-MLX-8bit",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "quantization_config": {
+    "bits": 8
+   },
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 129055,
+  "safetensors": {
+   "parameters": {
+    "U32": 25235685376,
+    "BF16": 570250830
+   },
+   "total": 25805936206
+  },
+  "tags": [
+   "transformers",
+   "safetensors",
+   "gemma4",
+   "image-text-to-text",
+   "mlx",
+   "conversational",
+   "base_model:google/gemma-4-26B-A4B-it",
+   "base_model:quantized:google/gemma-4-26B-A4B-it",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "8-bit",
+   "region:us"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "69cfde0ec61c6c0fbb97a67f",
+  "id": "lmstudio-community/gemma-4-26B-A4B-it-MLX-6bit",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "quantization_config": {
+    "bits": 6
+   },
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 127902,
+  "safetensors": {
+   "parameters": {
+    "U32": 25235685376,
+    "BF16": 570250830
+   },
+   "total": 25805936206
+  },
+  "tags": [
+   "transformers",
+   "safetensors",
+   "gemma4",
+   "image-text-to-text",
+   "mlx",
+   "conversational",
+   "base_model:google/gemma-4-26B-A4B-it",
+   "base_model:quantized:google/gemma-4-26B-A4B-it",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "6-bit",
+   "region:us"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "69cfdd6edc51445bfaea7643",
+  "id": "lmstudio-community/gemma-4-26B-A4B-it-MLX-5bit",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "quantization_config": {
+    "bits": 5
+   },
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 127343,
+  "safetensors": {
+   "parameters": {
+    "U32": 25235685376,
+    "BF16": 570250830
+   },
+   "total": 25805936206
+  },
+  "tags": [
+   "transformers",
+   "safetensors",
+   "gemma4",
+   "image-text-to-text",
+   "mlx",
+   "conversational",
+   "base_model:google/gemma-4-26B-A4B-it",
+   "base_model:quantized:google/gemma-4-26B-A4B-it",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "5-bit",
+   "region:us"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "69ea7e2e32f03e2bc5b624ad",
+  "id": "google/gemma-4-26B-A4B-it-assistant",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4_assistant",
+   "architectures": [
+    "Gemma4AssistantForCausalLM"
+   ]
+  },
+  "downloads": 125638,
+  "safetensors": {
+   "parameters": {
+    "BF16": 419711236
+   },
+   "total": 419711236
+  },
+  "tags": [
+   "transformers",
+   "safetensors",
+   "gemma4_assistant",
+   "text-generation",
+   "any-to-any",
+   "arxiv:2607.02770",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "region:us"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "69cfd1c71f617c54ba18895a",
+  "id": "cyankiwi/gemma-4-26B-A4B-it-AWQ-8bit",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "quantization_config": {
+    "config_groups": {
+     "group_0": {
+      "format": "pack-quantized",
+      "targets": [
+       "Linear"
+      ],
+      "weights": {
+       "num_bits": 8
+      }
+     }
+    },
+    "format": "pack-quantized",
+    "quant_method": "compressed-tensors"
+   },
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 119427,
+  "safetensors": {
+   "parameters": {
+    "I32": 23948165120,
+    "BF16": 2606151246
+   },
+   "total": 26554316366
+  },
+  "tags": [
+   "transformers",
+   "safetensors",
+   "gemma4",
+   "image-text-to-text",
+   "conversational",
+   "base_model:google/gemma-4-26B-A4B-it",
+   "base_model:quantized:google/gemma-4-26B-A4B-it",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "compressed-tensors",
+   "region:us"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "6a563002e5fefb2b1575f703",
+  "id": "unsloth/gemma-4-26B-A4B-it-NVFP4",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "quantization_config": {
+    "config_groups": {
+     "group_0": {
+      "format": "float-quantized",
+      "targets": [
+       "re:.*self_attn\\.(q|k|v|o)_proj$"
+      ],
+      "weights": {
+       "num_bits": 8
+      }
+     },
+     "group_1": {
+      "format": "nvfp4-pack-quantized",
+      "targets": [
+       "re:.*\\.experts\\.\\d+\\.(gate|up|down)_proj$",
+       "re:.*language_model.*\\.mlp\\.(gate|up|down)_proj$"
+      ],
+      "weights": {
+       "num_bits": 4
+      }
+     }
+    },
+    "format": "mixed-precision",
+    "quant_method": "compressed-tensors"
+   },
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 90864,
+  "safetensors": {
+   "parameters": {
+    "F32": 23220,
+    "BF16": 1322841226,
+    "F8_E4M3": 2571008000,
+    "U8": 11686625280
+   },
+   "total": 15580497726
+  },
+  "tags": [
+   "safetensors",
+   "gemma4",
+   "unsloth",
+   "gemma",
+   "google",
+   "image-text-to-text",
+   "conversational",
+   "base_model:google/gemma-4-26B-A4B-it",
+   "base_model:quantized:google/gemma-4-26B-A4B-it",
+   "license:apache-2.0",
+   "8-bit",
+   "compressed-tensors",
+   "region:us"
+  ]
+ },
+ {
+  "_id": "6a05f7507c68f7caa0f17290",
+  "id": "HauhauCS/Gemma4-26B-A4B-Uncensored-HauhauCS-Balanced",
+  "gated": false,
+  "config": {},
+  "downloads": 71870,
+  "tags": [
+   "gguf",
+   "uncensored",
+   "gemma4",
+   "moe",
+   "vision",
+   "multimodal",
+   "agentic",
+   "coding",
+   "image-text-to-text",
+   "en",
+   "base_model:google/gemma-4-26B-A4B-it",
+   "base_model:quantized:google/gemma-4-26B-A4B-it",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "region:us",
+   "imatrix",
+   "conversational"
+  ]
+ },
+ {
+  "_id": "6a2676f4e6a88f6f7da64eb6",
+  "id": "cyankiwi/gemma-4-26B-A4B-it-qat-AWQ-INT4",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "quantization_config": {
+    "config_groups": {
+     "group_0": {
+      "format": "pack-quantized",
+      "targets": [
+       "Linear"
+      ],
+      "weights": {
+       "num_bits": 4
+      }
+     }
+    },
+    "format": "pack-quantized",
+    "quant_method": "compressed-tensors"
+   },
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 59269,
+  "safetensors": {
+   "parameters": {
+    "I64": 23270,
+    "I32": 23948165120,
+    "F16": 2606151246
+   },
+   "total": 26554339636
+  },
+  "tags": [
+   "transformers",
+   "safetensors",
+   "gemma4",
+   "image-text-to-text",
+   "conversational",
+   "base_model:google/gemma-4-26B-A4B-it-qat-q4_0-unquantized",
+   "base_model:quantized:google/gemma-4-26B-A4B-it-qat-q4_0-unquantized",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "compressed-tensors",
+   "region:us"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "69b20aeb427072f53f20acbe",
+  "id": "google/gemma-4-26B-A4B",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 50900,
+  "safetensors": {
+   "parameters": {
+    "BF16": 25805936206
+   },
+   "total": 26544131376
+  },
+  "tags": [
+   "transformers",
+   "safetensors",
+   "gemma4",
+   "image-text-to-text",
+   "arxiv:2607.02770",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "region:us"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "69ce92b82542452497883ece",
+  "id": "bartowski/google_gemma-4-26B-A4B-it-GGUF",
+  "gated": false,
+  "config": {},
+  "downloads": 50781,
+  "tags": [
+   "gguf",
+   "image-text-to-text",
+   "base_model:google/gemma-4-26B-A4B-it",
+   "base_model:quantized:google/gemma-4-26B-A4B-it",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "region:us",
+   "imatrix",
+   "conversational"
+  ]
+ },
+ {
+  "_id": "69ce6cd02ac678a9bc73e047",
+  "id": "lmstudio-community/gemma-4-26B-A4B-it-GGUF",
+  "gated": false,
+  "config": {},
+  "downloads": 44964,
+  "tags": [
+   "gguf",
+   "base_model:google/gemma-4-26B-A4B-it",
+   "base_model:quantized:google/gemma-4-26B-A4B-it",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "region:us",
+   "conversational"
+  ]
+ },
+ {
+  "_id": "6a90f6e5ff65a75f8aeea196",
+  "id": "Jommarn/UNSEEN_Gemma_4_26B_NSFW-GGUF",
+  "gated": false,
+  "config": {},
+  "downloads": 39328,
+  "tags": [
+   "transformers",
+   "gguf",
+   "uncensored",
+   "nsfw",
+   "abliteration",
+   "gemma",
+   "vision",
+   "llama.cpp",
+   "2bit",
+   "3bit",
+   "4bit",
+   "5bit",
+   "6bit",
+   "8bit",
+   "iq2_m",
+   "iq3_m",
+   "q5_k_m",
+   "q6_k",
+   "quantized",
+   "image-text-to-text",
+   "th",
+   "en",
+   "endpoints_compatible",
+   "region:us",
+   "conversational",
+   "not-for-all-audiences"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "69d130fb7ae20ba0d326b475",
+  "id": "TrevorJS/gemma-4-26B-A4B-it-uncensored-GGUF",
+  "gated": false,
+  "config": {},
+  "downloads": 38008,
+  "tags": [
+   "gguf",
+   "abliteration",
+   "uncensored",
+   "gemma-4",
+   "text-generation",
+   "en",
+   "base_model:TrevorJS/gemma-4-26B-A4B-it-uncensored",
+   "base_model:quantized:TrevorJS/gemma-4-26B-A4B-it-uncensored",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "region:us",
+   "conversational"
+  ]
+ },
+ {
+  "_id": "69d6ef9dcc3d8a3a678bccc8",
+  "id": "AEON-7/Gemma-4-26B-A4B-it-Uncensored-NVFP4",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "quantization_config": {
+    "config_groups": {
+     "group_0": {
+      "format": "nvfp4-pack-quantized",
+      "targets": [
+       "Linear"
+      ],
+      "weights": {
+       "num_bits": 4
+      }
+     }
+    },
+    "format": "nvfp4-pack-quantized",
+    "quant_method": "compressed-tensors"
+   },
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 37252,
+  "safetensors": {
+   "parameters": {
+    "F32": 23450,
+    "BF16": 1322505806,
+    "F8_E4M3": 1530214400,
+    "U8": 12241715200
+   },
+   "total": 15094458856
+  },
+  "tags": [
+   "transformers",
+   "safetensors",
+   "gemma4",
+   "image-text-to-text",
+   "26b",
+   "4-bit",
+   "4b-active",
+   "aarch64",
+   "abliterated",
+   "aeon",
+   "aeon-7",
+   "agentic",
+   "arm64",
+   "blackwell",
+   "chat",
+   "chunked-prefill",
+   "coding",
+   "compressed-tensors",
+   "conversational",
+   "dflash",
+   "dgx-spark",
+   "edge",
+   "english",
+   "flashinfer-cutlass",
+   "fp4",
+   "fp8-kv-cache",
+   "function-calling",
+   "gb10",
+   "gemma",
+   "gemma-4",
+   "google",
+   "gpu",
+   "grace-blackwell",
+   "instruct",
+   "llmcompressor",
+   "long-context",
+   "mixture-of-experts",
+   "moe",
+   "multimodal",
+   "native-fp4",
+   "nvfp4",
+   "nvidia",
+   "on-device",
+   "openai-api",
+   "openai-compatible",
+   "prefix-caching",
+   "production-ready",
+   "quantized",
+   "reasoning",
+   "refusal-removed",
+   "sliding-window-attention",
+   "sm_121a",
+   "sparse-moe",
+   "speculative-decoding",
+   "text-generation",
+   "thinking",
+   "tool-calling",
+   "transformer",
+   "uncensored",
+   "unfiltered",
+   "vision",
+   "vision-language",
+   "vllm",
+   "weight-quantization",
+   "en",
+   "base_model:TrevorJS/gemma-4-26B-A4B-it-uncensored",
+   "base_model:quantized:TrevorJS/gemma-4-26B-A4B-it-uncensored",
+   "license:gemma",
+   "endpoints_compatible",
+   "8-bit",
+   "region:us"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "69d865dd4efc7c6f6ba414a0",
+  "id": "cklaus/gemma-4-26B-A4B-it-NVFP4",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "quantization_config": {
+    "quant_method": "modelopt"
+   },
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 28971,
+  "safetensors": {
+   "parameters": {
+    "F32": 23220,
+    "BF16": 2432685646,
+    "F8_E4M3": 1460828160,
+    "U8": 11686625280
+   },
+   "total": 15580162306
+  },
+  "tags": [
+   "vllm",
+   "safetensors",
+   "gemma4",
+   "nvfp4",
+   "modelopt",
+   "blackwell",
+   "moe",
+   "fp4",
+   "text-generation",
+   "conversational",
+   "base_model:google/gemma-4-26B-A4B-it",
+   "base_model:quantized:google/gemma-4-26B-A4B-it",
+   "license:apache-2.0",
+   "8-bit",
+   "region:us"
+  ],
+  "library_name": "vllm"
+ },
+ {
+  "_id": "69d4602d3599ddb549992ded",
+  "id": "llmfan46/gemma-4-26B-A4B-it-ultra-uncensored-heretic-GGUF",
+  "gated": false,
+  "config": {},
+  "downloads": 28585,
+  "tags": [
+   "transformers",
+   "gguf",
+   "heretic",
+   "uncensored",
+   "decensored",
+   "abliterated",
+   "ara",
+   "image-text-to-text",
+   "base_model:llmfan46/gemma-4-26B-A4B-it-ultra-uncensored-heretic",
+   "base_model:quantized:llmfan46/gemma-4-26B-A4B-it-ultra-uncensored-heretic",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "region:us",
+   "conversational"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "69cbd266f5efb6bcdfc5392f",
+  "id": "unsloth/gemma-4-26B-A4B-it",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 28541,
+  "safetensors": {
+   "parameters": {
+    "BF16": 25805936206
+   },
+   "total": 26544131376
+  },
+  "tags": [
+   "safetensors",
+   "gemma4",
+   "unsloth",
+   "gemma",
+   "google",
+   "image-text-to-text",
+   "conversational",
+   "base_model:google/gemma-4-26B-A4B-it",
+   "base_model:finetune:google/gemma-4-26B-A4B-it",
+   "license:apache-2.0",
+   "region:us"
+  ]
+ },
+ {
+  "_id": "69f1048302bb17724085a8d9",
+  "id": "z-lab/gemma-4-26B-A4B-it-DFlash",
+  "gated": false,
+  "config": {
+   "model_type": "qwen3",
+   "architectures": [
+    "DFlashDraftModel"
+   ]
+  },
+  "downloads": 24658,
+  "safetensors": {
+   "parameters": {
+    "BF16": 429689088
+   },
+   "total": 429689088
+  },
+  "tags": [
+   "transformers",
+   "safetensors",
+   "qwen3",
+   "dflash",
+   "speculative-decoding",
+   "block-diffusion",
+   "draft-model",
+   "efficiency",
+   "qwen",
+   "gemma",
+   "diffusion-language-model",
+   "text-generation",
+   "arxiv:2602.06036",
+   "license:apache-2.0",
+   "text-generation-inference",
+   "endpoints_compatible",
+   "region:us"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "69da18cc97388ce31f988924",
+  "id": "groxaxo/Huihui-gemma-4-26B-A4B-it-abliterated-GGUF",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 23216,
+  "tags": [
+   "llama.cpp",
+   "gguf",
+   "gemma4",
+   "mxfp4",
+   "quantized",
+   "multimodal",
+   "abliterated",
+   "uncensored",
+   "image-text-to-text",
+   "conversational",
+   "base_model:huihui-ai/Huihui-gemma-4-26B-A4B-it-abliterated",
+   "base_model:quantized:huihui-ai/Huihui-gemma-4-26B-A4B-it-abliterated",
+   "endpoints_compatible",
+   "region:us",
+   "imatrix"
+  ],
+  "library_name": "llama.cpp"
+ },
+ {
+  "_id": "6a3166ae8b30738ce9d04383",
+  "id": "mlx-community/gemma-4-26B-A4B-it-qat-OptiQ-4bit",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "quantization_config": {
+    "bits": 4
+   },
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 21370,
+  "safetensors": {
+   "parameters": {
+    "U32": 25232441344,
+    "BF16": 573494862
+   },
+   "total": 25233053440
+  },
+  "tags": [
+   "mlx",
+   "safetensors",
+   "gemma4",
+   "quantized",
+   "mixed-precision",
+   "4bit",
+   "8bit",
+   "optiq",
+   "qat",
+   "moe",
+   "apple-silicon",
+   "text-generation",
+   "image-text-to-text",
+   "gemma-4",
+   "conversational",
+   "base_model:google/gemma-4-26B-A4B-it-qat-q4_0-unquantized",
+   "base_model:quantized:google/gemma-4-26B-A4B-it-qat-q4_0-unquantized",
+   "license:apache-2.0",
+   "4-bit",
+   "region:us"
+  ],
+  "library_name": "mlx"
+ },
+ {
+  "_id": "69d170e659ede2545f6b0281",
+  "id": "mradermacher/gemma-4-26B-A4B-it-heretic-GGUF",
+  "gated": false,
+  "config": {},
+  "downloads": 21268,
+  "tags": [
+   "transformers",
+   "gguf",
+   "heretic",
+   "uncensored",
+   "decensored",
+   "abliterated",
+   "ara",
+   "en",
+   "base_model:coder3101/gemma-4-26B-A4B-it-heretic",
+   "base_model:quantized:coder3101/gemma-4-26B-A4B-it-heretic",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "region:us",
+   "conversational"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "69fb4d5c1646e98126f9031b",
+  "id": "wwlwwl/gemma-4-26B-A4B-it-heretic-zh-RP-gguf",
+  "gated": false,
+  "config": {},
+  "downloads": 20913,
+  "tags": [
+   "gguf",
+   "zh",
+   "dataset:LooksJuicy/Chinese-Roleplay-Novel",
+   "dataset:Seikaijyu/Classical-Chinese-Roleplay",
+   "dataset:ScratchThePlan/novel_cn_roleplay_dataset_liars_lips_fall_apart_in_love",
+   "dataset:silk-road/Haruhi-Baize-Role-Playing-Conversation",
+   "dataset:BigPancake01/roleplayLLM_Chinese",
+   "base_model:coder3101/gemma-4-26B-A4B-it-heretic",
+   "base_model:quantized:coder3101/gemma-4-26B-A4B-it-heretic",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "region:us",
+   "imatrix",
+   "conversational"
+  ]
+ },
+ {
+  "_id": "69db0998802d89435c420e07",
+  "id": "Firworks/gemma-4-26B-A4B-it-fp8",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "quantization_config": {
+    "config_groups": {
+     "group_0": {
+      "format": "float-quantized",
+      "targets": [
+       "Linear",
+       "MoELinear"
+      ],
+      "weights": {
+       "num_bits": 8
+      }
+     }
+    },
+    "format": "float-quantized",
+    "quant_method": "compressed-tensors"
+   },
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 20218,
+  "safetensors": {
+   "parameters": {
+    "BF16": 2077470030,
+    "F8_E4M3": 24483430400
+   },
+   "total": 26560900430
+  },
+  "tags": [
+   "safetensors",
+   "gemma4",
+   "fp8",
+   "quantized",
+   "base_model:google/gemma-4-26B-A4B-it",
+   "base_model:quantized:google/gemma-4-26B-A4B-it",
+   "compressed-tensors",
+   "region:us"
+  ]
+ },
+ {
+  "_id": "69d1bec4304840cc8a447e73",
+  "id": "mudler/gemma-4-26B-A4B-it-heretic-APEX-GGUF",
+  "gated": false,
+  "config": {},
+  "downloads": 18703,
+  "tags": [
+   "gguf",
+   "quantized",
+   "apex",
+   "moe",
+   "mixture-of-experts",
+   "gemma4",
+   "vlm",
+   "vision",
+   "base_model:coder3101/gemma-4-26B-A4B-it-heretic",
+   "base_model:quantized:coder3101/gemma-4-26B-A4B-it-heretic",
+   "license:gemma",
+   "endpoints_compatible",
+   "region:us",
+   "conversational"
+  ]
+ },
+ {
+  "_id": "69d1cf9c8b740d944df1e996",
+  "id": "mudler/gemma-4-26B-A4B-it-Claude-Opus-Distill-APEX-GGUF",
+  "gated": false,
+  "config": {},
+  "downloads": 17102,
+  "tags": [
+   "gguf",
+   "quantized",
+   "apex",
+   "moe",
+   "mixture-of-experts",
+   "gemma4",
+   "claude-distilled",
+   "vlm",
+   "vision",
+   "base_model:TeichAI/gemma-4-26B-A4B-it-Claude-Opus-Distill",
+   "base_model:quantized:TeichAI/gemma-4-26B-A4B-it-Claude-Opus-Distill",
+   "license:gemma",
+   "endpoints_compatible",
+   "region:us",
+   "conversational"
+  ]
+ },
+ {
+  "_id": "69cf9c1331fbf4f691807ae1",
+  "id": "bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "quantization_config": {
+    "config_groups": {
+     "group_0": {
+      "weights": {
+       "num_bits": 4
+      },
+      "targets": [
+       "Linear"
+      ]
+     }
+    },
+    "quant_method": "modelopt"
+   },
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 14856,
+  "safetensors": {
+   "parameters": {
+    "BF16": 1322505806,
+    "F8_E4M3": 1530214400,
+    "U8": 12241715200
+   },
+   "total": 15094435406
+  },
+  "tags": [
+   "transformers",
+   "safetensors",
+   "gemma4",
+   "image-text-to-text",
+   "nvidia",
+   "nvfp4",
+   "modelopt",
+   "quantized",
+   "moe",
+   "dgx-spark",
+   "blackwell",
+   "W4A4",
+   "post-training-quantization",
+   "text-generation",
+   "conversational",
+   "multilingual",
+   "base_model:google/gemma-4-26B-A4B-it",
+   "base_model:quantized:google/gemma-4-26B-A4B-it",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "8-bit",
+   "region:us"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "69cea443f501de9d605b209a",
+  "id": "mlx-community/gemma-4-26b-a4b-it-4bit",
+  "gated": false,
+  "config": {
+   "model_type": "gemma4",
+   "quantization_config": {
+    "bits": 4
+   },
+   "architectures": [
+    "Gemma4ForConditionalGeneration"
+   ]
+  },
+  "downloads": 14629,
+  "safetensors": {
+   "parameters": {
+    "U32": 25235685376,
+    "BF16": 570250830
+   },
+   "total": 25805936206
+  },
+  "tags": [
+   "mlx",
+   "safetensors",
+   "gemma4",
+   "image-text-to-text",
+   "conversational",
+   "4-bit",
+   "base_model:google/gemma-4-26B-A4B-it",
+   "base_model:quantized:google/gemma-4-26B-A4B-it",
+   "license:apache-2.0",
+   "region:us"
+  ],
+  "library_name": "mlx"
+ },
+ {
+  "_id": "6aa02cb9177613dea7252324",
+  "id": "mradermacher/gemma-4-26B-A4B-it-qat-q4_0-unquantized-uncensored-heretic-v2-i1-GGUF",
+  "gated": false,
+  "config": {},
+  "downloads": 14415,
+  "tags": [
+   "transformers",
+   "gguf",
+   "heretic",
+   "uncensored",
+   "decensored",
+   "abliterated",
+   "en",
+   "base_model:OS-Software/gemma-4-26B-A4B-it-qat-q4_0-unquantized-uncensored-heretic-v2",
+   "base_model:quantized:OS-Software/gemma-4-26B-A4B-it-qat-q4_0-unquantized-uncensored-heretic-v2",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "region:us",
+   "imatrix",
+   "conversational"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "69d7325957f55bd933050928",
+  "id": "mradermacher/gemma-4-26B-A4B-it-uncensored-GGUF",
+  "gated": false,
+  "config": {},
+  "downloads": 12313,
+  "tags": [
+   "transformers",
+   "gguf",
+   "abliteration",
+   "uncensored",
+   "gemma4",
+   "biprojection",
+   "moe",
+   "en",
+   "base_model:InfinimindCreations/gemma-4-26B-A4B-it-uncensored",
+   "base_model:quantized:InfinimindCreations/gemma-4-26B-A4B-it-uncensored",
+   "license:gemma",
+   "endpoints_compatible",
+   "region:us",
+   "conversational"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "6a379ece1278d868e0101f02",
+  "id": "mradermacher/Gemma-4-26B-A4B-StyleTune-V2-i1-GGUF",
+  "gated": false,
+  "config": {},
+  "downloads": 11215,
+  "tags": [
+   "transformers",
+   "gguf",
+   "gemma4",
+   "conversational",
+   "instruct",
+   "finetune",
+   "roleplay",
+   "creative-writing",
+   "style-tune",
+   "en",
+   "base_model:Gryphe/Gemma-4-26B-A4B-StyleTune-V2",
+   "base_model:quantized:Gryphe/Gemma-4-26B-A4B-StyleTune-V2",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "region:us",
+   "imatrix"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "69dbafa5e7d734b4eeddcfa2",
+  "id": "mradermacher/gemma-4-26B-A4B-it-ultra-uncensored-heretic-GGUF",
+  "gated": false,
+  "config": {},
+  "downloads": 10545,
+  "tags": [
+   "transformers",
+   "gguf",
+   "heretic",
+   "uncensored",
+   "decensored",
+   "abliterated",
+   "ara",
+   "en",
+   "base_model:llmfan46/gemma-4-26B-A4B-it-ultra-uncensored-heretic",
+   "base_model:quantized:llmfan46/gemma-4-26B-A4B-it-ultra-uncensored-heretic",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "region:us",
+   "conversational"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "6a2aa9595ba1a836708d4537",
+  "id": "huihui-ai/Huihui-gemma-4-26B-A4B-it-qat-q4_0-unquantized-abliterated-GGUF",
+  "gated": false,
+  "config": {},
+  "downloads": 10252,
+  "tags": [
+   "transformers",
+   "gguf",
+   "abliterated",
+   "uncensored",
+   "any-to-any",
+   "base_model:google/gemma-4-26B-A4B-it-qat-q4_0-unquantized",
+   "base_model:quantized:google/gemma-4-26B-A4B-it-qat-q4_0-unquantized",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "region:us",
+   "conversational"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "6aa40218873a8f8157de43aa",
+  "id": "OS-Software/gemma-4-26B-A4B-it-qat-q4_0-heretic-japanese-pruned-GGUF",
+  "gated": false,
+  "config": {},
+  "downloads": 10150,
+  "tags": [
+   "transformers",
+   "gguf",
+   "heretic",
+   "uncensored",
+   "decensored",
+   "abliterated",
+   "image-text-to-text",
+   "arxiv:2607.02770",
+   "base_model:google/gemma-4-26B-A4B-it",
+   "base_model:quantized:google/gemma-4-26B-A4B-it",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "region:us",
+   "conversational"
+  ],
+  "library_name": "transformers"
+ },
+ {
+  "_id": "69d461fa5a6a59b86c6d64c0",
+  "id": "llmfan46/gemma-4-26B-A4B-it-uncensored-heretic-GGUF",
+  "gated": false,
+  "config": {},
+  "downloads": 9804,
+  "tags": [
+   "transformers",
+   "gguf",
+   "heretic",
+   "uncensored",
+   "decensored",
+   "abliterated",
+   "ara",
+   "image-text-to-text",
+   "base_model:llmfan46/gemma-4-26B-A4B-it-uncensored-heretic",
+   "base_model:quantized:llmfan46/gemma-4-26B-A4B-it-uncensored-heretic",
+   "license:apache-2.0",
+   "endpoints_compatible",
+   "region:us",
+   "conversational"
+  ],
+  "library_name": "transformers"
+ }
+]

@@ -60,6 +60,11 @@ const api = {
   hostDetail: (id) => call("GET", `/pool/hosts/${encodeURIComponent(id)}`),
   setSearch: (body) => call("PATCH", "/pool/config/rented", body),
   setEngine: (body) => call("PATCH", "/pool/config/engine", body),
+  builds: (model, engine, { fresh = false, search } = {}) => call("GET", `/pool/builds?${new URLSearchParams({
+    model, engine, ...(fresh ? { fresh: "true" } : {}), ...(search ? { search } : {}) })}`),
+  directory: () => call("GET", "/pool/directory"),
+  refreshDirectory: () => call("POST", "/pool/directory/refresh"),
+  addModels: (body) => call("POST", "/pool/config/models", body),
   setHostService: (id, disabled) => call("PATCH", `/pool/config/hosts/${encodeURIComponent(id)}`, { disabled }),
   removeHost: (id, confirm) => call("DELETE", `/pool/config/hosts/${encodeURIComponent(id)}`, confirm === undefined ? {} : { confirm }),
   restartEngine: (hostId, applySettings) =>
@@ -858,6 +863,7 @@ function engineDraft(status) {
     images: images.length ? images.map((i) => ({ ...i })) : null,
     image: e.image || "",
     engine_start: e.engine_start || "",
+    engine_options: [...(e.engine_options || [])],
   };
 }
 
@@ -886,6 +892,9 @@ function engineRows(status, box, draw) {
     // Offer what the chosen engine needs, starting from what the pool already has for it.
     const fresh = engineDraft({ ...status, engine: { ...status.engine, rented: d.rented } });
     d.builds = fresh.builds;
+    // Only the options the chosen engine offers survive the switch; the file refuses the rest.
+    const offered = ((status.engine.offers || {})[d.rented] || {}).options || {};
+    d.engine_options = d.engine_options.filter((o) => o in offered);
     if (d.rented === "vllm") {
       d.images = d.images || VLLM_IMAGE_SUGGESTIONS.map((i) => ({ ...i }));
       if (/ollama/i.test(d.engine_start)) d.engine_start = "";
@@ -920,15 +929,33 @@ function engineRows(status, box, draw) {
       "models your configured hosts hold need not be rented for; a model nobody holds is refused on save"));
   }
 
+  const offer = (status.engine.offers || {})[d.rented] || { builds_on_hub: false, options: {} };
   const renting = d.placement === "declared" ? d.rented_models : (status.model_set || []);
   for (const name of status.model_set || []) {
     if (d.placement === "declared" && !renting.includes(name)) continue;
-    const input = el("input", { type: "text", style: "width:22rem", value: d.builds[name] || "",
-      placeholder: vllm ? "owner/name of the model on the hub" : "the engine's tag for this model",
+    const typed = el("input", { type: "text", style: "width:22rem", value: d.builds[name] || "",
+      placeholder: offer.builds_on_hub ? "owner/name of the model on the hub" : "the engine's tag for this model",
       oninput: (ev) => { d.builds[name] = ev.target.value; } });
-    rows.push(configRow(`build ${name}`, `${d.rented} build of ${name}`, { control: input },
-      vllm ? "the repository vLLM fetches — the same model under the name this engine knows it by"
-        : "blank keeps what the catalog already has"));
+    if (!offer.builds_on_hub) {
+      rows.push(configRow(`build ${name}`, `${d.rented} build of ${name}`, { control: typed },
+        "blank keeps what the catalog already has"));
+      continue;
+    }
+    // The engine's builds are hub repositories: offer them, sorted, rather than a box to type
+    // one into (D100). Looked up once and cached by the pool; typing stays for a private build.
+    const found = hubBuilds[`${d.rented}|${name}`];
+    if (!found) loadBuilds(name, d.rented).then(draw);
+    const control = el("div", {},
+      el("div", { class: "row", style: "margin-top:0" },
+        el("span", { class: "mono" }, d.builds[name] || el("span", { class: "muted" }, "none chosen")),
+        el("button", { class: "small", onclick: () => loadBuilds(name, d.rented, { fresh: true }).then(draw) },
+          "Look again on the hub"),
+        found?.loading ? el("span", { class: "muted" }, "looking on the hub…") : null,
+        found?.error ? el("span", { class: "error" }, found.error) : null),
+      found?.data ? buildTable(found.data, d.builds[name], (repo) => { d.builds[name] = repo; draw(); }, `engine-${name}`) : null,
+      el("details", {}, el("summary", { class: "muted" }, "or name a repository yourself"), typed));
+    rows.push(configRow(`build ${name}`, `${d.rented} build of ${name}`, { control },
+      "the repository its hosts fetch — the same model, in a precision the cards you rent can run"));
   }
 
   if (vllm) {
@@ -945,6 +972,15 @@ function engineRows(status, box, draw) {
   } else {
     rows.push(configRow("image", "image", { control: el("input", { type: "text", style: "width:18rem", value: d.image,
       oninput: (ev) => { d.image = ev.target.value; } }) }, "pinned, never a floating tag"));
+  }
+
+  const optionNames = Object.keys(offer.options || {});
+  if (optionNames.length) {
+    const custom = (d.engine_start || "").trim() !== "";
+    const boxes = optionNames.map((key) => optionBox(key, offer.options[key], d.engine_options, custom, draw));
+    rows.push(configRow("engine_options", "engine options", { control: el("div", {}, ...boxes) },
+      custom ? "these belong to the engine's own start; clear the start command to use them"
+        : "each model gets an option only if its family has one — the rest start without it, and the machine says so"));
   }
 
   rows.push(configRow("engine_start", "start command", {
@@ -964,6 +1000,74 @@ function engineRows(status, box, draw) {
   ];
 }
 
+// --- builds on the model hub, and the engine's named options (D100) ---
+
+// One lookup per (engine, model), shared by the engine editor and the model directory.
+const hubBuilds = {};
+
+async function loadBuilds(model, engine, { fresh = false } = {}) {
+  const key = `${engine}|${model}`;
+  hubBuilds[key] = { ...(hubBuilds[key] || {}), loading: true, error: null };
+  try {
+    hubBuilds[key].data = await api.builds(model, engine, { fresh });
+  } catch (error) {
+    hubBuilds[key].error = error.message;
+  } finally {
+    hubBuilds[key].loading = false;
+  }
+  return hubBuilds[key];
+}
+
+const ago = (ts) => {
+  if (!ts) return "never";
+  const minutes = Math.max(0, (Date.now() / 1000 - ts) / 60);
+  if (minutes < 1) return "just now";
+  if (minutes < 90) return `${Math.round(minutes)} min ago`;
+  if (minutes < 48 * 60) return `${Math.round(minutes / 60)} h ago`;
+  return `${Math.round(minutes / 1440)} days ago`;
+};
+
+// A model's builds on the hub, as the pool sorted them: pick one with a radio button. A build a
+// rented host cannot fetch is shown, and cannot be picked, with the reason.
+function buildTable(found, chosen, onChoose, group, { allowNone = false } = {}) {
+  const radio = (value, disabled) => el("input", {
+    type: "radio", name: group, value, ...(chosen === value || (!chosen && value === "") ? { checked: true } : {}),
+    ...(disabled ? { disabled: true } : {}), onchange: () => onChoose(value),
+  });
+  const rows = (found.builds || []).map((b) => el("tr", {},
+    el("td", {}, el("label", { class: "pick" }, radio(b.repo, !!b.why_not), el("span", { class: "mono" }, b.repo))),
+    el("td", {}, b.relation === "original" ? pill("original", "ok") : el("span", { class: "muted" }, "build")),
+    el("td", {}, b.precision || "?"),
+    el("td", { class: "num" }, b.size_gb == null ? "—" : `${b.size_estimated ? "≈" : ""}${b.size_gb} GB`),
+    el("td", {}, b.full_speed_on ? `full speed on ${b.full_speed_on}` : "—",
+      b.runs_on && b.runs_on !== b.full_speed_on ? el("div", { class: "muted" }, `runs on ${b.runs_on}`) : null),
+    el("td", { class: "muted" }, (b.options || []).join(", ") || "—"),
+    el("td", { class: "num" }, (b.downloads || 0).toLocaleString()),
+    el("td", { class: "muted" }, b.why_not || "")));
+  if (allowNone) rows.unshift(el("tr", {}, el("td", { colspan: "8" },
+    el("label", { class: "pick" }, radio("", false), el("span", { class: "muted" }, "no build for this engine")))));
+  const left = Object.entries(found.hidden || {}).map(([why, n]) => `${n} ${why}`).join(" · ");
+  return el("div", {},
+    (found.builds || []).length ? el("table", { class: "builds" },
+      el("thead", {}, el("tr", {}, ...["Build", "", "Precision", "Size", "Cards", "Options", "Downloads", ""].map((h) => el("th", {}, h)))),
+      el("tbody", {}, ...rows))
+      : el("p", { class: "muted" }, `No build found on the hub for ${found.model} (searched ${(found.searched || []).join(", ")}).`),
+    el("p", { class: "muted" }, left ? `Left out: ${left}.` : "", ` Looked up ${ago(found.looked_up_at)}.`));
+}
+
+function optionBox(key, option, chosen, disabled, redraw) {
+  const box = el("input", { type: "checkbox", ...(chosen.includes(key) ? { checked: true } : {}),
+    ...(disabled ? { disabled: true } : {}),
+    onchange: (ev) => {
+      const at = chosen.indexOf(key);
+      if (ev.target.checked && at < 0) chosen.push(key);
+      if (!ev.target.checked && at >= 0) chosen.splice(at, 1);
+      redraw();
+    } });
+  return el("label", { class: "pick option" }, box, el("span", {}, option.label),
+    el("span", { class: "muted" }, ` — for ${option.families.join(", ")}`));
+}
+
 async function saveEngine(event, note) {
   const d = engineEdit.draft;
   const body = {
@@ -971,6 +1075,7 @@ async function saveEngine(event, note) {
     rented_models: d.placement === "declared" ? d.rented_models : [],
     builds: Object.fromEntries(Object.entries(d.builds).filter(([, tag]) => (tag || "").trim())),
     engine_start: d.engine_start,
+    engine_options: (d.engine_start || "").trim() ? [] : d.engine_options,
   };
   if (d.rented === "vllm") body.images = (d.images || []).filter((i) => (i.image || "").trim());
   else { body.images = []; if ((d.image || "").trim()) body.image = d.image.trim(); }
@@ -1560,8 +1665,238 @@ screens.models = (status) => {
         el("td", { class: "muted" }, row.served ? row.served.runtime_class : "—"),
         el("td", { class: "muted" }, row.served ? schema(row.served.enforces_schema) : "—"),
         el("td", {}, row.served ? residentPill(row) : pill("not served", "bad")))))),
+    ...directorySection(),
   ];
 };
+
+// --- the model directory (D101) ---
+
+// What the pool could serve: Ollama's library and the builds looked up on the hub, cached by the
+// supervisor. Kept across redraws of the screen — the status arrives every few seconds, and a
+// half-made choice must not be thrown away with it.
+const directoryView = {
+  data: null, loading: false, error: null, query: "", open: new Set(), everyTag: new Set(),
+  picks: {}, options: null, message: "", box: null, list: null, search: null, polling: false,
+};
+
+function directorySection() {
+  const v = directoryView;
+  if (!v.box) {
+    v.box = el("div", {});
+    v.list = el("div", {});
+    v.search = el("input", { type: "search", placeholder: "filter: a name, a word, a capability", style: "width:22rem",
+      oninput: (ev) => { v.query = ev.target.value; drawDirectoryList(); } });
+  }
+  if (!v.data && !v.loading && !v.error) loadDirectory();
+  drawDirectory();
+  return [el("h2", {}, "Model directory"), v.box];
+}
+
+async function loadDirectory() {
+  const v = directoryView;
+  v.loading = true;
+  try {
+    v.data = await api.directory();
+    v.error = null;
+    if (v.options === null) v.options = [...(v.data.engine_options || [])];
+  } catch (error) {
+    v.error = error.message;
+  } finally {
+    v.loading = false;
+    drawDirectory();
+  }
+}
+
+function hubEngine() {
+  const offers = directoryView.data?.offers || {};
+  return Object.keys(offers).find((name) => offers[name].builds_on_hub) || null;
+}
+
+async function refreshDirectoryNow(button) {
+  button.disabled = true;
+  try {
+    await api.refreshDirectory();
+    directoryView.polling = true;
+    // A refresh reads hundreds of pages at a gentle pace; follow it rather than wait on it.
+    while (directoryView.polling) {
+      await loadDirectory();
+      if (!directoryView.data?.refreshing) break;
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+    }
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    directoryView.polling = false;
+    button.disabled = false;
+  }
+}
+
+function drawDirectory() {
+  const v = directoryView;
+  if (!v.box) return;
+  if (!v.data) {
+    v.box.replaceChildren(el("p", { class: v.error ? "error" : "muted" }, v.error || "Loading…"));
+    return;
+  }
+  const runs = v.data.refreshed || {};
+  const run = (source, label) => {
+    const r = runs[source];
+    if (!r) return el("div", {}, `${label}: never read`);
+    const state = r.ok === null || r.ok === undefined ? pill("refreshing", "warn") : r.ok ? pill("ok", "ok") : pill("failed", "bad");
+    return el("div", {}, `${label}: `, state, ` ${r.detail || ""} · last good ${ago(r.last_success)}`);
+  };
+  const settings = v.data.settings || {};
+  v.box.replaceChildren(
+    el("div", { class: "panel" },
+      el("p", { class: "muted", style: "margin-top:0" },
+        "Every model Ollama's library offers, and each one's builds on the model hub for engines that fetch from it — ",
+        "cached here, and served to apps as it is. Adding one edits the pool's file, through its own rules."),
+      run("ollama", "Ollama's library"),
+      run("hub", "Builds on the model hub"),
+      el("div", { class: "row" },
+        el("button", { class: "primary", onclick: (ev) => refreshDirectoryNow(ev.target),
+          ...(v.data.refreshing ? { disabled: true } : {}) }, v.data.refreshing ? "Refreshing…" : "Refresh now"),
+        el("span", { class: "muted" },
+          settings.refresh_hours ? `refreshed on its own every ${settings.refresh_hours} h` : "refreshed only when asked (directory.refresh_hours: 0)",
+          ` · hub lookups: ${settings.hub_builds === "all" ? "every size in the library" : settings.hub_builds === "none" ? "only when asked" : "the pool's own models"}`,
+          ` at ${settings.hub_requests_per_minute}/min`))),
+    el("div", { class: "row" }, v.search, el("span", { class: "muted" }, `${(v.data.models || []).length} models`)),
+    v.list,
+    directoryFooter());
+  drawDirectoryList();
+}
+
+function drawDirectoryList() {
+  const v = directoryView;
+  if (!v.list || !v.data) return;
+  const words = v.query.trim().toLowerCase();
+  const matches = (v.data.models || []).filter((m) => !words
+    || m.name.toLowerCase().includes(words) || (m.description || "").toLowerCase().includes(words)
+    || (m.capabilities || []).some((c) => c.toLowerCase() === words));
+  const shown = words ? matches : matches.slice(0, 40);
+  v.list.replaceChildren(
+    !(v.data.models || []).length ? el("p", { class: "muted" }, "Nothing cached yet. Refresh now to read Ollama's library.") : null,
+    ...shown.map(directoryModel),
+    shown.length < matches.length ? el("p", { class: "muted" }, `${matches.length - shown.length} more — filter to find them.`) : null);
+}
+
+function directoryModel(model) {
+  const v = directoryView;
+  const open = v.open.has(model.name);
+  const toggle = () => { open ? v.open.delete(model.name) : v.open.add(model.name); drawDirectoryList(); };
+  const head = el("div", { class: "row dir-head", style: "cursor:pointer", onclick: toggle },
+    el("strong", { class: "mono" }, `${open ? "▾" : "▸"} ${model.name}`),
+    ...(model.capabilities || []).map((c) => pill(c)),
+    el("span", { class: "muted" }, (model.sizes || []).join(" · ")),
+    model.pulls ? el("span", { class: "muted" }, `${model.pulls} pulls`) : null);
+  if (!open) return el("div", { class: "dir-model" }, head, el("div", { class: "muted" }, model.description));
+  const every = v.everyTag.has(model.name);
+  const tags = (model.tags || []).filter((t) => every || t.runtime === null || t.in_pool);
+  const rows = [];
+  for (const t of tags) {
+    const pick = v.picks[t.name];
+    const box = el("input", { type: "checkbox", ...(pick ? { checked: true } : {}),
+      ...(t.in_pool || t.runtime === "cloud" ? { disabled: true } : {}),
+      onchange: (ev) => {
+        if (ev.target.checked) v.picks[t.name] = { tag: t, ollama: true, hub: "", rent_for: true };
+        else delete v.picks[t.name];
+        drawDirectory();
+      } });
+    rows.push(el("tr", {},
+      el("td", {}, el("label", { class: "pick" }, box, el("span", { class: "mono" }, t.name))),
+      el("td", { class: "num" }, t.size_gb == null ? "—" : `${t.size_gb} GB`),
+      el("td", {}, t.context || "—"),
+      el("td", { class: "muted" }, (t.inputs || []).join(", ")),
+      el("td", {}, t.in_pool ? pill("in the pool", "ok") : t.runtime === "mlx" ? pill("Apple silicon only", "warn")
+        : t.runtime === "cloud" ? pill("Ollama's cloud only", "bad") : t.is_latest ? pill("latest") : "")));
+    if (pick) rows.push(el("tr", { class: "detail" }, el("td", { colspan: "5" }, directoryPick(t, pick))));
+  }
+  return el("div", { class: "dir-model open" }, head,
+    el("p", { class: "muted" }, model.description),
+    el("table", {}, el("thead", {}, el("tr", {}, ...["Add as", "Download", "Context", "Input", ""].map((h) => el("th", {}, h)))),
+      el("tbody", {}, ...rows)),
+    el("button", { class: "small", onclick: () => { every ? v.everyTag.delete(model.name) : v.everyTag.add(model.name); drawDirectoryList(); } },
+      every ? "Only the sizes" : `Every encoding (${(model.tags || []).length})`));
+}
+
+function directoryPick(tag, pick) {
+  const v = directoryView;
+  const engine = hubEngine();
+  const declared = v.data.placement === "declared";
+  const found = tag.vllm;
+  const lookup = async (button, fresh) => {
+    button.disabled = true;
+    const result = await loadBuilds(tag.name, engine, { fresh });
+    if (result.data) tag.vllm = result.data;
+    else alert(result.error);
+    drawDirectory();
+  };
+  return el("div", {},
+    el("label", { class: "pick" }, el("input", { type: "checkbox", ...(pick.ollama ? { checked: true } : {}),
+      onchange: (ev) => { pick.ollama = ev.target.checked; } }), el("span", {}, "served by Ollama as "), el("span", { class: "mono" }, tag.name)),
+    engine ? el("div", {},
+      el("div", { class: "row" }, el("span", {}, `${engine} build:`),
+        found ? el("button", { class: "small", onclick: (ev) => lookup(ev.target, true) }, "Look again on the hub")
+          : el("button", { class: "small", onclick: (ev) => lookup(ev.target, false) }, "Look up on the hub")),
+      found ? buildTable(found, pick.hub, (repo) => { pick.hub = repo; drawDirectory(); }, `dir-${tag.name}`, { allowNone: true }) : null)
+      : null,
+    declared ? el("label", { class: "pick" }, el("input", { type: "checkbox", ...(pick.rent_for ? { checked: true } : {}),
+      onchange: (ev) => { pick.rent_for = ev.target.checked; } }), el("span", {}, "rent hosts for it")) : null);
+}
+
+function directoryFooter() {
+  const v = directoryView;
+  const picks = Object.values(v.picks);
+  if (!picks.length) return null;
+  const engine = hubEngine();
+  const offered = ((v.data.offers || {})[engine] || {}).options || {};
+  const note = el("span", { class: "muted" }, v.message);
+  return el("div", { class: "panel" },
+    el("h2", {}, `Add ${picks.length} model(s) to the pool`),
+    el("div", { class: "mono" }, picks.map((p) => p.tag.name).join("  ·  ")),
+    Object.keys(offered).length ? el("div", {}, el("p", { class: "muted" }, `${engine} options, for every model its hosts run:`),
+      ...Object.keys(offered).map((key) => optionBox(key, offered[key], v.options, false, () => {}))) : null,
+    el("div", { class: "row" },
+      el("button", { class: "primary", onclick: (ev) => addFromDirectory(ev.target, note) }, "Add to the pool"),
+      el("button", { class: "small", onclick: () => { v.picks = {}; v.message = ""; drawDirectory(); } }, "Clear"),
+      note));
+}
+
+async function addFromDirectory(button, note) {
+  const v = directoryView;
+  const engine = hubEngine();
+  const body = {
+    add: Object.values(v.picks).map((p) => ({
+      name: p.tag.name,
+      builds: { ...(p.ollama ? { ollama: p.tag.name } : {}), ...(engine && p.hub ? { [engine]: p.hub } : {}) },
+      rent_for: v.data.placement === "declared" ? !!p.rent_for : false,
+    })),
+    engine_options: v.options || [],
+  };
+  button.disabled = true;
+  try {
+    let answer;
+    try {
+      answer = await api.addModels(body);
+    } catch (error) {
+      const retype = (error.changes || []).find((c) => c.requires_retype);
+      if (!retype) throw error;
+      const ok = await confirmAction({ title: "This loosens a limit",
+        body: el("div", {}, ...error.changes.map((c) => el("p", {}, c.detail))), retype: retype.value });
+      if (!ok) return;
+      answer = await api.addModels({ ...body, confirm: retype.value });
+    }
+    v.picks = {};
+    v.data = null;
+    v.message = ` added · ${(answer.changes || []).length} change(s) applied`;
+    await refresh();
+  } catch (error) {
+    v.message = ` not added: ${error.message}`;
+    note.textContent = v.message;
+  } finally {
+    button.disabled = false;
+  }
+}
 
 screens.leases = async () => {
   const { leases } = await api.leases();
@@ -1821,7 +2156,9 @@ function handleFrame(chunk) {
   } else if (type === "status") {
     state.status = payload;
     document.getElementById("pool-name").textContent = payload.pool;
-    if (["overview", "hosts", "models"].includes(state.screen)) render();
+    // Not while the operator is typing into the directory: a redraw would take the field away.
+    const typing = state.screen === "models" && directoryView.box?.contains(document.activeElement);
+    if (["overview", "hosts", "models"].includes(state.screen) && !typing) render();
   }
 }
 

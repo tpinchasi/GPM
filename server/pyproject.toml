@@ -1,6 +1,6 @@
 [project]
 name = "gpm-server"
-version = "0.14.0"
+version = "0.15.0"
 description = "GPM router: serves GPU inference from a pool of hosts behind one URL, without an app knowing where the GPU runs."
 requires-python = ">=3.11"
 dependencies = [
