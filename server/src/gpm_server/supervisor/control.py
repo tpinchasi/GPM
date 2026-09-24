@@ -1172,8 +1172,11 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         detail["required_tags"] = sorted(required)
         if client is not None:
             try:
-                resident = await supervisor.engine.models_resident(client)
-                available = await supervisor.engine.models_available(client)
+                # This machine's own engine, not the pool's default (D93): asked with the
+                # wrong adapter, a vLLM host read as "not answering: 405 /api/ps" while it was.
+                engine = supervisor.engine_for(rented)
+                resident = await engine.models_resident(client)
+                available = await engine.models_available(client)
                 detail["engine"] = {
                     "answers": True,
                     "loaded": sorted(resident),

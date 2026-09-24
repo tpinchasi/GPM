@@ -219,6 +219,18 @@ def test_the_batch_is_never_smaller_than_the_sequences_the_engine_must_run():
         assert int(settings[BATCHED_TOKENS]) >= workers
 
 
+def test_the_batch_is_never_below_the_engines_own_default():
+    """Found live on the first vLLM host that got as far as starting: six workers gave a batch
+    of 1,536 tokens, and Gemma 4 — to which one image is 2,496 tokens — refused to start. The
+    engine's own default is 8,192; a smaller number from the pool can only ever hurt."""
+    from gpm_server.engines.vllm import MIN_BATCHED_TOKENS
+
+    assert MIN_BATCHED_TOKENS >= 2496
+    for workers in (1, 6, 84):
+        assert int(engine.launch_settings(workers=workers, context=4096, n_models=1)[BATCHED_TOKENS]) >= MIN_BATCHED_TOKENS
+    assert int(engine.launch_settings(workers=512, context=4096, n_models=1)[BATCHED_TOKENS]) == 512 * 256
+
+
 def test_nothing_is_bound_wider_than_asked():
     """The pool reaches the engine through a forward into the machine, so binding every
     interface only exposes it to everyone else (D77)."""

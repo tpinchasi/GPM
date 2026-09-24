@@ -37,6 +37,12 @@ LISTEN = "GPM_VLLM_LISTEN"
 #: refuses to start, so the multiplier is never less than one.
 TOKENS_PER_SEQUENCE = 256
 
+#: Never launch with a batch below the engine's own default. Found live: six workers gave a
+#: batch of 1,536 tokens, and a multimodal model — one image is 2,496 tokens to Gemma 4 —
+#: refused to start ("max_tokens_per_mm_item is larger than max_num_batched_tokens"). The
+#: pool's number was only ever *smaller* than the engine's, so it could only ever hurt.
+MIN_BATCHED_TOKENS = 8192
+
 _METRIC = re.compile(r"^(?P<name>vllm:[a-z_]+)(?:\{[^}]*\})?\s+(?P<value>[0-9.eE+-]+)\s*$", re.M)
 
 
@@ -237,7 +243,7 @@ class VllmEngine:
             CONTEXT: str(context),
             # The engine refuses to start with a batch smaller than the number of sequences it
             # is told to run, so this is a floor before it is a tuning knob.
-            BATCHED_TOKENS: str(max(workers, workers * TOKENS_PER_SEQUENCE)),
+            BATCHED_TOKENS: str(max(MIN_BATCHED_TOKENS, workers * TOKENS_PER_SEQUENCE)),
         }
         if listen:
             # The same reasoning as every other engine the pool launches: it is reached through
