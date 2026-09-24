@@ -292,21 +292,64 @@ def test_two_models_are_bought_a_host_each_and_each_host_is_ready_on_its_own(mon
 # --- every model on one host, behind the router (D96) ---
 
 
+ADMIN_KEY = "gpmx_sequence_admin"
+MODEL_STATES = {"not here yet", "downloading", "on disk", "loading", "loaded", "failed"}
+
+
+def watched_until_ready(machines, http, within_s: float = 40.0):
+    """`until_ready`, reading the host's detail through the control API at every step — what
+    an operator watching the console sees while the host is prepared (D105)."""
+    seen: list[dict] = []
+    deadline = time.monotonic() + within_s
+    while time.monotonic() < deadline:
+        machines.pool.reprobe()
+        live = [h for h in machines.fleet.hosts.values() if not h.released]
+        for h in live:
+            answer = http.get(f"/pool/hosts/{h.host_id}")
+            if answer.status_code == 200:
+                seen.append(answer.json())
+        if live and all(h.state == "ready" for h in live):
+            return live, seen
+        time.sleep(0.1)
+    raise AssertionError(f"not ready within {within_s}s: {[(s['state'], s['stage_detail']) for s in seen[-5:]]}")
+
+
 def test_every_model_on_one_host_starts_an_engine_each_behind_the_router(monkeypatch, tmp_path):
+    from gpm_server.supervisor.control import create_control_app
+
     hub = FakeHub(HUB)
     with pool_harness(
         [EngineSpec(id="laptop", resident={"gemma4:26b", EMBED}, kind="local", workers=1)],
         rentable=[EngineSpec(id="market-1", resident=set(), workers=2, engine="vllm")],
         model_set=[BIG, EMBED], catalog=CATALOG,
         rented=rented(engine_proxy=True),
+        extra_config={"auth": {"app_keys": ["test-app-key"], "admin_keys": [ADMIN_KEY]}},
     ) as pool:
         hub_server = ServerHandle(hub.app, pool.loop)
+        control = ServerHandle(create_control_app(pool.supervisor, pool.supervisor.config), pool.loop)
         monkeypatch.setenv("HF_ENDPOINT", hub_server.base_url)
         try:
             machines = Machines(pool, tmp_path, monkeypatch)
             machines.fleet.open_lease(workers=2, max_hours=2, max_spend=2.00, allow_rent=True)
-            (host,) = machines.until_ready(1)
+            with httpx.Client(base_url=control.base_url, headers={"Authorization": f"Bearer {ADMIN_KEY}"}, timeout=10) as http:
+                (host,), seen = watched_until_ready(machines, http)
+                final = http.get(f"/pool/hosts/{host.host_id}").json()
             machines.check_no_failures()
+
+            # What the operator saw on the way (D105): every model with a state at every step,
+            # never a word outside the known ones; the engine's silence while the agent was
+            # fetching reported as the plan, never as a fault; and the preparation visible as
+            # something other than "loaded" before it was.
+            assert seen, "the detail was never readable while the host was prepared"
+            for snapshot in seen:
+                assert [m["tag"] for m in snapshot["models"]] == sorted(snapshot["required_tags"])
+                assert {m["state"] for m in snapshot["models"]} <= MODEL_STATES
+                if snapshot["agent"]["installed"] and not snapshot["engine"]["answers"]:
+                    assert snapshot["engine"].get("expected") is True, snapshot["engine"]
+                    assert snapshot["stage_detail"].startswith(("fetching models", "every model is on disk")), snapshot["stage_detail"]
+            assert any({m["state"] for m in s["models"]} != {"loaded"} for s in seen), "never seen preparing"
+            assert {m["state"] for m in final["models"]} == {"loaded"}
+            assert final["stage_detail"] == "ready — serving requests"
 
             # Both fetched, then one start — after both had landed — with the router, one engine
             # per model, memory split between them.
@@ -325,6 +368,7 @@ def test_every_model_on_one_host_starts_an_engine_each_behind_the_router(monkeyp
                     assert answer.status_code == 200, (model, answer.text)
                     assert answer.headers["X-GPM-Host"] == host.host_id
         finally:
+            control.stop()
             hub_server.stop()
 
 

@@ -333,7 +333,19 @@ def test_the_pools_numbers_become_this_engines_names(tmp_path):
     environment = facts(tmp_path).launch_environment(workers=84, models_held=3, context=32768)
     assert environment["GPM_VLLM_MAX_NUM_SEQS"] == "84"
     assert environment["GPM_VLLM_MAX_MODEL_LEN"] == "32768"
-    assert int(environment["GPM_VLLM_MAX_NUM_BATCHED_TOKENS"]) >= 84
+    assert int(environment["GPM_VLLM_MAX_NUM_BATCHED_TOKENS"]) >= 84 * 256
+
+
+def test_the_batch_is_never_below_the_engines_own_default(tmp_path):
+    """Found live, twice: six workers gave 1,536 tokens and a multimodal model refused to start
+    — fixed on the pool's start command, then undone by the restart the pool asks for once the
+    weights have landed, which writes this environment. The two must agree."""
+    from gpm_agent.engines import MIN_BATCHED_TOKENS
+
+    assert MIN_BATCHED_TOKENS == 8192
+    environment = facts(tmp_path).launch_environment(workers=6, models_held=3)
+    assert environment["GPM_VLLM_MAX_NUM_BATCHED_TOKENS"] == "8192"
+    assert int(environment["GPM_VLLM_MAX_NUM_BATCHED_TOKENS"]) >= int(environment["GPM_VLLM_MAX_NUM_SEQS"])
 
 
 def test_the_count_of_models_is_not_written_because_it_cannot_be_honoured(tmp_path):

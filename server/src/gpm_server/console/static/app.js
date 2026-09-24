@@ -162,11 +162,30 @@ function hostPanel(d) {
   if (d.tunnel) facts.push(["tunnel", `${d.tunnel.up ? "up" : "down"} on :${d.tunnel.local_port} · ${d.tunnel.restarts} restart(s)`]);
   facts.push(["engine", engine.answers
     ? `answers · ${(engine.on_disk || []).length} on disk, ${(engine.loaded || []).length} loaded`
+    // Silent on purpose (D105): an engine started once its weights have landed is not a fault
+    // while the agent fetches them, and was read as one when it said "ReadError" here.
+    : engine.expected ? el("span", { class: "muted" }, engine.detail || "not started yet")
     : el("span", { class: "error" }, `not answering: ${engine.detail || "?"}`)]);
+
+  // One row per model the host must hold, with its state from everything the pool knows
+  // (D105): downloading with its bar, on disk, loading, loaded, failed with the reason.
+  const MODEL_PILL = { loaded: "ok", loading: "warn", "on disk": "warn", downloading: "warn", failed: "bad", "not here yet": "bad" };
+  const modelRows = (d.models || []).map((m) => el("tr", {},
+    el("td", { class: "mono" }, m.tag),
+    el("td", {}, pill(m.state, MODEL_PILL[m.state] || "warn")),
+    el("td", {}, m.detail || "",
+      m.state === "downloading" && m.total
+        ? el("div", { class: "burn" }, el("div", { style: `width:${(Math.min(1, m.completed / m.total) * 100).toFixed(1)}%` }))
+        : null)));
 
   return [
     el("div", { class: "kv" }, ...facts.flatMap(([k, v]) => [el("div", { class: "k" }, k), el("div", {}, v)])),
-    progress.length ? el("div", {},
+    modelRows.length ? el("div", {},
+      el("h2", {}, "The model set on this host"),
+      el("table", {}, el("tbody", {}, modelRows))) : null,
+    // From a supervisor that does not report per-model states yet: the old view, from the
+    // engine's own lists and the pool's downloads.
+    !d.models && progress.length ? el("div", {},
       el("h2", {}, "Downloads"),
       ...progress.map(([tag, p]) => {
         const share = p.total ? Math.min(1, p.completed / p.total) : 0;
@@ -178,7 +197,7 @@ function hostPanel(d) {
             p.attempt > 1 ? el("span", { class: "muted" }, ` · attempt ${p.attempt}`) : null),
           el("div", { class: "burn" }, el("div", { style: `width:${(share * 100).toFixed(1)}%` })));
       })) : null,
-    engine.answers ? el("div", {},
+    engine.answers && !d.models ? el("div", {},
       el("h2", {}, "The model set on this host"),
       el("table", {}, el("tbody", {}, (d.required_tags || []).map((tag) => el("tr", {},
         el("td", { class: "mono" }, tag),
