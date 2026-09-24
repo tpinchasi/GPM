@@ -605,40 +605,75 @@ function hostTestForm() {
     output);
 }
 
+// Rented capacity is five screens' worth of settings; one long page hid which belonged to
+// what. Each tab answers one question an operator comes here with, and has its own address so
+// Back works and a tab can be linked to.
+const RENTED_TABS = [
+  { id: "hosts", label: "Hosts", about: "What this pool is renting now, what it costs, and renting one more by hand." },
+  { id: "engine", label: "Engine & models", about: "What the machines this pool rents run: the engine, how models are placed on them, each model's build, and the engine's options." },
+  { id: "finding", label: "Finding machines", about: "What the pool looks for on the market, and the live market those settings let through — try values here before saving them." },
+  { id: "scaling", label: "Scaling", about: "How many machines at most, how much per hour at most, and how the pool decides when to rent another." },
+  { id: "teardown", label: "Tear-down", about: "When an unused or failing machine is paused, destroyed or given up." },
+];
+// Which tabs read the saved settings and the market — the only ones that ask the provider.
+const RENTED_TABS_WITH_MARKET = new Set(["finding", "scaling", "teardown"]);
+
+function rentedTabs(current) {
+  return el("div", { class: "tabs" }, ...RENTED_TABS.map((tab) => el("a", {
+    href: `#rented/${tab.id}`, ...(tab.id === current ? { class: "active" } : {}),
+  }, tab.label)));
+}
+
 screens.rented = async (status) => {
   if (!status.provider) return [el("h1", {}, "Rented capacity"), el("p", { class: "muted" }, "This pool has no rented capacity configured, so it cannot spend.")];
-  const [account, market] = await Promise.all([
-    api.account().catch((e) => ({ error: e.message })),
-    api.market(1).catch((e) => ({ error: e.message })),
-  ]);
+  const tab = RENTED_TABS.find((t) => t.id === state.sub) || RENTED_TABS[0];
+  const market = RENTED_TABS_WITH_MARKET.has(tab.id) ? await api.market(1).catch((e) => ({ error: e.message })) : null;
+  const head = [el("h1", {}, "Rented capacity"), rentedTabs(tab.id), el("p", { class: "muted tab-about" }, tab.about)];
+  if (tab.id === "engine") return [...head, el("div", { class: "grid" }, enginePanel(status.engine)), ...engineSection(status)];
+  if (tab.id === "finding") return [...head, ...searchSection(market), ...marketSection(market)];
+  if (tab.id === "scaling") return [...head, limitsPanel(status), ...allocationSection(market)];
+  if (tab.id === "teardown") return [...head, ...teardownSection(market)];
+  return [...head, ...await rentedHostsTab(status)];
+};
+
+function providerPanel(status, account) {
   const capabilities = Object.entries(status.provider.capabilities).filter(([, on]) => on).map(([name]) => name);
+  return el("div", { class: "panel" }, el("h2", {}, "Provider"),
+    el("div", { class: "kv" },
+      el("div", { class: "k" }, "name"), el("div", {}, status.provider.name),
+      el("div", { class: "k" }, "credential"), el("div", {}, account.error ? pill("error", "bad") : pill(account.credential_valid ? "valid ✓" : "invalid ✗", account.credential_valid ? "ok" : "bad")),
+      el("div", { class: "k" }, "credit left"), el("div", {}, account.error ? account.error : money(account.credit_remaining)),
+      el("div", { class: "k" }, "can"), el("div", { class: "muted" }, capabilities.join(", ")),
+      el("div", { class: "k" }, "cap margin"), el("div", {}, `${(status.provider.cap_safety_margin * 100).toFixed(0)}%`,
+        el("span", { class: "muted" }, status.provider.capabilities.reports_charges ? " — narrows once a charge is reported" : " — wider: this provider reports no charges"))));
+}
+
+function limitsPanel(status) {
+  return el("div", { class: "panel" }, el("h2", {}, "Limits"),
+    el("div", { class: "kv" },
+      el("div", { class: "k" }, "max rented hosts"), el("div", {}, hostLimitControl(status.limits.max_rented_hosts)),
+      el("div", { class: "k" }, "per-host ceiling"), el("div", {}, rate(status.limits.per_host_ceiling)),
+      el("div", { class: "k" }, "overall cap"), el("div", {}, status.limits.max_hourly_burn == null
+        ? el("span", { class: "muted" }, `none — bounded at ${rate(status.limits.worst_case_hourly)} by hosts × ceiling`)
+        : rate(status.limits.max_hourly_burn))),
+    el("p", { class: "muted" }, "Raising either is a configuration change that must be retyped to confirm."));
+}
+
+async function rentedHostsTab(status) {
+  const account = await api.account().catch((e) => ({ error: e.message }));
+  const burn = status.rented.reduce((n, h) => n + (h.bid_hourly || 0), 0);
   return [
-    el("h1", {}, "Rented capacity"),
     el("div", { class: "grid" },
-      el("div", { class: "panel" }, el("h2", {}, "Provider"),
+      providerPanel(status, account),
+      el("div", { class: "panel" }, el("h2", {}, "Now"),
         el("div", { class: "kv" },
-          el("div", { class: "k" }, "name"), el("div", {}, status.provider.name),
-          el("div", { class: "k" }, "credential"), el("div", {}, account.error ? pill("error", "bad") : pill(account.credential_valid ? "valid ✓" : "invalid ✗", account.credential_valid ? "ok" : "bad")),
-          el("div", { class: "k" }, "credit left"), el("div", {}, account.error ? account.error : money(account.credit_remaining)),
-          el("div", { class: "k" }, "can"), el("div", { class: "muted" }, capabilities.join(", ")),
-          el("div", { class: "k" }, "cap margin"), el("div", {}, `${(status.provider.cap_safety_margin * 100).toFixed(0)}%`,
-            el("span", { class: "muted" }, status.provider.capabilities.reports_charges ? " — narrows once a charge is reported" : " — wider: this provider reports no charges")))),
-      el("div", { class: "panel" }, el("h2", {}, "Limits"),
-        el("div", { class: "kv" },
-          el("div", { class: "k" }, "max rented hosts"), el("div", {}, hostLimitControl(status.limits.max_rented_hosts)),
-          el("div", { class: "k" }, "per-host ceiling"), el("div", {}, rate(status.limits.per_host_ceiling)),
-          el("div", { class: "k" }, "overall cap"), el("div", {}, status.limits.max_hourly_burn == null
-            ? el("span", { class: "muted" }, `none — bounded at ${rate(status.limits.worst_case_hourly)} by hosts × ceiling`)
-            : rate(status.limits.max_hourly_burn))),
-        el("p", { class: "muted" }, "Raising either is a configuration change that must be retyped to confirm.")),
-      enginePanel(status.engine),
-      preparePanel(),
-    ),
-    ...searchSection(market),
-    ...allocationSection(market),
-    ...engineSection(status),
-    ...teardownSection(market),
-    ...marketSection(market),
+          el("div", { class: "k" }, "rented"), el("div", {}, `${status.rented.length} of at most ${status.limits.max_rented_hosts}`),
+          el("div", { class: "k" }, "burning"), el("div", {}, rate(burn),
+            el("span", { class: "muted" }, status.limits.max_hourly_burn == null ? "" : ` of ${rate(status.limits.max_hourly_burn)} allowed`)),
+          el("div", { class: "k" }, "engine"), el("div", { class: "mono" }, status.engine?.rented || "—",
+            el("a", { href: "#rented/engine", class: "muted" }, "  change")),
+          el("div", { class: "k" }, "limits"), el("a", { href: "#rented/scaling" }, "on the Scaling tab"))),
+      preparePanel()),
     el("h2", {}, "Rented and parked hosts"),
     status.rented.length ? el("table", {},
       el("thead", {}, el("tr", {},
@@ -661,7 +696,7 @@ screens.rented = async (status) => {
           el("button", { class: "small danger", onclick: (e) => run(e.target, () => api.hostAction(host.host_id, "release")) }, "Release")))))))
       : el("p", { class: "muted" }, "Nothing rented."),
   ];
-};
+}
 
 // The market, refreshed in place: by the button, and on its own every minute while it is on
 // screen. Only this panel is replaced — re-rendering the whole screen would wipe whatever is
@@ -776,6 +811,15 @@ function controlFor(kind, value, a, b, c) {
   }
   const made = slider(value, a, b, c);
   return { control: made.row, read: made.read };
+}
+
+// The same row with its explanation under the control rather than beside it — for editors
+// whose controls are wide (a list of builds, a long select), where a third column is squeezed
+// to a word per line.
+function stackedRow(key, label, made, why) {
+  return el("tr", {},
+    el("td", { class: "mono stacked-label" }, label),
+    el("td", {}, made.control, why ? el("div", { class: "muted why" }, why) : null));
 }
 
 function configRow(key, label, made, why) {
@@ -908,9 +952,9 @@ function engineRows(status, box, draw) {
     }, invalid[value] ? `${label} (${invalid[value]})` : label)));
 
   const rows = [
-    configRow("engine", "rented engine", { control: engineSelect },
+    stackedRow("engine", "rented engine", { control: engineSelect },
       "what the machines this pool buys run; hosts you configured keep their own"),
-    configRow("placement", "placement", { control: placementSelect },
+    stackedRow("placement", "placement", { control: placementSelect },
       d.placement === "all_proxy" ? "each machine's memory is split between the models, so the largest gets less cache than it would alone"
         : d.placement === "declared" ? "the pool buys a machine for whichever model is short, and never takes the last one serving a model"
         : "any ready host serves any request"),
@@ -925,7 +969,7 @@ function engineRows(status, box, draw) {
         } });
       return el("label", { class: "row" }, input, el("span", { class: "mono" }, name));
     });
-    rows.push(configRow("rented_models", "rent hosts for", { control: el("div", {}, ...boxes) },
+    rows.push(stackedRow("rented_models", "rent hosts for", { control: el("div", {}, ...boxes) },
       "models your configured hosts hold need not be rented for; a model nobody holds is refused on save"));
   }
 
@@ -937,7 +981,7 @@ function engineRows(status, box, draw) {
       placeholder: offer.builds_on_hub ? "owner/name of the model on the hub" : "the engine's tag for this model",
       oninput: (ev) => { d.builds[name] = ev.target.value; } });
     if (!offer.builds_on_hub) {
-      rows.push(configRow(`build ${name}`, `${d.rented} build of ${name}`, { control: typed },
+      rows.push(stackedRow(`build ${name}`, `${d.rented} build of ${name}`, { control: typed },
         "blank keeps what the catalog already has"));
       continue;
     }
@@ -954,7 +998,7 @@ function engineRows(status, box, draw) {
         found?.error ? el("span", { class: "error" }, found.error) : null),
       found?.data ? buildTable(found.data, d.builds[name], (repo) => { d.builds[name] = repo; draw(); }, `engine-${name}`) : null,
       el("details", {}, el("summary", { class: "muted" }, "or name a repository yourself"), typed));
-    rows.push(configRow(`build ${name}`, `${d.rented} build of ${name}`, { control },
+    rows.push(stackedRow(`build ${name}`, `${d.rented} build of ${name}`, { control },
       "the repository its hosts fetch — the same model, in a precision the cards you rent can run"));
   }
 
@@ -967,10 +1011,10 @@ function engineRows(status, box, draw) {
         oninput: (ev) => { d.images[i].min_driver = ev.target.value; } }),
       el("button", { class: "small", onclick: () => { d.images.splice(i, 1); draw(); } }, "Remove"))),
       el("button", { class: "small", onclick: () => { d.images.push({ image: "", min_driver: "" }); draw(); } }, "Add a build"));
-    rows.push(configRow("images", "images, newest first", { control: list },
+    rows.push(stackedRow("images", "images, newest first", { control: list },
       "a machine gets the first its driver can run; one that can run none is never bid on"));
   } else {
-    rows.push(configRow("image", "image", { control: el("input", { type: "text", style: "width:18rem", value: d.image,
+    rows.push(stackedRow("image", "image", { control: el("input", { type: "text", style: "width:18rem", value: d.image,
       oninput: (ev) => { d.image = ev.target.value; } }) }, "pinned, never a floating tag"));
   }
 
@@ -978,12 +1022,12 @@ function engineRows(status, box, draw) {
   if (optionNames.length) {
     const custom = (d.engine_start || "").trim() !== "";
     const boxes = optionNames.map((key) => optionBox(key, offer.options[key], d.engine_options, custom, draw));
-    rows.push(configRow("engine_options", "engine options", { control: el("div", {}, ...boxes) },
+    rows.push(stackedRow("engine_options", "engine options", { control: el("div", {}, ...boxes) },
       custom ? "these belong to the engine's own start; clear the start command to use them"
         : "each model gets an option only if its family has one — the rest start without it, and the machine says so"));
   }
 
-  rows.push(configRow("engine_start", "start command", {
+  rows.push(stackedRow("engine_start", "start command", {
     control: el("input", { type: "text", style: "width:26rem", value: d.engine_start,
       placeholder: vllm ? "blank: the agent's own vllm-start (recommended)" : "how the image's engine is started, if it does not start itself",
       oninput: (ev) => { d.engine_start = ev.target.value; } }),
@@ -1547,7 +1591,7 @@ const marketPanel = (market) => {
       el("h2", {}, "Rejected, by reason"),
       el("table", {}, el("tbody", {}, Object.entries(market.rejected_by_reason || {}).map(([reason, count]) =>
         el("tr", {}, el("td", { class: "num" }, count), el("td", { class: "muted" }, reason)))))),
-    el("div", { class: "panel" }, el("h2", {}, "Best offers"),
+    el("div", { class: "panel wide" }, el("h2", {}, "Best offers"),
       el("table", {},
         el("thead", {}, el("tr", {},
           el("th", {}, "Hardware"), el("th", {}, "Kind"), el("th", { class: "num" }, "Floor"), el("th", { class: "num" }, "Would pay"),
@@ -1611,7 +1655,7 @@ function preparePanel() {
     el("label", {}, "Time limit (hours) ", hours),
     el("label", {}, "When ready ", when),
     el("label", {}, "Rent it ", kind),
-    el("p", { class: "muted" }, "Or pick one machine: every row in the market below has its own Rent button."),
+    el("p", { class: "muted" }, "Or pick one machine: every offer on the ", el("a", { href: "#rented/finding" }, "Finding machines"), " tab has its own Rent button."),
     el("div", { class: "row" }, el("button", { class: "primary", onclick: async (e) => {
       const worst = el("div", {}, el("p", {}, `This spends money. Worst case: ${money(Number(spend.value))} over ${hours.value}h, one host.`),
         el("p", { class: "muted" }, "The pool bids on the best offer its policy allows, and stops at the cap less the safety margin."));
@@ -2081,8 +2125,10 @@ screens.config = async () => {
 // --- shell ---
 
 async function render() {
-  const name = location.hash.replace("#", "") || "overview";
+  // `#rented/engine`: the screen, then which of its tabs.
+  const [name, ...rest] = (location.hash.replace("#", "") || "overview").split("/");
   state.screen = name;
+  state.sub = rest.join("/") || null;
   for (const link of document.querySelectorAll("#nav a")) {
     link.classList.toggle("active", link.getAttribute("href") === `#${name}`);
   }
