@@ -405,11 +405,15 @@ screens.hosts = (status) => [
   el("p", { class: "muted" }, "Configured hosts. Add, edit and disable are configuration changes, so they go through plan on the Configuration screen."),
   el("table", {},
     el("thead", {}, el("tr", {},
-      el("th", {}, "Host"), el("th", {}, "Kind"), el("th", {}, "Transport"), el("th", {}, "State"),
+      el("th", {}, "Host"), el("th", {}, "Kind"), el("th", {}, "Engine"), el("th", {}, "Transport"), el("th", {}, "State"),
       el("th", { class: "num" }, "Workers"), el("th", {}, "Capabilities"), el("th", {}, "Residency"), el("th", {}, "Tunnel"), el("th", { class: "num" }, "Served"))),
     el("tbody", {}, status.hosts.map((host) => el("tr", {},
       el("td", { class: "mono" }, hostLink(host.host_id)),
       el("td", {}, host.kind),
+      // A pool may run a different engine on each machine (D93), and which models this one
+      // holds is now a per-host fact too (D89).
+      el("td", { class: "mono" }, host.engine || "—",
+        (host.holds || []).length ? el("div", { class: "muted" }, `holds ${host.holds.join(", ")}`) : null),
       el("td", {}, host.transport),
       el("td", {}, pill(host.state), host.last_error ? el("div", { class: "muted" }, host.last_error) : null),
       el("td", { class: "num" }, host.workers),
@@ -628,11 +632,14 @@ screens.rented = async (status) => {
     el("h2", {}, "Rented and parked hosts"),
     status.rented.length ? el("table", {},
       el("thead", {}, el("tr", {},
-        el("th", {}, "Host"), el("th", {}, "State"), el("th", {}, "Machine"), el("th", {}, "Rented as"), el("th", { class: "num" }, "Price"),
+        el("th", {}, "Host"), el("th", {}, "State"), el("th", {}, "Serving"), el("th", {}, "Machine"), el("th", {}, "Rented as"), el("th", { class: "num" }, "Price"),
         el("th", { class: "num" }, "Storage"), el("th", { class: "num" }, "Held"), el("th", { class: "num" }, "Spend"), el("th", {}, ""))),
       el("tbody", {}, status.rented.map((host) => el("tr", {},
         el("td", { class: "mono" }, hostLink(host.host_id)),
         el("td", {}, pill(host.state)),
+        // What this machine was bought to serve, and what runs it (D93, D94). A pool buying
+        // the wrong thing used to look exactly like one buying the right thing.
+        el("td", {}, boughtFor(host)),
         el("td", { class: "muted" }, `${host.machine} · ${host.hardware || ""}`),
         el("td", {}, host.interruptible === false ? pill("on demand", "ok") : pill("bid", "warn")),
         el("td", { class: "num" }, rate(host.bid_hourly)),
@@ -772,6 +779,17 @@ function configRow(key, label, made, why) {
 // neither the engine nor the image was visible anywhere in the console, and a pool set to one
 // engine with an image built for another looked exactly like a correct one — until a host had
 // been bought, started the wrong server, and never answered.
+// What a rented host was bought to serve, with the engine that serves it. A host bought before
+// the pool assigned models holds the whole rented set, and says so rather than showing nothing.
+function boughtFor(host) {
+  const models = host.bought_for || [];
+  const engine = host.engine ? el("div", { class: "muted mono" }, host.engine) : null;
+  if (!models.length) {
+    return el("div", {}, el("span", { class: "muted" }, "the whole rented set"), engine);
+  }
+  return el("div", {}, ...models.map((name) => el("div", { class: "mono" }, name)), engine);
+}
+
 function enginePanel(engine) {
   if (!engine) return el("div", { class: "panel" }, el("h2", {}, "Engine"),
     el("p", { class: "muted" }, "This pool's supervisor does not report its engine yet; restart it to see it here."));
@@ -782,13 +800,18 @@ function enginePanel(engine) {
       ? el("span", {}, "driver ", el("span", { class: "mono" }, i.min_driver), "+")
       : el("span", { class: "muted" }, "any driver the policy allows")),
     el("td", { class: "muted" }, i.note || "")));
+  const several = (engine.in_use || []).length > 1;
   return el("div", { class: "panel" }, el("h2", {}, "Engine"),
     el("div", { class: "kv" },
-      el("div", { class: "k" }, "engine"), el("div", { class: "mono" }, engine.name),
+      el("div", { class: "k" }, "pool default"), el("div", { class: "mono" }, engine.name),
+      el("div", { class: "k" }, "rented hosts"), el("div", { class: "mono" }, engine.rented || engine.name,
+        several ? el("div", { class: "muted" }, `this pool runs ${(engine.in_use || []).join(" and ")}`) : null),
       el("div", { class: "k" }, "port"), el("div", { class: "mono" }, String(engine.port)),
       el("div", { class: "k" }, "model set"), el("div", {}, engine.models_per_host === "all"
-        ? "every host holds the whole set"
-        : "each host holds what it declares")),
+        ? (engine.proxy
+            ? "every host holds the whole set — one engine process per model, behind a router on the machine"
+            : "every host holds the whole set")
+        : "each host holds what it declares; the pool buys a host per model")),
     el("table", {}, el("tbody", {}, ...rows)),
     el("p", { class: "muted" }, images.length > 1
       ? "A machine is rented with the first build its driver can run; one that can run none is refused before it is bid on."

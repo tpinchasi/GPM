@@ -421,3 +421,29 @@ def test_allocation_can_be_switched_on_from_the_rented_screen(control, tmp_path)
     reloaded = load_config(written)
     assert reloaded.rented.allocation == "dynamic"
     assert reloaded.rented.dynamic.max_round == 3
+
+
+# --- what the console needs to see (D93, D94) ---
+
+
+def test_status_says_which_engine_runs_where_and_what_each_host_holds(control):
+    """Before this neither was visible anywhere, so a pool buying the wrong thing looked exactly
+    like one buying the right thing. The console's Engine panel and host tables read these."""
+    supervisor, url, _ = control
+    with client(url) as http:
+        http.post("/pool/hosts/prepare", json={"max_spend": 1.0, "max_hours": 1, "when_ready": "park"})
+        status = http.get("/pool/status").json()
+
+    engine = status["engine"]
+    assert engine["name"] == "ollama" and engine["rented"] == "ollama"
+    assert engine["in_use"] == ["ollama"]
+    assert engine["proxy"] is False and engine["models_per_host"] == "all"
+
+    (host,) = status["hosts"]
+    assert host["engine"] == "ollama" and host["holds"] == [MODEL]
+
+    (rented,) = status["rented"]
+    assert rented["engine"] == "ollama"
+    # This engine holds several models per process, so a host is bought for the whole rented
+    # set — here, the pool's one model.
+    assert rented["bought_for"] == [MODEL]
