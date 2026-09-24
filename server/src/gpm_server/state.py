@@ -26,7 +26,12 @@ class RouterState:
     def __init__(self, config: PoolConfig, database: Database):
         self.config = config
         self.db = database
-        self.engine: Engine = get_engine(config.engine)
+        # Every engine this pool runs (D93). The pool's own is first and remains "the engine"
+        # for anything that asks without naming a host.
+        self.engines: dict[str, Engine] = {
+            name: get_engine(name) for name in config.engines_in_use()
+        }
+        self.engine: Engine = self.engines[config.engine]
         self.app_hashes = config.auth.app_hashes()
         self.dispatcher = Dispatcher([])
         self.registry = HostRegistry(
@@ -37,6 +42,30 @@ class RouterState:
     @property
     def hosts(self) -> list[Host]:
         return self.dispatcher.hosts
+
+    def engine_of(self, host: Host) -> Engine:
+        """The engine on that machine, falling back to the pool's for a host published before
+        engines could differ."""
+        return self.engines.get(host.engine, self.engine)
+
+    def parser_for(self, path: str) -> Optional[Engine]:
+        """Which engine's rules read a request that arrived on this path (D93).
+
+        The **path** decides, not the host — a request must be understood before the pool knows
+        where it will go. Where two engines serve the same path they read it identically, by
+        construction: they share one module for it. Where only one serves it, that one reads it.
+        """
+        for engine in self.engines.values():
+            if path in engine.inference_paths():
+                return engine
+        return None
+
+    def paths(self) -> set[str]:
+        """Every inference path this pool's hosts serve between them."""
+        found: set[str] = set()
+        for engine in self.engines.values():
+            found |= engine.inference_paths()
+        return found
 
     async def aclose(self) -> None:
         await self.registry.aclose()

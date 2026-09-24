@@ -46,6 +46,8 @@ class VllmEngine:
     #: means something in front of them choosing between ports — and that is a component the
     #: pool does not yet ship, so the combination is refused at load rather than at 3 a.m.
     serves_one_model: ClassVar[bool] = True
+    default_port: ClassVar[int] = 8000
+    image_words: ClassVar[tuple[str, ...]] = ("vllm",)
 
     # --- request path: the shared protocol, not this engine's invention ---
 

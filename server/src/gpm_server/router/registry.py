@@ -100,6 +100,7 @@ class HostRegistry:
             resident=row.resident,
             available=row.available,
             residency=row.residency,
+            engine=row.engine,
             last_error=row.last_error,
         )
 

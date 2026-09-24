@@ -405,11 +405,15 @@ screens.hosts = (status) => [
   el("p", { class: "muted" }, "Configured hosts. Add, edit and disable are configuration changes, so they go through plan on the Configuration screen."),
   el("table", {},
     el("thead", {}, el("tr", {},
-      el("th", {}, "Host"), el("th", {}, "Kind"), el("th", {}, "Transport"), el("th", {}, "State"),
+      el("th", {}, "Host"), el("th", {}, "Kind"), el("th", {}, "Engine"), el("th", {}, "Transport"), el("th", {}, "State"),
       el("th", { class: "num" }, "Workers"), el("th", {}, "Capabilities"), el("th", {}, "Residency"), el("th", {}, "Tunnel"), el("th", { class: "num" }, "Served"))),
     el("tbody", {}, status.hosts.map((host) => el("tr", {},
       el("td", { class: "mono" }, hostLink(host.host_id)),
       el("td", {}, host.kind),
+      // A pool may run a different engine on each machine (D93), and which models this one
+      // holds is now a per-host fact too (D89).
+      el("td", { class: "mono" }, host.engine || "—",
+        (host.holds || []).length ? el("div", { class: "muted" }, `holds ${host.holds.join(", ")}`) : null),
       el("td", {}, host.transport),
       el("td", {}, pill(host.state), host.last_error ? el("div", { class: "muted" }, host.last_error) : null),
       el("td", { class: "num" }, host.workers),
@@ -618,6 +622,7 @@ screens.rented = async (status) => {
             ? el("span", { class: "muted" }, `none — bounded at ${rate(status.limits.worst_case_hourly)} by hosts × ceiling`)
             : rate(status.limits.max_hourly_burn))),
         el("p", { class: "muted" }, "Raising either is a configuration change that must be retyped to confirm.")),
+      enginePanel(status.engine),
       preparePanel(),
     ),
     ...searchSection(market),
@@ -627,11 +632,14 @@ screens.rented = async (status) => {
     el("h2", {}, "Rented and parked hosts"),
     status.rented.length ? el("table", {},
       el("thead", {}, el("tr", {},
-        el("th", {}, "Host"), el("th", {}, "State"), el("th", {}, "Machine"), el("th", {}, "Rented as"), el("th", { class: "num" }, "Price"),
+        el("th", {}, "Host"), el("th", {}, "State"), el("th", {}, "Serving"), el("th", {}, "Machine"), el("th", {}, "Rented as"), el("th", { class: "num" }, "Price"),
         el("th", { class: "num" }, "Storage"), el("th", { class: "num" }, "Held"), el("th", { class: "num" }, "Spend"), el("th", {}, ""))),
       el("tbody", {}, status.rented.map((host) => el("tr", {},
         el("td", { class: "mono" }, hostLink(host.host_id)),
         el("td", {}, pill(host.state)),
+        // What this machine was bought to serve, and what runs it (D93, D94). A pool buying
+        // the wrong thing used to look exactly like one buying the right thing.
+        el("td", {}, boughtFor(host)),
         el("td", { class: "muted" }, `${host.machine} · ${host.hardware || ""}`),
         el("td", {}, host.interruptible === false ? pill("on demand", "ok") : pill("bid", "warn")),
         el("td", { class: "num" }, rate(host.bid_hourly)),
@@ -654,37 +662,37 @@ screens.rented = async (status) => {
 // runs the real pipeline against the live market and saves nothing — and saving goes through
 // the file, the plan, and the retype rule, exactly as the Configuration screen does (D51).
 const SEARCH_FIELDS = [
-  ["offer_policy", "min_gpu_memory_gb", "number", "the card must have at least this much memory"],
-  ["offer_policy", "min_disk_gb", "number", "the machine must offer at least this much disk"],
-  ["offer_policy", "max_all_in_hourly", "number", "the most this pool will pay per host, per hour"],
-  ["offer_policy", "max_all_in_per_gpu", "number", "and per accelerator — a multi-GPU machine is judged by the card, not the bill"],
-  ["offer_policy", "max_download_per_gb", "number", "the most it will pay per GB downloaded"],
-  ["offer_policy", "min_download_mbps", "number", "slower than this and the model set takes too long"],
-  ["offer_policy", "min_reliability", "number", "the provider's own score, 0 to 1"],
+  ["offer_policy", "min_gpu_memory_gb", "range", "the card must have at least this much memory", 0, 200, 4],
+  ["offer_policy", "min_disk_gb", "range", "the machine must offer at least this much disk", 0, 500, 10],
+  ["offer_policy", "max_all_in_hourly", "range", "the most this pool will pay per host, per hour", 0, 20, 0.05],
+  ["offer_policy", "max_all_in_per_gpu", "range", "and per accelerator — a multi-GPU machine is judged by the card, not the bill", 0, 10, 0.05],
+  ["offer_policy", "max_download_per_gb", "range", "the most it will pay per GB downloaded", 0, 0.5, 0.005],
+  ["offer_policy", "min_download_mbps", "range", "slower than this and the model set takes too long", 0, 10000, 100],
+  ["offer_policy", "min_reliability", "range", "the provider's own score, 0 to 1", 0, 1, 0.01],
   ["offer_policy", "min_driver_version", "text", "the accelerator driver this engine image needs — below it the card sits idle and the CPU serves"],
   ["offer_policy", "verified_only", "checkbox", "only machines the provider has verified"],
   ["offer_policy", "exclude_hardware", "list", "refused by name, case-insensitive"],
   ["offer_policy", "avoid_machines", "list", "machine ids to skip — one that keeps failing, say"],
-  ["bidding", "bid_ceiling", "number", "never bid above this, whatever a strategy returns"],
-  ["bidding", "premium", "number", "added to the market floor when bidding"],
-  ["bidding", "on_demand_crossover", "number", "past this fraction of the on-demand price, do not bid"],
-  ["bidding", "attempts", "number", "offers to try in one pass before giving up"],
+  ["bidding", "bid_ceiling", "range", "never bid above this, whatever a strategy returns", 0, 20, 0.05],
+  ["bidding", "premium", "range", "added to the market floor when bidding", 0, 2, 0.01],
+  ["bidding", "on_demand_crossover", "range", "past this fraction of the on-demand price, do not bid", 0, 1, 0.01],
+  ["bidding", "attempts", "range", "offers to try in one pass before giving up", 1, 20, 1],
 ];
 
 // How capacity is allocated, editable on the same screen for the same reason (D74): two
 // opt-in features that spend money should be visible and changeable where renting is watched,
 // not only in a file on the supervisor's machine.
 const ALLOCATION_FIELDS = [
-  ["dynamic", "target_utilisation", "number", "rent before saturation, not at it: 0.75 keeps a quarter spare"],
-  ["dynamic", "window_s", "number", "load must hold this long before the first host is bought"],
-  ["dynamic", "ramp_factor", "number", "each round asks for this many times the last: 1, 2, 4 …"],
-  ["dynamic", "ramp_backoff_s", "number", "and waits this long after the last round has landed"],
-  ["dynamic", "max_round", "number", "the most one round may add, however long the load lasts"],
-  ["dynamic", "min_hosts", "number", "a warm floor kept while a lease is open; 0 spends nothing when quiet"],
+  ["dynamic", "target_utilisation", "range", "rent before saturation, not at it: 0.75 keeps a quarter spare", 0.1, 1, 0.05],
+  ["dynamic", "window_s", "range", "load must hold this long before the first host is bought", 0, 600, 10],
+  ["dynamic", "ramp_factor", "range", "each round asks for this many times the last: 1, 2, 4 …", 1, 4, 0.5],
+  ["dynamic", "ramp_backoff_s", "range", "and waits this long after the last round has landed", 0, 900, 30],
+  ["dynamic", "max_round", "range", "the most one round may add, however long the load lasts", 1, 16, 1],
+  ["dynamic", "min_hosts", "range", "a warm floor kept while a lease is open; 0 spends nothing when quiet", 0, 8, 1],
   ["workers_auto", "enabled", "checkbox", "each host finds its own worker count while it serves"],
-  ["workers_auto", "max", "number", "the most any host's engine is launched to run at once"],
-  ["workers_auto", "min_gain", "number", "a step up must raise throughput by this much to count"],
-  ["workers_auto", "slow_host_factor", "number", "service time this far over the pool's median steps a host down"],
+  ["workers_auto", "max", "range", "the most any host's engine is launched to run at once", 1, 64, 1],
+  ["workers_auto", "min_gain", "range", "a step up must raise throughput by this much to count", 0, 1, 0.01],
+  ["workers_auto", "slow_host_factor", "range", "service time this far over the pool's median steps a host down", 1, 5, 0.1],
 ];
 
 // When a host is given up, and how hard the pool tries first (D86). Sliders, because every
@@ -725,6 +733,91 @@ function slider(value, min, max, step, onchange) {
   return { row: el("span", { class: "row" }, range, box), read: () => (box.value === "" ? null : Number(box.value)) };
 }
 
+// Every configuration row on this screen is built here, so the sections cannot drift apart in
+// look or in how their values are read back. `range` is the default for a number with known
+// bounds: the handle shows where in the range a value sits, the box says exactly what it is.
+function controlFor(kind, value, a, b, c) {
+  if (kind === "checkbox") {
+    const input = el("input", { type: "checkbox", ...(value ? { checked: true } : {}) });
+    return { control: input, read: () => input.checked };
+  }
+  if (kind === "choice") {
+    const input = el("select", {}, ...a.map((v) =>
+      el("option", { value: v, ...(String(value) === v ? { selected: true } : {}) }, v)));
+    return { control: input, read: () => input.value };
+  }
+  if (kind === "list" || kind === "text") {
+    const shown = value === null || value === undefined ? "" : (kind === "list" ? value.join(", ") : String(value));
+    const input = el("input", { type: "text", style: "width:17rem", value: shown });
+    return {
+      control: input,
+      read: () => {
+        const raw = input.value.trim();
+        if (kind === "list") return raw ? raw.split(",").map((t) => t.trim()).filter(Boolean) : [];
+        return raw === "" ? null : raw;
+      },
+    };
+  }
+  if (kind === "number" || a === undefined) {
+    // No bounds to put a handle on — a plain box, rather than a slider that would invent them.
+    const shown = value === null || value === undefined ? "" : String(value);
+    const input = el("input", { type: "number", step: "any", style: "width:9rem", value: shown });
+    return { control: input, read: () => (input.value.trim() === "" ? null : Number(input.value)) };
+  }
+  const made = slider(value, a, b, c);
+  return { control: made.row, read: made.read };
+}
+
+function configRow(key, label, made, why) {
+  return el("tr", {},
+    el("td", { class: "mono" }, label),
+    el("td", {}, made.control),
+    el("td", { class: "muted" }, why));
+}
+
+// What would actually be started on a machine this pool rents (D92). Until this existed
+// neither the engine nor the image was visible anywhere in the console, and a pool set to one
+// engine with an image built for another looked exactly like a correct one — until a host had
+// been bought, started the wrong server, and never answered.
+// What a rented host was bought to serve, with the engine that serves it. A host bought before
+// the pool assigned models holds the whole rented set, and says so rather than showing nothing.
+function boughtFor(host) {
+  const models = host.bought_for || [];
+  const engine = host.engine ? el("div", { class: "muted mono" }, host.engine) : null;
+  if (!models.length) {
+    return el("div", {}, el("span", { class: "muted" }, "the whole rented set"), engine);
+  }
+  return el("div", {}, ...models.map((name) => el("div", { class: "mono" }, name)), engine);
+}
+
+function enginePanel(engine) {
+  if (!engine) return el("div", { class: "panel" }, el("h2", {}, "Engine"),
+    el("p", { class: "muted" }, "This pool's supervisor does not report its engine yet; restart it to see it here."));
+  const images = engine.images || [];
+  const rows = images.map((i) => el("tr", {},
+    el("td", { class: "mono" }, i.image),
+    el("td", {}, i.min_driver
+      ? el("span", {}, "driver ", el("span", { class: "mono" }, i.min_driver), "+")
+      : el("span", { class: "muted" }, "any driver the policy allows")),
+    el("td", { class: "muted" }, i.note || "")));
+  const several = (engine.in_use || []).length > 1;
+  return el("div", { class: "panel" }, el("h2", {}, "Engine"),
+    el("div", { class: "kv" },
+      el("div", { class: "k" }, "pool default"), el("div", { class: "mono" }, engine.name),
+      el("div", { class: "k" }, "rented hosts"), el("div", { class: "mono" }, engine.rented || engine.name,
+        several ? el("div", { class: "muted" }, `this pool runs ${(engine.in_use || []).join(" and ")}`) : null),
+      el("div", { class: "k" }, "port"), el("div", { class: "mono" }, String(engine.port)),
+      el("div", { class: "k" }, "model set"), el("div", {}, engine.models_per_host === "all"
+        ? (engine.proxy
+            ? "every host holds the whole set — one engine process per model, behind a router on the machine"
+            : "every host holds the whole set")
+        : "each host holds what it declares; the pool buys a host per model")),
+    el("table", {}, el("tbody", {}, ...rows)),
+    el("p", { class: "muted" }, images.length > 1
+      ? "A machine is rented with the first build its driver can run; one that can run none is refused before it is bid on."
+      : "One build for every machine. The driver floor in the search is what keeps an unusable machine out."));
+}
+
 function teardownSection(market) {
   const saved = (market.saved || {}).teardown;
   teardown.saved = saved;
@@ -737,23 +830,9 @@ function teardownSection(market) {
   }
   const rows = TEARDOWN_FIELDS.map(([section, key, kind, why, a, b, c]) => {
     const value = saved[key];
-    let control, read;
-    if (kind === "checkbox") {
-      const input = el("input", { type: "checkbox", ...(value ? { checked: true } : {}) });
-      control = input; read = () => input.checked;
-    } else if (kind === "choice") {
-      const input = el("select", {}, ...a.map((v) =>
-        el("option", { value: v, ...(String(value) === v ? { selected: true } : {}) }, v)));
-      control = input; read = () => input.value;
-    } else {
-      const made = slider(value, a, b, c);
-      control = made.row; read = made.read;
-    }
-    teardown.inputs[key] = { read, was: value === undefined ? null : value };
-    return el("tr", {},
-      el("td", { class: "mono" }, key),
-      el("td", {}, control),
-      el("td", { class: "muted" }, why));
+    const made = controlFor(kind, value, a, b, c);
+    teardown.inputs[key] = { read: made.read, was: value === undefined ? null : value };
+    return configRow(key, key, made, why);
   });
   const note = el("span", { class: "muted" }, teardown.message);
   return [
@@ -830,19 +909,11 @@ function searchSection(market) {
       el("option", { value: name, ...(search.profile === name ? { selected: true } : {}) }, name)));
   const modeSelect = el("select", {}, ...MODES.map(([value, label]) =>
     el("option", { value, ...(search.mode === value ? { selected: true } : {}) }, label)));
-  const rows = SEARCH_FIELDS.filter(([section]) => saved[section]).map(([section, key, kind, why]) => {
+  const rows = SEARCH_FIELDS.filter(([section]) => saved[section]).map(([section, key, kind, why, a, b, c]) => {
     const value = saved[section][key];
-    const input = kind === "checkbox"
-      ? el("input", { type: "checkbox", ...(value ? { checked: true } : {}) })
-      : el("input", {
-          type: kind === "number" ? "number" : "text", step: "any", style: "width:9rem",
-          value: value === null || value === undefined ? "" : (kind === "list" ? value.join(", ") : String(value)),
-        });
-    search.inputs[`${section}.${key}`] = { input, kind, section, key, was: value };
-    return el("tr", {},
-      el("td", { class: "mono" }, key),
-      el("td", {}, input),
-      el("td", { class: "muted" }, why));
+    const made = controlFor(kind, value, a, b, c);
+    search.inputs[`${section}.${key}`] = { read: made.read, section, key, was: value };
+    return configRow(key, key, made, why);
   });
 
   const note = el("span", { class: "muted" }, search.message);
@@ -911,17 +982,11 @@ function allocationSection(market) {
       "dynamic — the traffic is the demand, the lease is the ceiling"),
   );
 
-  const rows = ALLOCATION_FIELDS.filter(([section]) => saved[section]).map(([section, key, kind, why]) => {
+  const rows = ALLOCATION_FIELDS.filter(([section]) => saved[section]).map(([section, key, kind, why, a, b, c]) => {
     const value = saved[section][key];
-    const input = kind === "checkbox"
-      ? el("input", { type: "checkbox", ...(value ? { checked: true } : {}) })
-      : el("input", { type: "number", step: "any", style: "width:9rem",
-                      value: value === null || value === undefined ? "" : String(value) });
-    allocation.inputs[`${section}.${key}`] = { input, kind, section, key, was: value };
-    return el("tr", {},
-      el("td", { class: "mono" }, `${section === "dynamic" ? "" : "workers_auto: "}${key}`),
-      el("td", {}, input),
-      el("td", { class: "muted" }, why));
+    const made = controlFor(kind, value, a, b, c);
+    allocation.inputs[`${section}.${key}`] = { read: made.read, section, key, was: value };
+    return configRow(key, `${section === "dynamic" ? "" : "workers_auto: "}${key}`, made, why);
   });
 
   const note = el("span", { class: "muted" }, allocation.message);
@@ -943,11 +1008,7 @@ function allocationSection(market) {
 
 function allocationValues() {
   const body = { allocation: null, dynamic: {}, workers_auto: {} };
-  for (const { input, kind, section, key } of Object.values(allocation.inputs)) {
-    if (kind === "checkbox") { body[section][key] = input.checked; continue; }
-    const raw = input.value.trim();
-    body[section][key] = raw === "" ? null : Number(raw);
-  }
+  for (const { read, section, key } of Object.values(allocation.inputs)) body[section][key] = read();
   return body;
 }
 
@@ -996,12 +1057,7 @@ async function saveAllocation(event, note, mode) {
 
 function searchValues() {
   const body = { offer_policy: {}, bidding: {} };
-  for (const { input, kind, section, key } of Object.values(search.inputs)) {
-    if (kind === "checkbox") { body[section][key] = input.checked; continue; }
-    const raw = input.value.trim();
-    if (kind === "list") { body[section][key] = raw ? raw.split(",").map((s) => s.trim()).filter(Boolean) : []; continue; }
-    body[section][key] = raw === "" ? null : Number(raw);
-  }
+  for (const { read, section, key } of Object.values(search.inputs)) body[section][key] = read();
   return body;
 }
 

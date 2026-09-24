@@ -20,7 +20,7 @@ import statistics
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 
@@ -103,7 +103,12 @@ class Supervisor:
         self.store = ConfigStore(self.config_path) if self.config_path else None
         self._config_mtime = self.config_path.stat().st_mtime if self.config_path else None
         self.db = database
-        self.engine: Engine = get_engine(config.engine)
+        # Every engine this pool runs (D93); `self.engine` stays the pool's own, for the
+        # questions that are not about one host.
+        self.engines: dict[str, Engine] = {
+            name: get_engine(name) for name in config.engines_in_use()
+        }
+        self.engine: Engine = self.engines[config.engine]
         self.table = HostTable(database)
         self.counters = HostCounters(database)
         self.lock = SupervisorLock(
@@ -156,7 +161,7 @@ class Supervisor:
                 self.config.models_held_by(host_config),
                 self.config.catalog,
                 capabilities,
-                self.engine.name,
+                self.config.engine_of(host_config),
             ),
             dial_url=dial_url,
             tunnel=tunnel,
@@ -307,6 +312,7 @@ class Supervisor:
                 busy={host_id: counter.busy for host_id, counter in self.counters.all().items()},
                 pressure=self._pressure(),
                 load=self._load() if self.config.rented.allocation == "dynamic" else None,
+                waiting_by_model=self._waiting_by_model(),
             )
             if self.config.rented and self.config.rented.workers_auto.enabled:
                 await self._adjust_workers()
@@ -374,7 +380,8 @@ class Supervisor:
             else:
                 existing.config = host_config
                 existing.variants = variants_for_host(
-                    new.models_held_by(host_config), new.catalog, existing.capabilities, self.engine.name
+                    new.models_held_by(host_config), new.catalog, existing.capabilities,
+                    new.engine_of(host_config),
                 )
                 if host_config.disabled and existing.state is not HostState.DISABLED:
                     existing.state = HostState.DISABLED
@@ -535,6 +542,19 @@ class Supervisor:
         )
         return strategies.Load(busy_workers=busy, ready_workers=ready, waiting=waiting)
 
+    def _waiting_by_model(self) -> dict[str, int]:
+        """Which models the waiting is for (D95), over the same window and the same test as the
+        pool's own decision to rent at all — so "we need more" and "more of what" cannot
+        disagree about what waiting means."""
+        window = self.config.rented.dynamic.window_s if self.config.rented else 120.0
+        rows = self.db.query(
+            "SELECT model_requested AS model, COUNT(*) AS n FROM request_log "
+            "WHERE ts > ? AND (queue_wait_ms >= 1000 OR reason = 'queue_timeout') "
+            "AND model_requested IS NOT NULL GROUP BY model_requested",
+            (time.time() - min(window, 60.0),),
+        )
+        return {row["model"]: int(row["n"]) for row in rows}
+
     def _pressure(self) -> bool:
         """Is load asking for more than the ready hosts give? (D64)
 
@@ -598,7 +618,7 @@ class Supervisor:
         if host.capabilities != before:
             host.variants = variants_for_host(
                 self.config.models_held_by(host.config), self.config.catalog, host.capabilities,
-                self.engine.name,
+                self.config.engine_of(host.config),
             )
             self.events.record(
                 "capabilities_derived",
@@ -649,7 +669,7 @@ class Supervisor:
 
             await self.fleet.ask_agent(host)
 
-            health = await self.engine.health(client)
+            health = await self.engine_for(host).health(client)
             if not health.ok:
                 host.mark_preparing()
                 continue
@@ -666,7 +686,7 @@ class Supervisor:
             if host.engine_seen_at is None:
                 host.engine_seen_at = time.time()  # it has started; "stuck starting" is over
             try:
-                resident = await self.engine.models_resident(client)
+                resident = await self.engine_for(host).models_resident(client)
             except httpx.HTTPError:
                 host.mark_preparing()
                 continue
@@ -675,7 +695,7 @@ class Supervisor:
             # accelerator's price, and looks healthy by every other measure (D81). The driver
             # floor refuses that machine before it is rented; this is the same fault arriving
             # any other way, on a host already being paid for.
-            on_cpu = await self.engine.serving_from_cpu(client)
+            on_cpu = await self.engine_for(host).serving_from_cpu(client)
             if on_cpu:
                 self.fleet.avoid(host.offer.machine_id, "its engine ran on the processor")
                 self.fleet.events.record(
@@ -735,6 +755,17 @@ class Supervisor:
         finally:
             self._preparing.pop(host_id, None)
 
+    def engine_for(self, host: Any) -> Engine:
+        """The engine on that machine (D93).
+
+        Two kinds of host reach this. A configured one carries its `HostConfig` and names its
+        own engine or inherits the pool's; a rented one has no such config and runs whatever
+        the rented configuration says.
+        """
+        config = getattr(host, "config", None)
+        name = self.config.engine_of(config) if config is not None else self.config.rented_engine()
+        return self.engines.get(name, self.engine)
+
     def _rented_models(self) -> list[str]:
         """What a rented host is asked to hold (D89). With `all`, the pool's whole set; with
         `declared`, what the rented configuration names, or anything the pool still needs."""
@@ -747,7 +778,7 @@ class Supervisor:
         rented = self.config.rented
         capabilities = frozenset(rented.capabilities) if rented else frozenset()
         variants = variants_for_host(
-            self._rented_models(), self.config.catalog, capabilities, self.engine.name
+            self._rented_models(), self.config.catalog, capabilities, self.config.rented_engine()
         )
         return frozenset(v[0].tag for v in variants.values() if v)
 
@@ -757,7 +788,7 @@ class Supervisor:
         rented = self.config.rented
         capabilities = frozenset(rented.capabilities)
         variants = variants_for_host(
-            self._rented_models(), self.config.catalog, capabilities, self.engine.name
+            self._rented_models(), self.config.catalog, capabilities, self.config.rented_engine()
         )
         live = set()
         for host_id, host in self.fleet.hosts.items():
@@ -779,6 +810,7 @@ class Supervisor:
                         for name, group in variants.items()
                     },
                     resident=getattr(host, "resident", frozenset()),
+                    engine=self.config.rented_engine(),
                     lease_id=host.lease_id,
                     provider_ref=self.fleet.published_ref(host),
                     hourly_rate=host.bid_hourly,
@@ -795,7 +827,7 @@ class Supervisor:
             return
 
         previous = host.state
-        health = await self.engine.health(host.client)
+        health = await self.engine_for(host).health(host.client)
         if not health.ok:
             host.state = HostState.UNREACHABLE
             host.last_error = health.detail
@@ -803,8 +835,8 @@ class Supervisor:
             host.available = frozenset()
         else:
             try:
-                resident = await self.engine.models_resident(host.client)
-                available = await self.engine.models_available(host.client)
+                resident = await self.engine_for(host).models_resident(host.client)
+                available = await self.engine_for(host).models_available(host.client)
             except httpx.HTTPError as exc:
                 host.state = HostState.UNREACHABLE
                 host.last_error = str(exc)
@@ -859,6 +891,7 @@ class Supervisor:
                     resident=host.resident,
                     available=host.available,
                     residency=host.config.residency,
+                    engine=self.config.engine_of(host.config),
                     last_error=host.last_error,
                 )
             )

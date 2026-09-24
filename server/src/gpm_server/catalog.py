@@ -32,6 +32,18 @@ def derive_runtime_class(variant: Variant, capabilities: Iterable[str], engine_n
     return f"{platform}-{engine_name}"
 
 
+def for_engine(variant: "Variant", engine_name: str) -> bool:
+    """Is this build one the named engine can serve (D93)?
+
+    A variant that names no engine is taken to work anywhere — which is what every catalog
+    written before pools could run more than one engine means, and what a plain tag means. A
+    variant that names one is offered only to hosts running it: the same model is `gemma4:26b`
+    to one engine and a model-hub repository to another, and handing either to the wrong engine
+    produces a host that looks ready and cannot serve.
+    """
+    return variant.engine is None or variant.engine == engine_name
+
+
 def variants_for_host(
     model_set: Sequence[str],
     catalog: Mapping[str, CatalogEntry],
@@ -54,7 +66,7 @@ def variants_for_host(
                 enforces_schema=variant.enforces_schema,
             )
             for variant in declared
-            if set(variant.requires) <= caps
+            if set(variant.requires) <= caps and for_engine(variant, engine_name)
         )
     return resolved
 

@@ -77,6 +77,27 @@ Three rules the hub fetch keeps:
 - **A hub credential is the machine's.** Read from the environment its owner started it in;
   never accepted from the pool, written to disk, or returned in any answer.
 
+## 2.2 The router in front of several engines (D96)
+
+The agent's archive also carries a **router**: one endpoint on the machine in front of several
+engine processes, so an engine that serves a single model per process can still hold a whole set
+on one machine while the pool dials one URL.
+
+**It is not the agent.** It runs as a separate process on its own port, started by the machine's
+own start-up, and carries inference traffic and nothing else. The agent's protocol stays a closed
+list of verbs and the agent stays off the request path; they share an archive because that
+archive is already on every host the pool creates.
+
+| | |
+|---|---|
+| Routes by | The `model` field of the request, against a file the machine's start-up wrote mapping model to upstream — re-read as it changes |
+| Translates | **Nothing.** The request leaves as it arrived, byte for byte, with only the upstream chosen |
+| `/health` | 200 only when **every** engine behind it answers — a machine serving two models of three is not one the pool can call ready |
+| `/v1/models` | The union, so the pool sees one host holding a set |
+| `/metrics` | Every engine's, labelled and concatenated — not summed, because a sum of cache fractions means nothing |
+
+The pool names a model. It never names a port, a path or a command.
+
 ## 3. What it reports — facts
 
 Read-only, cheap, no privileges: operating system and architecture; accelerators (kind, name,

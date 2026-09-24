@@ -287,16 +287,23 @@ def create_app(
 
     @app.post("/{full_path:path}")
     async def inference(request: Request, full_path: str) -> Response:
-        engine = state.engine
         path = "/" + full_path
+        # The **path** chooses how the request is read, not the host: it has to be understood
+        # before the pool knows where it will go (D93). Engines that serve the same path read it
+        # identically, by construction — they share one module for it.
+        engine = state.parser_for(path) or state.engine
         request_id = uuid.uuid4().hex
         session_id = request.headers.get("x-gpm-session")
         started = time.monotonic()
 
         if not _authorised(state, request):
             return _error(401, "unauthorized", detail="missing or invalid app key")
-        if path not in engine.inference_paths():
-            return _error(404, "not_found", "unknown_path", f"{path} is not an inference path of engine {engine.name!r}")
+        if path not in state.paths():
+            served = ", ".join(sorted(state.engines))
+            return _error(
+                404, "not_found", "unknown_path",
+                f"{path} is not an inference path of any engine this pool runs ({served})",
+            )
 
         body = await request.body()
         requested = engine.requested_model(path, body)
@@ -330,6 +337,11 @@ def create_app(
             model=requested,
             wants_schema=engine.wants_schema(path, body),
             runtime_class_pin=request.headers.get("x-gpm-runtime-class"),
+            # Only hosts whose engine serves this path (D93): a request on one engine's own API
+            # would be a 404 on a host running the other, after the pool had called it eligible.
+            engines=frozenset(
+                name for name, candidate in state.engines.items() if path in candidate.inference_paths()
+            ),
         )
 
         request_deadline = _parse_deadline(request.headers.get("x-gpm-deadline"))
@@ -379,7 +391,8 @@ def create_app(
                 return _no_capacity("queue_timeout", "every eligible worker stayed busy past the queue limit")
 
             assignment.host.last_request_at = time.time()
-            forwarded = engine.with_model(path, body, assignment.variant.tag)
+            host_engine = state.engine_of(assignment.host)
+            forwarded = host_engine.with_model(path, body, assignment.variant.tag)
             upstream_request = assignment.host.client.build_request(
                 "POST", path, content=forwarded, headers=_upstream_headers(request)
             )

@@ -205,6 +205,9 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 "resident": sorted(host.resident),
                 "available": sorted(host.available),
                 "residency": host.config.residency,
+                # What this machine runs, and which of the pool's models it holds (D89, D93).
+                "engine": supervisor.config.engine_of(host.config),
+                "holds": supervisor.config.models_held_by(host.config),
                 "served": served_on(host.variants, host.resident, host.available),
                 "last_error": host.last_error,
             }
@@ -235,10 +238,10 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         rented = []
         if fleet is not None:
             rented_variants = variants_for_host(
-                supervisor.config.pool.model_set,
+                fleet.rented_models,
                 supervisor.config.catalog,
                 frozenset(fleet.rented.capabilities),
-                supervisor.engine.name,
+                supervisor.config.rented_engine(),
             )
             for host in fleet.hosts.values():
                 counter = counters.get(host.host_id)
@@ -255,6 +258,12 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                             getattr(host, "resident", frozenset()),
                             getattr(host, "resident", frozenset()),
                         ),
+                        # What this machine runs, and what it was bought to serve (D93, D94).
+                        # Neither was visible anywhere, so a pool buying the wrong thing looked
+                        # exactly like one buying the right thing.
+                        "engine": supervisor.config.rented_engine(),
+                        "bought_for": list(host.models),
+                        "image": host.instance.spec.image if getattr(host, "instance", None) and getattr(host.instance, "spec", None) else None,
                         "machine": host.offer.machine_id,
                         "hardware": host.offer.hardware,
                         "bid_hourly": host.bid_hourly,
@@ -330,6 +339,29 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     if fleet is not None
                     else None
                 ),
+                # What would actually be started on a machine this pool rents (D92). Together
+                # these decide whether a rental can work at all, and until now neither was
+                # visible anywhere: an engine and an image for a different engine looked
+                # exactly like a correct pool until a host was bought and never answered.
+                "engine": {
+                    "name": supervisor.config.engine,
+                    # A pool may run more than one (D93); the rented machines are commonly the
+                    # ones that differ, and that is where the money goes.
+                    "rented": supervisor.config.rented_engine(),
+                    "in_use": supervisor.config.engines_in_use(),
+                    "proxy": bool(supervisor.config.rented and supervisor.config.rented.engine_proxy),
+                    "models_per_host": supervisor.config.pool.models_per_host,
+                    "port": supervisor.config.engine_port(),
+                    "images": (
+                        [
+                            {"image": i.image, "min_driver": i.min_driver, "note": i.note}
+                            for i in supervisor.config.rented.images
+                        ]
+                        or [{"image": supervisor.config.rented.image, "min_driver": None, "note": None}]
+                    )
+                    if supervisor.config.rented is not None
+                    else [],
+                },
             }
 
     @app.get("/pool/status")

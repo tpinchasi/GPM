@@ -17,3 +17,9 @@ build/
 
 # The host agent, packed for pushing to rented hosts — built, never committed.
 gpm-agent.pyz
+
+# Environment files that hold credentials — the provider key and the admin key live in the
+# owner's shell, never in the repository. `env` at the root was found holding both.
+env
+.env
+.env.*

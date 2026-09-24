@@ -49,6 +49,7 @@ from ..strategies import (
     decide_rent,
     decide_teardown,
     filter_name,
+    image_for,
     price_bid,
     rank_offers,
 )
@@ -76,6 +77,11 @@ class RentedHost:
     estimated_spend: float = 0.0
     reported_spend: float = 0.0
     connection: Optional[ConnectionInfo] = None
+    #: The models this host was bought to serve (D94). With the set spread across hosts and an
+    #: engine that holds one model per process, that is a single model, chosen when the machine
+    #: was bought from whatever the pool was shortest of. Empty means the whole rented set, which
+    #: is what every host meant before the pool could buy one per model.
+    models: tuple[str, ...] = ()
     ready_at: Optional[float] = None
     parked_at: Optional[float] = None
     #: The agent the pool installed here, if any, and what it reported. A host without one is
@@ -185,7 +191,10 @@ class Fleet:
         self.state_dir = Path(config.request_log).expanduser().resolve().parent
         #: Tests dial the agent through their own transport; nothing else sets this.
         self._agent_transport = None
-        self.engine = get_engine(config.engine)
+        # The engine on the machines this fleet buys — not necessarily the pool's default
+        # (D93). Everything here is about rented hosts, so launch settings and "how many models
+        # can one of these hold" must both come from the engine those machines actually run.
+        self.engine = get_engine(config.rented_engine())
         #: A second forward per host, to the agent on its loopback (D63).
         self.agent_tunnels: dict[str, SshTunnel] = {}
         #: Forwards to rented hosts the provider cannot expose directly, keyed by host id.
@@ -283,7 +292,11 @@ class Fleet:
         busy: Optional[Mapping[str, int]] = None,
         pressure: bool = False,
         load: Optional[Load] = None,
+        waiting_by_model: Optional[Mapping[str, int]] = None,
     ) -> None:
+        # What each model's traffic is waiting on, for deciding which model to buy for (D95).
+        # Held for this pass only: it is a measurement, not state.
+        self._waiting_by_model = dict(waiting_by_model or {})
         open_leases = self.leases.open_leases()
         await self.finish_draining(busy or {})
         await self.beat_deadman_timers()
@@ -418,7 +431,7 @@ class Fleet:
         return onstart_script(
             self.provider.self_terminate_request(self.rented.teardown.deadman_action),
             window_s=int(self.rented.teardown.deadman_minutes * 60),
-            engine_port=self.rented.engine_port,
+            engine_port=self.engine_port,
             public_key=self.pool_public_key(),
             ssh_user=self.rented.ssh_user,
             extra=self.rented.engine_start,
@@ -520,12 +533,119 @@ class Fleet:
         return max(starts_at, auto.max)
 
     @property
+    def engine_port(self) -> int:
+        """Where this pool's engine listens on a host it creates — stated, or the engine's own
+        default (D92). Keeping the previous engine's port after changing engine would have the
+        pool dial a closed door on every machine it rented."""
+        return self.config.engine_port()
+
+    @property
     def rented_models(self) -> list[str]:
-        """What a rented host is asked to hold (D89): the pool's whole set, or — where the pool
-        spreads its set across hosts — what the rented configuration names."""
+        """The models the pool may rent **for** (D89, D94).
+
+        With `all` that is the whole set and every host holds it. With `declared` it is what
+        `rented.models` names, or the whole set where it names nothing — and each host the pool
+        buys is given one of them, not all of them.
+        """
         if self.config.pool.models_per_host == "all" or self.rented.models is None:
             return list(self.config.pool.model_set)
         return list(self.rented.models)
+
+    @property
+    def one_model_per_host(self) -> bool:
+        """Does a rented host hold a single model (D94)? True where the set is spread across
+        hosts and this engine serves one model per process."""
+        return (
+            self.config.pool.models_per_host != "all"
+            and bool(getattr(self.engine, "serves_one_model", False))
+        )
+
+    def models_for_new_host(self) -> tuple[str, ...]:
+        """Which models the next machine is bought to serve (D94, D95).
+
+        Where a host holds one, two questions are asked in order, and the order is the point:
+
+        1. **Is any model served by nothing?** Then buy for that one. A model with no host
+           cannot be served at all, and no amount of throughput elsewhere makes up for it —
+           availability comes before capacity.
+        2. **Otherwise, which model's traffic is waiting most?** Measured the same way the pool
+           measures whether to rent at all: requests that queued or were refused for queueing.
+           Buying for coverage alone would keep adding hosts to a model nobody is asking for.
+
+        Ties go to the order the operator listed them, so the answer is stable and explainable.
+        """
+        candidates = self.rented_models
+        if not self.one_model_per_host or not candidates:
+            return tuple(candidates)
+
+        serving: dict[str, int] = {name: 0 for name in candidates}
+        for host in self.hosts.values():
+            if host.released:
+                continue
+            for name in host.models:
+                if name in serving:
+                    serving[name] += 1
+
+        uncovered = [name for name in candidates if serving[name] == 0]
+        if uncovered:
+            return (uncovered[0],)
+
+        waiting = getattr(self, "_waiting_by_model", {})
+        if any(waiting.get(name) for name in candidates):
+            busiest = max(candidates, key=lambda name: (waiting.get(name, 0), -candidates.index(name)))
+            return (busiest,)
+
+        fewest = min(candidates, key=lambda name: (serving[name], candidates.index(name)))
+        return (fewest,)
+
+    def last_host_serving(self, host: RentedHost) -> bool:
+        """Would taking this host leave one of its models with no host at all (D95)?
+
+        Only where a host holds a single model: with the whole set on every host, any remaining
+        host still serves everything, and the question does not arise. A host that is being
+        released, or is not serving, does not count as cover.
+        """
+        if not self.one_model_per_host or not host.models:
+            return False
+        for name in host.models:
+            others = [
+                other for other in self.hosts.values()
+                if other.host_id != host.host_id
+                and not other.released
+                and other.state in ("ready", "preparing")
+                and name in other.models
+            ]
+            if not others:
+                return True
+        return False
+
+    def models_of(self, host: RentedHost) -> list[str]:
+        """What this host was bought to serve, falling back to the rented set for one bought
+        before the pool assigned models."""
+        return list(host.models) if host.models else self.rented_models
+
+    def image_for(self, offer) -> tuple[Optional[str], str]:
+        """Which build of the engine this machine gets, and why (D92).
+
+        With a single `image` the answer never varies, and the driver floor in the offer policy
+        is what keeps an unusable machine out. With several, the pool takes the first whose
+        driver floor this machine meets — so a newer, faster build is used where it can be, and
+        an older machine still gets a build that runs rather than being refused outright.
+        """
+        images = self.rented.images
+        if not images:
+            return self.rented.image, "the pool's only image"
+        chosen = image_for(offer, images)
+        if chosen is None:
+            wanted = ", ".join(f"{i.image} needs {i.min_driver}" for i in images)
+            return None, (
+                f"driver: this machine reports {offer.driver_version or 'nothing'}, and no build "
+                f"of the engine runs on it ({wanted})"
+            )
+        return chosen.image, (
+            f"driver {offer.driver_version} meets {chosen.min_driver}"
+            + (f" — {chosen.note}" if chosen.note else "")
+        )
 
     def instance_env(self, workers: Optional[int] = None) -> dict[str, str]:
         """What makes the engine run this many workers at this context, holding the models this
@@ -536,7 +656,7 @@ class Fleet:
             n_models=len(self.rented_models),
             # The pool reaches this engine through a forward into the machine, never across
             # the network, so it binds loopback and nothing a provider publishes leads to it.
-            listen=f"127.0.0.1:{self.rented.engine_port}",
+            listen=f"127.0.0.1:{self.engine_port}",
         )
 
     def max_lease_hours(self) -> Optional[float]:
@@ -582,7 +702,7 @@ class Fleet:
             ssh_port=connection.ssh_port or 22,
             ssh_user=connection.ssh_user or self.rented.ssh_user,
             ssh_key=self.rented.ssh_key,
-            remote_port=self.rented.engine_port,
+            remote_port=self.engine_port,
             known_hosts=self.rented.known_hosts,
         )
         tunnel = SshTunnel(host_id, transport)
@@ -672,7 +792,8 @@ class Fleet:
                 run=lambda command: self.run_on_host(host, command),
                 push=lambda data, path: self.push_to_host(host, data, path),
                 archive=archive,
-                engine_port=self.rented.engine_port,
+                engine_port=self.engine_port,
+                engine=self.config.rented_engine(),
             )
         except hostagent.AgentInstallFailed as exc:
             host.agent_attempts += 1
@@ -810,7 +931,7 @@ class Fleet:
                 f"{host.launch_workers} its engine was launched for means relaunching it — "
                 "which only an agent on that host can do"
             )
-        settings = agents.wanted_engine_settings(workers, len(self.required_tags))
+        settings = agents.wanted_engine_settings(workers, len(self.tags_for(host)))
         status, answer = await agents.restart_engine(
             host.agent, settings, transport=self._agent_transport
         )
@@ -1264,7 +1385,7 @@ class Fleet:
         """
         if host.agent is None or not host.agent.manage_models:
             return None
-        tags = sorted(self.required_tags)
+        tags = sorted(self.tags_for(host))
         # An agent that was started a second ago may not be listening yet. Seen live: the pool
         # asked the moment the install returned, the one call failed, and the host was prepared
         # the slow way for its whole life — a minute of idle accelerator that D57 exists to
@@ -1322,7 +1443,7 @@ class Fleet:
         accelerator on a billing host, and it holds whether or not this host runs an agent: the
         agent does the same thing on hosts that have one.
         """
-        tags = sorted(self.required_tags)
+        tags = sorted(self.tags_for(host))
         moved = 0
         for tag in tags:
             result = await self._pull_with_retries(host, engine, client, tag)
@@ -1374,13 +1495,20 @@ class Fleet:
 
     @property
     def required_tags(self) -> frozenset[str]:
+        """Every build the pool may be asked to put on a rented host. Where each host holds one
+        model this is the union across them, not what any single machine carries."""
+        return self.tags_for(None)
+
+    def tags_for(self, host: Optional[RentedHost]) -> frozenset[str]:
+        """The builds one host must hold (D94) — what it was bought for, or the whole rented set
+        for a host bought before the pool assigned models."""
         from ..catalog import variants_for_host
 
         variants = variants_for_host(
-            self.rented_models,
+            self.models_of(host) if host is not None else self.rented_models,
             self.config.catalog,
             frozenset(self.rented.capabilities),
-            self.config.engine,
+            self.config.rented_engine(),
         )
         return frozenset(group[0].tag for group in variants.values() if group)
 
@@ -1517,6 +1645,7 @@ class Fleet:
                 ready_at=ref.get("ready_at"),
                 prepared=bool(ref.get("prepared")),
                 hold_until=ref.get("hold_until"),
+                models=tuple(ref.get("models") or ()),
                 when_ready=ref.get("when_ready") or "join",
                 download_cost=float(ref.get("download_cost") or 0.0),
                 parked_at=ref.get("parked_at"),
@@ -2051,12 +2180,25 @@ class Fleet:
                 )
                 continue
 
+            image, image_why = self.image_for(offer)
+            if image is None:
+                # Refused *before* the bid: renting a machine whose driver cannot run any build
+                # of the engine buys a host that can never answer, and pays for it until the
+                # give-up window closes (D92).
+                self.events.record(
+                    "offer_refused", f"{offer.machine_id}: {image_why}", lease_id=lease.lease_id
+                )
+                continue
+
             host_id = f"rented-{uuid.uuid4().hex[:6]}"
+            # Which models this machine is bought for, decided before the bid so the event that
+            # records the purchase can say what it was bought to serve (D94).
+            for_this_host = self.models_for_new_host()
             workers, workers_why = self.workers_for(offer)
             launch_workers = self.launch_workers_for(workers)
             spec = InstanceSpec(
                 label=f"{self.label_prefix}{host_id}",
-                image=self.rented.image,
+                image=image,
                 disk_gb=self.rented.disk_gb,
                 # Launched at what it may be asked for, used at what it is given (D68).
                 env=self.instance_env(launch_workers),
@@ -2099,6 +2241,7 @@ class Fleet:
                 workers=workers,
                 launch_workers=launch_workers,
                 interruptible=offer.interruptible,
+                models=for_this_host,
             )
             connection = await self.provider.connection(instance)
             host.connection = connection
@@ -2231,6 +2374,17 @@ class Fleet:
         ):
             host = self.hosts.get(action.host_id)
             if host is None or host.released:
+                continue
+            if self.last_host_serving(host):
+                # Taking it would leave a model with nowhere to go, and every request for it
+                # would be refused until another machine was bought and prepared — minutes at
+                # best (D95). A host doing nothing is cheaper than a model that cannot be
+                # served at all; the lease's caps still bound what this costs.
+                self.events.record(
+                    "teardown_declined",
+                    f"{host.host_id}: kept — the only host serving {', '.join(host.models)}",
+                    host_id=host.host_id,
+                )
                 continue
             idle = action.reasons[0].startswith("idle")
             if action.host_id in held and not idle:

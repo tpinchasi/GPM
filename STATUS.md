@@ -4,7 +4,7 @@
 > session** (current state, open decisions, session log) so the next session can resume without
 > re-reading everything.
 
-## Current state — 2026-09-22
+## Current state — 2026-09-24
 
 **Phases 1–4 are effectively complete.** The router and SDK, the supervisor with leases and
 renting (proven on a real marketplace for $0.008), the operator console, and the release work:
@@ -158,34 +158,34 @@ Read [docs/overview.md](docs/overview.md) first, then [docs/decisions.md](docs/d
 
 ## Next actions, in order
 
-0. **Deploy `v0.6.2` as a release, not a working tree.** Everything from the 2026-09-21 live
-   run is committed and green, and **none of it is running** until the supervisor is restarted
-   — which is the very fault D79 exists to end. The deploy is two commands:
-   `deploy/gpm-deploy v0.6.2 --activate`, then start the supervisor from
-   `~/.local/share/gpm/releases/current/venv/bin/gpm`. After that `gpm --version` names a tag
-   and edits to the working tree cannot reach the running pool. PR #15 is green and unmerged;
-   the later commits are on the same branch.
+0. **Review and merge PR #21, then deploy it.** D92–D96 and the console work: card-aware
+   images, a different engine per host, a host bought for a model, demand-driven buying with
+   the last host of a model protected, and the on-machine router. v0.7.0 is what runs today
+   (deployed 2026-09-22). After merge: tag, `deploy/gpm-deploy <tag> --activate`, restart the
+   supervisor **from the owner's shell** (the provider key lives only there). Nothing in it
+   changes a pool that runs Ollama and names none of the new keys.
 
-1. **Built, unproven: the vLLM adapter (D89-D91). The benchmark is now the next thing.**
-   The adapter, the shared `/v1` surface, the agent's hub fetch and `models_per_host: declared` are
-   written and green — but **every throughput figure behind them is still an estimate**. The
-   measurement plan is a same-machine A/B/B′: ollama at 7 workers, vLLM at 7, vLLM at its
-   reported maximum, one host, back to back, prefix caching off, aggregate tokens/second only.
-   Roughly $6 on one `1x RTX PRO 6000 WS`. **Pre-registered decision rule: ≥6x the same
-   machine's ollama figure means build on it; 2-6x means correct the claim in
-   [docs/economics.md](docs/economics.md); below 2x means the estimate was wrong and this
-   should not be pursued.** The owner has approved building first and measuring after; the
-   spend is still unasked.
+1. **The benchmark decides whether any of this was worth building.** Every throughput figure
+   behind the vLLM work is still an estimate. The plan is a same-machine A/B/B′: ollama at 7
+   workers, vLLM at 7, vLLM at its reported maximum, one host, back to back, prefix caching off,
+   aggregate tokens/second only. Roughly $6 on one `1x RTX PRO 6000 WS`. **Pre-registered
+   decision rule: ≥6x the same machine's ollama figure means build on it; 2–6x means correct the
+   claim in [docs/economics.md](docs/economics.md); below 2x means the estimate was wrong and
+   this should not be pursued.** The owner approved building first and measuring after; **the
+   spend is still unasked.** Easiest shape: a second pool with its own config, ports and
+   database beside the live one — the supervisor lock is per pool name, so they cannot collide.
 
    Still open in the same area:
-   - **`vllm` + `models_per_host: all` is refused at load**, because holding several models on
-     one machine needs a model-routing process in front of several engines, which the pool does
-     not ship. The owner wants this combination eventually; it is the one piece of the design
-     deliberately left out, and `declared`'s data model already contains it.
-   - **Renting does not yet choose *which* model** a new rented host is for. `rented.models`
-     names it; coverage-driven assignment from per-model demand is not built.
-   - **Occupancy is reported but not yet acted on**: `Engine.occupancy()` returns the engine's
-     running/waiting/cache figures, and nothing yet ranks, scales or tears down by them.
+   - **The on-machine router (D96) has only met fake upstreams.** Its first real test should be
+     part of the benchmark host, not a separate rental.
+   - **Occupancy is reported but not acted on**: `Engine.occupancy()` returns running, waiting
+     and cache figures, and nothing yet ranks, scales or tears down by them.
+   - **The laptop's agent runs from the working tree**, with its settings in a dead session's
+     `/tmp` scratchpad (`…/7d80e9bd-…/scratchpad/agent.json`). It works; if `/tmp` is cleaned it
+     cannot restart. Its settings belong in `~/.config/gpm/` and it should run from a release.
+   - **`env` at the repository root holds the provider key and the admin key.** Found
+     2026-09-24, never committed (checked on every branch), now gitignored. It is still a
+     credential in a file in the working tree — the owner may want it moved or deleted.
 
 2. **Open, and the owner's to decide: a lease counts hosts, not workers.** Raised by the owner
    after D80 — with `workers_auto` on, a host's worker count moves, so a worker-denominated
@@ -349,6 +349,11 @@ In `~/workspace/Aletheia`: backlog entries `GPU-POOL-01` and `GPU-CLOUD-01` in
 
 | Date | What happened |
 |---|---|
+| 2026-09-24 | **The console shows which engine runs where and what each host was bought for; PR #21 opened for D92–D96.** Configured hosts gained an Engine column with the models each holds, rented hosts a Serving column (what the machine was bought for, and its engine), and the Engine panel now names the rented engine separately, lists every engine in use, and says whether a router fronts several processes — the same class of gap D92 closed, where a pool doing the wrong thing looked normal. **A credential nearly reached GitHub:** `env` at the repository root, created 2026-09-23, held `VAST_API_KEY` and `GPM_ADMIN_KEY`, untracked and not ignored, and every commit this session had used `git add -A`. It was never committed — the last commit predated it by eleven hours, confirmed across every branch, local and remote — but the next would have pushed it. Now gitignored with `.env` and `.env.*`, and files are staged by name. A browser test that failed once under load passed three times alone and again in the full run: a timeout, not the change. **786 tests pass, lint clean.** |
+| 2026-09-23 | **Both placement shapes built, on the owner's "do both" (D95, D96).** Finishing the model-pools side: a host is now bought for the model whose traffic is **waiting** rather than merely uncovered — coverage still first, because a model with no host has no traffic to show and would never be bought for otherwise — and tear-down **refuses to take the last host serving a model**, since every request for it would be refused until another was bought and prepared. Then the other shape: the agent's archive now carries a **router** (`gpm-agent proxy`) that puts several engine processes behind one port, routing by the request's `model` field and translating nothing; the host is healthy only when every engine behind it is, `/v1/models` is the union and `/metrics` every engine's, labelled and concatenated rather than summed. It runs as a **separate process** started by the machine's own start-up — the agent's protocol stays a closed verb list and the agent stays off the request path. `rented.engine_proxy` turns it on and lifts the `models_per_host: all` refusal for an engine that serves one model per process, at the cost the refusal named: the accelerator's memory is split between the processes. One more silent bug found: an insertion had landed in `plan()` as well as `pass_once`, breaking the control API — caught by the suite, not by review. **785 tests pass, lint clean.** Nothing deployed since v0.7.0; the console still does not show per-host engines or which model a host was bought for. |
+| 2026-09-22 | **Model pools built (D94), after the owner's question exposed that the second mode was half done.** He asked where to state "a model per host" against "a model per process on a host", and the answer was that `pool.models_per_host` already chose between them but only one worked. Demonstrated before fixing: a valid configuration with two models in `rented.models` under vLLM was **accepted**, and every rented host was asked to hold both — machines paid for that can never reach `ready`. Now `rented.models` is the set the pool may rent **for**; each machine it buys is given the model with the fewest hosts serving it (ties by the operator's order), carries what it was bought for, and is prepared only for that. A host bought before this keeps the whole rented set, so a supervisor upgraded under a running pool does not under-prepare a machine it already owns. Any host *asked* for more than its engine can hold is refused at load. Two further bugs found on the way: the guard against this had silently not been applied by an earlier edit (so a vLLM rented pool passed validation), and `Fleet.engine` was the pool's default rather than the rented one — a vLLM host would have been launched with Ollama's settings. **761 tests pass, lint clean.** Still open for this mode: renting chooses by **coverage, not demand** — the pool does not yet measure demand per model — and tear-down does not yet protect the last host of a model. Mode 1 (several vLLM processes on one host, behind a model-routing proxy) is not started. |
+| 2026-09-22 | **Per-host engines built (D93), superseding "a pool has one engine type".** The owner's case: the laptop runs Ollama because Apple silicon has no practical vLLM backend, while the machines worth renting run vLLM — and before this the choice was one or the other for the whole pool. `engine:` now sits on a host and `rented.engine` on the machines the pool buys; a catalog variant may name the engine it is for and is offered only to hosts running it, because the same model is a plain tag to one engine and a model-hub repository to another. The routing rule that makes it safe: **the path chooses how a request is read** (engines serving the same path read it identically, sharing one module), and a request only reaches a host whose engine serves that path — without which an `/api/chat` call would have been handed to a vLLM host that answers 404 to it, a failure the pool caused itself. Each host's engine is published in the host table (with a migration defaulting older rows to `ollama`) and told to its agent at installation. This was only possible because D89 had already put both engines on one wire API: the request-path rules stopped being per-engine, so only the supervisor side varies per host. **749 tests pass, lint clean.** Not yet done: the console does not show per-host engines, and nothing has been deployed since v0.7.0. |
+| 2026-09-22 | **v0.7.0 deployed, then the renting path made engine-aware (D92).** The owner asked where the vLLM configuration was and whether renting would take the right Docker image: it would not. `image`, `engine_start` and `engine_port` were all hard-coded for Ollama, so a vLLM pool would have rented a machine, started the wrong server, never reached `ready`, and paid until the give-up window closed — with nothing anywhere saying why. The owner's answer to the fix was better than the one offered: choose the image **from what the card supports**, rather than pinning one and filtering machines out. vLLM publishes every release twice (`cuda-13.0` needs driver 580+, `cuda-12.9` needs 550+), so `rented.images` now lists builds newest first and a machine gets the first its driver can run; one that can run none is refused **before** the bid, and an unreported driver is given no benefit of the doubt (the D81 reasoning). `engine_port` now defaults to the engine's own port, and a configuration naming one engine with an image built for another is refused at load. The console gained an Engine panel — engine, port, placement and the build list — because neither the engine nor the image had been visible anywhere. Also, on the owner's request, the Rented capacity screen's sections now share **one control factory**, so search and allocation gained the sliders tear-down already had and the three cannot drift apart again. `vastai/vllm` is the right image, not `vastai/vllm-omni`, which is for omni-modality and diffusion models. **736 tests pass, lint clean.** |
 | 2026-09-22 | **vLLM built as the second engine (D89-D91), on the owner's instruction to build first and benchmark after.** Investigating what an adapter would need turned up a collision the owner settled: a vLLM process serves **one model**, a host row has one dial URL, so a vLLM host serves one model — which D23 forbids. The owner asked for both shapes, selectable. Built as one mechanism rather than two pool types: `pool.models_per_host` is `all` (D23 unchanged, default) or `declared`, where each host declares what it holds (several allowed) and the pool **refuses at load** any set a host would leave uncovered. D23's purpose survives intact — nothing swaps under either. The proxy that would let vLLM hold a whole set is deliberately **not** built, and that combination is refused with a message saying why. Also built: `engines/openai_api.py`, the `/v1` surface both engines now serve, with Ollama's native paths untouched — which caught a trap worth naming, **`stream` defaults to false on `/v1` and true on Ollama's own API**, so an adapter serving both must not apply one default to the other. `Engine.occupancy()` (D91) reads vLLM's own running/waiting/cache figures, because worker slots are exact for an engine serving one request per slot and misleading for one that batches. The agent fetches weights itself over plain HTTP, resumable by range request — no CLI, no new dependency, and the pool names a *repository*, never a path. The SDK speaks `/v1` by default and still understands both reply shapes. The fake Ollama grew a `/v1` surface, without which a pool could have shipped that could not answer the SDK's own default call. **714 tests pass, lint clean.** Two things the owner should know: an earlier claim of mine that NVFP4 "dissolves" the D23 problem was **wrong** — it solves memory, not addressing — and the 5-15x throughput estimate remains unmeasured. |
 | 2026-09-17 | Design drafted in the Aletheia repo: host kinds, router, supervisor, leases. Extended by owner requirements: pool/app decoupling and tunnel/http/https transports; client SDK with default wait-and-retry; routing priority; logical model names (Apple-optimised vs standard builds); rent / bid / hold / tear-down strategies; operator console; workers per host. |
 | 2026-09-17 | Architecture review written (18 findings). Decided one by one with the owner: F1 record-and-measure; F2 two processes; F3 time budget; F4 pool API key as the isolation unit; F5 deferred; F6 v1 cut line with three owner musts; F7 phase re-order; F9 catalog-only resolution; F11 whole model set resident + FCFS; F13 spend reconciliation + provider API. Owner added: public-framework intent; current scripts are not design inputs; prepare-a-host from the console. Verified: the first provider's per-instance restricted key makes the dead-man timer possible without the account key. |

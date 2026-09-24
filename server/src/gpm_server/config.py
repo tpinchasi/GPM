@@ -30,6 +30,11 @@ class Variant(BaseModel):
 
     tag: str
     requires: list[str] = Field(default_factory=list)
+    #: The engine this build is for, when a pool runs more than one (D93). Weights are named
+    #: differently by different engines — the same model is `gemma4:26b` to one and a model-hub
+    #: repository to another — so a variant that does not say is usable by any engine, and one
+    #: that does is offered only to hosts running it.
+    engine: Optional[str] = None
     runtime_class: str = "by-platform"
     #: Three-valued on purpose: True when this build is known to enforce a structured-output
     #: schema, False when it is known to accept one and ignore it, and unset when nobody has
@@ -192,6 +197,10 @@ class HostConfig(BaseModel):
     #: routable once the set is *on disk*; the engine loads a model on first use and may evict
     #: it when memory is wanted elsewhere — for a laptop that is also used for other work.
     #: Either way nothing is ever downloaded because a request asked for it (spec §3).
+    #: The engine on this machine, when it is not the pool's (D93). A laptop may run one engine
+    #: and rented hosts another: what the machine runs is a fact about the machine, and a pool
+    #: that can only hold one engine cannot use both at once.
+    engine: Optional[str] = None
     residency: Literal["pinned", "on_demand"] = "pinned"
     #: Which of the pool's models this host holds, when the pool spreads its set across hosts
     #: (`pool.models_per_host: declared`, D89). Absent there means the first model in the set this
@@ -612,9 +621,37 @@ class LimitsConfig(BaseModel):
     max_hourly_burn: Optional[float] = Field(default=None, gt=0)
 
 
+class EngineImage(BaseModel):
+    """One build of the engine, and the accelerator driver it needs (D92)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Pinned, never a floating tag (threat model T10).
+    image: str
+    #: The driver this build needs, as "major" or "major.minor". Compared part by part, so
+    #: "580" admits "580.65" and refuses "550.144".
+    min_driver: str
+    #: Optional: what this build is for, shown beside the choice the pool made.
+    note: Optional[str] = None
+
+
 class RentedConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    #: Whether the machines this pool rents put a router in front of several engine processes
+    #: (D96). With it, an engine serving one model per process can still hold a whole set on one
+    #: machine: each model gets its own process and the router chooses between them by name, so
+    #: the pool still dials one URL. Off by default, because it is the machine's start-up that
+    #: has to run it — the pool never sends a command.
+    #:
+    #: It costs what it sounds like it costs: the accelerator's memory is split between the
+    #: processes at launch, so the largest model gets a fraction of the cache it would have had
+    #: to itself, and cache is where a batching engine's throughput comes from.
+    engine_proxy: bool = False
+    #: The engine on hosts the pool rents, when it is not the pool's (D93). This is the one that
+    #: matters in practice: the machines worth renting run a different engine from the machine
+    #: on the operator's desk.
+    engine: Optional[str] = None
     #: Which of the pool's models a rented host holds, when the pool spreads its set across
     #: hosts (`pool.models_per_host: declared`, D89). This is where the money decision lives: a
     #: 0.3 GB embedding model does not need the card that was rented for a 26 B one, so a pool
@@ -648,6 +685,16 @@ class RentedConfig(BaseModel):
     mode: Literal["interruptible", "on_demand", "cheaper"] = "interruptible"
     #: Pinned, never a floating tag (threat model T10).
     image: str = "ollama/ollama:0.34.2"
+    #: Builds of the same engine for different accelerator generations, **chosen per machine**
+    #: (D92). An engine is commonly published once per CUDA line — a newer one is smaller and
+    #: faster but needs a newer driver — and a pool with a single image must either refuse every
+    #: older machine or fail on it after paying for it. Given these, the pool takes the **first
+    #: whose driver floor the machine meets**, so list them newest first; a machine that meets
+    #: none is refused before it is bid on, with the reason.
+    #:
+    #: This replaces `image` when present. `offer_policy.min_driver_version` still applies and
+    #: is the floor below which no machine is wanted at all, whatever image would run on it.
+    images: list["EngineImage"] = Field(default_factory=list)
     disk_gb: float = 60.0
     workers: int = Field(default=1, ge=1)
     capabilities: list[str] = Field(default_factory=list)
@@ -656,8 +703,9 @@ class RentedConfig(BaseModel):
     ssh_key: Optional[str] = None
     ssh_user: str = "root"
     known_hosts: str = "~/.config/gpm/known_hosts"
-    #: Where the engine listens inside the instance. Not guessed: state it.
-    engine_port: int = 11434
+    #: Where the engine listens inside the instance. Unset means the engine's own default —
+    #: 11434 for Ollama, 8000 for vLLM — so a pool need not state a port it cannot choose.
+    engine_port: Optional[int] = None
     #: Context length the engine is launched with on hosts the pool creates.
     context_length: int = 8192
     #: Runs after the dead-man timer is armed, for images whose entrypoint the provider's
@@ -723,6 +771,7 @@ class PoolConfig(BaseModel):
         if unknown:
             raise ValueError(f"catalog names not in the pool's model set: {sorted(unknown)}")
         self._engine_can_hold_what_the_pool_asks()
+        self._images_are_built_for_this_engine()
         self._hosts_can_serve_what_they_are_asked_for()
         self._declared_models_are_in_the_set()
         self._every_model_is_held_by_somebody()
@@ -744,11 +793,17 @@ class PoolConfig(BaseModel):
         return servable[:1]
 
     def _servable_by(self, host: "HostConfig") -> list[str]:
+        """Models this host could serve: a build its platform can run **and its engine can
+        read** (D93). A build named for another engine is not one this host has."""
         caps = set(host.capabilities)
+        engine = self.engine_of(host)
         servable = []
         for name in self.pool.model_set:
             entry = self.catalog.get(name)
-            if entry is None or any(set(v.requires) <= caps for v in entry.variants):
+            if entry is None or any(
+                set(v.requires) <= caps and (v.engine is None or v.engine == engine)
+                for v in entry.variants
+            ):
                 servable.append(name)
         return servable
 
@@ -814,28 +869,151 @@ class PoolConfig(BaseModel):
             )
 
     def _engine_can_hold_what_the_pool_asks(self) -> None:
-        """An engine that serves one model per process cannot hold the whole set on one host.
+        """No host may be asked for more models than its engine can hold at once (D89, D94).
 
-        Refused here, at load, rather than discovered after a machine has been rented and can
-        never reach `ready` (D89). An engine the pool cannot resolve is left alone: naming an
-        uninstalled engine is its own error, reported where engines are loaded.
+        An engine that serves one model per process holds exactly one. What each host is *asked*
+        for depends on the placement: with `all` that is the pool's whole set, with `declared` it
+        is what that host declares — and a host declaring two is over the line just as surely.
+
+        Refused here, at load, rather than after a machine has been rented that can never reach
+        `ready` and is paid for until the give-up window closes.
         """
         from .engines import EngineNotFound, get_engine
 
-        if self.pool.models_per_host != "all":
-            return
+        def holds_one(name: str, *, behind_proxy: bool = False) -> bool:
+            if behind_proxy:
+                # Several processes behind a router on the machine: one URL, many models (D96).
+                return False
+            try:
+                return bool(getattr(get_engine(name), "serves_one_model", False))
+            except EngineNotFound:
+                return False  # naming an uninstalled engine is its own error, reported elsewhere
+
+        for host in self.hosts:
+            if host.disabled:
+                continue
+            asked = self.models_held_by(host)
+            engine = self.engine_of(host)
+            if len(asked) > 1 and holds_one(engine):
+                raise ValueError(
+                    f"host {host.id!r} runs {engine!r}, which serves one model per process, but "
+                    f"is asked to hold {len(asked)}: {asked}. Give it a single model in its "
+                    f"`models`, or run an engine that holds several at once."
+                )
+
+        # Rented hosts differ from configured ones: with the set spread across hosts,
+        # `rented.models` is the set the pool may rent **for**, and each host it buys is given
+        # one of them (D94). Only `all` asks a single rented machine for the lot.
+        if self.rented is not None and self.pool.models_per_host == "all":
+            asked = list(self.pool.model_set)
+            engine = self.rented_engine()
+            if len(asked) > 1 and holds_one(engine, behind_proxy=self.rented.engine_proxy):
+                raise ValueError(
+                    f"rented hosts run {engine!r}, which serves one model per process, but with "
+                    f"pool.models_per_host 'all' every one of them is asked to hold "
+                    f"{len(asked)} models ({asked}). Either set pool.models_per_host to "
+                    f"'declared', and the pool will buy a host per model; or set "
+                    f"rented.engine_proxy and have the machine's own start-up run one engine "
+                    f"per model behind the router the agent ships (D96) — which splits the "
+                    f"accelerator's memory between them."
+                )
+
+    def _rented_models(self) -> list[str]:
+        """What a rented host is asked to hold: the pool's whole set, or what `rented.models`
+        names where the set is spread across hosts."""
+        if self.pool.models_per_host == "all" or self.rented is None or self.rented.models is None:
+            return list(self.pool.model_set)
+        return list(self.rented.models)
+
+    def _engines_and_where(self) -> list[tuple[str, str]]:
+        """Each engine this pool runs, with something an operator can go and look at."""
+        found = [(self.engine, "this pool")]
+        for host in self.hosts:
+            if host.engine:
+                found.append((host.engine, f"host {host.id!r}"))
+        if self.rented is not None and self.rented.engine:
+            found.append((self.rented.engine, "rented hosts"))
+        return found
+
+    def engine_of(self, host: "HostConfig") -> str:
+        """Which engine this host runs (D93): its own, or the pool's where it says nothing."""
+        return host.engine or self.engine
+
+    def rented_engine(self) -> str:
+        """Which engine hosts the pool rents run (D93)."""
+        if self.rented is not None and self.rented.engine:
+            return self.rented.engine
+        return self.engine
+
+    def engines_in_use(self) -> list[str]:
+        """Every engine this pool runs, the pool's default first.
+
+        The router needs all of them: it must know which paths its hosts serve between them, and
+        which host can serve the path a request actually arrived on.
+        """
+        found = [self.engine]
+        for host in self.hosts:
+            if host.engine and host.engine not in found:
+                found.append(host.engine)
+        rented = self.rented_engine()
+        if rented not in found:
+            found.append(rented)
+        return found
+
+    def engine_port(self) -> int:
+        """Where the engine listens on a host the pool creates (D92).
+
+        Stated wins; otherwise the engine's own default. A pool that changed engine and kept the
+        previous engine's port would dial a closed door on every host it rented.
+        """
+        if self.rented is not None and self.rented.engine_port is not None:
+            return self.rented.engine_port
+        from .engines import EngineNotFound, get_engine
+
         try:
-            engine = get_engine(self.engine)
+            return get_engine(self.rented_engine()).default_port or 11434
+        except EngineNotFound:
+            return 11434
+
+    def _images_are_built_for_this_engine(self) -> None:
+        """Refuse an image built for a *different* engine than the one configured (D92).
+
+        A pool set to vLLM with an Ollama image rents a machine, starts the wrong server, never
+        reaches `ready`, and pays until the give-up window closes — and nothing before this said
+        anything was wrong. Only a clash is refused: an image matching no known engine is left
+        alone, because a private build may be called anything.
+        """
+        if self.rented is None:
+            return
+        from .engines import EngineNotFound, available_engines, get_engine
+
+        try:
+            mine = get_engine(self.rented_engine())
         except EngineNotFound:
             return
-        if getattr(engine, "serves_one_model", False):
-            raise ValueError(
-                f"engine {self.engine!r} serves one model per process, so no single host can "
-                f"hold this pool's whole model set. Set pool.models_per_host to 'declared' and the "
-                f"pool will cover the set across its hosts instead. (Holding the set on one "
-                f"machine would need a process in front of several engines, choosing between "
-                f"them by model name; the pool does not ship one.)"
-            )
+        others = {}
+        for name in available_engines():
+            if name == self.rented_engine():
+                continue
+            try:
+                others[name] = get_engine(name).image_words
+            except EngineNotFound:
+                continue
+        # `images` replaces `image`, so only what would actually be used is checked — the
+        # unused default must not refuse a configuration that never names it.
+        named = [i.image for i in self.rented.images] or [self.rented.image]
+        for image in named:
+            lowered = image.lower()
+            if any(word in lowered for word in mine.image_words):
+                continue
+            for other, words in others.items():
+                if any(word in lowered for word in words):
+                    raise ValueError(
+                        f"rented hosts run {self.rented_engine()!r} but the image {image!r} is built for "
+                        f"{other!r}. A host rented from it would start the wrong server, never "
+                        f"answer, and be paid for until it was given up. Name an image for "
+                        f"{self.rented_engine()!r}, or change the engine."
+                    )
 
     def _hosts_can_serve_what_they_are_asked_for(self) -> None:
         """Every configured host must be able to serve something the pool needs (spec §3).
@@ -848,16 +1026,17 @@ class PoolConfig(BaseModel):
         whole_set = self.pool.models_per_host == "all"
         for host in self.hosts:
             caps = set(host.capabilities)
+            servable_here = set(self._servable_by(host))
             servable = []
             for name in self.pool.model_set:
-                entry = self.catalog.get(name)
-                if entry is None or any(set(v.requires) <= caps for v in entry.variants):
+                if name in servable_here:
                     servable.append(name)
                 elif whole_set:
                     raise ValueError(
-                        f"host {host.id!r} has no usable variant of {name!r}: its capabilities "
-                        f"{sorted(caps)} meet no variant's requirements. Give it the capability, "
-                        f"add a fallback variant with no requirements, or remove the host."
+                        f"host {host.id!r} has no usable variant of {name!r}: it runs "
+                        f"{self.engine_of(host)!r} with capabilities {sorted(caps)}, and no "
+                        f"variant matches both. Give it the capability, add a variant for that "
+                        f"engine, add a fallback with no requirements, or remove the host."
                     )
             if not servable:
                 raise ValueError(

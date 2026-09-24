@@ -67,6 +67,7 @@ async def install(
     push,
     archive: Path,
     engine_port: int,
+    engine: str = "ollama",
     agent_port: int = AGENT_PORT,
 ) -> str:
     """Put the agent on one host and return the key it minted.
@@ -89,6 +90,9 @@ async def install(
         f"mkdir -p {REMOTE_DIR} && chmod 700 {REMOTE_DIR} && rm -f {SETTINGS} && "
         f"python3 {ARCHIVE} -c {SETTINGS} init "
         f"--host 127.0.0.1 --port {agent_port} "
+        # Which engine this machine runs (D93): the agent holds models and reads settings in
+        # that engine's terms, and one told the wrong name would fetch the wrong weights.
+        f"--engine {shlex.quote(engine)} "
         f"--engine-url http://127.0.0.1:{engine_port} "
         f"--heartbeat-file {HEARTBEAT} "
         # On a host the pool created, what restarts the engine is the pool's own start-up
