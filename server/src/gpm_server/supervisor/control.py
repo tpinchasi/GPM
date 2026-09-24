@@ -756,12 +756,15 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
     async def directory(q: Optional[str] = None) -> JSONResponse:
         """The model directory (D101): Ollama's library and the hub builds looked up so far,
         from the cache — nothing here asks either of them anything."""
+        # Asked before reading, not after: a refresh that ends between the two would otherwise be
+        # reported finished beside what it had half written (found by CI).
+        refreshing = supervisor.directory.running
         found = await asyncio.to_thread(
             read_directory, supervisor.db, q, tuple(supervisor.config.pool.model_set)
         )
         settings = supervisor.config.directory
         return JSONResponse(found | {
-            "refreshing": supervisor.directory.running,
+            "refreshing": refreshing,
             "settings": settings.model_dump(),
             "offers": engine_offers(),
             "model_set": list(supervisor.config.pool.model_set),
