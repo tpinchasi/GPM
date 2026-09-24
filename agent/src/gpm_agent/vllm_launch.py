@@ -47,9 +47,28 @@ UPSTREAMS_FILE = ".gpm-upstreams.json"
 #: model; the rest is headroom the driver and the runtime need.
 TOTAL_MEMORY_SHARE = 0.90
 
-#: The least any one model is given when several share a card. Proportional-to-weights alone
-#: would hand a 0.3 GB embedding model under 2% beside a 19 GB one — too little to start at all.
+#: The least any one model is given when several share a card and the card's size is not
+#: known. Proportional-to-weights alone would hand a 0.3 GB embedding model under 2% beside a
+#: 19 GB one — too little to start at all.
 MEMORY_FLOOR = 0.10
+
+#: What a process needs beyond its weights, when the card's size is known: room for the cache
+#: it batches in and for its own workspace. Found live: splitting a 48 GB card by weights alone
+#: gave a 15 GB model 17.9 GB, and it refused to start for want of 2.1 GiB of cache. A model
+#: is given its weights (with a tenth over for what loading them costs) plus this reserve; a set
+#: that does not fit is refused before anything starts, rather than started and watched die.
+WEIGHT_OVERHEAD = 1.10
+CACHE_RESERVE_BYTES = 3 * 1024**3
+
+# What this launcher started, by model — process, port, log — is read back by the agent to tell
+# a process that has since died from one still loading. The reading lives apart from this
+# module: the agent must never import anything that can start a process (D63).
+from .vllm_state import (  # noqa: E402,F401
+    STARTED_FILE,
+    failed_engines,
+    last_error_line,
+    read_record,
+)
 
 #: The pool's numbers, under the names the agent writes them in (D41). Only those present are
 #: passed on: an absent one means "the engine's own default", not zero.
@@ -91,6 +110,10 @@ class Started:
     skipped: list[str] = field(default_factory=list)
     #: Options asked for that a model's family does not have, said out loud.
     not_applied: list[str] = field(default_factory=list)
+    #: Why nothing was started, when the set could not have run on this card.
+    refused: Optional[str] = None
+    #: Each model's share of the card and what it was sized for, for the record.
+    plan: dict[str, Any] = field(default_factory=dict)
 
     def pids(self) -> list[int]:
         found = [e["pid"] for e in self.engines if e.get("pid")]
@@ -137,6 +160,46 @@ def memory_shares(sizes: Sequence[int]) -> list[float]:
     floored = [max((size or 1) / total, MEMORY_FLOOR) for size in sizes]
     scale = sum(floored)
     return [round(TOTAL_MEMORY_SHARE * share / scale, 3) for share in floored]
+
+
+def card_memory_bytes(run: Callable[..., Any] = subprocess.run) -> Optional[int]:
+    """The accelerator's memory, from the driver — or None where it cannot be asked."""
+    try:
+        out = run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                  capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sizes = [int(line.strip()) for line in out.splitlines() if line.strip().isdigit()]
+    return min(sizes) * 1024 * 1024 if sizes else None
+
+
+def memory_plan(sizes: Sequence[int], card_bytes: Optional[int]) -> tuple[list[float], Optional[str]]:
+    """Each model's share of the card, or why the set cannot run on it.
+
+    With the card's size known, each model is given its weights plus a cache reserve, and what
+    is left of the launcher's share of the card is spread by weight — so the largest model gets
+    the most cache. A set whose needs exceed that share is refused, with the arithmetic. Without
+    the card's size, the old split by weights with a floor, which is a guess and says so.
+    """
+    if not sizes:
+        return [], None
+    if card_bytes is None:
+        return memory_shares(sizes), None
+    needs = [int(size * WEIGHT_OVERHEAD) + CACHE_RESERVE_BYTES for size in sizes]
+    usable = TOTAL_MEMORY_SHARE * card_bytes
+    if sum(needs) > usable:
+        return [], (
+            f"the models need {sum(needs) / 1e9:.1f} GB together (each its weights plus a "
+            f"{CACHE_RESERVE_BYTES / 1024**3:.0f} GiB cache reserve) and this card gives "
+            f"{usable / 1e9:.1f} GB; fewer models on this host, or a larger card"
+        )
+    spare = usable - sum(needs)
+    total_weight = sum(sizes) or len(sizes)
+    shares = [
+        (need + spare * ((size or 1) / total_weight)) / card_bytes
+        for need, size in zip(needs, sizes, strict=True)
+    ]
+    return [round(share, 3) for share in shares], None
 
 
 def number_flags(env: Mapping[str, str]) -> list[str]:
@@ -229,6 +292,8 @@ def launch(
     popen: Callable[..., Any] = subprocess.Popen,
     kill: Callable[[int, int], None] = os.kill,
     alive: Optional[Callable[[int], bool]] = None,
+    card_bytes: Optional[int] = None,
+    probe_card: Callable[[], Optional[int]] = card_memory_bytes,
 ) -> Started:
     """Stop what ran before, then start vLLM for every complete model on disk.
 
@@ -238,6 +303,7 @@ def launch(
     models_dir = Path(models_dir).expanduser()
     env = dict(os.environ if env is None else env)
     stop_previous(models_dir, kill=kill, alive=alive)
+    (models_dir / STARTED_FILE).unlink(missing_ok=True)
 
     started = Started()
     found = complete_models(models_dir)
@@ -253,7 +319,20 @@ def launch(
 
     logs = models_dir / ".gpm-logs"
     logs.mkdir(parents=True, exist_ok=True)
-    shares = memory_shares([size_of(d) for d in found])
+    sizes = [size_of(d) for d in found]
+    card = card_bytes if card_bytes is not None else probe_card()
+    shares, refused = memory_plan(sizes, card)
+    started.plan = {
+        "card_bytes": card,
+        "models": {served_name(d): {"weights_bytes": s} for d, s in zip(found, sizes, strict=True)},
+    }
+    if refused:
+        # Said where the agent reads it, so the pool hears the reason instead of watching
+        # processes die one by one.
+        started.refused = refused
+        log.error("not starting vLLM: %s", refused)
+        _record(models_dir, started)
+        return started
     upstreams: dict[str, str] = {}
 
     for index, (directory, share) in enumerate(zip(found, shares, strict=True)):
@@ -275,10 +354,11 @@ def launch(
             *number_flags(env),
             *extra,
         ]
-        out = open(logs / f"{directory.name}.log", "ab")
+        log_path = logs / f"{directory.name}.log"
+        out = open(log_path, "ab")
         process = popen(argv, stdout=out, stderr=subprocess.STDOUT, env=env, start_new_session=True)
         started.engines.append({"model": name, "port": engine_port, "memory_share": share,
-                                "pid": getattr(process, "pid", None), "argv": argv})
+                                "pid": getattr(process, "pid", None), "argv": argv, "log": str(log_path)})
         upstreams[name] = f"http://127.0.0.1:{engine_port}"
 
     if proxy:
@@ -293,7 +373,22 @@ def launch(
         started.proxy = {"port": port, "pid": getattr(process, "pid", None), "argv": argv}
 
     (models_dir / PIDS_FILE).write_text(json.dumps(started.pids()))
+    _record(models_dir, started)
     return started
+
+
+def _record(models_dir: Path, started: Started) -> None:
+    """What was started (or why nothing was), for the agent to read back."""
+    record = {
+        "at": time.time(),
+        "refused": started.refused,
+        "plan": started.plan,
+        "engines": [{k: v for k, v in e.items() if k != "argv"} for e in started.engines],
+        "proxy": {k: v for k, v in started.proxy.items() if k != "argv"} if started.proxy else None,
+    }
+    draft = (models_dir / STARTED_FILE).with_suffix(".new")
+    draft.write_text(json.dumps(record, indent=2))
+    draft.replace(models_dir / STARTED_FILE)
 
 
 def add_arguments(parser: Any) -> None:
@@ -309,6 +404,9 @@ def add_arguments(parser: Any) -> None:
 
 def main(args: Any) -> int:
     started = launch(args.models_dir, args.port, proxy=args.proxy, options=args.option)
+    if started.refused:
+        print(f"gpm-agent vllm-start: not started — {started.refused}")
+        return 1
     if not started.engines:
         print("gpm-agent vllm-start: no complete model on disk yet; nothing started")
         return 0

@@ -128,10 +128,17 @@ async def install(
 
     # Started detached, so it outlives this SSH session; its log stays on the host for an
     # operator who goes looking, and carries no request content.
+    #
+    # An agent already running here — from a supervisor that has since restarted and, having
+    # kept no secret, minted a new key — is stopped first. Found live: the old one kept the
+    # port, the new one never bound, the check found the old one and said "started", and the
+    # pool spent the host's whole life being refused by an agent holding the previous key.
+    # The patterns are written so they do not match the shell that runs them.
     code, output = await run(
+        f"pkill -f 'gpm-agent[.]pyz.*serve' 2>/dev/null; sleep 0.5; "
         f"(setsid nohup python3 {ARCHIVE} -c {SETTINGS} serve "
         f">{REMOTE_DIR}/agent.log 2>&1 &) ; sleep 1; "
-        f"kill -0 $(pgrep -f 'gpm-agent.pyz.*serve' | head -1) 2>/dev/null && echo started"
+        f"kill -0 $(pgrep -f 'gpm-agent[.]pyz.*serve' | head -1) 2>/dev/null && echo started"
     )
     if code != 0 or "started" not in output:
         raise AgentInstallFailed(f"the agent did not start: {output.strip()[:200]}")

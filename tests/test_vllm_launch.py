@@ -7,6 +7,7 @@ GPU, or installs vLLM.
 
 import json
 import signal
+from pathlib import Path
 
 import httpx
 import pytest
@@ -47,6 +48,7 @@ class Processes:
             self.alive.discard(pid)
 
     def launch(self, models_dir, **kwargs):
+        kwargs.setdefault("probe_card", lambda: None)  # no driver to ask on the test machine
         return vllm_launch.launch(
             models_dir, 8000, env={}, popen=self.popen, kill=self.kill,
             alive=lambda pid: pid in self.alive, agent="/var/run/gpm/gpm-agent.pyz",
@@ -285,3 +287,95 @@ def test_the_command_line_accepts_only_the_named_options():
     assert ok.option == ["tool_calling"]
     with pytest.raises(SystemExit):
         parser.parse_args(["--models-dir", "/m", "--port", "8000", "--option", "--chat-template=/etc/x"])
+
+
+# --- placing several models on one card (D104) ---
+
+GB = 1024**3
+
+
+def test_each_model_gets_its_weights_plus_a_cache_reserve_and_the_spare_goes_by_weight():
+    """Found live: a 48 GB card split by weights alone gave a 15 GB model 17.9 GB, and it
+    refused to start for want of 2.1 GiB of cache."""
+    shares, refused = vllm_launch.memory_plan([16 * GB, 2 * GB], 48 * GB)
+    assert refused is None
+    big, small = shares
+    assert big * 48 * GB >= 16 * GB * 1.10 + 3 * GB, "weights, loading overhead, and the reserve"
+    assert small * 48 * GB >= 2 * GB * 1.10 + 3 * GB
+    assert big > small and abs(big + small - 0.90) < 0.01, "everything the launcher may use, the larger model getting more"
+
+
+def test_a_set_that_does_not_fit_is_refused_with_the_arithmetic():
+    """The three the owner rented for: on a 48 GB card they need more than the launcher may use."""
+    shares, refused = vllm_launch.memory_plan([16 * GB, 18.8 * GB, 1.9 * GB], 48 * GB)
+    assert shares == [] and refused is not None
+    assert "need" in refused and "this card gives" in refused and "fewer models" in refused
+
+
+def test_a_card_of_unknown_size_falls_back_to_the_split_by_weights():
+    shares, refused = vllm_launch.memory_plan([16 * GB, 2 * GB], None)
+    assert refused is None and shares == vllm_launch.memory_shares([16 * GB, 2 * GB])
+
+
+def test_a_refused_set_starts_nothing_and_says_why_where_the_agent_reads_it(tmp_path):
+    downloaded(tmp_path, BIG, 19_000)
+    downloaded(tmp_path, EMBED, 2_000)
+    processes = Processes()
+    started = processes.launch(tmp_path, proxy=True, card_bytes=20_000)  # far too small
+    assert started.refused and processes.started == []
+    record = vllm_launch.read_record(tmp_path)
+    assert record["refused"] == started.refused
+    assert set(record["plan"]["models"]) == {BIG, EMBED}
+    assert vllm_launch.failed_engines(tmp_path, served=[]) == {BIG: started.refused, EMBED: started.refused}
+
+
+def test_what_was_started_is_recorded_with_its_process_and_log(tmp_path):
+    downloaded(tmp_path, BIG, 100)
+    processes = Processes()
+    processes.launch(tmp_path, card_bytes=48 * GB)
+    (engine,) = vllm_launch.read_record(tmp_path)["engines"]
+    assert engine["model"] == BIG and engine["pid"] in processes.alive
+    assert engine["log"].endswith("nvidia__Gemma-4-26B-A4B-NVFP4.log")
+
+
+# --- a process that dies is a failure, not a model still loading (D104) ---
+
+
+def test_a_process_that_exited_without_serving_is_reported_with_its_logs_reason(tmp_path):
+    downloaded(tmp_path, BIG, 100)
+    processes = Processes()
+    processes.launch(tmp_path, card_bytes=48 * GB)
+    (engine,) = vllm_launch.read_record(tmp_path)["engines"]
+    Path(engine["log"]).write_text(
+        "(APIServer pid=1657) INFO loading\n"
+        "(APIServer pid=1657) ValueError: Chunked MM input disabled but max_tokens_per_mm_item (2496) is larger than max_num_batched_tokens (1536).\n"
+        "(APIServer pid=1657) INFO shutting down\n"
+    )
+    processes.alive.discard(engine["pid"])
+    failed = vllm_launch.failed_engines(tmp_path, served=[], alive=lambda pid: pid in processes.alive)
+    assert set(failed) == {BIG}
+    assert failed[BIG].startswith("its vLLM process exited before serving it: ValueError: Chunked MM input")
+    assert "(APIServer" not in failed[BIG], "the process prefix is not the reason"
+
+
+def test_a_process_still_up_is_loading_however_long_it_takes(tmp_path):
+    downloaded(tmp_path, BIG, 100)
+    processes = Processes()
+    processes.launch(tmp_path, card_bytes=48 * GB)
+    assert vllm_launch.failed_engines(tmp_path, served=[], alive=lambda pid: pid in processes.alive) == {}
+
+
+def test_a_model_being_served_is_never_failed_whatever_its_pid_says(tmp_path):
+    downloaded(tmp_path, BIG, 100)
+    processes = Processes()
+    processes.launch(tmp_path, card_bytes=48 * GB)
+    assert vllm_launch.failed_engines(tmp_path, served=[BIG], alive=lambda pid: False) == {}
+
+
+def test_a_new_launch_forgets_the_last_launchs_record(tmp_path):
+    downloaded(tmp_path, BIG, 100)
+    processes = Processes()
+    processes.launch(tmp_path, card_bytes=20_000)  # refused
+    assert vllm_launch.read_record(tmp_path)["refused"]
+    processes.launch(tmp_path, card_bytes=48 * GB)  # fits
+    assert vllm_launch.read_record(tmp_path)["refused"] is None

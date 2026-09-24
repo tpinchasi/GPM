@@ -228,3 +228,16 @@ class StubAgent:
     async def restart(self, settings):
         self.asked.append(settings)
         return self.status, {"engine_answers": self.engine_answers, "settings": settings}
+
+
+def test_an_agent_already_running_is_stopped_before_the_new_one_starts(archive):
+    """Found live on an adopted host: the supervisor that restarted had kept no secret, so it
+    minted a new key and started a second agent — which never bound the port the old one held.
+    The check found the old one, said "started", and the pool was refused for the host's whole
+    life. The old agent goes first; and the patterns must not match the shell running them."""
+    host = FakeHost()
+    install(host, archive)
+    starting = next(c for c in host.commands if " serve" in c)
+    assert starting.index("pkill -f 'gpm-agent[.]pyz.*serve'") < starting.index("nohup python3")
+    assert "pgrep -f 'gpm-agent[.]pyz.*serve'" in starting
+    assert "pgrep -f 'gpm-agent.pyz" not in starting, "a pattern that matches its own shell"
