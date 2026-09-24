@@ -33,6 +33,7 @@ from ..configplan import (
     RentedNow,
     StaleVersion,
     plan_changes,
+    remove_list_item,
     set_in_list_item,
     set_values,
 )
@@ -668,6 +669,77 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     text = set_in_list_item(text, "hosts", "id", host.id, {"models": None})
         except CannotEdit as exc:
             return _error(409, "cannot_edit", str(exc))
+        return _validate_plan_apply(text, version, body)
+
+    def _configured_host(host_id: str) -> Optional[JSONResponse]:
+        """None when `host_id` is a host this pool's file configures; otherwise why not."""
+        if store() is None:
+            return _error(400, "no_config_file", "this pool was not started from a file")
+        if any(host.id == host_id for host in supervisor.config.hosts):
+            return None
+        if supervisor.fleet is not None and host_id in supervisor.fleet.hosts:
+            return _error(
+                400, "rented_host",
+                f"{host_id!r} is rented: it is released from the Rented capacity screen, not removed",
+            )
+        return _error(404, "unknown_host", f"no configured host {host_id!r}")
+
+    @app.patch("/pool/config/hosts/{host_id}")
+    async def set_host_service(host_id: str, request: Request) -> JSONResponse:
+        """Take a configured host out of service, or return it (`disabled` in the file).
+
+        The host stays in the file and comes back with one click; requests already on it finish.
+        The file's own rules still hold — taking out the only host that serves a model is
+        refused, with the reason, rather than leaving that model with nowhere to go.
+        """
+        refused = _configured_host(host_id)
+        if refused is not None:
+            return refused
+        body = await request.json()
+        if not isinstance(body.get("disabled"), bool):
+            return _error(400, "bad_request", "send `disabled`: true to take the host out of service, false to return it")
+        text, version = store().read()
+        try:
+            text = set_in_list_item(text, "hosts", "id", host_id, {"disabled": body["disabled"]})
+        except CannotEdit as exc:
+            return _error(409, "cannot_edit", str(exc))
+        return _validate_plan_apply(text, version, body)
+
+    @app.delete("/pool/config/hosts/{host_id}")
+    async def remove_host(host_id: str, request: Request) -> JSONResponse:
+        """Remove a configured host from the pool's file.
+
+        Typed to confirm, like anything that cannot be undone with one click: the host's entry
+        leaves the file. Requests already on it finish; its tunnels close. The file keeps its
+        own history, so the previous version can be rolled back to.
+        """
+        refused = _configured_host(host_id)
+        if refused is not None:
+            return refused
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        text, version = store().read()
+        try:
+            text = remove_list_item(text, "hosts", "id", host_id)
+        except CannotEdit as exc:
+            return _error(409, "cannot_edit", str(exc))
+        # What the file would say first: a removal the rules refuse is never offered to confirm.
+        errors = store().validate(text)
+        if errors:
+            return _error(400, "invalid_config", "; ".join(errors))
+        if str(body.get("confirm")) != host_id:
+            changes = plan_changes(supervisor.config, store().parse(text), rented_now(), machines_now())
+            listed = [c.as_dict() for c in changes]
+            for change in listed:
+                if change["kind"] == "host_removed":
+                    change["requires_retype"], change["value"] = True, host_id
+            return JSONResponse(status_code=400, content={
+                "error": "not_confirmed",
+                "detail": f"removing a host is confirmed by typing its id; send `confirm`: {host_id!r}",
+                "changes": listed,
+            })
         return _validate_plan_apply(text, version, body)
 
     def _validate_plan_apply(text: str, version: str, body: dict) -> JSONResponse:

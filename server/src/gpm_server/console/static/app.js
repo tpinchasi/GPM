@@ -60,6 +60,8 @@ const api = {
   hostDetail: (id) => call("GET", `/pool/hosts/${encodeURIComponent(id)}`),
   setSearch: (body) => call("PATCH", "/pool/config/rented", body),
   setEngine: (body) => call("PATCH", "/pool/config/engine", body),
+  setHostService: (id, disabled) => call("PATCH", `/pool/config/hosts/${encodeURIComponent(id)}`, { disabled }),
+  removeHost: (id, confirm) => call("DELETE", `/pool/config/hosts/${encodeURIComponent(id)}`, confirm === undefined ? {} : { confirm }),
   restartEngine: (hostId, applySettings) =>
     call("POST", `/pool/hosts/${hostId}/engine/restart`, { confirm: hostId, apply_settings: applySettings }),
   deleteModel: (hostId, tag) => call("POST", `/pool/hosts/${hostId}/models/delete`, { tag, confirm: tag }),
@@ -403,11 +405,11 @@ const feed = () => el("div", { class: "panel feed" }, state.events.slice(0, 40).
 
 screens.hosts = (status) => [
   el("h1", {}, "Hosts"),
-  el("p", { class: "muted" }, "Configured hosts. Add, edit and disable are configuration changes, so they go through plan on the Configuration screen."),
+  el("p", { class: "muted" }, "Hosts you configured, rather than rented. Take one out of service or remove it here; adding and editing one are on the Configuration screen. Rented hosts are released from Rented capacity."),
   el("table", {},
     el("thead", {}, el("tr", {},
       el("th", {}, "Host"), el("th", {}, "Kind"), el("th", {}, "Engine"), el("th", {}, "Transport"), el("th", {}, "State"),
-      el("th", { class: "num" }, "Workers"), el("th", {}, "Capabilities"), el("th", {}, "Residency"), el("th", {}, "Tunnel"), el("th", { class: "num" }, "Served"))),
+      el("th", { class: "num" }, "Workers"), el("th", {}, "Capabilities"), el("th", {}, "Residency"), el("th", {}, "Tunnel"), el("th", { class: "num" }, "Served"), el("th", {}, ""))),
     el("tbody", {}, status.hosts.map((host) => el("tr", {},
       el("td", { class: "mono" }, hostLink(host.host_id)),
       el("td", {}, host.kind),
@@ -425,7 +427,8 @@ screens.hosts = (status) => [
         host.residency === "on_demand" ? "on demand" : "pinned"),
       el("td", {}, host.tunnel ? pill(host.tunnel.up ? "up" : "down", host.tunnel.up ? "ok" : "bad") : "—",
         host.tunnel ? el("div", { class: "muted mono" }, `:${host.tunnel.local_port} · ${host.tunnel.restarts} restart(s)`) : null),
-      el("td", { class: "num" }, host.requests_served ?? 0))))),
+      el("td", { class: "num" }, host.requests_served ?? 0),
+      el("td", {}, hostControls(host)))))),
   ...status.hosts.filter((host) => host.agent).map(agentPanel),
   el("h2", {}, "Test connection"),
   hostTestForm(),
@@ -1000,6 +1003,41 @@ async function saveEngine(event, note) {
   } finally {
     button.disabled = false;
   }
+}
+
+// Taking a configured host out of the pool (a laptop wanted back, a box being moved). Out of
+// service is the reversible one: the host stays in the file and returns with one click. Remove
+// takes it out of the file, and is typed to confirm. Both go through the file, the plan and its
+// rules, so taking out the only host serving a model is refused with the reason.
+function hostControls(host) {
+  const out = host.state === "disabled";
+  const service = out
+    ? el("button", { class: "small", onclick: (e) => run(e.target, () => api.setHostService(host.host_id, false)) },
+        "Return to service")
+    : el("button", { class: "small", onclick: async (e) => {
+        const ok = await confirmAction({
+          title: `Take ${host.host_id} out of service?`,
+          body: "It stops receiving requests; any already on it finish. It stays in the configuration and returns with one click.",
+        });
+        if (ok) run(e.target, () => api.setHostService(host.host_id, true));
+      } }, "Take out of service");
+  const remove = el("button", { class: "small danger", onclick: (e) => run(e.target, async () => {
+    try {
+      await api.removeHost(host.host_id);  // asks first: the answer is the plan, and what to type
+    } catch (error) {
+      const retype = (error.changes || []).find((c) => c.requires_retype);
+      if (!retype) throw error;  // refused by the pool's rules; the message says why
+      const ok = await confirmAction({
+        title: `Remove ${host.host_id} from the pool?`,
+        body: el("div", {},
+          ...(error.changes || []).map((c) => el("p", {}, c.detail)),
+          el("p", { class: "muted" }, "Its entry leaves the configuration file. The file keeps its history, so this can be rolled back on the Configuration screen.")),
+        retype: retype.value,
+      });
+      if (ok) await api.removeHost(host.host_id, retype.value);
+    }
+  }) }, "Remove…");
+  return el("div", { class: "row" }, service, remove);
 }
 
 function teardownSection(market) {

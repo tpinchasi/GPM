@@ -8,7 +8,7 @@ and delete every comment in the file, which is the price D51 refuses.
 
 import pytest
 import yaml
-from gpm_server.configplan import CannotEdit, set_in_list_item, set_values
+from gpm_server.configplan import CannotEdit, remove_list_item, set_in_list_item, set_values
 
 FILE = """\
 pool:
@@ -127,3 +127,48 @@ def test_an_item_written_on_one_line_is_refused_rather_than_rewritten():
     )
     with pytest.raises(CannotEdit, match="one line"):
         set_in_list_item(one_line, "hosts", "id", "desk", {"models": ["a"]})
+
+
+# --- removing one item of a list ---
+
+
+def test_one_host_is_removed_and_everything_else_is_kept():
+    after = remove_list_item(FILE, "hosts", "id", "laptop")
+    parsed = yaml.safe_load(after)
+    assert [h["id"] for h in parsed["hosts"]] == ["desk"]
+    assert parsed["catalog"]["a"]["variants"][0]["tag"] == "a-mlx", "the rest of the file is untouched"
+    for comment in ("# the pool's own name", "# Logical names", "# the image does not start it"):
+        assert comment in after, comment
+
+
+def test_the_last_host_in_the_list_is_removed_too():
+    after = remove_list_item(FILE, "hosts", "id", "desk")
+    assert [h["id"] for h in yaml.safe_load(after)["hosts"]] == ["laptop"]
+    assert "rented:" in after and "\nrented:" in after, "the next section keeps its place"
+
+
+def test_removing_the_only_host_leaves_an_empty_list_not_a_null():
+    """An empty block is null to YAML, and a pool's list of hosts is never null."""
+    once = remove_list_item(FILE, "hosts", "id", "laptop")
+    twice = remove_list_item(once, "hosts", "id", "desk")
+    assert yaml.safe_load(twice)["hosts"] == []
+
+
+def test_a_host_written_on_one_line_can_be_removed():
+    one_line = FILE.replace(
+        "  - id: desk\n    kind: local\n    transport: { type: http, base_url: \"http://127.0.0.1:11435\" }\n",
+        "  - { id: desk, kind: local }\n",
+    )
+    after = remove_list_item(one_line, "hosts", "id", "desk")
+    assert [h["id"] for h in yaml.safe_load(after)["hosts"]] == ["laptop"]
+
+
+def test_removing_a_host_that_is_not_there_is_refused():
+    with pytest.raises(CannotEdit, match="no item"):
+        remove_list_item(FILE, "hosts", "id", "nobody")
+
+
+def test_a_list_written_on_one_line_is_refused_rather_than_rewritten():
+    flow = "hosts: [{ id: laptop }, { id: desk }]\n"
+    with pytest.raises(CannotEdit, match="one line"):
+        remove_list_item(flow, "hosts", "id", "laptop")
