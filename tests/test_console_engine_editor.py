@@ -109,7 +109,7 @@ def served(tmp_path, monkeypatch):
 @pytest.mark.timeout(240)
 def test_switching_to_vllm_from_the_console(served):
     supervisor, url, config_path, original = served
-    with open_page(f"{url}/ui/#rented") as page:
+    with open_page(f"{url}/ui/#rented/engine") as page:
         # The page opens its key dialog as its very last statement: open means it has run to
         # the end and attached its handlers.
         page.until("(document.getElementById('key-dialog') || {}).open === true", within=60, what="the page")

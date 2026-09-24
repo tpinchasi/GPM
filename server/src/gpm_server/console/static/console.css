@@ -70,3 +70,12 @@ table.builds td, table.builds th { padding: 4px 6px; }
 .dir-model { border-bottom: 1px solid var(--line); padding: 8px 0; }
 .dir-model .row { margin-top: 0; }
 details summary { cursor: pointer; margin-top: 6px; }
+.tabs { display: flex; gap: 2px; flex-wrap: wrap; border-bottom: 1px solid var(--line); margin: 4px 0 0; }
+.tabs a { padding: 7px 14px; color: var(--muted); text-decoration: none; border: 1px solid transparent; border-bottom: none; border-radius: 6px 6px 0 0; margin-bottom: -1px; }
+.tabs a:hover { color: var(--ink); }
+.tabs a.active { color: var(--ink); font-weight: 600; background: var(--panel); border-color: var(--line); }
+.tab-about { margin: 10px 0 14px; }
+.panel { overflow-x: auto; }
+.grid > .panel.wide { grid-column: 1 / -1; }
+td.stacked-label { width: 13rem; }
+td .why { margin-top: 4px; font-size: 12.5px; }
