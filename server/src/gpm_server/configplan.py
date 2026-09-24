@@ -665,6 +665,53 @@ def set_in_list_item(
     return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
 
 
+def remove_list_item(text: str, list_key: str, match_key: str, match_value: str) -> str:
+    """Delete one item of a top-level list — the host whose `id` is `laptop` — and nothing else.
+
+    The item's own lines go; the comments around it stay, because nothing in a file says which
+    item a comment was about. A list left empty is written `[]`, since an empty block means
+    null to YAML and a pool's list of hosts is never null.
+    """
+    lines = text.splitlines()
+    at, first, last = _block_of(lines, list_key, 0, len(lines), 0)
+    inline = lines[at].split(":", 1)[1].split(" #", 1)[0].strip()
+    if inline.startswith("["):
+        raise CannotEdit(f"{list_key!r} is written on one line; remove the item there")
+    starts = [n for n in range(first, last) if lines[n].lstrip().startswith("- ")]
+    if not starts:
+        raise CannotEdit(f"{list_key!r} holds no items")
+    item_indent = len(lines[starts[0]]) - len(lines[starts[0]].lstrip())
+    starts = [n for n in starts if len(lines[n]) - len(lines[n].lstrip()) == item_indent]
+    bounds = list(zip(starts, starts[1:] + [last], strict=True))
+    wanted = re.compile(rf"^\s*(?:-\s+)?{re.escape(match_key)}\s*:\s*[\"']?{re.escape(str(match_value))}[\"']?\s*(#.*)?$")
+
+    def matches(a: int, b: int) -> bool:
+        head = lines[a].lstrip()[2:].split(" #", 1)[0].strip()
+        if head.startswith("{"):
+            try:
+                item = yaml.safe_load(head)
+            except yaml.YAMLError:
+                return False
+            return isinstance(item, dict) and str(item.get(match_key)) == str(match_value)
+        return any(wanted.match(lines[n]) for n in range(a, b))
+
+    found = [(a, b) for a, b in bounds if matches(a, b)]
+    if not found:
+        raise CannotEdit(f"no item in {list_key!r} has {match_key}: {match_value}")
+    if len(found) > 1:
+        raise CannotEdit(f"{len(found)} items in {list_key!r} have {match_key}: {match_value}")
+    begin, finish = found[0]
+    # Only the item's own lines: trailing blank lines and comments belong to what follows.
+    while finish > begin + 1 and (not lines[finish - 1].strip() or lines[finish - 1].strip().startswith("#")):
+        finish -= 1
+    del lines[begin:finish]
+    if len(bounds) == 1:
+        head = lines[at]
+        comment = head[len(head.split(" #", 1)[0]):] if " #" in head else ""
+        lines[at] = f"{head.split(':', 1)[0]}: []{comment}"
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+
+
 def _set_in_flow(line: str, values: Mapping[str, Any], name: str) -> str:
     """A one-line `key: { a: 1, b: 2 }`, changed inside its braces."""
     head, _, rest = line.partition("{")
