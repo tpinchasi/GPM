@@ -14,7 +14,7 @@ from typing import Any, AsyncIterator, Optional
 
 import httpx
 
-from . import modelhub
+from . import modelhub, vllm_state
 
 
 class OllamaFacts:
@@ -222,17 +222,22 @@ class VllmFacts:
         except (httpx.HTTPError, ValueError) as exc:
             return {
                 "name": self.name, "answers": False, "detail": str(exc) or type(exc).__name__,
-                "models_on_disk": on_disk, "models_loaded": [],
+                "models_on_disk": on_disk, "models_loaded": [], "models_failed": self._failed([]),
             }
+        loaded = sorted(entry["id"] for entry in served if isinstance(entry, dict) and entry.get("id"))
         return {
             "name": self.name,
             "answers": True,
             "version": version,
             "models_on_disk": on_disk,
-            "models_loaded": sorted(
-                entry["id"] for entry in served if isinstance(entry, dict) and entry.get("id")
-            ),
+            "models_loaded": loaded,
+            # A process the launcher started that has since exited without serving its model
+            # is a failure, not a model still loading — with the reason from its own log.
+            "models_failed": self._failed(loaded),
         }
+
+    def _failed(self, loaded: list[str]) -> dict[str, str]:
+        return vllm_state.failed_engines(Path(self._models_dir).expanduser(), loaded)
 
     def _on_disk(self) -> list[dict[str, Any]]:
         root = Path(self._models_dir).expanduser()

@@ -76,6 +76,12 @@ whole preparation in, and folding them into one number would hide it (D97):
   so a small model can still start) and the router on the engine port. It stops what it started
   last time first, so starting again is a restart. On a host the pool created, the pool asks
   for that restart once every model the host was bought for is on disk (§4).
+- With the router, each model is given **its weights plus a cache reserve** of the card the driver
+  reports, the rest spread by weight; a set that needs more than nine tenths of the card is
+  **refused before anything starts**, and the refusal is reported for every model (D104). What
+  was started is recorded in `.gpm-vllm.started.json`; a process that has exited without ever
+  serving its model is reported as that model's error, with the last error line of its log, and
+  the pool gives the host up saying so — never as "still preparing".
 - It takes **named options** (`--option tool_calling`, `--option reasoning`, D100) from a closed
   list its command line enforces, and turns each into vLLM's flags per model, by the family in
   that model's own `config.json` — `gemma4` gets the `gemma4` parsers, `qwen3` the `hermes` tool

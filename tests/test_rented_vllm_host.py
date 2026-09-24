@@ -86,6 +86,9 @@ class Machines:
         self.disks: dict[str, Path] = {}             # agent hostname -> its models directory
         self.engines: dict[str, object] = {}         # agent hostname -> its fake vLLM
         self.launches: list[tuple[str, list[str], list[str], bool]] = []
+        #: Models whose vLLM process "dies at start": started with a pid nothing answers to,
+        #: and never served by the fake engine — what a real crash looks like from outside.
+        self.crashes: set[str] = set()
         by_url = {engine.server.base_url.rstrip("/"): engine for engine in pool.rentable.values()}
 
         async def by_hostname(scope, receive, send):
@@ -97,7 +100,9 @@ class Machines:
         async def installed(host):
             if host.agent is not None:
                 return
-            engine = by_url[host.dial_url.rstrip("/")]
+            engine = by_url.get((host.dial_url or "").rstrip("/"))
+            if engine is None:
+                return  # a machine this test did not set up (rented after one was given up)
             name = f"agent-{engine.spec.id}"
             disk = tmp_path / engine.spec.id / "models"
             self.disks[name], self.engines[name] = disk, engine.fake
@@ -129,13 +134,18 @@ class Machines:
 
             def popen(argv, **kwargs):
                 if "--served-model-name" in argv:
-                    names.append(argv[argv.index("--served-model-name") + 1])
+                    name_started = argv[argv.index("--served-model-name") + 1]
+                    if name_started in machines.crashes:
+                        kwargs["stdout"].write(b"(APIServer pid=1) INFO loading\n(APIServer pid=1) "
+                                               b"ValueError: 2.14 GiB KV cache is needed, larger than the available 1.83 GiB\n")
+                        return type("Process", (), {"pid": 2**22 + 7})()  # no such process
+                    names.append(name_started)
                 return type("Process", (), {"pid": None})()
 
             vllm_launch.launch(
                 disk, 8000, proxy=proxy, popen=popen, alive=lambda pid: False,
                 env=engine_control.read_applied(control.settings.engine_env_file) or {},
-                agent="/var/run/gpm/gpm-agent.pyz",
+                agent="/var/run/gpm/gpm-agent.pyz", probe_card=lambda: None,
             )
             # One port in front of whatever was started — the router's job when there are several.
             engine.start(names)
@@ -398,3 +408,43 @@ def test_a_host_rented_before_the_switch_keeps_being_what_it_is():
             pool.reprobe()
         assert host.state == "ready", "and it still serves"
         assert fleet.published_ref(host)["engine"] == "ollama", "and a successor would know it"
+
+
+# --- a vLLM process that dies is a failure, not a host still preparing (D104) ---
+
+
+def test_a_process_that_dies_at_start_gives_the_host_up_with_the_reason(monkeypatch, tmp_path):
+    """Found live: two of three processes died at start, the third served, and the host sat
+    "preparing" — billing — until its hold ran out, because nothing looked at the processes."""
+    hub = FakeHub(HUB)
+    with pool_harness(
+        [EngineSpec(id="laptop", resident={"gemma4:26b", EMBED}, kind="local", workers=1)],
+        rentable=[EngineSpec(id="market-1", resident=set(), workers=2, engine="vllm")],
+        model_set=[BIG, EMBED], catalog=CATALOG,
+        rented=rented(engine_proxy=True),
+    ) as pool:
+        hub_server = ServerHandle(hub.app, pool.loop)
+        monkeypatch.setenv("HF_ENDPOINT", hub_server.base_url)
+        try:
+            machines = Machines(pool, tmp_path, monkeypatch)
+            machines.crashes = {BIG_REPO}
+            machines.fleet.open_lease(workers=2, max_hours=2, max_spend=2.00, allow_rent=True)
+
+            # Given up, saying why — with the reason from the process's own log, not a summary.
+            deadline = time.monotonic() + 40
+            failed: list[str] = []
+            while time.monotonic() < deadline and not failed:
+                pool.reprobe()
+                failed = [e["summary"] for e in pool.supervisor.events.recent(100) if "exited before serving it" in e["summary"]]
+                time.sleep(0.1)
+            assert failed, [e["summary"][:120] for e in pool.supervisor.events.recent(12)]
+            assert "2.14 GiB KV cache is needed" in failed[0]
+            assert "(APIServer" not in failed[0]
+            assert machines.launches, "the engine was started, and only then found to have died"
+            kinds = {e["kind"] for e in pool.supervisor.events.recent(100)}
+            assert "prepare_failed" in kinds
+            released = [e["summary"] for e in pool.supervisor.events.recent(100) if e["kind"] == "released"]
+            assert released and "exited before serving it" in released[0], "given up, with the reason on the record"
+            assert not machines.raised
+        finally:
+            hub_server.stop()

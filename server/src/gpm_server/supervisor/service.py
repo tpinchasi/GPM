@@ -782,10 +782,15 @@ class Supervisor:
             # it always has, over the engine's own API.
             through_agent = await self.fleet.load_model_set_through_agent(host)
             if through_agent is False:
-                if host.agent_models is not None and any(
-                    (model or {}).get("error") for model in host.agent_models.get("models", [])
-                ):
-                    await self.fleet.destroy(host, "could not hold the pool's model set")
+                errors = [
+                    f"{model.get('tag')}: {model.get('error')}"
+                    for model in (host.agent_models or {}).get("models", [])
+                    if (model or {}).get("error")
+                ]
+                if errors:
+                    # The reason the machine gave, not a summary of it: "could not hold the
+                    # model set" told the operator nothing about a process that had died.
+                    await self.fleet.destroy(host, f"could not serve the model set — {'; '.join(errors)[:400]}")
                 return  # still coming; the next pass asks again
             if through_agent:
                 return
