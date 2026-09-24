@@ -186,8 +186,10 @@ uv run pytest -m integration                   # opt-in, needs a local Ollama ho
 
 The **[simulation](docs/simulation.md)** runs the real router and supervisor against a market
 that moves under them — load that climbs and stops, machines that come and go, hosts taken away
-mid-answer, a provider that goes quiet, a supervisor restarted under traffic. It is a merge
-gate: CI runs it beside the unit suite on every pull request.
+mid-answer, a provider that goes quiet, a supervisor restarted under traffic. It is the merge
+gate for a change to renting, allocation or recovery: CI runs it on a pull request that carries
+the `simulation` label, and on every supported Python weekly and on request. Every pull request
+gets the default suite, lint, the version check, the secret scan and the dependency audit.
 
 ## Layout
 
