@@ -65,6 +65,11 @@ class AgentInstallFailed(Exception):
     """The host gets no agent. It still joins the pool."""
 
 
+class HostNotReachable(AgentInstallFailed):
+    """SSH itself did not get through — a machine still starting, most often. Says nothing about
+    what the machine has, so it is not a reason to stop trying."""
+
+
 async def install(
     *,
     run,
@@ -81,7 +86,12 @@ async def install(
     existing ways of reaching a rented host: one SSH exec, and one with a file on its input.
     """
     code, found = await run("command -v python3 || true")
-    if code != 0 or not found.strip():
+    if code != 0:
+        # The command cannot fail on the machine (`|| true`), so a failure is the connection's.
+        # Found live: a booting machine refusing SSH was read as "no python3", three times, and
+        # a vLLM host — which cannot fetch its weights without an agent — was left for dead.
+        raise HostNotReachable(f"SSH did not get through yet: {found.strip()[:200]}")
+    if not found.strip():
         raise AgentInstallFailed(
             "this host has no python3, so it runs without an agent "
             "(an image that carries one — the provider's own build, say — would get it one)"

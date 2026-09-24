@@ -135,6 +135,54 @@ def test_a_host_without_an_interpreter_gets_no_agent(archive):
     assert hostagent.ARCHIVE not in host.files, "nothing is copied to a host that cannot run it"
 
 
+class BootingHost(FakeHost):
+    """A machine whose SSH is not accepting yet: every command fails at the connection."""
+
+    async def run(self, command: str):
+        self.commands.append(command)
+        return 255, "Connection closed by 3.81.94.205 port 27522"
+
+
+def test_a_machine_not_accepting_ssh_yet_is_not_read_as_one_without_python(archive):
+    """Found on the owner's second vLLM rental: the check for an interpreter failed at the
+    connection while the machine booted, and was reported as "no python3" — three times, after
+    which the pool stopped trying, and a vLLM host that cannot fetch its weights without an
+    agent was left to bill until given up."""
+    with pytest.raises(hostagent.HostNotReachable, match="SSH did not get through"):
+        install(BootingHost(), archive)
+
+
+def test_an_unreachable_machine_does_not_use_up_its_attempts(archive, tmp_path):
+    """The pool tries a few times and then leaves a host without an agent — but only counting
+    tries that learned something about the machine."""
+    from gpm_server.supervisor.renting import Fleet
+
+    host = type("Host", (), {"agent": None, "agent_attempts": 0, "agent_detail": None,
+                             "host_id": "rented-x", "engine": "vllm", "engine_port": 8000,
+                             "lease_id": "lease-x", "connection": None})()
+    fleet = Fleet.__new__(Fleet)
+    fleet.rented = type("Rented", (), {"agent_on_rented_hosts": True, "agent_attempts": 3})()
+    fleet.state_dir = tmp_path
+    fleet._engines = {}
+    fleet.config = type("Config", (), {"rented_engine": lambda self: "vllm", "engine_port": lambda self: 8000})()
+    fleet.run_on_host = lambda h, command: BootingHost().run(command)
+    fleet.push_to_host = lambda h, data, path: BootingHost().push(data, path)
+    fleet.events = None
+    import gpm_server.supervisor.renting as renting
+
+    loop = BackgroundLoop()
+    try:
+        original = renting.agentpkg.cached
+        renting.agentpkg.cached = lambda state_dir: archive
+        for _ in range(5):
+            loop.run(fleet.install_agent(host))
+    finally:
+        renting.agentpkg.cached = original
+        loop.stop()
+    assert host.agent_attempts == 0
+    assert "waiting for the machine to accept SSH" in host.agent_detail
+
+
 def test_an_agent_that_will_not_start_is_not_pretended_to_be_there(archive):
     with pytest.raises(hostagent.AgentInstallFailed, match="did not start"):
         install(FakeHost(start_ok=False), archive)
