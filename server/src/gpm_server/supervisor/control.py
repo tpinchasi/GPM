@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Mapping, Optional, Sequence
@@ -38,8 +39,10 @@ from ..configplan import (
     set_values,
 )
 from ..contract import CONTRACT_VERSION
-from ..engines import available_engines
+from ..directory import read_directory
+from ..engines import EngineNotFound, available_engines, get_engine
 from ..hostcheck import test_connection
+from ..hubbuilds import HubUnavailable, valid_search
 from ..keys import verify
 from ..ledger import LeaseRefused
 from . import agents
@@ -90,6 +93,59 @@ def _stage_of(detail: dict[str, Any]) -> str:
     if engine.get("not_loaded"):
         return f"downloaded; loading into memory: {', '.join(engine['not_loaded'])}"
     return "the model set is loaded; waiting for the next probe to mark it ready"
+
+
+def engine_offers() -> dict[str, Any]:
+    """What each installed engine's own start can switch on, and whether its builds can be
+    looked up on a model hub (D100) — the editor's checkboxes, from the engines themselves."""
+    offers: dict[str, Any] = {}
+    for name in sorted(available_engines()):
+        try:
+            engine = get_engine(name)
+        except EngineNotFound:
+            continue
+        offers[name] = {
+            "builds_on_hub": bool(getattr(engine, "builds_on_hub", False)),
+            "options": {
+                key: {"label": option.label, "families": list(option.families)}
+                for key, option in (getattr(engine, "options", None) or {}).items()
+            },
+        }
+    return offers
+
+
+#: A name the pool may call a model by, as a request or the catalog names it.
+_MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+
+
+def _with_builds(text: str, config: PoolConfig, name: str, builds: dict[str, str]) -> str:
+    """`text` with the catalog entry for `name` holding `builds` — one per engine — and every
+    build it already had for other engines (D98, D101).
+
+    Two things are done because getting them wrong is silent: a build written before the pool
+    ran two engines names none, so it is marked as the pool's own engine's — otherwise a vLLM
+    host could be handed an Ollama tag to fetch from a model hub; and a model with no entry keeps
+    being served under its own name by the engine it was written for.
+    """
+    entry = config.catalog.get(name)
+    before = [v.model_dump(exclude_defaults=True) for v in entry.variants] if entry else []
+    if entry is not None:
+        variants = [v | {"engine": v.get("engine") or config.engine} for v in before]
+    else:
+        variants = [{"tag": name, "engine": config.engine}]
+    for engine, tag in builds.items():
+        variants = [v for v in variants if v.get("engine") != engine]
+        variants.append({"tag": tag, "engine": engine})
+    if entry is not None and variants == before:
+        return text  # nothing about this model changes
+    if entry is None and variants == [{"tag": name, "engine": config.engine}]:
+        return text  # served under its own name by the pool's engine: no entry needed
+    if entry is not None:
+        return set_values(text, ("catalog", name), {"variants": variants})
+    try:
+        return set_values(text, ("catalog",), {name: {"variants": variants}})
+    except CannotEdit:
+        return set_values(text, (), {"catalog": {name: {"variants": variants}}})
 
 
 def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
@@ -366,6 +422,12 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     "engine_start": supervisor.config.rented.engine_start if supervisor.config.rented else None,
                     "image": supervisor.config.rented.image if supervisor.config.rented else None,
                     "available": sorted(available_engines()),
+                    # What each engine's own start can switch on, and whether its builds can be
+                    # looked up on a model hub — what the editor offers as checkboxes (D100).
+                    "offers": engine_offers(),
+                    "engine_options": (
+                        list(supervisor.config.rented.engine_options) if supervisor.config.rented else []
+                    ),
                     "port": supervisor.config.engine_port(),
                     "images": (
                         [
@@ -631,35 +693,22 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     {k: v for k, v in item.items() if k in ("image", "min_driver", "note") and v not in (None, "")}
                     for item in body.get("images") or []
                 ]
+            # Named options of the engine's own start (D100). Unsent, the ones the new engine
+            # also offers are kept, so switching engine never leaves a name it would refuse.
+            offered = get_engine(rented_engine).options
+            options = body.get("engine_options")
+            if options is None:
+                options = [o for o in config.rented.engine_options if o in offered]
+            if not isinstance(options, list) or not all(isinstance(o, str) for o in options):
+                return _error(400, "bad_options", "engine_options is a list of option names")
+            if list(options) != list(config.rented.engine_options):
+                rented["engine_options"] = list(dict.fromkeys(options))
             text = set_values(text, ("rented",), rented)
 
             builds = body.get("builds") or {}
             for name in config.pool.model_set:
                 build = (builds.get(name) or "").strip()
-                entry = config.catalog.get(name)
-                had_entry = entry is not None
-                before = [v.model_dump(exclude_defaults=True) for v in entry.variants] if entry else []
-                if had_entry:
-                    # Builds that name no engine were written for the pool's own; say so.
-                    variants = [v | {"engine": v.get("engine") or config.engine} for v in before]
-                else:
-                    # A model with no catalog entry is served under its own name; keep that,
-                    # for the engine it was written for.
-                    variants = [{"tag": name, "engine": config.engine}]
-                if build:
-                    variants = [v for v in variants if v.get("engine") != rented_engine]
-                    variants.append({"tag": build, "engine": rented_engine})
-                if had_entry and variants == before:
-                    continue  # nothing about this model changes
-                if not had_entry and not build:
-                    continue  # no entry, and nothing to add to one
-                if had_entry:
-                    text = set_values(text, ("catalog", name), {"variants": variants})
-                else:
-                    try:
-                        text = set_values(text, ("catalog",), {name: {"variants": variants}})
-                    except CannotEdit:
-                        text = set_values(text, (), {"catalog": {name: {"variants": variants}}})
+                text = _with_builds(text, config, name, {rented_engine: build} if build else {})
 
             for host in config.hosts:
                 if per_host == "declared" and host.models is None:
@@ -667,6 +716,122 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     text = set_in_list_item(text, "hosts", "id", host.id, {"models": held})
                 elif per_host == "all" and host.models is not None:
                     text = set_in_list_item(text, "hosts", "id", host.id, {"models": None})
+        except CannotEdit as exc:
+            return _error(409, "cannot_edit", str(exc))
+        return _validate_plan_apply(text, version, body)
+
+    @app.get("/pool/builds")
+    async def builds_on_hub(model: str, engine: Optional[str] = None, search: Optional[str] = None,
+                            fresh: bool = False) -> JSONResponse:
+        """An engine's builds of one of the pool's models, found on the model hub and sorted
+        (D100): the original and its quantisations, each with its precision, size, the cards it
+        runs on and whether a rented host can fetch it; files the engine cannot load and
+        different models under similar names left out, and counted.
+
+        Read-only, and asked of the hub with no credential. Served from the model directory's
+        cache (D101) unless it is stale or `fresh` is asked; a lookup is cached for everyone. The
+        operator's choice is saved through the engine editor like any other build.
+        """
+        engine = engine or supervisor.config.rented_engine()
+        if not _MODEL_NAME.match(model or ""):
+            return _error(400, "bad_model", "name a model: letters, digits, '.', '_', ':', '-' and '/'")
+        try:
+            adapter = get_engine(engine)
+        except EngineNotFound:
+            return _error(400, "bad_engine", f"no engine {engine!r}; installed: {sorted(available_engines())}")
+        if not getattr(adapter, "builds_on_hub", False):
+            return _error(
+                400, "no_hub",
+                f"{engine!r} builds are named in its own library, not found on a model hub",
+            )
+        if search is not None and not valid_search(search):
+            return _error(400, "bad_search", "search for a model's name: letters, digits, '.', '_', '-' and '/'")
+        try:
+            found = await supervisor.directory.lookup(model, search or None, fresh=fresh)
+        except HubUnavailable as exc:
+            return _error(502, "hub_unavailable", str(exc))
+        return JSONResponse(found | {"engine": engine})
+
+    @app.get("/pool/directory")
+    async def directory(q: Optional[str] = None) -> JSONResponse:
+        """The model directory (D101): Ollama's library and the hub builds looked up so far,
+        from the cache — nothing here asks either of them anything."""
+        found = await asyncio.to_thread(
+            read_directory, supervisor.db, q, tuple(supervisor.config.pool.model_set)
+        )
+        settings = supervisor.config.directory
+        return JSONResponse(found | {
+            "refreshing": supervisor.directory.running,
+            "settings": settings.model_dump(),
+            "offers": engine_offers(),
+            "model_set": list(supervisor.config.pool.model_set),
+            "placement": supervisor.config.pool.models_per_host,
+            "rented_models": (
+                list(supervisor.config.rented.models)
+                if supervisor.config.rented and supervisor.config.rented.models is not None else None
+            ),
+            "engine_options": list(supervisor.config.rented.engine_options) if supervisor.config.rented else [],
+        })
+
+    @app.post("/pool/directory/refresh")
+    async def refresh_directory() -> JSONResponse:
+        """Refresh the directory now, in the background. It reads Ollama's library and looks up
+        builds on the hub at the stated pace; the status says how far it has got."""
+        started = supervisor.directory.start()
+        return JSONResponse(status_code=202, content={
+            "started": started,
+            "detail": "refreshing" if started else "a refresh is already running",
+        })
+
+    @app.post("/pool/config/models")
+    async def add_models(request: Request) -> JSONResponse:
+        """Add models to the pool from the directory, with a build for each engine (D101).
+
+        One write, like every other editor: the model set, each model's builds, the hosts it is
+        rented for and the engine's options, then validated, planned and confirmed. A model no
+        host can hold is refused by the file's own rules, in words, before anything is written.
+        """
+        if store() is None:
+            return _error(400, "no_config_file", "this pool was not started from a file")
+        body = await request.json()
+        config = supervisor.config
+        wanted = body.get("add")
+        if not isinstance(wanted, list) or not wanted:
+            return _error(400, "bad_request", "send `add`: a list of models, each with its `name` and `builds`")
+        installed = set(available_engines())
+        model_set = list(config.pool.model_set)
+        rent_for = list(config.rented.models or []) if config.rented and config.rented.models is not None else None
+        text, version = store().read()
+        try:
+            for item in wanted:
+                name = str((item or {}).get("name") or "").strip()
+                if not _MODEL_NAME.match(name):
+                    return _error(400, "bad_model", f"not a model name: {name!r}")
+                builds = {str(k): str(v).strip() for k, v in ((item or {}).get("builds") or {}).items() if str(v).strip()}
+                unknown = set(builds) - installed
+                if unknown:
+                    return _error(400, "bad_engine", f"no engine {sorted(unknown)}; installed: {sorted(installed)}")
+                for tag in builds.values():
+                    if not _MODEL_NAME.match(tag):
+                        return _error(400, "bad_build", f"not a build name: {tag!r}")
+                if name not in model_set:
+                    model_set.append(name)
+                if item.get("rent_for") and rent_for is not None and name not in rent_for:
+                    rent_for.append(name)
+                text = _with_builds(text, config, name, builds)
+            if model_set != list(config.pool.model_set):
+                text = set_values(text, ("pool",), {"model_set": model_set})
+            rented: dict[str, Any] = {}
+            if rent_for is not None and rent_for != list(config.rented.models or []):
+                rented["models"] = rent_for
+            if "engine_options" in body and config.rented is not None:
+                options = body.get("engine_options")
+                if not isinstance(options, list) or not all(isinstance(o, str) for o in options):
+                    return _error(400, "bad_options", "engine_options is a list of option names")
+                if list(options) != list(config.rented.engine_options):
+                    rented["engine_options"] = list(dict.fromkeys(options))
+            if rented:
+                text = set_values(text, ("rented",), rented)
         except CannotEdit as exc:
             return _error(409, "cannot_edit", str(exc))
         return _validate_plan_apply(text, version, body)

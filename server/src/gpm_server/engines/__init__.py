@@ -1,6 +1,7 @@
 from .base import (
     Engine,
     EngineNotFound,
+    EngineOption,
     Health,
     Occupancy,
     PullResult,
@@ -13,6 +14,7 @@ from .vllm import VllmEngine
 __all__ = [
     "Engine",
     "EngineNotFound",
+    "EngineOption",
     "Health",
     "Occupancy",
     "OllamaEngine",

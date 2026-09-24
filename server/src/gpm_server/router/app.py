@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from ..config import PoolConfig
 from ..contract import CONTRACT_VERSION
 from ..db import Database, RequestRecord
+from ..directory import read_directory
 from ..keys import verify
 from ..models import HostState
 from ..state import RouterState, open_database
@@ -284,6 +285,18 @@ def create_app(
             },
             headers={"X-GPM-Contract": CONTRACT_VERSION},
         )
+
+    @app.get("/pool/directory")
+    async def pool_directory(request: Request, q: Optional[str] = None) -> Response:
+        """What this pool could serve, beyond what it serves now (D101): the model directory the
+        supervisor keeps, read from the shared file. No outbound request is made here, ever —
+        this process carries inference traffic — and nothing here changes the pool: `in_pool`
+        says which names a request may use today.
+        """
+        if not _authorised(state, request):
+            return _error(401, "unauthorized", detail="missing or invalid app key")
+        found = await asyncio.to_thread(read_directory, database, q, tuple(config.pool.model_set))
+        return JSONResponse(found, headers={"X-GPM-Contract": CONTRACT_VERSION})
 
     @app.post("/{full_path:path}")
     async def inference(request: Request, full_path: str) -> Response:

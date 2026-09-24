@@ -97,19 +97,49 @@ class FakeVllm:
 
 class FakeHub:
     """A model hub with a few repositories, served over real HTTP so the agent's fetch runs as
-    it would against the real one — pointed here by `HF_ENDPOINT`."""
+    it would against the real one — pointed here by `HF_ENDPOINT`.
 
-    def __init__(self, repos: dict[str, dict[str, bytes]]):
+    It also answers the hub's search the way the real one does (D100): `search` maps a search
+    term to the entries the hub returned for it — recorded from the real hub, in the tests that
+    use it — and `info` answers a repository asked for by name."""
+
+    def __init__(self, repos: dict[str, dict[str, bytes]],
+                 search: Optional[dict[str, list[dict[str, Any]]]] = None,
+                 info: Optional[dict[str, dict[str, Any]]] = None):
         self.repos = repos
+        self.search = search or {}
+        self.info = info or {}
+        #: Set to make every answer fail, as a hub that is down would.
+        self.down = False
         self.requests: list[str] = []
+        self.headers_seen: list[dict[str, str]] = []
         self.app = Starlette(routes=[
+            Route("/api/models", self._search, methods=["GET"]),
             Route("/api/models/{owner}/{name}/tree/main", self._tree, methods=["GET"]),
+            Route("/api/models/{owner}/{name}", self._info, methods=["GET"]),
             Route("/{owner}/{name}/resolve/main/{path:path}", self._file, methods=["GET"]),
         ])
+
+    async def _search(self, request: Request) -> Response:
+        term = request.query_params.get("search", "")
+        self.requests.append(f"search {term}")
+        self.headers_seen.append(dict(request.headers))
+        if self.down:
+            return JSONResponse({"error": "down"}, status_code=503)
+        return JSONResponse(self.search.get(term, []))
+
+    async def _info(self, request: Request) -> Response:
+        repo = f"{request.path_params['owner']}/{request.path_params['name']}"
+        self.requests.append(f"info {repo}")
+        if repo not in self.info:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return JSONResponse(self.info[repo])
 
     async def _tree(self, request: Request) -> Response:
         repo = f"{request.path_params['owner']}/{request.path_params['name']}"
         self.requests.append(f"list {repo}")
+        if self.down:
+            return JSONResponse({"error": "down"}, status_code=503)
         files = self.repos.get(repo)
         if files is None:
             return JSONResponse({"error": "not found"}, status_code=404)

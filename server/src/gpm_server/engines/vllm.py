@@ -22,7 +22,7 @@ from typing import ClassVar, Optional
 import httpx
 
 from . import openai_api
-from .base import Health, Occupancy, PullResult
+from .base import EngineOption, Health, Occupancy, PullResult
 
 #: What the pool's integers are called in this engine's start-up environment. The engine takes
 #: command-line flags, not variables, so a host that runs it reads these in its own start
@@ -51,9 +51,25 @@ class VllmEngine:
     image_words: ClassVar[tuple[str, ...]] = ("vllm",)
     #: It serves what it was started with; a downloaded model is picked up by starting it again.
     loads_by_restart: ClassVar[bool] = True
+    #: Its builds are model-hub repositories, which the pool can look up (D100).
+    builds_on_hub: ClassVar[bool] = True
+    #: What the agent's launcher can switch on, and for which model families (`model_type` in a
+    #: model's own configuration). The flags live in the launcher, on the machine; these are the
+    #: same names and families, for the operator to choose from (D100).
+    options: ClassVar[dict[str, EngineOption]] = {
+        "tool_calling": EngineOption(
+            label="tool calling — apps may send `tools` and get `tool_calls` back",
+            families=("gemma4", "gpt_oss", "qwen2", "qwen3", "qwen3_moe"),
+        ),
+        "reasoning": EngineOption(
+            label="reasoning — a thinking model's reasoning returned apart from its answer",
+            families=("gemma4", "qwen3", "qwen3_moe"),
+        ),
+    }
 
     def default_start_command(
-        self, *, port: int, models_dir: str, agent_archive: str, proxy: bool
+        self, *, port: int, models_dir: str, agent_archive: str, proxy: bool,
+        options: tuple[str, ...] = (),
     ) -> Optional[str]:
         """The agent's own launcher, from its archive (D97).
 
@@ -68,6 +84,10 @@ class VllmEngine:
         )
         if proxy:
             command += " --proxy"
+        for option in options:
+            if option not in self.options:
+                raise ValueError(f"vllm has no option {option!r}")
+            command += f" --option {shlex.quote(option)}"
         return f"if [ -f {shlex.quote(agent_archive)} ]; then {command}; fi"
 
     # --- request path: the shared protocol, not this engine's invention ---
