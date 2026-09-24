@@ -89,6 +89,10 @@ class Machines:
         #: Models whose vLLM process "dies at start": started with a pid nothing answers to,
         #: and never served by the fake engine — what a real crash looks like from outside.
         self.crashes: set[str] = set()
+        #: The cards each machine's driver lists; none means one card, placed where CUDA puts it.
+        self.devices: list[str] = []
+        #: Every vLLM command line the launcher built, with the card it was pinned to.
+        self.commands: list[tuple[list[str], str | None]] = []
         by_url = {engine.server.base_url.rstrip("/"): engine for engine in pool.rentable.values()}
 
         async def by_hostname(scope, receive, send):
@@ -140,12 +144,14 @@ class Machines:
                                                b"ValueError: 2.14 GiB KV cache is needed, larger than the available 1.83 GiB\n")
                         return type("Process", (), {"pid": 2**22 + 7})()  # no such process
                     names.append(name_started)
+                    machines.commands.append((argv, (kwargs.get("env") or {}).get("CUDA_VISIBLE_DEVICES")))
                 return type("Process", (), {"pid": None})()
 
             vllm_launch.launch(
                 disk, 8000, proxy=proxy, popen=popen, alive=lambda pid: False,
                 env=engine_control.read_applied(control.settings.engine_env_file) or {},
                 agent="/var/run/gpm/gpm-agent.pyz", probe_card=lambda: None,
+                probe_devices=lambda env: list(machines.devices),
             )
             # One port in front of whatever was started — the router's job when there are several.
             engine.start(names)
@@ -285,6 +291,53 @@ def test_two_models_are_bought_a_host_each_and_each_host_is_ready_on_its_own(mon
             # And each fetched only its own: nothing downloaded twice, nothing downloaded for nothing.
             for name, disk in machines.disks.items():
                 assert len(vllm_launch.complete_models(disk)) == 1, name
+        finally:
+            hub_server.stop()
+
+
+# --- a machine with two cards (D107) ---
+
+
+def test_a_two_card_machine_runs_twice_the_work_with_a_copy_on_each_card(monkeypatch, tmp_path):
+    """Found live: a 2x H100 host was given the one-card default of six workers, and every model
+    ran on card 0 while card 1 sat empty. Rented with two cards, it is given twice the workers,
+    runs a copy of its model on each card, and each copy is given half."""
+    hub = FakeHub(HUB)
+    with pool_harness(
+        [EngineSpec(id="laptop", resident={EMBED}, kind="local", workers=1)],
+        host_overrides={"laptop": {"models": [EMBED]}},
+        rentable=[EngineSpec(id="market-1", resident=set(), workers=2, engine="vllm")],
+        model_set=[BIG, EMBED], catalog=CATALOG,
+        rented=rented(models=[BIG], workers=3),
+        pool_settings={"models_per_host": "declared"},
+    ) as pool:
+        hub_server = ServerHandle(hub.app, pool.loop)
+        monkeypatch.setenv("HF_ENDPOINT", hub_server.base_url)
+        try:
+            machines = Machines(pool, tmp_path, monkeypatch)
+            machines.devices = ["0", "1"]
+            machines.fleet.provider.offers = [default_offer(hardware="2x FakeGPU 48GB", gpus=2)]
+            machines.fleet.open_lease(workers=6, max_hours=2, max_spend=2.00, allow_rent=True)
+            (host,) = machines.until_ready(1)
+            machines.check_no_failures()
+
+            assert host.workers == 6, "three per card, two cards"
+            assert [card for _, card in machines.commands] == ["0", "1"], "a copy pinned to each card"
+            for argv, _ in machines.commands:
+                assert argv[argv.index("--served-model-name") + 1] == BIG_REPO
+                assert argv[argv.index("--max-num-seqs") + 1] == "3", "each copy runs its half"
+            ((_, _, _, proxy),) = machines.launches
+            assert proxy is False, "the pool placed one model; the router came with the copies"
+            disk = machines.disks["agent-market-1"]
+            upstreams = (disk / vllm_launch.UPSTREAMS_FILE).read_text()
+            assert "8001" in upstreams and "8002" in upstreams
+
+            with pool.client() as client:
+                answer = client.post("/v1/chat/completions", json={
+                    "model": BIG, "messages": [{"role": "user", "content": "hello"}],
+                })
+                assert answer.status_code == 200, answer.text
+                assert answer.headers["X-GPM-Host"] == host.host_id
         finally:
             hub_server.stop()
 

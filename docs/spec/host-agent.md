@@ -88,6 +88,12 @@ whole preparation in, and folding them into one number would hide it (D97):
   parser and the `qwen3` reasoning parser. A family with no such option starts without it and
   the launcher says so; an unknown name is refused. The flags are written in the launcher and
   nowhere else, so the pool still sends no text that becomes part of a command (D41).
+- **On a machine with several cards, every model runs once on each** (D107): a copy per card,
+  pinned to it with `CUDA_VISIBLE_DEVICES`, planned against the smallest card, and given its share
+  of the host's workers (`--max-num-seqs` divided by the copies, rounded up). The cards are those
+  the machine's environment limits it to, or else every card the driver lists. The router is
+  started whenever there is more than one process, even for one model. Each copy writes its own
+  log, and a copy that dies is reported with its card.
 
 Three rules the hub fetch keeps:
 
@@ -114,11 +120,12 @@ archive is already on every host the pool creates.
 
 | | |
 |---|---|
-| Routes by | The `model` field of the request, against a file the machine's start-up wrote mapping model to upstream — re-read as it changes |
+| Routes by | The `model` field of the request, against a file the machine's start-up wrote mapping model to its upstream, or to one per copy — re-read as it changes |
+| Between copies | The one with the fewest requests in flight from the router; a copy that refuses the connection is passed over for the next, since it never saw the request (D107) |
 | Translates | **Nothing.** The request leaves as it arrived, byte for byte, with only the upstream chosen |
-| `/health` | 200 only when **every** engine behind it answers — a machine serving two models of three is not one the pool can call ready |
-| `/v1/models` | The union, so the pool sees one host holding a set |
-| `/metrics` | Every engine's, labelled and concatenated — not summed, because a sum of cache fractions means nothing |
+| `/health` | 200 only when **every** engine behind it answers — every copy of every model. A machine serving two models of three is not one the pool can call ready, nor one serving a model on one card of two |
+| `/v1/models` | The union, so the pool sees one host holding a set; a model with copies once every copy answers |
+| `/metrics` | Every engine's, labelled and concatenated — not summed, because a sum of cache fractions means nothing. The pool sums running and waiting across them and takes the fullest cache |
 
 The pool names a model. It never names a port, a path or a command.
 

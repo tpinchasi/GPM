@@ -50,6 +50,8 @@ def failed_engines(models_dir: Path, served: Sequence[str],
 
     A process that is still up is loading, however long it takes; only one that has exited
     without its model being served has failed. The launcher's refusal counts for every model.
+    A model with a copy on each card (D107) is served only once every copy answers, so one dead
+    copy fails it, named with its card.
     """
     record = read_record(models_dir)
     if not record:
@@ -74,5 +76,7 @@ def failed_engines(models_dir: Path, served: Sequence[str],
         if is_alive(pid):
             continue
         reason = last_error_line(engine.get("log") or "") or "no reason in its log"
-        failed[name] = f"its vLLM process exited before serving it: {reason}"
+        card = engine.get("card")
+        on = f" on card {card}" if card is not None else ""
+        failed[name] = f"its vLLM process{on} exited before serving it: {reason}"
     return failed

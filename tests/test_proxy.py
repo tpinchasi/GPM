@@ -5,6 +5,7 @@ process, behind one port — because the pool dials one URL per host. Against fa
 nothing here needs a GPU or vLLM.
 """
 
+import asyncio
 import json
 
 import httpx
@@ -231,3 +232,122 @@ async def test_a_model_whose_engine_is_still_loading_is_not_listed(tmp_path):
     async with proxy_for(tmp_path, Engines(healthy=(BIG,))) as proxy:
         answer = await proxy.get("/v1/models")
     assert [entry["id"] for entry in answer.json()["data"]] == [BIG]
+
+
+# --- a copy of a model on each card (D107) ---
+
+
+class Copies:
+    """One model, a copy on each of two ports. A copy can be made to hold its requests open, to
+    refuse connections, or to report itself unhealthy."""
+
+    def __init__(self):
+        self.seen: list[int] = []
+        self.hold = asyncio.Event()
+        self.holding: set[int] = set()
+        self.refusing: set[int] = set()
+        self.unhealthy: set[int] = set()
+
+    def transport(self) -> httpx.MockTransport:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            port = request.url.port
+            if port in self.refusing:
+                raise httpx.ConnectError("connection refused", request=request)
+            if request.url.path == "/health":
+                return httpx.Response(503 if port in self.unhealthy else 200)
+            self.seen.append(port)
+            if port in self.holding:
+                await self.hold.wait()
+            body = json.loads(request.content or b"{}")
+            if body.get("stream"):
+                return httpx.Response(200, content=_frames(), headers={"content-type": "text/event-stream"})
+            return httpx.Response(200, json={"port": port})
+
+        return httpx.MockTransport(handler)
+
+
+def copies_proxy(tmp_path, copies: Copies) -> httpx.AsyncClient:
+    mapping = {BIG: ["http://127.0.0.1:8001", "http://127.0.0.1:8002"]}
+    app = create_app(
+        upstream_file(tmp_path, mapping),
+        client=httpx.AsyncClient(transport=copies.transport(), timeout=10),
+    )
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy")
+
+
+async def test_a_request_goes_to_the_copy_with_the_fewest_in_flight(tmp_path):
+    """Found live: the second card of a 2x H100 host sat idle. With a copy on each, the next
+    request goes where the last one is not still running."""
+    copies = Copies()
+    copies.holding = {8001}
+    async with copies_proxy(tmp_path, copies) as proxy:
+        first = asyncio.create_task(proxy.post("/v1/chat/completions", json={"model": BIG}))
+        while not copies.seen:
+            await asyncio.sleep(0)
+        second = await proxy.post("/v1/chat/completions", json={"model": BIG})
+        copies.hold.set()
+        first = await first
+
+    assert first.json()["port"] == 8001 and second.json()["port"] == 8002
+
+
+async def test_idle_copies_share_the_work_in_turn_when_requests_finish(tmp_path):
+    copies = Copies()
+    async with copies_proxy(tmp_path, copies) as proxy:
+        for _ in range(3):
+            await proxy.post("/v1/chat/completions", json={"model": BIG})
+    assert copies.seen == [8001, 8001, 8001], "none in flight, so the first copy each time"
+
+
+async def test_a_copy_refusing_the_connection_is_passed_over(tmp_path):
+    """It never saw the request, so trying the next copy cannot run it twice."""
+    copies = Copies()
+    copies.refusing = {8001}
+    async with copies_proxy(tmp_path, copies) as proxy:
+        answer = await proxy.post("/v1/chat/completions", json={"model": BIG})
+        async with proxy.stream("POST", "/v1/chat/completions", json={"model": BIG, "stream": True}) as stream:
+            frames = [line async for line in stream.aiter_lines() if line.strip()]
+    assert answer.status_code == 200 and answer.json()["port"] == 8002
+    assert frames[-1] == "data: [DONE]"
+
+
+async def test_every_copy_refusing_is_a_bad_gateway(tmp_path):
+    copies = Copies()
+    copies.refusing = {8001, 8002}
+    async with copies_proxy(tmp_path, copies) as proxy:
+        answer = await proxy.post("/v1/chat/completions", json={"model": BIG})
+    assert answer.status_code == 502
+
+
+async def test_a_model_is_served_only_when_every_copy_answers(tmp_path):
+    """The host's workers were set for both cards; on one of them it is not what was bought,
+    and the pool must not call it ready."""
+    copies = Copies()
+    copies.unhealthy = {8002}
+    async with copies_proxy(tmp_path, copies) as proxy:
+        listed = (await proxy.get("/v1/models")).json()["data"]
+        health = await proxy.get("/health")
+    assert listed == []
+    assert health.status_code == 503 and "8002" in health.json()["error"]
+
+
+async def test_each_copys_metrics_are_offered(tmp_path):
+    engines = Engines()
+    mapping = {BIG: ["http://127.0.0.1:8001", "http://127.0.0.1:8002"]}
+    async with proxy_for(tmp_path, engines, mapping=mapping) as proxy:
+        answer = await proxy.get("/metrics")
+    assert answer.text.count("vllm:num_requests_running") == 2
+
+
+def test_a_map_of_single_urls_is_still_read(tmp_path):
+    """The launcher's older shape, one URL per model."""
+    path = tmp_path / "upstreams.json"
+    path.write_text(json.dumps({BIG: "http://127.0.0.1:8001/"}))
+    assert Upstreams(path).by_model() == {BIG: ["http://127.0.0.1:8001"]}
+
+
+@pytest.mark.parametrize("bad", [{BIG: []}, {BIG: ["http://127.0.0.1:8001", "nope"]}])
+def test_a_list_with_anything_but_urls_is_ignored(tmp_path, bad):
+    path = tmp_path / "upstreams.json"
+    path.write_text(json.dumps(bad))
+    assert Upstreams(path).by_model() == {}

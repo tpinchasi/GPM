@@ -14,6 +14,12 @@ it, byte for byte, with only the upstream chosen from the `model` field. The sam
 itself obeys, for the same reason: translation is where tool-calling and structured-output
 fidelity get lost.
 
+**A model may have several copies** — one per card on a machine with more than one (D107). Each
+request goes to the copy with the fewest requests in flight from this process, and a copy that
+refuses the connection is passed over for the next. The machine counts as serving a model only
+when every copy answers: its worker count was set for all of its cards, and a host running on
+half of them is not what was bought.
+
 Started by the machine's own start-up command, which also starts the engines and writes the map
 of model to upstream. The pool names a model; it never names a port, a path or a command.
 """
@@ -43,19 +49,20 @@ INFERENCE_TIMEOUT_S = 3600.0
 
 
 class Upstreams:
-    """Which engine on this machine serves which model.
+    """Which engines on this machine serve which model — one URL per copy.
 
     Read from a file the machine's own start-up wrote. Re-read when it changes, so an engine
     added or moved does not need this process restarted — and because a start-up that writes the
-    file after this starts is the ordinary case, not an error.
+    file after this starts is the ordinary case, not an error. A model maps to one URL or to a
+    list of them, one per copy.
     """
 
     def __init__(self, path: str | Path):
         self.path = Path(path).expanduser()
         self._stamp: Optional[float] = None
-        self._by_model: dict[str, str] = {}
+        self._by_model: dict[str, list[str]] = {}
 
-    def by_model(self) -> dict[str, str]:
+    def by_model(self) -> dict[str, list[str]]:
         try:
             stamp = self.path.stat().st_mtime
         except OSError:
@@ -65,7 +72,7 @@ class Upstreams:
             self._stamp = stamp
         return self._by_model
 
-    def _read(self) -> dict[str, str]:
+    def _read(self) -> dict[str, list[str]]:
         try:
             raw = json.loads(self.path.read_text())
         except (OSError, ValueError) as exc:
@@ -75,15 +82,17 @@ class Upstreams:
             log.warning("the upstream map at %s is not an object", self.path)
             return self._by_model
         found = {}
-        for model, url in raw.items():
-            if model and isinstance(model, str) and isinstance(url, str) and url.startswith("http"):
-                found[model] = url.rstrip("/")
+        for model, urls in raw.items():
+            urls = [urls] if isinstance(urls, str) else urls
+            if (model and isinstance(model, str) and isinstance(urls, list) and urls
+                    and all(isinstance(u, str) and u.startswith("http") for u in urls)):
+                found[model] = [u.rstrip("/") for u in urls]
             else:
-                log.warning("ignoring upstream entry %r: not a model and a URL", model)
+                log.warning("ignoring upstream entry %r: not a model and its URLs", model)
         return found
 
-    def url_for(self, model: Optional[str]) -> Optional[str]:
-        return self.by_model().get(model) if model else None
+    def urls_for(self, model: Optional[str]) -> list[str]:
+        return self.by_model().get(model, []) if model else []
 
 
 def _model_of(body: bytes) -> Optional[str]:
@@ -108,25 +117,38 @@ def _wants_stream(body: bytes) -> bool:
 def create_app(upstream_map: str | Path, *, client: Optional[httpx.AsyncClient] = None) -> Starlette:
     upstreams = Upstreams(upstream_map)
     http = client or httpx.AsyncClient(timeout=INFERENCE_TIMEOUT_S, follow_redirects=False)
+    #: Requests this process has open to each copy — how the least busy one is chosen.
+    in_flight: dict[str, int] = {}
+
+    async def unhealthy_copies(model: str, urls: list[str]) -> list[str]:
+        found = []
+        for url in urls:
+            try:
+                answer = await http.get(f"{url}/health", timeout=HEALTH_TIMEOUT_S)
+                if answer.status_code != 200:
+                    found.append(f"{model} at {url}: /health returned {answer.status_code}")
+            except httpx.HTTPError as exc:
+                found.append(f"{model} at {url}: {exc or type(exc).__name__}")
+        return found
+
+    def least_busy_first(urls: list[str]) -> list[str]:
+        # Stable, so copies tied at zero are taken in the launcher's order.
+        return sorted(urls, key=lambda url: in_flight.get(url, 0))
 
     async def health(request: Request) -> Response:
-        """200 only when **every** engine behind this answers.
+        """200 only when **every** engine behind this answers — every copy of every model.
 
         A machine serving two models of three is not a machine the pool can treat as ready: a
-        request for the missing one would be refused after being routed here. Saying so plainly
-        lets the pool's own readiness rule do its job without knowing this process exists.
+        request for the missing one would be refused after being routed here. Nor is one serving
+        a model on one card of two: its worker count was set for both. Saying so plainly lets the
+        pool's own readiness rule do its job without knowing this process exists.
         """
         by_model = upstreams.by_model()
         if not by_model:
             return JSONResponse({"error": "no upstreams are configured yet"}, status_code=503)
         unhealthy = []
-        for model, url in sorted(by_model.items()):
-            try:
-                answer = await http.get(f"{url}/health", timeout=HEALTH_TIMEOUT_S)
-                if answer.status_code != 200:
-                    unhealthy.append(f"{model}: /health returned {answer.status_code}")
-            except httpx.HTTPError as exc:
-                unhealthy.append(f"{model}: {exc or type(exc).__name__}")
+        for model, urls in sorted(by_model.items()):
+            unhealthy += await unhealthy_copies(model, urls)
         if unhealthy:
             return JSONResponse({"error": "; ".join(unhealthy)}, status_code=503)
         return Response(status_code=200)
@@ -137,15 +159,11 @@ def create_app(upstream_map: str | Path, *, client: Optional[httpx.AsyncClient] 
         Only engines that answer are listed. The pool reads this as "what is resident" and calls
         the host ready when its set is here — so listing an engine still loading its weights
         would have the pool route requests to it minutes early. The map says what *will* be
-        served; this says what *is*.
+        served; this says what *is*. A model with copies is listed once every copy answers.
         """
         served = []
-        for model, url in sorted(upstreams.by_model().items()):
-            try:
-                answer = await http.get(f"{url}/health", timeout=HEALTH_TIMEOUT_S)
-            except httpx.HTTPError:
-                continue
-            if answer.status_code == 200:
+        for model, urls in sorted(upstreams.by_model().items()):
+            if not await unhealthy_copies(model, urls):
                 served.append(model)
         return JSONResponse({
             "object": "list",
@@ -153,27 +171,28 @@ def create_app(upstream_map: str | Path, *, client: Optional[httpx.AsyncClient] 
         })
 
     async def metrics(request: Request) -> Response:
-        """Every engine's metrics, one after another, each labelled with its model.
+        """Every engine's metrics, one after another, each labelled with its model and URL.
 
         Concatenated rather than summed: the pool reads running, waiting and cache use, and a
         sum of cache fractions across engines would mean nothing. Whoever reads them aggregates
         knowing what they are.
         """
         chunks = []
-        for model, url in sorted(upstreams.by_model().items()):
-            try:
-                answer = await http.get(f"{url}/metrics", timeout=HEALTH_TIMEOUT_S)
-                if answer.status_code == 200:
-                    chunks.append(f"# gpm-proxy upstream {model}\n{answer.text}")
-            except httpx.HTTPError:
-                continue  # one engine that will not say must not hide the others
+        for model, urls in sorted(upstreams.by_model().items()):
+            for url in urls:
+                try:
+                    answer = await http.get(f"{url}/metrics", timeout=HEALTH_TIMEOUT_S)
+                    if answer.status_code == 200:
+                        chunks.append(f"# gpm-proxy upstream {model} {url}\n{answer.text}")
+                except httpx.HTTPError:
+                    continue  # one engine that will not say must not hide the others
         return Response("\n".join(chunks), media_type="text/plain; version=0.0.4")
 
     async def forward(request: Request) -> Response:
         body = await request.body()
         model = _model_of(body)
-        url = upstreams.url_for(model)
-        if url is None:
+        urls = upstreams.urls_for(model)
+        if not urls:
             known = ", ".join(sorted(upstreams.by_model())) or "none"
             return JSONResponse(
                 {"error": {
@@ -189,32 +208,54 @@ def create_app(upstream_map: str | Path, *, client: Optional[httpx.AsyncClient] 
             name: value for name, value in request.headers.items()
             if name.lower() not in ("host", "content-length", "connection", "transfer-encoding")
         }
-        target = f"{url}{request.url.path}"
+        # Least busy first; a copy that refuses the connection never saw the request, so the
+        # next is tried. Anything after the connection is the copy's answer and is passed on.
+        candidates = least_busy_first(urls)
 
         if not _wants_stream(body):
-            try:
-                answer = await http.post(target, content=body, headers=headers)
-            except httpx.HTTPError as exc:
-                return JSONResponse(
-                    {"error": {"message": f"the engine for {model!r} did not answer: {exc}",
-                               "type": "upstream_unavailable"}},
-                    status_code=502,
+            refused: Optional[httpx.HTTPError] = None
+            for url in candidates:
+                in_flight[url] = in_flight.get(url, 0) + 1
+                try:
+                    answer = await http.post(f"{url}{request.url.path}", content=body, headers=headers)
+                except httpx.ConnectError as exc:
+                    refused = exc
+                    continue
+                except httpx.HTTPError as exc:
+                    refused = exc
+                    break
+                finally:
+                    in_flight[url] -= 1
+                return Response(
+                    content=answer.content,
+                    status_code=answer.status_code,
+                    media_type=answer.headers.get("content-type"),
                 )
-            return Response(
-                content=answer.content,
-                status_code=answer.status_code,
-                media_type=answer.headers.get("content-type"),
+            return JSONResponse(
+                {"error": {"message": f"the engine for {model!r} did not answer: {refused}",
+                           "type": "upstream_unavailable"}},
+                status_code=502,
             )
 
         # Streaming: opened here and closed when the client goes, so an abandoned request stops
         # the work upstream rather than generating into nothing on a machine being paid for.
         async def relay():
-            try:
-                async with http.stream("POST", target, content=body, headers=headers) as upstream:
-                    async for chunk in upstream.aiter_raw():
-                        yield chunk
-            except httpx.HTTPError as exc:
-                log.warning("stream to %s for %s ended: %s", target, model, exc)
+            for url in candidates:
+                target = f"{url}{request.url.path}"
+                in_flight[url] = in_flight.get(url, 0) + 1
+                try:
+                    async with http.stream("POST", target, content=body, headers=headers) as upstream:
+                        async for chunk in upstream.aiter_raw():
+                            yield chunk
+                    return
+                except httpx.ConnectError as exc:
+                    log.warning("the copy of %s at %s refused the connection: %s", model, url, exc)
+                    continue
+                except httpx.HTTPError as exc:
+                    log.warning("stream to %s for %s ended: %s", target, model, exc)
+                    return
+                finally:
+                    in_flight[url] -= 1
 
         return StreamingResponse(relay(), media_type="text/event-stream")
 
@@ -247,6 +288,6 @@ def serve(upstream_map: str, host: str = "127.0.0.1", port: int = 8000) -> None:
 
 
 def add_arguments(parser: Any) -> None:
-    parser.add_argument("--upstreams", required=True, help="JSON file mapping model name to engine URL")
+    parser.add_argument("--upstreams", required=True, help="JSON file mapping model name to its engine URL, or a list of them (one per copy)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)

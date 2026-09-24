@@ -155,22 +155,27 @@ class VllmEngine:
             response.raise_for_status()
         except httpx.HTTPError:
             return None
-        found = {m.group("name"): m.group("value") for m in _METRIC.finditer(response.text)}
-
-        def number(name: str) -> Optional[float]:
+        # Behind the machine's router there is one set of metrics per engine process — a model
+        # each, and a copy of each per card (D96, D107) — so every value is kept, not the last.
+        found: dict[str, list[float]] = {}
+        for m in _METRIC.finditer(response.text):
             try:
-                return float(found[name])
-            except (KeyError, ValueError):
-                return None
+                found.setdefault(m.group("name"), []).append(float(m.group("value")))
+            except ValueError:
+                continue
 
-        running, waiting = number("vllm:num_requests_running"), number("vllm:num_requests_waiting")
+        def numbers(name: str) -> Optional[list[float]]:
+            return found.get(name) or None
+
+        running, waiting = numbers("vllm:num_requests_running"), numbers("vllm:num_requests_waiting")
         if running is None or waiting is None:
             return None
-        # Named for the cache in both current and older builds; whichever is present wins.
-        cache = number("vllm:kv_cache_usage_perc")
-        if cache is None:
-            cache = number("vllm:gpu_cache_usage_perc")
-        return Occupancy(running=int(running), waiting=int(waiting), cache_used=cache)
+        # Named for the cache in both current and older builds; whichever is present wins. The
+        # fullest engine's, because a fraction summed across engines means nothing and the
+        # fullest is the one that starts turning requests away.
+        cache = numbers("vllm:kv_cache_usage_perc") or numbers("vllm:gpu_cache_usage_perc")
+        return Occupancy(running=int(sum(running)), waiting=int(sum(waiting)),
+                         cache_used=max(cache) if cache else None)
 
     async def serving_from_cpu(self, client: httpx.AsyncClient) -> Optional[frozenset[str]]:
         """None: this engine reports no per-model placement to ask. The driver floor and the

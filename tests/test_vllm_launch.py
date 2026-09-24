@@ -30,6 +30,7 @@ class Processes:
 
     def __init__(self):
         self.started: list[list[str]] = []
+        self.envs: list[dict] = []
         self.killed: list[tuple[int, int]] = []
         self.alive: set[int] = set()
         self._next = 1000
@@ -38,6 +39,7 @@ class Processes:
         assert "shell" not in kwargs, "never through a shell"
         assert isinstance(argv, list), "always an argument list"
         self.started.append(argv)
+        self.envs.append(kwargs.get("env") or {})
         self._next += 1
         self.alive.add(self._next)
         return type("Process", (), {"pid": self._next})()
@@ -49,6 +51,7 @@ class Processes:
 
     def launch(self, models_dir, **kwargs):
         kwargs.setdefault("probe_card", lambda: None)  # no driver to ask on the test machine
+        kwargs.setdefault("probe_devices", lambda env: [])
         return vllm_launch.launch(
             models_dir, 8000, env={}, popen=self.popen, kill=self.kill,
             alive=lambda pid: pid in self.alive, agent="/var/run/gpm/gpm-agent.pyz",
@@ -99,6 +102,7 @@ def test_the_pools_numbers_are_passed_on_and_only_those_present(tmp_path):
     vllm_launch.launch(
         tmp_path, 8000, popen=processes.popen, kill=processes.kill, alive=lambda pid: False,
         env={"GPM_VLLM_MAX_NUM_SEQS": "84", "GPM_VLLM_MAX_MODEL_LEN": "32768"},
+        probe_card=lambda: None, probe_devices=lambda env: [],
     )
     (argv,) = processes.started
     assert argv[argv.index("--max-num-seqs") + 1] == "84"
@@ -134,7 +138,7 @@ def test_each_model_gets_its_own_engine_and_the_router_takes_the_pools_port(tmp_
     assert router[:3] == ["python3", "/var/run/gpm/gpm-agent.pyz", "proxy"]
 
     upstreams = json.loads((tmp_path / vllm_launch.UPSTREAMS_FILE).read_text())
-    assert upstreams == {name: f"http://127.0.0.1:{e['port']}" for name, e in engines.items()}
+    assert upstreams == {name: [f"http://127.0.0.1:{e['port']}"] for name, e in engines.items()}
 
 
 def test_memory_is_split_by_weights_with_a_floor_for_the_small_model(tmp_path):
@@ -379,3 +383,97 @@ def test_a_new_launch_forgets_the_last_launchs_record(tmp_path):
     assert vllm_launch.read_record(tmp_path)["refused"]
     processes.launch(tmp_path, card_bytes=48 * GB)  # fits
     assert vllm_launch.read_record(tmp_path)["refused"] is None
+
+
+# --- a machine with several cards: a copy of every model on each (D107) ---
+
+SMALL = "google/gemma-4-E4B-it"
+
+
+def test_every_model_runs_once_on_each_card_pinned_to_it(tmp_path):
+    """Found live: a 2x H100 host ran all three models on card 0, and card 1 sat at 4 MiB."""
+    downloaded(tmp_path, BIG, 19_000)
+    downloaded(tmp_path, SMALL, 15_000)
+    downloaded(tmp_path, EMBED, 2_000)
+    processes = Processes()
+    started = processes.launch(tmp_path, proxy=True, devices=["0", "1"])
+
+    engines = started.engines
+    assert len(engines) == 6, "three models, two cards"
+    for card in ("0", "1"):
+        on_card = [e for e in engines if e["card"] == card]
+        assert {e["model"] for e in on_card} == {BIG, SMALL, EMBED}
+    for engine, env in zip(engines, processes.envs, strict=False):
+        assert env["CUDA_VISIBLE_DEVICES"] == engine["card"], "each copy sees only its card"
+    assert sorted(e["port"] for e in engines) == list(range(8001, 8007))
+    # The memory plan is per card: each copy of a model gets the same share of its own card.
+    shares = {(e["model"], e["card"]): e["memory_share"] for e in engines}
+    assert all(shares[(m, "0")] == shares[(m, "1")] for m in (BIG, SMALL, EMBED))
+
+    upstreams = json.loads((tmp_path / vllm_launch.UPSTREAMS_FILE).read_text())
+    for model in (BIG, SMALL, EMBED):
+        assert len(upstreams[model]) == 2, "the router is told about both copies"
+    assert started.proxy["port"] == 8000
+
+
+def test_the_hosts_workers_are_split_between_its_copies(tmp_path):
+    """The pool gives a host its workers for all its cards; vLLM's limit is per process, so a
+    copy per card at the whole number would admit twice what the pool asked for."""
+    downloaded(tmp_path, BIG, 1000)
+    processes = Processes()
+    vllm_launch.launch(
+        tmp_path, 8000, popen=processes.popen, kill=processes.kill, alive=lambda pid: False,
+        env={"GPM_VLLM_MAX_NUM_SEQS": "13", "GPM_VLLM_MAX_NUM_BATCHED_TOKENS": "8192"},
+        devices=["0", "1"], probe_card=lambda: None,
+    )
+    engines = [argv for argv in processes.started if argv[0] == "vllm"]
+    assert [argv[argv.index("--max-num-seqs") + 1] for argv in engines] == ["7", "7"], "rounded up"
+    assert all(argv[argv.index("--max-num-batched-tokens") + 1] == "8192" for argv in engines), \
+        "a batch is per process already, and is not split"
+
+
+def test_one_model_on_two_cards_still_gets_the_router(tmp_path):
+    """The pool placed one model, and still dials one port: two copies need something in front."""
+    downloaded(tmp_path, BIG, 1000)
+    processes = Processes()
+    started = processes.launch(tmp_path, devices=["0", "1"])
+    assert [e["port"] for e in started.engines] == [8001, 8002]
+    assert started.proxy and started.proxy["port"] == 8000
+    assert processes.started[-1][2] == "proxy"
+
+
+def test_one_card_is_exactly_as_before(tmp_path):
+    downloaded(tmp_path, BIG, 1000)
+    processes = Processes()
+    started = processes.launch(tmp_path, devices=["0"])
+    (engine,) = started.engines
+    assert engine["port"] == 8000 and engine["card"] is None and started.proxy is None
+    assert "CUDA_VISIBLE_DEVICES" not in processes.envs[0], "nothing pinned where there is no choice"
+
+
+def test_the_cards_are_those_the_environment_allows_or_the_driver_lists():
+    def driver(argv, **kwargs):
+        return type("Done", (), {"stdout": "0\n1\n"})()
+
+    def no_driver(argv, **kwargs):
+        raise FileNotFoundError("nvidia-smi")
+
+    assert vllm_launch.card_devices({}, run=driver) == ["0", "1"]
+    assert vllm_launch.card_devices({"CUDA_VISIBLE_DEVICES": "2,3"}, run=driver) == ["2", "3"], \
+        "a machine limited to some cards is held to them"
+    assert vllm_launch.card_devices({}, run=no_driver) == []
+
+
+def test_a_copy_that_died_is_reported_with_its_card(tmp_path):
+    """A model is served once every copy answers, so one dead copy fails it — and the operator
+    needs to know which card to look at."""
+    downloaded(tmp_path, BIG, 100)
+    processes = Processes()
+    processes.launch(tmp_path, devices=["0", "1"])
+    record = vllm_launch.read_record(tmp_path)
+    dead = next(e for e in record["engines"] if e["card"] == "1")
+    Path(dead["log"]).write_text("(APIServer pid=9) torch.OutOfMemoryError: CUDA out of memory\n")
+    processes.alive.discard(dead["pid"])
+    failed = vllm_launch.failed_engines(tmp_path, served=[], alive=lambda pid: pid in processes.alive)
+    assert failed[BIG].startswith("its vLLM process on card 1 exited before serving it: torch.OutOfMemoryError")
+    assert dead["log"].endswith(".card1.log"), "each copy writes its own log"
