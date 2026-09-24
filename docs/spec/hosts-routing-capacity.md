@@ -258,8 +258,9 @@ the pool rather than on every machine.
 With `declared`, `rented.models` is the set the pool may rent **for**, and each machine it buys
 is given **one** of them where its engine serves one model per process — whichever model has the
 fewest hosts serving it, ties going to the order the operator listed them (D94). A host is
-prepared only for what it was bought for; one bought before the pool assigned models keeps the
-whole rented set.
+prepared only for what it was bought for, and **ready when it holds that** — not the whole rented
+set, which no host holds when each is bought for one model (D97); one bought before the pool
+assigned models keeps the whole rented set.
 
 A host *asked* for more models than its engine can hold at once is refused at load, whether that
 comes from `all` or from naming several in a host's own `models` — **unless the machine runs a

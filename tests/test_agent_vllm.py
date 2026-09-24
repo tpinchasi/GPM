@@ -147,10 +147,12 @@ async def test_a_cut_transfer_resumes_where_it_stopped(tmp_path):
     pool retries a cut download (D57) and a rented host pays for every second of it."""
     hub = FakeHub(WEIGHTS, cut_after=1000)
     async with hub.client() as client:
-        async for _ in modelhub.fetch(REPO, tmp_path, client=client):
-            pass
+        # A cut is a failure the next attempt resumes — never a finished download (D97).
+        with pytest.raises(modelhub.HubRefused, match="resume"):
+            async for _ in modelhub.fetch(REPO, tmp_path, client=client):
+                pass
     partial = modelhub.directory_for(tmp_path, REPO) / "model.safetensors"
-    assert partial.stat().st_size == 1000
+    assert partial.stat().st_size == 1000, "what arrived is kept"
 
     hub.cut_after = None
     async with hub.client() as client:
@@ -233,12 +235,19 @@ def engine_answering(routes: dict) -> httpx.AsyncClient:
 SERVING = {"/v1/models": {"data": [{"id": REPO}]}, "/version": {"version": "0.11.0"}}
 
 
+def downloaded(tmp_path, repo=REPO, size=2048):
+    """A model the fetch finished: its files, and the marker it writes last."""
+    into = modelhub.directory_for(tmp_path, repo)
+    into.mkdir(parents=True, exist_ok=True)
+    (into / "model.safetensors").write_bytes(b"w" * size)
+    (into / modelhub.COMPLETE_MARKER).write_text(f"{size}\n")
+    return into
+
+
 async def test_on_disk_and_serving_are_reported_as_different_sets(tmp_path):
     """The state a vLLM host spends its whole preparation in — weights present, engine not yet
     serving them — must be visible, not folded into one number."""
-    into = modelhub.directory_for(tmp_path, REPO)
-    into.mkdir(parents=True)
-    (into / "model.safetensors").write_bytes(b"w" * 2048)
+    downloaded(tmp_path)
 
     async with engine_answering({"/v1/models": {"data": []}, "/version": {"version": "0.11.0"}}) as client:
         described = await facts(tmp_path).describe(client)
@@ -248,10 +257,27 @@ async def test_on_disk_and_serving_are_reported_as_different_sets(tmp_path):
     assert described["models_on_disk"] == [{"tag": REPO, "size_bytes": 2048}]
 
 
-async def test_an_engine_that_does_not_answer_is_reported_as_such_with_nothing_else_claimed(tmp_path):
+async def test_a_stopped_engine_still_reports_what_is_on_disk(tmp_path):
+    """On a machine that has just booted this engine is not running — it has nothing to serve
+    yet — and what is on disk is exactly what decides what happens next. Reporting nothing
+    while it was down is what kept the agent from ever starting the download (D97)."""
+    downloaded(tmp_path)
     async with engine_answering({}) as client:
         described = await facts(tmp_path).describe(client)
-    assert described["answers"] is False and "models_loaded" not in described
+    assert described["answers"] is False
+    assert described["models_loaded"] == []
+    assert described["models_on_disk"] == [{"tag": REPO, "size_bytes": 2048}]
+
+
+async def test_a_download_in_progress_is_not_a_model_on_disk(tmp_path):
+    """Files without the fetch's completion marker are a download still under way. Counting
+    them would have the pool restart the engine on half a model."""
+    into = modelhub.directory_for(tmp_path, REPO)
+    into.mkdir(parents=True)
+    (into / "model.safetensors").write_bytes(b"w" * 1000)
+    async with engine_answering({}) as client:
+        described = await facts(tmp_path).describe(client)
+    assert described["models_on_disk"] == []
 
 
 async def test_a_tag_the_engine_serves_is_already_held(tmp_path):
@@ -262,9 +288,7 @@ async def test_a_tag_the_engine_serves_is_already_held(tmp_path):
 
 
 async def test_a_tag_on_disk_but_not_served_says_a_restart_is_what_is_missing(tmp_path):
-    into = modelhub.directory_for(tmp_path, REPO)
-    into.mkdir(parents=True)
-    (into / "model.safetensors").write_bytes(b"w")
+    downloaded(tmp_path)
 
     async with engine_answering({"/v1/models": {"data": []}}) as client:
         with pytest.raises(EngineRefused, match="restarted"):

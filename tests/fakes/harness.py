@@ -99,12 +99,15 @@ class EngineSpec:
     available: set[str] = dataclasses.field(default_factory=set)
     #: "pinned" or "on_demand" — the host's residency policy in the pool's configuration.
     residency: str = "pinned"
+    #: Which engine this machine runs: "ollama", or "vllm" for one that serves nothing until it
+    #: is started with models on disk (D97). Only for machines the pool rents.
+    engine: str = "ollama"
 
 
 @dataclasses.dataclass
 class RunningEngine:
     spec: EngineSpec
-    fake: FakeOllama
+    fake: Any
     server: ServerHandle
 
     @property
@@ -127,6 +130,7 @@ class PoolHarness:
         host_overrides: Optional[dict[str, dict[str, Any]]] = None,
         rentable: Optional[list[EngineSpec]] = None,
         rented: Optional[dict[str, Any]] = None,
+        pool_settings: Optional[dict[str, Any]] = None,
         delivery: Optional[dict[str, Any]] = None,
         extra_config: Optional[dict[str, Any]] = None,
     ):
@@ -177,10 +181,15 @@ class PoolHarness:
         self.rentable: dict[str, RunningEngine] = {}
         rentable_urls: list[str] = []
         for spec in rentable or []:
-            fake = FakeOllama(
-                resident=spec.resident, available=spec.available,
-                chunk_delay_s=spec.chunk_delay_s, chunks=spec.chunks,
-            )
+            if spec.engine == "vllm":
+                from .fake_vllm import FakeVllm
+
+                fake = FakeVllm()
+            else:
+                fake = FakeOllama(
+                    resident=spec.resident, available=spec.available,
+                    chunk_delay_s=spec.chunk_delay_s, chunks=spec.chunks,
+                )
             server = ServerHandle(fake.app, self.loop)
             self.rentable[spec.id] = RunningEngine(spec=spec, fake=fake, server=server)
             rentable_urls.append(server.base_url)
@@ -201,6 +210,7 @@ class PoolHarness:
                     "upstream_connect_timeout_s": upstream_connect_timeout_s,
                     "upstream_read_timeout_s": upstream_read_timeout_s,
                     **({"delivery": delivery} if delivery else {}),
+                    **(pool_settings or {}),
                 },
                 "auth": {"app_keys": [APP_KEY]},
                 "catalog": catalog or {},

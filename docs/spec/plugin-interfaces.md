@@ -182,29 +182,19 @@ interface had to accommodate:
 
 ### Starting vLLM on a host the pool creates
 
-The pool sends **numbers**, never a command (D41). It writes them into the host's engine
-environment file, and the host's own `engine_start` reads them — which is why the example below
-lives in an operator's configuration and not in the pool:
+An engine declares **`loads_by_restart`** when a downloaded model is served by starting it
+again rather than by asking it to load (D97), and may offer a **`default_start_command`** for
+hosts the pool creates. vLLM does both: with no `engine_start` configured, the pool's restart
+script runs the agent's own launcher,
 
-```yaml
-rented:
-  engine_start: |
-    D=$(ls -d /models/*/ | head -1); N=$(basename "$D" | sed 's|__|/|')
-    nohup vllm serve "$D" --served-model-name "$N" \
-      --host 127.0.0.1 --port 8000 \
-      --max-num-seqs "${GPM_VLLM_MAX_NUM_SEQS:-64}" \
-      --max-num-batched-tokens "${GPM_VLLM_MAX_NUM_BATCHED_TOKENS:-16384}" \
-      --max-model-len "${GPM_VLLM_MAX_MODEL_LEN:-32768}" \
-      --gpu-memory-utilization 0.90 >/var/log/vllm.log 2>&1 &
+```
+python3 /var/run/gpm/gpm-agent.pyz vllm-start --models-dir /opt/gpm/models --port 8000 [--proxy]
 ```
 
-Two things it does that are not obvious:
-
-- **It reads the model from disk rather than being told.** The agent fetched it and named the
-  directory after the repository, with the owner's `/` flattened to `__`; the command turns that
-  back into the served name. So the model's name never travels from the pool into a command.
-- **It binds loopback.** The pool reaches the engine through a forward into the machine, so
-  anything wider only exposes it (D77).
+which does nothing at boot (no models yet), and once the pool asks for the restart starts vLLM on
+what the agent fetched — reading numbers from the environment file the agent writes, and names
+from the directories it made, so no text from the pool reaches a command (D41). An operator may
+still set `engine_start`; one written for a *different* engine is refused at load.
 
 ### Choosing the build per machine
 

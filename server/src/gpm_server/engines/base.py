@@ -72,6 +72,19 @@ class Engine(Protocol):
     #: Where this engine listens by default, so a pool need not state a port it cannot choose.
     default_port: ClassVar[int] = 0
 
+    #: Whether a downloaded model is served by **starting the engine again** rather than by
+    #: asking the running engine to load it (D97). Such an engine cannot be told to load
+    #: anything; on a host the pool created, the pool restarts it once the models are on disk.
+    loads_by_restart: ClassVar[bool] = False
+
+    def default_start_command(
+        self, *, port: int, models_dir: str, agent_archive: str, proxy: bool
+    ) -> Optional[str]:
+        """How to start this engine on a host the pool creates, when the operator gave no
+        `engine_start` — or None to require one. It runs in the pool's own restart script,
+        after the settings file is loaded, and must return once the engine is on its way."""
+        return None
+
     #: Words that appear in an image built for this engine. Used only to catch a configuration
     #: that names one engine and an image built for a *different* one — a mistake that is not
     #: found until a machine has been rented, started, and never answered (D92). An image whose

@@ -33,9 +33,11 @@ from ..configplan import (
     RentedNow,
     StaleVersion,
     plan_changes,
+    set_in_list_item,
     set_values,
 )
 from ..contract import CONTRACT_VERSION
+from ..engines import available_engines
 from ..hostcheck import test_connection
 from ..keys import verify
 from ..ledger import LeaseRefused
@@ -315,6 +317,9 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                             "requires": list(variant.requires),
                             "runtime_class": variant.runtime_class,
                             "enforces_schema": variant.enforces_schema,
+                            # Which engine this build is for, or null for any (D93) — what the
+                            # engine editor shows and fills in.
+                            "engine": variant.engine,
                         }
                         for variant in entry.variants
                     ]
@@ -351,6 +356,15 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     "in_use": supervisor.config.engines_in_use(),
                     "proxy": bool(supervisor.config.rented and supervisor.config.rented.engine_proxy),
                     "models_per_host": supervisor.config.pool.models_per_host,
+                    # What the engine editor starts from (D98).
+                    "rented_models": (
+                        list(supervisor.config.rented.models)
+                        if supervisor.config.rented and supervisor.config.rented.models is not None
+                        else None
+                    ),
+                    "engine_start": supervisor.config.rented.engine_start if supervisor.config.rented else None,
+                    "image": supervisor.config.rented.image if supervisor.config.rented else None,
+                    "available": sorted(available_engines()),
                     "port": supervisor.config.engine_port(),
                     "images": (
                         [
@@ -563,11 +577,105 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     text = set_values(text, ("rented", section), wanted)
         except CannotEdit as exc:
             return _error(409, "cannot_edit", str(exc))
+        return _validate_plan_apply(text, version, body)
 
+    @app.patch("/pool/config/engine")
+    async def set_engine(request: Request) -> JSONResponse:
+        """Change which engine rented hosts run and how models are placed, in one write (D98).
+
+        These cannot be changed one at a time: an engine switched without its builds, images or
+        start command is a configuration that rents machines which can never serve, and the
+        load-time checks refuse every half-way state. So the whole of it arrives together, is
+        written into the file in place — comments and layout kept (D51) — then validated,
+        planned and confirmed exactly as every other change is.
+
+        Two things are done for the operator because getting them wrong is silent:
+
+        - a build written before the pool ran two engines names none, so any engine may be
+          offered it; it is marked as the pool's own engine's, so a vLLM host is never handed an
+          Ollama tag to fetch from a model hub;
+        - a configured host that held the whole set keeps it when the set is spread across hosts
+          — rather than silently dropping to the first model it can serve.
+        """
+        if store() is None:
+            return _error(400, "no_config_file", "this pool was not started from a file")
+        body = await request.json()
+        config = supervisor.config
+        rented_engine = body.get("rented_engine")
+        placement = body.get("placement")
+        if rented_engine not in available_engines():
+            return _error(400, "bad_engine", f"rented_engine must be one of {sorted(available_engines())}")
+        if placement not in ("all", "all_proxy", "declared"):
+            return _error(400, "bad_placement", "placement must be 'all', 'all_proxy' or 'declared'")
+        if config.rented is None:
+            return _error(400, "cannot_rent", "this pool has no rented capacity to configure")
+
+        text, version = store().read()
+        try:
+            per_host = "declared" if placement == "declared" else "all"
+            text = set_values(text, ("pool",), {"models_per_host": per_host})
+
+            rented: dict[str, Any] = {
+                "engine": rented_engine,
+                "engine_proxy": placement == "all_proxy",
+                "models": list(body.get("rented_models") or []) if per_host == "declared" else None,
+            }
+            if "engine_start" in body:
+                # Blank means "the engine's own start" (D97), which the file says as null.
+                rented["engine_start"] = (body["engine_start"] or "").strip() or None
+            if body.get("image"):
+                rented["image"] = body["image"]
+            if "images" in body:
+                rented["images"] = [
+                    {k: v for k, v in item.items() if k in ("image", "min_driver", "note") and v not in (None, "")}
+                    for item in body.get("images") or []
+                ]
+            text = set_values(text, ("rented",), rented)
+
+            builds = body.get("builds") or {}
+            for name in config.pool.model_set:
+                build = (builds.get(name) or "").strip()
+                entry = config.catalog.get(name)
+                had_entry = entry is not None
+                before = [v.model_dump(exclude_defaults=True) for v in entry.variants] if entry else []
+                if had_entry:
+                    # Builds that name no engine were written for the pool's own; say so.
+                    variants = [v | {"engine": v.get("engine") or config.engine} for v in before]
+                else:
+                    # A model with no catalog entry is served under its own name; keep that,
+                    # for the engine it was written for.
+                    variants = [{"tag": name, "engine": config.engine}]
+                if build:
+                    variants = [v for v in variants if v.get("engine") != rented_engine]
+                    variants.append({"tag": build, "engine": rented_engine})
+                if had_entry and variants == before:
+                    continue  # nothing about this model changes
+                if not had_entry and not build:
+                    continue  # no entry, and nothing to add to one
+                if had_entry:
+                    text = set_values(text, ("catalog", name), {"variants": variants})
+                else:
+                    try:
+                        text = set_values(text, ("catalog",), {name: {"variants": variants}})
+                    except CannotEdit:
+                        text = set_values(text, (), {"catalog": {name: {"variants": variants}}})
+
+            for host in config.hosts:
+                if per_host == "declared" and host.models is None:
+                    held = config.models_held_by(host)
+                    text = set_in_list_item(text, "hosts", "id", host.id, {"models": held})
+                elif per_host == "all" and host.models is not None:
+                    text = set_in_list_item(text, "hosts", "id", host.id, {"models": None})
+        except CannotEdit as exc:
+            return _error(409, "cannot_edit", str(exc))
+        return _validate_plan_apply(text, version, body)
+
+    def _validate_plan_apply(text: str, version: str, body: dict) -> JSONResponse:
+        """The path every edit takes: validated, planned, and applied only if nothing that
+        loosens a limit is unconfirmed."""
         errors = store().validate(text)
         if errors:
             return _error(400, "invalid_config", "; ".join(errors))
-
         candidate = store().parse(text)
         changes = plan_changes(supervisor.config, candidate, rented_now(), machines_now())
         loosening = [c for c in changes if c.requires_retype]

@@ -136,8 +136,12 @@ class ModelWork:
         state = await self.engine.describe(self.client)
         on_disk = {m["tag"]: m.get("size_bytes") for m in state.get("models_on_disk", [])}
         loaded = set(state.get("models_loaded", []))
+        restarts = bool(getattr(self.engine, "loads_by_restart", False))
         return {
             "engine_answers": bool(state.get("answers")),
+            # An engine that serves only what it was started with picks up a downloaded model
+            # when it is started again (D97). The pool reads this and asks for the restart.
+            "loads_by_restart": restarts,
             "residency": self.desired.residency,
             "busy": any(
                 task is not None and not task.done() for task in (self._task, self._loading)
@@ -152,6 +156,9 @@ class ModelWork:
                     "loaded": tag in loaded,
                     "pinned_by_agent": tag in self.pinned_by_agent,
                     "pulling": dict(self.pulling) if self.pulling and self.pulling["tag"] == tag else None,
+                    # Downloaded, and waiting for the engine to be started with it — the normal
+                    # state of such an engine between its fetch and its restart, not a failure.
+                    "awaiting_restart": restarts and tag in on_disk and tag not in loaded,
                     "error": self.errors[tag][1] if tag in self.errors else None,
                 }
                 for tag in self.desired.tags
@@ -169,10 +176,22 @@ class ModelWork:
 
     async def _work(self) -> None:
         state = await self.engine.describe(self.client)
-        if not state.get("answers"):
+        fetches_alone = bool(getattr(self.engine, "fetches_without_engine", False))
+        if not state.get("answers") and not fetches_alone:
             return
-        on_disk = {m["tag"] for m in state["models_on_disk"]}
-        loaded = set(state["models_loaded"])
+        on_disk = {m["tag"] for m in state.get("models_on_disk", [])}
+        loaded = set(state.get("models_loaded", []))
+
+        if getattr(self.engine, "loads_by_restart", False):
+            # Fetch, and nothing more (D97). Such an engine cannot be asked to load a model while
+            # it runs — it serves what it was started with — so "holding" is not something this
+            # agent does to it. Trying would only record a refusal the pool would read as a
+            # failed host, which is how a machine with every model safely downloaded used to be
+            # destroyed. The pool sees what is on disk and asks for the engine to be restarted.
+            for tag in self.desired.tags:
+                if tag not in on_disk and self._may_retry(tag):
+                    await self._pull(tag)
+            return
 
         def wants_loading(tag: str) -> bool:
             return (

@@ -59,6 +59,7 @@ const api = {
   testHost: (host) => call("POST", "/pool/hosts/test", host),
   hostDetail: (id) => call("GET", `/pool/hosts/${encodeURIComponent(id)}`),
   setSearch: (body) => call("PATCH", "/pool/config/rented", body),
+  setEngine: (body) => call("PATCH", "/pool/config/engine", body),
   restartEngine: (hostId, applySettings) =>
     call("POST", `/pool/hosts/${hostId}/engine/restart`, { confirm: hostId, apply_settings: applySettings }),
   deleteModel: (hostId, tag) => call("POST", `/pool/hosts/${hostId}/models/delete`, { tag, confirm: tag }),
@@ -627,6 +628,7 @@ screens.rented = async (status) => {
     ),
     ...searchSection(market),
     ...allocationSection(market),
+    ...engineSection(status),
     ...teardownSection(market),
     ...marketSection(market),
     el("h2", {}, "Rented and parked hosts"),
@@ -816,6 +818,188 @@ function enginePanel(engine) {
     el("p", { class: "muted" }, images.length > 1
       ? "A machine is rented with the first build its driver can run; one that can run none is refused before it is bid on."
       : "One build for every machine. The driver floor in the search is what keeps an unusable machine out."));
+}
+
+// Which engine rented hosts run, and how the pool's models are placed on them (D98). One write,
+// because none of these can change alone: an engine switched without its builds, images or start
+// command rents machines that can never serve — and the file refuses every half-way state.
+const engineEdit = { draft: null, message: "" };
+
+// Suggested vLLM builds of the engine, newest first: a machine gets the first its driver runs (D92).
+const VLLM_IMAGE_SUGGESTIONS = [
+  { image: "vastai/vllm:v0.29.0-cuda-13.0", min_driver: "580", note: "newest; needs a recent driver" },
+  { image: "vastai/vllm:v0.29.0-cuda-12.9", min_driver: "550", note: "for older drivers" },
+];
+
+const PLACEMENTS = [
+  ["all", "every host holds every model — one engine process",
+   (engine) => engine === "vllm" ? "vLLM serves one model per process; choose one of the other two" : null],
+  ["all_proxy", "every host holds every model — one vLLM per model, behind a router on the machine",
+   (engine) => engine !== "vllm" ? "only for vLLM; Ollama already holds several models in one process" : null],
+  ["declared", "one model per host — a pool of hosts for each model", () => null],
+];
+
+function engineDraft(status) {
+  const e = status.engine || {};
+  const rented = e.rented || e.name || "ollama";
+  const placement = e.models_per_host === "declared" ? "declared" : (e.proxy ? "all_proxy" : "all");
+  const builds = {};
+  for (const name of status.model_set || []) {
+    const hit = ((status.catalog || {})[name] || []).find((v) => v.engine === rented);
+    builds[name] = hit ? hit.tag : "";
+  }
+  const images = (e.images || []).filter((i) => i.min_driver);
+  return {
+    rented, placement, builds,
+    rented_models: e.rented_models || [],
+    images: images.length ? images.map((i) => ({ ...i })) : null,
+    image: e.image || "",
+    engine_start: e.engine_start || "",
+  };
+}
+
+function engineSection(status) {
+  if (!status.engine || !status.provider) return [];
+  if (!engineEdit.draft) engineEdit.draft = engineDraft(status);
+  const box = el("div", { class: "panel" });
+  const draw = () => {
+    box.replaceChildren(...engineRows(status, box, draw));
+  };
+  draw();
+  return [el("h2", {}, "Engine and placement on rented hosts"), box];
+}
+
+function engineRows(status, box, draw) {
+  const d = engineEdit.draft;
+  const available = (status.engine.available || ["ollama"]);
+  const vllm = d.rented === "vllm";
+  const invalid = Object.fromEntries(PLACEMENTS.map(([v, , why]) => [v, why(d.rented)]));
+  // When the engine rules out the current placement, land on a model to a host: each engine
+  // then has the whole card, which is where a batching engine's throughput comes from.
+  if (invalid[d.placement]) d.placement = !invalid.declared ? "declared" : PLACEMENTS.find(([v]) => !invalid[v])[0];
+
+  const engineSelect = el("select", { onchange: (ev) => {
+    d.rented = ev.target.value;
+    // Offer what the chosen engine needs, starting from what the pool already has for it.
+    const fresh = engineDraft({ ...status, engine: { ...status.engine, rented: d.rented } });
+    d.builds = fresh.builds;
+    if (d.rented === "vllm") {
+      d.images = d.images || VLLM_IMAGE_SUGGESTIONS.map((i) => ({ ...i }));
+      if (/ollama/i.test(d.engine_start)) d.engine_start = "";
+    }
+    draw();
+  } }, ...available.map((name) => el("option", { value: name, ...(d.rented === name ? { selected: true } : {}) }, name)));
+
+  const placementSelect = el("select", { onchange: (ev) => { d.placement = ev.target.value; draw(); } },
+    ...PLACEMENTS.map(([value, label]) => el("option", {
+      value, ...(d.placement === value ? { selected: true } : {}), ...(invalid[value] ? { disabled: true } : {}),
+    }, invalid[value] ? `${label} (${invalid[value]})` : label)));
+
+  const rows = [
+    configRow("engine", "rented engine", { control: engineSelect },
+      "what the machines this pool buys run; hosts you configured keep their own"),
+    configRow("placement", "placement", { control: placementSelect },
+      d.placement === "all_proxy" ? "each machine's memory is split between the models, so the largest gets less cache than it would alone"
+        : d.placement === "declared" ? "the pool buys a machine for whichever model is short, and never takes the last one serving a model"
+        : "any ready host serves any request"),
+  ];
+
+  if (d.placement === "declared") {
+    const boxes = (status.model_set || []).map((name) => {
+      const input = el("input", { type: "checkbox", ...(d.rented_models.includes(name) ? { checked: true } : {}),
+        onchange: (ev) => {
+          d.rented_models = ev.target.checked ? [...d.rented_models, name] : d.rented_models.filter((m) => m !== name);
+          draw();  // a model now rented for needs its build asked for, one no longer does not
+        } });
+      return el("label", { class: "row" }, input, el("span", { class: "mono" }, name));
+    });
+    rows.push(configRow("rented_models", "rent hosts for", { control: el("div", {}, ...boxes) },
+      "models your configured hosts hold need not be rented for; a model nobody holds is refused on save"));
+  }
+
+  const renting = d.placement === "declared" ? d.rented_models : (status.model_set || []);
+  for (const name of status.model_set || []) {
+    if (d.placement === "declared" && !renting.includes(name)) continue;
+    const input = el("input", { type: "text", style: "width:22rem", value: d.builds[name] || "",
+      placeholder: vllm ? "owner/name of the model on the hub" : "the engine's tag for this model",
+      oninput: (ev) => { d.builds[name] = ev.target.value; } });
+    rows.push(configRow(`build ${name}`, `${d.rented} build of ${name}`, { control: input },
+      vllm ? "the repository vLLM fetches — the same model under the name this engine knows it by"
+        : "blank keeps what the catalog already has"));
+  }
+
+  if (vllm) {
+    const list = el("div", {}, ...(d.images || []).map((img, i) => el("div", { class: "row" },
+      el("input", { type: "text", style: "width:18rem", value: img.image,
+        oninput: (ev) => { d.images[i].image = ev.target.value; } }),
+      el("span", { class: "muted" }, "driver ≥"),
+      el("input", { type: "text", style: "width:5rem", value: img.min_driver,
+        oninput: (ev) => { d.images[i].min_driver = ev.target.value; } }),
+      el("button", { class: "small", onclick: () => { d.images.splice(i, 1); draw(); } }, "Remove"))),
+      el("button", { class: "small", onclick: () => { d.images.push({ image: "", min_driver: "" }); draw(); } }, "Add a build"));
+    rows.push(configRow("images", "images, newest first", { control: list },
+      "a machine gets the first its driver can run; one that can run none is never bid on"));
+  } else {
+    rows.push(configRow("image", "image", { control: el("input", { type: "text", style: "width:18rem", value: d.image,
+      oninput: (ev) => { d.image = ev.target.value; } }) }, "pinned, never a floating tag"));
+  }
+
+  rows.push(configRow("engine_start", "start command", {
+    control: el("input", { type: "text", style: "width:26rem", value: d.engine_start,
+      placeholder: vllm ? "blank: the agent's own vllm-start (recommended)" : "how the image's engine is started, if it does not start itself",
+      oninput: (ev) => { d.engine_start = ev.target.value; } }),
+  }, vllm ? "blank lets the pool start vLLM on what its agent downloaded" : "runs after the dead-man timer is armed"));
+
+  const note = el("span", { class: "muted" }, engineEdit.message);
+  return [
+    el("table", {}, el("tbody", {}, ...rows)),
+    el("div", { class: "row" },
+      el("button", { class: "primary", onclick: (ev) => saveEngine(ev, note) }, "Save to configuration"),
+      el("button", { class: "small", onclick: () => { engineEdit.draft = engineDraft(status); engineEdit.message = ""; draw(); } }, "Reset"),
+      note),
+    el("p", { class: "muted" }, "Saved as one change to the file, with its comments kept. Hosts already running keep what they were started with; new ones use this."),
+  ];
+}
+
+async function saveEngine(event, note) {
+  const d = engineEdit.draft;
+  const body = {
+    rented_engine: d.rented, placement: d.placement,
+    rented_models: d.placement === "declared" ? d.rented_models : [],
+    builds: Object.fromEntries(Object.entries(d.builds).filter(([, tag]) => (tag || "").trim())),
+    engine_start: d.engine_start,
+  };
+  if (d.rented === "vllm") body.images = (d.images || []).filter((i) => (i.image || "").trim());
+  else { body.images = []; if ((d.image || "").trim()) body.image = d.image.trim(); }
+  const button = event.target;
+  button.disabled = true;
+  try {
+    let answer;
+    try {
+      answer = await api.setEngine(body);
+    } catch (error) {
+      const changes = error.changes || [];
+      const retype = changes.find((c) => c.requires_retype);
+      if (!retype) throw error;
+      const ok = await confirmAction({
+        title: "This loosens a limit",
+        body: el("div", {}, ...changes.map((c) => el("p", {}, c.detail))),
+        retype: retype.value,
+      });
+      if (!ok) return;
+      answer = await api.setEngine({ ...body, confirm: retype.value });
+    }
+    engineEdit.draft = null;
+    engineEdit.message = ` saved · ${(answer.changes || []).length} change(s) applied`;
+    note.textContent = engineEdit.message;
+    await refresh();
+  } catch (error) {
+    // The file's own rules say what is wrong, in words written for an operator.
+    engineEdit.message = ` not saved: ${error.message}`;
+    note.textContent = engineEdit.message;
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function teardownSection(market) {

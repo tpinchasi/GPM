@@ -771,6 +771,7 @@ class PoolConfig(BaseModel):
         if unknown:
             raise ValueError(f"catalog names not in the pool's model set: {sorted(unknown)}")
         self._engine_can_hold_what_the_pool_asks()
+        self._rented_hosts_have_a_build_of_what_they_rent_for()
         self._images_are_built_for_this_engine()
         self._hosts_can_serve_what_they_are_asked_for()
         self._declared_models_are_in_the_set()
@@ -918,6 +919,35 @@ class PoolConfig(BaseModel):
                     f"accelerator's memory between them."
                 )
 
+    def _rented_hosts_have_a_build_of_what_they_rent_for(self) -> None:
+        """Every model the pool may rent a host for needs a build that host's engine can serve.
+
+        Otherwise the host is prepared for nothing and called ready holding nothing — no error,
+        no event, just a model that is never served however many machines are bought for it.
+        The same model is a plain tag to one engine and a model-hub repository to another, so a
+        pool that changes its rented engine has to say what the new one should fetch (D98).
+        """
+        if self.rented is None:
+            return
+        engine = self.rented_engine()
+        caps = set(self.rented.capabilities)
+        missing = []
+        for name in self._rented_models():
+            entry = self.catalog.get(name)
+            if entry is None:
+                continue  # served under its own name, by any engine
+            if not any(
+                set(v.requires) <= caps and (v.engine is None or v.engine == engine)
+                for v in entry.variants
+            ):
+                missing.append(name)
+        if missing:
+            raise ValueError(
+                f"rented hosts run {engine!r}, and the catalog has no build of {missing} for it "
+                f"(with capabilities {sorted(caps)}). Add a variant with `engine: {engine}` — for "
+                f"vLLM, the model's repository on the hub — or stop renting for those models."
+            )
+
     def _rented_models(self) -> list[str]:
         """What a rented host is asked to hold: the pool's whole set, or what `rented.models`
         names where the set is spread across hosts."""
@@ -999,6 +1029,19 @@ class PoolConfig(BaseModel):
                 others[name] = get_engine(name).image_words
             except EngineNotFound:
                 continue
+        # A start command written for another engine is the same mistake by another route: it
+        # runs the wrong server inside the right image (D97). A pool that switched its rented
+        # hosts to vLLM and kept `nohup ollama serve` would do exactly that.
+        start = (self.rented.engine_start or "").lower()
+        if start and not any(word in start for word in mine.image_words):
+            for other, words in others.items():
+                if any(word in start for word in words):
+                    raise ValueError(
+                        f"rented hosts run {self.rented_engine()!r}, but rented.engine_start "
+                        f"starts {other!r}. Remove engine_start to use {self.rented_engine()!r}'s "
+                        f"own start, or write one for it."
+                    )
+
         # `images` replaces `image`, so only what would actually be used is checked — the
         # unused default must not refuse a configuration that never names it.
         named = [i.image for i in self.rented.images] or [self.rented.image]
@@ -1060,4 +1103,24 @@ def load_config(path: str | Path) -> PoolConfig:
     try:
         return PoolConfig.model_validate(raw)
     except Exception as exc:  # pydantic ValidationError, or a ValueError from a validator
-        raise ConfigError(f"{path} is not a usable pool configuration:\n{exc}") from exc
+        problems = "\n".join(f"  - {line}" for line in operator_lines(exc))
+        raise ConfigError(f"{path} is not a usable pool configuration:\n{problems}") from exc
+
+
+def operator_lines(exc: Exception) -> list[str]:
+    """Each problem as one sentence an operator can act on, and where in the file it is.
+
+    Pydantic's own text is written for the programmer: an error count, a type code, the whole
+    offending input echoed back, and a link to its documentation — with the one sentence that
+    matters somewhere in the middle. Seen in the console, where a refused engine switch showed
+    exactly that.
+    """
+    errors = getattr(exc, "errors", None)
+    if not callable(errors):
+        return [str(exc)]
+    lines = []
+    for error in errors():
+        message = str(error.get("msg", "")).removeprefix("Value error, ")
+        where = ".".join(str(part) for part in error.get("loc", ()) if part != "__root__")
+        lines.append(f"{where}: {message}" if where else message)
+    return lines or [str(exc)]

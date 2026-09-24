@@ -671,7 +671,10 @@ class Supervisor:
 
             health = await self.engine_for(host).health(client)
             if not health.ok:
-                host.mark_preparing()
+                if self.engine_for(host).loads_by_restart:
+                    await self._bring_up_through_its_agent(host_id, host, client)
+                else:
+                    host.mark_preparing()
                 continue
 
             if host.agent is None:
@@ -708,7 +711,10 @@ class Supervisor:
                 )
                 await self.fleet.destroy(host, "its engine could not use the accelerator")
                 continue
-            required = self._rented_required_tags()
+            # What *this* host was bought for — not everything the pool rents for. With a model
+            # to a host (D94), no single host holds the whole rented set, and judging each by it
+            # would leave every one of them preparing for ever.
+            required = self.fleet.tags_for(host)
             if host.state == "ready" and (required & host.resident) - resident:
                 # It held the set and no longer does: the engine ran out of memory for what it
                 # was asked to keep, which is the clearest evidence a host has too many
@@ -729,6 +735,36 @@ class Supervisor:
                     self._prepare_rented(host_id, client), name=f"prepare:{host_id}"
                 )
 
+    #: How long between agent install attempts on a host whose engine cannot answer yet (D97).
+    AGENT_SPACING_S = 30.0
+
+    async def _bring_up_through_its_agent(self, host_id: str, host: Any, client: httpx.AsyncClient) -> None:
+        """Prepare a host whose engine cannot answer until its models are on disk (D97).
+
+        Every other host is proven up by its engine answering: that is when the pool installs
+        its agent and starts preparing. An engine that serves only what it was started with
+        answers nothing until the agent has fetched its weights — so waiting for it would wait
+        for ever, and the host would be given up as never having started. Here the **agent**
+        answering is the proof: it only runs once the image is up and its filesystem usable.
+        """
+        host.mark_preparing()
+        if host.agent is None:
+            now = time.time()
+            if host.agent_tried_at is not None and now - host.agent_tried_at < self.AGENT_SPACING_S:
+                return  # a machine still settling is given time, not every attempt at once
+            host.agent_tried_at = now
+            await self.fleet.install_agent(host)
+            if host.agent is None:
+                return
+            await self.fleet.ask_agent(host)
+        if host.engine_seen_at is None:
+            # It has started: its agent answers from it. "Never started" is over.
+            host.engine_seen_at = time.time()
+        if host_id not in self._preparing:
+            self._preparing[host_id] = asyncio.create_task(
+                self._prepare_rented(host_id, client), name=f"prepare:{host_id}"
+            )
+
     async def _prepare_rented(self, host_id: str, client: httpx.AsyncClient) -> None:
         assert self.fleet is not None
         host = self.fleet.hosts.get(host_id)
@@ -747,7 +783,18 @@ class Supervisor:
                 return  # still coming; the next pass asks again
             if through_agent:
                 return
-            loaded = await self.fleet.load_model_set(host, self.engine, client)
+            engine = self.engine_for(host)
+            if engine.loads_by_restart:
+                # Nothing but the agent can fetch for this engine (D90): its own API has no pull.
+                # An agent not answering yet is waited for; one the pool has stopped trying to
+                # install means this host can never serve, and is given up saying why.
+                if host.agent is None and host.agent_attempts >= self.config.rented.agent_attempts:
+                    await self.fleet.destroy(
+                        host, "no agent could be installed, and nothing else can fetch this engine's models"
+                    )
+                return
+            # The host's own engine, not the pool's default (D93): the two can differ.
+            loaded = await self.fleet.load_model_set(host, engine, client)
             if not loaded:
                 await self.fleet.destroy(host, "could not hold the pool's model set")
         except Exception:  # noqa: BLE001 - recorded; the host stays preparing and is retried

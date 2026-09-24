@@ -30,6 +30,14 @@ class OllamaEngine:
     name: ClassVar[str] = "ollama"
     default_port: ClassVar[int] = 11434
     image_words: ClassVar[tuple[str, ...]] = ("ollama",)
+    loads_by_restart: ClassVar[bool] = False
+
+    def default_start_command(
+        self, *, port: int, models_dir: str, agent_archive: str, proxy: bool
+    ) -> Optional[str]:
+        """None: images of this engine start it themselves, and where a provider's launch mode
+        skips that, the operator's `engine_start` names the image's own way (D71)."""
+        return None
 
     def inference_paths(self) -> set[str]:
         """Both surfaces: this engine's own API, and the OpenAI-shaped one it also serves.

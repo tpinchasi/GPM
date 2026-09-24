@@ -247,3 +247,21 @@ def test_ollama_keeps_serving_its_own_api_as_well():
     """Apps written against the native paths keep working; nothing translates between the two."""
     assert {"/api/chat", "/api/generate", "/api/embed"} <= ollama.inference_paths()
     assert openai_api.INFERENCE_PATHS <= ollama.inference_paths()
+
+
+def test_every_operation_the_engine_interface_names_is_implemented():
+    """Found by running a rented vLLM host end to end: the pool called an operation this
+    adapter had never defined. A protocol's defaults are not inherited, so each adapter must
+    define every operation itself — checked here for every shipped one."""
+    import ast
+    import pathlib
+
+    import gpm_server.engines as engines
+
+    root = pathlib.Path(engines.__file__).parent
+    base = ast.parse((root / "base.py").read_text())
+    protocol = next(n for n in base.body if isinstance(n, ast.ClassDef) and n.name == "Engine")
+    wanted = {f.name for f in protocol.body if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    for adapter in (OllamaEngine, VllmEngine):
+        missing = sorted(name for name in wanted if not hasattr(adapter, name))
+        assert not missing, f"{adapter.__name__} lacks {missing}"

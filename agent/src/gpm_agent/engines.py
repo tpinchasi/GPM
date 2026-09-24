@@ -19,6 +19,10 @@ from . import modelhub
 
 class OllamaFacts:
     name = "ollama"
+    #: This engine fetches through its own API, so there is nothing to fetch with until it runs.
+    fetches_without_engine = False
+    #: A model is loaded by asking the running engine to load it.
+    loads_by_restart = False
 
     def __init__(self, settings: Any = None) -> None:
         #: Unused here — this engine answers every question about itself over its own API.
@@ -184,13 +188,20 @@ class VllmFacts:
     """
 
     name = "vllm"
+    #: Weights come from a hub, not through the engine — and the engine cannot run until they
+    #: are here. An agent that waited for this engine to answer before fetching would wait
+    #: forever on a machine that has just booted (D97).
+    fetches_without_engine = True
+    #: A model is "loaded" by starting the engine again with it on disk. The agent fetches and
+    #: reports; the pool, seeing a model downloaded and not yet served, asks for the restart.
+    loads_by_restart = True
 
     def __init__(self, settings: Any = None) -> None:
         self.settings = settings
 
     @property
     def _models_dir(self) -> str:
-        return getattr(self.settings, "models_path", None) or "~/.cache/gpm-models"
+        return getattr(self.settings, "models_path", None) or "~/gpm-models"
 
     async def describe(self, client: httpx.AsyncClient) -> dict[str, Any]:
         """What this engine is serving, and what is on disk waiting for a restart.
@@ -198,6 +209,10 @@ class VllmFacts:
         The two are different sets here, and reporting them as one would hide the state a vLLM
         host spends its whole preparation in: weights present, engine not yet serving them.
         """
+        # What is on disk is known whether or not the engine runs — and on a machine that has
+        # just booted it does not, because it has nothing to serve yet. Reporting nothing then
+        # would hide the one fact that decides what happens next.
+        on_disk = self._on_disk()
         try:
             version = (await client.get("/version")).json().get("version")
         except (httpx.HTTPError, ValueError):
@@ -205,12 +220,15 @@ class VllmFacts:
         try:
             served = (await client.get("/v1/models")).raise_for_status().json().get("data", [])
         except (httpx.HTTPError, ValueError) as exc:
-            return {"name": self.name, "answers": False, "detail": str(exc) or type(exc).__name__}
+            return {
+                "name": self.name, "answers": False, "detail": str(exc) or type(exc).__name__,
+                "models_on_disk": on_disk, "models_loaded": [],
+            }
         return {
             "name": self.name,
             "answers": True,
             "version": version,
-            "models_on_disk": self._on_disk(),
+            "models_on_disk": on_disk,
             "models_loaded": sorted(
                 entry["id"] for entry in served if isinstance(entry, dict) and entry.get("id")
             ),
@@ -221,9 +239,15 @@ class VllmFacts:
         found = []
         if not root.is_dir():
             return found
-        for directory in sorted(p for p in root.iterdir() if p.is_dir()):
-            size = sum(f.stat().st_size for f in directory.rglob("*") if f.is_file())
-            found.append({"tag": directory.name.replace("__", "/"), "size_bytes": size})
+        for directory in sorted(p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")):
+            if not (directory / modelhub.COMPLETE_MARKER).exists():
+                continue  # a download in progress is not a model on disk
+            # The model's own files; the fetch's bookkeeping is not part of what was downloaded.
+            size = sum(
+                f.stat().st_size for f in directory.rglob("*")
+                if f.is_file() and not f.name.startswith(".")
+            )
+            found.append({"tag": directory.name.replace("__", "/", 1), "size_bytes": size})
         return found
 
     async def pull(self, client: httpx.AsyncClient, tag: str) -> AsyncIterator[tuple[int, int]]:

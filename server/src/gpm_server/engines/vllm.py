@@ -16,6 +16,7 @@ What is different about this engine, and why the adapter looks the way it does:
 from __future__ import annotations
 
 import re
+import shlex
 from typing import ClassVar, Optional
 
 import httpx
@@ -48,6 +49,26 @@ class VllmEngine:
     serves_one_model: ClassVar[bool] = True
     default_port: ClassVar[int] = 8000
     image_words: ClassVar[tuple[str, ...]] = ("vllm",)
+    #: It serves what it was started with; a downloaded model is picked up by starting it again.
+    loads_by_restart: ClassVar[bool] = True
+
+    def default_start_command(
+        self, *, port: int, models_dir: str, agent_archive: str, proxy: bool
+    ) -> Optional[str]:
+        """The agent's own launcher, from its archive (D97).
+
+        At boot neither the archive nor any model is on the machine yet — the agent is pushed
+        later and fetches afterwards — so this does nothing then, successfully. The pool calls
+        the same script again once the models are on disk, and it starts vLLM for them: one
+        process, or one per model behind the router when `proxy` is set.
+        """
+        command = (
+            f"python3 {shlex.quote(agent_archive)} vllm-start "
+            f"--models-dir {shlex.quote(models_dir)} --port {int(port)}"
+        )
+        if proxy:
+            command += " --proxy"
+        return f"if [ -f {shlex.quote(agent_archive)} ]; then {command}; fi"
 
     # --- request path: the shared protocol, not this engine's invention ---
 
@@ -124,6 +145,11 @@ class VllmEngine:
         if cache is None:
             cache = number("vllm:gpu_cache_usage_perc")
         return Occupancy(running=int(running), waiting=int(waiting), cache_used=cache)
+
+    async def serving_from_cpu(self, client: httpx.AsyncClient) -> Optional[frozenset[str]]:
+        """None: this engine reports no per-model placement to ask. The driver floor and the
+        per-machine choice of build (D81, D92) are what keep it off a card it cannot use."""
+        return None
 
     async def models_resident(self, client: httpx.AsyncClient) -> frozenset[str]:
         """Everything this engine serves is resident: it is launched with its model and holds it
