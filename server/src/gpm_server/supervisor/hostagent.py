@@ -40,6 +40,14 @@ MODELS_DIR = "/opt/gpm/models"
 
 _KEY = re.compile(r"\b(gpmg_[0-9a-f]{64})\b")
 
+#: The agent's own process, and nothing else on the machine. Anchored to an interpreter as the
+#: first word: the shell that runs the install command carries the whole command in its own
+#: command line — including the very `python3 … gpm-agent.pyz … serve` it is about to start —
+#: and `pkill -f` on Linux matches that shell and kills it (found live: the install ended with
+#: the provider's banner and nothing else, three times). Writing `[.]` protects only against
+#: the pattern matching its own text; the anchor is what keeps it off the shell.
+AGENT_PROCESS = "^[^ ]*python3 [^ ]*gpm-agent[.]pyz .*serve"
+
 
 @dataclasses.dataclass
 class RentedAgent:
@@ -133,12 +141,13 @@ async def install(
     # kept no secret, minted a new key — is stopped first. Found live: the old one kept the
     # port, the new one never bound, the check found the old one and said "started", and the
     # pool spent the host's whole life being refused by an agent holding the previous key.
-    # The patterns are written so they do not match the shell that runs them.
+    # The pattern names the agent's process and cannot match the shell that runs it
+    # (`AGENT_PROCESS`); a BSD `pkill` spares its ancestors, a Linux one does not.
     code, output = await run(
-        f"pkill -f 'gpm-agent[.]pyz.*serve' 2>/dev/null; sleep 0.5; "
+        f"pkill -f '{AGENT_PROCESS}' 2>/dev/null; sleep 0.5; "
         f"(setsid nohup python3 {ARCHIVE} -c {SETTINGS} serve "
         f">{REMOTE_DIR}/agent.log 2>&1 &) ; sleep 1; "
-        f"kill -0 $(pgrep -f 'gpm-agent[.]pyz.*serve' | head -1) 2>/dev/null && echo started"
+        f"kill -0 $(pgrep -f '{AGENT_PROCESS}' | head -1) 2>/dev/null && echo started"
     )
     if code != 0 or "started" not in output:
         raise AgentInstallFailed(f"the agent did not start: {output.strip()[:200]}")

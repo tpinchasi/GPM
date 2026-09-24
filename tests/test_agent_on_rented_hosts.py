@@ -235,9 +235,21 @@ def test_an_agent_already_running_is_stopped_before_the_new_one_starts(archive):
     minted a new key and started a second agent — which never bound the port the old one held.
     The check found the old one, said "started", and the pool was refused for the host's whole
     life. The old agent goes first; and the patterns must not match the shell running them."""
+    import re
+
     host = FakeHost()
     install(host, archive)
     starting = next(c for c in host.commands if " serve" in c)
-    assert starting.index("pkill -f 'gpm-agent[.]pyz.*serve'") < starting.index("nohup python3")
-    assert "pgrep -f 'gpm-agent[.]pyz.*serve'" in starting
-    assert "pgrep -f 'gpm-agent.pyz" not in starting, "a pattern that matches its own shell"
+    pattern = hostagent.AGENT_PROCESS
+    assert starting.index(f"pkill -f '{pattern}'") < starting.index("nohup python3")
+    assert f"pgrep -f '{pattern}'" in starting
+    # The shell running the command carries the whole command — the real `python3 … serve`
+    # included — in its own command line, and a Linux `pkill -f` matches its parent. Found
+    # live: the shell killed itself, the agent never started, and the install answered with
+    # the provider's banner alone. (A BSD `pkill` spares its ancestors, so a test that ran the
+    # command on a developer's Mac would have passed.)
+    for shell in ("bash -c ", "sh -c ", "/bin/bash -c "):
+        assert not re.search(pattern, shell + starting), "the pattern matches the shell running it"
+    assert re.search(pattern, f"python3 {hostagent.ARCHIVE} -c {hostagent.SETTINGS} serve")
+    assert re.search(pattern, f"/usr/bin/python3 {hostagent.ARCHIVE} -c {hostagent.SETTINGS} serve")
+    assert not re.search(pattern, f"python3 {hostagent.ARCHIVE} -c {hostagent.SETTINGS} init --port 1")
