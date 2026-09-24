@@ -171,7 +171,8 @@ def test_a_host_asked_for_a_build_its_platform_cannot_run_is_refused():
             hosts=[{"id": "cuda-1", "kind": "local", "workers": 1, "models": [BIG],
                     "capabilities": ["cuda"],
                     "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}}],
-            rented=rented(),
+            # Rented hosts rent for the others, so the configured host is the only problem.
+            rented=rented(models=[SMALL, EMBED]),
         )
 
 
@@ -200,3 +201,16 @@ def test_that_same_engine_is_fine_once_the_set_is_spread():
 
 def test_the_first_engine_holds_the_whole_set_as_it_always_did():
     assert config(engine="ollama").pool.models_per_host == "all"
+
+
+def test_rented_hosts_with_no_build_of_a_model_they_rent_for_are_refused():
+    """Otherwise the host is prepared for nothing and called ready holding nothing — a model
+    never served however many machines are bought for it (D98)."""
+    with pytest.raises(ValueError, match="no build of"):
+        config(
+            pool={"models_per_host": "declared"},
+            catalog={BIG: {"variants": [{"tag": "gemma4:26b", "engine": "ollama"}]}},
+            hosts=[{"id": "laptop", "kind": "local", "workers": 1, "models": [BIG, SMALL, EMBED],
+                    "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}}],
+            rented=rented(engine="vllm", image="vastai/vllm:v0.29.0-cuda-12.9", models=[BIG]),
+        )

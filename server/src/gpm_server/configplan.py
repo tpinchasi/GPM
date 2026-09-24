@@ -19,6 +19,8 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
+import yaml
+
 from .config import ConfigError, PoolConfig, load_config
 
 #: Applied versions kept beside the file (spec §1: the last 50, with a diff and rollback).
@@ -395,7 +397,12 @@ class ConfigStore:
             load_config(temporary)
             return []
         except ConfigError as exc:
-            return str(exc).splitlines()
+            # The problems themselves. The heading names this temporary file, which means
+            # nothing to whoever is editing the pool's real one.
+            lines = str(exc).splitlines()
+            if lines and lines[0].startswith(str(temporary)):
+                lines = lines[1:]
+            return [line.strip().removeprefix("- ") for line in lines if line.strip()] or [str(exc)]
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -559,10 +566,102 @@ def set_values(text: str, path: Sequence[str], values: Mapping[str, Any]) -> str
         if hits:
             match = pattern.match(lines[hits[0]])
             # The trailing comment is the operator's and is kept, even when it no longer fits.
-            lines[hits[0]] = f"{match.group(1)}{key}{match.group(2)}{_as_yaml(value)}{match.group(4) or ''}"
+            # A key that held a block ends at its colon; a value needs a space after it.
+            separator = match.group(2).rstrip() + " "
+            lines[hits[0]] = f"{match.group(1)}{key}{separator}{_as_yaml(value)}{match.group(4) or ''}"
+            # A key that held a whole indented block — a list of variants, say — has its block
+            # replaced too. Rewriting only the key's own line left the old block under it: a
+            # file that no longer parsed, or worse, one that parsed as something else.
+            own = child_indent
+            stop = hits[0] + 1
+            while stop < end:
+                stripped = lines[stop].strip()
+                if stripped and not stripped.startswith("#") and len(lines[stop]) - len(lines[stop].lstrip()) <= own:
+                    break
+                stop += 1
+            # Trailing blank lines and comments belong to what follows, not to this value.
+            while stop > hits[0] + 1 and (not lines[stop - 1].strip() or lines[stop - 1].strip().startswith("#")):
+                stop -= 1
+            if stop > hits[0] + 1:
+                del lines[hits[0] + 1:stop]
+                end -= stop - (hits[0] + 1)
         else:
             lines.insert(end, f"{' ' * child_indent}{key}: {_as_yaml(value)}")
             end += 1
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+
+
+def set_in_list_item(
+    text: str, list_key: str, match_key: str, match_value: str, values: Mapping[str, Any]
+) -> str:
+    """Change `values` inside one item of a top-level list — the host whose `id` is `laptop`.
+
+    The same promise as `set_values`: everything outside the keys changed stays byte for byte.
+    Only block-style items are edited; a list item written in flow style on one line is refused
+    rather than rewritten, because rewriting it would lose how the operator wrote it.
+    """
+    if not values:
+        return text
+    lines = text.splitlines()
+    _, first, last = _block_of(lines, list_key, 0, len(lines), 0)
+    starts = [n for n in range(first, last) if lines[n].lstrip().startswith("- ")]
+    if not starts:
+        raise CannotEdit(f"{list_key!r} holds no items to change")
+    item_indent = len(lines[starts[0]]) - len(lines[starts[0]].lstrip())
+    starts = [n for n in starts if len(lines[n]) - len(lines[n].lstrip()) == item_indent]
+    bounds = list(zip(starts, starts[1:] + [last], strict=True))
+    wanted = re.compile(rf"^\s*(?:-\s+)?{re.escape(match_key)}\s*:\s*[\"']?{re.escape(str(match_value))}[\"']?\s*(#.*)?$")
+
+    def one_line_match(a: int) -> bool:
+        # An item written `- { id: desk, ... }` is read to say *why* it is refused, never edited.
+        head = lines[a].lstrip()[2:].split(" #", 1)[0].strip()
+        if not head.startswith("{"):
+            return False
+        try:
+            item = yaml.safe_load(head)
+        except yaml.YAMLError:
+            return False
+        return isinstance(item, dict) and str(item.get(match_key)) == str(match_value)
+
+    found = [
+        (a, b) for a, b in bounds
+        if one_line_match(a) or any(wanted.match(lines[n]) for n in range(a, b))
+    ]
+    if not found:
+        raise CannotEdit(f"no item in {list_key!r} has {match_key}: {match_value}")
+    if len(found) > 1:
+        raise CannotEdit(f"{len(found)} items in {list_key!r} have {match_key}: {match_value}")
+    begin, finish = found[0]
+    if lines[begin].lstrip()[2:].lstrip().startswith("{"):
+        raise CannotEdit(f"the {match_value!r} item in {list_key!r} is written on one line; change it there")
+    key_indent = item_indent + 2
+    # Trailing blank lines and comments belong to what follows.
+    while finish > begin + 1 and (not lines[finish - 1].strip() or lines[finish - 1].strip().startswith("#")):
+        finish -= 1
+    for key, value in values.items():
+        pattern = re.compile(rf"^(\s*)(-\s+)?{re.escape(key)}(\s*:\s*)(.*?)(\s+#.*)?$")
+        hit = next(
+            (n for n in range(begin, finish)
+             if (m := pattern.match(lines[n]))
+             and len(m.group(1)) + len(m.group(2) or "") == key_indent),
+            None,
+        )
+        if hit is None:
+            lines.insert(finish, f"{' ' * key_indent}{key}: {_as_yaml(value)}")
+            finish += 1
+            continue
+        m = pattern.match(lines[hit])
+        separator = m.group(3).rstrip() + " "
+        lines[hit] = f"{m.group(1)}{m.group(2) or ''}{key}{separator}{_as_yaml(value)}{m.group(5) or ''}"
+        stop = hit + 1
+        while stop < finish:
+            stripped = lines[stop].strip()
+            if stripped and not stripped.startswith("#") and len(lines[stop]) - len(lines[stop].lstrip()) <= key_indent:
+                break
+            stop += 1
+        if stop > hit + 1:
+            del lines[hit + 1:stop]
+            finish -= stop - (hit + 1)
     return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
 
 
