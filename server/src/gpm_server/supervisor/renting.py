@@ -89,6 +89,12 @@ class RentedHost:
     agent: Optional[hostagent.RentedAgent] = None
     agent_facts: Optional[dict] = None
     agent_models: Optional[dict] = None
+    #: For an engine that loads by being restarted (D97): the models on disk the last time the
+    #: pool asked for that restart, and when. One ask per set of downloaded models — a restart
+    #: takes minutes, and asking again every pass would only ever interrupt it.
+    restarted_for: Optional[frozenset] = None
+    restart_asked_at: Optional[float] = None
+    restart_task: Optional[asyncio.Task] = dataclasses.field(default=None, repr=False, compare=False)
     #: True once this host's agent has answered a heartbeat, so an operator can see the verb
     #: working before the ssh beat beside it is retired.
     agent_beats: bool = False
@@ -102,6 +108,10 @@ class RentedHost:
     agent_detail: Optional[str] = None
     #: How many times the pool has tried to put an agent here, so it stops trying.
     agent_attempts: int = 0
+    #: When the agent was last tried on a host whose engine cannot answer yet (D97): such an
+    #: install cannot wait for the engine, so it waits for the clock instead, and a machine still
+    #: settling does not spend every attempt in the first half-minute.
+    agent_tried_at: Optional[float] = None
     #: When this host was parked for having no traffic, the moment its idleness began — so the
     #: destroy limit is counted from its last request, not from the park (D64).
     idle_since: Optional[float] = None
@@ -434,7 +444,21 @@ class Fleet:
             engine_port=self.engine_port,
             public_key=self.pool_public_key(),
             ssh_user=self.rented.ssh_user,
-            extra=self.rented.engine_start,
+            extra=self.engine_start_command(),
+        )
+
+    def engine_start_command(self) -> Optional[str]:
+        """How the engine is started on a host this pool creates: the operator's `engine_start`
+        if there is one, and otherwise the engine's own (D97). vLLM has one — the agent's
+        launcher — because starting it means reading what the agent fetched, which is not a
+        line an operator should have to get exactly right."""
+        if self.rented.engine_start:
+            return self.rented.engine_start
+        return self.engine.default_start_command(
+            port=self.engine_port,
+            models_dir=hostagent.MODELS_DIR,
+            agent_archive=hostagent.ARCHIVE,
+            proxy=self.rented.engine_proxy,
         )
 
     def pool_public_key(self) -> Optional[str]:
@@ -794,6 +818,9 @@ class Fleet:
                 archive=archive,
                 engine_port=self.engine_port,
                 engine=self.config.rented_engine(),
+                # Where the agent fetches to, for an engine that does not fetch for itself —
+                # the same directory its start command reads (D97).
+                models_path=hostagent.MODELS_DIR if self.engine.loads_by_restart else None,
             )
         except hostagent.AgentInstallFailed as exc:
             host.agent_attempts += 1
@@ -1422,6 +1449,8 @@ class Fleet:
             return False
         host.progress = self._progress_from_agent(host, tags, held)
         if not all(held.get(tag, {}).get("loaded") for tag in tags):
+            if report.get("loads_by_restart"):
+                self._restart_when_downloaded(host, tags, held, report)
             return False
         host.download_cost = host.offer.download_per_gb * (
             sum(int(model.get("size_bytes") or 0) for model in held.values()) / 1e9
@@ -1434,6 +1463,73 @@ class Fleet:
             lease_id=host.lease_id,
         )
         return True
+
+    #: How long before a failed restart request is tried again. The agent answers fast when it
+    #: refuses, so without a pause a machine that cannot restart would be asked every pass.
+    RESTART_RETRY_S = 120.0
+
+    def _restart_when_downloaded(
+        self, host: RentedHost, tags: list[str], held: dict[str, dict], report: dict
+    ) -> None:
+        """Start the engine again once every model this host was bought for is on disk (D97).
+
+        An engine that serves only what it was started with cannot be asked to load a model, so
+        on a host the pool created this *is* loading: the agent fetched the weights, and the
+        pool's own restart script — installed at boot, never sent over the protocol — starts
+        the engine on them. Without it a machine with every model safely downloaded sat
+        unserving until it was given up, and was paid for the whole time.
+
+        Asked in the background: a restart waits for the engine to answer, which on a large
+        model is minutes, and nothing slow runs in the control pass.
+        """
+        if host.agent is None:
+            return
+        # Every model complete on disk, and nothing still downloading. Not the agent's "busy":
+        # asking it starts a pass and it reports in the same breath, so it is busy every time
+        # the pool asks — waiting on that waited for ever. "On disk" already means complete
+        # (the fetch marks a model only when every file has landed).
+        if not all(held.get(tag, {}).get("on_disk") for tag in tags):
+            return  # still fetching: a restart now would start the engine on half the set
+        if any(held.get(tag, {}).get("pulling") for tag in tags):
+            return
+        if not any(held.get(tag, {}).get("awaiting_restart") for tag in tags):
+            return
+        on_disk = frozenset(tags)
+        if host.restarted_for == on_disk:
+            return  # asked already; the engine is loading them
+        now = time.time()
+        if host.restart_asked_at is not None and now - host.restart_asked_at < self.RESTART_RETRY_S:
+            return
+        if host.restart_task is not None and not host.restart_task.done():
+            return
+        host.restarted_for = on_disk
+        host.restart_asked_at = now
+        self.events.record(
+            "engine_restart",
+            f"{host.host_id}: every model it was bought for is on disk "
+            f"({', '.join(sorted(tags))}); starting its engine on them",
+            host_id=host.host_id,
+            lease_id=host.lease_id,
+        )
+        settings = agents.wanted_engine_settings(host.launch_workers or host.workers, len(tags))
+
+        async def ask() -> None:
+            status, answer = await agents.restart_engine(
+                host.agent, settings, transport=self._agent_transport
+            )
+            if status != 200:
+                # Let the next pass after the pause ask again, rather than wait on a restart
+                # that was never made.
+                host.restarted_for = None
+                self.events.record(
+                    "engine_restart_failed",
+                    f"{host.host_id}: its agent did not restart the engine — "
+                    f"{answer.get('detail') or answer.get('error') or status}",
+                    host_id=host.host_id,
+                    lease_id=host.lease_id,
+                )
+
+        host.restart_task = asyncio.create_task(ask(), name=f"gpm:restart:{host.host_id}")
 
     async def load_model_set(self, host: RentedHost, engine, client) -> bool:
         """Fetch the set, loading each model as its own download finishes, then check they are

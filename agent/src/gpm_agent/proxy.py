@@ -132,9 +132,21 @@ def create_app(upstream_map: str | Path, *, client: Optional[httpx.AsyncClient] 
         return Response(status_code=200)
 
     async def models(request: Request) -> Response:
-        """Every model this machine serves, in the engine's own shape — so the pool sees one
-        host holding a set, which is exactly what it is."""
-        served = sorted(upstreams.by_model())
+        """The models this machine is serving **now**, in the engine's own shape.
+
+        Only engines that answer are listed. The pool reads this as "what is resident" and calls
+        the host ready when its set is here — so listing an engine still loading its weights
+        would have the pool route requests to it minutes early. The map says what *will* be
+        served; this says what *is*.
+        """
+        served = []
+        for model, url in sorted(upstreams.by_model().items()):
+            try:
+                answer = await http.get(f"{url}/health", timeout=HEALTH_TIMEOUT_S)
+            except httpx.HTTPError:
+                continue
+            if answer.status_code == 200:
+                served.append(model)
         return JSONResponse({
             "object": "list",
             "data": [{"id": model, "object": "model", "owned_by": "gpm"} for model in served],

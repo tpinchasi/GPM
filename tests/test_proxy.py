@@ -223,3 +223,11 @@ def test_an_entry_that_is_not_a_model_and_a_url_is_ignored(tmp_path, bad):
     path = tmp_path / "upstreams.json"
     path.write_text(json.dumps(bad))
     assert Upstreams(path).by_model() == {}
+
+
+async def test_a_model_whose_engine_is_still_loading_is_not_listed(tmp_path):
+    """The pool calls a host ready when its set appears here. Listing an engine that is still
+    loading its weights would have requests routed to it minutes early."""
+    async with proxy_for(tmp_path, Engines(healthy=(BIG,))) as proxy:
+        answer = await proxy.get("/v1/models")
+    assert [entry["id"] for entry in answer.json()["data"]] == [BIG]

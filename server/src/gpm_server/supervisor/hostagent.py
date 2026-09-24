@@ -33,6 +33,10 @@ ENGINE_RESTART = f"{REMOTE_DIR}/restart-engine.sh"
 ENGINE_ENV = f"{REMOTE_DIR}/engine.env"
 #: The agent listens here, on the host's loopback only. Never exposed; the pool forwards to it.
 AGENT_PORT = 8195
+#: Where an engine the agent fetches for keeps its weights on a rented host (D97). On the
+#: machine's own disk, deliberately not beside the agent: `/var/run` is commonly held in memory,
+#: and twenty gigabytes of weights there would be twenty gigabytes the engine cannot use.
+MODELS_DIR = "/opt/gpm/models"
 
 _KEY = re.compile(r"\b(gpmg_[0-9a-f]{64})\b")
 
@@ -69,6 +73,7 @@ async def install(
     engine_port: int,
     engine: str = "ollama",
     agent_port: int = AGENT_PORT,
+    models_path: Optional[str] = None,
 ) -> str:
     """Put the agent on one host and return the key it minted.
 
@@ -86,6 +91,10 @@ async def install(
     if code != 0:
         raise AgentInstallFailed(f"the agent could not be copied: {output.strip()[:200]}")
 
+    # Where this engine's weights go, for an engine the agent fetches for (D97). Only then:
+    # an engine that fetches for itself keeps its models where it always has, and the agent
+    # measures free disk there.
+    models_flag = f"--models-path {shlex.quote(models_path)} " if models_path else ""
     code, output = await run(
         f"mkdir -p {REMOTE_DIR} && chmod 700 {REMOTE_DIR} && rm -f {SETTINGS} && "
         f"python3 {ARCHIVE} -c {SETTINGS} init "
@@ -93,6 +102,7 @@ async def install(
         # Which engine this machine runs (D93): the agent holds models and reads settings in
         # that engine's terms, and one told the wrong name would fetch the wrong weights.
         f"--engine {shlex.quote(engine)} "
+        f"{models_flag}"
         f"--engine-url http://127.0.0.1:{engine_port} "
         f"--heartbeat-file {HEARTBEAT} "
         # On a host the pool created, what restarts the engine is the pool's own start-up

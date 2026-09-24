@@ -43,6 +43,13 @@ PREFERRED = ".safetensors"
 
 _CHUNK = 1 << 20
 
+#: Written into a model's directory once **every** file has landed, and removed when a fetch
+#: starts. Anything reading the models directory — what the agent reports as on disk, what the
+#: engine is started with — goes by this, because a directory with some of its files is a
+#: download in progress, and an engine started on half a model fails in ways that look like the
+#: model's fault (D97).
+COMPLETE_MARKER = ".gpm-complete"
+
 
 class HubRefused(Exception):
     """The hub said no, or the request was not one this module will make."""
@@ -144,6 +151,8 @@ async def fetch(
         raise HubRefused(f"{repo} holds no files this agent would fetch")
     total = sum(f.size for f in files)
     into.mkdir(parents=True, exist_ok=True)
+    # Not complete until this fetch says so, whatever an earlier one left behind.
+    (into / COMPLETE_MARKER).unlink(missing_ok=True)
 
     own = client is None
     client = client or httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=300.0), follow_redirects=True)
@@ -163,8 +172,19 @@ async def fetch(
                 already = 0
             async for moved in _one_file(client, repo, entry, target, already):
                 yield done + moved, total
-            done += entry.size or target.stat().st_size
+            landed = target.stat().st_size
+            if entry.size and landed != entry.size:
+                # A connection that closes early ends the stream without an error, and the loop
+                # above ends with it. Taking that as done would mark half a file complete and
+                # start an engine on it. Refused instead: what arrived is kept, and the next
+                # attempt resumes from there (D97).
+                raise HubRefused(
+                    f"{entry.path} of {repo} stopped at {landed} of {entry.size} bytes; "
+                    f"the next attempt will resume it"
+                )
+            done += entry.size or landed
             yield done, total
+        (into / COMPLETE_MARKER).write_text(f"{total}\n")
     except httpx.HTTPError as exc:
         raise HubRefused(f"fetching {repo} stopped: {exc or type(exc).__name__}") from exc
     finally:

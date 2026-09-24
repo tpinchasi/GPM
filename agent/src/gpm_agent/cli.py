@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from . import proxy as proxy_module
+from . import vllm_launch
 from .settings import DEFAULT_PATH, Settings, SettingsError, fingerprint, load, mint_key, save
 
 
@@ -25,6 +26,9 @@ def _init(args: argparse.Namespace) -> int:
             key_hash=fingerprint(key), host=args.host, port=args.port,
             engine=args.engine,
             engine_url=args.engine_url, heartbeat_file=args.heartbeat_file,
+            # Where this engine's weights live — measured for free disk, and for an engine the
+            # agent fetches for, where the fetch puts them and the engine is started from.
+            models_path=args.models_path or DEFAULT_MODELS_PATH.get(args.engine, "~/.ollama/models"),
             restart_command=([args.restart_command] if args.restart_command else None),
             engine_env_file=args.engine_env_file,
         )
@@ -55,6 +59,10 @@ def _serve(args: argparse.Namespace) -> int:
     return 0
 
 
+#: Where each engine keeps its models when nobody says otherwise.
+DEFAULT_MODELS_PATH = {"ollama": "~/.ollama/models", "vllm": "~/gpm-models"}
+
+
 def _proxy(args: Any) -> int:
     proxy_module.serve(args.upstreams, host=args.host, port=args.port)
     return 0
@@ -70,6 +78,8 @@ def main(argv: list[str] | None = None) -> int:
     init.add_argument("--port", type=int, default=8095)
     init.add_argument("--engine", default="ollama", help="which engine this machine runs")
     init.add_argument("--engine-url", default="http://127.0.0.1:11434")
+    init.add_argument("--models-path", default=None,
+                      help="where the engine's models live; the engine's usual place if unset")
     init.add_argument("--heartbeat-file", default=None, help="the dead-man timer's file, where the pool created this host")
     init.add_argument("--restart-command", default=None, help="how the engine is restarted here (a program to run)")
     init.add_argument("--engine-env-file", default=None, help="where the engine's start-up environment is written")
@@ -88,6 +98,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     proxy_module.add_arguments(proxy)
     proxy.set_defaults(run=_proxy)
+
+    # Run by the machine's own restart script, never over the agent's protocol (D97).
+    start = verbs.add_parser(
+        "vllm-start", help="start vLLM for the models on disk here, stopping what ran before"
+    )
+    vllm_launch.add_arguments(start)
+    start.set_defaults(run=vllm_launch.main)
 
     args = parser.parse_args(argv)
     try:

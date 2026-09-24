@@ -999,6 +999,19 @@ class PoolConfig(BaseModel):
                 others[name] = get_engine(name).image_words
             except EngineNotFound:
                 continue
+        # A start command written for another engine is the same mistake by another route: it
+        # runs the wrong server inside the right image (D97). A pool that switched its rented
+        # hosts to vLLM and kept `nohup ollama serve` would do exactly that.
+        start = (self.rented.engine_start or "").lower()
+        if start and not any(word in start for word in mine.image_words):
+            for other, words in others.items():
+                if any(word in start for word in words):
+                    raise ValueError(
+                        f"rented hosts run {self.rented_engine()!r}, but rented.engine_start "
+                        f"starts {other!r}. Remove engine_start to use {self.rented_engine()!r}'s "
+                        f"own start, or write one for it."
+                    )
+
         # `images` replaces `image`, so only what would actually be used is checked — the
         # unused default must not refuse a configuration that never names it.
         named = [i.image for i in self.rented.images] or [self.rented.image]

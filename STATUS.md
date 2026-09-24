@@ -158,12 +158,18 @@ Read [docs/overview.md](docs/overview.md) first, then [docs/decisions.md](docs/d
 
 ## Next actions, in order
 
-0. **Review and merge PR #21, then deploy it.** D92–D96 and the console work: card-aware
-   images, a different engine per host, a host bought for a model, demand-driven buying with
-   the last host of a model protected, and the on-machine router. v0.7.0 is what runs today
-   (deployed 2026-09-22). After merge: tag, `deploy/gpm-deploy <tag> --activate`, restart the
-   supervisor **from the owner's shell** (the provider key lives only there). Nothing in it
-   changes a pool that runs Ollama and names none of the new keys.
+0. **v0.11.1 is deployed and running (2026-09-24).** PR #21 merged, tagged, built from the
+   tag, checked against the live `pool.yaml` before activating, and started. Supervisor and
+   router both run from the release; the laptop is `ready` on Ollama holding all three models;
+   nothing rented, no leases. **Two things are not back:**
+   - ~~The laptop's agent~~ **— back, the same day.** Its old settings (in a dead session's
+     `/tmp` scratchpad) went with the reboot, and the agent stores only its key's *hash*, so the
+     old key could not be recovered. Re-created from the release with settings in
+     `~/.config/gpm/laptop-agent.json`; the new key went straight into `env` without being
+     displayed; the supervisor was restarted to pick it up. Reachable, managing models.
+   - **Nothing starts the pool after a reboot.** It was down 24 hours after the 2026-09-23
+     reboot and nothing said so. Ollama.app came back on its own; GPM, started by hand with
+     `nohup`, did not.
 
 1. **The benchmark decides whether any of this was worth building.** Every throughput figure
    behind the vLLM work is still an estimate. The plan is a same-machine A/B/B′: ollama at 7
@@ -180,12 +186,8 @@ Read [docs/overview.md](docs/overview.md) first, then [docs/decisions.md](docs/d
      part of the benchmark host, not a separate rental.
    - **Occupancy is reported but not acted on**: `Engine.occupancy()` returns running, waiting
      and cache figures, and nothing yet ranks, scales or tears down by them.
-   - **The laptop's agent runs from the working tree**, with its settings in a dead session's
-     `/tmp` scratchpad (`…/7d80e9bd-…/scratchpad/agent.json`). It works; if `/tmp` is cleaned it
-     cannot restart. Its settings belong in `~/.config/gpm/` and it should run from a release.
-   - **`env` at the repository root holds the provider key and the admin key.** Found
-     2026-09-24, never committed (checked on every branch), now gitignored. It is still a
-     credential in a file in the working tree — the owner may want it moved or deleted.
+   - **`env` at the repository root holds the provider and admin keys**, put there by the owner
+     so the pool can be restarted without their terminal. Gitignored; never committed.
 
 2. **Open, and the owner's to decide: a lease counts hosts, not workers.** Raised by the owner
    after D80 — with `workers_auto` on, a host's worker count moves, so a worker-denominated
@@ -349,6 +351,8 @@ In `~/workspace/Aletheia`: backlog entries `GPU-POOL-01` and `GPU-CLOUD-01` in
 
 | Date | What happened |
 |---|---|
+| 2026-09-24 | **The laptop agent re-created.** The owner saw `agent key missing: LAPTOP_AGENT_KEY is not set` and asked whether the key had changed. It had not: `env` had never held it (three keys, no mention of "LAPTOP", unchanged since before Claude first read it), and no shell profile or config file named it — the old supervisor must have got it from a terminal the reboot closed. And the old key was unrecoverable anyway: the agent stores only a hash, in a settings file the reboot deleted, and `init` always mints. So: `gpm-agent init` into `~/.config/gpm/laptop-agent.json`, the new key piped straight into `env` without appearing anywhere, the agent started from the release (401 without the key, 200 with it), and the supervisor restarted after confirming nothing was rented. It now reaches the agent, which reports Ollama 0.34.3 and ten models on disk. `env` was also found **world-readable** (644) and is now 600. |
+| 2026-09-24 | **v0.11.1 deployed — and the pool was found down.** Merged PR #21, tagged `v0.11.1`, built it from the tag, and checked it against the live `pool.yaml` before activating (config loads, Ollama resolves to 11434 unaided, the laptop holds all three models, the router is in the agent's archive). Going to restart it, nothing was running: **the Mac had rebooted on 2026-09-23 at 11:26 and the pool had been down for 24 hours.** Nothing was rented and no lease was open, so nothing billed unsupervised; the chat app had sent nothing since the 22nd. The reboot also cleared `/tmp`, taking the laptop agent's settings and key with it. Started the supervisor with **only** `VAST_API_KEY` from the owner's new `env` file and the router with no keys at all; verified through the control API — laptop `ready`, engine `ollama`, holdings correct, the new status fields present — and that the router refuses both `/v1` and `/api` without the app key. The live database gained its `engine` column. A full inference through the router was not run: the app key exists only in the chat app, stored hashed here. |
 | 2026-09-24 | **The console shows which engine runs where and what each host was bought for; PR #21 opened for D92–D96.** Configured hosts gained an Engine column with the models each holds, rented hosts a Serving column (what the machine was bought for, and its engine), and the Engine panel now names the rented engine separately, lists every engine in use, and says whether a router fronts several processes — the same class of gap D92 closed, where a pool doing the wrong thing looked normal. **A credential nearly reached GitHub:** `env` at the repository root, created 2026-09-23, held `VAST_API_KEY` and `GPM_ADMIN_KEY`, untracked and not ignored, and every commit this session had used `git add -A`. It was never committed — the last commit predated it by eleven hours, confirmed across every branch, local and remote — but the next would have pushed it. Now gitignored with `.env` and `.env.*`, and files are staged by name. A browser test that failed once under load passed three times alone and again in the full run: a timeout, not the change. **786 tests pass, lint clean.** |
 | 2026-09-23 | **Both placement shapes built, on the owner's "do both" (D95, D96).** Finishing the model-pools side: a host is now bought for the model whose traffic is **waiting** rather than merely uncovered — coverage still first, because a model with no host has no traffic to show and would never be bought for otherwise — and tear-down **refuses to take the last host serving a model**, since every request for it would be refused until another was bought and prepared. Then the other shape: the agent's archive now carries a **router** (`gpm-agent proxy`) that puts several engine processes behind one port, routing by the request's `model` field and translating nothing; the host is healthy only when every engine behind it is, `/v1/models` is the union and `/metrics` every engine's, labelled and concatenated rather than summed. It runs as a **separate process** started by the machine's own start-up — the agent's protocol stays a closed verb list and the agent stays off the request path. `rented.engine_proxy` turns it on and lifts the `models_per_host: all` refusal for an engine that serves one model per process, at the cost the refusal named: the accelerator's memory is split between the processes. One more silent bug found: an insertion had landed in `plan()` as well as `pass_once`, breaking the control API — caught by the suite, not by review. **785 tests pass, lint clean.** Nothing deployed since v0.7.0; the console still does not show per-host engines or which model a host was bought for. |
 | 2026-09-22 | **Model pools built (D94), after the owner's question exposed that the second mode was half done.** He asked where to state "a model per host" against "a model per process on a host", and the answer was that `pool.models_per_host` already chose between them but only one worked. Demonstrated before fixing: a valid configuration with two models in `rented.models` under vLLM was **accepted**, and every rented host was asked to hold both — machines paid for that can never reach `ready`. Now `rented.models` is the set the pool may rent **for**; each machine it buys is given the model with the fewest hosts serving it (ties by the operator's order), carries what it was bought for, and is prepared only for that. A host bought before this keeps the whole rented set, so a supervisor upgraded under a running pool does not under-prepare a machine it already owns. Any host *asked* for more than its engine can hold is refused at load. Two further bugs found on the way: the guard against this had silently not been applied by an earlier edit (so a vLLM rented pool passed validation), and `Fleet.engine` was the pool's default rather than the rented one — a vLLM host would have been launched with Ollama's settings. **761 tests pass, lint clean.** Still open for this mode: renting chooses by **coverage, not demand** — the pool does not yet measure demand per model — and tear-down does not yet protect the last host of a model. Mode 1 (several vLLM processes on one host, behind a model-routing proxy) is not started. |

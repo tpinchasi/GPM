@@ -214,7 +214,10 @@ if [ -r "{state_dir}/engine.env" ]; then
 fi
 
 {engine_start}
-echo $! > "$PIDFILE"
+# `$!` is unset when the start left no background job — a command that starts its own processes
+# and returns, say — and under `set -u` that failed the whole script *after* the engine had
+# started, reporting a working restart as a broken one. Empty is the honest answer there.
+{{ set +u; echo "$!"; }} > "$PIDFILE"
 """
 
 

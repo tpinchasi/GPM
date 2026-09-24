@@ -88,7 +88,11 @@ def test_the_agent_never_runs_a_shell_or_a_command_it_was_given():
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 names = {alias.name for alias in node.names} | {getattr(node, "module", None)}
                 if "subprocess" in names or "os.system" in names:
-                    assert path.name == "facts.py", f"{path.name} can start a process"
+                    # facts.py runs literal argument lists to learn what the machine is. The vLLM
+                    # launcher (D97) starts `vllm` and the agent's own router, as fixed argument
+                    # lists — and is a command-line entry for the machine's restart script,
+                    # reachable from nothing on the agent's protocol (checked below).
+                    assert path.name in ("facts.py", "vllm_launch.py"), f"{path.name} can start a process"
         text = path.read_text()
         assert "os.system" not in text and "os.popen" not in text and "create_subprocess_shell" not in text
         if "create_subprocess_exec" in text:
@@ -96,6 +100,14 @@ def test_the_agent_never_runs_a_shell_or_a_command_it_was_given():
             assert path.name == "engine_control.py", f"{path.name} can start a process"
             assert text.count("create_subprocess_exec(") == 1
             assert "create_subprocess_exec(\n                *self.settings.restart_command," in text
+
+    # The launcher can start processes, so nothing that answers the pool may reach it: only the
+    # command line imports it, and the machine's restart script is what runs that.
+    for name in ("app.py", "models.py", "engine_control.py", "engines.py", "proxy.py"):
+        text = (root / name).read_text()
+        assert "vllm_launch" not in text, f"{name} reaches the launcher, which can start processes"
+    launcher = (root / "vllm_launch.py").read_text()
+    assert "shell=" not in launcher and "os.system" not in launcher
 
 
 # --- the agent's own settings ---

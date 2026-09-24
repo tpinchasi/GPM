@@ -62,8 +62,20 @@ without the pool's server package, so it cannot share the pool's adapters.
 
 For vLLM the agent reports **models on disk and models served as different sets**, because they
 are: weights present with the engine not yet serving them is the state a vLLM host spends its
-whole preparation in, and folding them into one number would hide it. A model becomes servable
-only when the engine restarts, which only an operator causes (§4).
+whole preparation in, and folding them into one number would hide it (D97):
+
+- It **fetches while the engine is not running** — on a machine that has just booted vLLM has
+  nothing to serve and answers nothing, and waiting for it would wait for ever.
+- A model is **on disk only once every file has landed**: the fetch writes a completion marker
+  last and removes it when it starts. A download cut short is a failure the next attempt
+  resumes, never a finished model.
+- A model on disk and not yet served is reported **`awaiting_restart`** — not a failed hold.
+- The engine is started by **`gpm-agent vllm-start`**, run by the machine's own restart script
+  (never over the protocol): one vLLM process on the engine port, or, with the router, one per
+  model on the ports above it with the card's memory split by weight size (floored at a tenth,
+  so a small model can still start) and the router on the engine port. It stops what it started
+  last time first, so starting again is a restart. On a host the pool created, the pool asks
+  for that restart once every model the host was bought for is on disk (§4).
 
 Three rules the hub fetch keeps:
 
