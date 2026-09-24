@@ -820,6 +820,93 @@ def test_the_stage_is_said_in_words_and_derived_from_what_is_known(detail, expec
     assert expected in _stage_of(detail)
 
 
+def test_each_model_has_one_state_from_everything_the_pool_knows():
+    """The fifth vLLM rental, as the console showed it: "not answering: ReadError" beside a
+    download bar, no state per model while they landed, and "not on disk" for three models
+    the agent held — because every word came from the engine, which for vLLM is silent by
+    design until the weights are there (D105)."""
+    from gpm_server.supervisor.control import _model_states
+
+    required = {"a/e4b", "a/embed", "a/26b"}
+    agent = {"models": [
+        {"tag": "a/e4b", "on_disk": True, "loaded": False, "pulling": None, "error": None},
+        {"tag": "a/embed", "on_disk": False, "loaded": False, "pulling": {"tag": "a/embed", "completed_bytes": 5e8, "total_bytes": 1.9e9}, "error": None},
+        {"tag": "a/26b", "on_disk": False, "loaded": False, "pulling": None, "error": None},
+    ]}
+    # While the agent fetches: one landed, one on the wire, one not begun; the engine silent.
+    fetching = {m["tag"]: m for m in _model_states(
+        required, progress={}, agent_models=agent, resident=frozenset(), available=frozenset(),
+        loads_by_restart=True, restart_asked=False)}
+    assert fetching["a/e4b"]["state"] == "on disk" and "starts once every model" in fetching["a/e4b"]["detail"]
+    assert fetching["a/embed"]["state"] == "downloading" and fetching["a/embed"]["detail"] == "0.5 of 1.9 GB"
+    assert fetching["a/26b"]["state"] == "not here yet"
+    # The pool's own download record, with its measured rate, wins over the agent's.
+    with_rate = _model_states(
+        {"a/embed"}, progress={"a/embed": {"completed": 1e9, "total": 1.9e9, "mbps": 812}},
+        agent_models=agent, resident=frozenset(), available=frozenset(), loads_by_restart=True, restart_asked=False)
+    assert with_rate[0]["detail"] == "1.0 of 1.9 GB at 812 Mbps" and with_rate[0]["completed"] == 1e9
+    # All landed and the restart asked: loading, not "still to download".
+    landed = {"models": [{"tag": t, "on_disk": True, "loaded": False, "awaiting_restart": True} for t in required]}
+    loading = _model_states(required, progress={}, agent_models=landed, resident=frozenset(), available=frozenset(),
+                            loads_by_restart=True, restart_asked=True)
+    assert {m["state"] for m in loading} == {"loading"}
+    # The engine serving one, the agent reporting another dead: each says which.
+    dead = {"models": [{"tag": "a/26b", "on_disk": True, "loaded": False, "error": "ValueError: batch too small"}]}
+    mixed = {m["tag"]: m for m in _model_states(
+        required, progress={}, agent_models=dead, resident=frozenset({"a/e4b"}), available=frozenset({"a/embed"}),
+        loads_by_restart=True, restart_asked=True)}
+    assert mixed["a/e4b"]["state"] == "loaded"
+    assert mixed["a/26b"] == {"tag": "a/26b", "state": "failed", "detail": "ValueError: batch too small"}
+    assert mixed["a/embed"]["state"] == "loading"
+    # An engine that loads for itself: on disk means loading, no restart involved.
+    own = _model_states({"m"}, progress={}, agent_models=None, resident=frozenset(), available=frozenset({"m"}),
+                        loads_by_restart=False, restart_asked=False)
+    assert own[0]["state"] == "loading" and own[0]["detail"] == "downloaded; loading into memory"
+
+
+@pytest.mark.parametrize("detail, expected", [
+    ({"state": "preparing", "engine": {"answers": False, "expected": True, "detail": "not started yet"},
+      "models": [{"tag": "a", "state": "on disk"}, {"tag": "b", "state": "downloading", "detail": "6.0 of 18.6 GB"},
+                 {"tag": "c", "state": "not here yet"}]},
+     "fetching models: 1 of 3 on disk; downloading b — 6.0 of 18.6 GB"),
+    ({"state": "preparing", "engine": {"answers": False, "expected": True},
+      "models": [{"tag": "a", "state": "on disk"}, {"tag": "b", "state": "loading"}]},
+     "every model is on disk; the engine is starting on them"),
+    ({"state": "preparing", "engine": {"answers": True, "missing_from_disk": [], "not_loaded": ["b"]},
+      "models": [{"tag": "a", "state": "loaded"}, {"tag": "b", "state": "failed", "detail": "ValueError: no"}]},
+     "b failed to start: ValueError: no"),
+])
+def test_the_stage_says_what_the_machine_is_doing_while_its_engine_is_silent_on_purpose(detail, expected):
+    from gpm_server.supervisor.control import _stage_of
+
+    assert _stage_of(detail) == expected
+
+
+def test_a_silent_engine_is_a_fault_only_when_it_is_not_the_plan():
+    from types import SimpleNamespace
+
+    from gpm_server.supervisor.control import _silent_engine
+
+    fetching = SimpleNamespace(agent=object(), restart_asked_at=None)
+    assert _silent_engine("ReadError", fetching, loads_by_restart=True)["expected"] is True
+    starting = SimpleNamespace(agent=object(), restart_asked_at=time.time() - 30)
+    said = _silent_engine("ReadError", starting, loads_by_restart=True)
+    assert said["expected"] is True and "starting" in said["detail"] and "30s ago" in said["detail"]
+    # No agent yet: the machine may still be booting, and that is what is said.
+    booting = SimpleNamespace(agent=None, restart_asked_at=None)
+    assert _silent_engine("ReadError", booting, loads_by_restart=True) == {"answers": False, "detail": "ReadError"}
+    # An engine that loads for itself is expected to answer as soon as the machine is up.
+    assert _silent_engine("ReadError", fetching, loads_by_restart=False) == {"answers": False, "detail": "ReadError"}
+
+
+def test_the_console_shows_each_models_state_and_an_expected_silence_as_no_fault():
+    """Structural: the panel draws the per-model states the supervisor derives, and does not
+    paint an engine that is silent by design red."""
+    source = (STATIC / "app.js").read_text()
+    assert "d.models" in source and "m.state" in source
+    assert "engine.expected" in source
+
+
 def test_what_the_agent_holds_on_disk_counts_as_on_disk():
     """An engine launched with its models can only name what it serves, so while its processes
     load it says nothing is on disk. Found live: three fetched models read "still to download"

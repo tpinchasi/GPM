@@ -76,6 +76,75 @@ def _held_on_disk(agent_models: Optional[dict[str, Any]]) -> frozenset[str]:
     )
 
 
+def _silent_engine(why: str, rented: Any, *, loads_by_restart: bool) -> dict[str, Any]:
+    """An engine that did not answer, said truthfully (D105).
+
+    For an engine that is started once its weights have landed, silence while the agent fetches
+    is the plan, not a fault — and "not answering: ReadError" beside a download bar was read as
+    one. It is expected silence only once the agent is there: before that the machine may
+    still be booting, and the old words are the right ones.
+    """
+    if loads_by_restart and rented is not None and getattr(rented, "agent", None) is not None:
+        if getattr(rented, "restart_asked_at", None) is None:
+            return {
+                "answers": False, "expected": True,
+                "detail": "not started yet — this engine is started once every model it was bought for is on disk",
+            }
+        return {
+            "answers": False, "expected": True,
+            "detail": f"starting on the downloaded models, asked {time.time() - rented.restart_asked_at:.0f}s ago; not answering yet",
+        }
+    return {"answers": False, "detail": why}
+
+
+def _model_states(
+    required: set[str], *, progress: dict[str, Any], agent_models: Optional[dict[str, Any]],
+    resident: frozenset[str], available: frozenset[str], loads_by_restart: bool, restart_asked: bool,
+) -> list[dict[str, Any]]:
+    """One state per model the host must hold, from every source the pool has (D105).
+
+    In order of certainty: the engine serving it; the agent reporting it failed; the agent
+    reporting it loaded; a download in progress (the pool's own, or the agent's); on disk by
+    either account; nothing. Each carries the words for that state, so the console does not
+    have to invent them.
+    """
+    by_tag: dict[str, dict[str, Any]] = {}
+    for entry in (agent_models or {}).get("models") or []:
+        if isinstance(entry, dict) and isinstance(entry.get("tag"), str):
+            by_tag[entry["tag"]] = entry
+    states: list[dict[str, Any]] = []
+    for tag in sorted(required):
+        agent = by_tag.get(tag, {})
+        pulled = progress.get(tag) or {}
+        pulling = agent.get("pulling") or {}
+        done = pulled.get("completed") if pulled else pulling.get("completed_bytes")
+        total = pulled.get("total") if pulled else pulling.get("total_bytes")
+        downloading = bool(pulling) or (bool(pulled) and total and (done or 0) < total)
+        state: dict[str, Any] = {"tag": tag}
+        if tag in resident or agent.get("loaded"):
+            state.update(state="loaded", detail="in memory, serving")
+        elif agent.get("error"):
+            state.update(state="failed", detail=str(agent["error"]))
+        elif downloading:
+            words = f"{(done or 0) / 1e9:.1f} of {total / 1e9:.1f} GB" if total else "download starting"
+            if pulled.get("mbps") is not None:
+                words += f" at {pulled['mbps']:.0f} Mbps"
+            state.update(state="downloading", detail=words, completed=done or 0, total=total)
+        elif agent.get("on_disk") or tag in available:
+            if loads_by_restart:
+                state.update(
+                    state="loading" if restart_asked else "on disk",
+                    detail=("downloaded; the engine is starting on it" if restart_asked
+                            else "downloaded; the engine starts once every model has landed"),
+                )
+            else:
+                state.update(state="loading", detail="downloaded; loading into memory")
+        else:
+            state.update(state="not here yet", detail="not on this machine yet")
+        states.append(state)
+    return states
+
+
 def _stage_of(detail: dict[str, Any]) -> str:
     """Where preparing this host has got to, in words, from what is known about it.
 
@@ -88,8 +157,22 @@ def _stage_of(detail: dict[str, Any]) -> str:
     provider = (detail.get("provider") or {}).get("detail") or ""
     engine = detail.get("engine") or {}
     stage = detail.get("stage") or ""
+    models = detail.get("models") or []
 
+    failed = [m for m in models if m.get("state") == "failed"]
+    if failed:
+        return f"{failed[0]['tag']} failed to start: {failed[0].get('detail', '')}"
     if not engine.get("answers"):
+        if engine.get("expected"):
+            # The engine is silent on purpose: say what the machine is doing instead.
+            landed = sum(1 for m in models if m.get("state") in ("on disk", "loading", "loaded"))
+            downloading = [m for m in models if m.get("state") == "downloading"]
+            if downloading:
+                return (f"fetching models: {landed} of {len(models)} on disk; "
+                        f"downloading {downloading[0]['tag']} — {downloading[0].get('detail', '')}")
+            if models and landed == len(models):
+                return "every model is on disk; the engine is starting on them"
+            return f"fetching models: {landed} of {len(models)} on disk"
         if "pulling" in provider.lower():
             return f"the provider is still starting the machine: {provider.strip()}"
         return "waiting for the engine to answer — the machine is starting, or the tunnel is not up yet"
@@ -1181,18 +1264,22 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 detail["provider"] = {"state": "unknown", "detail": str(exc)}
 
         detail["required_tags"] = sorted(required)
+        # This machine's own engine, not the pool's default (D93): asked with the wrong
+        # adapter, a vLLM host read as "not answering: 405 /api/ps" while it was.
+        engine = supervisor.engine_for(rented) if rented is not None else supervisor.engine_for(configured)
+        loads_by_restart = bool(getattr(engine, "loads_by_restart", False))
+        agent_models = getattr(rented if rented is not None else configured, "agent_models", None)
+        resident: frozenset[str] = frozenset()
+        available: frozenset[str] = frozenset()
         if client is not None:
             try:
-                # This machine's own engine, not the pool's default (D93): asked with the
-                # wrong adapter, a vLLM host read as "not answering: 405 /api/ps" while it was.
-                engine = supervisor.engine_for(rented)
                 resident = await engine.models_resident(client)
                 available = await engine.models_available(client)
                 # What the agent holds on disk counts too. An engine launched with its models
                 # (vLLM) can only name what it is serving, so while its processes are still
                 # loading it says nothing is here — and the operator watching three fetched
                 # models read "still to download" beside a 16 GB file that had landed.
-                on_disk = available | resident | _held_on_disk(rented.agent_models)
+                on_disk = available | resident | _held_on_disk(agent_models)
                 detail["engine"] = {
                     "answers": True,
                     "loaded": sorted(resident),
@@ -1201,10 +1288,24 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     "not_loaded": sorted(required - resident),
                 }
             except Exception as exc:  # noqa: BLE001 - say it is not answering, do not 500
-                detail["engine"] = {"answers": False, "detail": str(exc) or type(exc).__name__}
+                detail["engine"] = _silent_engine(
+                    str(exc) or type(exc).__name__, rented, loads_by_restart=loads_by_restart
+                )
         else:
             detail["engine"] = {"answers": False, "detail": "the pool has no connection to this host yet"}
 
+        # One state per model, from everything the pool knows (D105): its own downloads, the
+        # agent's report, the engine's list. The engine alone cannot say it — for one launched
+        # with its models it knows nothing until it is up.
+        detail["models"] = _model_states(
+            required,
+            progress=detail.get("progress") or {},
+            agent_models=agent_models,
+            resident=resident,
+            available=available,
+            loads_by_restart=loads_by_restart,
+            restart_asked=rented is not None and rented.restart_asked_at is not None,
+        )
         detail["stage_detail"] = _stage_of(detail)
         return JSONResponse(detail)
 
