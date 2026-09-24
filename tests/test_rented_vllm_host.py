@@ -316,3 +316,85 @@ def test_every_model_on_one_host_starts_an_engine_each_behind_the_router(monkeyp
                     assert answer.headers["X-GPM-Host"] == host.host_id
         finally:
             hub_server.stop()
+
+
+# --- switching engine on a running supervisor (D98) ---
+
+
+def switched_to(pool, engine: str, **rented_changes):
+    """What the console's engine editor does to a running pool: a new configuration, applied."""
+    config = pool.supervisor.config
+    new = config.model_copy(update={
+        "rented": config.rented.model_copy(update={"engine": engine, **rented_changes}),
+    })
+    pool.supervisor.apply_config(new)
+    return new
+
+
+def test_a_pool_switched_to_vllm_while_running_rents_a_vllm_host(monkeypatch, tmp_path):
+    """Found on the owner's first vLLM rental: the supervisor had started on Ollama and was
+    switched from the console. The configuration changed and the fleet's engine — fixed when the
+    supervisor started — did not, so the machine was rented with vLLM's image and Ollama's
+    start, and prepared as an Ollama host: waiting for an engine to answer, which a vLLM host
+    cannot do until its agent has fetched its weights. It could never have become ready."""
+    hub = FakeHub(HUB)
+    with pool_harness(
+        [EngineSpec(id="laptop", resident={EMBED}, kind="local", workers=1)],
+        host_overrides={"laptop": {"models": [EMBED]}},
+        rentable=[EngineSpec(id="market-1", resident=set(), workers=2, engine="vllm")],
+        model_set=[BIG, EMBED], catalog=CATALOG,
+        rented=rented(engine="ollama", image="vastai/ollama:0.34.2", models=[BIG]),
+        pool_settings={"models_per_host": "declared"},
+    ) as pool:
+        hub_server = ServerHandle(hub.app, pool.loop)
+        monkeypatch.setenv("HF_ENDPOINT", hub_server.base_url)
+        try:
+            machines = Machines(pool, tmp_path, monkeypatch)
+            assert machines.fleet.engine.name == "ollama"
+            switched_to(pool, "vllm", image="vastai/vllm:v0.29.0-cuda-12.9")
+
+            # What the next machine is rented with follows the switch.
+            assert machines.fleet.engine.name == "vllm"
+            assert machines.fleet.engine_port == 8000
+            assert "vllm-start" in (machines.fleet.engine_start_command() or "")
+
+            machines.fleet.open_lease(workers=2, max_hours=2, max_spend=2.00, allow_rent=True)
+            (host,) = machines.until_ready(1)
+            machines.check_no_failures()
+            assert (host.engine, host.engine_port) == ("vllm", 8000)
+            assert pool.supervisor.engine_for(host).name == "vllm"
+            assert pool.rentable["market-1"].fake.starts == [{BIG_REPO}]
+        finally:
+            hub_server.stop()
+
+
+def test_a_host_rented_before_the_switch_keeps_being_what_it_is():
+    """A machine started for Ollama does not become a vLLM machine because the pool will rent
+    vLLM next: it is still probed, dialled and prepared as Ollama."""
+    with pool_harness(
+        [],
+        rentable=[EngineSpec(id="market-1", resident={BIG}, workers=2)],
+        model_set=[BIG],
+        rented=rented(engine="ollama", image="vastai/ollama:0.34.2", engine_proxy=False),
+    ) as pool:
+        fleet = pool.supervisor.fleet
+        fleet.open_lease(workers=2, max_hours=2, max_spend=2.00, allow_rent=True)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            pool.reprobe()
+            live = [h for h in fleet.hosts.values() if not h.released]
+            if live and live[0].state == "ready":
+                break
+            time.sleep(0.1)
+        (host,) = [h for h in fleet.hosts.values() if not h.released]
+        assert host.state == "ready" and (host.engine, host.engine_port) == ("ollama", 11434)
+
+        switched_to(pool, "vllm", image="vastai/vllm:v0.29.0-cuda-12.9")
+        assert fleet.engine.name == "vllm", "the next one is vLLM"
+        assert pool.supervisor.engine_for(host).name == "ollama", "this one is still Ollama"
+        assert fleet.port_of(host) == 11434
+
+        for _ in range(3):
+            pool.reprobe()
+        assert host.state == "ready", "and it still serves"
+        assert fleet.published_ref(host)["engine"] == "ollama", "and a successor would know it"

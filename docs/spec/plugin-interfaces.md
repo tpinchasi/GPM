@@ -113,6 +113,9 @@ shipped engines serve one wire API (D89), so a request is read the same way wher
   it — the same model is a plain tag to one engine and a model-hub repository to another. A
   variant naming no engine works anywhere, which is what every catalog written before this
   means.
+- **A rented host keeps the engine it was rented with** (D103). Switching `rented.engine`
+  changes what the pool rents next — image, start, port, download directory — and nothing about
+  a machine already running: it is probed, dialled and prepared as what it is.
 
 ```python
 class Engine(Protocol):

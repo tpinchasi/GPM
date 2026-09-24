@@ -18,7 +18,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Mapping, Optional
+from typing import Any, Mapping, Optional
 
 from .. import agentpkg, history
 from ..config import BiddingConfig, OfferPolicy, PoolConfig, RentedConfig, TransportConfig
@@ -105,6 +105,12 @@ class RentedHost:
     last_worker_change: int = 0
     #: True when a model the pool requires was seen to leave this host's memory.
     lost_a_model: bool = False
+    #: The engine this machine was rented to run, and the port it listens on — fixed when it
+    #: was bought. The pool's rented engine can be switched while hosts are running (D98), and
+    #: a machine started for one engine does not become the other: it keeps being dialled,
+    #: prepared and restarted as what it is. Empty for a row from before this was recorded.
+    engine: str = ""
+    engine_port: int = 0
     agent_detail: Optional[str] = None
     #: How many times the pool has tried to put an agent here, so it stops trying.
     agent_attempts: int = 0
@@ -201,10 +207,8 @@ class Fleet:
         self.state_dir = Path(config.request_log).expanduser().resolve().parent
         #: Tests dial the agent through their own transport; nothing else sets this.
         self._agent_transport = None
-        # The engine on the machines this fleet buys — not necessarily the pool's default
-        # (D93). Everything here is about rented hosts, so launch settings and "how many models
-        # can one of these hold" must both come from the engine those machines actually run.
-        self.engine = get_engine(config.rented_engine())
+        #: Engine adapters by name, loaded once each.
+        self._engines: dict[str, Any] = {}
         #: A second forward per host, to the agent on its loopback (D63).
         self.agent_tunnels: dict[str, SshTunnel] = {}
         #: Forwards to rented hosts the provider cannot expose directly, keyed by host id.
@@ -557,6 +561,26 @@ class Fleet:
             return starts_at
         return max(starts_at, auto.max)
 
+    def _engine_named(self, name: str) -> Any:
+        if name not in self._engines:
+            self._engines[name] = get_engine(name)
+        return self._engines[name]
+
+    @property
+    def engine(self) -> Any:
+        """The engine on the machines this fleet buys **next** — not necessarily the pool's
+        default (D93). Read from the configuration in force every time: it was once fixed when
+        the supervisor started, so a switch to vLLM from the console rented a vLLM image with
+        Ollama's start, port and download directory, and a machine that could never serve."""
+        return self._engine_named(self.config.rented_engine())
+
+    def engine_of(self, host: "RentedHost") -> Any:
+        """The engine this machine was rented to run, whatever the pool buys now."""
+        return self._engine_named(host.engine or self.config.rented_engine())
+
+    def port_of(self, host: "RentedHost") -> int:
+        return host.engine_port or self.engine_port
+
     @property
     def engine_port(self) -> int:
         """Where this pool's engine listens on a host it creates — stated, or the engine's own
@@ -716,7 +740,8 @@ class Fleet:
             if code != 0:
                 log.warning("heartbeat to %s failed: %s", host.host_id, output.strip())
 
-    async def _open_tunnel(self, host_id: str, connection: ConnectionInfo) -> Optional[str]:
+    async def _open_tunnel(self, host_id: str, connection: ConnectionInfo,
+                           port: Optional[int] = None) -> Optional[str]:
         """The default way to a rented host: a supervised forward, so the engine is never
         exposed (hosts-routing-capacity.md §1.3). Returns the local URL the router dials."""
         if not connection.ssh_host:
@@ -727,7 +752,7 @@ class Fleet:
             ssh_port=connection.ssh_port or 22,
             ssh_user=connection.ssh_user or self.rented.ssh_user,
             ssh_key=self.rented.ssh_key,
-            remote_port=self.engine_port,
+            remote_port=port or self.engine_port,
             known_hosts=self.rented.known_hosts,
         )
         tunnel = SshTunnel(host_id, transport)
@@ -817,11 +842,11 @@ class Fleet:
                 run=lambda command: self.run_on_host(host, command),
                 push=lambda data, path: self.push_to_host(host, data, path),
                 archive=archive,
-                engine_port=self.engine_port,
-                engine=self.config.rented_engine(),
+                engine_port=self.port_of(host),
+                engine=self.engine_of(host).name,
                 # Where the agent fetches to, for an engine that does not fetch for itself —
                 # the same directory its start command reads (D97).
-                models_path=hostagent.MODELS_DIR if self.engine.loads_by_restart else None,
+                models_path=hostagent.MODELS_DIR if self.engine_of(host).loads_by_restart else None,
             )
         except hostagent.AgentInstallFailed as exc:
             host.agent_attempts += 1
@@ -1693,6 +1718,8 @@ class Fleet:
             "parked_at": host.parked_at,
             "idle_since": host.idle_since,
             "launch_workers": host.launch_workers,
+            "engine": host.engine,
+            "engine_port": host.engine_port,
             "offer": dataclasses.asdict(dataclasses.replace(host.offer, raw={})),
         }
 
@@ -1753,6 +1780,8 @@ class Fleet:
                 workers=int(ref.get("workers") or self.rented.workers),
                 interruptible=bool(ref.get("interruptible", True)),
                 engine_seen_at=ref.get("engine_seen_at"),
+                engine=str(ref.get("engine") or ""),
+                engine_port=int(ref.get("engine_port") or 0),
             )
             if host.idle_since is not None:
                 self.idle_gate = True  # paused for idleness: load, not the lease, brings it back
@@ -1767,7 +1796,7 @@ class Fleet:
                 log.warning("no connection details for %s yet: %s", row.host_id, exc)
             if host.state != "parked" and host.connection is not None:
                 host.dial_url = host.connection.public_url or await self._open_tunnel(
-                    row.host_id, host.connection
+                    row.host_id, host.connection, self.port_of(host)
                 )
             self.hosts[row.host_id] = host
             adopted.append(row.host_id)
@@ -2339,10 +2368,12 @@ class Fleet:
                 launch_workers=launch_workers,
                 interruptible=offer.interruptible,
                 models=for_this_host,
+                engine=self.config.rented_engine(),
+                engine_port=self.engine_port,
             )
             connection = await self.provider.connection(instance)
             host.connection = connection
-            host.dial_url = connection.public_url or await self._open_tunnel(host_id, connection)
+            host.dial_url = connection.public_url or await self._open_tunnel(host_id, connection, host.engine_port)
             host.mark_preparing()
             self.hosts[host_id] = host
             self.events.record(
