@@ -816,8 +816,16 @@ class Supervisor:
         the rented configuration says.
         """
         config = getattr(host, "config", None)
+        if config is None and self.fleet is not None:
+            # What the machine was rented to run, not what the pool rents now (D98): a switch
+            # of engine must not make a running host look like the other one.
+            return self.fleet.engine_of(host)
         name = self.config.engine_of(config) if config is not None else self.config.rented_engine()
-        return self.engines.get(name, self.engine)
+        if name not in self.engines:
+            # An engine the file started naming after this process began — loaded on first use
+            # rather than silently answered by the pool's default adapter.
+            self.engines[name] = get_engine(name)
+        return self.engines[name]
 
     def _rented_models(self) -> list[str]:
         """What a rented host is asked to hold (D89). With `all`, the pool's whole set; with
