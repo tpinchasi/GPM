@@ -44,7 +44,15 @@ from .base import (
 log = logging.getLogger("gpm.vast")
 
 _BASE_URL = "https://console.vast.ai"
-_HOURS_PER_MONTH = 730.0
+#: The provider's own month, in hours: its `dph_total` for 150 GB on a machine at $0.20/GB-month
+#: carries exactly $0.041667/h of storage (checked against the live market, 2026-09-25).
+_HOURS_PER_MONTH = 720.0
+
+
+def _compact(answer: Any, limit: int = 500) -> str:
+    """An answer as one line of JSON, cut to a length a log line can carry."""
+    text = json.dumps(answer, separators=(",", ":"), sort_keys=True, default=str)
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def _gb(megabytes: Optional[float]) -> float:
@@ -235,8 +243,11 @@ class VastProvider:
                 if interruptible else float(entry.get("dph_total") or 0)
             ),
             interruptible=interruptible,
-            # Quoted per gigabyte per month; the pool reasons in dollars per hour.
-            storage_hourly=storage_monthly_per_gb * disk_gb / _HOURS_PER_MONTH,
+            # The storage inside `dph_total` is for a few GB the provider chose, not the listing's
+            # disk; each offer is repriced for the disk the pool rents (D108). Quoted per GB per
+            # month; the pool reasons in dollars per hour.
+            storage_hourly=float(entry.get("storage_total_cost") or 0),
+            storage_per_gb_hourly=storage_monthly_per_gb / _HOURS_PER_MONTH,
             download_per_gb=float(entry.get("inet_down_cost") or 0),
             download_mbps=float(entry.get("inet_down") or 0),
             # What the engine image will find when it looks for the card (D81).
@@ -266,7 +277,10 @@ class VastProvider:
             body["onstart"] = spec.onstart
 
         payload = await self._call("PUT", f"/api/v0/asks/{offer.offer_id}/", json=body)
-        refused = payload.get("msg", "refused") if not payload.get("success", True) else None
+        refused = None
+        if not payload.get("success", True):
+            # Its own words where it gave any; otherwise the whole answer, which is kept anyway.
+            refused = payload.get("msg") or payload.get("error") or f"refused, answering {_compact(payload)}"
         contract = payload.get("new_contract")
 
         if refused is not None or contract is None:
@@ -277,7 +291,7 @@ class VastProvider:
             detail = refused or "returned no instance"
             if stray:
                 detail += f" — but created {stray}, which has been destroyed"
-            raise BidLost(f"bid ${bid} on {offer.machine_id}: {detail}")
+            raise BidLost(f"bid ${bid} on {offer.machine_id}: {detail}", response=payload)
 
         return Instance(instance_id=str(contract), label=spec.label, machine_id=offer.machine_id)
 

@@ -33,7 +33,7 @@ def control(tmp_path):
             ],
             "rented": {
                 "provider": "fake",
-                "bidding": {"bid_ceiling": 0.60},
+                "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 0.60},
                 "scale": {"scale_up_after_s": 0},
             },
         }
@@ -312,7 +312,7 @@ def test_the_market_preview_runs_the_real_filters_and_creates_nothing(control):
     assert preview["seen"] == 1
     assert preview["passed"] == 1
     assert preview["best"][0]["would_bid"] == pytest.approx(0.12)
-    assert preview["policy"]["bid_ceiling"] == 0.60
+    assert preview["policy"]["max_all_in_hourly"] == 0.60
     assert supervisor.fleet.provider.instances == {}  # nothing was created
 
 
@@ -400,7 +400,7 @@ def test_allocation_can_be_switched_on_from_the_rented_screen(control, tmp_path)
         "    transport: { type: http, base_url: 'http://127.0.0.1:1' }\n"
         "rented:\n"
         "  provider: fake\n"
-        "  bidding: { bid_ceiling: 0.60 }\n"
+        "  offer_policy: { min_disk_gb: 10, max_all_in_hourly: 0.60 }\n"
     )
     from gpm_server.configplan import ConfigStore
 
@@ -447,3 +447,19 @@ def test_status_says_which_engine_runs_where_and_what_each_host_holds(control):
     # This engine holds several models per process, so a host is bought for the whole rented
     # set — here, the pool's one model.
     assert rented["bought_for"] == [MODEL]
+
+
+def test_a_lease_asking_for_the_old_bid_ceiling_is_told_what_replaced_it(control):
+    """A lease's price ceiling is all-in now and named for it (D108); a caller still sending
+    the old field hears why, rather than having the tightening it asked for silently dropped."""
+    _, url, _ = control
+    with client(url) as http:
+        answer = http.post("/pool/leases", json={"workers": 1, "max_spend": 1.0, "allow_rent": True,
+                                                  "bid_ceiling": 0.30})
+        assert answer.status_code == 400 and "max_all_in_hourly" in answer.json()["detail"]
+        tightened = http.post("/pool/leases", json={"workers": 1, "max_spend": 1.0, "allow_rent": True,
+                                                     "max_all_in_hourly": 0.30})
+        assert tightened.status_code == 201, tightened.text
+        looser = http.post("/pool/leases", json={"workers": 1, "max_spend": 1.0, "allow_rent": True,
+                                                  "max_all_in_hourly": 9.0})
+        assert looser.status_code == 400 and "tighten" in looser.text

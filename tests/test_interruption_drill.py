@@ -19,8 +19,7 @@ MODEL = "m1"
 RENTED = {
     "provider": "fake",
     "workers": 2,
-    "model_set_gb": 5.0,
-    "bidding": {"bid_ceiling": 0.60, "premium": 0.02},
+    "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 0.60}, "bidding": {"premium": 0.02},
     "scale": {"scale_up_after_s": 0},
     "teardown": {"idle_minutes": 10},
 }

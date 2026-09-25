@@ -170,7 +170,7 @@ def test_stopping_the_supervisor_process_releases_its_lock(tmp_path):
         pool: {{ name: stoptest, model_set: [m1], probe_interval_s: 1 }}
         auth: {{ app_keys: [k] }}
         hosts: []
-        rented: {{ provider: fake, bidding: {{ bid_ceiling: 0.5 }} }}
+        rented: {{ provider: fake, offer_policy: {{ min_disk_gb: 10, max_all_in_hourly: 0.5 }} }}
         request_log: {db_path}
     """))
     child = subprocess.Popen(

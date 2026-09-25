@@ -48,7 +48,7 @@ path is exercised as much as the acquiring one.
 | **market_day** | A full day: quiet, a morning climb, a peak far past what the pool holds, a shock where hosts are taken away mid-answer, a lull, a false dawn where load returns while hosts are paused, and a night. Exercises the ramp (D66), buffered delivery (D62), eviction recovery, pausing and waking (D64) and per-host worker adjustment (D67, D68) in one run |
 | **load_under_capacity** | Steady load the local host already covers. **Nothing may be rented**, however long it goes on |
 | **empty_market** | Load with every machine gone from the market, then the market returning. The pool says why it cannot buy, keeps serving from what it has, and rents the moment it can |
-| **priced_out** | Every machine priced past the bid ceiling. Nothing is bought; every refusal carries its reason (D34) |
+| **priced_out** | Every machine priced past the all-in maximum. Nothing is bought; every refusal carries its reason (D34) |
 | **outbid_over_and_over** | An interruptible market at its worst: something outbid every two seconds, under load, for half a minute. No app ever sees half an answer |
 | **hosts_that_never_answer** | Machines that come up and whose engine never answers. Given up rather than billed for the whole preparing window, and their machines avoided (D54) |
 | **instances_without_their_script** | Instances that come up without their start-up material — no dead-man timer, no way in. Ended in the same pass (D65) |

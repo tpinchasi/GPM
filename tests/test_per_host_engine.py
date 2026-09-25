@@ -42,7 +42,7 @@ def config(**overrides):
             "provider": "fake", "workers": 2, "capabilities": ["cuda"],
             "engine": "vllm", "models": [BIG],
             "image": "vastai/vllm:v0.29.0-cuda-12.9",
-            "bidding": {"bid_ceiling": 2.0, "premium": 0.02},
+            "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 2.0}, "bidding": {"premium": 0.02},
         },
     }
     base.update(overrides)

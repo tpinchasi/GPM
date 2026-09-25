@@ -66,7 +66,7 @@ could neither adopt its hosts nor verify a destroy, and says what to set instead
 
 ```
 gpm lease open --workers 12 --max-hours 8 --max-spend 5.00 --allow-rent
-                # optional, tighten only:  --bid-ceiling 0.40
+                # optional, tighten only:  --max-all-in-hourly 0.40
 ```
 
 A lease is the unit of demand and of spending authority: wanted workers, a time limit, a dollar
@@ -201,9 +201,20 @@ model set. **Parked hosts are tried first** (§8).
    | `volatility_aware` | premium scaled by the observed swing of that machine's floor | post-v1 |
    | `fraction_of_on_demand` | a fixed fraction of the same offer's on-demand price | post-v1 |
 
-   Every strategy is clamped by **two ceilings**: the configured `bid_ceiling`, and
-   `on_demand_crossover` (default 0.8) × the on-demand price of an equivalent offer. Past the
-   second an interruptible host has the eviction risk without the discount.
+   Every strategy is clamped by **two ceilings**: the search's `max_all_in_hourly` — the most a
+   host may cost per hour, all-in, so the bid stops at it less the storage the host is billed
+   beside the bid (D108) — and `on_demand_crossover` (default 0.8) × the on-demand price of an
+   equivalent offer. Past the second an interruptible host has the eviction risk without the
+   discount. The same all-in maximum filters the market, holds every re-bid after an eviction,
+   and times `max_rented_hosts` bounds the pool's hourly spend: one number, not a search limit
+   beside a separate bid limit that could disagree with it.
+
+   **What is searched for is what is rented (D108).** Each offer is priced for the disk the host
+   would be rented with — `min_disk_gb` of the search in force, which is also the least a machine
+   must offer and the disk the rental asks for — so the all-in compared is the all-in billed. The
+   models' size is not typed: it is read from the sizes of the builds the rented engine fetches,
+   as the model directory measured them, and a search whose disk cannot hold them rejects every
+   offer saying so. A build the directory has not measured is named, not counted.
 4. **Place and confirm** — ask the provider to fail rather than park a losing bid; label the
    instance `<pool>/<host_id>`; wait for running; if it sits stopped with nothing pending for
    60 s the bid lost — destroy and verify. The floor moving between search and create is normal:
@@ -280,7 +291,7 @@ Overflow-driven renting answers "demand exceeded what I have". **Prepare a host*
 one ready before I start" and "keep one warm between runs". Available from the console, the
 control API and the CLI (`gpm host prepare`).
 
-**It is its own small lease**: it cannot start without a bid ceiling, a total dollar cap and a
+**It is its own small lease**: it cannot start without a price ceiling, a total dollar cap and a
 time limit, and its confirmation states the worst case. It borrows no authority from any other
 open lease.
 
@@ -417,10 +428,11 @@ rented:
     provider: <provider plug-in name>
     transport: { type: tunnel }
     image: <pinned engine image>               # never a floating tag
-    disk_gb: 60
-    offer_policy: { min_vram_gb: 64, max_allin_hourly: 0.66, max_download_per_gb: 0.01 }
+    offer_policy: { min_vram_gb: 64, min_disk_gb: 60,          # the disk each host is rented with
+                    max_all_in_hourly: 0.60,                   # the most per host-hour, all-in; bids stop here
+                    max_download_per_gb: 0.01 }
     scale:    { scale_up_after_s: 120, scale_down_after_s: 600, min_useful_hours: 1, one_at_a_time: true }
-    bidding:  { strategy: floor_plus_premium, premium: 0.02, bid_ceiling: 0.60,
+    bidding:  { strategy: floor_plus_premium, premium: 0.02,
                 on_demand_crossover: 0.8, attempts: 3, retry_market_every_min: 10 }
     spend:    { cap_safety_margin: 0.10, drift_alert: 0.15 }
     prepare:  { max_park_hours: 72, default_when_ready: join }

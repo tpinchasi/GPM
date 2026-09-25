@@ -25,9 +25,9 @@ def config(profiles=(), rented_workers=2):
                    "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}}],
         "capacity_profiles": list(profiles),
         "rented": {
-            "provider": "fake", "workers": rented_workers, "model_set_gb": 10.0,
+            "provider": "fake", "workers": rented_workers,
             "capabilities": ["cuda"],
-            "bidding": {"bid_ceiling": 0.60, "premium": 0.02},
+            "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 0.60}, "bidding": {"premium": 0.02},
             "scale": {"scale_up_after_s": 0},
         },
     })

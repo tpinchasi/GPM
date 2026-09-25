@@ -51,7 +51,7 @@ def pool_file(per_host: str = "all") -> str:
         rented:
           provider: fake
           {"models: [b]" if declared else ""}
-          bidding: {{ bid_ceiling: 0.60 }}
+          offer_policy: {{ min_disk_gb: 10, max_all_in_hourly: 0.60 }}
         """
     ).strip()
 

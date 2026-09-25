@@ -200,7 +200,8 @@ class FakeProvider:
             raise OfferGone(f"offer {offer.offer_id} is no longer available")
         if offer.offer_id in self.lose_bid_on:
             # A losing bid must fail and leave nothing behind.
-            raise BidLost(f"bid {bid} did not win machine {offer.machine_id}")
+            raise BidLost(f"bid {bid} did not win machine {offer.machine_id}",
+                          response={"success": False, "msg": "outbid", "offer": offer.offer_id})
 
         instance_id = f"i-{next(self._ids)}"
         self.instances[instance_id] = FakeInstance(

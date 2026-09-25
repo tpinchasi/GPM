@@ -72,7 +72,7 @@ POOL_YAML = textwrap.dedent(
       # Vast's ssh launch mode replaces the image's entrypoint, so the engine is started here.
       engine_start: "{OLLAMA_START}"
       capabilities: [cuda]
-      bidding: {{ bid_ceiling: 0.60 }}
+      offer_policy: {{ min_disk_gb: 10, max_all_in_hourly: 0.60 }}
     """
 ).strip()
 

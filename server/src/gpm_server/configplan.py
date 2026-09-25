@@ -62,6 +62,8 @@ class RentedNow:
 
     host_id: str
     bid_hourly: float
+    #: The storage it is billed beside its bid, so its all-in can be set against a ceiling.
+    storage_hourly: float = 0.0
 
 
 def plan_changes(
@@ -179,9 +181,10 @@ def plan_changes(
 _EXPLAINED = (
     "pool.model_set", "pool.queue_timeout_s", "catalog", "listen",
     "limits.max_rented_hosts", "limits.max_hourly_burn",
-    "rented.bidding.bid_ceiling", "rented.image",
+    "rented.image",
     "rented.teardown.idle_minutes", "rented.teardown.deadman_minutes",
-    "rented.offer_policy.max_all_in_hourly", "rented.offer_policy.max_download_per_gb",
+    "rented.offer_policy.max_all_in_hourly", "rented.offer_policy.max_all_in_per_gpu",
+    "rented.offer_policy.max_download_per_gb", "rented.offer_policy.min_disk_gb",
     "capacity_profiles",
 )
 _EXPLAINED_PER_HOST = ("transport", "workers", "disabled", "agent", "residency")
@@ -295,9 +298,10 @@ def _limit_changes(current: PoolConfig, candidate: PoolConfig, rented: Sequence[
         if loosened:
             detail = f"the overall hourly burn cap goes from {says(old_burn)} to {says(new_burn)}"
             if new_burn is None and candidate.rented is not None:
-                bound = new_limits.max_rented_hosts * candidate.rented.bidding.bid_ceiling
+                ceiling = candidate.rented.max_all_in_hourly
+                bound = new_limits.max_rented_hosts * ceiling
                 detail += (f"; spending is then bounded per host — {new_limits.max_rented_hosts} host(s) × "
-                           f"${candidate.rented.bidding.bid_ceiling:.2f}/h = ${bound:.2f}/h at most")
+                           f"${ceiling:.2f}/h = ${bound:.2f}/h at most")
             changes.append(Change(
                 "burn_raised", detail,
                 requires_retype="none" if new_burn is None else f"{new_burn:.2f}",
@@ -318,37 +322,40 @@ def _limit_changes(current: PoolConfig, candidate: PoolConfig, rented: Sequence[
             requires_retype="rented" if new_rented else None,
         ))
     elif old_rented is not None and new_rented is not None:
-        old_ceiling = old_rented.bidding.bid_ceiling
-        new_ceiling = new_rented.bidding.bid_ceiling
-        if new_ceiling > old_ceiling:
-            changes.append(Change(
-                "bid_ceiling_raised",
-                f"the bid ceiling goes from ${old_ceiling:.3f} to ${new_ceiling:.3f}/h",
-                requires_retype=f"{new_ceiling:.3f}",
-            ))
-        elif new_ceiling < old_ceiling:
-            over = [host for host in rented if host.bid_hourly > new_ceiling]
-            detail = f"the bid ceiling drops to ${new_ceiling:.3f}/h"
-            if over:
-                names = ", ".join(f"{h.host_id} at ${h.bid_hourly:.3f}" for h in over)
-                detail += f"; {names} now bids above it and will be drained and released"
-            changes.append(Change("bid_ceiling_lowered", detail))
-
-        # The other two price ceilings. Raising or removing either lets the pool pay more, so
-        # it is loosening, and loosening is typed again — the same rule as the bid ceiling.
+        # The search in force is what the pool rents with (D108) — the file's own policy, or the
+        # profile it names — so switching profile can raise the price as surely as editing it.
+        old_policy, new_policy = old_rented.policy_in_force, new_rented.policy_in_force
+        # Raising or removing a price ceiling lets the pool pay more, so it is loosening, and
+        # loosening is typed again.
         for field, what, unit in (
-            ("max_all_in_hourly", "the all-in hourly price the pool will accept", "/h"),
+            ("max_all_in_hourly", "the most the pool pays per host, all-in, bids included", "/h"),
+            ("max_all_in_per_gpu", "the most the pool pays per card, all-in", "/h"),
             ("max_download_per_gb", "the download price the pool will accept", "/GB"),
         ):
-            old_cap, new_cap = getattr(old_rented.offer_policy, field), getattr(new_rented.offer_policy, field)
+            old_cap, new_cap = getattr(old_policy, field), getattr(new_policy, field)
             if old_cap == new_cap:
                 continue
             loosened = new_cap is None or (old_cap is not None and new_cap > old_cap)
+            detail = f"{what} goes from {_price(old_cap, unit)} to {_price(new_cap, unit)}"
+            if not loosened:
+                detail += "; offers above it are rejected from the next pass"
+                if field == "max_all_in_hourly":
+                    over = [h for h in rented if h.bid_hourly + h.storage_hourly > new_cap]
+                    if over:
+                        names = ", ".join(
+                            f"{h.host_id} at ${h.bid_hourly + h.storage_hourly:.3f}" for h in over
+                        )
+                        detail += f"; {names} already costs more, and keeps its bid until it is re-bid"
             changes.append(Change(
-                f"{field}_{'raised' if loosened else 'lowered'}",
-                f"{what} goes from {_price(old_cap, unit)} to {_price(new_cap, unit)}"
-                + ("" if loosened else "; offers above it are rejected from the next pass"),
+                f"{field}_{'raised' if loosened else 'lowered'}", detail,
                 requires_retype=("none" if new_cap is None else f"{new_cap:.3f}") if loosened else None,
+            ))
+        if old_policy.min_disk_gb != new_policy.min_disk_gb:
+            changes.append(Change(
+                "disk",
+                f"hosts are rented with {new_policy.min_disk_gb:g} GB of disk, from "
+                f"{old_policy.min_disk_gb:g} GB, and only machines offering that much are "
+                "considered; hosts already running keep theirs",
             ))
 
         if new_rented.image != old_rented.image:
@@ -712,19 +719,47 @@ def remove_list_item(text: str, list_key: str, match_key: str, match_value: str)
     return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
 
 
+def _flow_items(body: str) -> list[str]:
+    """The items of a flow mapping's body, split only at its own commas — not at those inside a
+    nested `{ }` or `[ ]`, or inside quotes. Splitting at every comma cut a profile written as
+    `{ cheap: { min_disk_gb: 50, ... } }` in half, and the file it wrote did not load."""
+    items, depth, quote, start = [], 0, None, 0
+    for at, char in enumerate(body):
+        if quote:
+            if char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char in "{[":
+            depth += 1
+        elif char in "}]":
+            depth -= 1
+        elif char == "," and depth == 0:
+            items.append(body[start:at])
+            start = at + 1
+    items.append(body[start:])
+    return items
+
+
 def _set_in_flow(line: str, values: Mapping[str, Any], name: str) -> str:
-    """A one-line `key: { a: 1, b: 2 }`, changed inside its braces."""
+    """A one-line `key: { a: 1, b: { c: 2 } }`, changed inside its outer braces."""
     head, _, rest = line.partition("{")
     body, closing, tail = rest.rpartition("}")
     if not closing:
         raise CannotEdit(f"{name!r} is written across lines; change it on the Configuration screen")
+    items = _flow_items(body) if body.strip() else []
     for key, value in values.items():
-        pattern = re.compile(rf"(^|,)(\s*){re.escape(key)}(\s*:\s*)([^,}}]*)")
-        if pattern.search(body):
-            body = pattern.sub(
-                lambda m, key=key, value=value: f"{m.group(1)}{m.group(2)}{key}{m.group(3)}{_as_yaml(value)}",
-                body, count=1,
-            )
+        for index, item in enumerate(items):
+            found, colon, _old = item.partition(":")
+            if colon and found.strip().strip("\"'") == key:
+                lead = item[: len(item) - len(item.lstrip())]
+                trail = item[len(item.rstrip()):]
+                items[index] = f"{lead}{found.strip()}: {_as_yaml(value)}{trail}"
+                break
         else:
-            body = (body.rstrip() + ", " if body.strip() else " ") + f"{key}: {_as_yaml(value)} "
-    return f"{head}{{{body}}}{tail}"
+            if items:
+                items[-1] = items[-1].rstrip()
+                items.append(f" {key}: {_as_yaml(value)} ")
+            else:
+                items = [f" {key}: {_as_yaml(value)} "]
+    return f"{head}{{{','.join(items)}}}{tail}"

@@ -253,6 +253,34 @@ def read_directory(database: Database, query: Optional[str] = None,
     return {"refreshed": store.runs(), "models": models, "looked_up_elsewhere": elsewhere}
 
 
+def build_sizes_gb(database: Database, builds: dict[str, str]) -> dict[str, Optional[float]]:
+    """Each build's size on disk, by the model it is a build of — or None where the directory
+    has not measured it (D108). `builds` maps a pool model to the tag its engine fetches.
+
+    Read from what the directory already holds: a hub build's weight files, as listed when the
+    pool's builds were looked up, and an Ollama tag's size from its library page. Nothing is
+    fetched here; a build never looked up is unknown, and said to be.
+    """
+    store = DirectoryStore(database)
+    hub = store.all(HUB)
+    library_tags = {
+        tag.get("name"): tag.get("size_gb")
+        for entry, _ in store.all(OLLAMA).values() for tag in entry.get("tags", [])
+    }
+    sizes: dict[str, Optional[float]] = {}
+    for model, tag in builds.items():
+        found: Optional[float] = None
+        looked_up = hub.get(model)
+        if looked_up:
+            found = next(
+                (b.get("size_gb") for b in looked_up[0].get("builds", []) if b.get("repo") == tag), None
+            )
+        if found is None:
+            found = library_tags.get(tag)
+        sizes[model] = float(found) if found else None
+    return sizes
+
+
 # --- refreshing (the supervisor only) ---
 
 

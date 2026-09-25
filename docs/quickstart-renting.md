@@ -25,7 +25,7 @@ And two more inside the rented section:
 
 | Limit | Ships as | What it stops |
 |---|---|---|
-| `bid_ceiling` | required, no default | A single bid running away |
+| `offer_policy.max_all_in_hourly` | required, no default | A single host costing more than you meant — machines above it are not considered, and bids stop at it |
 | `on_demand_crossover` | 0.8 | Paying near the on-demand price for a host that can still be evicted |
 
 ## 1. Give the provider its credential
@@ -52,15 +52,14 @@ limits:
 rented:
   provider: vast
   image: ollama/ollama:0.34.2  # pinned, never a floating tag
-  disk_gb: 40
-  workers: 2
+  workers: 2                   # per card: a two-card machine runs twice this
   capabilities: [cuda]
-  model_set_gb: 6              # what your model set costs to download, for ranking and estimates
   ssh_key: ~/.ssh/id_ed25519   # the pool installs its public half on each host it rents
 
   offer_policy:                # hard filters. Never relaxed unattended
     min_gpu_memory_gb: 24
-    max_all_in_hourly: 0.40
+    min_disk_gb: 40            # the disk each host is rented with, and the least a machine must offer
+    max_all_in_hourly: 0.30    # the most per host per hour, all-in with that disk — bids stop here
     max_download_per_gb: 0.01
     min_download_mbps: 100
     min_reliability: 0.95
@@ -70,7 +69,6 @@ rented:
   bidding:
     strategy: floor_plus_premium
     premium: 0.02              # absolute, not a multiplier: floors span an order of magnitude
-    bid_ceiling: 0.30
 
   teardown:
     idle_minutes: 2            # idle time, not the hourly rate, is what actually costs you
