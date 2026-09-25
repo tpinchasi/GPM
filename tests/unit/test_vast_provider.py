@@ -269,6 +269,39 @@ async def test_stopped_while_we_wanted_running_reads_as_an_eviction():
     assert status.stopped_by_provider is True
 
 
+async def test_outbid_while_its_image_is_still_loading_reads_as_stopped():
+    """Found live (D109), the provider's own answer for rented-9023b1 four minutes in: still
+    loading its image, and already decided not to run it. Read as "still starting", the pool
+    neither re-bid nor released it."""
+    payload = {"instances": {
+        "actual_status": "loading", "intended_status": "stopped", "cur_state": "stopped",
+        "next_state": "stopped", "status_msg": "\n#5 [2/6] RUN mkdir -p /tmp; chmod 1777 /tmp; exit 0;\n",
+    }}
+    status = await provider(lambda r: httpx.Response(200, json=payload)).status(Instance("1"))
+    assert status.state == InstanceState.STOPPED
+
+
+async def test_a_machines_own_price_is_asked_of_the_machine_rentable_or_not():
+    """A machine the pool was just outbid on is held by whoever outbid it, so the ordinary
+    search, which asks for rentable machines only, cannot see it (D109)."""
+    seen = []
+
+    def handler(request):
+        body = json.loads(request.read())
+        seen.append(body)
+        if body.get("type") == "on-demand":
+            return httpx.Response(200, json={"offers": []})
+        return httpx.Response(200, json={"offers": [
+            {**OFFER, "id": 40176930, "machine_id": 138919, "num_gpus": 1, "min_bid": 1.2, "rentable": False},
+            {**OFFER, "id": 40176932, "machine_id": 138919, "num_gpus": 2, "min_bid": 2.4, "rentable": False},
+        ]})
+
+    offer = await provider(handler).offer_for_machine("138919", gpus=1)
+    assert offer is not None and offer.offer_id == "40176930" and offer.min_bid_hourly == 1.2
+    assert seen[0]["machine_id"] == {"eq": 138919} and "rentable" not in seen[0]
+    assert await provider(handler).offer_for_machine("138919", gpus=4) is None
+
+
 async def test_a_running_instance_is_running():
     payload = {"instances": {"actual_status": "running", "intended_status": "running"}}
     status = await provider(lambda r: httpx.Response(200, json=payload)).status(Instance("1"))

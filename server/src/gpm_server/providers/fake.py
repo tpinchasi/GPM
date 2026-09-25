@@ -91,6 +91,9 @@ class FakeProvider:
         # --- the script ---
         #: Offer ids whose bid will be lost at create time.
         self.lose_bid_on: set[str] = set()
+        #: Listings the search does not return because someone else holds the machine — the one
+        #: that just outbid the pool, say — but whose price can still be asked (D109).
+        self.held_by_others: list[Offer] = []
         #: Offer ids that vanish between search and create.
         self.offer_gone_on: set[str] = set()
         #: How many more times destroy() should fail before working.
@@ -193,6 +196,15 @@ class FakeProvider:
             and (query.interruptible if offer.interruptible else query.on_demand)
         ]
         return found[: query.limit]
+
+    async def offer_for_machine(self, machine_id: str, gpus: int) -> Optional[Offer]:
+        """This machine's current bid listing, whether or not the search would show it."""
+        self._guard("search_offers")
+        return next(
+            (o for o in self.offers + self.held_by_others
+             if o.machine_id == machine_id and o.gpus == gpus and o.interruptible),
+            None,
+        )
 
     async def create(self, offer: Offer, spec: InstanceSpec, bid: Optional[float]) -> Instance:
         self._guard("create")

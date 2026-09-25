@@ -551,34 +551,29 @@ def decide_eviction(
     best_alternative: Optional[Offer],
     lease: Optional[LeaseView],
     cfg: BiddingConfig,
-    model_set_gb: float,
     policy: OfferPolicy,
 ) -> EvictionDecision:
-    """By cost over the hours the lease still has, not by habit."""
+    """Outbid: win the machine back if a bid within the ceilings can, and otherwise let it go
+    (D109). The machine already holds the disk and the models it was prepared with; a bid that
+    wins it back is worth more than anything a new rental could give sooner. Whether that bid
+    won is judged after it is placed — the supervisor releases a host its re-bid did not bring
+    back."""
     if lease is None or not lease.allow_rent:
         return EvictionDecision(
             "destroy", None, ["no lease allows renting, so the host is not replaced"]
         )
 
-    hours = lease.hours_left
     reasons: list[str] = []
-
-    rebid = (
-        price_bid(same_machine_offer, cfg, policy, lease.max_all_in_hourly)
-        if same_machine_offer else None
-    )
-    if rebid is not None and same_machine_offer is not None:
-        alternative_rate = best_alternative.min_bid_hourly if best_alternative else rebid.hourly
-        rebid_cost = (rebid.hourly - alternative_rate) * hours
-        replace_cost = (
-            best_alternative.download_per_gb * model_set_gb if best_alternative else float("inf")
-        )
-        reasons.append(
-            f"re-bid in place ${rebid.hourly:.3f}/h costs ${rebid_cost:.2f} over {hours:.2f}h; "
-            f"replacing costs ${replace_cost:.2f} in model download"
-        )
-        if rebid_cost <= replace_cost:
-            return EvictionDecision("rebid", rebid.hourly, reasons + rebid.reasons)
+    if same_machine_offer is None:
+        reasons.append("the machine's price could not be read, so there is nothing to bid against")
+    else:
+        rebid = price_bid(same_machine_offer, cfg, policy, lease.max_all_in_hourly)
+        if rebid.hourly > 0:
+            return EvictionDecision(
+                "rebid", rebid.hourly,
+                [f"re-bid ${rebid.hourly:.3f}/h to win the machine back"] + rebid.reasons,
+            )
+        reasons.append(f"it cannot be won back within the ceilings: {rebid.reasons[-1]}")
 
     if best_alternative is None:
         return EvictionDecision(

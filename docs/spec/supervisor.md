@@ -225,18 +225,22 @@ model set. **Parked hosts are tried first** (§8).
 
 ### 6.2 On eviction
 
-Choose by cost over the hours the lease still has, not by habit:
+**Try to outbid; let it go if that fails (D109).** An eviction is noticed as soon as the
+provider decides not to run the instance — outbid while its image is still loading included —
+not only once its container has stopped.
 
-| Option | Cost | In v1 |
+| In order | What | When |
 |---|---|---|
-| **Re-bid in place** — same machine, disk and models kept | (new bid − best alternative's run rate) × hours left; only within both ceilings | yes |
-| **Replace** on another machine | model download at that host's price + time to ready | yes |
-| **Wait it out**, instance stopped, storage only, time-boxed | storage, plus the run pausing unless higher tiers cover demand | post-v1 |
+| 1 | **Re-bid in place** — same machine, disk and models kept: the machine's current floor plus the premium | whenever that bid fits the all-in maximum and the on-demand crossover. The floor is read from the market, or, where the machine is not listed because whoever outbid the pool holds it, asked of that machine (`offer_for_machine`) |
+| 2 | **Release** it | the bid cannot fit the ceilings, the machine's price cannot be read, or a re-bid has not brought the instance back once the grace below has run out (`rebid_lost`) |
+| — | **Replace** | not an eviction response: a released host is a lease's missing capacity, and renting for it is the ordinary acquire path. A prepared host's lease closes with it |
+| — | **Wait it out**, instance stopped, storage only, time-boxed | post-v1 |
 
 A re-bid asks the provider to start the instance again, and the provider takes longer than a
 pass to do it. For a grace period after the re-bid (`REBID_GRACE_S`, 120 s) a stopped instance
 is that restart in flight, not a new eviction; the grace ends the moment the instance is seen
-running, and a stop that outlasts it is judged again (D106). Without this the machine's floor —
+running, and a stop that outlasts it means the re-bid did not win: the host is released (D106,
+D109). Without this the machine's floor —
 the pool's own bid, once it is the top bidder — plus the premium was bid again every pass.
 
 *(Also post-v1: sampling each rented machine's floor every pass, proactive re-bid before being

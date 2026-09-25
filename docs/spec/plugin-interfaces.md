@@ -53,7 +53,7 @@ class Provider(Protocol):
 | `list_instances` | Returns **every** instance carrying the label prefix, in any state, including stopped ones that still bill storage. The orphan sweep and crash recovery rest on this |
 | `create` | Either returns a running-or-scheduling instance, or raises and **leaves nothing behind**. A bid that loses must fail, not leave a parked instance |
 | `destroy` | Idempotent. The pool verifies by calling `list_instances` again; it never trusts a return value |
-| `status` | Distinguishes at least: running, scheduling, stopped-by-us, **outbid / stopped-by-provider**, gone |
+| `status` | Distinguishes at least: running, scheduling, stopped-by-us, **outbid / stopped-by-provider**, gone. An instance the provider has decided not to run is stopped **whatever its container is doing** — outbid while still loading its image included (D109) |
 | `search_offers` | Each `Offer` carries what ranking needs: hardware, memory, a throughput proxy, the current minimum bid, on-demand price if any, storage price, download price per gigabyte, download speed, reliability, provider verification flag, a stable machine identifier |
 | `reported_charges` | What the provider says the instance has cost so far, or `None` if it cannot say |
 | Every operation | Bounded by a timeout; raises typed errors (`ProviderAuthError`, `ProviderRateLimited`, `ProviderUnavailable`, `OfferGone`, `BidLost`); never blocks indefinitely |
@@ -62,6 +62,13 @@ class Provider(Protocol):
 URL, headers, optional body — never a command line (D71). Header values may name an environment
 variable the provider injects; the account credential never appears. The host decides how to make
 the call, because what a machine has to make it with is not the provider's business.
+
+**Optional: `offer_for_machine(machine_id, gpus)`** — the current bid listing for one machine's
+slice, asked of the machine itself whether or not anyone may rent it (D109). The ordinary search
+lists rentable machines only, and a machine the pool was just outbid on is held by whoever
+outbid it — so without this the pool has no price to re-bid against, and lets the host go. A
+provider without it is not an error: an outbid host whose machine the search cannot see is
+released.
 
 **Optional in an instance's status: `startup_material`** — true, false, or unknown. A provider
 that can tell whether an instance still carries the start-up material it was created with says
