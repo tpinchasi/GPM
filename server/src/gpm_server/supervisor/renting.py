@@ -1999,8 +1999,26 @@ class Fleet:
                 await self.destroy(host, "evicted with no open lease")
                 continue
 
+            if host.rebid_at is not None:
+                # The pool re-bid, the grace has run out, and the machine is still not ours: the
+                # bid did not win it back. Let it go rather than bid again and again (D109).
+                self.events.record(
+                    "rebid_lost",
+                    f"{host.host_id}: the re-bid at ${host.bid_hourly:.3f}/h did not win "
+                    f"{host.offer.machine_id} back within {self.REBID_GRACE_S:.0f}s; releasing it",
+                    numbers={"bid": host.bid_hourly, "machine": host.offer.machine_id},
+                    host_id=host.host_id,
+                    lease_id=host.lease_id,
+                )
+                await self.destroy(host, "outbid, and the re-bid did not win it back")
+                continue
+
             offers = await self._offers()
             same_machine = next((o for o in offers if o.machine_id == host.offer.machine_id), None)
+            if same_machine is None and host.interruptible:
+                # Outbid means someone else holds it now, so the search does not list it: ask
+                # for this machine's own price (D109).
+                same_machine = await self._machine_price(host)
             alternatives = [o for o in offers if o.machine_id != host.offer.machine_id]
             best_alternative = alternatives[0] if alternatives else None
 
@@ -2019,7 +2037,6 @@ class Fleet:
                 best_alternative,
                 self._lease_view(lease),
                 self.rented.bidding,
-                self.model_set_gb(self.models_of(host)),
                 self.rented.policy_in_force,
             )
             self.events.record(
@@ -2045,6 +2062,19 @@ class Fleet:
                     log.warning("re-bid for %s failed: %s", host.host_id, exc)
             else:
                 await self.destroy(host, f"evicted; {decision.action}")
+
+    async def _machine_price(self, host: "RentedHost") -> Optional[Offer]:
+        """The current bid listing for the machine this host was rented on, asked of the machine
+        itself — or None where the provider cannot say, which releases rather than guesses."""
+        finder = getattr(self.provider, "offer_for_machine", None)
+        if finder is None:
+            return None
+        try:
+            offer = await finder(host.offer.machine_id, host.offer.gpus)
+        except ProviderError as exc:
+            log.warning("the price of %s could not be read: %s", host.offer.machine_id, exc)
+            return None
+        return offer.priced_for(self.rented.disk_gb) if offer is not None else None
 
     # --- acquire what is missing ---
 

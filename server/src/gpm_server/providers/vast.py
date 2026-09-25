@@ -180,6 +180,24 @@ class VastProvider:
             found.extend(self._to_offer(entry, {}, interruptible=False) for entry in raw)
         return found
 
+    async def offer_for_machine(self, machine_id: str, gpus: int) -> Optional[Offer]:
+        """What it takes now to bid for this machine's `gpus`-card slice — asked of the machine
+        itself, rentable or not (D109). The ordinary search sees only machines anyone may rent,
+        and a machine the pool was just outbid on is held by whoever outbid it, so it is exactly
+        the one the search cannot see."""
+        try:
+            wanted = int(machine_id)
+        except ValueError:
+            return None
+        payload = await self._call(
+            "POST", "/api/v0/bundles", json={"machine_id": {"eq": wanted}, "type": "bid", "limit": 20},
+        )
+        entries = payload.get("offers", payload if isinstance(payload, list) else [])
+        entry = next((e for e in entries if int(e.get("num_gpus") or 1) == gpus), None)
+        if entry is None:
+            return None
+        return self._to_offer(entry, await self._on_demand_prices([entry]))
+
     async def _listing(self, kind: str, query: OfferQuery) -> list[dict[str, Any]]:
         body: dict[str, Any] = {"limit": query.limit, "type": kind, "rentable": {"eq": True}}
         if query.verified_only:
@@ -371,7 +389,13 @@ class VastProvider:
 
         actual = str(entry.get("actual_status") or "").lower()
         intended = str(entry.get("intended_status") or "").lower()
-        if actual == "running":
+        if intended == "stopped":
+            # The provider has decided not to run it, whatever its container is doing now.
+            # Found live (D109): outbid while its image was still loading, an instance read
+            # `loading` for minutes with intended, current and next state all `stopped` — and
+            # read as "still starting", the pool neither re-bid nor released it.
+            state = InstanceState.STOPPED
+        elif actual == "running":
             state = InstanceState.RUNNING
         elif actual in ("loading", "created", "scheduling"):
             state = InstanceState.SCHEDULING

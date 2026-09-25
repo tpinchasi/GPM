@@ -5,6 +5,7 @@ are wrong: nothing rents without a lease, every cap is re-checked after a strate
 lease stops before its dollar cap, and a release counts only once the provider agrees.
 """
 
+import dataclasses
 import time
 from pathlib import Path
 
@@ -399,10 +400,12 @@ async def test_a_stop_seen_while_the_pools_own_re_bid_restarts_is_not_a_second_e
     await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
     assert kinds(fleet).count("eviction") == 2
 
-    # A start that never happens is judged again once the grace has run out.
+    # A re-bid that has not brought the machine back once the grace has run out did not win
+    # it: the host is let go, not bid for again and again (D109).
     host.rebid_at = time.time() - fleet.REBID_GRACE_S - 1
     await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
-    assert kinds(fleet).count("eviction") == 3
+    assert kinds(fleet).count("eviction") == 2
+    assert "rebid_lost" in kinds(fleet) and host.released
 
 
 async def test_an_eviction_outside_a_lease_rents_nothing_back(fleet):
@@ -977,3 +980,48 @@ def test_both_ceilings_apply_when_both_are_set():
 
 def test_a_per_gpu_ceiling_nobody_set_refuses_nothing():
     assert not reject_reasons(default_offer(gpus=8, all_in_hourly=40.0), OfferPolicy())
+
+
+# --- outbid, even while it is still starting (D109) ---
+
+
+async def test_an_outbid_host_the_search_cannot_see_is_bid_for_at_its_machines_own_price(fleet):
+    """Found live: outbid minutes after renting, the machine was held by whoever outbid the
+    pool, so the search — which lists only machines anyone may rent — did not show it, and
+    there was nothing to re-bid against."""
+    open_lease(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    host = next(iter(fleet.hosts.values()))
+    rented_on = host.offer
+    # Outbid: the machine leaves the market, held by someone else at a higher floor.
+    fleet.provider.offers = [o for o in fleet.provider.offers if o.machine_id != rented_on.machine_id]
+    fleet.provider.held_by_others = [dataclasses.replace(rented_on, min_bid_hourly=0.30, on_demand_hourly=None)]
+    fleet.provider.evict(host.instance.instance_id)
+
+    await fleet.handle_evictions()
+    eviction = next(e for e in fleet.events.recent() if e["kind"] == "eviction")
+    assert "rebid" in eviction["summary"]
+    assert host.bid_hourly == pytest.approx(0.32), "the machine's own floor plus the premium"
+    assert not host.released
+
+
+async def test_a_host_the_re_bid_did_not_win_back_is_released(fleet):
+    import time
+
+    open_lease(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    host = next(iter(fleet.hosts.values()))
+
+    async def never_starts(instance):
+        pass
+
+    fleet.provider.start = never_starts
+    fleet.provider.evict(host.instance.instance_id)
+    await fleet.handle_evictions()
+    assert host.rebid_at is not None and not host.released
+
+    host.rebid_at = time.time() - fleet.REBID_GRACE_S - 1
+    await fleet.handle_evictions()
+    assert host.released
+    lost = next(e for e in fleet.events.recent() if e["kind"] == "rebid_lost")
+    assert "did not win" in lost["summary"]

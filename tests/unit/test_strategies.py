@@ -202,26 +202,38 @@ def test_a_refused_bid_is_a_rejection_with_its_own_filter_name():
 # --- eviction ---
 
 
-def test_re_bidding_in_place_wins_when_the_download_would_cost_more():
-    host = HostView("h1", 20, 0, 2, 0, bid_hourly=0.12, machine_id="m-1")
-    same = default_offer(machine_id="m-1", min_bid_hourly=0.13)
-    alternative = default_offer(offer_id="o-2", machine_id="m-2", min_bid_hourly=0.12, download_per_gb=0.05)
-    decision = decide_eviction(host, same, alternative, lease(hours_left=1.0), BIDDING, model_set_gb=20, policy=POLICY)
-    assert decision.action == "rebid"
-    assert decision.bid == pytest.approx(0.15)
-
-
-def test_replacing_wins_when_holding_the_machine_costs_more_than_moving():
+def test_an_outbid_host_is_bid_for_again_when_a_bid_within_the_ceilings_can_win_it():
+    """The owner (D109): "the pool needs to be aware and try to outbid" — even where moving
+    would be cheaper, the machine already holds the disk and the models."""
     host = HostView("h1", 20, 0, 2, 0, bid_hourly=0.12, machine_id="m-1")
     same = default_offer(machine_id="m-1", min_bid_hourly=0.50, on_demand_hourly=None)
-    alternative = default_offer(offer_id="o-2", machine_id="m-2", min_bid_hourly=0.10, download_per_gb=0.0001)
-    decision = decide_eviction(host, same, alternative, lease(hours_left=8.0), BIDDING, model_set_gb=1, policy=POLICY)
+    cheaper_elsewhere = default_offer(offer_id="o-2", machine_id="m-2", min_bid_hourly=0.10, download_per_gb=0.0001)
+    decision = decide_eviction(host, same, cheaper_elsewhere, lease(hours_left=8.0), BIDDING, POLICY)
+    assert decision.action == "rebid"
+    assert decision.bid == pytest.approx(0.52)
+    assert "win the machine back" in decision.reasons[0]
+
+
+def test_a_machine_that_cannot_be_won_back_within_the_ceilings_is_let_go():
+    host = HostView("h1", 20, 0, 2, 0, bid_hourly=0.12, machine_id="m-1")
+    same = default_offer(machine_id="m-1", min_bid_hourly=1.20, on_demand_hourly=None)  # above the 0.60 maximum
+    alternative = default_offer(offer_id="o-2", machine_id="m-2", min_bid_hourly=0.10)
+    decision = decide_eviction(host, same, alternative, lease(hours_left=8.0), BIDDING, POLICY)
     assert decision.action == "replace"
+    assert any("cannot be won back within the ceilings" in r for r in decision.reasons)
+    alone = decide_eviction(host, same, None, lease(hours_left=8.0), BIDDING, POLICY)
+    assert alone.action == "destroy"
+
+
+def test_a_machine_whose_price_cannot_be_read_is_let_go_rather_than_guessed_at():
+    host = HostView("h1", 20, 0, 2, 0, bid_hourly=0.12, machine_id="m-1")
+    decision = decide_eviction(host, None, None, lease(hours_left=8.0), BIDDING, POLICY)
+    assert decision.action == "destroy" and "could not be read" in decision.reasons[0]
 
 
 def test_an_eviction_outside_a_lease_just_stops_billing():
     host = HostView("h1", 20, 0, 2, 0, bid_hourly=0.12, machine_id="m-1")
-    decision = decide_eviction(host, default_offer(), default_offer(), None, BIDDING, model_set_gb=1, policy=POLICY)
+    decision = decide_eviction(host, default_offer(), default_offer(), None, BIDDING, POLICY)
     assert decision.action == "destroy"
 
 
