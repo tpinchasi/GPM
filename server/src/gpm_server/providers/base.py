@@ -35,7 +35,16 @@ class OfferGone(ProviderError):
 
 
 class BidLost(ProviderError):
-    """The bid was placed and did not win."""
+    """The bid was placed and did not win.
+
+    `response` is the provider's own answer, as it gave it, where it gave one: found live, a
+    refusal whose only recorded word was "refused" left the reason to be reconstructed by hand
+    from the market afterwards.
+    """
+
+    def __init__(self, message: str, response: Any = None):
+        super().__init__(message)
+        self.response = response
 
 
 @dataclasses.dataclass(frozen=True)
@@ -78,7 +87,11 @@ class Offer:
     #: The all-in hourly figure the provider quotes, including its own overheads.
     all_in_hourly: float
     on_demand_hourly: Optional[float] = None
+    #: The storage inside `all_in_hourly`, per hour.
     storage_hourly: float = 0.0
+    #: What each gigabyte of disk costs per hour on this machine, where the provider says —
+    #: so the offer can be priced for the disk the pool will actually rent (D108).
+    storage_per_gb_hourly: float = 0.0
     download_per_gb: float = 0.0
     download_mbps: float = 0.0
     #: The machine's accelerator driver, as the provider reports it ("595.84"). None
@@ -93,6 +106,27 @@ class Offer:
     #: `all_in_hourly`, there is nothing to bid, and nobody can take it away (D52).
     interruptible: bool = True
     raw: dict[str, Any] = dataclasses.field(default_factory=dict, repr=False)
+
+    def priced_for(self, disk_gb: float) -> "Offer":
+        """This offer as it would be billed with `disk_gb` of disk (D108).
+
+        A provider quotes an all-in price for some storage of its own choosing — a few GB, or
+        the whole listing's disk — and neither is what the pool rents. The price the search
+        compares must be the price the host is billed, so the storage in it is replaced by the
+        storage for the disk requested. A provider that does not price storage per GB leaves
+        the quote as it is.
+        """
+        if not self.storage_per_gb_hourly:
+            return self
+        storage = self.storage_per_gb_hourly * disk_gb
+        all_in = self.all_in_hourly - self.storage_hourly + storage
+        return dataclasses.replace(
+            self,
+            all_in_hourly=all_in,
+            storage_hourly=storage,
+            # A fixed price has no floor apart from itself.
+            min_bid_hourly=self.min_bid_hourly if self.interruptible else all_in,
+        )
 
 
 @dataclasses.dataclass(frozen=True)

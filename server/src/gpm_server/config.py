@@ -10,7 +10,7 @@ from __future__ import annotations
 import ipaddress
 import os
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, ClassVar, Literal, Optional
 from urllib.parse import urlparse
 
 import yaml
@@ -391,8 +391,15 @@ class OfferPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     min_gpu_memory_gb: float = 0.0
+    #: The disk each host is rented with, and the least a machine must offer to be considered —
+    #: one number (D108). A machine is priced for exactly this much storage, so the all-in
+    #: price the search compares is the price the host is billed. Required where the pool rents.
     min_disk_gb: float = 0.0
-    max_all_in_hourly: Optional[float] = None
+    #: The most the pool pays for one host, per hour, **all-in**: its bid (or fixed price) plus
+    #: the storage for `min_disk_gb` (D108). A machine above it is not considered; a bid, and
+    #: every re-bid after an eviction, stops at it; and `max_rented_hosts ×` it bounds the
+    #: pool's hourly spend. Required where the pool rents — nothing bids without a ceiling.
+    max_all_in_hourly: Optional[float] = Field(default=None, gt=0)
     #: The same ceiling, per accelerator (D85). A machine-level cap refuses every
     #: multi-GPU offer on its total price, however good its value: a 2-card machine at
     #: $2.80 is cheaper per card than a single at $1.47, and the machine cap cannot see
@@ -428,8 +435,7 @@ class BiddingConfig(BaseModel):
 
     strategy: Literal["floor_plus_premium"] = "floor_plus_premium"
     premium: float = 0.02
-    #: Mandatory: nothing bids without a stated ceiling.
-    bid_ceiling: float
+    # No ceiling of its own: the bid stops at the search's all-in maximum (D108).
     on_demand_crossover: float = 0.8
     attempts: int = 3
 
@@ -613,11 +619,11 @@ class LimitsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     max_rented_hosts: int = Field(default=1, ge=0)
-    #: Optional, and unset by default (D46): the cap that matters is per host — every bid is
-    #: clamped to `rented.bidding.bid_ceiling` and every offer filtered by `max_all_in_hourly` —
-    #: so the pool's hourly spend is already bounded by `max_rented_hosts × bid_ceiling`, and a
-    #: second total would only block the host count the operator asked for. Set it to impose an
-    #: overall budget below that bound.
+    #: Optional, and unset by default (D46): the cap that matters is per host — every offer is
+    #: filtered by, and every bid stops at, the search's `max_all_in_hourly` (D108) — so the
+    #: pool's hourly spend is already bounded by `max_rented_hosts ×` it, and a second total
+    #: would only block the host count the operator asked for. Set it to impose an overall
+    #: budget below that bound.
     max_hourly_burn: Optional[float] = Field(default=None, gt=0)
 
 
@@ -659,6 +665,52 @@ class RentedConfig(BaseModel):
     #: already has. Absent there means rented hosts may hold any model the pool still needs.
     models: Optional[list[str]] = None
 
+    #: Settings that were a second number for something the search already names (D108), and
+    #: where each went. Refused by name rather than as an unknown key, so the file says how to
+    #: fix it.
+    _MERGED: ClassVar[dict[str, str]] = {
+        "disk_gb": "the disk a host is rented with is the disk searched for: set "
+                   "offer_policy.min_disk_gb (and min_disk_gb in each search profile)",
+        "model_set_gb": "the models' size is now worked out from their builds; remove it",
+    }
+
+    @model_validator(mode="before")
+    @classmethod
+    def _merged_settings(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        for key, where in cls._MERGED.items():
+            if key in data:
+                raise ValueError(f"rented.{key} is gone (D108): {where}")
+        bidding = data.get("bidding")
+        if isinstance(bidding, dict) and "bid_ceiling" in bidding:
+            raise ValueError(
+                "rented.bidding.bid_ceiling is gone (D108): the most the pool pays per host per "
+                "hour, bids included, is offer_policy.max_all_in_hourly (and max_all_in_hourly "
+                "in each search profile)"
+            )
+        return data
+
+    @model_validator(mode="after")
+    def _every_search_says_what_it_rents(self) -> "RentedConfig":
+        """Every policy the pool may search with names the disk it rents and the most it pays
+        (D108): a profile switched on later is as able to spend as the default one."""
+        policies = {"offer_policy": self.offer_policy} | {
+            f"search_profiles.{name}": policy for name, policy in self.search_profiles.items()
+        }
+        for where, policy in policies.items():
+            if policy.min_disk_gb <= 0:
+                raise ValueError(
+                    f"rented.{where}.min_disk_gb must be set: it is the disk every host is "
+                    "rented with (D108)"
+                )
+            if policy.max_all_in_hourly is None:
+                raise ValueError(
+                    f"rented.{where}.max_all_in_hourly must be set: it is the most the pool "
+                    "pays per host per hour, all-in, and nothing bids without a ceiling (D108)"
+                )
+        return self
+
     @model_validator(mode="after")
     def _profile_exists(self) -> "RentedConfig":
         """A named profile that is not there would silently fall back to the default policy —
@@ -676,6 +728,18 @@ class RentedConfig(BaseModel):
         if self.search_profile:
             return self.search_profiles[self.search_profile]
         return self.offer_policy
+
+    @property
+    def disk_gb(self) -> float:
+        """The disk every host is rented with: the disk the search in force asks for (D108)."""
+        return self.policy_in_force.min_disk_gb
+
+    @property
+    def max_all_in_hourly(self) -> float:
+        """The most the pool pays per host per hour, all-in: the search in force's (D108)."""
+        ceiling = self.policy_in_force.max_all_in_hourly
+        assert ceiling is not None, "refused at load"
+        return ceiling
 
     provider: str
     provider_settings: dict[str, Any] = Field(default_factory=dict)
@@ -695,12 +759,10 @@ class RentedConfig(BaseModel):
     #: This replaces `image` when present. `offer_policy.min_driver_version` still applies and
     #: is the floor below which no machine is wanted at all, whatever image would run on it.
     images: list["EngineImage"] = Field(default_factory=list)
-    disk_gb: float = 60.0
     #: Workers **per card** for a machine no capacity profile matches (D107): two cards run
     #: twice the work, as under a profile that names the card (D88), held at 64 per host.
     workers: int = Field(default=1, ge=1)
     capabilities: list[str] = Field(default_factory=list)
-    model_set_gb: float = 0.0
     label_prefix: Optional[str] = None
     ssh_key: Optional[str] = None
     ssh_user: str = "root"
@@ -744,7 +806,7 @@ class RentedConfig(BaseModel):
     search_profiles: dict[str, OfferPolicy] = Field(default_factory=dict)
     search_profile: Optional[str] = None
     scale: ScaleConfig = Field(default_factory=ScaleConfig)
-    bidding: BiddingConfig
+    bidding: BiddingConfig = Field(default_factory=BiddingConfig)
     spend: SpendConfig = Field(default_factory=SpendConfig)
     teardown: TeardownConfig = Field(default_factory=TeardownConfig)
 

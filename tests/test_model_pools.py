@@ -42,7 +42,7 @@ def config(rented_models=(BIG, SMALL), engine="vllm", per_host="declared"):
             # Likewise: naming what rented hosts hold is refused where they hold everything.
             **({} if per_host == "all" else {"models": list(rented_models)}),
             "image": f"vastai/{engine}:latest",
-            "bidding": {"bid_ceiling": 2.0, "premium": 0.02},
+            "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 2.0}, "bidding": {"premium": 0.02},
             "scale": {"scale_up_after_s": 0},
         },
     })

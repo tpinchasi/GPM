@@ -22,8 +22,8 @@ OLD = EngineImage(image="vastai/vllm:v0.29.0-cuda-12.9", min_driver="550")
 
 def config(images=(), image=None):
     rented = {
-        "provider": "fake", "workers": 2, "model_set_gb": 10.0, "capabilities": ["cuda"],
-        "bidding": {"bid_ceiling": 2.0, "premium": 0.02},
+        "provider": "fake", "workers": 2, "capabilities": ["cuda"],
+        "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 2.0}, "bidding": {"premium": 0.02},
         "scale": {"scale_up_after_s": 0},
     }
     if images:
@@ -168,7 +168,7 @@ def test_a_build_must_say_which_driver_it_needs():
                        "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}}],
             "engine": "vllm",
             "rented": {"provider": "fake", "workers": 1, "capabilities": ["cuda"],
-                       "bidding": {"bid_ceiling": 1.0, "premium": 0.0},
+                       "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 1.0}, "bidding": {"premium": 0.0},
                        "images": [{"image": "vastai/vllm:v0.29.0-cuda-13.0"}]},
         })
 

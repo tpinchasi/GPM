@@ -180,6 +180,7 @@ def test_load_config_reads_the_shipped_example():
     parsed = load_config(EXAMPLE_CONFIG)
     assert parsed.pool.model_set
     assert parsed.rented.provider == "vast"
-    assert parsed.rented.bidding.bid_ceiling == 0.60
+    assert parsed.rented.max_all_in_hourly == 0.60
+    assert parsed.rented.disk_gb == 60
     assert parsed.limits.max_rented_hosts == 1
     assert parsed.auth.app_keys_file and parsed.auth.admin_keys_file

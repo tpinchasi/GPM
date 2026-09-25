@@ -175,7 +175,7 @@ def _lease(args: argparse.Namespace) -> int:
                 "max_hours": args.max_hours if args.max_hours is not None else 4.0,
                 "max_spend": args.max_spend,
                 "allow_rent": args.allow_rent,
-                "bid_ceiling": args.bid_ceiling,
+                "max_all_in_hourly": args.max_all_in_hourly,
             },
         )
     if args.action == "close":
@@ -199,7 +199,7 @@ def _host(args: argparse.Namespace) -> int:
             {
                 "max_spend": args.max_spend,
                 "max_hours": args.max_hours,
-                "bid_ceiling": args.bid_ceiling,
+                "max_all_in_hourly": args.max_all_in_hourly,
                 "when_ready": args.when_ready,
                 "offer_id": args.offer_id,
                 "kind": args.kind,
@@ -346,7 +346,8 @@ def main(argv: list[str] | None = None) -> int:
     #: No default on purpose: a lease that can rent must state its dollars (D32).
     lease.add_argument("--max-spend", type=float, default=None)
     lease.add_argument("--allow-rent", action="store_true")
-    lease.add_argument("--bid-ceiling", type=float, default=None)
+    lease.add_argument("--max-all-in-hourly", type=float, default=None,
+                       help="tighten the pool's all-in maximum per host-hour for this lease")
     lease.add_argument("--confirm", default=None,
                        help="extend: the new value again, since raising a limit is loosening")
     lease.add_argument("--url", default=None)
@@ -377,7 +378,8 @@ def main(argv: list[str] | None = None) -> int:
     host.add_argument("--workers", type=int, default=None, help="resize: how many requests this host takes at once")
     host.add_argument("--max-spend", type=float, default=None)
     host.add_argument("--max-hours", type=float, default=1.0)
-    host.add_argument("--bid-ceiling", type=float, default=None)
+    host.add_argument("--max-all-in-hourly", type=float, default=None,
+                      help="prepare: tighten the pool's all-in maximum per host-hour")
     host.add_argument("--when-ready", choices=["join", "park", "destroy"], default="join")
     host.add_argument("--offer-id", default=None, help="prepare: rent exactly this offer from `gpm market`")
     host.add_argument("--kind", choices=["interruptible", "on_demand"], default=None,

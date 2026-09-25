@@ -45,7 +45,8 @@ class LeaseView:
     allow_rent: bool
     hours_left: float
     dollars_left: float
-    bid_ceiling: Optional[float] = None
+    #: The lease's own all-in ceiling per host-hour, if it tightened the pool's (D108).
+    max_all_in_hourly: Optional[float] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -344,7 +345,9 @@ def reject_reasons(offer: Offer, policy: OfferPolicy, model_set_gb: float = 0.0)
             f"gpu memory: {offer.gpu_memory_gb}GB below the {policy.min_gpu_memory_gb}GB minimum"
         )
     if offer.disk_gb < policy.min_disk_gb:
-        reasons.append(f"disk: {offer.disk_gb}GB below the {policy.min_disk_gb}GB minimum")
+        reasons.append(
+            f"disk: {offer.disk_gb:g}GB below the {policy.min_disk_gb:g}GB this pool rents a host with"
+        )
     if policy.max_all_in_hourly is not None and offer.all_in_hourly > policy.max_all_in_hourly:
         reasons.append(
             f"all-in ceiling: ${offer.all_in_hourly:.3f}/h above ${policy.max_all_in_hourly:.3f}"
@@ -390,9 +393,12 @@ def reject_reasons(offer: Offer, policy: OfferPolicy, model_set_gb: float = 0.0)
     )
     if excluded is not None:
         reasons.append(f"excluded hardware: {offer.hardware!r} matches {excluded!r}")
-    if model_set_gb and offer.disk_gb < model_set_gb:
+    if model_set_gb and policy.min_disk_gb < model_set_gb:
+        # The disk rented is the disk searched for (D108), so this is about the search, not
+        # the machine — and it is said on every offer, because none of them would do.
         reasons.append(
-            f"disk: {offer.disk_gb}GB cannot hold the pool's model set ({model_set_gb}GB)"
+            f"disk: the {policy.min_disk_gb:g}GB this pool rents a host with cannot hold the "
+            f"models it would be bought for ({model_set_gb:.1f}GB)"
         )
     return reasons
 
@@ -433,7 +439,7 @@ def rank_offers(
         if reasons:
             rejected[offer.offer_id] = reasons
             continue
-        bid = price_bid(offer, bidding)
+        bid = price_bid(offer, bidding, policy)
         if bid.hourly <= 0:
             rejected[offer.offer_id] = ["bid: " + bid.reasons[-1]]
             continue
@@ -464,30 +470,56 @@ def history_note(offer: Offer, history: Optional[dict[str, Any]], history_cfg: O
 # --- how much to bid (spec §6.1) ---
 
 
-def price_bid(offer: Offer, cfg: BiddingConfig, lease_ceiling: Optional[float] = None) -> Bid:
-    """`floor_plus_premium`: the market floor plus an **absolute** premium.
+def all_in_ceiling(offer: Offer, policy: OfferPolicy, lease_ceiling: Optional[float] = None) -> tuple[float, str]:
+    """The most this host may cost per hour, all-in, and which rule set it (D108).
+
+    One number the operator searched with — `max_all_in_hourly` — tightened by the per-card
+    ceiling on a multi-card machine (D85) and by the lease's own, where either is set.
+    """
+    ceilings = []
+    if policy.max_all_in_hourly is not None:
+        ceilings.append((policy.max_all_in_hourly, f"the ${policy.max_all_in_hourly:.3f}/h all-in maximum"))
+    if policy.max_all_in_per_gpu is not None and offer.gpus:
+        per_host = policy.max_all_in_per_gpu * offer.gpus
+        ceilings.append((per_host, f"the ${policy.max_all_in_per_gpu:.3f}/h per-card maximum x {offer.gpus}"))
+    if lease_ceiling is not None:
+        ceilings.append((lease_ceiling, f"the lease's ${lease_ceiling:.3f}/h all-in maximum"))
+    if not ceilings:
+        # Refused at load wherever the pool rents; a policy without one bids nothing.
+        return 0.0, "no all-in maximum is set"
+    return min(ceilings)
+
+
+def price_bid(
+    offer: Offer, cfg: BiddingConfig, policy: OfferPolicy, lease_ceiling: Optional[float] = None,
+) -> Bid:
+    """`floor_plus_premium`: the market floor plus an **absolute** premium, stopping where the
+    host's all-in price reaches the search's maximum (D108).
 
     A multiplier is wrong here — floors span an order of magnitude or more, so any fixed
-    multiple is either free or wasteful.
+    multiple is either free or wasteful. The bid is the machine's price alone; the host is
+    billed that plus its storage, so the bid may rise to the maximum less the storage.
     """
+    ceiling, which = all_in_ceiling(offer, policy, lease_ceiling)
     if not offer.interruptible:
         # Nothing to bid: the price is fixed and the host cannot be outbid. A ceiling it
         # exceeds is a refusal, never a clamp — offering less does not rent it (D52).
         price = offer.all_in_hourly
-        ceiling = cfg.bid_ceiling if lease_ceiling is None else min(cfg.bid_ceiling, lease_ceiling)
-        reasons = [f"on-demand at ${price:.3f}/h — a fixed price, not a bid; it cannot be outbid"]
+        reasons = [f"on-demand at ${price:.3f}/h all-in — a fixed price, not a bid; it cannot be outbid"]
         if price > ceiling:
-            reasons.append(f"above the ${ceiling:.3f} ceiling, and a fixed price cannot be lowered to meet it")
+            reasons.append(f"above {which}, and a fixed price cannot be lowered to meet it")
             return Bid(hourly=0.0, reasons=reasons)
         return Bid(hourly=round(price, 4), reasons=reasons)
 
     reasons = [f"floor ${offer.min_bid_hourly:.3f} + premium ${cfg.premium:.3f}"]
     bid = offer.min_bid_hourly + cfg.premium
 
-    ceiling = cfg.bid_ceiling if lease_ceiling is None else min(cfg.bid_ceiling, lease_ceiling)
-    if bid > ceiling:
-        reasons.append(f"clamped to the bid ceiling ${ceiling:.3f}")
-        bid = ceiling
+    most = ceiling - offer.storage_hourly
+    if bid > most:
+        reasons.append(
+            f"clamped to ${most:.3f}: {which}, less ${offer.storage_hourly:.3f}/h of storage"
+        )
+        bid = most
 
     if offer.on_demand_hourly:
         crossover = cfg.on_demand_crossover * offer.on_demand_hourly
@@ -520,6 +552,7 @@ def decide_eviction(
     lease: Optional[LeaseView],
     cfg: BiddingConfig,
     model_set_gb: float,
+    policy: OfferPolicy,
 ) -> EvictionDecision:
     """By cost over the hours the lease still has, not by habit."""
     if lease is None or not lease.allow_rent:
@@ -530,7 +563,10 @@ def decide_eviction(
     hours = lease.hours_left
     reasons: list[str] = []
 
-    rebid = price_bid(same_machine_offer, cfg, lease.bid_ceiling) if same_machine_offer else None
+    rebid = (
+        price_bid(same_machine_offer, cfg, policy, lease.max_all_in_hourly)
+        if same_machine_offer else None
+    )
     if rebid is not None and same_machine_offer is not None:
         alternative_rate = best_alternative.min_bid_hourly if best_alternative else rebid.hourly
         rebid_cost = (rebid.hourly - alternative_rate) * hours

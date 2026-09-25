@@ -50,6 +50,13 @@ from .service import Supervisor
 
 log = logging.getLogger("gpm.control")
 
+#: A lease's price ceiling was a bid ceiling; it is all-in now, and named for it (D108). Refused
+#: by name, so a caller still sending the old field hears why rather than having it ignored.
+_BID_CEILING_GONE = (
+    "bid_ceiling is gone (D108): a lease tightens the pool's all-in maximum per host-hour with "
+    "max_all_in_hourly"
+)
+
 
 def _error(status_code: int, error: str, detail: Optional[str] = None) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"error": error, "detail": detail})
@@ -484,7 +491,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     "max_hourly_burn": supervisor.config.limits.max_hourly_burn,
                     # What the configured limits actually allow, whichever of them binds (D46).
                     "worst_case_hourly": supervisor.fleet.worst_case_hourly() if supervisor.fleet else 0.0,
-                    "per_host_ceiling": supervisor.config.rented.bidding.bid_ceiling if supervisor.config.rented else None,
+                    "per_host_ceiling": supervisor.config.rented.max_all_in_hourly if supervisor.config.rented else None,
                 },
                 "provider": (
                     {
@@ -638,7 +645,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         if supervisor.fleet is None:
             return []
         return [
-            RentedNow(host_id=h.host_id, bid_hourly=h.bid_hourly)
+            RentedNow(host_id=h.host_id, bid_hourly=h.bid_hourly, storage_hourly=h.offer.storage_hourly)
             for h in supervisor.fleet.hosts.values()
             if not h.released
         ]
@@ -724,10 +731,24 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     straight[section] = wanted
             if straight:
                 text = set_values(text, ("rented",), straight)
+            # The screen shows the search in force, so its edits go to the search in force (D108):
+            # with a profile named, into that profile. Written into `offer_policy` instead, they
+            # sat in the file unused while the screen went on showing the profile's values —
+            # found live, as a max all-in that "kept showing 0.85".
+            rented_config = supervisor.config.rented
+            in_force = body.get("search_profile", rented_config.search_profile if rented_config else None)
+            edits = {k: v for k, v in (body.get("offer_policy") or {}).items() if v is not None}
+            if edits and in_force and not save_as:
+                profile = rented_config.search_profiles.get(in_force) if rented_config else None
+                if profile is None:
+                    return _error(400, "bad_request", f"there is no search profile named {in_force!r}")
+                merged = {k: v for k, v in {**profile.model_dump(), **edits}.items() if v is not None}
+                text = set_values(text, ("rented", "search_profiles"), {str(in_force): merged})
             for section in ("offer_policy", "bidding", "dynamic", "workers_auto", "teardown"):
                 # Saving under a name puts those filter values in the *profile*; writing them
                 # to the live policy as well would edit the very thing being saved away from.
-                if section == "offer_policy" and save_as:
+                # With a profile in force, the edits went to it above.
+                if section == "offer_policy" and (save_as or in_force):
                     continue
                 wanted = body.get(section) or {}
                 if wanted and section not in straight:
@@ -1088,6 +1109,8 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
     async def open_lease(request: Request) -> JSONResponse:
         body = await request.json()
         fleet = supervisor.fleet
+        if "bid_ceiling" in body:
+            return _error(400, "bad_request", _BID_CEILING_GONE)
         try:
             if fleet is not None:
                 lease = fleet.open_lease(
@@ -1095,7 +1118,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     max_hours=float(body.get("max_hours", 4)),
                     max_spend=body.get("max_spend"),
                     allow_rent=bool(body.get("allow_rent", False)),
-                    bid_ceiling=body.get("bid_ceiling"),
+                    max_all_in_hourly=body.get("max_all_in_hourly"),
                 )
             else:
                 lease = supervisor.leases.open(
@@ -1184,11 +1207,13 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         body = await request.json()
         if supervisor.fleet is None:
             return _error(400, "cannot_rent", "this pool has no rented capacity configured")
+        if "bid_ceiling" in body:
+            return _error(400, "bad_request", _BID_CEILING_GONE)
         try:
             host = await supervisor.fleet.prepare(
                 max_spend=float(body["max_spend"]),
                 max_hours=float(body.get("max_hours", 1)),
-                bid_ceiling=body.get("bid_ceiling"),
+                max_all_in_hourly=body.get("max_all_in_hourly"),
                 when_ready=body.get("when_ready", "join"),
                 # Optional: exactly this offer, and how to rent it (D55).
                 offer_id=str(body["offer_id"]) if body.get("offer_id") is not None else None,

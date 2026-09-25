@@ -23,9 +23,8 @@ def make_config(**rented_overrides):
     rented = {
         "provider": "fake",
         "workers": 2,
-        "model_set_gb": 10.0,
-        "bidding": {"bid_ceiling": 0.60, "premium": 0.02},
-        "offer_policy": {"min_gpu_memory_gb": 24},
+        "bidding": {"premium": 0.02},
+        "offer_policy": {"min_gpu_memory_gb": 24, "min_disk_gb": 10, "max_all_in_hourly": 0.60},
         "scale": {"scale_up_after_s": 0},
     }
     rented.update(rented_overrides)
@@ -117,11 +116,11 @@ async def test_a_closed_lease_is_not_reopened_by_amending_it(fleet):
         fleet.leases.tighten(lease.lease_id, max_hours=10, loosen=True)
 
 
-async def test_a_lease_may_not_loosen_the_pools_bid_ceiling(fleet):
+async def test_a_lease_may_not_loosen_the_pools_all_in_maximum(fleet):
     with pytest.raises(LeaseRefused, match="tighten"):
         fleet.leases.open(
             workers=4, max_hours=2, max_spend=1.0, allow_rent=True,
-            bid_ceiling=5.0, pool_bid_ceiling=0.60,
+            max_all_in_hourly=5.0, pool_max_all_in_hourly=0.60,
         )
 
 
@@ -185,6 +184,9 @@ async def test_a_lost_bid_leaves_nothing_behind_and_tries_the_next_offer(fleet):
     assert next(iter(fleet.hosts.values())).offer.machine_id == "m-2"
     assert "bid_failed" in kinds(fleet)
     assert len(fleet.provider.instances) == 1  # the losing bid left nothing
+    (failed,) = [e for e in fleet.events.recent() if e["kind"] == "bid_failed"]
+    assert failed["numbers"]["provider_response"] == {"success": False, "msg": "outbid", "offer": "o-1"}, \
+        "the provider's own answer is kept beside the summary"
 
 
 async def test_an_empty_market_stays_paused_rather_than_relaxing_a_filter(fleet):
@@ -200,8 +202,12 @@ async def test_an_empty_market_stays_paused_rather_than_relaxing_a_filter(fleet)
 async def test_a_bid_over_the_ceiling_is_clamped_by_the_supervisor_not_trusted(fleet):
     """A faulty or hostile strategy cannot spend past the limits."""
     lease = open_lease(fleet)
-    assert fleet._cap_bid(99.0, lease) == 0.60
+    offer = default_offer(storage_hourly=0.005)
+    # The ceiling is all-in (D108): the bid is held to it less the storage billed beside it.
+    assert fleet._cap_bid(99.0, lease, offer) == pytest.approx(0.595)
     assert any(e["kind"] == "bid_clamped" for e in fleet.events.recent())
+    # A fixed price is all-in already.
+    assert fleet._cap_bid(99.0, lease, default_offer(interruptible=False)) == pytest.approx(0.60)
 
 
 # --- money ---
@@ -514,7 +520,7 @@ async def test_a_fixed_price_above_the_ceiling_is_refused_not_bid_down(fleet):
     """You cannot offer a marketplace less than its asking price and be served."""
     from gpm_server.strategies import price_bid
 
-    bid = price_bid(on_demand_offer(all_in_hourly=2.0), fleet.rented.bidding)
+    bid = price_bid(on_demand_offer(all_in_hourly=2.0), fleet.rented.bidding, fleet.rented.policy_in_force)
     assert bid.hourly == 0.0
     assert "cannot be lowered" in " ".join(bid.reasons)
 

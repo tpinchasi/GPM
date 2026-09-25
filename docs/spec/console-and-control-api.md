@@ -86,7 +86,7 @@ means. *(Strategy replay against recorded markets is post-v1.)*
 The console flow for [supervisor.md](supervisor.md) §8: choose models (the pool's set by
 default) and an offer — *best by policy* or one row of the live market list; see the estimate
 (download size × that host's price per gigabyte, time to ready, hourly rate, storage rate if
-parked); confirm the bid ceiling, dollar cap and time limit with the worst case stated; then
+parked); confirm the all-in price ceiling, dollar cap and time limit with the worst case stated; then
 watch bid → instance up → per-model download with cost so far → verify → workers sized → ready;
 finally **join**, **park** or **destroy**.
 

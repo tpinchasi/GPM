@@ -160,7 +160,7 @@ def test_a_machine_with_a_bad_record_loses_to_an_equal_one_without_it():
             machine_id="m-bad", hardware="x", rentals=7, reached_ready=2, failures=5
         )
     }
-    policy, bidding = OfferPolicy(), BiddingConfig(bid_ceiling=1.0)
+    policy, bidding = OfferPolicy(min_disk_gb=10, max_all_in_hourly=1.0), BiddingConfig()
 
     blind, _ = rank_offers(offers, policy, bidding, hours=2, model_set_gb=1)
     assert blind[0][0].offer_id == "o-bad", "identical offers, so the tie breaks on id"
@@ -188,8 +188,8 @@ def test_a_record_never_admits_an_offer_the_hard_filters_rejected():
 
     accepted, rejected = rank_offers(
         [too_small],
-        OfferPolicy(min_gpu_memory_gb=40),
-        BiddingConfig(bid_ceiling=1.0),
+        OfferPolicy(min_gpu_memory_gb=40, min_disk_gb=10, max_all_in_hourly=1.0),
+        BiddingConfig(),
         hours=2,
         model_set_gb=1,
         history=records,

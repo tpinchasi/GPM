@@ -75,10 +75,10 @@ rented:
     provider: vast
     transport: { type: tunnel }         # team-context API key: public key injected by the start-up script
     image: vastai/ollama:0.34.1         # there is no :latest tag; an unpinned image never starts
-    disk_gb: 60
     offer_policy: { min_vram_gb: 64, memory_bandwidth_gbs: [1200, 2000],   # above 2000 was outbid within minutes, three times
-                    max_allin_hourly: 0.66, max_download_per_gb: 0.01, exclude_gpu_names: ["CMP"] }
-    bidding:  { strategy: floor_plus_premium, premium: 0.02, bid_ceiling: 0.60 }
+                    min_disk_gb: 60, max_all_in_hourly: 0.60,               # the disk rented, and the most per host-hour all-in
+                    max_download_per_gb: 0.01, exclude_gpu_names: ["CMP"] }
+    bidding:  { strategy: floor_plus_premium, premium: 0.02 }
 
 models:                                 # catalog
   gemma4:26b: { variants: [ { tag: "gemma4:26b-mlx", requires: [apple-silicon], runtime_class: apple-mlx, enforces_schema: false },

@@ -42,7 +42,7 @@ BASE_YAML = textwrap.dedent(
     limits: {{max_rented_hosts: 1, max_hourly_burn: 1.00}}
     rented:
       provider: fake
-      bidding: {{bid_ceiling: 0.60}}
+      offer_policy: {{ min_disk_gb: 10, max_all_in_hourly: 0.60 }}
       scale: {{scale_up_after_s: 0}}
     """
 ).strip()
@@ -350,32 +350,32 @@ def test_a_mistyped_ceiling_is_caught_by_plan_and_must_be_retyped(console):
     supervisor.fleet.open_lease(workers=4, max_hours=2, max_spend=2.0, allow_rent=True)
     loop.run(supervisor.fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={}))
 
-    typo = edited(path.read_text(), "bid_ceiling: 0.60", "bid_ceiling: 6.0")
+    typo = edited(path.read_text(), "max_all_in_hourly: 0.60", "max_all_in_hourly: 6.0")
     with client(url) as http:
         plan = http.post("/pool/config/plan", json={"text": typo}).json()
 
-    raised = [c for c in plan["changes"] if c["kind"] == "bid_ceiling_raised"]
+    raised = [c for c in plan["changes"] if c["kind"] == "max_all_in_hourly_raised"]
     assert raised, plan
     assert raised[0]["requires_retype"] is True
     assert raised[0]["value"] == "6.000"
-    assert "$0.600 to $6.000" in raised[0]["detail"]
+    assert "$0.600/h to $6.000/h" in raised[0]["detail"]
     # And nothing has changed until Apply.
-    assert supervisor.config.rented.bidding.bid_ceiling == 0.60
+    assert supervisor.config.rented.max_all_in_hourly == 0.60
 
 
-def test_plan_says_which_running_host_a_lowered_ceiling_would_release(console):
+def test_plan_says_which_running_host_already_costs_more_than_a_lowered_ceiling(console):
     supervisor, url, path, loop = console
     supervisor.fleet.open_lease(workers=4, max_hours=2, max_spend=2.0, allow_rent=True)
     loop.run(supervisor.fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={}))
     host = next(iter(supervisor.fleet.hosts.values()))
 
-    lowered = edited(path.read_text(), "bid_ceiling: 0.60", "bid_ceiling: 0.05")
+    lowered = edited(path.read_text(), "max_all_in_hourly: 0.60", "max_all_in_hourly: 0.05")
     with client(url) as http:
         plan = http.post("/pool/config/plan", json={"text": lowered}).json()
 
-    change = [c for c in plan["changes"] if c["kind"] == "bid_ceiling_lowered"][0]
+    change = [c for c in plan["changes"] if c["kind"] == "max_all_in_hourly_lowered"][0]
     assert host.host_id in change["detail"]
-    assert "drained and released" in change["detail"]
+    assert "already costs more" in change["detail"]
     assert change["requires_retype"] is False  # tightening needs no ceremony
 
 
@@ -506,7 +506,7 @@ def test_the_market_preview_can_use_the_forms_unsaved_values(console):
 def test_an_unsaved_policy_that_makes_no_sense_is_a_400_not_something_the_pool_acts_on(console):
     _, url, _, _ = console
     with client(url) as http:
-        response = http.post("/pool/market/preview", json={"bidding": {"bid_ceiling": "not a number"}})
+        response = http.post("/pool/market/preview", json={"offer_policy": {"max_all_in_hourly": "not a number"}})
     assert response.status_code == 400
 
 
@@ -613,9 +613,9 @@ def test_history_is_trimmed(tmp_path, monkeypatch):
 
 FULL_YAML = edited(
     BASE_YAML,
-    "  bidding: {bid_ceiling: 0.60}",
-    "  bidding: {bid_ceiling: 0.60, premium: 0.02}\n"
-    "  disk_gb: 20\n  model_set_gb: 0.4\n  workers: 2\n  capabilities: [cuda]\n"
+    "  offer_policy: { min_disk_gb: 10, max_all_in_hourly: 0.60 }",
+    "  bidding: {premium: 0.02}\n"
+    "  workers: 2\n  capabilities: [cuda]\n"
     "  offer_policy: {min_gpu_memory_gb: 12, min_disk_gb: 20, max_all_in_hourly: 0.30,\n"
     "                 max_download_per_gb: 0.01, min_download_mbps: 100, min_reliability: 0.95}\n"
     "  teardown: {idle_minutes: 10, deadman_minutes: 20}",
@@ -625,14 +625,14 @@ FULL_YAML = edited(
 def test_the_live_failure_a_resized_rented_block_is_now_in_the_plan():
     """Found applying a real change: disk, download estimate and the offer policy all moved,
     and the plan listed none of them."""
-    assert "disk_gb: 20" in FULL_YAML
+    assert "min_disk_gb: 20" in FULL_YAML
     current = parse(FULL_YAML)
     candidate = parse(
-        FULL_YAML.replace("disk_gb: 20", "disk_gb: 40").replace("model_set_gb: 0.4", "model_set_gb: 29")
+        FULL_YAML.replace("min_disk_gb: 20", "min_disk_gb: 40")
         .replace("min_gpu_memory_gb: 12", "min_gpu_memory_gb: 40")
     )
     said = " | ".join(c.detail for c in plan_changes(current, candidate))
-    for expected in ("rented.disk_gb changes from 20.0 to 40.0", "rented.model_set_gb", "rented.offer_policy.min_gpu_memory_gb"):
+    for expected in ("hosts are rented with 40 GB of disk, from 20 GB", "rented.offer_policy.min_gpu_memory_gb"):
         assert expected in said, said
 
 
@@ -972,16 +972,33 @@ def test_a_setting_is_changed_in_place_leaving_the_rest_of_the_file_alone():
         "    min_gpu_memory_gb: 80\n"
         "    max_download_per_gb: 0.015   # half a cent per GB\n"
         "    verified_only: true\n"
-        "  bidding: { bid_ceiling: 0.80, premium: 0.02 }\n"
+        "  bidding: { premium: 0.02 }\n"
     )
     after = set_values(before, ("rented", "offer_policy"), {"min_gpu_memory_gb": 48, "avoid_machines": ["144381"]})
-    after = set_values(after, ("rented", "bidding"), {"bid_ceiling": 0.9, "attempts": 5})
+    after = set_values(after, ("rented", "bidding"), {"premium": 0.05, "attempts": 5})
 
     assert "# the account credential is read from the environment" in after
     assert "max_download_per_gb: 0.015   # half a cent per GB" in after  # untouched, comment kept
     assert "    min_gpu_memory_gb: 48\n" in after
     assert '    avoid_machines: ["144381"]\n' in after  # added under the right block
-    assert "  bidding: { bid_ceiling: 0.9, premium: 0.02, attempts: 5 }\n" in after  # flow style kept
+    assert "  bidding: { premium: 0.05, attempts: 5 }\n" in after  # flow style kept
+
+
+def test_a_nested_one_line_mapping_is_edited_whole_not_cut_at_its_first_comma():
+    """Found writing a search profile back (D108): `search_profiles: { cheap: { a: 1, b: 2 } }`
+    was split at every comma, the new profile landed beside half of the old one, and the file
+    no longer loaded. The owner's own file writes its profiles this way."""
+    import yaml
+    from gpm_server.configplan import set_values
+
+    before = (
+        "rented:\n"
+        '  search_profiles: { cheap tests: { min_disk_gb: 20, exclude_hardware: ["CMP", "P106"] }, other: {min_disk_gb: 5} }\n'
+    )
+    after = set_values(before, ("rented", "search_profiles"), {"cheap tests": {"min_disk_gb": 40}})
+    assert yaml.safe_load(after)["rented"]["search_profiles"] == {
+        "cheap tests": {"min_disk_gb": 40}, "other": {"min_disk_gb": 5},
+    }
 
 
 def test_a_setting_the_pool_cannot_place_unambiguously_is_refused_not_guessed():
@@ -996,8 +1013,8 @@ def test_a_setting_the_pool_cannot_place_unambiguously_is_refused_not_guessed():
 
 def test_the_search_can_be_changed_from_the_rented_screen(console):
     supervisor, url, path, _ = console
-    path.write_text(edited(path.read_text(), "  bidding: {bid_ceiling: 0.60}",
-                           "  bidding: {bid_ceiling: 0.60}\n  offer_policy: {min_gpu_memory_gb: 24}"))
+    path.write_text(edited(path.read_text(), "  offer_policy: { min_disk_gb: 10, max_all_in_hourly: 0.60 }",
+                           "  offer_policy: {min_disk_gb: 10, max_all_in_hourly: 0.60, min_gpu_memory_gb: 24}"))
     supervisor.reload_config()
 
     with client(url) as http:
@@ -1006,23 +1023,62 @@ def test_the_search_can_be_changed_from_the_rented_screen(console):
         assert supervisor.config.rented.offer_policy.min_gpu_memory_gb == 48
 
         # Raising a price ceiling is loosening: refused, and the refusal carries the plan.
-        loosened = http.patch("/pool/config/rented", json={"bidding": {"bid_ceiling": 5.0}})
+        loosened = http.patch("/pool/config/rented", json={"offer_policy": {"max_all_in_hourly": 5.0}})
         assert loosened.status_code == 400 and loosened.json()["error"] == "not_confirmed"
         retype = [c for c in loosened.json()["changes"] if c["requires_retype"]][0]
-        assert supervisor.config.rented.bidding.bid_ceiling == 0.60  # nothing applied
+        assert supervisor.config.rented.max_all_in_hourly == 0.60  # nothing applied
 
-        confirmed = http.patch("/pool/config/rented", json={"bidding": {"bid_ceiling": 5.0}, "confirm": retype["value"]})
+        confirmed = http.patch("/pool/config/rented", json={"offer_policy": {"max_all_in_hourly": 5.0}, "confirm": retype["value"]})
         assert confirmed.status_code == 200
-        assert supervisor.config.rented.bidding.bid_ceiling == 5.0
+        assert supervisor.config.rented.max_all_in_hourly == 5.0
 
         nonsense = http.patch("/pool/config/rented", json={"offer_policy": {"min_reliability": "soon"}})
     assert nonsense.status_code == 400 and nonsense.json()["error"] == "invalid_config"
 
 
+def test_with_a_search_profile_in_force_the_screens_edits_go_into_that_profile(console):
+    """Found live: the Finding tab showed the profile in force and wrote its edits into the
+    pool's own offer_policy, which was not in force — the owner's max all-in "kept showing
+    0.85" while the new value sat in the file unused (D108)."""
+    supervisor, url, path, _ = console
+    path.write_text(edited(
+        path.read_text(), "  offer_policy: { min_disk_gb: 10, max_all_in_hourly: 0.60 }",
+        "  offer_policy: { min_disk_gb: 10, max_all_in_hourly: 0.60 }\n"
+        "  search_profiles: { cheap: { min_disk_gb: 20, max_all_in_hourly: 0.50 } }\n"
+        "  search_profile: cheap",
+    ))
+    supervisor.reload_config()
+
+    with client(url) as http:
+        answer = http.patch("/pool/config/rented", json={"offer_policy": {"min_disk_gb": 40}})
+    assert answer.status_code == 200, answer.text
+    rented = supervisor.config.rented
+    assert rented.search_profiles["cheap"].min_disk_gb == 40, "the profile in force took the edit"
+    assert rented.search_profiles["cheap"].max_all_in_hourly == 0.50, "and kept the rest of itself"
+    assert rented.offer_policy.min_disk_gb == 10, "the unused policy is left alone"
+    assert rented.disk_gb == 40
+
+
+def test_raising_the_price_by_switching_to_a_dearer_profile_must_be_retyped(console):
+    """The search in force is what the pool pays by, so switching profile can raise the price
+    as surely as editing it (D108)."""
+    supervisor, url, path, _ = console
+    path.write_text(edited(
+        path.read_text(), "  offer_policy: { min_disk_gb: 10, max_all_in_hourly: 0.60 }",
+        "  offer_policy: { min_disk_gb: 10, max_all_in_hourly: 0.60 }\n"
+        "  search_profiles: { dear: { min_disk_gb: 10, max_all_in_hourly: 4.00 } }",
+    ))
+    supervisor.reload_config()
+    with client(url) as http:
+        answer = http.patch("/pool/config/rented", json={"search_profile": "dear"})
+    assert answer.status_code == 400 and answer.json()["error"] == "not_confirmed"
+    assert any(c["kind"] == "max_all_in_hourly_raised" for c in answer.json()["changes"])
+
+
 def test_the_preview_says_what_is_saved_so_the_form_is_the_pools_own(console):
     supervisor, url, _, loop = console
     preview = loop.run(supervisor.fleet.market_preview(hours=1))
-    assert preview["saved"]["bidding"]["bid_ceiling"] == supervisor.config.rented.bidding.bid_ceiling
+    assert preview["saved"]["offer_policy"]["max_all_in_hourly"] == supervisor.config.rented.max_all_in_hourly
     assert "min_gpu_memory_gb" in preview["saved"]["offer_policy"]
 
 
@@ -1168,7 +1224,8 @@ def test_a_profile_that_does_not_exist_is_refused_at_load():
     from gpm_server.config import RentedConfig
 
     with _pytest.raises(ValueError, match="not among the search_profiles"):
-        RentedConfig(provider="fake", bidding={"bid_ceiling": 1.0}, search_profile="no-such-thing")
+        RentedConfig(provider="fake", offer_policy={"min_disk_gb": 10, "max_all_in_hourly": 1.0},
+                     search_profile="no-such-thing")
 
 
 def test_the_search_profile_is_chosen_from_a_dropdown():

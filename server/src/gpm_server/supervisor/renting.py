@@ -18,7 +18,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 from .. import agentpkg, history
 from ..config import BiddingConfig, OfferPolicy, PoolConfig, RentedConfig, TransportConfig
@@ -44,6 +44,7 @@ from ..strategies import (
     HostView,
     LeaseView,
     Load,
+    all_in_ceiling,
     decide_eviction,
     decide_ramp,
     decide_rent,
@@ -220,6 +221,9 @@ class Fleet:
         #: Machines that just failed to start or to download, and until when they are skipped.
         #: In memory only: a restart forgets, which costs at most one more try.
         self.avoided: dict[str, tuple[float, str]] = {}
+        #: Models whose build the directory has not measured, from the last size worked out: the
+        #: disk check and the download cost leave them out, and the preview says so (D108).
+        self.model_sizes_unknown: list[str] = []
         #: Why the last offer search came back empty, when it was not the market's doing.
         self.last_offer_error: Optional[str] = None
         #: The provider's own words for why it refused, kept apart from the wait they earned.
@@ -432,7 +436,7 @@ class Fleet:
                 f"{self.provider.name} offers no instance-scoped credential, so no dead-man "
                 f"timer can be armed; leases there are limited to {limit}h, not {requested}h"
             )
-        return self.leases.open(pool_bid_ceiling=self.rented.bidding.bid_ceiling, **kwargs)
+        return self.leases.open(pool_max_all_in_hourly=self.rented.max_all_in_hourly, **kwargs)
 
     # --- the dead-man timer ---
 
@@ -611,6 +615,22 @@ class Fleet:
         if self.config.pool.models_per_host == "all" or self.rented.models is None:
             return list(self.config.pool.model_set)
         return list(self.rented.models)
+
+    def model_set_gb(self, models: Sequence[str]) -> float:
+        """What these models take on disk, from the sizes of the builds this pool's rented
+        engine fetches (D108) — the builds the directory has measured. A build it has not is
+        left out and said so in `model_sizes_unknown`, rather than guessed at."""
+        from ..catalog import variants_for_host
+        from ..directory import build_sizes_gb
+
+        variants = variants_for_host(
+            list(models), self.config.catalog, frozenset(self.rented.capabilities),
+            self.config.rented_engine(),
+        )
+        builds = {model: group[0].tag for model, group in variants.items() if group}
+        sizes = build_sizes_gb(self.leases.db, builds) if builds else {}
+        self.model_sizes_unknown = sorted(model for model, size in sizes.items() if size is None)
+        return round(sum(size for size in sizes.values() if size), 3)
 
     @property
     def one_model_per_host(self) -> bool:
@@ -1114,14 +1134,14 @@ class Fleet:
             offers = await self._offers()
             ranked, rejected = rank_offers(
                 offers, self._policy_with_avoided(self.rented.policy_in_force), self.rented.bidding,
-                lease.hours_left(), self.rented.model_set_gb,
+                lease.hours_left(), self.model_set_gb(self.models_for_new_host()),
                 history=self.machine_history(), history_cfg=self.rented.history,
             )
             step["offers_seen"] = len(offers)
             step["offers_rejected"] = {key: value for key, value in list(rejected.items())[:10]}
             if ranked:
                 best, best_score = ranked[0]
-                bid = price_bid(best, self.rented.bidding, lease.bid_ceiling)
+                bid = price_bid(best, self.rented.bidding, self.rented.policy_in_force, lease.max_all_in_hourly)
                 step["would_bid"] = {
                     "machine": best.machine_id,
                     "hardware": best.hardware,
@@ -1167,7 +1187,8 @@ class Fleet:
             raise ValueError(f"kinds must be one of {sorted(self._KINDS)}")
         offers = await self._offers(policy, kinds)
         ranked, rejected = rank_offers(
-            offers, self._policy_with_avoided(policy), bid_config, hours, self.rented.model_set_gb,
+            offers, self._policy_with_avoided(policy), bid_config, hours,
+            self.model_set_gb(self.models_for_new_host()),
             history=self.machine_history(), history_cfg=self.rented.history,
         )
         problem = self.last_offer_error
@@ -1179,7 +1200,7 @@ class Fleet:
 
         accepted = []
         for offer, offer_score in ranked[:10]:
-            bid = price_bid(offer, bid_config)
+            bid = price_bid(offer, bid_config, policy)
             workers, workers_why = self.workers_for(offer)
             accepted.append(
                 {
@@ -1214,8 +1235,13 @@ class Fleet:
             # Machines skipped for now because they just failed, and why.
             "avoided": self.avoided_now(),
             "best": accepted,
+            # What the next host would be bought for takes this much disk, from its builds' sizes;
+            # a build the directory has not measured is named rather than counted as nothing.
+            "model_set_gb": self.model_set_gb(self.models_for_new_host()),
+            "model_sizes_unknown": self.model_sizes_unknown,
             "policy": {
-                "bid_ceiling": bid_config.bid_ceiling,
+                "max_all_in_hourly": policy.max_all_in_hourly,
+                "disk_gb": policy.min_disk_gb,
                 "premium": bid_config.premium,
                 "on_demand_crossover": bid_config.on_demand_crossover,
             },
@@ -1254,7 +1280,7 @@ class Fleet:
         *,
         max_spend: float,
         max_hours: float,
-        bid_ceiling: Optional[float] = None,
+        max_all_in_hourly: Optional[float] = None,
         when_ready: str = "join",
         engine: Optional[object] = None,
         client_for: Optional[object] = None,
@@ -1263,7 +1289,7 @@ class Fleet:
     ) -> Optional[RentedHost]:
         """Get a host ready *before* a run, or keep one warm between runs.
 
-        It is its own small lease: it cannot start without a bid ceiling, a dollar cap and a
+        It is its own small lease: it cannot start without a price ceiling, a dollar cap and a
         time limit, and it borrows authority from no other open lease.
         """
         lease = self.open_lease(
@@ -1271,7 +1297,7 @@ class Fleet:
             max_hours=max_hours,
             max_spend=max_spend,
             allow_rent=True,
-            bid_ceiling=bid_ceiling,
+            max_all_in_hourly=max_all_in_hourly,
         )
         self.events.record(
             "prepare_started",
@@ -1666,8 +1692,8 @@ class Fleet:
             same_machine = next((o for o in offers if o.machine_id == host.offer.machine_id), None)
             if same_machine is None:
                 continue
-            bid = price_bid(same_machine, self.rented.bidding, lease.bid_ceiling)
-            capped = self._cap_bid(bid.hourly, lease)
+            bid = price_bid(same_machine, self.rented.bidding, self.rented.policy_in_force, lease.max_all_in_hourly)
+            capped = self._cap_bid(bid.hourly, lease, same_machine)
             if capped is None:
                 continue
             try:
@@ -1993,7 +2019,8 @@ class Fleet:
                 best_alternative,
                 self._lease_view(lease),
                 self.rented.bidding,
-                self.rented.model_set_gb,
+                self.model_set_gb(self.models_of(host)),
+                self.rented.policy_in_force,
             )
             self.events.record(
                 "eviction",
@@ -2004,7 +2031,7 @@ class Fleet:
             )
 
             if decision.action == "rebid" and decision.bid is not None:
-                capped = self._cap_bid(decision.bid, lease)
+                capped = self._cap_bid(decision.bid, lease, same_machine)
                 if capped is None:
                     await self.destroy(host, "re-bid would cross a ceiling")
                     continue
@@ -2237,9 +2264,9 @@ class Fleet:
         return None
 
     def worst_case_hourly(self) -> float:
-        """The most the rented hosts can burn per hour: every host at the per-host ceiling, as
+        """The most the rented hosts can burn per hour: every host at the all-in maximum, as
         many hosts as the pool may hold — or the overall cap, if one is set below that (D46)."""
-        bound = self.config.limits.max_rented_hosts * self.rented.bidding.bid_ceiling
+        bound = self.config.limits.max_rented_hosts * self.rented.max_all_in_hourly
         total = self.config.limits.max_hourly_burn
         return bound if total is None else min(bound, total)
 
@@ -2275,7 +2302,7 @@ class Fleet:
             self._policy_with_avoided(self.rented.policy_in_force),
             self.rented.bidding,
             lease.hours_left(),
-            self.rented.model_set_gb,
+            self.model_set_gb(self.models_for_new_host()),
             history=self.machine_history(),
             history_cfg=self.rented.history,
         )
@@ -2323,8 +2350,8 @@ class Fleet:
         self._said_nothing_passed = None
 
         for offer, offer_score in ranked[: self.rented.bidding.attempts]:
-            bid = price_bid(offer, self.rented.bidding, lease.bid_ceiling)
-            capped = self._cap_bid(bid.hourly, lease)
+            bid = price_bid(offer, self.rented.bidding, self.rented.policy_in_force, lease.max_all_in_hourly)
+            capped = self._cap_bid(bid.hourly, lease, offer)
             if capped is None:
                 continue
 
@@ -2365,10 +2392,16 @@ class Fleet:
                 # No price on an on-demand rental: the provider's listed rate is what is paid.
                 instance = await self.provider.create(offer, spec, capped if offer.interruptible else None)
             except (BidLost, OfferGone) as exc:
+                numbers = {"bid": capped, "offer": offer.offer_id, "score": offer_score}
+                response = getattr(exc, "response", None)
+                if response is not None:
+                    # Kept whole beside the summary, so a refusal can be read later in the
+                    # provider's own terms rather than reconstructed from the market.
+                    numbers["provider_response"] = response
                 self.events.record(
                     "bid_failed",
                     f"bid ${capped:.3f} on {offer.machine_id} did not take: {exc}",
-                    numbers={"bid": capped, "offer": offer.offer_id, "score": offer_score},
+                    numbers=numbers,
                     lease_id=lease.lease_id,
                 )
                 self.last_refusal = f"the bid on {offer.machine_id} did not take: {exc}"
@@ -2429,12 +2462,13 @@ class Fleet:
             return host
         return None
 
-    def _cap_bid(self, bid: float, lease: Lease) -> Optional[float]:
+    def _cap_bid(self, bid: float, lease: Lease, offer: Offer) -> Optional[float]:
         """The supervisor's own clamp, applied after the strategy returns — a faulty or
-        hostile strategy cannot spend past the ceilings."""
-        ceiling = self.rented.bidding.bid_ceiling
-        if lease.bid_ceiling is not None:
-            ceiling = min(ceiling, lease.bid_ceiling)
+        hostile strategy cannot spend past the ceilings. The ceiling is all-in (D108): a bid
+        may rise to it less the storage the host is billed beside the bid; a fixed price is
+        all-in already."""
+        all_in, _which = all_in_ceiling(offer, self.rented.policy_in_force, lease.max_all_in_hourly)
+        ceiling = all_in - offer.storage_hourly if offer.interruptible else all_in
         if bid > ceiling:
             self.events.record(
                 "bid_clamped",
@@ -2718,7 +2752,10 @@ class Fleet:
         self._offer_backoff_s = 0.0
         self._offer_retry_at = 0.0
         self.last_offer_error = None
-        return offers
+        # Priced for the disk the host would be rented with, so the all-in the filters and
+        # the bid compare is what it would be billed (D108).
+        disk_gb = (policy or self.rented.policy_in_force).min_disk_gb
+        return [offer.priced_for(disk_gb) for offer in offers]
 
     def _lease_view(self, lease: Optional[Lease]) -> Optional[LeaseView]:
         if lease is None:
@@ -2728,5 +2765,5 @@ class Fleet:
             allow_rent=lease.allow_rent,
             hours_left=lease.hours_left(),
             dollars_left=self.budget_left(lease),
-            bid_ceiling=lease.bid_ceiling,
+            max_all_in_hourly=lease.max_all_in_hourly,
         )

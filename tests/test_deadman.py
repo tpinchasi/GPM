@@ -232,7 +232,7 @@ def fleet_for(tmp_path, **capabilities):
             ],
             "rented": {
                 "provider": "fake",
-                "bidding": {"bid_ceiling": 0.60},
+                "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 0.60},
                 "scale": {"scale_up_after_s": 0},
             },
         }

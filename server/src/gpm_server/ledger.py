@@ -27,7 +27,9 @@ class Lease:
     max_spend: float
     allow_rent: bool
     state: str = "open"
-    bid_ceiling: Optional[float] = None
+    #: This lease's own all-in ceiling per host-hour, tightening the pool's (D108). Stored in the
+    #: `bid_ceiling` column, which predates the ceiling being all-in.
+    max_all_in_hourly: Optional[float] = None
     opened_at: float = dataclasses.field(default_factory=time.time)
     closed_at: Optional[float] = None
     closed_reason: Optional[str] = None
@@ -55,8 +57,8 @@ class LeaseStore:
         max_hours: float,
         max_spend: Optional[float],
         allow_rent: bool,
-        bid_ceiling: Optional[float] = None,
-        pool_bid_ceiling: Optional[float] = None,
+        max_all_in_hourly: Optional[float] = None,
+        pool_max_all_in_hourly: Optional[float] = None,
         lease_id: Optional[str] = None,
     ) -> Lease:
         """A lease that can rent **must** carry a dollar cap, and may tighten the pool's
@@ -69,10 +71,11 @@ class LeaseStore:
             raise LeaseRefused("a dollar cap must be above zero")
         if max_hours <= 0:
             raise LeaseRefused("a lease must have a time limit above zero")
-        if bid_ceiling is not None and pool_bid_ceiling is not None and bid_ceiling > pool_bid_ceiling:
+        if (max_all_in_hourly is not None and pool_max_all_in_hourly is not None
+                and max_all_in_hourly > pool_max_all_in_hourly):
             raise LeaseRefused(
-                f"a lease may only tighten the bid ceiling: ${bid_ceiling:.3f} is above the "
-                f"pool's ${pool_bid_ceiling:.3f}"
+                f"a lease may only tighten the all-in maximum: ${max_all_in_hourly:.3f}/h is "
+                f"above the pool's ${pool_max_all_in_hourly:.3f}/h"
             )
 
         lease = Lease(
@@ -81,7 +84,7 @@ class LeaseStore:
             max_hours=max_hours,
             max_spend=max_spend if max_spend is not None else 0.0,
             allow_rent=allow_rent,
-            bid_ceiling=bid_ceiling,
+            max_all_in_hourly=max_all_in_hourly,
         )
         self.db.execute(
             """
@@ -96,7 +99,7 @@ class LeaseStore:
                 lease.max_hours,
                 lease.max_spend,
                 int(lease.allow_rent),
-                lease.bid_ceiling,
+                lease.max_all_in_hourly,
                 lease.state,
                 lease.opened_at,
             ),
@@ -173,7 +176,7 @@ def _to_lease(row: Any) -> Lease:
         max_hours=row["max_hours"],
         max_spend=row["max_spend"],
         allow_rent=bool(row["allow_rent"]),
-        bid_ceiling=row["bid_ceiling"],
+        max_all_in_hourly=row["bid_ceiling"],
         state=row["state"],
         opened_at=row["opened_at"],
         closed_at=row["closed_at"],

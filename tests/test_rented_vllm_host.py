@@ -65,8 +65,8 @@ CATALOG = {
 def rented(**overrides):
     base = {
         "provider": "fake", "engine": "vllm", "image": "vastai/vllm:v0.29.0-cuda-12.9",
-        "workers": 2, "model_set_gb": 1.0,
-        "bidding": {"bid_ceiling": 0.60, "premium": 0.02},
+        "workers": 2,
+        "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 0.60}, "bidding": {"premium": 0.02},
         "scale": {"scale_up_after_s": 0},
         "teardown": {"idle_minutes": 10},
     }

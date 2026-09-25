@@ -253,7 +253,6 @@ def build_pool(*, rentable_hosts: int = 8) -> PoolHarness:
         rented={
             "provider": "fake",
             "workers": 2,
-            "model_set_gb": 1.0,
             "allocation": "dynamic",
             "dynamic": {
                 "target_utilisation": 0.75,
@@ -263,7 +262,7 @@ def build_pool(*, rentable_hosts: int = 8) -> PoolHarness:
                 "max_round": 4,
             },
             "workers_auto": {"enabled": True, "window_s": 1.0, "max": 6},
-            "bidding": {"bid_ceiling": 0.60, "premium": 0.02},
+            "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 0.60}, "bidding": {"premium": 0.02},
             "scale": {"scale_up_after_s": 0.5},
             "teardown": {"idle_minutes": 0.1, "destroy_idle_minutes": 0.25, "park_when_idle": True},
         },

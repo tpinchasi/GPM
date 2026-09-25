@@ -671,7 +671,7 @@ function limitsPanel(status) {
   return el("div", { class: "panel" }, el("h2", {}, "Limits"),
     el("div", { class: "kv" },
       el("div", { class: "k" }, "max rented hosts"), el("div", {}, hostLimitControl(status.limits.max_rented_hosts)),
-      el("div", { class: "k" }, "per-host ceiling"), el("div", {}, rate(status.limits.per_host_ceiling)),
+      el("div", { class: "k" }, "per-host ceiling, all-in"), el("div", {}, rate(status.limits.per_host_ceiling)),
       el("div", { class: "k" }, "overall cap"), el("div", {}, status.limits.max_hourly_burn == null
         ? el("span", { class: "muted" }, `none — bounded at ${rate(status.limits.worst_case_hourly)} by hosts × ceiling`)
         : rate(status.limits.max_hourly_burn))),
@@ -727,8 +727,8 @@ async function rentedHostsTab(status) {
 // the file, the plan, and the retype rule, exactly as the Configuration screen does (D51).
 const SEARCH_FIELDS = [
   ["offer_policy", "min_gpu_memory_gb", "range", "the card must have at least this much memory", 0, 200, 4],
-  ["offer_policy", "min_disk_gb", "range", "the machine must offer at least this much disk", 0, 500, 10],
-  ["offer_policy", "max_all_in_hourly", "range", "the most this pool will pay per host, per hour", 0, 20, 0.05],
+  ["offer_policy", "min_disk_gb", "range", "the disk each host is rented with — only machines offering this much are considered", 10, 500, 10],
+  ["offer_policy", "max_all_in_hourly", "range", "the most this pool pays per host, per hour, all-in with that disk — bids and re-bids stop here", 0.05, 20, 0.05],
   ["offer_policy", "max_all_in_per_gpu", "range", "and per accelerator — a multi-GPU machine is judged by the card, not the bill", 0, 10, 0.05],
   ["offer_policy", "max_download_per_gb", "range", "the most it will pay per GB downloaded", 0, 0.5, 0.005],
   ["offer_policy", "min_download_mbps", "range", "slower than this and the model set takes too long", 0, 10000, 100],
@@ -737,7 +737,6 @@ const SEARCH_FIELDS = [
   ["offer_policy", "verified_only", "checkbox", "only machines the provider has verified"],
   ["offer_policy", "exclude_hardware", "list", "refused by name, case-insensitive"],
   ["offer_policy", "avoid_machines", "list", "machine ids to skip — one that keeps failing, say"],
-  ["bidding", "bid_ceiling", "range", "never bid above this, whatever a strategy returns", 0, 20, 0.05],
   ["bidding", "premium", "range", "added to the market floor when bidding", 0, 2, 0.01],
   ["bidding", "on_demand_crossover", "range", "past this fraction of the on-demand price, do not bid", 0, 1, 0.01],
   ["bidding", "attempts", "range", "offers to try in one pass before giving up", 1, 20, 1],
@@ -1607,6 +1606,13 @@ const marketPanel = (market) => {
     el("div", { class: "panel" },
       el("div", { class: "stat" }, `${market.passed} pass · ${market.rejected} rejected`),
       el("div", { class: "muted" }, `${market.seen} offers seen through your policy`),
+      // What the disk has to hold, from the builds' own sizes (D108) — beside the disk the
+      // host is rented with, so the two can be compared at a glance.
+      market.policy ? el("div", { class: "muted" },
+        `rented with ${market.policy.disk_gb} GB of disk · the models it would be bought for take ` +
+        `${market.model_set_gb} GB` +
+        ((market.model_sizes_unknown || []).length
+          ? ` (not measured yet: ${market.model_sizes_unknown.join(", ")})` : "")) : null,
       el("h2", {}, "Rejected, by reason"),
       el("table", {}, el("tbody", {}, Object.entries(market.rejected_by_reason || {}).map(([reason, count]) =>
         el("tr", {}, el("td", { class: "num" }, count), el("td", { class: "muted" }, reason)))))),

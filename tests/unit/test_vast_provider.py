@@ -113,10 +113,23 @@ async def test_the_bid_rows_dph_base_is_never_mistaken_for_the_on_demand_price()
 
 
 async def test_storage_is_converted_from_per_month_to_per_hour():
-    """The provider quotes $/GB/month; every cost the pool reasons about is hourly."""
+    """The provider quotes $/GB/month; every cost the pool reasons about is hourly — over the
+    provider's own 720-hour month, which is what its `dph_total` is computed with."""
     offers = await provider(market()).search_offers(OfferQuery())
-    # 0.15 $/GB/month x 120GB / 730h
-    assert offers[0].storage_hourly == pytest.approx(0.15 * 120 / 730)
+    assert offers[0].storage_per_gb_hourly == pytest.approx(0.15 / 720)
+
+
+async def test_an_offer_is_priced_for_the_disk_the_pool_rents_not_the_providers_default():
+    """Found live (D108): `dph_total` carries storage for a few GB of the provider's choosing,
+    so a 150 GB host was billed more than the price the search compared. Checked against the
+    live market: $0.20/GB-month at 150 GB is $0.041667/h inside `dph_total`."""
+    entry = {**OFFER, "min_bid": 1.952, "dph_total": 1.954222, "storage_cost": 0.2,
+             "storage_total_cost": 0.002222, "disk_space": 202.5}
+    (offer,) = await provider(market(bid_offers=(entry,))).search_offers(OfferQuery())
+    priced = offer.priced_for(150)
+    assert priced.storage_hourly == pytest.approx(0.041667, abs=1e-6)
+    assert priced.all_in_hourly == pytest.approx(1.993667, abs=1e-5), "the provider's own figure for 150 GB"
+    assert priced.min_bid_hourly == offer.min_bid_hourly, "the floor is the machine's, whatever the disk"
 
 
 async def test_an_unverified_machine_is_reported_as_such():
@@ -156,6 +169,33 @@ async def test_a_lost_bid_raises_rather_than_returning_something_half_made():
     offer = (await provider(market()).search_offers(OfferQuery()))[0]
 
     with pytest.raises(BidLost, match="outbid"):
+        await provider(handler).create(offer, InstanceSpec(label="l", image="i", disk_gb=10), bid=0.1)
+
+
+async def test_a_refusal_keeps_the_providers_whole_answer():
+    """Found live: three refusals in a row whose only recorded word was "refused" — the reason
+    (a listing with less disk than was asked for) had to be worked out from the market after."""
+    answer = {"success": False, "error": "invalid_args", "msg": None, "detail": "disk 150 > 101.25"}
+
+    def handler(request):
+        if request.method == "PUT":
+            return httpx.Response(200, json=answer)
+        return httpx.Response(200, json={"instances": []})
+
+    offer = (await provider(market()).search_offers(OfferQuery()))[0]
+    with pytest.raises(BidLost, match="invalid_args") as lost:
+        await provider(handler).create(offer, InstanceSpec(label="l", image="i", disk_gb=150), bid=0.1)
+    assert lost.value.response == answer
+
+
+async def test_a_refusal_with_no_words_of_its_own_is_quoted_whole():
+    def handler(request):
+        if request.method == "PUT":
+            return httpx.Response(200, json={"success": False, "new_contract": None})
+        return httpx.Response(200, json={"instances": []})
+
+    offer = (await provider(market()).search_offers(OfferQuery()))[0]
+    with pytest.raises(BidLost, match='refused, answering {"new_contract":null,"success":false}'):
         await provider(handler).create(offer, InstanceSpec(label="l", image="i", disk_gb=10), bid=0.1)
 
 
