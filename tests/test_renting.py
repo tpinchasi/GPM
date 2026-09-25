@@ -1025,3 +1025,19 @@ async def test_a_host_the_re_bid_did_not_win_back_is_released(fleet):
     assert host.released
     lost = next(e for e in fleet.events.recent() if e["kind"] == "rebid_lost")
     assert "did not win" in lost["summary"]
+
+
+async def test_a_credential_in_a_providers_answer_never_reaches_the_event_log(fleet):
+    """Whichever provider raised it: the fleet cleans the answer once more before writing."""
+    from gpm_server.providers.base import BidLost
+
+    async def loses(offer, spec, bid):
+        raise BidLost("did not win", response={"success": False, "instance_api_key": "abc"},
+                      instance_state={"actual_status": "scheduling", "api_key": "def"})
+
+    fleet.provider.create = loses
+    open_lease(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    (failed,) = [e for e in fleet.events.recent() if e["kind"] == "bid_failed"]
+    assert failed["numbers"]["provider_response"] == {"success": False, "instance_api_key": "[redacted]"}
+    assert failed["numbers"]["created_instance"] == {"actual_status": "scheduling", "api_key": "[redacted]"}

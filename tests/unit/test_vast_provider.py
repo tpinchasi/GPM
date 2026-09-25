@@ -520,6 +520,87 @@ async def test_a_bid_reported_lost_that_actually_created_an_instance_destroys_it
     assert destroyed == ["/api/v0/instances/77/"]
 
 
+# --- a bid that was created and did not start (found live, 2026-09-25) ---
+
+# The key is a stand-in: the real one is exactly what must never be written down.
+LIVE_ANSWER = {"success": False, "new_contract": 52637617, "instance_api_key": "fake-instance-key"}
+
+
+def created_but_not_started(instance_state, *, seen):
+    """The provider as it answered a $1.17 bid on a contested machine: `success: false` with a
+    contract and an instance key — created, not refused (a refusal carries `error` and `msg`
+    and no contract). The created instance's own record is what says why."""
+    def handler(request):
+        seen.append((request.method, request.url.path))
+        if request.method == "PUT":
+            return httpx.Response(200, json=LIVE_ANSWER)
+        if request.method == "DELETE":
+            return httpx.Response(200, json={})
+        if request.url.path == "/api/v0/instances/52637617/":
+            return instance_state if isinstance(instance_state, httpx.Response) else \
+                httpx.Response(200, json={"instances": instance_state})
+        return httpx.Response(200, json={"instances": [{"id": 52637617, "label": "p/rented-x", "machine_id": 56779}]})
+    return handler
+
+
+async def test_a_bid_created_without_success_has_its_instance_read_before_it_is_destroyed():
+    """Two such bids in a row left only the word "refused" and two destroyed instances the
+    provider then had no record of. The instance's state is the only account of what happened,
+    and it exists only until the destroy."""
+    seen = []
+    state = {"id": 52637617, "actual_status": "scheduling", "intended_status": "running",
+             "cur_state": "running", "next_state": "running", "status_msg": "bid too low",
+             "instance_api_key": "also-a-secret"}
+    offer = (await provider(market()).search_offers(OfferQuery()))[0]
+    spec = InstanceSpec(label="p/rented-x", image="img", disk_gb=50, onstart="")
+    with pytest.raises(BidLost) as lost:
+        await provider(created_but_not_started(state, seen=seen)).create(offer, spec, 1.17)
+
+    message = str(lost.value)
+    assert "created but not started" in message and "did not win" in message
+    assert "actual scheduling, intended running" in message and "bid too low" in message
+    assert "which has been destroyed" in message
+    read = seen.index(("GET", "/api/v0/instances/52637617/"))
+    destroyed = seen.index(("DELETE", "/api/v0/instances/52637617/"))
+    assert read < destroyed, "read while the provider still has a record of it"
+    assert lost.value.instance_state["status_msg"] == "bid too low"
+
+
+async def test_no_credential_in_the_providers_answer_reaches_the_pools_record():
+    """Found live: an instance key sat in the event log, inside the answer to a bid that did
+    not take. The message, the answer and the instance's record are all cleaned."""
+    seen = []
+    state = {"id": 52637617, "actual_status": "scheduling", "instance_api_key": "also-a-secret"}
+    offer = (await provider(market()).search_offers(OfferQuery()))[0]
+    spec = InstanceSpec(label="p/rented-x", image="img", disk_gb=50, onstart="")
+    with pytest.raises(BidLost) as lost:
+        await provider(created_but_not_started(state, seen=seen)).create(offer, spec, 1.17)
+    assert "fake-instance-key" not in str(lost.value) and "also-a-secret" not in str(lost.value)
+    assert lost.value.response == {"success": False, "new_contract": 52637617, "instance_api_key": "[redacted]"}
+    assert lost.value.instance_state["instance_api_key"] == "[redacted]"
+
+
+async def test_an_instance_whose_state_cannot_be_read_is_still_destroyed():
+    seen = []
+    offer = (await provider(market()).search_offers(OfferQuery()))[0]
+    spec = InstanceSpec(label="p/rented-x", image="img", disk_gb=50, onstart="")
+    with pytest.raises(BidLost, match="its state could not be read") as lost:
+        await provider(created_but_not_started(httpx.Response(500, json={}), seen=seen)).create(offer, spec, 1.17)
+    assert ("DELETE", "/api/v0/instances/52637617/") in seen
+    assert lost.value.instance_state is None
+
+
+def test_redaction_reaches_every_credential_named_field_however_deep():
+    from gpm_server.providers.base import redacted
+
+    answer = {"success": False, "instance_api_key": "k", "nested": {"ssh_token": "t", "ok": 1},
+              "list": [{"Password": "p"}, "plain"], "secret_count": 3}
+    assert redacted(answer) == {
+        "success": False, "instance_api_key": "[redacted]", "nested": {"ssh_token": "[redacted]", "ok": 1},
+        "list": [{"Password": "[redacted]"}, "plain"], "secret_count": "[redacted]",
+    }
+
+
 async def test_a_lost_bid_that_cannot_be_checked_raises_a_provider_error_not_a_lost_bid():
     """The caller treats these differently on purpose: BidLost means try the next offer,
     ProviderError means stop. Not knowing what is running must never mean "try the next"."""

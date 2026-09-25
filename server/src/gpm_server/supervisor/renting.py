@@ -38,6 +38,7 @@ from ..providers.base import (
     Provider,
     ProviderError,
     ProviderRateLimited,
+    redacted,
 )
 from ..strategies import (
     Demand,
@@ -2426,8 +2427,12 @@ class Fleet:
                 response = getattr(exc, "response", None)
                 if response is not None:
                     # Kept whole beside the summary, so a refusal can be read later in the
-                    # provider's own terms rather than reconstructed from the market.
-                    numbers["provider_response"] = response
+                    # provider's own terms rather than reconstructed from the market — with
+                    # any credential in it replaced first, whichever provider raised it.
+                    numbers["provider_response"] = redacted(response)
+                created = getattr(exc, "instance_state", None)
+                if created is not None:
+                    numbers["created_instance"] = redacted(created)
                 self.events.record(
                     "bid_failed",
                     f"bid ${capped:.3f} on {offer.machine_id} did not take: {exc}",

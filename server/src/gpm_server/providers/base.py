@@ -34,17 +34,39 @@ class OfferGone(ProviderError):
     """The offer disappeared between search and create — normal in a live market."""
 
 
+#: Fields of a provider's answer that are credentials, by name. Anything the pool writes down
+#: from an answer — an event, a log line, a message — has these replaced first: an instance key
+#: was found live in the event log, inside the answer to a bid that did not take.
+CREDENTIAL_FIELD = ("key", "token", "secret", "password", "credential")
+
+
+def redacted(answer: Any) -> Any:
+    """`answer` with every credential-named field replaced, however deep it sits."""
+    if isinstance(answer, dict):
+        return {
+            name: ("[redacted]" if isinstance(name, str) and any(w in name.lower() for w in CREDENTIAL_FIELD)
+                   else redacted(value))
+            for name, value in answer.items()
+        }
+    if isinstance(answer, list):
+        return [redacted(item) for item in answer]
+    return answer
+
+
 class BidLost(ProviderError):
     """The bid was placed and did not win.
 
-    `response` is the provider's own answer, as it gave it, where it gave one: found live, a
-    refusal whose only recorded word was "refused" left the reason to be reconstructed by hand
-    from the market afterwards.
+    `response` is the provider's own answer, as it gave it (credentials redacted), where it gave
+    one: found live, a refusal whose only recorded word was "refused" left the reason to be
+    reconstructed by hand from the market afterwards. `instance_state` is what the provider said
+    about the instance the attempt created, read before it was destroyed — for a bid that was
+    created and did not start, the only record of why.
     """
 
-    def __init__(self, message: str, response: Any = None):
+    def __init__(self, message: str, response: Any = None, instance_state: Any = None):
         super().__init__(message)
         self.response = response
+        self.instance_state = instance_state
 
 
 @dataclasses.dataclass(frozen=True)

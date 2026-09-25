@@ -39,6 +39,7 @@ from .base import (
     ProviderRateLimited,
     ProviderUnavailable,
     SelfTerminateRequest,
+    redacted,
 )
 
 log = logging.getLogger("gpm.vast")
@@ -47,6 +48,18 @@ _BASE_URL = "https://console.vast.ai"
 #: The provider's own month, in hours: its `dph_total` for 150 GB on a machine at $0.20/GB-month
 #: carries exactly $0.041667/h of storage (checked against the live market, 2026-09-25).
 _HOURS_PER_MONTH = 720.0
+
+
+def _state_line(entry: dict[str, Any]) -> str:
+    """An instance's state as the provider reports it, on one line: where it is, where the
+    provider means it to be, and the provider's own words."""
+    parts = [f"actual {entry.get('actual_status') or '?'}", f"intended {entry.get('intended_status') or '?'}"]
+    for name in ("cur_state", "next_state"):
+        if entry.get(name):
+            parts.append(f"{name} {entry[name]}")
+    line = ", ".join(parts)
+    message = str(entry.get("status_msg") or "").strip()
+    return f"{line}: {message[:200]}" if message else line
 
 
 def _compact(answer: Any, limit: int = 500) -> str:
@@ -295,23 +308,48 @@ class VastProvider:
             body["onstart"] = spec.onstart
 
         payload = await self._call("PUT", f"/api/v0/asks/{offer.offer_id}/", json=body)
-        refused = None
-        if not payload.get("success", True):
-            # Its own words where it gave any; otherwise the whole answer, which is kept anyway.
-            refused = payload.get("msg") or payload.get("error") or f"refused, answering {_compact(payload)}"
+        answer = redacted(payload)
+        success = bool(payload.get("success", True))
         contract = payload.get("new_contract")
+        if success and contract is not None:
+            return Instance(instance_id=str(contract), label=spec.label, machine_id=offer.machine_id)
 
-        if refused is not None or contract is None:
-            # Seen live: this API answered `success: false` and created the instance anyway.
-            # "Either an instance or nothing behind" is this method's contract, so before
-            # reporting the bid lost, look for what the label would have been and end it.
-            stray = await self._destroy_stray(spec.label)
-            detail = refused or "returned no instance"
-            if stray:
-                detail += f" — but created {stray}, which has been destroyed"
-            raise BidLost(f"bid ${bid} on {offer.machine_id}: {detail}", response=payload)
+        # Not a host. Three shapes, told apart because they mean different things:
+        # - a refusal proper carries `error` and `msg` and no contract (the documented shape);
+        # - `success: false` **with** a contract is a bid that was created and did not start —
+        #   seen live, repeatedly, on a contested machine: the listing's `min_bid` is the host's
+        #   floor, not the standing top bid, so floor plus premium can lose on creation;
+        # - `success: true` with no contract, which this client does not trust.
+        words = payload.get("msg") or payload.get("error")
+        if not success and contract is not None:
+            detail = words or "created but not started — the bid did not win the machine"
+        elif not success:
+            detail = words or f"refused, answering {_compact(answer)}"
+        else:
+            detail = "returned no instance"
 
-        return Instance(instance_id=str(contract), label=spec.label, machine_id=offer.machine_id)
+        # What the provider says about the instance the attempt created, read **before** it is
+        # destroyed: afterwards the provider keeps no record of it (seen live: `instances: None`).
+        state: Optional[dict[str, Any]] = None
+        state_line = ""
+        if contract is not None:
+            try:
+                entry = await self._instance(str(contract))
+            except ProviderError as exc:
+                state_line = f"its state could not be read: {exc}"
+            else:
+                state = redacted(entry) if entry else None
+                state_line = _state_line(entry) if entry else "the provider has no record of it"
+
+        # "Either an instance or nothing behind" is this method's contract, so before reporting
+        # the bid lost, look for what the label would have been and end it.
+        stray = await self._destroy_stray(spec.label)
+        if stray:
+            detail += f" — but created {stray}"
+            if state_line:
+                detail += f" ({state_line})"
+            detail += ", which has been destroyed"
+        raise BidLost(f"bid ${bid} on {offer.machine_id}: {detail}", response=answer, instance_state=state)
 
     async def _destroy_stray(self, label: str) -> Optional[str]:
         """An instance this exact label names, ended. Returns its id if there was one.
