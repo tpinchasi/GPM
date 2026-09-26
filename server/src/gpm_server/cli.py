@@ -107,6 +107,38 @@ def _supervise(args: argparse.Namespace) -> int:
     return 0
 
 
+def _forwarder(args: argparse.Namespace) -> int:
+    """Keep the pool's SSH forwards up, apart from the supervisor (D110)."""
+    import signal
+    from pathlib import Path
+
+    from .db import SupervisorBusy
+    from .forwarder import Forwarder
+    from .state import open_database
+
+    logging.basicConfig(level=args.log_level.upper(), format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    config = load_config(args.config)
+    if not config.forwarder.enabled:
+        print("this pool's forwarder is off (forwarder.enabled); the supervisor keeps its own forwards",
+              file=sys.stderr)
+        return 2
+    database = open_database(config)
+    forwarder = Forwarder(
+        database, config.pool.name, config.forwarder.on_restart,
+        Path(config.request_log).expanduser().resolve().parent,
+    )
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: forwarder.stop())
+    try:
+        forwarder.run()
+    except SupervisorBusy as exc:
+        print(str(exc).replace("supervisor", "forwarder"), file=sys.stderr)
+        return 3
+    finally:
+        database.close()
+    return 0
+
+
 def _control(args: argparse.Namespace, method: str, path: str, body: Optional[dict] = None) -> int:
     """Every control verb is the same call with the admin key. Nothing is console-only, and
     nothing here is CLI-only either."""
@@ -325,6 +357,13 @@ def main(argv: list[str] | None = None) -> int:
     supervise.add_argument("--config", "-c", default="pool.yaml")
     supervise.add_argument("--log-level", default="info")
     supervise.set_defaults(func=_supervise)
+
+    forwarder = subparsers.add_parser(
+        "forwarder", help="keep the pool's SSH forwards up, apart from the supervisor (forwarder.enabled)"
+    )
+    forwarder.add_argument("--config", "-c", default="pool.yaml")
+    forwarder.add_argument("--log-level", default="info")
+    forwarder.set_defaults(func=_forwarder)
 
     status = subparsers.add_parser("status", help="print the pool's status")
     status.add_argument("--url", default=None)

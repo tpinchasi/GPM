@@ -129,6 +129,7 @@ RELEASE=~/.local/share/gpm/releases/current/venv/bin
 $RELEASE/gpm serve -c pool.yaml                  # both halves
 $RELEASE/gpm supervise -c pool.yaml              # or: the supervisor alone, on its own machine
 $RELEASE/gpm serve -c pool.yaml --router-only    # and the router alone, reading the same database
+$RELEASE/gpm forwarder -c pool.yaml              # the SSH forwards, when forwarder.enabled (started by the supervisor by default)
 ```
 
 During development, `uv run gpm serve -c pool.yaml` runs the working tree instead — convenient,

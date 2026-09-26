@@ -50,7 +50,7 @@ and optional headers.
 
 | Transport | How the router reaches the engine | Auth | Typical use |
 |---|---|---|---|
-| `tunnel` | A supervised SSH local forward on an allocated local port, re-resolved from the provider on every reconnect | SSH key | Default for rented hosts; the engine is never exposed |
+| `tunnel` | A supervised SSH local forward on a local port fixed for the host's life, re-resolved from the provider on every reconnect — kept by the supervisor, or, with `forwarder.enabled`, by `gpm forwarder`, which outlives it (D110) | SSH key | Default for rented hosts; the engine is never exposed |
 | `http` | Direct URL | Optional bearer / basic header | Private network or VPN |
 | `https` | Direct URL, TLS verified by default; private CA file and client certificate supported | Bearer / basic header, or mutual TLS | An engine behind a reverse proxy |
 

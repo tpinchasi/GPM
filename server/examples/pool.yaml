@@ -131,3 +131,10 @@ rented:
     deadman_minutes: 20        # the on-host timer, armed at creation
     deadman_action: destroy
     max_park_hours: 72
+
+# Keep the SSH forwards to rented hosts in a process of their own, so restarting the supervisor
+# cuts nothing in flight (D110). Off by default; the supervisor then keeps them itself.
+# forwarder:
+#   enabled: true
+#   on_restart: reattach       # reattach: forwards outlive a forwarder restart; close: they end with it
+#   start_automatically: true  # the supervisor starts the forwarder when none is running

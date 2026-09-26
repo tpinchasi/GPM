@@ -294,3 +294,101 @@ def test_a_supervisor_with_no_usable_credential_does_not_start(tmp_path, market)
     finally:
         database.close()
 
+
+
+# --- a forward that outlived the supervisor (D110) ---
+
+
+class SurvivingForward:
+    """What the forwarder's forward looks like to a new supervisor: already wanted, already up
+    on the port the router dials — here, the engine itself."""
+
+    def __init__(self, url, reused=True, up=True):
+        self.local_url, self.reused, self.up = url, reused, up
+
+    async def start(self, wait_s=10.0):
+        return self.up
+
+    async def stop(self):
+        pass
+
+    async def detach(self):
+        pass
+
+
+def over_ssh_only(provider, monkeypatch):
+    """The provider exposes the host by SSH alone, so a forward is the only way in."""
+    from gpm_server.providers.base import ConnectionInfo
+
+    async def connection(instance):
+        return ConnectionInfo(ssh_host="127.0.0.1", ssh_port=22001)
+
+    monkeypatch.setattr(provider, "connection", connection)
+
+
+@pytest.mark.parametrize("survived, state", [(True, "ready"), (False, "preparing")])
+def test_an_adopted_host_whose_forward_survived_keeps_serving(tmp_path, market, monkeypatch, survived, state):
+    """Found live: a supervisor restart took a serving host out of routing for 31 seconds to
+    re-verify it. With its forward kept by the forwarder, the router never lost it, so it keeps
+    `ready` while the pass re-checks it — and one whose forward did not survive is re-verified
+    as before (D50)."""
+    loop, provider, _engine = market
+    database = Database(tmp_path / "gpm.sqlite3")
+    try:
+        first = Supervisor(config(), database, provider=provider)
+        first.fleet.run_on_host = silent
+        loop.run(first.start())
+        host = rent_one(loop, first)
+        url = host.dial_url
+        loop.run(first.aclose())
+
+        second = Supervisor(config(), database, provider=provider)
+        second.fleet.run_on_host = silent
+        over_ssh_only(provider, monkeypatch)
+        second.fleet.make_tunnel = lambda name, transport: SurvivingForward(url, reused=survived, up=survived)
+        loop.run(second.adopt_rented())
+        adopted = second.fleet.hosts[host.host_id]
+        assert adopted.state == state
+        assert adopted.dial_url == url
+        loop.run(second.pass_once())
+        assert adopted.state == "ready", "either way, verified by the pass"
+        loop.run(second.aclose())
+    finally:
+        database.close()
+
+
+def test_a_draining_host_is_left_to_its_drain_by_the_supervisors_probe(tmp_path, market):
+    """Found live (2026-09-26): a host drained at its lease's end was probed, found still
+    holding its models, and set back to `ready` — so the router sent it new work, and tear-down,
+    seeing a ready host under no lease, destroyed it 18 seconds in with answers still running.
+    It cut nothing only because every answer happened to be short."""
+    from gpm_server.db import CounterRow, HostCounters
+
+    loop, provider, _ = market
+    database = Database(tmp_path / "gpm.sqlite3")
+    try:
+        supervisor = Supervisor(config(), database, provider=provider)
+        supervisor.fleet.run_on_host = silent
+        loop.run(supervisor.start())
+        host = rent_one(loop, supervisor)
+        (lease,) = supervisor.fleet.leases.open_leases()
+        supervisor.fleet.leases.close(lease.lease_id, "time limit reached")
+        loop.run(supervisor.fleet.release_lease(lease, "time limit reached"))
+        assert host.state == "draining"
+
+        # A long answer is still running on it, pass after pass.
+        loop.run(HostCounters(database).publish([CounterRow(host.host_id, busy=1, total=2, requests_served=0, failures=0, last_request_at=None)]))
+        for _ in range(3):
+            loop.run(supervisor.pass_once())
+            assert host.host_id in supervisor.fleet.hosts and host.state == "draining"
+        rows = {r.host_id: r for r in HostTable(database).all()}
+        assert rows[host.host_id].state == "draining", "the router sees it draining, not ready"
+
+        loop.run(HostCounters(database).publish([CounterRow(host.host_id, busy=0, total=2, requests_served=0, failures=0, last_request_at=None)]))
+        loop.run(supervisor.pass_once())
+        assert host.host_id not in supervisor.fleet.hosts
+        released = next(e for e in supervisor.events.recent() if e["kind"] == "released")
+        assert "its work had finished" in released["summary"]
+        loop.run(supervisor.aclose())
+    finally:
+        database.close()

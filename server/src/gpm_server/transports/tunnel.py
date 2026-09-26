@@ -146,6 +146,11 @@ class SshTunnel:
         self._task = asyncio.create_task(self._supervise(), name=f"tunnel:{self.host_id}")
         return await self._wait_until_listening(wait_s)
 
+    async def detach(self) -> None:
+        """The supervisor is going. A forward it runs itself goes with it (D110: that is what
+        the forwarder exists to change)."""
+        await self.stop()
+
     async def stop(self) -> None:
         self._stopping = True
         await self._terminate()

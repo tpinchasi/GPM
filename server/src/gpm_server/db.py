@@ -140,6 +140,24 @@ CREATE TABLE IF NOT EXISTS directory_refresh (
     last_success  REAL
 );
 
+-- The SSH forwards the supervisor wants kept up, and how the forwarder is keeping them (D110).
+-- The supervisor writes a row and removes it when the host is released; the forwarder reads
+-- them, runs one `ssh -N -L` per row on the row's fixed local port, and writes back how each
+-- is doing. `transport` is the forward's fields as JSON: the command is built from them by
+-- the forwarder, so nothing in a row becomes part of a command line.
+CREATE TABLE IF NOT EXISTS forwards (
+    name        TEXT PRIMARY KEY,
+    transport   TEXT NOT NULL,
+    local_port  INTEGER NOT NULL,
+    wanted_at   REAL NOT NULL,
+    state       TEXT NOT NULL DEFAULT 'wanted',
+    pid         INTEGER,
+    argv        TEXT,
+    last_error  TEXT,
+    restarts    INTEGER NOT NULL DEFAULT 0,
+    updated_at  REAL
+);
+
 -- One row per pool. Exactly one supervisor runs at a time (supervisor.md §1).
 CREATE TABLE IF NOT EXISTS supervisor_lock (
     pool       TEXT PRIMARY KEY,

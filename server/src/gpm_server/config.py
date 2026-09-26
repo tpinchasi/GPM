@@ -627,6 +627,29 @@ class LimitsConfig(BaseModel):
     max_hourly_burn: Optional[float] = Field(default=None, gt=0)
 
 
+class ForwarderConfig(BaseModel):
+    """Where the pool's SSH forwards live (D110).
+
+    Off, the supervisor runs them itself, and a restart of the supervisor ends every forward
+    and cuts every answer in flight through it. On, a process of their own keeps them — `gpm
+    forwarder` — and the supervisor only says which forwards it wants, in the database both
+    share, so restarting the supervisor touches none of them.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    #: What a restart of the forwarder itself does to the forwards it holds.
+    #: `reattach`: each `ssh` runs in a session of its own and outlives the forwarder, and the
+    #: next forwarder takes it back — nothing in flight is cut. `close`: the forwards end with
+    #: the forwarder, and the next one opens them afresh; simpler, and nothing is left running
+    #: while no forwarder is.
+    on_restart: Literal["reattach", "close"] = "reattach"
+    #: The supervisor starts the forwarder when none is running, detached, so it outlives the
+    #: supervisor. Off: something else — an operator, a service manager — starts it.
+    start_automatically: bool = True
+
+
 class EngineImage(BaseModel):
     """One build of the engine, and the accelerator driver it needs (D92)."""
 
@@ -848,6 +871,7 @@ class PoolConfig(BaseModel):
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
     #: Absent means the pool cannot rent at all — there is nothing to spend with.
     rented: Optional[RentedConfig] = None
+    forwarder: ForwarderConfig = Field(default_factory=ForwarderConfig)
     request_log: str = "gpm.sqlite3"
     directory: DirectoryConfig = Field(default_factory=DirectoryConfig)
 

@@ -34,7 +34,7 @@ from ..engines import Engine, get_engine
 from ..ledger import EventLog, LeaseStore, SpendLedger
 from ..models import RENTED_KINDS, HostState
 from ..providers.base import ProviderAuthError, ProviderError, get_provider
-from ..transports import SshTunnel, build_client
+from ..transports import SshTunnel, build_client, tunnel_maker
 from . import agents
 from .renting import Fleet
 
@@ -128,6 +128,13 @@ class Supervisor:
         self._adoption_pending = False
         self._saturated_passes = 0
         self._stopping = False
+        #: How a forward is opened: by the forwarder, where the pool has one (D110), else here.
+        self.make_tunnel = tunnel_maker(config, database)
+        #: When the forwarder was last started from here, so a missing one is not started every
+        #: pass while it is still coming up.
+        self._forwarder_started_at = 0.0
+        #: Tests replace how the forwarder is started; nothing else does.
+        self.spawn_forwarder = self._spawn_forwarder
         for host_config in config.hosts:
             self.hosts[host_config.id] = self._build(host_config)
 
@@ -142,6 +149,7 @@ class Supervisor:
                 self.events,
                 self.spend,
             )
+            self.fleet.make_tunnel = self.make_tunnel
         #: Clients for hosts the pool rented, keyed by host id.
         self._rented_clients: dict[str, httpx.AsyncClient] = {}
         #: Model-set preparations in flight, keyed by host id.
@@ -152,7 +160,7 @@ class Supervisor:
     def _build(self, host_config: HostConfig) -> SupervisedHost:
         capabilities = frozenset(host_config.capabilities)
         tunnel = (
-            SshTunnel(host_config.id, host_config.transport)
+            self.make_tunnel(host_config.id, host_config.transport)
             if host_config.transport.type == "tunnel"
             else None
         )
@@ -188,13 +196,57 @@ class Supervisor:
         forward = host.config.transport.model_copy(
             update={"remote_host": "127.0.0.1", "remote_port": wanted, "local_port": None}
         )
-        host.agent_tunnel = SshTunnel(f"{host.host_id}:agent", forward)
+        host.agent_tunnel = self.make_tunnel(f"{host.host_id}:agent", forward)
         return host.agent_tunnel
 
     # --- lifecycle ---
 
+    # --- the forwarder (D110) ---
+
+    #: A forwarder whose heartbeat is older than this is taken for gone.
+    FORWARDER_STALE_S = 15.0
+    #: And one started from here is given this long to come up before it is started again.
+    FORWARDER_GRACE_S = 30.0
+
+    def forwarder_running(self) -> bool:
+        from ..forwarder import lock_name
+
+        rows = self.db.query(
+            "SELECT heartbeat FROM supervisor_lock WHERE pool = ?", (lock_name(self.config.pool.name),)
+        )
+        return bool(rows) and time.time() - rows[0]["heartbeat"] < self.FORWARDER_STALE_S
+
+    def ensure_forwarder(self) -> None:
+        """Start the forwarder when the pool has one and none is running. It is started detached
+        — a session of its own — so it outlives this supervisor, which is its whole purpose."""
+        forwarder = self.config.forwarder
+        if not forwarder.enabled or not forwarder.start_automatically or self.forwarder_running():
+            return
+        if time.monotonic() - self._forwarder_started_at < self.FORWARDER_GRACE_S and self._forwarder_started_at:
+            return
+        self._forwarder_started_at = time.monotonic()
+        self.spawn_forwarder()
+
+    def _spawn_forwarder(self) -> None:
+        if self.config_path is None:
+            log.warning("the forwarder is on, but this pool was not started from a file to start it with")
+            return
+        import subprocess
+        import sys
+
+        state_dir = Path(self.config.request_log).expanduser().resolve().parent
+        out = open(state_dir / "gpm-forwarder.log", "ab")
+        child = subprocess.Popen(
+            [sys.executable, "-m", "gpm_server.cli", "forwarder", "-c", str(self.config_path)],
+            stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+        out.close()
+        self.events.record("forwarder_started", f"the forwarder was not running; started it (pid {child.pid})",
+                           numbers={"pid": child.pid})
+
     async def start(self) -> None:
         self.lock.acquire()
+        self.ensure_forwarder()
         for host in self.hosts.values():
             if host.tunnel is not None:
                 await host.tunnel.start()
@@ -281,18 +333,19 @@ class Supervisor:
         self._stopping = True
         await self.directory.aclose()
         for host in self.hosts.values():
+            # Detached, not stopped: with the forwarder (D110) the forwards outlive this
+            # process, and the next supervisor finds them on the same ports.
             if host.tunnel is not None:
-                await host.tunnel.stop()
+                await host.tunnel.detach()
             if host.agent_tunnel is not None:
-                await host.agent_tunnel.stop()
+                await host.agent_tunnel.detach()
             await host.client.aclose()
         for task in self._preparing.values():
             task.cancel()
         for client in self._rented_clients.values():
             await client.aclose()
         if self.fleet is not None:
-            for host_id in list(self.fleet.tunnels):
-                await self.fleet.close_tunnel(host_id)
+            await self.fleet.detach_tunnels()
         self.lock.release()
 
     # --- the control loop ---
@@ -304,6 +357,7 @@ class Supervisor:
         what is broken, then acquire what is missing.
         """
         self._follow_config_file()
+        self.ensure_forwarder()
         if self._adoption_pending:
             await self.adopt_rented()
         await asyncio.gather(*(self._ask_agent(host) for host in self.hosts.values()))
@@ -657,6 +711,12 @@ class Supervisor:
                 # handler then reads as "stopped, and we did not ask" — an eviction — and the
                 # host is destroyed seconds after being parked. Found by the simulation:
                 # parking had never once saved a download.
+                continue
+            if host.state == "draining":
+                # The drain owns it until its work is done or its time is up. Probed, a host
+                # still holding its models was set back to `ready` — so the router sent it new
+                # work, and tear-down, seeing a ready host under no lease, destroyed it with
+                # answers in flight. Found live: 18 seconds into a drain at a lease's end.
                 continue
             client = self._rented_clients.get(host_id)
             if client is None or str(client.base_url).rstrip("/") != host.dial_url.rstrip("/"):
