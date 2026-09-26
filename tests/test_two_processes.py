@@ -64,6 +64,48 @@ def test_a_host_removed_from_the_table_stops_taking_requests(pool):
     assert response.json()["reason"] == "hosts_unreachable"
 
 
+def test_the_router_follows_every_routing_field_of_a_host_it_already_knows(pool):
+    """Found live: the router copied a republished row's state and loaded models, but not its
+    on-disk list, residency or engine. A laptop that was disabled when the router started was
+    first seen with an empty disk; when it came back on demand with its models on disk and
+    nothing loaded, the router kept the empty list, and refused every request as "no eligible
+    host" until it was restarted."""
+    import dataclasses
+
+    pool.stop_supervisor()  # so nothing republishes over the row this test writes
+    table = HostTable(pool.database)
+    row = {r.host_id: r for r in table.all()}["local-1"]
+    assert pool.state.hosts[0].residency == "pinned"
+
+    # The supervisor's next word on the host: on demand, nothing loaded, the model on disk.
+    table.publish(dataclasses.replace(
+        row, resident=frozenset(), available=frozenset({MODEL}), residency="on_demand", engine="ollama",
+        updated_at=time.time(),
+    ))
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        host = pool.state.hosts[0]
+        if host.residency == "on_demand" and MODEL in host.available and not host.resident:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError(f"the router never took the republished row: {vars(pool.state.hosts[0])}")
+
+    # On disk on an on-demand host is servable: the engine loads it on first use.
+    assert MODEL in pool.state.hosts[0].servable
+    with pool.client() as client:
+        response = client.post("/api/chat", json=chat())
+    assert response.status_code == 200, response.text
+
+    # And the engine is followed too: a row naming one that does not serve this path takes
+    # the host out of the running for it, rather than handing it a request it would 404.
+    table.publish(dataclasses.replace(row, engine="vllm", updated_at=time.time()))
+    deadline = time.monotonic() + 10
+    while pool.state.hosts[0].engine != "vllm" and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert pool.state.hosts[0].engine == "vllm"
+
+
 def test_the_router_reports_what_it_is_serving_back_to_the_supervisor(pool):
     with pool.client() as client:
         client.post("/api/chat", json=chat())

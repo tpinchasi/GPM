@@ -79,7 +79,7 @@ It is served from a cached copy, never by asking a third party while the app wai
 | `503` | `hosts_unreachable` | Configured hosts are not answering | wait and retry |
 | `503` | `no_offer` | Renting is authorised but no acceptable offer exists right now | wait and retry |
 | `503` | `no_lease` | Only rented hosts could serve this and no lease is open — waiting cannot help | **fail fast** with `PoolUnavailable` (overridable) |
-| `503` | `no_eligible_host` | Hosts are ready, but none holds a build of this model that satisfies the request — its schema requirement or its pinned runtime class | wait and retry |
+| `503` | `no_eligible_host` | Hosts are ready, but none may take this request. `detail` says which: the request arrived on one engine's own path (`/api/chat`, say) and every ready host runs an engine that does not serve it — the detail names both and the paths that reach every engine — or none holds a build of this model that satisfies the request's schema requirement or pinned runtime class | for a path no ready host serves, call the `/v1` paths; otherwise wait and retry |
 | `503` | `host_lost` | The host serving this was taken away before any of the response reached you; nothing partial was sent (§5.1) | wait and retry |
 | `504` | `deadline_exceeded` | The request's `X-GPM-Deadline` passed before it could be served | **fail fast** — the app already said the answer would be useless |
 
