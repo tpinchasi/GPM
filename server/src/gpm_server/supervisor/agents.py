@@ -156,10 +156,20 @@ async def restart_engine(
         return 502, {"error": "agent_unreachable", "detail": str(exc) or type(exc).__name__}
 
 
-def wanted_engine_settings(workers: int, models_held: int) -> dict[str, int]:
+def wanted_engine_settings(workers: int, models_held: int, context: Optional[int] = None) -> dict[str, int]:
     """What this host's engine must run with for the pool's numbers to be true: as many
-    requests at once as the host has workers, and the whole model set held together."""
-    return {"workers": workers, "models_held": max(1, models_held)}
+    requests at once as the host has workers, the whole model set held together, and — when
+    the host's configuration states one — the context length each model is loaded with.
+
+    The context is a memory decision, not a tuning knob: found live, a laptop whose engine had
+    come back after a reboot at its own default context (32k for one model family) could no
+    longer hold two models it had held for a month at 8k, and reloaded one on every
+    alternation. Unset means the engine's own default, as before.
+    """
+    wanted = {"workers": workers, "models_held": max(1, models_held)}
+    if context is not None:
+        wanted["context"] = context
+    return wanted
 
 
 def model_events(before: Optional[dict[str, Any]], after: Optional[dict[str, Any]]) -> list[tuple[str, str, dict[str, Any]]]:

@@ -1020,7 +1020,7 @@ class Fleet:
                 f"{host.launch_workers} its engine was launched for means relaunching it — "
                 "which only an agent on that host can do"
             )
-        settings = agents.wanted_engine_settings(workers, len(self.tags_for(host)))
+        settings = agents.wanted_engine_settings(workers, len(self.tags_for(host)), self.rented.context_length)
         status, answer = await agents.restart_engine(
             host.agent, settings, transport=self._agent_transport
         )
@@ -1583,7 +1583,7 @@ class Fleet:
             host_id=host.host_id,
             lease_id=host.lease_id,
         )
-        settings = agents.wanted_engine_settings(host.launch_workers or host.workers, len(tags))
+        settings = agents.wanted_engine_settings(host.launch_workers or host.workers, len(tags), self.rented.context_length)
 
         async def ask() -> None:
             status, answer = await agents.restart_engine(
