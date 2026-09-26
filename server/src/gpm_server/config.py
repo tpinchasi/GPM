@@ -204,10 +204,10 @@ class HostConfig(BaseModel):
     residency: Literal["pinned", "on_demand"] = "pinned"
     #: The context length this host's engine loads each model with, sent with the engine
     #: settings its agent applies (`workers`, `models_held`, D41) — the same number a rented
-    #: host gets from `rented.context_length`. A memory decision: a laptop that held two
-    #: models for a month at 8k could not hold them at the 32k its engine chose for itself
-    #: after a reboot, and reloaded one on every alternation. Unset means the engine's own
-    #: default, and nothing is sent.
+    #: host gets from `rented.context_length`. A memory decision the engine otherwise makes
+    #: for itself: Ollama picks a default context from the accelerator's memory, so what each
+    #: model takes can change with a restart (found live: 8k one week, 32k the next, on the
+    #: same laptop). Unset means the engine's own default, and nothing is sent.
     context_length: Optional[int] = Field(default=None, ge=256)
     #: Which of the pool's models this host holds, when the pool spreads its set across hosts
     #: (`pool.models_per_host: declared`, D89). Absent there means the first model in the set this

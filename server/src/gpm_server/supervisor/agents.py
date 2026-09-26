@@ -161,10 +161,10 @@ def wanted_engine_settings(workers: int, models_held: int, context: Optional[int
     requests at once as the host has workers, the whole model set held together, and — when
     the host's configuration states one — the context length each model is loaded with.
 
-    The context is a memory decision, not a tuning knob: found live, a laptop whose engine had
-    come back after a reboot at its own default context (32k for one model family) could no
-    longer hold two models it had held for a month at 8k, and reloaded one on every
-    alternation. Unset means the engine's own default, as before.
+    The context is a memory decision, not a tuning knob, and one the engine otherwise makes
+    for itself: Ollama picks a default context from the accelerator's memory, so what each
+    model takes can change with a restart (found live: 8k one week, 32k the next, on the same
+    laptop). Unset means the engine's own default, as before.
     """
     wanted = {"workers": workers, "models_held": max(1, models_held)}
     if context is not None:
