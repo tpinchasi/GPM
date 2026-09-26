@@ -172,6 +172,30 @@ def test_a_request_on_one_engines_own_api_never_reaches_a_host_running_the_other
     assert [h.host_id for h, _ in dispatcher.eligible(native)] == ["laptop"]
 
 
+def test_a_refusal_for_a_path_no_ready_host_serves_says_so():
+    """Found live: an app on Ollama's `/api/chat` against a pool whose only ready host ran vLLM
+    was refused ninety times with "none holds a build of this model" — true, and no help. The
+    refusal must name the path, the engines, and the paths that reach every engine."""
+    from gpm_server.router.app import _ineligible_detail
+
+    paths = {
+        "ollama": {"/api/chat", "/api/generate", "/api/embed", "/v1/chat/completions", "/v1/embeddings"},
+        "vllm": {"/v1/chat/completions", "/v1/completions", "/v1/embeddings"},
+    }
+    said = _ineligible_detail("/api/chat", frozenset({"ollama"}), frozenset({"vllm"}), paths)
+    assert said == (
+        "/api/chat is served by ollama; the hosts ready now run vllm, which does not serve it"
+        " — /v1/chat/completions, /v1/embeddings would reach every engine this pool runs"
+    )
+    # A path the ready hosts do serve: the refusal is about the build, as before.
+    build = "hosts are ready but none holds a build of this model that satisfies the request"
+    assert _ineligible_detail("/v1/chat/completions", frozenset({"ollama", "vllm"}), frozenset({"vllm"}), paths) == build
+    # A single-engine pool names no engines on its needs; the refusal is about the build too.
+    assert _ineligible_detail("/api/chat", frozenset(), frozenset({"ollama"}), paths) == build
+    # An engine the router has no adapter for is not guessed about.
+    assert _ineligible_detail("/api/chat", frozenset({"ollama"}), frozenset({"other"}), paths).endswith("does not serve it")
+
+
 def test_a_request_on_the_shared_api_reaches_either():
     """Both engines serve `/v1/chat/completions`, which is what lets one pool hold both."""
     dispatcher = Dispatcher([
