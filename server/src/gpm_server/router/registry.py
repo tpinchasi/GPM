@@ -122,9 +122,20 @@ class HostRegistry:
         )
 
     def _update(self, host: Host, row: HostRow) -> None:
+        """Every field routing reads, copied from the row — the same set `_build` sets.
+
+        Found live: this copied the loaded models but not the on-disk list, the residency or
+        the engine. A laptop that was disabled when the router started was first seen with an
+        empty disk; when it came back with its models on disk and nothing loaded, the router
+        kept the empty list, and on an on-demand host that meant nothing was servable — every
+        request refused as "no eligible host" for as long as the router ran.
+        """
         host.priority = row.priority
         host.state = HostState(row.state)
         host.resident = row.resident
+        host.available = row.available
+        host.residency = row.residency
+        host.engine = row.engine
         host.last_error = row.last_error
         host.capabilities = frozenset(row.capabilities)
         variants = _variants(row)
