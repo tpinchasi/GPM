@@ -675,7 +675,11 @@ def test_the_pool_restarts_only_when_an_operator_says_so_with_the_host_named_twi
 
     assert "restart_engine" not in pathlib.Path(service.__file__).read_text()  # never from the pass
 
-    with pool_harness([EngineSpec(id="box", resident={MODEL}, workers=3)], model_set=[MODEL], host_overrides={"box": agent_block(monkeypatch)}) as pool:
+    # The host states a context length: it travels with the settings and reaches the engine's
+    # environment. Found live: a laptop whose engine came back after a reboot at its own 32k
+    # default could no longer hold the two models it had held for a month at 8k.
+    box = {**agent_block(monkeypatch), "context_length": 8192}
+    with pool_harness([EngineSpec(id="box", resident={MODEL}, workers=3)], model_set=[MODEL], host_overrides={"box": box}) as pool:
         machine = restartable(tmp_path)
         pool.supervisor._agent_transport = machine.transport
         pool.reprobe()
@@ -683,12 +687,13 @@ def test_the_pool_restarts_only_when_an_operator_says_so_with_the_host_named_twi
         try:
             with httpx.Client(base_url=server.base_url, headers={"Authorization": "Bearer gpmx_console"}, timeout=60) as http:
                 status = http.get("/pool/status").json()["hosts"][0]["agent"]
-                assert status["wanted_engine_settings"] == {"workers": 3, "models_held": 1}
+                assert status["wanted_engine_settings"] == {"workers": 3, "models_held": 1, "context": 8192}
                 url = "/pool/hosts/box/engine/restart"
                 assert http.post(url, json={"apply_settings": True}).json()["error"] == "not_confirmed"
                 assert not machine.marker.exists()
                 done = http.post(url, json={"apply_settings": True, "confirm": "box"})
                 assert done.status_code == 200 and done.json()["applied"]["OLLAMA_NUM_PARALLEL"] == "3"
+                assert done.json()["applied"]["OLLAMA_CONTEXT_LENGTH"] == "8192"
         finally:
             server.stop()
         event = next(e for e in pool.supervisor.events.recent(10) if e["kind"] == "agent_engine_restarted")

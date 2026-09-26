@@ -389,7 +389,9 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     "asked_at": view.asked_at if view else None,
                     "facts": view.facts if view and view.reachable else None,
                     "manages_models": host.config.agent.manage_models,
-                    "wanted_engine_settings": agents.wanted_engine_settings(host.config.workers, len(host.required_tags)),
+                    "wanted_engine_settings": agents.wanted_engine_settings(
+                        host.config.workers, len(host.required_tags), host.config.context_length
+                    ),
                     "models": view.models if view and view.reachable else None,
                     "capability_conflict": agents.capability_conflict(host.config.capabilities, view),
                 }
@@ -1349,7 +1351,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         if body.get("confirm") != host_id:
             return _error(400, "not_confirmed", "type the host id again as `confirm`: requests in flight on that host will fail over or fail")
         settings = (
-            agents.wanted_engine_settings(host.config.workers, len(host.required_tags))
+            agents.wanted_engine_settings(host.config.workers, len(host.required_tags), host.config.context_length)
             if body.get("apply_settings") else None
         )
         status_code, answer = await agents.restart_engine(host.agent_endpoint, settings, transport=supervisor._agent_transport)

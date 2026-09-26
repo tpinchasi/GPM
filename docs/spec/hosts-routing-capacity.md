@@ -202,7 +202,10 @@ directions are not symmetric, because only one of them needs the engine to chang
   any other preparation.
 
 What reaches the host is a closed set of bounded whole numbers — `workers`, `models_held`, and
-optionally `context` — exactly as for a delegated host (D41). The relaunch is performed by the
+optionally `context` — exactly as for a delegated host (D41). A configured host's `context`
+is its `context_length` setting when it states one, and nothing otherwise; a rented host's is
+`rented.context_length`. It is a memory decision, not a tuning knob: an engine left to choose
+its own context after a restart may no longer hold together the models it held before. The relaunch is performed by the
 start-up script the pool installed when it created the host; the pool never sends a command, a
 path or a URL. The operator asks with `gpm host resize <id> --workers N`; a **raise** relaunches
 that host's engine, so the host id is typed again, and the host holds its model set once more
