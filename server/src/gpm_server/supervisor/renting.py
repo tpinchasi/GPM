@@ -223,6 +223,9 @@ class Fleet:
         self._agent_transport = None
         #: Engine adapters by name, loaded once each.
         self._engines: dict[str, Any] = {}
+        #: How a forward is opened — `SshTunnel` here, or through the forwarder (D110), which the
+        #: supervisor sets from the pool's configuration.
+        self.make_tunnel: Any = SshTunnel
         #: A second forward per host, to the agent on its loopback (D63).
         self.agent_tunnels: dict[str, SshTunnel] = {}
         #: Forwards to rented hosts the provider cannot expose directly, keyed by host id.
@@ -796,7 +799,7 @@ class Fleet:
             remote_port=port or self.engine_port,
             known_hosts=self.rented.known_hosts,
         )
-        tunnel = SshTunnel(host_id, transport)
+        tunnel = self.make_tunnel(host_id, transport)
         self.tunnels[host_id] = tunnel
         # A host that is still booting refuses SSH for a while; the forward keeps retrying,
         # and the probe simply finds nothing listening until it is up.
@@ -816,10 +819,24 @@ class Fleet:
             remote_port=port,
             known_hosts=self.rented.known_hosts,
         )
-        tunnel = SshTunnel(f"{host_id}/agent", transport)
+        tunnel = self.make_tunnel(f"{host_id}/agent", transport)
         self.agent_tunnels[host_id] = tunnel
         await tunnel.start(wait_s=1.0)
         return tunnel.local_url
+
+    async def detach_tunnels(self) -> None:
+        """The supervisor is going. Forwards kept by the forwarder stay up for the next one
+        (D110); forwards run here go with it, as they always did."""
+        for tunnel in [*self.agent_tunnels.values(), *self.tunnels.values()]:
+            await tunnel.detach()
+        self.agent_tunnels.clear()
+        self.tunnels.clear()
+
+    def forward_survived(self, host_id: str) -> bool:
+        """Is this host's forward one that outlived the last supervisor, still up on the port
+        the router dials? Only a forward kept by the forwarder can have (D110)."""
+        tunnel = self.tunnels.get(host_id)
+        return bool(getattr(tunnel, "reused", False)) and bool(getattr(tunnel, "up", False))
 
     async def close_tunnel(self, host_id: str) -> None:
         agent_tunnel = self.agent_tunnels.pop(host_id, None)
@@ -1840,7 +1857,8 @@ class Fleet:
             )
             if host.idle_since is not None:
                 self.idle_gate = True  # paused for idleness: load, not the lease, brings it back
-            if host.state == "ready":
+            was_ready = host.state == "ready"
+            if was_ready:
                 # Readiness is re-verified, never assumed — and the clock on "not ready in
                 # time" starts now, not when the host was created (D50).
                 host.state = "adopting"
@@ -1853,6 +1871,12 @@ class Fleet:
                 host.dial_url = host.connection.public_url or await self._open_tunnel(
                     row.host_id, host.connection, self.port_of(host)
                 )
+            if was_ready and self.forward_survived(row.host_id):
+                # Its forward outlived the last supervisor and is still up on the same port, so
+                # the router never stopped reaching it (D110). It keeps `ready` rather than
+                # leaving routing to be re-verified: the pass's probe checks it now as it checks
+                # every host every pass, and takes it out if it no longer holds its models.
+                host.state = "ready"
             self.hosts[row.host_id] = host
             adopted.append(row.host_id)
             self.events.record(

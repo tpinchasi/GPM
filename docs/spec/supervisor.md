@@ -49,6 +49,28 @@ and none of them announced itself.
 There is no release-on-exit. It cannot be made reliable — a crash runs no exit code — and when
 it does run it is usually wrong.
 
+### 1.1 The forwarder: SSH forwards that outlive the supervisor (D110)
+
+With `forwarder.enabled`, a third process — **`gpm forwarder`** — keeps the pool's SSH forwards,
+so a supervisor restart cuts nothing in flight. It never talks to the supervisor: the supervisor
+writes each forward it wants to the `forwards` table (the forward's fields and a local port fixed
+for the host's life) and removes the row when the host is released; the forwarder runs one
+`ssh -N -L` per row, restarts a dropped one with a back-off, closes one whose row is gone, and
+writes back how each is doing. A supervisor that is only shutting down leaves its rows, and the
+next finds each forward still up on the same port — the port the router has been dialling all
+along. An adopted host whose forward survived keeps `ready`, and the pass's probe re-checks it as
+it re-checks every host every pass (§1.2, D50).
+
+| `forwarder.on_restart` | A restart of the forwarder itself |
+|---|---|
+| `reattach` (default) | Each `ssh` runs in a session of its own and outlives the forwarder; the next takes back each one that is still exactly the recorded process — its pid, its command line, its port answering — so nothing is cut |
+| `close` | The forwards end with the forwarder and the next opens them afresh; one left by a `reattach` run is ended, not taken back |
+
+With `forwarder.start_automatically` (default), the supervisor starts the forwarder, detached,
+whenever none is running. A deploy restarts the supervisor and the router; the forwarder only
+when its own code changed. What no mode can save is an answer in flight when an `ssh` itself dies
+— a dropped link, a host rebooting; that is buffered delivery's case (D62).
+
 ### 1.2 Source of truth
 
 **The provider is the source of truth for what exists; the database is the source of truth for
