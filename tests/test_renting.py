@@ -1025,3 +1025,74 @@ async def test_a_host_the_re_bid_did_not_win_back_is_released(fleet):
     assert host.released
     lost = next(e for e in fleet.events.recent() if e["kind"] == "rebid_lost")
     assert "did not win" in lost["summary"]
+
+
+async def test_a_credential_in_a_providers_answer_never_reaches_the_event_log(fleet):
+    """Whichever provider raised it: the fleet cleans the answer once more before writing."""
+    from gpm_server.providers.base import BidLost
+
+    async def loses(offer, spec, bid):
+        raise BidLost("did not win", response={"success": False, "instance_api_key": "abc"},
+                      instance_state={"actual_status": "scheduling", "api_key": "def"})
+
+    fleet.provider.create = loses
+    open_lease(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    (failed,) = [e for e in fleet.events.recent() if e["kind"] == "bid_failed"]
+    assert failed["numbers"]["provider_response"] == {"success": False, "instance_api_key": "[redacted]"}
+    assert failed["numbers"]["created_instance"] == {"actual_status": "scheduling", "api_key": "[redacted]"}
+
+
+# --- a host that has served for hours and leaves `ready` is not one that "never became ready" ---
+
+
+def _serving_for_hours(host, hours=3):
+    host.created_at -= hours * 3600
+    host.preparing_since = (host.preparing_since or time.time()) - hours * 3600
+    host.engine_seen_at = time.time() - hours * 3600
+    host.state = "ready"
+
+
+async def test_a_host_draining_at_its_leases_end_keeps_its_work_and_its_machine(fleet):
+    """Found live (2026-09-26): at 13:05:28 a host that had served for three hours began
+    draining at its lease's time limit; one second later the give-up rule for hosts that never
+    finish preparing took it for one, destroyed it with four answers mid-stream, and avoided its
+    good machine for an hour as "never became ready"."""
+    fleet.rented.teardown.max_preparing_minutes = 30
+    lease = open_lease(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    (host,) = fleet.hosts.values()
+    _serving_for_hours(host)
+
+    fleet.leases.close(lease.lease_id, "time limit reached")
+    await fleet.release_lease(lease, "time limit reached")
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={}, busy={host.host_id: 4})
+
+    assert host.host_id in fleet.hosts and host.state == "draining", "its four answers still run"
+    assert host.offer.machine_id not in fleet.avoided
+    assert not any("not ready after" in e["summary"] for e in fleet.events.recent())
+
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={}, busy={host.host_id: 0})
+    released = next(e for e in fleet.events.recent() if e["kind"] == "released")
+    assert "its work had finished" in released["summary"]
+
+
+async def test_a_re_bid_host_is_given_its_own_time_to_come_back(fleet):
+    """Outbid after hours of serving and re-bid (D109): it has been starting again for seconds,
+    not "not ready for 30 minutes"."""
+    fleet.rented.teardown.max_preparing_minutes = 30
+    open_lease(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    (host,) = fleet.hosts.values()
+    _serving_for_hours(host)
+
+    async def slow_start(instance):
+        pass
+
+    fleet.provider.start = slow_start
+    fleet.provider.evict(host.instance.instance_id)
+    await fleet.handle_evictions()
+    assert host.state == "scheduling" and host.preparing_since > time.time() - 5
+
+    await fleet.tear_down(fleet.leases.open_leases(), {})
+    assert host.host_id in fleet.hosts, "given up as never ready seconds after its re-bid"

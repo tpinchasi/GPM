@@ -57,6 +57,7 @@ class Provider(Protocol):
 | `search_offers` | Each `Offer` carries what ranking needs: hardware, memory, a throughput proxy, the current minimum bid, on-demand price if any, storage price, download price per gigabyte, download speed, reliability, provider verification flag, a stable machine identifier |
 | `reported_charges` | What the provider says the instance has cost so far, or `None` if it cannot say |
 | Every operation | Bounded by a timeout; raises typed errors (`ProviderAuthError`, `ProviderRateLimited`, `ProviderUnavailable`, `OfferGone`, `BidLost`); never blocks indefinitely |
+| `BidLost` | Carries the provider's answer (`response`) and, where the attempt created an instance, that instance's state as read **before** it was destroyed (`instance_state`) — with every credential-named field replaced. The pool writes both into the `bid_failed` event, and replaces credentials once more before it does |
 
 **`self_terminate_request(action)`** returns the call one instance makes to end itself — method,
 URL, headers, optional body — never a command line (D71). Header values may name an environment

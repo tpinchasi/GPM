@@ -694,6 +694,40 @@ async def test_raising_the_count_relaunches_the_engine_through_the_agent(fleet, 
     assert host.state == "preparing", "it holds the set again before anything is routed to it"
 
 
+async def test_a_relaunch_hours_into_a_hosts_life_restarts_its_clock(fleet, monkeypatch):
+    """Found 2026-09-26: a resize that relaunches the engine put a host that had served for
+    hours back in `preparing` with the clock it was created with, so the next pass destroyed it
+    as "not ready after 30 minutes" and avoided its machine."""
+    fleet.rented.teardown.max_preparing_minutes = 30
+    host = await fleet.prepare(max_spend=1.00, max_hours=2)
+    host.state = "ready"
+    host.created_at -= 3 * 3600
+    host.preparing_since -= 3 * 3600
+    host.agent = object()
+
+    async def restart(agent, settings, transport=None):
+        return 200, {"engine_answers": True}
+
+    monkeypatch.setattr("gpm_server.supervisor.agents.restart_engine", restart)
+    done, _why = await fleet.resize(host, 6)
+    assert done and host.state == "preparing" and host.preparing_since > time.time() - 5
+
+    await fleet.tear_down(fleet.leases.open_leases(), {})
+    assert host.host_id in fleet.hosts and host.offer.machine_id not in fleet.avoided
+
+
+async def test_a_host_restarted_from_parked_is_given_its_own_time(fleet):
+    fleet.rented.teardown.max_preparing_minutes = 30
+    host = await fleet.prepare(max_spend=1.00, max_hours=2)
+    await fleet.park(host, "between runs")
+    host.created_at -= 3 * 3600
+    host.preparing_since = (host.preparing_since or time.time()) - 3 * 3600
+
+    lease = fleet.open_lease(workers=4, max_hours=2, max_spend=1.0, allow_rent=True)
+    restarted = await fleet.restart_parked(lease)
+    assert restarted is host and host.state == "preparing" and host.preparing_since > time.time() - 5
+
+
 async def test_an_engine_that_does_not_come_back_does_not_get_the_new_count(fleet, monkeypatch):
     host = await fleet.prepare(max_spend=1.00, max_hours=2)
     host.state = "ready"
