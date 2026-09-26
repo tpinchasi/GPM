@@ -13,7 +13,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Mapping, Optional
 
 import anyio
 import httpx
@@ -193,6 +193,31 @@ async def _acquire(state: RouterState, request: Request, need: Need, request_id:
     with contextlib.suppress(asyncio.CancelledError):
         await acquire
     raise ClientGone()
+
+
+def _ineligible_detail(
+    path: str, serving: frozenset[str], ready: frozenset[str], paths_by_engine: Mapping[str, set[str]],
+) -> str:
+    """Why hosts are ready and none may take this request, said as specifically as the pool
+    can tell.
+
+    The commonest case has a specific answer: the request arrived on one engine's own API and
+    every ready host runs another (D93). Found live: an app on Ollama's `/api/chat` against a
+    pool whose only ready host ran vLLM was told "none holds a build of this model" ninety
+    times, and the operator spent ten minutes and a parked host on a message that did not say
+    the path was the problem — or that the `/v1` paths would have reached every engine.
+    """
+    if serving and ready and not (serving & ready):
+        shared = sorted(
+            set.intersection(*(set(paths_by_engine.get(name, set())) for name in serving | ready))
+        ) if (serving | ready) <= set(paths_by_engine) else []
+        served_by = ", ".join(sorted(serving))
+        running = ", ".join(sorted(ready))
+        detail = f"{path} is served by {served_by}; the hosts ready now run {running}, which does not serve it"
+        if shared:
+            detail += f" — {', '.join(shared)} would reach every engine this pool runs"
+        return detail
+    return "hosts are ready but none holds a build of this model that satisfies the request"
 
 
 def _unready_reason(state: RouterState) -> str:
@@ -394,7 +419,12 @@ def create_app(
                 await record("rejected", status_code=503, reason="no_eligible_host")
                 return _no_capacity(
                     "no_eligible_host",
-                    "hosts are ready but none holds a build of this model that satisfies the request",
+                    _ineligible_detail(
+                        path,
+                        need.engines,
+                        frozenset(host.engine for host in state.hosts if host.state is HostState.READY),
+                        {name: candidate.inference_paths() for name, candidate in state.engines.items()},
+                    ),
                 )
             except QueueTimeout:
                 if request_deadline is not None and time.monotonic() >= request_deadline:
