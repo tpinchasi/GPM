@@ -315,6 +315,7 @@ ready from its advertised download speed; hourly rate while preparing; storage r
 | Verify | Every model loads; all resident **together**; a short clean generation per model. Readiness is unchanged by D57: a host joins on the whole set, never on a partial one |
 | Size | Worker count for this hardware and model set; engine parallelism set to match |
 | Given up | A host whose engine never answers within `max_starting_minutes` is destroyed and its machine avoided; where the provider offers it, the event quotes what the machine's own boot output said (D78) — data, shown to the operator, never acted on |
+| Not ready in time | A host still `scheduling` or `preparing` after `max_preparing_minutes` is destroyed and its machine avoided. The clock starts each time the host enters those states — at rental, adoption (D50), a restart from parked, a resize that relaunches its engine, or a re-bid — never at creation, and a `draining` host is finishing its work and is never judged by it |
 | Listen | The engine binds **loopback only** (D77). The pool dials it through a forward into the machine, never across the network, so it has no reason to accept a connection from anywhere else — and a provider image that publishes the engine's port would otherwise leave an unauthenticated engine on the open internet |
 | Ready | Cost to date, hourly cost from here, storage cost if parked |
 

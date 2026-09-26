@@ -158,6 +158,32 @@ Read [docs/overview.md](docs/overview.md) first, then [docs/decisions.md](docs/d
 
 ## Next actions, in order
 
+**Planned (owner, 2026-09-26): settings per engine.** What a card runs at once depends on the
+engine, not only the card: on the same RTX PRO 6000 WS, Ollama topped out at 6–7 workers, while
+vLLM ran 7 for three hours with its KV cache under 20% and never queued — the pool's 7 workers
+were the whole limit, at ~20,000 output tokens a minute. Today a capacity profile matches the
+card (`hardware`, `gpu`), its memory, or a capability, and `rented.workers` is one number, so the
+owner's "16 workers for vLLM" had to be written for every engine (done 2026-09-26: both RTX PRO
+6000 profiles and `rented.workers` at 16; a 2x H100 therefore gets 32). Proposed, not built:
+1. `match.engine` on a capacity profile, so the same card can carry a number per engine;
+2. `rented.workers` given per engine (`workers: { vllm: 16, ollama: 6 }`), a plain number still
+   meaning every engine;
+3. the same question for `context_length` and the queue timeout — the 30 s `queue_timeout` refused
+   about half of a laptop-only chat load on 2026-09-26, while vLLM never came near it.
+To decide: whether a per-engine number is a new block or a map on the existing fields.
+
+**Fixed 2026-09-26 in gpm-server 0.19.3 (PR #37, owner: "fix and fold"):** a host that leaves
+`ready` after serving — draining at a lease's end, a resize that relaunches its engine, a restart
+from parked, a re-bid after an eviction — was destroyed on the next pass as "not ready after 30
+minutes" and its machine avoided for an hour as "never became ready". Live: at 13:05:28
+`rented-72ea9d` began draining at its lease's time limit and was destroyed one second later,
+cutting four answers mid-stream, and machine 144186 was avoided until 14:05. Now only
+`scheduling`/`preparing` hosts are judged, and the clock restarts on every entry into them; tested
+on all four paths, each test failing on the old code. Still open, noticed alongside: on a bid
+listing whose `dph_total` is below its `min_bid`, the market preview's "all-in" shows the listing's
+price rather than the price at the bid, and "Would pay" means the bid alone for an interruptible
+offer but the total for an on-demand one.
+
 **Newest (2026-09-25, evening): why bids on the H100 pair kept "failing", and gpm-server 0.19.1
 on branch `fix/refused-bid-detail`, not merged or deployed.** Two $1.17 bids on machine 56779 (listed
 `min_bid` $1.07) came back `success: false` **with** a contract and an instance key — Vast's shape
@@ -454,6 +480,7 @@ In `~/workspace/Aletheia`: backlog entries `GPU-POOL-01` and `GPU-CLOUD-01` in
 
 | Date | What happened |
 |---|---|
+| 2026-09-26 | **A full day of vLLM under the owner's chat agent, and a bug in how hosts end.** `rented-72ea9d` (1x RTX PRO 6000 WS, on demand, $1.414/h, 7 workers) served 32,917 requests in 2h38 with none failed, at a flat ~20,000 output tokens a minute — pool-limited: 7 in flight, a 1–2 s queue, the KV cache under 20%, the GPU 96% busy mostly reading ~3,100-token prompts. $1.19 per million output tokens, half the best Ollama host on the same card; about 10× under Together AI's only Gemma 4 (31B), about level with the cheapest API for the same models. At its lease's end (13:05:28) it began draining and was destroyed a second later as "never became ready", four answers cut — fixed in 0.19.3 (PR #37). Then 16 workers (`rented-5a1f39`, same card type): **37,500 output tokens a minute (+86%), $0.63/M (−47%)**, the queue halved so the app's median answer came 0.6 s sooner, the 26B's own p95/p99 up to 6.5/9.1 s; GPU at 100%, cache at 33% — now GPU-bound, most of it prompt reading. Google's 4-bit E4B QAT build failed to start under vLLM v0.29.0 on this card; the pool recorded only vLLM's wrapper line, so the cause is unconfirmed. Planned: settings per engine (workers were set to 16 for every engine to get it for vLLM). |
 | 2026-09-26 | **The app on `/v1` was refused by the laptop, and the router was the cause.** The owner's app, moved to `/v1/chat/completions` in another session, got `no_eligible_host` six times a minute from a laptop that was ready with its models on disk. The router's own rule, run offline against the published table, said the laptop was eligible — so the router process held a different view: its update path for a host it already knows copied state, loaded models, variants and workers but **not the on-disk list, residency or engine**. The laptop was disabled when the router started, so it was first seen with an empty disk; when it came back on demand with its models on disk and nothing loaded, the router kept the empty list, and servable was empty. A router restart cleared it at once; the update path now copies every routing field, with a two-process test that republishes a row and watches the router follow it (gpm-server 0.19.2). Also checked on the way, in the adopter's code: no runtime-class pin, so that guess was wrong. |
 | 2026-09-26 | **The seventh rental reached ready, and the app could not use it.** `rented-ac762b`, a single RTX PRO 6000 (Blackwell, 96 GB) at $0.887/h: agent in 50 s, three models fetched at ~500 Mbps, vLLM started on all three — **the NVFP4 26B loads and serves on Blackwell** — ready in sixteen minutes. Then the owner's simulation: ninety `POST /api/chat` refused with `no_eligible_host` in ten minutes, zero served; the host was parked as idle two minutes after ready. The app talks through LangChain's Ollama client with the SDK's transport injected, so the path is Ollama's `/api/chat`, which vLLM does not serve (D93) and the only Ollama host is disabled. Released by the owner at ~$0.35. Agreed: the app moves to the `/v1` surface every engine serves (the owner, in another session), the router grows Ollama-dialect translation for `/v1` engines later as its own decision, and the refusal says the real reason now — gpm-server 0.19.1, the `no_eligible_host` detail names the path, the engines and the paths that reach every engine. Checked live on the laptop's Ollama 0.34.3 before recommending `/v1`: chat, streaming, tool calls, `json_schema` and embeddings all work on `/v1` — but **the gemma4 MLX builds leak tokens before the JSON under a schema, on both surfaces** (recorded under verified facts); a non-MLX model is clean. |
 | 2026-09-25 | **A "refused" bid was a bid that lost.** The owner asked why the latest bid failed and refused "don't know" as an answer. Two $1.17 bids on the 2x H100 slice of machine 56779 (`min_bid` $1.07, 133 GB of disk against 50 asked) came back `success: false` with `new_contract` and an `instance_api_key`; the pool called it refused and destroyed both within a second. Read against Vast's own API reference, a refusal carries `error` and `msg` and no contract, so these were instances created and not started — bids that did not win. The listing's `min_bid` equals `dph_base`, the host's floor, not the standing top bid (the rental-types article: "the current highest bid is the instance that runs"), and the same machine outbid the pool within one and seven minutes yesterday: a contested slice. Ruled out: disk (133 ≥ 50), the all-in cap ($1.19 under $1.40), credit ($9.52 on a credit-only account; a $1.74 on-demand rental succeeded on 09-22). Built: the created instance's state is read before the destroy and recorded (`created_instance`), and credentials are redacted from every provider answer the pool writes down — an instance key had reached the event log. gpm-server 0.19.1. |

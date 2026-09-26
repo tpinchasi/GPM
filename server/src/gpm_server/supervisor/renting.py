@@ -170,6 +170,14 @@ class RentedHost:
             self.preparing_since = time.time()
         self.state = "preparing"
 
+    def mark_scheduling(self) -> None:
+        """Enter `scheduling` — waiting for the provider to start it again after a re-bid —
+        starting the same clock. A host that served for hours and is then outbid has not been
+        "not ready for 30 minutes"; it has been not ready since now (found live, 2026-09-26)."""
+        if self.state != "scheduling":
+            self.preparing_since = time.time()
+        self.state = "scheduling"
+
     @property
     def hours_held(self) -> float:
         return (time.time() - self.created_at) / 3600
@@ -1040,7 +1048,7 @@ class Fleet:
             return False, "the engine was relaunched and is not answering"
         was = host.workers
         host.workers = workers
-        host.state = "preparing"  # it has to hold the model set again before it is routed to
+        host.mark_preparing()  # it has to hold the model set again before it is routed to
         self.events.record(
             "host_resized",
             f"{host.host_id} now takes {workers} requests at once, up from {was}; its engine "
@@ -1710,7 +1718,7 @@ class Fleet:
                 continue
             host.bid_hourly = capped
             host.lease_id = lease.lease_id
-            host.state = "preparing"
+            host.mark_preparing()  # its clock starts now, not when it was first rented
             host.parked_at = None
             host.idle_since = None
             self.events.record(
@@ -2057,7 +2065,7 @@ class Fleet:
                     await self.provider.set_bid(host.instance, capped)
                     await self.provider.start(host.instance)
                     host.bid_hourly = capped
-                    host.state = "scheduling"
+                    host.mark_scheduling()
                     host.rebid_at = time.time()
                 except ProviderError as exc:
                     log.warning("re-bid for %s failed: %s", host.host_id, exc)
@@ -2531,7 +2539,11 @@ class Fleet:
 
         # A host that is not ready yet is neither idle nor surplus: it is capacity on its
         # way, and billing while it comes. It is only given up on when it takes too long.
-        preparing = [h for h in live if h.state != "ready"]
+        # Only a host actually on its way counts: one that is draining is finishing its work
+        # and ends when that is done (found live: a host drained at its lease's end was taken
+        # for one "never ready", destroyed a second later with four answers in flight, and its
+        # good machine avoided for an hour).
+        preparing = [h for h in live if h.state in ("scheduling", "preparing")]
         ready = [h for h in live if h.state == "ready"]
         for host in preparing:
             since = host.preparing_since or host.created_at
