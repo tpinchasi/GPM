@@ -57,7 +57,7 @@ rented:
   ssh_key: ~/.ssh/id_ed25519   # the pool installs its public half on each host it rents
 
   offer_policy:                # hard filters. Never relaxed unattended
-    min_gpu_memory_gb: 24
+    min_gpu_memory_gb: 24      # raised to what the models need where that is more
     min_disk_gb: 40            # the disk each host is rented with, and the least a machine must offer
     max_all_in_hourly: 0.30    # the most per host per hour, all-in with that disk — bids stop here
     max_download_per_gb: 0.01
@@ -75,6 +75,12 @@ rented:
     deadman_minutes: 20
     deadman_action: destroy
 ```
+
+The models each rented machine holds, and the build of each, can be named as **model profiles**
+(`rented.model_profiles` and `rent_profiles` — easiest from the console's *Rented capacity →
+Engine & models* tab, which searches the model hub and Ollama's library for you). What a
+profile holds sets the least card and disk searched for: the pool works it out from the
+builds' sizes and raises the two minimums above where it has to, never lowering yours.
 
 Check it before it takes effect — this is what the console's Apply button does for you:
 

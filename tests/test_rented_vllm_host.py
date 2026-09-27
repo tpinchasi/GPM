@@ -132,7 +132,10 @@ class Machines:
         async def restart(control):
             name = next(n for n, disk in machines.disks.items() if str(disk) == control.settings.models_path)
             disk, engine = machines.disks[name], machines.engines[name]
-            proxy = "--proxy" in (machines.fleet.engine_start_command() or "")
+            # The start command the machine was created with: the router follows what it holds.
+            bought = next((h for h in machines.fleet.hosts.values()
+                           if h.agent is not None and h.agent.url == f"http://{name}"), None)
+            proxy = "--proxy" in (machines.fleet.engine_start_command(bought.models if bought else None) or "")
             on_disk = sorted(p.name for p in vllm_launch.complete_models(disk))
             names: list[str] = []
 
@@ -422,6 +425,83 @@ def test_every_model_on_one_host_starts_an_engine_each_behind_the_router(monkeyp
                     assert answer.headers["X-GPM-Host"] == host.host_id
         finally:
             control.stop()
+            hub_server.stop()
+
+
+# --- model profiles (D111) ---
+
+BIG_FP8 = "org/Gemma-4-26B-FP8"
+
+
+def test_a_host_bought_as_a_profile_fetches_and_serves_the_build_it_names(monkeypatch, tmp_path):
+    """The profile names the catalog's *second* vLLM build of the model. Resolved by catalog
+    order, the machine would fetch the first and the router would ask for it; bought as the
+    profile, both follow the profile."""
+    hub = FakeHub(HUB | {BIG_FP8: {
+        "config.json": b'{"architectures": ["Gemma4ForCausalLM"]}',
+        "model.safetensors": b"f" * 20_000,
+    }})
+    catalog = CATALOG | {BIG: {"variants": CATALOG[BIG]["variants"] + [{"tag": BIG_FP8, "engine": "vllm"}]}}
+    with pool_harness(
+        [EngineSpec(id="laptop", resident={EMBED}, kind="local", workers=1)],
+        host_overrides={"laptop": {"models": [EMBED]}},
+        rentable=[EngineSpec(id="market-1", resident=set(), workers=2, engine="vllm")],
+        model_set=[BIG, EMBED], catalog=catalog,
+        rented=rented(model_profiles={"chat-fp8": {BIG: BIG_FP8}}, rent_profiles=["chat-fp8"]),
+        pool_settings={"models_per_host": "declared"},
+    ) as pool:
+        hub_server = ServerHandle(hub.app, pool.loop)
+        monkeypatch.setenv("HF_ENDPOINT", hub_server.base_url)
+        try:
+            machines = Machines(pool, tmp_path, monkeypatch)
+            machines.fleet.open_lease(workers=2, max_hours=2, max_spend=2.00, allow_rent=True)
+            (host,) = machines.until_ready(1)
+            machines.check_no_failures()
+
+            assert (host.profile, host.models, host.builds) == ("chat-fp8", (BIG,), {BIG: BIG_FP8})
+            assert f"list {BIG_FP8}" in hub.requests
+            assert f"list {BIG_REPO}" not in hub.requests, "the catalog's first build was not fetched"
+            ((_, on_disk, started, proxy),) = machines.launches
+            assert (on_disk, started, proxy) == (["org__Gemma-4-26B-FP8"], [BIG_FP8], False)
+
+            with pool.client() as client:
+                answer = client.post("/v1/chat/completions", json={
+                    "model": BIG, "messages": [{"role": "user", "content": "hello"}],
+                })
+                assert answer.status_code == 200, answer.text
+                assert answer.headers["X-GPM-Host"] == host.host_id
+                assert pool.rentable["market-1"].fake.received[-1][1]["model"] == BIG_FP8
+        finally:
+            hub_server.stop()
+
+
+def test_a_profile_of_two_models_runs_the_router_without_a_pool_wide_switch(monkeypatch, tmp_path):
+    hub = FakeHub(HUB)
+    with pool_harness(
+        [EngineSpec(id="laptop", resident={EMBED}, kind="local", workers=1)],
+        host_overrides={"laptop": {"models": [EMBED]}},
+        rentable=[EngineSpec(id="market-1", resident=set(), workers=2, engine="vllm")],
+        model_set=[BIG, EMBED], catalog=CATALOG,
+        rented=rented(model_profiles={"both": {BIG: BIG_REPO, EMBED: EMBED_REPO}}, rent_profiles=["both"]),
+        pool_settings={"models_per_host": "declared"},
+    ) as pool:
+        hub_server = ServerHandle(hub.app, pool.loop)
+        monkeypatch.setenv("HF_ENDPOINT", hub_server.base_url)
+        try:
+            machines = Machines(pool, tmp_path, monkeypatch)
+            machines.fleet.open_lease(workers=2, max_hours=2, max_spend=2.00, allow_rent=True)
+            (host,) = machines.until_ready(1)
+            machines.check_no_failures()
+            ((_, _, started, proxy),) = machines.launches
+            assert proxy is True and sorted(started) == sorted([BIG_REPO, EMBED_REPO])
+            assert host.models == (BIG, EMBED)
+            with pool.client() as client:
+                answer = client.post("/v1/chat/completions", json={
+                    "model": BIG, "messages": [{"role": "user", "content": "hi"}],
+                })
+                assert answer.status_code == 200, answer.text
+                assert answer.headers["X-GPM-Host"] == host.host_id
+        finally:
             hub_server.stop()
 
 

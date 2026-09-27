@@ -283,6 +283,40 @@ With `declared`, the pool **refuses at load** any configuration where some model
 be held by no host — the only other symptom would be a 503 for that one model, long after the pool
 looked healthy, with nothing saying why. A disabled host covers nothing.
 
+### 3.1 Model profiles (D111)
+
+What a rented machine holds is said with **model profiles**: a named set of models, each with
+the build a machine fetches for it.
+
+```yaml
+rented:
+  model_profiles:
+    chat:      { gemma4:26b: nvidia/Gemma-4-26B-A4B-NVFP4 }
+    chat-fp8:  { gemma4:26b: RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic }
+    small-mix: { gemma4:e4b: google/gemma-4-E4B-it, nomic-embed-text:latest: nomic-ai/nomic-embed-text-v2-moe }
+  rent_profiles: [chat, small-mix]      # what the pool may rent hosts as, in preference order
+```
+
+- **Each machine is bought as exactly one profile**, and holds exactly its builds — whatever the
+  catalog lists first for that model. Which one: a profile holding a model no host serves first
+  (the first such model, in the order profiles are listed), then the profile whose models'
+  requests are waiting most, then the one with the fewest hosts. The same model may have a
+  different build in different profiles.
+- **A profile of one model is a host per model; a profile of several puts them on one machine**,
+  each in its own process behind the machine's router where the engine serves one model per
+  process (D96) — decided per machine by what it holds, not by a switch for the whole pool.
+- **What a profile holds sets the least card and disk searched for** (supervisor.md §6.1).
+- The file refuses: a rented profile that is not defined; a profile holding a model outside the
+  set; a build the catalog does not list for that model, or one rented hosts cannot run; naming
+  `rented.models` beside `rent_profiles`; and a model in the set held by no configured host and
+  no rented profile.
+- With `rent_profiles` empty the pool rents as it did before profiles: `rented.models` and
+  `pool.models_per_host` decide, and `rented.engine_proxy` puts the router on every machine.
+  `models_per_host` still says what *configured* hosts hold.
+
+What a rented host was bought as — its models, profile, builds and disk — is kept in the host
+table, so a restarted supervisor asks it for exactly what it holds.
+
 How a host holds what it was given is its **residency** policy, set per host:
 
 | `residency` | `ready` means | A model found evicted | For |

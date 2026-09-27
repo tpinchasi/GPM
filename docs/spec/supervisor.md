@@ -234,9 +234,18 @@ model set. **Parked hosts are tried first** (§8).
    **What is searched for is what is rented (D108).** Each offer is priced for the disk the host
    would be rented with — `min_disk_gb` of the search in force, which is also the least a machine
    must offer and the disk the rental asks for — so the all-in compared is the all-in billed. The
-   models' size is not typed: it is read from the sizes of the builds the rented engine fetches,
-   as the model directory measured them, and a search whose disk cannot hold them rejects every
-   offer saying so. A build the directory has not measured is named, not counted.
+   models' size is not typed: it is read from the sizes of the builds the next host will fetch —
+   the catalog's `size_gb` where the file states it, otherwise as the model directory measured
+   them. A build nobody has measured is named, not counted.
+
+   **What the next host holds sets the least card and disk searched for (D111).** The pool
+   decides what the next machine is bought as — which model profile, holding which builds —
+   *before* it searches, and raises the search's `min_gpu_memory_gb` and `min_disk_gb` to what
+   those builds need where the operator's are lower; never lowers them. Card memory is per card
+   (each card runs a copy, D107): each model's weights plus a tenth, plus a 3 GiB cache reserve,
+   within 90% of the card — the rule the machine's own launcher refuses to start without. Disk is
+   the weights plus a tenth, plus 10 GB for the engine's image, logs and caches. The disk searched
+   for is still the disk rented, so the host is rented with the raised figure.
 4. **Place and confirm** — ask the provider to fail rather than park a losing bid; label the
    instance `<pool>/<host_id>`; wait for running; if it sits stopped with nothing pending for
    60 s the bid lost — destroy and verify. The floor moving between search and create is normal:

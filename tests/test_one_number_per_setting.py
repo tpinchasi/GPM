@@ -146,15 +146,29 @@ def test_the_models_size_is_read_from_their_builds(make_fleet):
     assert fleet.model_sizes_unknown == []
 
 
-async def test_a_disk_too_small_for_the_models_rents_nothing_and_says_why(make_fleet):
+async def test_a_disk_below_what_the_models_need_is_raised_to_it(make_fleet):
+    """Superseded D108's refusal (D111): the models' size is known, so the search asks for what
+    they need — and the host is rented with that disk, still one number."""
+    fleet = make_fleet(config(offer_policy={"min_disk_gb": 30, "max_all_in_hourly": 0.60}))
+    DirectoryStore(fleet.leases.db).put(OLLAMA, "m", {"tags": [{"name": MODEL, "size_gb": 20.0}]})
+    open_lease(fleet)
+    preview = await fleet.market_preview(hours=1)
+    assert preview["next_host"]["typed"]["min_disk_gb"] == 30
+    assert preview["next_host"]["searched"]["min_disk_gb"] == 32  # 20 x 1.1 + 10
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    (instance,) = created(fleet)
+    assert instance.spec.disk_gb == 32
+
+
+async def test_a_card_too_small_for_the_models_is_not_bid_on_and_says_why(make_fleet):
     fleet = make_fleet(config(offer_policy={"min_disk_gb": 30, "max_all_in_hourly": 0.60}))
     DirectoryStore(fleet.leases.db).put(OLLAMA, "m", {"tags": [{"name": MODEL, "size_gb": 36.7}]})
     open_lease(fleet)
     await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
-    assert created(fleet) == []
+    assert created(fleet) == [], "a 48 GB card cannot hold 36.7 GB of weights with room to batch"
     preview = await fleet.market_preview(hours=1)
     assert preview["model_set_gb"] == pytest.approx(36.7)
-    assert preview["passed"] == 0 and "disk" in preview["rejected_by_reason"]
+    assert preview["passed"] == 0 and "gpu memory" in preview["rejected_by_reason"]
 
 
 # --- the old second numbers are refused by name ---

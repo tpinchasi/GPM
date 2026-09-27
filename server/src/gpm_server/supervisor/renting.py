@@ -40,6 +40,7 @@ from ..providers.base import (
     ProviderRateLimited,
     redacted,
 )
+from ..sizing import Needs, needs_for
 from ..strategies import (
     Demand,
     HostView,
@@ -84,6 +85,12 @@ class RentedHost:
     #: was bought from whatever the pool was shortest of. Empty means the whole rented set, which
     #: is what every host meant before the pool could buy one per model.
     models: tuple[str, ...] = ()
+    #: The model profile it was bought as, and the build of each model that profile named
+    #: (D111). Empty for a host bought without profiles: its builds are the catalog's first.
+    profile: Optional[str] = None
+    builds: dict[str, str] = dataclasses.field(default_factory=dict)
+    #: The disk it was rented with — the search's minimum, raised to what its models need.
+    disk_gb: Optional[float] = None
     ready_at: Optional[float] = None
     parked_at: Optional[float] = None
     #: The agent the pool installed here, if any, and what it reported. A host without one is
@@ -452,7 +459,7 @@ class Fleet:
 
     # --- the dead-man timer ---
 
-    def deadman_onstart(self) -> Optional[str]:
+    def deadman_onstart(self, models: Optional[Sequence[str]] = None) -> Optional[str]:
         """The start-up script that arms the timer, or None where the provider has no
         instance-scoped credential.
 
@@ -468,10 +475,10 @@ class Fleet:
             engine_port=self.engine_port,
             public_key=self.pool_public_key(),
             ssh_user=self.rented.ssh_user,
-            extra=self.engine_start_command(),
+            extra=self.engine_start_command(models),
         )
 
-    def engine_start_command(self) -> Optional[str]:
+    def engine_start_command(self, models: Optional[Sequence[str]] = None) -> Optional[str]:
         """How the engine is started on a host this pool creates: the operator's `engine_start`
         if there is one, and otherwise the engine's own (D97). vLLM has one — the agent's
         launcher — because starting it means reading what the agent fetched, which is not a
@@ -482,9 +489,18 @@ class Fleet:
             port=self.engine_port,
             models_dir=hostagent.MODELS_DIR,
             agent_archive=hostagent.ARCHIVE,
-            proxy=self.rented.engine_proxy,
+            proxy=self.proxy_for(models),
             options=tuple(self.rented.engine_options),
         )
+
+    def proxy_for(self, models: Optional[Sequence[str]]) -> bool:
+        """Whether a machine holding these models runs the router in front of one engine
+        process per model (D96): where the pool says so, or where it holds several models under
+        an engine that serves one per process (D111) — a profile of two is a router of two."""
+        if self.rented.engine_proxy:
+            return True
+        many = len(models) > 1 if models is not None else False
+        return many and bool(getattr(self.engine, "serves_one_model", False))
 
     def pool_public_key(self) -> Optional[str]:
         """The public half of `rented.ssh_key`, read from the `.pub` beside it."""
@@ -624,25 +640,74 @@ class Fleet:
         `rented.models` names, or the whole set where it names nothing — and each host the pool
         buys is given one of them, not all of them.
         """
+        if self.rented.rent_profiles:
+            from ..config import rented_profile_models
+
+            return rented_profile_models(self.rented)
         if self.config.pool.models_per_host == "all" or self.rented.models is None:
             return list(self.config.pool.model_set)
         return list(self.rented.models)
 
-    def model_set_gb(self, models: Sequence[str]) -> float:
-        """What these models take on disk, from the sizes of the builds this pool's rented
-        engine fetches (D108) — the builds the directory has measured. A build it has not is
-        left out and said so in `model_sizes_unknown`, rather than guessed at."""
+    def builds_of(self, models: Sequence[str], builds: Optional[dict[str, str]] = None) -> dict[str, str]:
+        """The build a rented host fetches for each of these models: the profile's, where one
+        names it (D111), and otherwise the catalog's first for the rented engine."""
         from ..catalog import variants_for_host
-        from ..directory import build_sizes_gb
 
         variants = variants_for_host(
             list(models), self.config.catalog, frozenset(self.rented.capabilities),
             self.config.rented_engine(),
         )
-        builds = {model: group[0].tag for model, group in variants.items() if group}
-        sizes = build_sizes_gb(self.leases.db, builds) if builds else {}
+        chosen = {model: group[0].tag for model, group in variants.items() if group}
+        chosen.update({model: tag for model, tag in (builds or {}).items() if model in chosen or model in models})
+        return chosen
+
+    def build_sizes(self, models: Sequence[str], builds: Optional[dict[str, str]] = None) -> dict[str, Optional[float]]:
+        """Each model's build size in GB, or None where nobody has measured it: the catalog's
+        own `size_gb` first, then what the directory measured (D108)."""
+        from ..directory import build_sizes_gb
+
+        chosen = self.builds_of(models, builds)
+        stated = {
+            v.tag: v.size_gb for entry in self.config.catalog.values() for v in entry.variants if v.size_gb
+        }
+        sizes = build_sizes_gb(self.leases.db, chosen) if chosen else {}
+        for model, tag in chosen.items():
+            if tag in stated:
+                sizes[model] = stated[tag]
+        return sizes
+
+    def model_set_gb(self, models: Sequence[str], builds: Optional[dict[str, str]] = None) -> float:
+        """What these models take on disk, from the sizes of the builds this pool's rented
+        engine fetches (D108) — the builds the directory has measured. A build it has not is
+        left out and said so in `model_sizes_unknown`, rather than guessed at."""
+        sizes = self.build_sizes(models, builds)
         self.model_sizes_unknown = sorted(model for model, size in sizes.items() if size is None)
         return round(sum(size for size in sizes.values() if size), 3)
+
+    def needs_of(self, models: Sequence[str], builds: Optional[dict[str, str]] = None) -> Needs:
+        """The least card and disk a machine holding these builds needs (D111)."""
+        return needs_for(self.build_sizes(models, builds))
+
+    def policy_for(
+        self, models: Sequence[str], builds: Optional[dict[str, str]] = None,
+        base: Optional[OfferPolicy] = None,
+    ) -> OfferPolicy:
+        """The search for a machine that will hold these models: the search in force, with its
+        card-memory and disk minimums raised to what the models need where they are lower
+        (D111). Never lowered — an operator's higher minimum is a choice, and stands. The disk
+        searched for is the disk the host is rented with (D108), so it is raised as one."""
+        base = base or self.rented.policy_in_force
+        needs = self.needs_of(models, builds)
+        raised: dict[str, float] = {}
+        if needs.card_memory_gb > base.min_gpu_memory_gb:
+            raised["min_gpu_memory_gb"] = needs.card_memory_gb
+        if needs.disk_gb > base.min_disk_gb:
+            raised["min_disk_gb"] = needs.disk_gb
+        return base.model_copy(update=raised) if raised else base
+
+    def next_host_policy(self, base: Optional[OfferPolicy] = None) -> OfferPolicy:
+        """The search for the next machine, sized for what it would be bought for."""
+        return self.policy_for(self.models_for_new_host(), self.builds_for_new_host(), base)
 
     @property
     def one_model_per_host(self) -> bool:
@@ -652,6 +717,46 @@ class Fleet:
             self.config.pool.models_per_host != "all"
             and bool(getattr(self.engine, "serves_one_model", False))
         )
+
+    @property
+    def hosts_hold_part_of_the_set(self) -> bool:
+        """Is each rented host bought for part of the rented set — by profile (D111), or one
+        model at a time (D94)? Then which it is bought for, and which may be let go, matter."""
+        return bool(self.rented.rent_profiles) or self.one_model_per_host
+
+    def profile_for_new_host(self) -> Optional[str]:
+        """Which profile the next machine is bought as (D111) — D95's rule, over profiles.
+
+        1. **A profile holding a model no host serves** — the first such model in the order the
+           operator listed profiles, and the first profile holding it. Availability first.
+        2. **Otherwise the profile whose models' requests are waiting most.**
+        3. **Otherwise the profile with the fewest hosts**, ties to the operator's order.
+        """
+        profiles = self.rented.profiles_rented()
+        if not profiles:
+            return None
+        names = list(profiles)
+        live = [host for host in self.hosts.values() if not host.released]
+        serving: dict[str, int] = {}
+        for host in live:
+            for model in self.models_of(host):
+                serving[model] = serving.get(model, 0) + 1
+        for model in self.rented_models:
+            if not serving.get(model):
+                return next(name for name in names if model in profiles[name])
+
+        waiting = getattr(self, "_waiting_by_model", {})
+        demand = {name: sum(waiting.get(model, 0) for model in profiles[name]) for name in names}
+        if any(demand.values()):
+            return max(names, key=lambda name: (demand[name], -names.index(name)))
+
+        count = {name: sum(1 for host in live if host.profile == name) for name in names}
+        return min(names, key=lambda name: (count[name], names.index(name)))
+
+    def builds_for_new_host(self) -> dict[str, str]:
+        """The builds the next machine is bought to fetch, where a profile names them."""
+        name = self.profile_for_new_host()
+        return dict(self.rented.model_profiles[name]) if name else {}
 
     def models_for_new_host(self) -> tuple[str, ...]:
         """Which models the next machine is bought to serve (D94, D95).
@@ -667,6 +772,9 @@ class Fleet:
 
         Ties go to the order the operator listed them, so the answer is stable and explainable.
         """
+        profile = self.profile_for_new_host()
+        if profile is not None:
+            return tuple(self.rented.model_profiles[profile])
         candidates = self.rented_models
         if not self.one_model_per_host or not candidates:
             return tuple(candidates)
@@ -698,7 +806,7 @@ class Fleet:
         host still serves everything, and the question does not arise. A host that is being
         released, or is not serving, does not count as cover.
         """
-        if not self.one_model_per_host or not host.models:
+        if not self.hosts_hold_part_of_the_set or not host.models:
             return False
         for name in host.models:
             others = [
@@ -740,13 +848,13 @@ class Fleet:
             + (f" — {chosen.note}" if chosen.note else "")
         )
 
-    def instance_env(self, workers: Optional[int] = None) -> dict[str, str]:
+    def instance_env(self, workers: Optional[int] = None, models: Optional[Sequence[str]] = None) -> dict[str, str]:
         """What makes the engine run this many workers at this context, holding the models this
         host is asked for — set at creation on hosts the pool creates (spec §2.2)."""
         return self.engine.launch_settings(
             workers=workers if workers is not None else self.rented.workers,
             context=self.rented.context_length,
-            n_models=len(self.rented_models),
+            n_models=len(models) if models is not None else len(self.rented_models),
             # The pool reaches this engine through a forward into the machine, never across
             # the network, so it binds loopback and nothing a provider publishes leads to it.
             listen=f"127.0.0.1:{self.engine_port}",
@@ -1157,10 +1265,11 @@ class Fleet:
         if refusal:
             step["refused_by_caps"] = refusal
         if decision.rent and refusal is None and lease is not None:
-            offers = await self._offers()
+            policy = self.next_host_policy()
+            offers = await self._offers(policy)
             ranked, rejected = rank_offers(
-                offers, self._policy_with_avoided(self.rented.policy_in_force), self.rented.bidding,
-                lease.hours_left(), self.model_set_gb(self.models_for_new_host()),
+                offers, self._policy_with_avoided(policy), self.rented.bidding,
+                lease.hours_left(), self.model_set_gb(self.models_for_new_host(), self.builds_for_new_host()),
                 history=self.machine_history(), history_cfg=self.rented.history,
             )
             step["offers_seen"] = len(offers)
@@ -1208,13 +1317,18 @@ class Fleet:
             policy = OfferPolicy.model_validate({**policy.model_dump(), **offer_policy})
         if bidding:
             bid_config = BiddingConfig.model_validate({**bid_config.model_dump(), **bidding})
+        # Searched as the next host would be: minimums raised to what it would hold (D111).
+        typed = policy
+        next_models, next_builds = self.models_for_new_host(), self.builds_for_new_host()
+        policy = self.policy_for(next_models, next_builds, typed)
+        needs = self.needs_of(next_models, next_builds)
 
         if kinds is not None and kinds not in self._KINDS:
             raise ValueError(f"kinds must be one of {sorted(self._KINDS)}")
         offers = await self._offers(policy, kinds)
         ranked, rejected = rank_offers(
             offers, self._policy_with_avoided(policy), bid_config, hours,
-            self.model_set_gb(self.models_for_new_host()),
+            self.model_set_gb(next_models, next_builds),
             history=self.machine_history(), history_cfg=self.rented.history,
         )
         problem = self.last_offer_error
@@ -1263,8 +1377,18 @@ class Fleet:
             "best": accepted,
             # What the next host would be bought for takes this much disk, from its builds' sizes;
             # a build the directory has not measured is named rather than counted as nothing.
-            "model_set_gb": self.model_set_gb(self.models_for_new_host()),
+            "model_set_gb": self.model_set_gb(next_models, next_builds),
             "model_sizes_unknown": self.model_sizes_unknown,
+            # What the next host is bought as and holds, what that needs, and the minimums the
+            # search used because of it — beside the operator's own (D111).
+            "next_host": {
+                "profile": self.profile_for_new_host(),
+                "models": list(next_models),
+                "builds": self.builds_of(next_models, next_builds),
+                "needs": needs.as_dict(),
+                "searched": {"min_gpu_memory_gb": policy.min_gpu_memory_gb, "min_disk_gb": policy.min_disk_gb},
+                "typed": {"min_gpu_memory_gb": typed.min_gpu_memory_gb, "min_disk_gb": typed.min_disk_gb},
+            },
             "policy": {
                 "max_all_in_hourly": policy.max_all_in_hourly,
                 "disk_gb": policy.min_disk_gb,
@@ -1696,6 +1820,13 @@ class Fleet:
     def tags_for(self, host: Optional[RentedHost]) -> frozenset[str]:
         """The builds one host must hold (D94) — what it was bought for, or the whole rented set
         for a host bought before the pool assigned models."""
+        if host is not None and host.builds:
+            # Bought as a profile: exactly the builds it named, whatever the catalog lists first.
+            return frozenset(host.builds.values())
+        if host is None and self.rented.rent_profiles:
+            return frozenset(
+                tag for models in self.rented.profiles_rented().values() for tag in models.values()
+            )
         from ..catalog import variants_for_host
 
         variants = variants_for_host(
@@ -1792,6 +1923,12 @@ class Fleet:
             "launch_workers": host.launch_workers,
             "engine": host.engine,
             "engine_port": host.engine_port,
+            # What it was bought to hold. Left out once, so a restarted supervisor read every
+            # host bought for one model as holding the whole rented set.
+            "models": list(host.models),
+            "profile": host.profile,
+            "builds": dict(host.builds),
+            "disk_gb": host.disk_gb,
             "offer": dataclasses.asdict(dataclasses.replace(host.offer, raw={})),
         }
 
@@ -1842,6 +1979,9 @@ class Fleet:
                 prepared=bool(ref.get("prepared")),
                 hold_until=ref.get("hold_until"),
                 models=tuple(ref.get("models") or ()),
+                profile=ref.get("profile"),
+                builds={str(k): str(v) for k, v in (ref.get("builds") or {}).items()},
+                disk_gb=ref.get("disk_gb"),
                 when_ready=ref.get("when_ready") or "join",
                 download_cost=float(ref.get("download_cost") or 0.0),
                 parked_at=ref.get("parked_at"),
@@ -2107,7 +2247,7 @@ class Fleet:
         except ProviderError as exc:
             log.warning("the price of %s could not be read: %s", host.offer.machine_id, exc)
             return None
-        return offer.priced_for(self.rented.disk_gb) if offer is not None else None
+        return offer.priced_for(host.disk_gb or self.rented.disk_gb) if offer is not None else None
 
     # --- acquire what is missing ---
 
@@ -2359,13 +2499,19 @@ class Fleet:
         not for a host (D55).
         """
         self.last_refusal = None
-        offers = await self._offers(kinds=kind or ("both" if offer_id else None))
+        # Which profile and models this machine is bought for, decided before the search: what
+        # it will hold sets the least card and disk worth looking at (D94, D111).
+        profile = self.profile_for_new_host()
+        for_this_host = self.models_for_new_host()
+        builds = self.builds_for_new_host()
+        policy = self.policy_for(for_this_host, builds)
+        offers = await self._offers(policy, kinds=kind or ("both" if offer_id else None))
         ranked, rejected = rank_offers(
             offers,
-            self._policy_with_avoided(self.rented.policy_in_force),
+            self._policy_with_avoided(policy),
             self.rented.bidding,
             lease.hours_left(),
-            self.model_set_gb(self.models_for_new_host()),
+            self.model_set_gb(for_this_host, builds),
             history=self.machine_history(),
             history_cfg=self.rented.history,
         )
@@ -2437,19 +2583,16 @@ class Fleet:
                 continue
 
             host_id = f"rented-{uuid.uuid4().hex[:6]}"
-            # Which models this machine is bought for, decided before the bid so the event that
-            # records the purchase can say what it was bought to serve (D94).
-            for_this_host = self.models_for_new_host()
             workers, workers_why = self.workers_for(offer)
             launch_workers = self.launch_workers_for(workers)
             spec = InstanceSpec(
                 label=f"{self.label_prefix}{host_id}",
                 image=image,
-                disk_gb=self.rented.disk_gb,
+                disk_gb=policy.min_disk_gb,
                 # Launched at what it may be asked for, used at what it is given (D68).
-                env=self.instance_env(launch_workers),
+                env=self.instance_env(launch_workers, for_this_host),
                 # Armed before anything else runs, and carrying no account credential.
-                onstart=self.deadman_onstart(),
+                onstart=self.deadman_onstart(for_this_host),
             )
             try:
                 # No price on an on-demand rental: the provider's listed rate is what is paid.
@@ -2498,6 +2641,9 @@ class Fleet:
                 launch_workers=launch_workers,
                 interruptible=offer.interruptible,
                 models=for_this_host,
+                profile=profile,
+                builds=builds,
+                disk_gb=policy.min_disk_gb,
                 engine=self.config.rented_engine(),
                 engine_port=self.engine_port,
             )

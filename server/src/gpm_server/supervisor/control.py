@@ -45,6 +45,7 @@ from ..hostcheck import test_connection
 from ..hubbuilds import HubUnavailable, valid_search
 from ..keys import verify
 from ..ledger import LeaseRefused
+from ..sizing import needs_for
 from . import agents
 from .service import Supervisor
 
@@ -249,6 +250,50 @@ def _with_builds(text: str, config: PoolConfig, name: str, builds: dict[str, str
         return set_values(text, (), {"catalog": {name: {"variants": variants}}})
 
 
+#: A model profile's name, as an operator would write it.
+_PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$")
+
+
+def _with_variants(text: str, config: PoolConfig, name: str, variants: list[dict[str, Any]]) -> str:
+    """`text` with each of `variants` in the catalog entry for `name`, **after** those already
+    there (D111): a profile names its build outright, and adding one must not move what any
+    other host resolves the model to. A build already listed is kept as it is."""
+    entry = config.catalog.get(name)
+    before = [v.model_dump(exclude_defaults=True) for v in entry.variants] if entry else []
+    if entry is not None:
+        current = [v | {"engine": v.get("engine") or config.engine} for v in before]
+    elif any(v["tag"] == name for v in variants):
+        current = []
+    else:
+        # Served under its own name by the pool's engine until now: that stays its first build.
+        current = [{"tag": name, "engine": config.engine}] if name in config.pool.model_set else []
+    tags = {v["tag"] for v in current}
+    for variant in variants:
+        if variant["tag"] not in tags:
+            current.append(variant)
+            tags.add(variant["tag"])
+    if entry is not None and current == before:
+        return text
+    if entry is not None:
+        return set_values(text, ("catalog", name), {"variants": current})
+    try:
+        return set_values(text, ("catalog",), {name: {"variants": current}})
+    except CannotEdit:
+        return set_values(text, (), {"catalog": {name: {"variants": current}}})
+
+
+def _host_can_serve(config: PoolConfig, host: Any, name: str, added: list[dict[str, Any]]) -> bool:
+    """Could this configured host serve `name`, with the builds being added for it?"""
+    engine = config.engine_of(host)
+    caps = set(host.capabilities)
+    entry = config.catalog.get(name)
+    listed = [v.model_dump() for v in entry.variants] if entry else []
+    return any(
+        set(v.get("requires") or []) <= caps and (not v.get("engine") or v.get("engine") == engine)
+        for v in listed + added
+    )
+
+
 def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
     admin_hashes = config.auth.admin_hashes()
     app_hashes = config.auth.app_hashes()
@@ -310,6 +355,34 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
     app.mount("/ui", StaticFiles(directory=str(static_dir), html=True), name="console")
 
     # --- reading ---
+
+    def _pinned(variants: Mapping[str, Sequence[Any]], builds: Mapping[str, str]) -> Mapping[str, Sequence[Any]]:
+        """Only the builds a profile named, on a host bought as one (D111)."""
+        if not builds:
+            return variants
+        return {
+            name: [v for v in group if v.tag == builds[name]] for name, group in variants.items() if name in builds
+        }
+
+    def _profiles_view() -> list[dict[str, Any]]:
+        """Every model profile, in the file's order: what it holds, each build's size where it
+        is known, and the least card and disk a machine holding it needs (D111)."""
+        rented = supervisor.config.rented
+        fleet = supervisor.fleet
+        if rented is None:
+            return []
+        view = []
+        for name, models in rented.model_profiles.items():
+            sizes = fleet.build_sizes(list(models), models) if fleet is not None else {}
+            needs = needs_for(sizes) if fleet is not None else None
+            view.append({
+                "name": name,
+                "rented": name in rented.rent_profiles,
+                "models": [{"model": model, "build": build, "size_gb": sizes.get(model)} for model, build in models.items()],
+                "needs": needs.as_dict() if needs else None,
+                "proxy": fleet.proxy_for(list(models)) if fleet is not None else None,
+            })
+        return view
 
     def served_on(
         variants: Mapping[str, Sequence[Any]], resident: frozenset[str], available: frozenset[str]
@@ -414,10 +487,13 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                         # on disk by definition, and the rest is not probed separately.
                         "residency": "pinned",
                         "served": served_on(
-                            rented_variants,
+                            _pinned(rented_variants, host.builds),
                             getattr(host, "resident", frozenset()),
                             getattr(host, "resident", frozenset()),
                         ),
+                        # The model profile it was bought as, and the builds that named (D111).
+                        "profile": host.profile,
+                        "builds": dict(host.builds),
                         # What this machine runs, and what it was bought to serve (D93, D94).
                         # Neither was visible anywhere, so a pool buying the wrong thing looked
                         # exactly like one buying the right thing.
@@ -478,6 +554,8 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                             # Which engine this build is for, or null for any (D93) — what the
                             # engine editor shows and fills in.
                             "engine": variant.engine,
+                            # What it downloads, where the file says — a profile's needs (D111).
+                            "size_gb": variant.size_gb,
                         }
                         for variant in entry.variants
                     ]
@@ -520,6 +598,9 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                         if supervisor.config.rented and supervisor.config.rented.models is not None
                         else None
                     ),
+                    # The model profiles, each with what a machine holding it needs (D111).
+                    "profiles": _profiles_view(),
+                    "rent_profiles": list(supervisor.config.rented.rent_profiles) if supervisor.config.rented else [],
                     "engine_start": supervisor.config.rented.engine_start if supervisor.config.rented else None,
                     "image": supervisor.config.rented.image if supervisor.config.rented else None,
                     "available": sorted(available_engines()),
@@ -783,21 +864,21 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         placement = body.get("placement")
         if rented_engine not in available_engines():
             return _error(400, "bad_engine", f"rented_engine must be one of {sorted(available_engines())}")
-        if placement not in ("all", "all_proxy", "declared"):
+        # Left out, the placement is left as it is — model profiles say what hosts hold (D111).
+        if placement is not None and placement not in ("all", "all_proxy", "declared"):
             return _error(400, "bad_placement", "placement must be 'all', 'all_proxy' or 'declared'")
         if config.rented is None:
             return _error(400, "cannot_rent", "this pool has no rented capacity to configure")
 
         text, version = store().read()
         try:
-            per_host = "declared" if placement == "declared" else "all"
-            text = set_values(text, ("pool",), {"models_per_host": per_host})
-
-            rented: dict[str, Any] = {
-                "engine": rented_engine,
-                "engine_proxy": placement == "all_proxy",
-                "models": list(body.get("rented_models") or []) if per_host == "declared" else None,
-            }
+            per_host = None
+            rented: dict[str, Any] = {"engine": rented_engine}
+            if placement is not None:
+                per_host = "declared" if placement == "declared" else "all"
+                text = set_values(text, ("pool",), {"models_per_host": per_host})
+                rented["engine_proxy"] = placement == "all_proxy"
+                rented["models"] = list(body.get("rented_models") or []) if per_host == "declared" else None
             if "engine_start" in body:
                 # Blank means "the engine's own start" (D97), which the file says as null.
                 rented["engine_start"] = (body["engine_start"] or "").strip() or None
@@ -825,15 +906,162 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 build = (builds.get(name) or "").strip()
                 text = _with_builds(text, config, name, {rented_engine: build} if build else {})
 
-            for host in config.hosts:
+            for host in config.hosts if per_host is not None else ():
                 if per_host == "declared" and host.models is None:
                     held = config.models_held_by(host)
                     text = set_in_list_item(text, "hosts", "id", host.id, {"models": held})
                 elif per_host == "all" and host.models is not None:
                     text = set_in_list_item(text, "hosts", "id", host.id, {"models": None})
+            # The model profiles, with the engine their builds are for (D111): switched apart,
+            # each half would be refused until the other was saved.
+            if "profiles" in body:
+                if placement is not None:
+                    return _error(400, "bad_request", "send `placement` or `profiles`, not both: profiles say what hosts hold")
+                text, refused = _write_profiles(text, body)
+                if refused is not None:
+                    return refused
         except CannotEdit as exc:
             return _error(409, "cannot_edit", str(exc))
         return _validate_plan_apply(text, version, body)
+
+    def _write_profiles(text: str, body: dict) -> tuple[str, Optional[JSONResponse]]:
+        """`text` with the model profiles in `body` written in, or why they cannot be (D111).
+
+        `profiles` is the whole set, {name: {model: build}}; `rent` the names rented as, in the
+        order the pool prefers them; `add` models and builds new to the pool, each
+        {name, builds: [{tag, engine, size_gb}]}, found by the operator's search.
+
+        Two things are done for the operator because getting them wrong is silent: a build is
+        added to the catalog *after* the ones already there, so what every other host resolves
+        to does not move; and where a configured host held the whole set and cannot serve a
+        model added here, the set is spread across hosts (`declared`) with each such host
+        keeping exactly what it held.
+        """
+        config = supervisor.config
+        profiles = body.get("profiles")
+        rent = body.get("rent")
+        if not isinstance(profiles, dict) or not isinstance(rent, list):
+            return text, _error(400, "bad_request", "send `profiles`: {name: {model: build}}, and `rent`: a list of their names")
+        if not rent:
+            return text, _error(400, "bad_request", "tick at least one profile for the pool to rent hosts as")
+        for name, models in profiles.items():
+            if not _PROFILE_NAME.match(str(name)):
+                return text, _error(400, "bad_profile", f"not a profile name: {name!r} — letters, digits, spaces, '.', '_' and '-'")
+            if not isinstance(models, dict) or not models:
+                return text, _error(400, "bad_profile", f"profile {name!r} holds no model")
+            for model, build in models.items():
+                if not _MODEL_NAME.match(str(model)) or not _MODEL_NAME.match(str(build or "")):
+                    return text, _error(400, "bad_profile", f"profile {name!r}: not a model and build: {model!r} → {build!r}")
+        unknown = [name for name in rent if name not in profiles]
+        if unknown:
+            return text, _error(400, "bad_profile", f"rent names profiles that are not sent: {unknown}")
+
+        installed = set(available_engines())
+        model_set = list(config.pool.model_set)
+        added: dict[str, list[dict[str, Any]]] = {}
+        for item in body.get("add") or []:
+            name = str((item or {}).get("name") or "").strip()
+            if not _MODEL_NAME.match(name):
+                return text, _error(400, "bad_model", f"not a model name: {name!r}")
+            for build in (item or {}).get("builds") or []:
+                tag, engine = str(build.get("tag") or "").strip(), str(build.get("engine") or "")
+                if not _MODEL_NAME.match(tag):
+                    return text, _error(400, "bad_build", f"not a build name: {tag!r}")
+                if engine not in installed:
+                    return text, _error(400, "bad_engine", f"no engine {engine!r}; installed: {sorted(installed)}")
+                size = build.get("size_gb")
+                variant: dict[str, Any] = {"tag": tag, "engine": engine}
+                if isinstance(size, (int, float)) and size > 0:
+                    variant["size_gb"] = round(float(size), 3)
+                added.setdefault(name, []).append(variant)
+            if name not in model_set:
+                model_set.append(name)
+        # Every model a profile holds is in the pool's set: a profile is how it gets served.
+        for models in profiles.values():
+            for model in models:
+                if model not in model_set:
+                    model_set.append(model)
+
+        for name, variants in added.items():
+            text = _with_variants(text, config, name, variants)
+        new_models = [name for name in model_set if name not in config.pool.model_set]
+        if new_models:
+            text = set_values(text, ("pool",), {"model_set": model_set})
+        # A configured host told to hold the whole set cannot hold a model built only for the
+        # rented engine; spread the set, and let it keep exactly what it held.
+        if config.pool.models_per_host == "all" and new_models:
+            cannot = [
+                host for host in config.hosts
+                if not host.disabled and any(
+                    not _host_can_serve(config, host, name, added.get(name, [])) for name in new_models
+                )
+            ]
+            if cannot:
+                text = set_values(text, ("pool",), {"models_per_host": "declared"})
+                for host in config.hosts:
+                    if host.models is None:
+                        text = set_in_list_item(text, "hosts", "id", host.id, {"models": list(config.pool.model_set)})
+        rented: dict[str, Any] = {
+            "model_profiles": {str(k): {str(m): str(b) for m, b in v.items()} for k, v in profiles.items()},
+            "rent_profiles": [str(name) for name in rent],
+        }
+        # One way to say what rented hosts hold (D111); the router in front of several engine
+        # processes follows each profile's size, not a switch for the whole pool.
+        if config.rented.models is not None:
+            rented["models"] = None
+        if config.rented.engine_proxy:
+            rented["engine_proxy"] = False
+        return set_values(text, ("rented",), rented), None
+
+    @app.put("/pool/config/profiles")
+    async def set_profiles(request: Request) -> JSONResponse:
+        """Write the model profiles and which of them the pool rents as, in one change (D111) —
+        written into the file in place, then validated, planned and confirmed like every other
+        change. The file's own rules decide what is allowed: a build the catalog does not list
+        for its model, or one rented hosts cannot run, is refused in words. The console saves
+        these with the engine, through `PATCH /pool/config/engine`, since a profile's builds
+        are one engine's."""
+        if store() is None:
+            return _error(400, "no_config_file", "this pool was not started from a file")
+        body = await request.json()
+        if supervisor.config.rented is None:
+            return _error(400, "cannot_rent", "this pool has no rented capacity to configure")
+        text, version = store().read()
+        try:
+            text, refused = _write_profiles(text, body)
+        except CannotEdit as exc:
+            return _error(409, "cannot_edit", str(exc))
+        if refused is not None:
+            return refused
+        return _validate_plan_apply(text, version, body)
+
+    @app.get("/pool/models/search")
+    async def search_models(q: str) -> JSONResponse:
+        """Find a model to put in a profile, by any part of its name (D111): the model hub,
+        asked live, and Ollama's library from the directory's cache. Read-only; the hub is asked
+        with no credential, at the directory's pace. The library is read only when the operator
+        asks (`POST /pool/directory/refresh`); this says whether it ever has been."""
+        term = (q or "").strip()
+        if not valid_search(term):
+            return _error(400, "bad_search", "search for a model's name: letters, digits, '.', '_', '-' and '/'")
+        library = await asyncio.to_thread(
+            read_directory, supervisor.db, term, tuple(supervisor.config.pool.model_set)
+        )
+        hub: list[dict[str, Any]] = []
+        hub_problem = None
+        try:
+            hub = await supervisor.directory.search_hub(term)
+        except HubUnavailable as exc:
+            hub_problem = str(exc)
+        return JSONResponse({
+            "query": term,
+            "hub": hub,
+            "hub_problem": hub_problem,
+            "library": library.get("models", []),
+            "library_read": bool(library.get("refreshed", {}).get("ollama")),
+            "library_refreshing": supervisor.directory.running,
+            "in_pool": list(supervisor.config.pool.model_set),
+        })
 
     @app.get("/pool/builds")
     async def builds_on_hub(model: str, engine: Optional[str] = None, search: Optional[str] = None,
@@ -889,6 +1117,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 if supervisor.config.rented and supervisor.config.rented.models is not None else None
             ),
             "engine_options": list(supervisor.config.rented.engine_options) if supervisor.config.rented else [],
+            "rent_profiles": list(supervisor.config.rented.rent_profiles) if supervisor.config.rented else [],
         })
 
     @app.post("/pool/directory/refresh")
