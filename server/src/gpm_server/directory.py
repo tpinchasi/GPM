@@ -404,6 +404,13 @@ class Directory:
         self.store.put(HUB, name, entry)
         return entry | {"looked_up_at": time.time(), "cached": False}
 
+    async def search_hub(self, term: str) -> list[dict[str, Any]]:
+        """Models on the hub whose name holds `term` (D111), at the directory's pace. Not cached:
+        a search is an operator looking, and the builds of whatever they choose are."""
+        async with self._client(hubbuilds.hub_url()) as client:
+            found = await hubbuilds.search_models(term, client=client, pace=self._paced)
+        return [asdict(model) for model in found]
+
     def hub_names(self) -> list[str]:
         """What a refresh looks up on the hub, by the operator's choice."""
         settings = self._settings()

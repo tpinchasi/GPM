@@ -25,7 +25,7 @@ pytestmark = pytest.mark.skipif(a_browser() is None, reason="no browser here")
 #: Each tab, and the section headings that belong on it — and only on it.
 TABS = {
     "hosts": ["Provider", "Now", "Prepare a host", "Rented and parked hosts"],
-    "engine": ["Engine", "Engine and placement on rented hosts"],
+    "engine": ["Engine", "Engine and models on rented hosts"],
     "finding": ["What the pool looks for", "Live market — the real offer pipeline, read-only"],
     "scaling": ["Limits", "How capacity is decided"],
     "teardown": ["When a host is given up"],

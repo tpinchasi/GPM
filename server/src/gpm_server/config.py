@@ -687,6 +687,45 @@ class RentedConfig(BaseModel):
     #: can rent only for the models that justify the price and serve the rest from machines it
     #: already has. Absent there means rented hosts may hold any model the pool still needs.
     models: Optional[list[str]] = None
+    #: Named sets of models, each with the build a rented host fetches for it (D111) — what one
+    #: machine holds. A profile of one model is a host per model; a profile of several puts
+    #: them all on one machine, each in its own process behind the machine's router where the
+    #: engine serves one model per process (D96). The same model may have a different build in
+    #: different profiles: a card that computes in FP4 wants one, an older card another.
+    model_profiles: dict[str, dict[str, str]] = Field(default_factory=dict)
+    #: The profiles the pool may rent hosts **as**. Each machine is bought as exactly one of
+    #: them — a profile holding a model no host serves first, then the one whose models'
+    #: requests are waiting most, then the one with the fewest hosts (D94, D95 over profiles).
+    #: Empty means the pool rents the way it did before profiles: `rented.models` and
+    #: `pool.models_per_host` decide. Replaces `rented.models`, so naming both is refused.
+    rent_profiles: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _profiles_are_whole(self) -> "RentedConfig":
+        """A profile rented but not defined, or defined with nothing in it, would buy machines
+        prepared for nothing — refused here rather than found on a bill."""
+        for name, models in self.model_profiles.items():
+            if not models:
+                raise ValueError(f"rented.model_profiles.{name} holds no model: name at least one, with its build")
+            for model, build in models.items():
+                if not str(build or "").strip():
+                    raise ValueError(f"rented.model_profiles.{name} names {model!r} with no build")
+        unknown = [name for name in self.rent_profiles if name not in self.model_profiles]
+        if unknown:
+            known = ", ".join(sorted(self.model_profiles)) or "none are defined"
+            raise ValueError(f"rent_profiles names {unknown}, which are not among the model_profiles ({known})")
+        if len(set(self.rent_profiles)) != len(self.rent_profiles):
+            raise ValueError("rent_profiles names a profile twice")
+        if self.rent_profiles and self.models is not None:
+            raise ValueError(
+                "rented.models and rented.rent_profiles both say what rented hosts hold; keep "
+                "rent_profiles and remove models (D111)"
+            )
+        return self
+
+    def profiles_rented(self) -> dict[str, dict[str, str]]:
+        """The profiles the pool may rent as, in the operator's order: {name: {model: build}}."""
+        return {name: dict(self.model_profiles[name]) for name in self.rent_profiles}
 
     #: Settings that were a second number for something the search already names (D108), and
     #: where each went. Refused by name rather than as an unknown key, so the file says how to
@@ -953,6 +992,13 @@ class PoolConfig(BaseModel):
                     f"host {host.id!r} is asked to hold {sorted(cannot)}, but its capabilities "
                     f"{sorted(set(host.capabilities))} meet no variant's requirements for them"
                 )
+        if self.rented is not None:
+            for profile, models in self.rented.model_profiles.items():
+                unknown = set(models) - known
+                if unknown:
+                    raise ValueError(
+                        f"model profile {profile!r} names models that are not in the pool's set: {sorted(unknown)}"
+                    )
         if self.rented is not None and self.rented.models is not None:
             if not spread:
                 raise ValueError(
@@ -971,20 +1017,21 @@ class PoolConfig(BaseModel):
         is what decides whether renting happens at all, but a configuration that could never
         cover a model however many hosts it bought is wrong on its face.
         """
-        if self.pool.models_per_host != "declared":
+        profiles = self.rented is not None and bool(self.rented.rent_profiles)
+        if self.pool.models_per_host != "declared" and not profiles:
             return
         covered: set[str] = set()
         for host in self.hosts:
             if not host.disabled:
                 covered.update(self.models_held_by(host))
         if self.rented is not None:
-            covered.update(self.rented.models if self.rented.models is not None else self.pool.model_set)
+            covered.update(self._rented_models())
         missing = [name for name in self.pool.model_set if name not in covered]
         if missing:
             raise ValueError(
-                f"with pool.models_per_host 'declared', the pool's hosts must between them hold every "
-                f"model in its set, and {missing} would be held by none. Name them on a host's "
-                f"`models`, add a host that holds them, or let rented hosts hold them."
+                f"the pool's hosts must between them hold every model in its set, and {missing} "
+                f"would be held by none. Name them on a host's `models`, add a host that holds "
+                f"them, or put them in a model profile the pool rents."
             )
 
     def _engine_can_hold_what_the_pool_asks(self) -> None:
@@ -1022,7 +1069,10 @@ class PoolConfig(BaseModel):
 
         # Rented hosts differ from configured ones: with the set spread across hosts,
         # `rented.models` is the set the pool may rent **for**, and each host it buys is given
-        # one of them (D94). Only `all` asks a single rented machine for the lot.
+        # one of them (D94). Only `all` asks a single rented machine for the lot. A profile of
+        # several models always runs the machine's router where the engine needs one (D111).
+        if self.rented is not None and self.rented.rent_profiles:
+            return
         if self.rented is not None and self.pool.models_per_host == "all":
             asked = list(self.pool.model_set)
             engine = self.rented_engine()
@@ -1049,6 +1099,26 @@ class PoolConfig(BaseModel):
             return
         engine = self.rented_engine()
         caps = set(self.rented.capabilities)
+        # A profile names its build outright: it must be one the catalog lists for that model,
+        # and one the rented engine can serve — only catalogued builds are ever resolved.
+        for profile, models in self.rented.model_profiles.items():
+            for name, build in models.items():
+                entry = self.catalog.get(name)
+                variants = entry.variants if entry else [Variant(tag=name)]
+                match = next((v for v in variants if v.tag == build), None)
+                if match is None:
+                    raise ValueError(
+                        f"model profile {profile!r} holds {name!r} as {build!r}, which the catalog "
+                        f"does not list for it. Add it as a variant of {name!r}, or choose one listed."
+                    )
+                if not (set(match.requires) <= caps and (match.engine is None or match.engine == engine)):
+                    raise ValueError(
+                        f"model profile {profile!r} holds {name!r} as {build!r}, which rented hosts "
+                        f"cannot serve: they run {engine!r} with capabilities {sorted(caps)}, and "
+                        f"that build is for {match.engine or 'any engine'} requiring {sorted(match.requires)}."
+                    )
+        if self.rented.rent_profiles:
+            return
         missing = []
         for name in self._rented_models():
             entry = self.catalog.get(name)
@@ -1069,6 +1139,8 @@ class PoolConfig(BaseModel):
     def _rented_models(self) -> list[str]:
         """What a rented host is asked to hold: the pool's whole set, or what `rented.models`
         names where the set is spread across hosts."""
+        if self.rented is not None and self.rented.rent_profiles:
+            return rented_profile_models(self.rented)
         if self.pool.models_per_host == "all" or self.rented is None or self.rented.models is None:
             return list(self.pool.model_set)
         return list(self.rented.models)
@@ -1232,6 +1304,11 @@ class PoolConfig(BaseModel):
                     f"capabilities {sorted(caps)} meet no variant's requirements. Give it the "
                     f"capability, add a fallback variant with no requirements, or remove the host."
                 )
+
+
+def rented_profile_models(rented: "RentedConfig") -> list[str]:
+    """Every model some profile the pool rents holds, in the operator's order, each once."""
+    return list(dict.fromkeys(model for models in rented.profiles_rented().values() for model in models))
 
 
 def load_config(path: str | Path) -> PoolConfig:

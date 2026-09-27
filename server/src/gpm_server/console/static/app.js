@@ -60,6 +60,7 @@ const api = {
   hostDetail: (id) => call("GET", `/pool/hosts/${encodeURIComponent(id)}`),
   setSearch: (body) => call("PATCH", "/pool/config/rented", body),
   setEngine: (body) => call("PATCH", "/pool/config/engine", body),
+  searchModels: (q) => call("GET", `/pool/models/search?${new URLSearchParams({ q })}`),
   builds: (model, engine, { fresh = false, search } = {}) => call("GET", `/pool/builds?${new URLSearchParams({
     model, engine, ...(fresh ? { fresh: "true" } : {}), ...(search ? { search } : {}) })}`),
   directory: () => call("GET", "/pool/directory"),
@@ -855,7 +856,8 @@ function configRow(key, label, made, why) {
 // the pool assigned models holds the whole rented set, and says so rather than showing nothing.
 function boughtFor(host) {
   const models = host.bought_for || [];
-  const engine = host.engine ? el("div", { class: "muted mono" }, host.engine) : null;
+  const engine = el("div", { class: "muted mono" }, host.engine || "",
+    host.profile ? el("span", {}, ` · profile ${host.profile}`) : null);
   if (!models.length) {
     return el("div", {}, el("span", { class: "muted" }, "the whole rented set"), engine);
   }
@@ -901,27 +903,18 @@ const VLLM_IMAGE_SUGGESTIONS = [
   { image: "vastai/vllm:v0.29.0-cuda-12.9", min_driver: "550", note: "for older drivers" },
 ];
 
-const PLACEMENTS = [
-  ["all", "every host holds every model — one engine process",
-   (engine) => engine === "vllm" ? "vLLM serves one model per process; choose one of the other two" : null],
-  ["all_proxy", "every host holds every model — one vLLM per model, behind a router on the machine",
-   (engine) => engine !== "vllm" ? "only for vLLM; Ollama already holds several models in one process" : null],
-  ["declared", "one model per host — a pool of hosts for each model", () => null],
-];
-
 function engineDraft(status) {
   const e = status.engine || {};
   const rented = e.rented || e.name || "ollama";
-  const placement = e.models_per_host === "declared" ? "declared" : (e.proxy ? "all_proxy" : "all");
-  const builds = {};
-  for (const name of status.model_set || []) {
-    const hit = ((status.catalog || {})[name] || []).find((v) => v.engine === rented);
-    builds[name] = hit ? hit.tag : "";
-  }
   const images = (e.images || []).filter((i) => i.min_driver);
+  const made = profilesFromStatus(status, rented);
   return {
-    rented, placement, builds,
-    rented_models: e.rented_models || [],
+    rented,
+    profiles: made.profiles,
+    migrated: made.migrated,
+    // Models and builds found by searching, new to the pool's file: {model: [{tag, engine, size_gb}]}.
+    adds: {},
+    editing: null,
     images: images.length ? images.map((i) => ({ ...i })) : null,
     image: e.image || "",
     engine_start: e.engine_start || "",
@@ -937,23 +930,16 @@ function engineSection(status) {
     box.replaceChildren(...engineRows(status, box, draw));
   };
   draw();
-  return [el("h2", {}, "Engine and placement on rented hosts"), box];
+  return [el("h2", {}, "Engine and models on rented hosts"), box];
 }
 
 function engineRows(status, box, draw) {
   const d = engineEdit.draft;
   const available = (status.engine.available || ["ollama"]);
   const vllm = d.rented === "vllm";
-  const invalid = Object.fromEntries(PLACEMENTS.map(([v, , why]) => [v, why(d.rented)]));
-  // When the engine rules out the current placement, land on a model to a host: each engine
-  // then has the whole card, which is where a batching engine's throughput comes from.
-  if (invalid[d.placement]) d.placement = !invalid.declared ? "declared" : PLACEMENTS.find(([v]) => !invalid[v])[0];
 
   const engineSelect = el("select", { onchange: (ev) => {
     d.rented = ev.target.value;
-    // Offer what the chosen engine needs, starting from what the pool already has for it.
-    const fresh = engineDraft({ ...status, engine: { ...status.engine, rented: d.rented } });
-    d.builds = fresh.builds;
     // Only the options the chosen engine offers survive the switch; the file refuses the rest.
     const offered = ((status.engine.offers || {})[d.rented] || {}).options || {};
     d.engine_options = d.engine_options.filter((o) => o in offered);
@@ -961,65 +947,26 @@ function engineRows(status, box, draw) {
       d.images = d.images || VLLM_IMAGE_SUGGESTIONS.map((i) => ({ ...i }));
       if (/ollama/i.test(d.engine_start)) d.engine_start = "";
     }
+    // A profile's builds are one engine's: offer the catalog's build for the new one, or ask.
+    for (const profile of d.profiles) {
+      for (const held of profile.models) {
+        const build = catalogBuild(status, d, held.model, d.rented);
+        held.build = build ? build.tag : "";
+        held.size_gb = build ? build.size_gb : null;
+      }
+    }
+    modelPicker.results = null;
     draw();
   } }, ...available.map((name) => el("option", { value: name, ...(d.rented === name ? { selected: true } : {}) }, name)));
-
-  const placementSelect = el("select", { onchange: (ev) => { d.placement = ev.target.value; draw(); } },
-    ...PLACEMENTS.map(([value, label]) => el("option", {
-      value, ...(d.placement === value ? { selected: true } : {}), ...(invalid[value] ? { disabled: true } : {}),
-    }, invalid[value] ? `${label} (${invalid[value]})` : label)));
 
   const rows = [
     stackedRow("engine", "rented engine", { control: engineSelect },
       "what the machines this pool buys run; hosts you configured keep their own"),
-    stackedRow("placement", "placement", { control: placementSelect },
-      d.placement === "all_proxy" ? "each machine's memory is split between the models, so the largest gets less cache than it would alone"
-        : d.placement === "declared" ? "the pool buys a machine for whichever model is short, and never takes the last one serving a model"
-        : "any ready host serves any request"),
+    stackedRow("model_profiles", "model profiles", { control: profilesControl(status, d, draw) },
+      "each machine the pool rents is bought as one ticked profile — one holding a model no host serves yet first, then the one whose requests are waiting most"),
   ];
 
-  if (d.placement === "declared") {
-    const boxes = (status.model_set || []).map((name) => {
-      const input = el("input", { type: "checkbox", ...(d.rented_models.includes(name) ? { checked: true } : {}),
-        onchange: (ev) => {
-          d.rented_models = ev.target.checked ? [...d.rented_models, name] : d.rented_models.filter((m) => m !== name);
-          draw();  // a model now rented for needs its build asked for, one no longer does not
-        } });
-      return el("label", { class: "row" }, input, el("span", { class: "mono" }, name));
-    });
-    rows.push(stackedRow("rented_models", "rent hosts for", { control: el("div", {}, ...boxes) },
-      "models your configured hosts hold need not be rented for; a model nobody holds is refused on save"));
-  }
-
   const offer = (status.engine.offers || {})[d.rented] || { builds_on_hub: false, options: {} };
-  const renting = d.placement === "declared" ? d.rented_models : (status.model_set || []);
-  for (const name of status.model_set || []) {
-    if (d.placement === "declared" && !renting.includes(name)) continue;
-    const typed = el("input", { type: "text", style: "width:22rem", value: d.builds[name] || "",
-      placeholder: offer.builds_on_hub ? "owner/name of the model on the hub" : "the engine's tag for this model",
-      oninput: (ev) => { d.builds[name] = ev.target.value; } });
-    if (!offer.builds_on_hub) {
-      rows.push(stackedRow(`build ${name}`, `${d.rented} build of ${name}`, { control: typed },
-        "blank keeps what the catalog already has"));
-      continue;
-    }
-    // The engine's builds are hub repositories: offer them, sorted, rather than a box to type
-    // one into (D100). Looked up once and cached by the pool; typing stays for a private build.
-    const found = hubBuilds[`${d.rented}|${name}`];
-    if (!found) loadBuilds(name, d.rented).then(draw);
-    const control = el("div", {},
-      el("div", { class: "row", style: "margin-top:0" },
-        el("span", { class: "mono" }, d.builds[name] || el("span", { class: "muted" }, "none chosen")),
-        el("button", { class: "small", onclick: () => loadBuilds(name, d.rented, { fresh: true }).then(draw) },
-          "Look again on the hub"),
-        found?.loading ? el("span", { class: "muted" }, "looking on the hub…") : null,
-        found?.error ? el("span", { class: "error" }, found.error) : null),
-      found?.data ? buildTable(found.data, d.builds[name], (repo) => { d.builds[name] = repo; draw(); }, `engine-${name}`) : null,
-      el("details", {}, el("summary", { class: "muted" }, "or name a repository yourself"), typed));
-    rows.push(stackedRow(`build ${name}`, `${d.rented} build of ${name}`, { control },
-      "the repository its hosts fetch — the same model, in a precision the cards you rent can run"));
-  }
-
   if (vllm) {
     const list = el("div", {}, ...(d.images || []).map((img, i) => el("div", { class: "row" },
       el("input", { type: "text", style: "width:18rem", value: img.image,
@@ -1056,10 +1003,356 @@ function engineRows(status, box, draw) {
     el("table", {}, el("tbody", {}, ...rows)),
     el("div", { class: "row" },
       el("button", { class: "primary", onclick: (ev) => saveEngine(ev, note) }, "Save to configuration"),
-      el("button", { class: "small", onclick: () => { engineEdit.draft = engineDraft(status); engineEdit.message = ""; draw(); } }, "Reset"),
+      el("button", { class: "small", onclick: () => {
+        engineEdit.draft = engineDraft(status); engineEdit.message = ""; modelPicker.results = null; draw();
+      } }, "Reset"),
       note),
     el("p", { class: "muted" }, "Saved as one change to the file, with its comments kept. Hosts already running keep what they were started with; new ones use this."),
   ];
+}
+
+// --- model profiles (D111) ---
+
+// What a machine holding these builds needs, per card and on disk: the server's rule
+// (gpm_server/sizing.py), which is the launcher's own. Shown while editing; the Finding machines
+// tab shows the number the search actually used.
+const SIZING = { weightOverhead: 1.10, cacheReserveGb: 3 * 1024 ** 3 / 1e9, share: 0.90, diskOverhead: 1.10, diskHeadroomGb: 10 };
+
+function needsFor(models) {
+  const known = models.filter((m) => m.size_gb);
+  const unknown = models.filter((m) => !m.size_gb).map((m) => m.model);
+  if (!known.length) return { card: 0, disk: 0, weights: 0, unknown };
+  const weights = known.reduce((sum, m) => sum + Number(m.size_gb), 0);
+  return {
+    card: Math.ceil((weights * SIZING.weightOverhead + SIZING.cacheReserveGb * known.length) / SIZING.share),
+    disk: Math.ceil(weights * SIZING.diskOverhead + SIZING.diskHeadroomGb),
+    weights: Math.round(weights * 10) / 10,
+    unknown,
+  };
+}
+
+function needsLine(models) {
+  const needs = needsFor(models);
+  if (!models.length) return el("span", { class: "muted" }, "holds nothing yet");
+  return el("span", {},
+    needs.weights ? el("span", {}, `needs a card of ≥ ${needs.card} GB and ≥ ${needs.disk} GB of disk`,
+      el("span", { class: "muted" }, ` (${needs.weights} GB of weights)`)) : null,
+    needs.unknown.length ? el("span", { class: "muted" },
+      `${needs.weights ? " · " : ""}size not measured for ${needs.unknown.join(", ")} — not counted; choose its build from the hub to measure it`) : null);
+}
+
+// The build of `model` the catalog lists for `engine`, first first — with any found by search.
+function catalogBuild(status, d, model, engine) {
+  const listed = [...((status.catalog || {})[model] || []), ...(d.adds[model] || [])];
+  return listed.find((v) => v.engine === engine) || listed.find((v) => v.engine == null && engine === status.engine.name)
+    || (!listed.length && engine === status.engine.name ? { tag: model, size_gb: null } : null);
+}
+
+const profileName = (model) => model.replace(/[^A-Za-z0-9 ._-]+/g, "-").slice(0, 40);
+
+// The profiles in the file, or — before a pool has any — the placement in force written as
+// profiles, so that saving without touching them changes only the words, not what is rented.
+function profilesFromStatus(status, rented) {
+  const e = status.engine || {};
+  const sizeOf = (model, tag) => (((status.catalog || {})[model] || []).find((v) => v.tag === tag) || {}).size_gb ?? null;
+  if ((e.profiles || []).length) {
+    return {
+      migrated: false,
+      profiles: e.profiles.map((p) => ({
+        name: p.name, rented: p.rented, several: p.models.length > 1,
+        models: p.models.map((m) => ({ model: m.model, build: m.build, size_gb: m.size_gb ?? sizeOf(m.model, m.build) })),
+      })),
+    };
+  }
+  const entry = (model) => {
+    const listed = (status.catalog || {})[model] || [];
+    const build = listed.find((v) => v.engine === rented) || listed.find((v) => v.engine == null)
+      || (!listed.length ? { tag: model } : null);
+    return { model, build: build ? build.tag : "", size_gb: build ? sizeOf(model, build.tag) : null };
+  };
+  const set = status.model_set || [];
+  if (e.models_per_host === "declared") {
+    const renting = e.rented_models || set;
+    return { migrated: true, profiles: renting.map((m) => ({ name: profileName(m), rented: true, several: false, models: [entry(m)] })) };
+  }
+  return { migrated: true, profiles: [{ name: "every model", rented: true, several: set.length > 1, models: set.map(entry) }] };
+}
+
+function profilesControl(status, d, draw) {
+  const cards = d.profiles.map((profile, i) => {
+    const editing = d.editing === i;
+    const rent = el("input", { type: "checkbox", ...(profile.rented ? { checked: true } : {}),
+      onchange: (ev) => { profile.rented = ev.target.checked; draw(); } });
+    const head = el("div", { class: "row", style: "margin-top:0" },
+      el("label", { class: "pick" }, rent, el("span", {}, "rent as ")),
+      el("strong", {}, profile.name || el("span", { class: "muted" }, "unnamed")),
+      pill(profile.several ? `${profile.models.length} models on one machine` : "one model per machine"),
+      needsLine(profile.models),
+      el("span", { style: "margin-left:auto" }),
+      editing ? null : el("button", { class: "small", onclick: () => { d.editing = i; modelPicker.reset(); draw(); } }, "Edit"),
+      el("button", { class: "small danger", onclick: () => {
+        d.profiles.splice(i, 1);
+        if (d.editing === i) d.editing = null; else if (d.editing > i) d.editing -= 1;
+        draw();
+      } }, "Remove"));
+    const held = el("div", {}, ...profile.models.map((m) => el("div", { class: "mono" },
+      m.model, el("span", { class: "muted" }, " → "),
+      m.build || el("span", { class: "error" }, `no ${d.rented} build chosen`),
+      m.size_gb ? el("span", { class: "muted" }, `  ${m.size_gb} GB`) : null)));
+    return el("div", { class: "profile" + (editing ? " editing" : "") }, head,
+      editing ? profileEditor(status, d, profile, draw) : held);
+  });
+  return el("div", {},
+    d.migrated ? el("p", { class: "muted", style: "margin-top:0" },
+      "This pool has no profiles yet: these are what it rents today, written as profiles. Saving keeps renting the same until you change them.") : null,
+    ...cards,
+    el("div", { class: "row" },
+      el("button", { class: "small", onclick: () => {
+        d.profiles.push({ name: `profile ${d.profiles.length + 1}`, rented: true, several: false, models: [] });
+        d.editing = d.profiles.length - 1;
+        modelPicker.reset();
+        draw();
+      } }, "New profile"),
+      d.profiles.some((p) => p.rented) ? null : el("span", { class: "error" }, "tick at least one profile to rent as")));
+}
+
+function profileEditor(status, d, profile, draw) {
+  const hubEngine = !!(((status.engine.offers || {})[d.rented] || {}).builds_on_hub);
+  const shape = (several, label) => el("label", { class: "pick" },
+    el("input", { type: "radio", name: "profile-shape", ...(profile.several === several ? { checked: true } : {}),
+      onchange: () => {
+        profile.several = several;
+        // One model per machine holds exactly one: the first stays, and the screen says so.
+        if (!several && profile.models.length > 1) profile.models = profile.models.slice(0, 1);
+        draw();
+      } }), el("span", {}, label));
+  const held = profile.models.map((m, at) => el("tr", {},
+    el("td", { class: "mono" }, m.model),
+    el("td", { class: "mono" }, m.build || el("span", { class: "error" }, "choose a build")),
+    el("td", { class: "num" }, m.size_gb ? `${m.size_gb} GB` : "—"),
+    el("td", {},
+      hubEngine ? el("button", { class: "small", onclick: () => { modelPicker.choose({ model: m.model }, d.rented); draw(); } }, "Change build") : null,
+      el("button", { class: "small", onclick: () => { profile.models.splice(at, 1); draw(); } }, "Remove"))));
+  return el("div", { class: "profile-editor" },
+    el("div", { class: "row" },
+      el("span", {}, "name"),
+      el("input", { type: "text", style: "width:14rem", value: profile.name, maxlength: "40",
+        oninput: (ev) => { profile.name = ev.target.value; } }),
+      el("span", { class: "muted", style: "margin-left:12px" }, "a machine holds"),
+      shape(false, "one model"),
+      shape(true, "several models")),
+    profile.several && d.rented === "vllm" && profile.models.length > 1
+      ? el("p", { class: "muted" }, "vLLM runs one process per model behind the machine's router, and splits the card's memory between them.") : null,
+    profile.models.length ? el("table", { class: "builds" },
+      el("thead", {}, el("tr", {}, ...["Model", `${d.rented} build`, "Size", ""].map((h) => el("th", {}, h)))),
+      el("tbody", {}, ...held)) : null,
+    el("div", { class: "row" }, needsLine(profile.models)),
+    el("h3", { class: "picker-title" }, profile.several || !profile.models.length ? "Add a model" : "Replace the model"),
+    modelPickerView(status, d, profile, draw),
+    el("div", { class: "row" },
+      el("button", { class: "small", onclick: () => { d.editing = null; modelPicker.reset(); draw(); } }, "Done")));
+}
+
+// Finding a model to hold (D111): the pool's own, or anything on the hub or in Ollama's library,
+// narrowed by size, precision and kind. Kept across redraws, like the directory's view.
+const modelPicker = {
+  query: "", loading: false, error: null, results: null, chosen: null, logical: "",
+  filters: { minParams: "", maxParams: "", maxSize: "", precision: "", kind: "", fitsCard: "", hideGated: true },
+  reset() { this.chosen = null; this.logical = ""; this.error = null; },
+  // A model to pick a build of: {model} already in the pool, {repo} from the hub, {tag} from the library.
+  choose(pick, engine) {
+    this.chosen = pick;
+    this.logical = pick.model || (pick.repo ? pick.repo.split("/").pop().toLowerCase() : pick.tag?.name || "");
+    this.engine = engine;
+  },
+};
+
+const paramsOf = (label) => {
+  const m = /(\d+(?:\.\d+)?)\s*([mb])$/i.exec(String(label || ""));
+  return m ? Number(m[1]) / (m[2].toLowerCase() === "m" ? 1000 : 1) : null;
+};
+
+function passesFilters(item) {
+  const f = modelPicker.filters;
+  const num = (v) => (v === "" || v === null || v === undefined ? null : Number(v));
+  const [lo, hi, max, card] = [num(f.minParams), num(f.maxParams), num(f.maxSize), num(f.fitsCard)];
+  if (lo !== null && (item.params === null || item.params < lo)) return false;
+  if (hi !== null && (item.params === null || item.params > hi)) return false;
+  if (max !== null && (item.size === null || item.size > max)) return false;
+  if (card !== null && (item.size === null || needsFor([{ model: "x", size_gb: item.size }]).card > card)) return false;
+  if (f.precision && item.precision !== f.precision) return false;
+  if (f.kind && !(item.kinds || []).includes(f.kind)) return false;
+  if (f.hideGated && item.gated) return false;
+  return true;
+}
+
+async function runSearch(draw) {
+  const v = modelPicker;
+  if (!v.query.trim()) return;
+  v.loading = true; v.error = null; draw();
+  try {
+    v.results = await api.searchModels(v.query.trim());
+  } catch (error) {
+    v.error = error.message;
+  } finally {
+    v.loading = false;
+    draw();
+  }
+}
+
+function modelPickerView(status, d, profile, draw) {
+  const v = modelPicker;
+  if (v.chosen) return buildChoiceView(status, d, profile, draw);
+  const hubEngine = !!(((status.engine.offers || {})[d.rented] || {}).builds_on_hub);
+  const f = v.filters;
+  const input = (key, placeholder, width = "5rem") => el("input", { type: "number", step: "any", min: "0", style: `width:${width}`,
+    placeholder, value: f[key], oninput: (ev) => { f[key] = ev.target.value; drawResults(); } });
+  const select = (key, options) => el("select", { onchange: (ev) => { f[key] = ev.target.value; drawResults(); } },
+    ...options.map(([value, label]) => el("option", { value, ...(f[key] === value ? { selected: true } : {}) }, label)));
+  const search = el("input", { type: "search", style: "width:20rem", value: v.query,
+    placeholder: "any model: qwen3 30b, gemma, embed…",
+    oninput: (ev) => { v.query = ev.target.value; },
+    onkeydown: (ev) => { if (ev.key === "Enter") runSearch(draw); } });
+  const resultsBox = el("div", {});
+  const drawResults = () => resultsBox.replaceChildren(...searchResults(status, d, profile, draw, hubEngine));
+
+  const inPool = [...(status.model_set || []), ...Object.keys(d.adds).filter((m) => !(status.model_set || []).includes(m))]
+    .filter((m) => !profile.models.some((held) => held.model === m));
+  const view = el("div", {},
+    inPool.length ? el("div", { class: "row" }, el("span", { class: "muted" }, "in the pool:"),
+      ...inPool.map((m) => el("button", { class: "small mono", onclick: () => {
+        if (hubEngine) { v.choose({ model: m }, d.rented); draw(); return; }
+        const build = catalogBuild(status, d, m, d.rented);
+        holdModel(d, profile, m, build ? build.tag : m, build ? build.size_gb : null, false);
+        draw();
+      } }, m))) : null,
+    el("div", { class: "row" }, search,
+      el("button", { class: "primary small", onclick: () => runSearch(draw) }, v.loading ? "Searching…" : "Search"),
+      el("span", { class: "muted" }, hubEngine ? "the model hub, live, and Ollama's library" : "Ollama's library")),
+    el("div", { class: "row filters" },
+      el("span", { class: "muted" }, "parameters"), input("minParams", "min B"), el("span", {}, "–"), input("maxParams", "max B"),
+      el("span", { class: "muted" }, "download ≤"), input("maxSize", "GB"),
+      el("span", { class: "muted" }, "fits a card of"), input("fitsCard", "GB"),
+      hubEngine ? select("precision", [["", "any precision"], ["BF16", "BF16"], ["FP16", "FP16"], ["FP8", "FP8"], ["NVFP4", "NVFP4"], ["MXFP4", "MXFP4"], ["INT4", "INT4"], ["INT8", "INT8"]]) : null,
+      select("kind", [["", "any kind"], ["chat", "chat"], ["vision", "vision"], ["embedding", "embedding"], ["tools", "tools"], ["thinking", "thinking"]]),
+      hubEngine ? el("label", { class: "pick" }, el("input", { type: "checkbox", ...(f.hideGated ? { checked: true } : {}),
+        onchange: (ev) => { f.hideGated = ev.target.checked; drawResults(); } }), el("span", {}, "hide gated")) : null),
+    v.error ? el("p", { class: "error" }, v.error) : null,
+    resultsBox);
+  drawResults();
+  return view;
+}
+
+function searchResults(status, d, profile, draw, hubEngine) {
+  const v = modelPicker;
+  if (!v.results) return [el("p", { class: "muted" }, "Search by any part of a name. Filters apply as you type.")];
+  const out = [];
+  if (hubEngine) {
+    const hub = (v.results.hub || []).map((m) => ({ ...m, params: m.params_b, size: m.size_gb, kinds: [m.task].filter(Boolean) }));
+    const shown = hub.filter(passesFilters);
+    out.push(el("h4", {}, `On the model hub — ${shown.length} of ${hub.length}`));
+    if (v.results.hub_problem) out.push(el("p", { class: "error" }, v.results.hub_problem));
+    if (shown.length) {
+      out.push(el("table", { class: "builds" },
+        el("thead", {}, el("tr", {}, ...["Model", "Params", "Precision", "Download", "Kind", "Downloads", ""].map((h) => el("th", {}, h)))),
+        el("tbody", {}, ...shown.map((m) => el("tr", {},
+          el("td", {}, el("span", { class: "mono" }, m.repo), m.made_from ? el("div", { class: "muted" }, m.made_from) : null,
+            m.gated ? el("div", { class: "error" }, "gated: a rented host cannot fetch it") : null),
+          el("td", { class: "num" }, m.params_b ? `${m.params_b} B` : "—"),
+          el("td", {}, m.precision || "?"),
+          el("td", { class: "num" }, m.size_gb ? `≈${m.size_gb} GB` : "—"),
+          el("td", {}, m.task || "—"),
+          el("td", { class: "num" }, (m.downloads || 0).toLocaleString()),
+          el("td", {}, el("button", { class: "small", onclick: () => { v.choose({ repo: m.repo }, d.rented); draw(); } }, "Choose")))))));
+    }
+  }
+  const library = [];
+  for (const model of v.results.library || []) {
+    for (const t of model.tags || []) {
+      if (t.runtime === "cloud" || t.runtime === "mlx") continue;  // rented hosts run neither
+      library.push({ model, tag: t, params: paramsOf(t.name.split(":")[1]) ?? null, size: t.size_gb ?? null,
+        kinds: model.capabilities || [], precision: null });
+    }
+  }
+  const shownLib = library.filter(passesFilters).slice(0, 60);
+  out.push(el("h4", {}, `In Ollama's library — ${shownLib.length} of ${library.length}`,
+    v.results.library_refreshing ? el("span", { class: "muted" }, " · reading the library now; search again in a minute")
+      : !v.results.library_read ? el("span", {}, " · never read here ",
+        el("button", { class: "small", onclick: async (ev) => {
+          ev.target.disabled = true;
+          try { await api.refreshDirectory(); v.results.library_refreshing = true; } catch (error) { v.error = error.message; }
+          draw();
+        } }, "Read Ollama's library")) : null));
+  if (shownLib.length) {
+    out.push(el("table", { class: "builds" },
+      el("thead", {}, el("tr", {}, ...["Model", "Download", "Context", "Kind", ""].map((h) => el("th", {}, h)))),
+      el("tbody", {}, ...shownLib.map(({ model, tag }) => el("tr", {},
+        el("td", {}, el("span", { class: "mono" }, tag.name), tag.in_pool ? pill("in the pool", "ok") : null),
+        el("td", { class: "num" }, tag.size_gb ? `${tag.size_gb} GB` : "—"),
+        el("td", {}, tag.context || "—"),
+        el("td", { class: "muted" }, (model.capabilities || []).join(", ") || "—"),
+        el("td", {}, el("button", { class: "small", onclick: () => {
+          if (hubEngine) { v.choose({ tag }, d.rented); draw(); return; }
+          holdModel(d, profile, tag.name, tag.name, tag.size_gb ?? null, !(status.catalog || {})[tag.name]
+            && !(status.model_set || []).includes(tag.name));
+          draw();
+        } }, "Choose")))))));
+  }
+  return out;
+}
+
+// Choosing the build of one model, for an engine whose builds live on the hub (D100): the
+// original and its quantisations, each with its precision, size and the cards it runs on.
+function buildChoiceView(status, d, profile, draw) {
+  const v = modelPicker;
+  const pick = v.chosen;
+  const known = !!pick.model;
+  const logical = known ? pick.model : v.logical;
+  const search = pick.repo ? pick.repo.split("/").pop() : undefined;
+  const key = `${d.rented}|${logical}|${search || ""}`;
+  const found = hubBuilds[key];
+  if (!found && logical) {
+    hubBuilds[key] = { loading: true };
+    api.builds(logical, d.rented, search ? { search } : {})
+      .then((data) => { hubBuilds[key] = { data }; })
+      .catch((error) => { hubBuilds[key] = { error: error.message }; })
+      .finally(draw);
+  }
+  const held = profile.models.find((m) => m.model === logical);
+  const nameOk = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(logical || "");
+  return el("div", {},
+    el("div", { class: "row" },
+      el("button", { class: "small", onclick: () => { v.reset(); draw(); } }, "← back to search"),
+      known ? el("strong", { class: "mono" }, logical) : el("span", {},
+        "name in the pool ",
+        el("input", { type: "text", class: "mono", style: "width:16rem", value: v.logical,
+          oninput: (ev) => { v.logical = ev.target.value; } }),
+        el("button", { class: "small", onclick: () => { delete hubBuilds[key]; draw(); } }, "Use this name"),
+        el("span", { class: "muted" }, " what apps will ask for"))),
+    !nameOk ? el("p", { class: "error" }, "a name is letters, digits, '.', '_', ':', '-' and '/'") : null,
+    found?.loading ? el("p", { class: "muted" }, "looking on the hub…") : null,
+    found?.error ? el("p", { class: "error" }, found.error) : null,
+    found?.data ? buildTable(found.data, held ? held.build : "", (repo) => {
+      const build = (found.data.builds || []).find((b) => b.repo === repo);
+      const inCatalog = ((status.catalog || {})[logical] || []).some((x) => x.tag === repo);
+      holdModel(d, profile, logical, repo, build ? build.size_gb : null, !inCatalog);
+      v.reset();
+      draw();
+    }, `profile-build-${logical}`) : null);
+}
+
+// Put a model, with its build, in a profile: one model per machine replaces, several adds.
+function holdModel(d, profile, model, build, size, isNewBuild) {
+  const entry = { model, build, size_gb: size };
+  if (!profile.several) profile.models = [entry];
+  else {
+    const at = profile.models.findIndex((m) => m.model === model);
+    if (at >= 0) profile.models[at] = entry; else profile.models.push(entry);
+  }
+  if (isNewBuild) {
+    const list = d.adds[model] || (d.adds[model] = []);
+    if (!list.some((b) => b.tag === build)) list.push({ tag: build, engine: d.rented, size_gb: size });
+  }
 }
 
 // --- builds on the model hub, and the engine's named options (D100) ---
@@ -1132,12 +1425,28 @@ function optionBox(key, option, chosen, disabled, redraw) {
 
 async function saveEngine(event, note) {
   const d = engineEdit.draft;
+  // Said here, before the file's own rules would say it less plainly.
+  const names = d.profiles.map((p) => (p.name || "").trim());
+  const problem = names.some((n) => !n) ? "every profile needs a name"
+    : new Set(names).size !== names.length ? "two profiles have the same name"
+    : d.profiles.some((p) => !p.models.length) ? `profile "${d.profiles.find((p) => !p.models.length).name}" holds no model`
+    : d.profiles.some((p) => p.models.some((m) => !m.build)) ? "choose a build for every model in every profile"
+    : !d.profiles.some((p) => p.rented) ? "tick at least one profile to rent as" : null;
+  if (problem) {
+    engineEdit.message = ` not saved: ${problem}`;
+    note.textContent = engineEdit.message;
+    return;
+  }
+  const used = new Set(d.profiles.flatMap((p) => p.models.map((m) => `${m.model}|${m.build}`)));
   const body = {
-    rented_engine: d.rented, placement: d.placement,
-    rented_models: d.placement === "declared" ? d.rented_models : [],
-    builds: Object.fromEntries(Object.entries(d.builds).filter(([, tag]) => (tag || "").trim())),
+    rented_engine: d.rented,
     engine_start: d.engine_start,
     engine_options: (d.engine_start || "").trim() ? [] : d.engine_options,
+    profiles: Object.fromEntries(d.profiles.map((p) => [p.name.trim(), Object.fromEntries(p.models.map((m) => [m.model, m.build]))])),
+    rent: d.profiles.filter((p) => p.rented).map((p) => p.name.trim()),
+    // Only builds a profile still uses: one found and then dropped is not written to the file.
+    add: Object.entries(d.adds).map(([name, builds]) => ({ name, builds: builds.filter((b) => used.has(`${name}|${b.tag}`)) }))
+      .filter((item) => item.builds.length),
   };
   if (d.rented === "vllm") body.images = (d.images || []).filter((i) => (i.image || "").trim());
   else { body.images = []; if ((d.image || "").trim()) body.image = d.image.trim(); }
@@ -1281,6 +1590,22 @@ const MODES = [
   ["cheaper", "cheaper — search both listings, take whichever costs less"],
 ];
 
+// What the next machine is bought as, what that needs, and the minimums the search used because
+// of it (D111): an operator's own minimum stands where it is higher, and is raised where not.
+function nextHostNote(market, { onlyWhenRaised = false } = {}) {
+  const next = market.next_host;
+  if (!next || !next.needs) return null;
+  const { searched, typed, needs } = next;
+  const raised = searched.min_gpu_memory_gb > typed.min_gpu_memory_gb || searched.min_disk_gb > typed.min_disk_gb;
+  if (onlyWhenRaised && !raised) return null;
+  const what = next.profile ? `bought as ${next.profile}, holding ${next.models.join(", ")}` : `holding ${next.models.join(", ")}`;
+  return el("div", { class: "muted", style: "margin-top:6px" },
+    `The next host is ${what}: it needs a card of ≥ ${needs.card_memory_gb} GB and ${needs.disk_gb} GB of disk`,
+    needs.unknown.length ? ` (${needs.unknown.join(", ")} not measured, not counted)` : "",
+    raised ? ` — so the search asks for ≥ ${searched.min_gpu_memory_gb} GB of card and ${searched.min_disk_gb} GB of disk, above the ${typed.min_gpu_memory_gb} and ${typed.min_disk_gb} set here.`
+      : " — within the minimums set here.");
+}
+
 function searchSection(market) {
   const saved = (market.saved || {});
   search.saved = saved;
@@ -1327,6 +1652,7 @@ function searchSection(market) {
           "which listings are searched at all — an offer in a listing the pool does not ask for "
           + "is never seen, and so never appears among the rejections below")),
       el("table", {}, el("tbody", {}, rows)),
+      nextHostNote(market, { onlyWhenRaised: true }),
       el("div", { class: "row" },
         // Deliberately not through `run`: that refreshes the screen, which would rebuild this
         // form from the saved values and throw away what was just typed into it.
@@ -1613,6 +1939,7 @@ const marketPanel = (market) => {
         `${market.model_set_gb} GB` +
         ((market.model_sizes_unknown || []).length
           ? ` (not measured yet: ${market.model_sizes_unknown.join(", ")})` : "")) : null,
+      nextHostNote(market),
       el("h2", {}, "Rejected, by reason"),
       el("table", {}, el("tbody", {}, Object.entries(market.rejected_by_reason || {}).map(([reason, count]) =>
         el("tr", {}, el("td", { class: "num" }, count), el("td", { class: "muted" }, reason)))))),
@@ -1891,7 +2218,8 @@ function directoryModel(model) {
 function directoryPick(tag, pick) {
   const v = directoryView;
   const engine = hubEngine();
-  const declared = v.data.placement === "declared";
+  // With model profiles, what rented hosts hold is chosen there, not here (D111).
+  const declared = v.data.placement === "declared" && !(v.data.rent_profiles || []).length;
   const found = tag.vllm;
   const lookup = async (button, fresh) => {
     button.disabled = true;

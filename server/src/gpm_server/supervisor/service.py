@@ -25,8 +25,15 @@ from typing import Any, Optional
 import httpx
 
 from .. import strategies
-from ..catalog import ResolvedVariant, variants_for_host
-from ..config import AgentConfig, ConfigError, HostConfig, PoolConfig, load_config
+from ..catalog import ResolvedVariant, literal_variants_for_host, variants_for_host
+from ..config import (
+    AgentConfig,
+    ConfigError,
+    HostConfig,
+    PoolConfig,
+    load_config,
+    rented_profile_models,
+)
 from ..configplan import ConfigStore
 from ..db import Database, HostCounters, HostRow, HostTable, SupervisorLock
 from ..directory import Directory
@@ -896,12 +903,16 @@ class Supervisor:
         """What a rented host is asked to hold (D89). With `all`, the pool's whole set; with
         `declared`, what the rented configuration names, or anything the pool still needs."""
         rented = self.config.rented
+        if rented is not None and rented.rent_profiles:
+            return rented_profile_models(rented)
         if self.config.pool.models_per_host == "all" or rented is None or rented.models is None:
             return list(self.config.pool.model_set)
         return list(rented.models)
 
     def _rented_required_tags(self) -> frozenset[str]:
         rented = self.config.rented
+        if rented is not None and rented.rent_profiles:
+            return frozenset(tag for models in rented.profiles_rented().values() for tag in models.values())
         capabilities = frozenset(rented.capabilities) if rented else frozenset()
         variants = variants_for_host(
             self._rented_models(), self.config.catalog, capabilities, self.config.rented_engine()
@@ -931,10 +942,7 @@ class Supervisor:
                     state=host.state if host.state in ("ready", "preparing", "draining") else "preparing",
                     workers=host.workers,
                     capabilities=tuple(rented.capabilities),
-                    variants={
-                        name: tuple((v.tag, v.runtime_class, v.enforces_schema) for v in group)
-                        for name, group in variants.items()
-                    },
+                    variants=self._rented_variants_of(host, variants),
                     resident=getattr(host, "resident", frozenset()),
                     engine=self.config.rented_engine(),
                     lease_id=host.lease_id,
@@ -945,6 +953,26 @@ class Supervisor:
         for row in self.table.all():
             if row.kind in RENTED_KINDS and row.host_id not in live:
                 self.table.remove(row.host_id)
+
+    def _rented_variants_of(self, host: Any, variants: dict) -> dict:
+        """What the router may resolve each model to on this rented host: the build its profile
+        named, where it was bought as one (D111) — the same model may be a different build on
+        another host — and otherwise every build the catalog offers rented hosts."""
+        builds = getattr(host, "builds", None) or {}
+        published = {}
+        for name, group in variants.items():
+            if builds:
+                if name not in builds:
+                    continue
+                group = tuple(v for v in group if v.tag == builds[name]) or tuple(
+                    # A build the profile has since dropped: still what this machine holds.
+                    v for v in literal_variants_for_host(
+                        [name], self.config.catalog, frozenset(self.config.rented.capabilities),
+                        self.config.rented_engine(),
+                    ).values() if v.tag == builds[name]
+                )
+            published[name] = tuple((v.tag, v.runtime_class, v.enforces_schema) for v in group)
+        return published
 
     async def _probe(self, host: SupervisedHost) -> None:
         """The pool verifies a host's engine; it never configures it, and never triggers a

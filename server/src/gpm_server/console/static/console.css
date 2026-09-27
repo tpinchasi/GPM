@@ -79,3 +79,10 @@ details summary { cursor: pointer; margin-top: 6px; }
 .grid > .panel.wide { grid-column: 1 / -1; }
 td.stacked-label { width: 13rem; }
 td .why { margin-top: 4px; font-size: 12.5px; }
+.profile { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin: 0 0 8px; }
+.profile.editing { border-color: var(--accent); }
+.profile .row { margin-top: 0; }
+.profile-editor .row { margin-top: 8px; }
+.profile-editor h3.picker-title { font-size: 13px; margin: 14px 0 0; }
+.profile-editor h4 { font-size: 12.5px; margin: 12px 0 4px; color: var(--muted); }
+.row.filters input, .row.filters select { padding: 3px 6px; }

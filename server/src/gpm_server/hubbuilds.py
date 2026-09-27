@@ -325,6 +325,110 @@ def sort_builds(model: str, searched: list[str], entries: list[dict[str, Any]],
     return found
 
 
+async def _unpaced() -> None:
+    return None
+
+
+#: What a search result is asked to carry: enough to filter by size, precision and task without
+#: a request per result.
+MODEL_EXPAND = EXPAND + ("pipeline_tag",)
+
+#: The hub's task names, as an operator would say them.
+_TASKS = {
+    "text-generation": "chat",
+    "image-text-to-text": "vision",
+    "any-to-any": "vision",
+    "feature-extraction": "embedding",
+    "sentence-similarity": "embedding",
+}
+
+
+@dataclass
+class HubModel:
+    """One model found by a free search — an original or a fine-tune, never a quantisation of
+    one (those are its builds, offered once it is chosen)."""
+
+    repo: str
+    #: Billions of parameters, from the weights' own tally; None where the hub has none.
+    params_b: Optional[float]
+    precision: Optional[str]
+    size_gb: Optional[float]
+    task: Optional[str]
+    family: Optional[str]
+    downloads: int
+    gated: bool
+    #: "original", or what it was made from: "fine-tune of …", "merge of …".
+    made_from: Optional[str] = None
+
+
+def params_b(entry: dict[str, Any]) -> Optional[float]:
+    tally = (entry.get("safetensors") or {})
+    total = tally.get("total") or sum((tally.get("parameters") or {}).values())
+    return round(total / 1e9, 2) if total else None
+
+
+def search_result(entry: dict[str, Any]) -> Optional[HubModel]:
+    """A search hit as a model to choose, or None where it is not one: files the engine cannot
+    load, or a quantisation of another model — which is offered as that model's build."""
+    if not_loadable(entry):
+        return None
+    linked = links(entry)
+    if {"quantized", "adapter"} & set(linked):
+        return None
+    config = entry.get("config") or {}
+    tally = (entry.get("safetensors") or {}).get("parameters") or {}
+    made_from = None
+    for kind in ("finetune", "merge"):
+        if linked.get(kind):
+            made_from = f"{'fine-tune' if kind == 'finetune' else 'merge'} of {sorted(linked[kind])[0]}"
+            break
+    return HubModel(
+        repo=entry["id"],
+        params_b=params_b(entry),
+        precision=precision_of(config.get("quantization_config"), tally),
+        size_gb=size_gb(tally),
+        task=_TASKS.get(str(entry.get("pipeline_tag") or "")),
+        family=config.get("model_type") if isinstance(config.get("model_type"), str) else None,
+        downloads=int(entry.get("downloads") or 0),
+        gated=bool(entry.get("gated")),
+        made_from=made_from,
+    )
+
+
+async def search_models(term: str, *, client: Optional[httpx.AsyncClient] = None,
+                        pace: Callable[[], Awaitable[None]] = _unpaced,
+                        limit: int = SEARCH_LIMIT) -> list[HubModel]:
+    """Any model on the hub whose name holds `term`, most downloaded first (D111).
+
+    One request, no credential — what an anonymous machine sees is what a rented host can fetch.
+    Only reads: the operator's choice is saved as a repository name, as every build is."""
+    if not valid_search(term):
+        raise ValueError(f"not a model name to search for: {term!r}")
+    owned = client is None
+    client = client or httpx.AsyncClient(base_url=hub_url(), timeout=20.0, headers={})
+    try:
+        await pace()
+        answer = await client.get("/api/models", params=[
+            ("search", term), ("limit", str(max(1, min(limit, 100)))), ("sort", "downloads"), ("direction", "-1"),
+        ] + [("expand[]", e) for e in MODEL_EXPAND])
+        answer.raise_for_status()
+        listed = answer.json()
+        if not isinstance(listed, list):
+            raise HubUnavailable("the hub's search did not return a list of models")
+    except httpx.HTTPError as exc:
+        raise HubUnavailable(f"the model hub did not answer: {exc or type(exc).__name__}") from exc
+    finally:
+        if owned:
+            await client.aclose()
+    found = []
+    for entry in listed:
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str):
+            model = search_result(entry)
+            if model is not None:
+                found.append(model)
+    return found
+
+
 def hub_url() -> str:
     return (os.environ.get("HF_ENDPOINT") or DEFAULT_HUB).rstrip("/")
 
@@ -338,10 +442,6 @@ def weights_size_gb(listing: Any) -> Optional[float]:
         if isinstance(f, dict) and str(f.get("path", "")).endswith(".safetensors")
     )
     return round(total / 1e9, 1) if total else None
-
-
-async def _unpaced() -> None:
-    return None
 
 
 async def find_builds(model: str, search: Optional[str] = None, *,
