@@ -60,12 +60,9 @@ const api = {
   hostDetail: (id) => call("GET", `/pool/hosts/${encodeURIComponent(id)}`),
   setSearch: (body) => call("PATCH", "/pool/config/rented", body),
   setEngine: (body) => call("PATCH", "/pool/config/engine", body),
+  modelSize: (repo) => call("GET", `/pool/models/size?${new URLSearchParams({ repo })}`),
   searchModels: (q) => call("GET", `/pool/models/search?${new URLSearchParams({ q })}`),
-  builds: (model, engine, { fresh = false, search } = {}) => call("GET", `/pool/builds?${new URLSearchParams({
-    model, engine, ...(fresh ? { fresh: "true" } : {}), ...(search ? { search } : {}) })}`),
-  directory: () => call("GET", "/pool/directory"),
   refreshDirectory: () => call("POST", "/pool/directory/refresh"),
-  addModels: (body) => call("POST", "/pool/config/models", body),
   setHostService: (id, disabled) => call("PATCH", `/pool/config/hosts/${encodeURIComponent(id)}`, { disabled }),
   removeHost: (id, confirm) => call("DELETE", `/pool/config/hosts/${encodeURIComponent(id)}`, confirm === undefined ? {} : { confirm }),
   restartEngine: (hostId, applySettings) =>
@@ -630,7 +627,7 @@ function hostTestForm() {
 // Back works and a tab can be linked to.
 const RENTED_TABS = [
   { id: "hosts", label: "Hosts", about: "What this pool is renting now, what it costs, and renting one more by hand." },
-  { id: "engine", label: "Engine & models", about: "What the machines this pool rents run: the engine, how models are placed on them, each model's build, and the engine's options." },
+  { id: "engine", label: "Profiles", about: "What each machine this pool rents holds — its models, each with the variant it fetches — and the engine, image and start they run with." },
   { id: "finding", label: "Finding machines", about: "What the pool looks for on the market, and the live market those settings let through — try values here before saving them." },
   { id: "scaling", label: "Scaling", about: "How many machines at most, how much per hour at most, and how the pool decides when to rent another." },
   { id: "teardown", label: "Tear-down", about: "When an unused or failing machine is paused, destroyed or given up." },
@@ -649,7 +646,7 @@ screens.rented = async (status) => {
   const tab = RENTED_TABS.find((t) => t.id === state.sub) || RENTED_TABS[0];
   const market = RENTED_TABS_WITH_MARKET.has(tab.id) ? await api.market(1).catch((e) => ({ error: e.message })) : null;
   const head = [el("h1", {}, "Rented capacity"), rentedTabs(tab.id), el("p", { class: "muted tab-about" }, tab.about)];
-  if (tab.id === "engine") return [...head, el("div", { class: "grid" }, enginePanel(status.engine)), ...engineSection(status)];
+  if (tab.id === "engine") return [...head, ...engineSection(status)];
   if (tab.id === "finding") return [...head, ...searchSection(market), ...marketSection(market)];
   if (tab.id === "scaling") return [...head, limitsPanel(status), ...allocationSection(market)];
   if (tab.id === "teardown") return [...head, ...teardownSection(market)];
@@ -912,9 +909,10 @@ function engineDraft(status) {
     rented,
     profiles: made.profiles,
     migrated: made.migrated,
-    // Models and builds found by searching, new to the pool's file: {model: [{tag, engine, size_gb}]}.
+    // Models and variants found by searching, new to the pool's file: {model: [{tag, engine, size_gb}]}.
     adds: {},
-    editing: null,
+    // Which profile's finder is open, by index; one at a time.
+    finding: null,
     images: images.length ? images.map((i) => ({ ...i })) : null,
     image: e.image || "",
     engine_start: e.engine_start || "",
@@ -925,97 +923,135 @@ function engineDraft(status) {
 function engineSection(status) {
   if (!status.engine || !status.provider) return [];
   if (!engineEdit.draft) engineEdit.draft = engineDraft(status);
-  const box = el("div", { class: "panel" });
-  const draw = () => {
-    box.replaceChildren(...engineRows(status, box, draw));
-  };
+  const box = el("div", {});
+  const draw = () => box.replaceChildren(...profilesTab(status, draw));
   draw();
-  return [el("h2", {}, "Engine and models on rented hosts"), box];
+  return [box];
 }
 
-function engineRows(status, box, draw) {
+// --- the Profiles tab (D111, D112) ---
+//
+// One place for what rented machines hold. A profile is a list of rows, each a model and the
+// variant a machine fetches for it; every picker on this screen chooses the two together, from
+// what the pool already has or from the hub and Ollama's library.
+
+function profilesTab(status, draw) {
   const d = engineEdit.draft;
-  const available = (status.engine.available || ["ollama"]);
-  const vllm = d.rented === "vllm";
-
-  const engineSelect = el("select", { onchange: (ev) => {
-    d.rented = ev.target.value;
-    // Only the options the chosen engine offers survive the switch; the file refuses the rest.
-    const offered = ((status.engine.offers || {})[d.rented] || {}).options || {};
-    d.engine_options = d.engine_options.filter((o) => o in offered);
-    if (d.rented === "vllm") {
-      d.images = d.images || VLLM_IMAGE_SUGGESTIONS.map((i) => ({ ...i }));
-      if (/ollama/i.test(d.engine_start)) d.engine_start = "";
-    }
-    // A profile's builds are one engine's: offer the catalog's build for the new one, or ask.
-    for (const profile of d.profiles) {
-      for (const held of profile.models) {
-        const build = catalogBuild(status, d, held.model, d.rented);
-        held.build = build ? build.tag : "";
-        held.size_gb = build ? build.size_gb : null;
-      }
-    }
-    modelPicker.results = null;
-    draw();
-  } }, ...available.map((name) => el("option", { value: name, ...(d.rented === name ? { selected: true } : {}) }, name)));
-
-  const rows = [
-    stackedRow("engine", "rented engine", { control: engineSelect },
-      "what the machines this pool buys run; hosts you configured keep their own"),
-    stackedRow("model_profiles", "model profiles", { control: profilesControl(status, d, draw) },
-      "each machine the pool rents is bought as one ticked profile — one holding a model no host serves yet first, then the one whose requests are waiting most"),
-  ];
-
-  const offer = (status.engine.offers || {})[d.rented] || { builds_on_hub: false, options: {} };
-  if (vllm) {
-    const list = el("div", {}, ...(d.images || []).map((img, i) => el("div", { class: "row" },
-      el("input", { type: "text", style: "width:18rem", value: img.image,
-        oninput: (ev) => { d.images[i].image = ev.target.value; } }),
-      el("span", { class: "muted" }, "driver ≥"),
-      el("input", { type: "text", style: "width:5rem", value: img.min_driver,
-        oninput: (ev) => { d.images[i].min_driver = ev.target.value; } }),
-      el("button", { class: "small", onclick: () => { d.images.splice(i, 1); draw(); } }, "Remove"))),
-      el("button", { class: "small", onclick: () => { d.images.push({ image: "", min_driver: "" }); draw(); } }, "Add a build"));
-    rows.push(stackedRow("images", "images, newest first", { control: list },
-      "a machine gets the first its driver can run; one that can run none is never bid on"));
-  } else {
-    rows.push(stackedRow("image", "image", { control: el("input", { type: "text", style: "width:18rem", value: d.image,
-      oninput: (ev) => { d.image = ev.target.value; } }) }, "pinned, never a floating tag"));
-  }
-
-  const optionNames = Object.keys(offer.options || {});
-  if (optionNames.length) {
-    const custom = (d.engine_start || "").trim() !== "";
-    const boxes = optionNames.map((key) => optionBox(key, offer.options[key], d.engine_options, custom, draw));
-    rows.push(stackedRow("engine_options", "engine options", { control: el("div", {}, ...boxes) },
-      custom ? "these belong to the engine's own start; clear the start command to use them"
-        : "each model gets an option only if its family has one — the rest start without it, and the machine says so"));
-  }
-
-  rows.push(stackedRow("engine_start", "start command", {
-    control: el("input", { type: "text", style: "width:26rem", value: d.engine_start,
-      placeholder: vllm ? "blank: the agent's own vllm-start (recommended)" : "how the image's engine is started, if it does not start itself",
-      oninput: (ev) => { d.engine_start = ev.target.value; } }),
-  }, vllm ? "blank lets the pool start vLLM on what its agent downloaded" : "runs after the dead-man timer is armed"));
-
+  const available = status.engine.available || ["ollama"];
+  const engineSelect = el("select", { onchange: (ev) => { switchEngine(status, d, ev.target.value); draw(); } },
+    ...available.map((name) => el("option", { value: name, ...(d.rented === name ? { selected: true } : {}) }, name)));
   const note = el("span", { class: "muted" }, engineEdit.message);
   return [
-    el("table", {}, el("tbody", {}, ...rows)),
+    el("h2", {}, "Profiles — what each rented machine holds"),
+    el("div", { class: "panel" },
+      el("div", { class: "row", style: "margin-top:0" },
+        el("span", {}, "Rented machines run"), engineSelect,
+        el("span", { class: "muted" }, "— every variant below is one this engine runs. Its image and start are under Machine setup.")),
+      el("p", { class: "muted" },
+        "Each machine the pool rents is bought as one ticked profile: one holding a model no host serves yet first, then the one whose requests are waiting most. "
+        + "What a profile holds sets the least card and disk the search asks for."),
+      d.migrated ? el("p", { class: "muted" },
+        "This pool has no profiles yet: below is what it rents today, written as profiles. Saving keeps renting the same until you change them.") : null,
+      ...d.profiles.map((profile, i) => profileCard(status, d, profile, i, draw)),
+      el("div", { class: "row" },
+        el("button", { onclick: () => {
+          d.migrated = false;  // no longer what the pool rents today
+          d.profiles.push({ name: `profile ${d.profiles.length + 1}`, rented: true, several: false, models: [] });
+          d.finding = d.profiles.length - 1;
+          finder.reset();
+          draw();
+        } }, "+ New profile"),
+        d.profiles.some((p) => p.rented) ? null : el("span", { class: "error" }, "tick at least one profile to rent as"))),
+    machineSetup(status, d, draw),
     el("div", { class: "row" },
       el("button", { class: "primary", onclick: (ev) => saveEngine(ev, note) }, "Save to configuration"),
       el("button", { class: "small", onclick: () => {
-        engineEdit.draft = engineDraft(status); engineEdit.message = ""; modelPicker.results = null; draw();
+        engineEdit.draft = engineDraft(status); engineEdit.message = ""; finder.reset(); draw();
       } }, "Reset"),
       note),
-    el("p", { class: "muted" }, "Saved as one change to the file, with its comments kept. Hosts already running keep what they were started with; new ones use this."),
+    el("p", { class: "muted" }, "Saved as one change to the file, with its comments kept. Machines already rented keep what they were bought with; new ones use this."),
   ];
 }
 
-// --- model profiles (D111) ---
+function switchEngine(status, d, engine) {
+  d.rented = engine;
+  d.migrated = false;
+  // Only the options the chosen engine offers survive the switch; the file refuses the rest.
+  const offered = ((status.engine.offers || {})[engine] || {}).options || {};
+  d.engine_options = d.engine_options.filter((o) => o in offered);
+  if (engine === "vllm") {
+    d.images = d.images || VLLM_IMAGE_SUGGESTIONS.map((i) => ({ ...i }));
+    if (/ollama/i.test(d.engine_start)) d.engine_start = "";
+  }
+  // A variant is one engine's: keep a row only where the pool has a variant of that model for the
+  // new engine, and say which rows need choosing again.
+  for (const profile of d.profiles) {
+    for (const row of profile.models) {
+      const variant = variantsFor(status, d).find((v) => v.model === row.model);
+      Object.assign(row, variant ? { build: variant.tag, size_gb: variant.size_gb, precision: variant.precision } : { build: "", size_gb: null, precision: null });
+    }
+  }
+  finder.results = null;
+}
 
-// What a machine holding these builds needs, per card and on disk: the server's rule
-// (gpm_server/sizing.py), which is the launcher's own. Shown while editing; the Finding machines
-// tab shows the number the search actually used.
+// Every variant the pool already has that rented machines can run, a model and its variant
+// together — what "in the pool" offers, and what a profile's rows are checked against.
+function variantsFor(status, d) {
+  const caps = new Set(status.engine.rented_capabilities || []);
+  const found = (status.engine.pool_variants || [])
+    .filter((v) => v.engine === d.rented && (v.requires || []).every((c) => caps.has(c)));
+  for (const [model, list] of Object.entries(d.adds)) {
+    for (const v of list) if (v.engine === d.rented) found.push({ model, tag: v.tag, size_gb: v.size_gb, precision: v.precision || null, requires: [] });
+  }
+  return found;
+}
+
+function profileCard(status, d, profile, i, draw) {
+  const finding = d.finding === i;
+  const shape = (several, label) => el("label", { class: "pick" },
+    el("input", { type: "radio", name: `shape-${i}`, ...(profile.several === several ? { checked: true } : {}),
+      onchange: () => {
+        profile.several = several;
+        // One model per machine holds one: the first stays, and the card shows it.
+        if (!several && profile.models.length > 1) profile.models = profile.models.slice(0, 1);
+        draw();
+      } }), el("span", {}, label));
+  const rows = profile.models.map((m, at) => el("tr", {},
+    el("td", { class: "mono" }, m.model),
+    el("td", { class: "mono" }, m.build || el("span", { class: "error" }, `no ${d.rented} variant — choose one`)),
+    el("td", {}, m.precision || "—"),
+    el("td", { class: "num" }, m.size_gb ? `${m.size_gb} GB` : m.build ? el("span", { class: "muted" }, "not measured") : "—"),
+    el("td", {}, el("button", { class: "small", title: "remove from this profile",
+      onclick: () => { profile.models.splice(at, 1); draw(); } }, "×"))));
+  const full = !profile.several && profile.models.length >= 1;
+  return el("div", { class: "profile" + (finding ? " editing" : "") },
+    el("div", { class: "row", style: "margin-top:0" },
+      el("label", { class: "pick" }, el("input", { type: "checkbox", ...(profile.rented ? { checked: true } : {}),
+        onchange: (ev) => { profile.rented = ev.target.checked; draw(); } }), el("span", {}, "rent")),
+      el("input", { type: "text", class: "profile-name", value: profile.name, maxlength: "40", "aria-label": "profile name",
+        oninput: (ev) => { profile.name = ev.target.value; } }),
+      el("span", { class: "muted" }, "a machine holds"), shape(false, "one model"), shape(true, "several models"),
+      el("span", { style: "margin-left:auto" }),
+      el("button", { class: "small danger", onclick: () => {
+        d.migrated = false;
+        d.profiles.splice(i, 1);
+        if (d.finding === i) d.finding = null; else if (d.finding > i) d.finding -= 1;
+        draw();
+      } }, "Remove profile")),
+    profile.models.length ? el("table", { class: "builds held" },
+      el("thead", {}, el("tr", {}, ...["Model", "Variant", "Precision", "Size", ""].map((h) => el("th", {}, h)))),
+      el("tbody", {}, ...rows)) : el("p", { class: "muted" }, "Holds nothing yet — add a model below."),
+    el("div", { class: "row" }, needsLine(profile.models),
+      profile.several && d.rented === "vllm" && profile.models.length > 1
+        ? el("span", { class: "muted" }, "· one vLLM process per model, the card's memory split between them") : null),
+    finding
+      ? finderView(status, d, profile, draw)
+      : el("div", { class: "row" }, el("button", { class: "small", onclick: () => { d.finding = i; finder.reset(); draw(); } },
+        full ? "Replace the model…" : "+ Add a model…")));
+}
+
+// What a machine holding these needs, per card and on disk: the server's rule (sizing.py), which
+// is the launcher's own. The Finding machines tab shows the number the search actually used.
 const SIZING = { weightOverhead: 1.10, cacheReserveGb: 3 * 1024 ** 3 / 1e9, share: 0.90, diskOverhead: 1.10, diskHeadroomGb: 10 };
 
 function needsFor(models) {
@@ -1032,20 +1068,13 @@ function needsFor(models) {
 }
 
 function needsLine(models) {
+  if (!models.length) return null;
   const needs = needsFor(models);
-  if (!models.length) return el("span", { class: "muted" }, "holds nothing yet");
-  return el("span", {},
+  return el("span", { class: "needs" },
     needs.weights ? el("span", {}, `needs a card of ≥ ${needs.card} GB and ≥ ${needs.disk} GB of disk`,
       el("span", { class: "muted" }, ` (${needs.weights} GB of weights)`)) : null,
     needs.unknown.length ? el("span", { class: "muted" },
-      `${needs.weights ? " · " : ""}size not measured for ${needs.unknown.join(", ")} — not counted; choose its build from the hub to measure it`) : null);
-}
-
-// The build of `model` the catalog lists for `engine`, first first — with any found by search.
-function catalogBuild(status, d, model, engine) {
-  const listed = [...((status.catalog || {})[model] || []), ...(d.adds[model] || [])];
-  return listed.find((v) => v.engine === engine) || listed.find((v) => v.engine == null && engine === status.engine.name)
-    || (!listed.length && engine === status.engine.name ? { tag: model, size_gb: null } : null);
+      `${needs.weights ? " · " : ""}size not measured for ${needs.unknown.join(", ")}, so not counted`) : null);
 }
 
 const profileName = (model) => model.replace(/[^A-Za-z0-9 ._-]+/g, "-").slice(0, 40);
@@ -1054,117 +1083,40 @@ const profileName = (model) => model.replace(/[^A-Za-z0-9 ._-]+/g, "-").slice(0,
 // profiles, so that saving without touching them changes only the words, not what is rented.
 function profilesFromStatus(status, rented) {
   const e = status.engine || {};
-  const sizeOf = (model, tag) => (((status.catalog || {})[model] || []).find((v) => v.tag === tag) || {}).size_gb ?? null;
+  const pool = e.pool_variants || [];
+  const about = (model, tag) => pool.find((v) => v.model === model && v.tag === tag) || {};
+  const row = (model, tag) => ({ model, build: tag || "", size_gb: about(model, tag).size_gb ?? null, precision: about(model, tag).precision ?? null });
   if ((e.profiles || []).length) {
     return {
       migrated: false,
       profiles: e.profiles.map((p) => ({
         name: p.name, rented: p.rented, several: p.models.length > 1,
-        models: p.models.map((m) => ({ model: m.model, build: m.build, size_gb: m.size_gb ?? sizeOf(m.model, m.build) })),
+        models: p.models.map((m) => ({ ...row(m.model, m.build), size_gb: m.size_gb ?? about(m.model, m.build).size_gb ?? null })),
       })),
     };
   }
-  const entry = (model) => {
-    const listed = (status.catalog || {})[model] || [];
-    const build = listed.find((v) => v.engine === rented) || listed.find((v) => v.engine == null)
-      || (!listed.length ? { tag: model } : null);
-    return { model, build: build ? build.tag : "", size_gb: build ? sizeOf(model, build.tag) : null };
-  };
+  // The first variant rented machines can actually run: a build for another platform is not one.
+  const caps = new Set(e.rented_capabilities || []);
+  const first = (model) => (pool.find((v) => v.model === model && v.engine === rented
+    && (v.requires || []).every((c) => caps.has(c))) || {}).tag;
   const set = status.model_set || [];
   if (e.models_per_host === "declared") {
     const renting = e.rented_models || set;
-    return { migrated: true, profiles: renting.map((m) => ({ name: profileName(m), rented: true, several: false, models: [entry(m)] })) };
+    return { migrated: true, profiles: renting.map((m) => ({ name: profileName(m), rented: true, several: false, models: [row(m, first(m))] })) };
   }
-  return { migrated: true, profiles: [{ name: "every model", rented: true, several: set.length > 1, models: set.map(entry) }] };
+  return { migrated: true, profiles: [{ name: "every model", rented: true, several: set.length > 1, models: set.map((m) => row(m, first(m))) }] };
 }
 
-function profilesControl(status, d, draw) {
-  const cards = d.profiles.map((profile, i) => {
-    const editing = d.editing === i;
-    const rent = el("input", { type: "checkbox", ...(profile.rented ? { checked: true } : {}),
-      onchange: (ev) => { profile.rented = ev.target.checked; draw(); } });
-    const head = el("div", { class: "row", style: "margin-top:0" },
-      el("label", { class: "pick" }, rent, el("span", {}, "rent as ")),
-      el("strong", {}, profile.name || el("span", { class: "muted" }, "unnamed")),
-      pill(profile.several ? `${profile.models.length} models on one machine` : "one model per machine"),
-      needsLine(profile.models),
-      el("span", { style: "margin-left:auto" }),
-      editing ? null : el("button", { class: "small", onclick: () => { d.editing = i; modelPicker.reset(); draw(); } }, "Edit"),
-      el("button", { class: "small danger", onclick: () => {
-        d.profiles.splice(i, 1);
-        if (d.editing === i) d.editing = null; else if (d.editing > i) d.editing -= 1;
-        draw();
-      } }, "Remove"));
-    const held = el("div", {}, ...profile.models.map((m) => el("div", { class: "mono" },
-      m.model, el("span", { class: "muted" }, " → "),
-      m.build || el("span", { class: "error" }, `no ${d.rented} build chosen`),
-      m.size_gb ? el("span", { class: "muted" }, `  ${m.size_gb} GB`) : null)));
-    return el("div", { class: "profile" + (editing ? " editing" : "") }, head,
-      editing ? profileEditor(status, d, profile, draw) : held);
-  });
-  return el("div", {},
-    d.migrated ? el("p", { class: "muted", style: "margin-top:0" },
-      "This pool has no profiles yet: these are what it rents today, written as profiles. Saving keeps renting the same until you change them.") : null,
-    ...cards,
-    el("div", { class: "row" },
-      el("button", { class: "small", onclick: () => {
-        d.profiles.push({ name: `profile ${d.profiles.length + 1}`, rented: true, several: false, models: [] });
-        d.editing = d.profiles.length - 1;
-        modelPicker.reset();
-        draw();
-      } }, "New profile"),
-      d.profiles.some((p) => p.rented) ? null : el("span", { class: "error" }, "tick at least one profile to rent as")));
-}
+// --- finding a model and its variant ---
 
-function profileEditor(status, d, profile, draw) {
-  const hubEngine = !!(((status.engine.offers || {})[d.rented] || {}).builds_on_hub);
-  const shape = (several, label) => el("label", { class: "pick" },
-    el("input", { type: "radio", name: "profile-shape", ...(profile.several === several ? { checked: true } : {}),
-      onchange: () => {
-        profile.several = several;
-        // One model per machine holds exactly one: the first stays, and the screen says so.
-        if (!several && profile.models.length > 1) profile.models = profile.models.slice(0, 1);
-        draw();
-      } }), el("span", {}, label));
-  const held = profile.models.map((m, at) => el("tr", {},
-    el("td", { class: "mono" }, m.model),
-    el("td", { class: "mono" }, m.build || el("span", { class: "error" }, "choose a build")),
-    el("td", { class: "num" }, m.size_gb ? `${m.size_gb} GB` : "—"),
-    el("td", {},
-      hubEngine ? el("button", { class: "small", onclick: () => { modelPicker.choose({ model: m.model }, d.rented); draw(); } }, "Change build") : null,
-      el("button", { class: "small", onclick: () => { profile.models.splice(at, 1); draw(); } }, "Remove"))));
-  return el("div", { class: "profile-editor" },
-    el("div", { class: "row" },
-      el("span", {}, "name"),
-      el("input", { type: "text", style: "width:14rem", value: profile.name, maxlength: "40",
-        oninput: (ev) => { profile.name = ev.target.value; } }),
-      el("span", { class: "muted", style: "margin-left:12px" }, "a machine holds"),
-      shape(false, "one model"),
-      shape(true, "several models")),
-    profile.several && d.rented === "vllm" && profile.models.length > 1
-      ? el("p", { class: "muted" }, "vLLM runs one process per model behind the machine's router, and splits the card's memory between them.") : null,
-    profile.models.length ? el("table", { class: "builds" },
-      el("thead", {}, el("tr", {}, ...["Model", `${d.rented} build`, "Size", ""].map((h) => el("th", {}, h)))),
-      el("tbody", {}, ...held)) : null,
-    el("div", { class: "row" }, needsLine(profile.models)),
-    el("h3", { class: "picker-title" }, profile.several || !profile.models.length ? "Add a model" : "Replace the model"),
-    modelPickerView(status, d, profile, draw),
-    el("div", { class: "row" },
-      el("button", { class: "small", onclick: () => { d.editing = null; modelPicker.reset(); draw(); } }, "Done")));
-}
-
-// Finding a model to hold (D111): the pool's own, or anything on the hub or in Ollama's library,
-// narrowed by size, precision and kind. Kept across redraws, like the directory's view.
-const modelPicker = {
-  query: "", loading: false, error: null, results: null, chosen: null, logical: "",
-  filters: { minParams: "", maxParams: "", maxSize: "", precision: "", kind: "", fitsCard: "", hideGated: true },
-  reset() { this.chosen = null; this.logical = ""; this.error = null; },
-  // A model to pick a build of: {model} already in the pool, {repo} from the hub, {tag} from the library.
-  choose(pick, engine) {
-    this.chosen = pick;
-    this.logical = pick.model || (pick.repo ? pick.repo.split("/").pop().toLowerCase() : pick.tag?.name || "");
-    this.engine = engine;
-  },
+const finder = {
+  query: "", loading: false, error: null, results: null,
+  filters: { minParams: "", maxParams: "", maxSize: "", fitsCard: "", precision: "", kind: "", hideGated: true },
+  // Names typed for models new to the pool, by the hub model they come from.
+  names: {},
+  // Exact sizes being read, by repository, so each is asked for once.
+  sizes: {},
+  reset() { this.error = null; },
 };
 
 const paramsOf = (label) => {
@@ -1172,23 +1124,26 @@ const paramsOf = (label) => {
   return m ? Number(m[1]) / (m[2].toLowerCase() === "m" ? 1000 : 1) : null;
 };
 
-function passesFilters(item) {
-  const f = modelPicker.filters;
+// Whether a variant row passes the filters. What is not known about a row does not exclude it,
+// except where the filter is about exactly that: an unmeasured size passes a size filter only
+// once it is measured.
+function passes(row) {
+  const f = finder.filters;
   const num = (v) => (v === "" || v === null || v === undefined ? null : Number(v));
   const [lo, hi, max, card] = [num(f.minParams), num(f.maxParams), num(f.maxSize), num(f.fitsCard)];
-  if (lo !== null && (item.params === null || item.params < lo)) return false;
-  if (hi !== null && (item.params === null || item.params > hi)) return false;
-  if (max !== null && (item.size === null || item.size > max)) return false;
-  if (card !== null && (item.size === null || needsFor([{ model: "x", size_gb: item.size }]).card > card)) return false;
-  if (f.precision && item.precision !== f.precision) return false;
-  if (f.kind && !(item.kinds || []).includes(f.kind)) return false;
-  if (f.hideGated && item.gated) return false;
+  if (lo !== null && row.params != null && row.params < lo) return false;
+  if (hi !== null && row.params != null && row.params > hi) return false;
+  if (max !== null && row.size != null && row.size > max) return false;
+  if (card !== null && row.size != null && needsFor([{ model: "x", size_gb: row.size }]).card > card) return false;
+  if (f.precision && row.precision !== f.precision) return false;
+  if (f.kind && row.kinds && row.kinds.length && !row.kinds.includes(f.kind)) return false;
+  if (f.hideGated && row.gated) return false;
   return true;
 }
 
 async function runSearch(draw) {
-  const v = modelPicker;
-  if (!v.query.trim()) return;
+  const v = finder;
+  if (!v.query.trim()) { v.results = null; draw(); return; }
   v.loading = true; v.error = null; draw();
   try {
     v.results = await api.searchModels(v.query.trim());
@@ -1200,178 +1155,253 @@ async function runSearch(draw) {
   }
 }
 
-function modelPickerView(status, d, profile, draw) {
-  const v = modelPicker;
-  if (v.chosen) return buildChoiceView(status, d, profile, draw);
+// The weights of a hub variant, read once, then the results redrawn with it — only the results,
+// so a search being typed keeps its focus.
+function measure(repo, redraw) {
+  if (repo in finder.sizes) return finder.sizes[repo];
+  finder.sizes[repo] = undefined;
+  api.modelSize(repo).then((a) => { finder.sizes[repo] = a.size_gb; }).catch(() => { finder.sizes[repo] = null; }).finally(redraw);
+  return undefined;
+}
+
+function finderView(status, d, profile, draw) {
+  const v = finder;
   const hubEngine = !!(((status.engine.offers || {})[d.rented] || {}).builds_on_hub);
   const f = v.filters;
-  const input = (key, placeholder, width = "5rem") => el("input", { type: "number", step: "any", min: "0", style: `width:${width}`,
-    placeholder, value: f[key], oninput: (ev) => { f[key] = ev.target.value; drawResults(); } });
-  const select = (key, options) => el("select", { onchange: (ev) => { f[key] = ev.target.value; drawResults(); } },
+  const results = el("div", {});
+  const redraw = () => results.replaceChildren(...finderResults(status, d, profile, draw, hubEngine, redraw));
+  const number = (key, placeholder) => el("input", { type: "number", step: "any", min: "0", style: "width:5rem",
+    placeholder, value: f[key], oninput: (ev) => { f[key] = ev.target.value; redraw(); } });
+  const select = (key, options) => el("select", { onchange: (ev) => { f[key] = ev.target.value; redraw(); } },
     ...options.map(([value, label]) => el("option", { value, ...(f[key] === value ? { selected: true } : {}) }, label)));
-  const search = el("input", { type: "search", style: "width:20rem", value: v.query,
-    placeholder: "any model: qwen3 30b, gemma, embed…",
-    oninput: (ev) => { v.query = ev.target.value; },
+  const search = el("input", { type: "search", class: "finder-search", value: v.query,
+    placeholder: hubEngine ? "search every model: qwen3 30b, gemma 4, embed…" : "search Ollama's library: qwen3, gemma4, embed…",
+    oninput: (ev) => { v.query = ev.target.value; redraw(); },
     onkeydown: (ev) => { if (ev.key === "Enter") runSearch(draw); } });
-  const resultsBox = el("div", {});
-  const drawResults = () => resultsBox.replaceChildren(...searchResults(status, d, profile, draw, hubEngine));
-
-  const inPool = [...(status.model_set || []), ...Object.keys(d.adds).filter((m) => !(status.model_set || []).includes(m))]
-    .filter((m) => !profile.models.some((held) => held.model === m));
-  const view = el("div", {},
-    inPool.length ? el("div", { class: "row" }, el("span", { class: "muted" }, "in the pool:"),
-      ...inPool.map((m) => el("button", { class: "small mono", onclick: () => {
-        if (hubEngine) { v.choose({ model: m }, d.rented); draw(); return; }
-        const build = catalogBuild(status, d, m, d.rented);
-        holdModel(d, profile, m, build ? build.tag : m, build ? build.size_gb : null, false);
-        draw();
-      } }, m))) : null,
+  const view = el("div", { class: "finder" },
+    el("div", { class: "row", style: "margin-top:0" },
+      el("strong", {}, !profile.several && profile.models.length ? "Replace the model" : "Add a model"),
+      el("span", { class: "muted" }, "— each row is a model and one variant of it; one click adds both"),
+      el("span", { style: "margin-left:auto" }),
+      el("button", { class: "small", onclick: () => { d.finding = null; draw(); } }, "Close")),
     el("div", { class: "row" }, search,
-      el("button", { class: "primary small", onclick: () => runSearch(draw) }, v.loading ? "Searching…" : "Search"),
-      el("span", { class: "muted" }, hubEngine ? "the model hub, live, and Ollama's library" : "Ollama's library")),
+      el("button", { class: "primary small", onclick: () => runSearch(draw) }, v.loading ? "Searching…" : "Search")),
     el("div", { class: "row filters" },
-      el("span", { class: "muted" }, "parameters"), input("minParams", "min B"), el("span", {}, "–"), input("maxParams", "max B"),
-      el("span", { class: "muted" }, "download ≤"), input("maxSize", "GB"),
-      el("span", { class: "muted" }, "fits a card of"), input("fitsCard", "GB"),
-      hubEngine ? select("precision", [["", "any precision"], ["BF16", "BF16"], ["FP16", "FP16"], ["FP8", "FP8"], ["NVFP4", "NVFP4"], ["MXFP4", "MXFP4"], ["INT4", "INT4"], ["INT8", "INT8"]]) : null,
+      el("span", { class: "muted" }, "parameters"), number("minParams", "min B"), el("span", {}, "–"), number("maxParams", "max B"),
+      el("span", { class: "muted" }, "size ≤"), number("maxSize", "GB"),
+      el("span", { class: "muted" }, "fits a card of"), number("fitsCard", "GB"),
+      hubEngine ? select("precision", [["", "any precision"], ...["BF16", "FP16", "FP8", "NVFP4", "MXFP4", "INT4", "INT8"].map((p) => [p, p])]) : null,
       select("kind", [["", "any kind"], ["chat", "chat"], ["vision", "vision"], ["embedding", "embedding"], ["tools", "tools"], ["thinking", "thinking"]]),
       hubEngine ? el("label", { class: "pick" }, el("input", { type: "checkbox", ...(f.hideGated ? { checked: true } : {}),
-        onchange: (ev) => { f.hideGated = ev.target.checked; drawResults(); } }), el("span", {}, "hide gated")) : null),
+        onchange: (ev) => { f.hideGated = ev.target.checked; redraw(); } }), el("span", {}, "hide gated")) : null),
     v.error ? el("p", { class: "error" }, v.error) : null,
-    resultsBox);
-  drawResults();
+    results);
+  redraw();
   return view;
 }
 
-function searchResults(status, d, profile, draw, hubEngine) {
-  const v = modelPicker;
-  if (!v.results) return [el("p", { class: "muted" }, "Search by any part of a name. Filters apply as you type.")];
+// One variant row: what it is, and the button that puts it — with its model — in the profile.
+function variantRow(cells, onAdd, label) {
+  return el("tr", {}, ...cells, el("td", {}, el("button", { class: "small", onclick: onAdd }, label)));
+}
+
+function finderResults(status, d, profile, draw, hubEngine, redraw) {
+  const v = finder;
+  const words = v.query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const matches = (...texts) => words.every((w) => texts.some((t) => String(t || "").toLowerCase().includes(w)));
+  const action = !profile.several && profile.models.length ? "Use" : "Add";
+  const held = new Set(profile.models.map((m) => `${m.model}|${m.build}`));
   const out = [];
-  if (hubEngine) {
-    const hub = (v.results.hub || []).map((m) => ({ ...m, params: m.params_b, size: m.size_gb, kinds: [m.task].filter(Boolean) }));
-    const shown = hub.filter(passesFilters);
-    out.push(el("h4", {}, `On the model hub — ${shown.length} of ${hub.length}`));
-    if (v.results.hub_problem) out.push(el("p", { class: "error" }, v.results.hub_problem));
-    if (shown.length) {
-      out.push(el("table", { class: "builds" },
-        el("thead", {}, el("tr", {}, ...["Model", "Params", "Precision", "Download", "Kind", "Downloads", ""].map((h) => el("th", {}, h)))),
-        el("tbody", {}, ...shown.map((m) => el("tr", {},
-          el("td", {}, el("span", { class: "mono" }, m.repo), m.made_from ? el("div", { class: "muted" }, m.made_from) : null,
-            m.gated ? el("div", { class: "error" }, "gated: a rented host cannot fetch it") : null),
-          el("td", { class: "num" }, m.params_b ? `${m.params_b} B` : "—"),
-          el("td", {}, m.precision || "?"),
-          el("td", { class: "num" }, m.size_gb ? `≈${m.size_gb} GB` : "—"),
-          el("td", {}, m.task || "—"),
-          el("td", { class: "num" }, (m.downloads || 0).toLocaleString()),
-          el("td", {}, el("button", { class: "small", onclick: () => { v.choose({ repo: m.repo }, d.rented); draw(); } }, "Choose")))))));
-    }
+
+  // What the pool already has — no search needed.
+  const pool = variantsFor(status, d)
+    .filter((x) => !held.has(`${x.model}|${x.tag}`) && matches(x.model, x.tag))
+    .map((x) => ({ ...x, params: paramsOf((x.model.split(":")[1] || "").replace(/^e/, "")), size: x.size_gb }))
+    .filter(passes);
+  out.push(el("h4", {}, `In the pool — ${pool.length}`));
+  out.push(pool.length ? el("table", { class: "builds" },
+    el("thead", {}, el("tr", {}, ...["Model", "Variant", "Precision", "Size", ""].map((h) => el("th", {}, h)))),
+    el("tbody", {}, ...pool.map((x) => variantRow([
+      el("td", { class: "mono" }, x.model), el("td", { class: "mono" }, x.tag),
+      el("td", {}, x.precision || "—"), el("td", { class: "num" }, x.size_gb ? `${x.size_gb} GB` : "—"),
+    ], () => { hold(d, profile, x.model, x.tag, x.size_gb, x.precision, false); draw(); }, action))))
+    : el("p", { class: "muted" }, words.length ? "Nothing in the pool matches." : `The pool has no other ${d.rented} variant.`));
+
+  if (!v.results) {
+    out.push(el("p", { class: "muted" }, `Press Search to look ${hubEngine ? "on the model hub" : "in Ollama's library"} for anything else.`));
+    return out;
   }
-  const library = [];
-  for (const model of v.results.library || []) {
-    for (const t of model.tags || []) {
-      if (t.runtime === "cloud" || t.runtime === "mlx") continue;  // rented hosts run neither
-      library.push({ model, tag: t, params: paramsOf(t.name.split(":")[1]) ?? null, size: t.size_gb ?? null,
-        kinds: model.capabilities || [], precision: null });
+  if (hubEngine) out.push(...hubResults(status, d, profile, draw, action, held, redraw));
+  else out.push(...libraryResults(status, d, profile, draw, action, held));
+  return out;
+}
+
+// At most this many models from a search, and variants of each, are shown — and measured.
+const SHOWN_GROUPS = 8, SHOWN_VARIANTS = 6;
+
+function hubResults(status, d, profile, draw, action, held, redraw) {
+  const v = finder;
+  const pool = status.engine.pool_variants || [];
+  const out = [el("h4", {}, "On the model hub")];
+  if (v.results.hub_problem) out.push(el("p", { class: "error" }, v.results.hub_problem));
+  let shown = 0;
+  for (const group of v.results.hub || []) {
+    // A group the pool already serves under a name keeps that name; a new one is named here.
+    const known = pool.find((p) => group.variants.some((x) => x.repo === p.tag));
+    const suggested = group.model.split("/").pop().toLowerCase();
+    const name = known ? known.model : (v.names[group.model] ?? suggested);
+    const rows = [];
+    for (const x of group.variants) {
+      if (held.has(`${name}|${x.repo}`)) continue;
+      if (rows.length >= SHOWN_VARIANTS) break;
+      const size = x.size_gb ?? (x.why_not ? null : measure(x.repo, redraw));
+      const row = { params: group.params_b, size, precision: x.precision, kinds: [group.task].filter(Boolean), gated: x.gated };
+      if (!passes(row)) continue;
+      rows.push(variantRow([
+        el("td", { class: "mono" }, x.repo, x.relation === "original" ? el("span", {}, " ", pill("original", "ok")) : null),
+        el("td", {}, x.precision || "?"),
+        el("td", { class: "num" }, size ? `${size} GB` : size === null ? "—" : el("span", { class: "muted" }, "measuring…")),
+        el("td", { class: "muted" }, x.full_speed_on ? `full speed on ${x.full_speed_on}` : (x.runs_on ? `runs on ${x.runs_on}` : "—")),
+        el("td", { class: x.why_not ? "error" : "muted" }, x.why_not || (x.options || []).join(", ")),
+      ], x.why_not ? () => {} : () => {
+        hold(d, profile, name, x.repo, size || null, x.precision, !pool.some((p) => p.tag === x.repo), x.repo);
+        draw();
+      }, x.why_not ? "—" : action));
     }
+    if (!rows.length) continue;
+    shown += 1;
+    if (shown > SHOWN_GROUPS) break;
+    out.push(el("div", { class: "hub-group" },
+      el("div", { class: "row", style: "margin-top:0" },
+        el("strong", { class: "mono" }, group.model),
+        group.params_b ? el("span", {}, `${group.params_b} B`) : null,
+        group.task ? pill(group.task) : null,
+        group.made_from ? el("span", { class: "muted" }, group.made_from) : null,
+        el("span", { style: "margin-left:auto" }),
+        known ? el("span", { class: "muted" }, "in the pool as ", el("span", { class: "mono" }, known.model))
+          : el("span", {}, el("span", { class: "muted" }, "add as "),
+            el("input", { type: "text", class: "mono", style: "width:14rem", value: name, "aria-label": "name in the pool",
+              oninput: (ev) => { v.names[group.model] = ev.target.value; } }))),
+      el("table", { class: "builds" },
+        el("thead", {}, el("tr", {}, ...["Variant", "Precision", "Size", "Cards", "", ""].map((h) => el("th", {}, h)))),
+        el("tbody", {}, ...rows))));
   }
-  const shownLib = library.filter(passesFilters).slice(0, 60);
-  out.push(el("h4", {}, `In Ollama's library — ${shownLib.length} of ${library.length}`,
-    v.results.library_refreshing ? el("span", { class: "muted" }, " · reading the library now; search again in a minute")
-      : !v.results.library_read ? el("span", {}, " · never read here ",
+  if (!shown) out.push(el("p", { class: "muted" }, `Nothing on the hub matches "${v.query}" with these filters.`));
+  return out;
+}
+
+function libraryResults(status, d, profile, draw, action, held) {
+  const v = finder;
+  const pool = status.engine.pool_variants || [];
+  const out = [el("h4", {}, "In Ollama's library",
+    v.results.library_refreshing ? el("span", { class: "muted" }, " · being read now; search again in a minute")
+      : !v.results.library_read ? el("span", {}, " · never read on this pool ",
         el("button", { class: "small", onclick: async (ev) => {
           ev.target.disabled = true;
           try { await api.refreshDirectory(); v.results.library_refreshing = true; } catch (error) { v.error = error.message; }
           draw();
-        } }, "Read Ollama's library")) : null));
-  if (shownLib.length) {
-    out.push(el("table", { class: "builds" },
-      el("thead", {}, el("tr", {}, ...["Model", "Download", "Context", "Kind", ""].map((h) => el("th", {}, h)))),
-      el("tbody", {}, ...shownLib.map(({ model, tag }) => el("tr", {},
-        el("td", {}, el("span", { class: "mono" }, tag.name), tag.in_pool ? pill("in the pool", "ok") : null),
-        el("td", { class: "num" }, tag.size_gb ? `${tag.size_gb} GB` : "—"),
-        el("td", {}, tag.context || "—"),
-        el("td", { class: "muted" }, (model.capabilities || []).join(", ") || "—"),
-        el("td", {}, el("button", { class: "small", onclick: () => {
-          if (hubEngine) { v.choose({ tag }, d.rented); draw(); return; }
-          holdModel(d, profile, tag.name, tag.name, tag.size_gb ?? null, !(status.catalog || {})[tag.name]
-            && !(status.model_set || []).includes(tag.name));
-          draw();
-        } }, "Choose")))))));
+        } }, "Read it now")) : null)];
+  let shown = 0;
+  for (const model of v.results.library || []) {
+    const rows = [];
+    for (const t of model.tags || []) {
+      if (t.runtime === "cloud" || t.runtime === "mlx" || held.has(`${t.name}|${t.name}`)) continue;  // rented hosts run neither
+      const row = { params: paramsOf((t.name.split(":")[1] || "").replace(/^e/, "")), size: t.size_gb ?? null, kinds: model.capabilities || [] };
+      if (!passes(row)) continue;
+      rows.push(variantRow([
+        el("td", { class: "mono" }, t.name, t.in_pool ? el("span", {}, " ", pill("in the pool", "ok")) : null),
+        el("td", { class: "num" }, t.size_gb ? `${t.size_gb} GB` : "—"),
+        el("td", {}, t.context || "—"),
+      ], () => {
+        hold(d, profile, t.name, t.name, t.size_gb ?? null, null, !pool.some((p) => p.tag === t.name));
+        draw();
+      }, action));
+    }
+    if (!rows.length) continue;
+    shown += 1;
+    out.push(el("div", { class: "hub-group" },
+      el("div", { class: "row", style: "margin-top:0" }, el("strong", { class: "mono" }, model.name),
+        ...(model.capabilities || []).map((c) => pill(c)), el("span", { class: "muted" }, model.description || "")),
+      el("table", { class: "builds" },
+        el("thead", {}, el("tr", {}, ...["Variant", "Size", "Context", ""].map((h) => el("th", {}, h)))),
+        el("tbody", {}, ...rows.slice(0, 12)))));
+    if (shown >= 20) break;
   }
+  if (!shown) out.push(el("p", { class: "muted" }, `Nothing in the library matches "${v.query}" with these filters.`));
   return out;
 }
 
-// Choosing the build of one model, for an engine whose builds live on the hub (D100): the
-// original and its quantisations, each with its precision, size and the cards it runs on.
-function buildChoiceView(status, d, profile, draw) {
-  const v = modelPicker;
-  const pick = v.chosen;
-  const known = !!pick.model;
-  const logical = known ? pick.model : v.logical;
-  const search = pick.repo ? pick.repo.split("/").pop() : undefined;
-  const key = `${d.rented}|${logical}|${search || ""}`;
-  const found = hubBuilds[key];
-  if (!found && logical) {
-    hubBuilds[key] = { loading: true };
-    api.builds(logical, d.rented, search ? { search } : {})
-      .then((data) => { hubBuilds[key] = { data }; })
-      .catch((error) => { hubBuilds[key] = { error: error.message }; })
-      .finally(draw);
+// Put a model and its variant in a profile: one model per machine replaces, several adds. A
+// variant new to the pool is remembered to be written into the catalog on save.
+function hold(d, profile, model, tag, size, precision, isNew, repo) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(model || "")) {
+    finder.error = `"${model}" cannot be a model's name: letters, digits, '.', '_', ':', '-' and '/'`;
+    return;
   }
-  const held = profile.models.find((m) => m.model === logical);
-  const nameOk = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(logical || "");
-  return el("div", {},
-    el("div", { class: "row" },
-      el("button", { class: "small", onclick: () => { v.reset(); draw(); } }, "← back to search"),
-      known ? el("strong", { class: "mono" }, logical) : el("span", {},
-        "name in the pool ",
-        el("input", { type: "text", class: "mono", style: "width:16rem", value: v.logical,
-          oninput: (ev) => { v.logical = ev.target.value; } }),
-        el("button", { class: "small", onclick: () => { delete hubBuilds[key]; draw(); } }, "Use this name"),
-        el("span", { class: "muted" }, " what apps will ask for"))),
-    !nameOk ? el("p", { class: "error" }, "a name is letters, digits, '.', '_', ':', '-' and '/'") : null,
-    found?.loading ? el("p", { class: "muted" }, "looking on the hub…") : null,
-    found?.error ? el("p", { class: "error" }, found.error) : null,
-    found?.data ? buildTable(found.data, held ? held.build : "", (repo) => {
-      const build = (found.data.builds || []).find((b) => b.repo === repo);
-      const inCatalog = ((status.catalog || {})[logical] || []).some((x) => x.tag === repo);
-      holdModel(d, profile, logical, repo, build ? build.size_gb : null, !inCatalog);
-      v.reset();
-      draw();
-    }, `profile-build-${logical}`) : null);
-}
-
-// Put a model, with its build, in a profile: one model per machine replaces, several adds.
-function holdModel(d, profile, model, build, size, isNewBuild) {
-  const entry = { model, build, size_gb: size };
+  finder.error = null;
+  const entry = { model, build: tag, size_gb: size, precision };
   if (!profile.several) profile.models = [entry];
   else {
     const at = profile.models.findIndex((m) => m.model === model);
     if (at >= 0) profile.models[at] = entry; else profile.models.push(entry);
   }
-  if (isNewBuild) {
+  if (isNew) {
     const list = d.adds[model] || (d.adds[model] = []);
-    if (!list.some((b) => b.tag === build)) list.push({ tag: build, engine: d.rented, size_gb: size });
+    if (!list.some((b) => b.tag === tag)) list.push({ tag, engine: d.rented, size_gb: size, precision });
+  }
+  // A size the search could not tell is read now, and fills in when it arrives.
+  if (!size && repo) {
+    api.modelSize(repo).then((a) => {
+      if (!a.size_gb) return;
+      entry.size_gb = a.size_gb;
+      for (const b of d.adds[model] || []) if (b.tag === tag) b.size_gb = a.size_gb;
+    }).catch(() => {});
   }
 }
 
-// --- builds on the model hub, and the engine's named options (D100) ---
+// --- machine setup: the engine's image, options and start ---
 
-// One lookup per (engine, model), shared by the engine editor and the model directory.
-const hubBuilds = {};
-
-async function loadBuilds(model, engine, { fresh = false } = {}) {
-  const key = `${engine}|${model}`;
-  hubBuilds[key] = { ...(hubBuilds[key] || {}), loading: true, error: null };
-  try {
-    hubBuilds[key].data = await api.builds(model, engine, { fresh });
-  } catch (error) {
-    hubBuilds[key].error = error.message;
-  } finally {
-    hubBuilds[key].loading = false;
+function machineSetup(status, d, draw) {
+  const vllm = d.rented === "vllm";
+  const offer = (status.engine.offers || {})[d.rented] || { builds_on_hub: false, options: {} };
+  const rows = [];
+  if (vllm) {
+    const list = el("div", {}, ...(d.images || []).map((img, i) => el("div", { class: "row" },
+      el("input", { type: "text", style: "width:18rem", value: img.image,
+        oninput: (ev) => { d.images[i].image = ev.target.value; } }),
+      el("span", { class: "muted" }, "driver ≥"),
+      el("input", { type: "text", style: "width:5rem", value: img.min_driver,
+        oninput: (ev) => { d.images[i].min_driver = ev.target.value; } }),
+      el("button", { class: "small", onclick: () => { d.images.splice(i, 1); draw(); } }, "Remove"))),
+      el("button", { class: "small", onclick: () => { d.images.push({ image: "", min_driver: "" }); draw(); } }, "Add an image"));
+    rows.push(stackedRow("images", "images, newest first", { control: list },
+      "a machine gets the first its driver can run; one that can run none is never bid on"));
+  } else {
+    rows.push(stackedRow("image", "image", { control: el("input", { type: "text", style: "width:18rem", value: d.image,
+      oninput: (ev) => { d.image = ev.target.value; } }) }, "pinned, never a floating tag"));
   }
-  return hubBuilds[key];
+  const optionNames = Object.keys(offer.options || {});
+  if (optionNames.length) {
+    const custom = (d.engine_start || "").trim() !== "";
+    rows.push(stackedRow("engine_options", "engine options",
+      { control: el("div", {}, ...optionNames.map((key) => optionBox(key, offer.options[key], d.engine_options, custom, draw))) },
+      custom ? "these belong to the engine's own start; clear the start command to use them"
+        : "each model gets an option only if its family has one — the rest start without it, and the machine says so"));
+  }
+  rows.push(stackedRow("engine_start", "start command", {
+    control: el("input", { type: "text", style: "width:26rem", value: d.engine_start,
+      placeholder: vllm ? "blank: the agent's own vllm-start (recommended)" : "how the image's engine is started, if it does not start itself",
+      oninput: (ev) => { d.engine_start = ev.target.value; } }),
+  }, vllm ? "blank lets the pool start vLLM on what its agent downloaded" : "runs after the dead-man timer is armed"));
+  return el("details", { class: "panel machine-setup", ...(engineEdit.setupOpen ? { open: true } : {}),
+    ontoggle: (ev) => { engineEdit.setupOpen = ev.target.open; } },
+    el("summary", {}, el("strong", {}, "Machine setup"),
+      el("span", { class: "muted" }, ` — ${d.rented}: ${vllm ? `${(d.images || []).length} image(s)` : d.image || "no image"}, ${d.engine_options.length ? d.engine_options.join(", ") : "no options"}, ${d.engine_start ? "own start command" : "the engine's own start"}`)),
+    el("table", {}, el("tbody", {}, ...rows)),
+    enginePanel(status.engine));
 }
+
+// --- the engine's named options (D100) ---
 
 const ago = (ts) => {
   if (!ts) return "never";
@@ -1381,34 +1411,6 @@ const ago = (ts) => {
   if (minutes < 48 * 60) return `${Math.round(minutes / 60)} h ago`;
   return `${Math.round(minutes / 1440)} days ago`;
 };
-
-// A model's builds on the hub, as the pool sorted them: pick one with a radio button. A build a
-// rented host cannot fetch is shown, and cannot be picked, with the reason.
-function buildTable(found, chosen, onChoose, group, { allowNone = false } = {}) {
-  const radio = (value, disabled) => el("input", {
-    type: "radio", name: group, value, ...(chosen === value || (!chosen && value === "") ? { checked: true } : {}),
-    ...(disabled ? { disabled: true } : {}), onchange: () => onChoose(value),
-  });
-  const rows = (found.builds || []).map((b) => el("tr", {},
-    el("td", {}, el("label", { class: "pick" }, radio(b.repo, !!b.why_not), el("span", { class: "mono" }, b.repo))),
-    el("td", {}, b.relation === "original" ? pill("original", "ok") : el("span", { class: "muted" }, "build")),
-    el("td", {}, b.precision || "?"),
-    el("td", { class: "num" }, b.size_gb == null ? "—" : `${b.size_estimated ? "≈" : ""}${b.size_gb} GB`),
-    el("td", {}, b.full_speed_on ? `full speed on ${b.full_speed_on}` : "—",
-      b.runs_on && b.runs_on !== b.full_speed_on ? el("div", { class: "muted" }, `runs on ${b.runs_on}`) : null),
-    el("td", { class: "muted" }, (b.options || []).join(", ") || "—"),
-    el("td", { class: "num" }, (b.downloads || 0).toLocaleString()),
-    el("td", { class: "muted" }, b.why_not || "")));
-  if (allowNone) rows.unshift(el("tr", {}, el("td", { colspan: "8" },
-    el("label", { class: "pick" }, radio("", false), el("span", { class: "muted" }, "no build for this engine")))));
-  const left = Object.entries(found.hidden || {}).map(([why, n]) => `${n} ${why}`).join(" · ");
-  return el("div", {},
-    (found.builds || []).length ? el("table", { class: "builds" },
-      el("thead", {}, el("tr", {}, ...["Build", "", "Precision", "Size", "Cards", "Options", "Downloads", ""].map((h) => el("th", {}, h)))),
-      el("tbody", {}, ...rows))
-      : el("p", { class: "muted" }, `No build found on the hub for ${found.model} (searched ${(found.searched || []).join(", ")}).`),
-    el("p", { class: "muted" }, left ? `Left out: ${left}.` : "", ` Looked up ${ago(found.looked_up_at)}.`));
-}
 
 function optionBox(key, option, chosen, disabled, redraw) {
   const box = el("input", { type: "checkbox", ...(chosen.includes(key) ? { checked: true } : {}),
@@ -2047,7 +2049,7 @@ screens.models = (status) => {
   };
   return [
     el("h1", {}, "Models"),
-    el("p", { class: "muted" }, "Every host holds the pool's whole model set, loaded, all the time. A host that does not is not routed to."),
+    el("p", { class: "muted" }, "What each host serves now: the variant of each model it was given, and whether it is loaded. A host missing what it was given is not routed to."),
     el("div", { class: "panel" }, el("h2", {}, "The pool's model set"),
       el("div", { class: "mono" }, (status.model_set || []).join("  ·  ") || "—")),
     el("h2", {}, "Per host"),
@@ -2061,239 +2063,10 @@ screens.models = (status) => {
         el("td", { class: "muted" }, row.served ? row.served.runtime_class : "—"),
         el("td", { class: "muted" }, row.served ? schema(row.served.enforces_schema) : "—"),
         el("td", {}, row.served ? residentPill(row) : pill("not served", "bad")))))),
-    ...directorySection(),
+    el("p", { class: "muted" }, "Models are added, and the variant each rented machine holds is chosen, under ",
+      el("a", { href: "#rented/engine" }, "Rented capacity → Profiles"), "."),
   ];
 };
-
-// --- the model directory (D101) ---
-
-// What the pool could serve: Ollama's library and the builds looked up on the hub, cached by the
-// supervisor. Kept across redraws of the screen — the status arrives every few seconds, and a
-// half-made choice must not be thrown away with it.
-const directoryView = {
-  data: null, loading: false, error: null, query: "", open: new Set(), everyTag: new Set(),
-  picks: {}, options: null, message: "", box: null, list: null, search: null, polling: false,
-};
-
-function directorySection() {
-  const v = directoryView;
-  if (!v.box) {
-    v.box = el("div", {});
-    v.list = el("div", {});
-    v.search = el("input", { type: "search", placeholder: "filter: a name, a word, a capability", style: "width:22rem",
-      oninput: (ev) => { v.query = ev.target.value; drawDirectoryList(); } });
-  }
-  if (!v.data && !v.loading && !v.error) loadDirectory();
-  drawDirectory();
-  return [el("h2", {}, "Model directory"), v.box];
-}
-
-async function loadDirectory() {
-  const v = directoryView;
-  v.loading = true;
-  try {
-    v.data = await api.directory();
-    v.error = null;
-    if (v.options === null) v.options = [...(v.data.engine_options || [])];
-  } catch (error) {
-    v.error = error.message;
-  } finally {
-    v.loading = false;
-    drawDirectory();
-  }
-}
-
-function hubEngine() {
-  const offers = directoryView.data?.offers || {};
-  return Object.keys(offers).find((name) => offers[name].builds_on_hub) || null;
-}
-
-async function refreshDirectoryNow(button) {
-  button.disabled = true;
-  try {
-    await api.refreshDirectory();
-    directoryView.polling = true;
-    // A refresh reads hundreds of pages at a gentle pace; follow it rather than wait on it.
-    while (directoryView.polling) {
-      await loadDirectory();
-      if (!directoryView.data?.refreshing) break;
-      await new Promise((resolve) => setTimeout(resolve, 3000));
-    }
-  } catch (error) {
-    alert(error.message);
-  } finally {
-    directoryView.polling = false;
-    button.disabled = false;
-  }
-}
-
-function drawDirectory() {
-  const v = directoryView;
-  if (!v.box) return;
-  if (!v.data) {
-    v.box.replaceChildren(el("p", { class: v.error ? "error" : "muted" }, v.error || "Loading…"));
-    return;
-  }
-  const runs = v.data.refreshed || {};
-  const run = (source, label) => {
-    const r = runs[source];
-    if (!r) return el("div", {}, `${label}: never read`);
-    const state = r.ok === null || r.ok === undefined ? pill("refreshing", "warn") : r.ok ? pill("ok", "ok") : pill("failed", "bad");
-    return el("div", {}, `${label}: `, state, ` ${r.detail || ""} · last good ${ago(r.last_success)}`);
-  };
-  const settings = v.data.settings || {};
-  v.box.replaceChildren(
-    el("div", { class: "panel" },
-      el("p", { class: "muted", style: "margin-top:0" },
-        "Every model Ollama's library offers, and each one's builds on the model hub for engines that fetch from it — ",
-        "cached here, and served to apps as it is. Adding one edits the pool's file, through its own rules."),
-      run("ollama", "Ollama's library"),
-      run("hub", "Builds on the model hub"),
-      el("div", { class: "row" },
-        el("button", { class: "primary", onclick: (ev) => refreshDirectoryNow(ev.target),
-          ...(v.data.refreshing ? { disabled: true } : {}) }, v.data.refreshing ? "Refreshing…" : "Refresh now"),
-        el("span", { class: "muted" },
-          settings.refresh_hours ? `refreshed on its own every ${settings.refresh_hours} h` : "refreshed only when asked (directory.refresh_hours: 0)",
-          ` · hub lookups: ${settings.hub_builds === "all" ? "every size in the library" : settings.hub_builds === "none" ? "only when asked" : "the pool's own models"}`,
-          ` at ${settings.hub_requests_per_minute}/min`))),
-    el("div", { class: "row" }, v.search, el("span", { class: "muted" }, `${(v.data.models || []).length} models`)),
-    v.list,
-    directoryFooter());
-  drawDirectoryList();
-}
-
-function drawDirectoryList() {
-  const v = directoryView;
-  if (!v.list || !v.data) return;
-  const words = v.query.trim().toLowerCase();
-  const matches = (v.data.models || []).filter((m) => !words
-    || m.name.toLowerCase().includes(words) || (m.description || "").toLowerCase().includes(words)
-    || (m.capabilities || []).some((c) => c.toLowerCase() === words));
-  const shown = words ? matches : matches.slice(0, 40);
-  v.list.replaceChildren(
-    !(v.data.models || []).length ? el("p", { class: "muted" }, "Nothing cached yet. Refresh now to read Ollama's library.") : null,
-    ...shown.map(directoryModel),
-    shown.length < matches.length ? el("p", { class: "muted" }, `${matches.length - shown.length} more — filter to find them.`) : null);
-}
-
-function directoryModel(model) {
-  const v = directoryView;
-  const open = v.open.has(model.name);
-  const toggle = () => { open ? v.open.delete(model.name) : v.open.add(model.name); drawDirectoryList(); };
-  const head = el("div", { class: "row dir-head", style: "cursor:pointer", onclick: toggle },
-    el("strong", { class: "mono" }, `${open ? "▾" : "▸"} ${model.name}`),
-    ...(model.capabilities || []).map((c) => pill(c)),
-    el("span", { class: "muted" }, (model.sizes || []).join(" · ")),
-    model.pulls ? el("span", { class: "muted" }, `${model.pulls} pulls`) : null);
-  if (!open) return el("div", { class: "dir-model" }, head, el("div", { class: "muted" }, model.description));
-  const every = v.everyTag.has(model.name);
-  const tags = (model.tags || []).filter((t) => every || t.runtime === null || t.in_pool);
-  const rows = [];
-  for (const t of tags) {
-    const pick = v.picks[t.name];
-    const box = el("input", { type: "checkbox", ...(pick ? { checked: true } : {}),
-      ...(t.in_pool || t.runtime === "cloud" ? { disabled: true } : {}),
-      onchange: (ev) => {
-        if (ev.target.checked) v.picks[t.name] = { tag: t, ollama: true, hub: "", rent_for: true };
-        else delete v.picks[t.name];
-        drawDirectory();
-      } });
-    rows.push(el("tr", {},
-      el("td", {}, el("label", { class: "pick" }, box, el("span", { class: "mono" }, t.name))),
-      el("td", { class: "num" }, t.size_gb == null ? "—" : `${t.size_gb} GB`),
-      el("td", {}, t.context || "—"),
-      el("td", { class: "muted" }, (t.inputs || []).join(", ")),
-      el("td", {}, t.in_pool ? pill("in the pool", "ok") : t.runtime === "mlx" ? pill("Apple silicon only", "warn")
-        : t.runtime === "cloud" ? pill("Ollama's cloud only", "bad") : t.is_latest ? pill("latest") : "")));
-    if (pick) rows.push(el("tr", { class: "detail" }, el("td", { colspan: "5" }, directoryPick(t, pick))));
-  }
-  return el("div", { class: "dir-model open" }, head,
-    el("p", { class: "muted" }, model.description),
-    el("table", {}, el("thead", {}, el("tr", {}, ...["Add as", "Download", "Context", "Input", ""].map((h) => el("th", {}, h)))),
-      el("tbody", {}, ...rows)),
-    el("button", { class: "small", onclick: () => { every ? v.everyTag.delete(model.name) : v.everyTag.add(model.name); drawDirectoryList(); } },
-      every ? "Only the sizes" : `Every encoding (${(model.tags || []).length})`));
-}
-
-function directoryPick(tag, pick) {
-  const v = directoryView;
-  const engine = hubEngine();
-  // With model profiles, what rented hosts hold is chosen there, not here (D111).
-  const declared = v.data.placement === "declared" && !(v.data.rent_profiles || []).length;
-  const found = tag.vllm;
-  const lookup = async (button, fresh) => {
-    button.disabled = true;
-    const result = await loadBuilds(tag.name, engine, { fresh });
-    if (result.data) tag.vllm = result.data;
-    else alert(result.error);
-    drawDirectory();
-  };
-  return el("div", {},
-    el("label", { class: "pick" }, el("input", { type: "checkbox", ...(pick.ollama ? { checked: true } : {}),
-      onchange: (ev) => { pick.ollama = ev.target.checked; } }), el("span", {}, "served by Ollama as "), el("span", { class: "mono" }, tag.name)),
-    engine ? el("div", {},
-      el("div", { class: "row" }, el("span", {}, `${engine} build:`),
-        found ? el("button", { class: "small", onclick: (ev) => lookup(ev.target, true) }, "Look again on the hub")
-          : el("button", { class: "small", onclick: (ev) => lookup(ev.target, false) }, "Look up on the hub")),
-      found ? buildTable(found, pick.hub, (repo) => { pick.hub = repo; drawDirectory(); }, `dir-${tag.name}`, { allowNone: true }) : null)
-      : null,
-    declared ? el("label", { class: "pick" }, el("input", { type: "checkbox", ...(pick.rent_for ? { checked: true } : {}),
-      onchange: (ev) => { pick.rent_for = ev.target.checked; } }), el("span", {}, "rent hosts for it")) : null);
-}
-
-function directoryFooter() {
-  const v = directoryView;
-  const picks = Object.values(v.picks);
-  if (!picks.length) return null;
-  const engine = hubEngine();
-  const offered = ((v.data.offers || {})[engine] || {}).options || {};
-  const note = el("span", { class: "muted" }, v.message);
-  return el("div", { class: "panel" },
-    el("h2", {}, `Add ${picks.length} model(s) to the pool`),
-    el("div", { class: "mono" }, picks.map((p) => p.tag.name).join("  ·  ")),
-    Object.keys(offered).length ? el("div", {}, el("p", { class: "muted" }, `${engine} options, for every model its hosts run:`),
-      ...Object.keys(offered).map((key) => optionBox(key, offered[key], v.options, false, () => {}))) : null,
-    el("div", { class: "row" },
-      el("button", { class: "primary", onclick: (ev) => addFromDirectory(ev.target, note) }, "Add to the pool"),
-      el("button", { class: "small", onclick: () => { v.picks = {}; v.message = ""; drawDirectory(); } }, "Clear"),
-      note));
-}
-
-async function addFromDirectory(button, note) {
-  const v = directoryView;
-  const engine = hubEngine();
-  const body = {
-    add: Object.values(v.picks).map((p) => ({
-      name: p.tag.name,
-      builds: { ...(p.ollama ? { ollama: p.tag.name } : {}), ...(engine && p.hub ? { [engine]: p.hub } : {}) },
-      rent_for: v.data.placement === "declared" ? !!p.rent_for : false,
-    })),
-    engine_options: v.options || [],
-  };
-  button.disabled = true;
-  try {
-    let answer;
-    try {
-      answer = await api.addModels(body);
-    } catch (error) {
-      const retype = (error.changes || []).find((c) => c.requires_retype);
-      if (!retype) throw error;
-      const ok = await confirmAction({ title: "This loosens a limit",
-        body: el("div", {}, ...error.changes.map((c) => el("p", {}, c.detail))), retype: retype.value });
-      if (!ok) return;
-      answer = await api.addModels({ ...body, confirm: retype.value });
-    }
-    v.picks = {};
-    v.data = null;
-    v.message = ` added · ${(answer.changes || []).length} change(s) applied`;
-    await refresh();
-  } catch (error) {
-    v.message = ` not added: ${error.message}`;
-    note.textContent = v.message;
-  } finally {
-    button.disabled = false;
-  }
-}
 
 screens.leases = async () => {
   const { leases } = await api.leases();
@@ -2555,9 +2328,7 @@ function handleFrame(chunk) {
   } else if (type === "status") {
     state.status = payload;
     document.getElementById("pool-name").textContent = payload.pool;
-    // Not while the operator is typing into the directory: a redraw would take the field away.
-    const typing = state.screen === "models" && directoryView.box?.contains(document.activeElement);
-    if (["overview", "hosts", "models"].includes(state.screen) && !typing) render();
+    if (["overview", "hosts", "models"].includes(state.screen)) render();
   }
 }
 

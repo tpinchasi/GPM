@@ -26,7 +26,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..catalog import variants_for_host
-from ..config import ConfigError, PoolConfig
+from ..config import ConfigError, PoolConfig, Variant
 from ..configplan import (
     CannotEdit,
     ConfigStore,
@@ -39,7 +39,7 @@ from ..configplan import (
     set_values,
 )
 from ..contract import CONTRACT_VERSION
-from ..directory import read_directory
+from ..directory import HUB, DirectoryStore, build_sizes_gb, read_directory
 from ..engines import EngineNotFound, available_engines, get_engine
 from ..hostcheck import test_connection
 from ..hubbuilds import HubUnavailable, valid_search
@@ -384,6 +384,31 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             })
         return view
 
+    def _pool_variants() -> list[dict[str, Any]]:
+        """Every variant the pool's catalog lists, for every engine, with its size and precision
+        where anything has measured them — what a profile picks from, a model and its variant
+        in one row (D111). A model with no catalog entry is served under its own name by the
+        pool's engine, and is listed that way."""
+        config = supervisor.config
+        store = DirectoryStore(supervisor.db)
+        found = []
+        for model in config.pool.model_set:
+            entry = config.catalog.get(model)
+            variants = entry.variants if entry else [Variant(tag=model, engine=config.engine)]
+            looked_up = store.get(HUB, model)
+            hub = {b.get("repo"): b for b in (looked_up[0].get("builds", []) if looked_up else [])}
+            for variant in variants:
+                size = variant.size_gb or build_sizes_gb(supervisor.db, {model: variant.tag}).get(model)
+                found.append({
+                    "model": model,
+                    "tag": variant.tag,
+                    "engine": variant.engine or config.engine,
+                    "requires": list(variant.requires),
+                    "size_gb": size,
+                    "precision": (hub.get(variant.tag) or {}).get("precision"),
+                })
+        return found
+
     def served_on(
         variants: Mapping[str, Sequence[Any]], resident: frozenset[str], available: frozenset[str]
     ) -> dict[str, Any]:
@@ -600,6 +625,9 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     ),
                     # The model profiles, each with what a machine holding it needs (D111).
                     "profiles": _profiles_view(),
+                    # Every variant a profile can pick from, a model and its variant together.
+                    "pool_variants": _pool_variants(),
+                    "rented_capabilities": list(supervisor.config.rented.capabilities) if supervisor.config.rented else [],
                     "rent_profiles": list(supervisor.config.rented.rent_profiles) if supervisor.config.rented else [],
                     "engine_start": supervisor.config.rented.engine_start if supervisor.config.rented else None,
                     "image": supervisor.config.rented.image if supervisor.config.rented else None,
@@ -1062,6 +1090,18 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             "library_refreshing": supervisor.directory.running,
             "in_pool": list(supervisor.config.pool.model_set),
         })
+
+    @app.get("/pool/models/size")
+    async def model_size(repo: str) -> JSONResponse:
+        """One hub repository's weights, exactly, from its file listing (D111) — a search only
+        has the hub's estimate, and a profile's minimums are worked out from this."""
+        if not valid_search(repo):
+            return _error(400, "bad_repo", "name a repository: letters, digits, '.', '_', '-' and '/'")
+        try:
+            size = await supervisor.directory.exact_size(repo)
+        except HubUnavailable as exc:
+            return _error(502, "hub_unavailable", str(exc))
+        return JSONResponse({"repo": repo, "size_gb": size})
 
     @app.get("/pool/builds")
     async def builds_on_hub(model: str, engine: Optional[str] = None, search: Optional[str] = None,

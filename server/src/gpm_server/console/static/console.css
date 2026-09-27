@@ -86,3 +86,12 @@ td .why { margin-top: 4px; font-size: 12.5px; }
 .profile-editor h3.picker-title { font-size: 13px; margin: 14px 0 0; }
 .profile-editor h4 { font-size: 12.5px; margin: 12px 0 4px; color: var(--muted); }
 .row.filters input, .row.filters select { padding: 3px 6px; }
+.profile .profile-name { width: 13rem; font-weight: 600; }
+.profile table.held { margin-top: 6px; }
+.needs { font-size: 13px; }
+.finder { border-top: 1px dashed var(--line); margin-top: 10px; padding-top: 10px; }
+.finder .finder-search { width: 26rem; max-width: 100%; }
+.finder h4 { font-size: 12.5px; margin: 14px 0 4px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.hub-group { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; margin: 6px 0; }
+details.machine-setup { margin-top: 12px; }
+details.machine-setup summary { margin-top: 0; }

@@ -10,15 +10,18 @@ each; the pool rents hosts *as* profiles; and what a profile holds sets the sear
 Against the fake provider and the fake hub; nothing here spends money.
 """
 
+import json
 import math
 import textwrap
+from pathlib import Path
 
 import httpx
 import pytest
 import yaml
+from fakes.fake_vllm import FakeHub
 from fakes.harness import BackgroundLoop, ServerHandle
 from gpm_agent import vllm_launch
-from gpm_server import sizing
+from gpm_server import hubbuilds, sizing
 from gpm_server.config import PoolConfig, load_config
 from gpm_server.db import Database
 from gpm_server.ledger import EventLog, LeaseStore, SpendLedger
@@ -384,3 +387,50 @@ def test_renting_as_no_profile_is_refused(pool):
     supervisor, url, path = pool
     answer = put(url, {"profiles": {"chat": {BIG: BIG_FP4}}, "rent": []})
     assert answer.status_code == 400 and "at least one profile" in answer.text
+
+
+# --- finding a model and its variant in one step ---
+
+RECORDED_SEARCH = json.loads(
+    (Path(__file__).resolve().parent / "fixtures" / "directory" / "hub_search_gemma-4-26b.json").read_text()
+)
+
+
+def test_a_search_answers_with_models_each_with_its_variants():
+    """A quantisation is a variant of its model, offered beside it — not a model of its own, and
+    not something to look up in a second step."""
+    groups = {g.model: g for g in hubbuilds.group_search(RECORDED_SEARCH)}
+    original = groups["google/gemma-4-26B-A4B-it"]
+    variants = [v.repo for v in original.variants]
+    assert variants[0] == "google/gemma-4-26B-A4B-it" and original.variants[0].relation == "original"
+    assert "nvidia/Gemma-4-26B-A4B-NVFP4" in variants and "nvidia/Gemma-4-26B-A4B-NVFP4" not in groups
+    assert original.params_b == 25.81
+    everything = [v.repo for g in groups.values() for v in g.variants]
+    assert not any("GGUF" in r or "gguf" in r or "MLX" in r for r in everything), "files a rented host cannot run"
+
+
+def test_a_quantised_variants_size_is_not_guessed():
+    """The hub's tally reads a 4-bit build as larger than its original; shown, that number would
+    filter and size machines wrongly. Unquantised sizes are exact from the tally and are kept."""
+    groups = {g.model: g for g in hubbuilds.group_search(RECORDED_SEARCH)}
+    by_repo = {v.repo: v for v in groups["google/gemma-4-26B-A4B-it"].variants}
+    assert by_repo["google/gemma-4-26B-A4B-it"].size_gb == 51.6
+    assert by_repo["cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit"].size_gb is None
+
+
+def test_a_variants_exact_size_is_read_once_and_kept(pool, monkeypatch):
+    supervisor, url, path = pool
+    hub = FakeHub({BIG_FP8: {"model-1.safetensors": b"w" * 3_000_000, "README.md": b"x"}})
+    loop = BackgroundLoop()
+    server = ServerHandle(hub.app, loop)
+    monkeypatch.setenv("HF_ENDPOINT", server.base_url)
+    try:
+        with httpx.Client(base_url=url, headers={"Authorization": f"Bearer {ADMIN_KEY}"}, timeout=30) as http:
+            first = http.get("/pool/models/size", params={"repo": BIG_FP8}).json()
+            second = http.get("/pool/models/size", params={"repo": BIG_FP8}).json()
+    finally:
+        server.stop()
+        loop.stop()
+    # A test-sized file rounds to nothing in GB; what matters here is one read, then the cache.
+    assert first == second == {"repo": BIG_FP8, "size_gb": first["size_gb"]}
+    assert sum(1 for r in hub.requests if r.startswith("list")) == 1, hub.requests
