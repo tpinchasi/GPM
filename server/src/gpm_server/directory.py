@@ -44,6 +44,8 @@ DEFAULT_OLLAMA_SITE = "https://ollama.com"
 OLLAMA_CONCURRENCY = 4
 
 OLLAMA, HUB = "ollama", "hub"
+#: One hub repository's exact weights, read from its file listing when a variant is chosen (D111).
+HUB_SIZE = "hub-size"
 
 
 def ollama_site() -> str:
@@ -277,6 +279,9 @@ def build_sizes_gb(database: Database, builds: dict[str, str]) -> dict[str, Opti
             )
         if found is None:
             found = library_tags.get(tag)
+        if found is None:
+            measured = store.get(HUB_SIZE, tag)
+            found = measured[0].get("size_gb") if measured else None
         sizes[model] = float(found) if found else None
     return sizes
 
@@ -405,11 +410,28 @@ class Directory:
         return entry | {"looked_up_at": time.time(), "cached": False}
 
     async def search_hub(self, term: str) -> list[dict[str, Any]]:
-        """Models on the hub whose name holds `term` (D111), at the directory's pace. Not cached:
-        a search is an operator looking, and the builds of whatever they choose are."""
+        """Models on the hub whose name holds `term`, each with its variants (D111), at the
+        directory's pace. Not cached: a search is an operator looking."""
         async with self._client(hubbuilds.hub_url()) as client:
-            found = await hubbuilds.search_models(term, client=client, pace=self._paced)
-        return [asdict(model) for model in found]
+            found = await hubbuilds.search_variants(term, client=client, pace=self._paced)
+        options = self._options()
+        groups = []
+        for group in found:
+            entry = asdict(group)
+            with_options({"builds": entry["variants"]}, options)
+            groups.append(entry)
+        return groups
+
+    async def exact_size(self, repo: str) -> Optional[float]:
+        """One repository's weights, exactly, at the directory's pace — read once, then kept."""
+        cached = self.store.get(HUB_SIZE, repo)
+        if cached is not None:
+            return cached[0].get("size_gb")
+        async with self._client(hubbuilds.hub_url()) as client:
+            size = await hubbuilds.exact_size_gb(repo, client=client, pace=self._paced)
+        if size is not None:
+            self.store.put(HUB_SIZE, repo, {"size_gb": size})
+        return size
 
     def hub_names(self) -> list[str]:
         """What a refresh looks up on the hub, by the operator's choice."""

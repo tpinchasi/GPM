@@ -344,21 +344,21 @@ _TASKS = {
 
 
 @dataclass
-class HubModel:
-    """One model found by a free search — an original or a fine-tune, never a quantisation of
-    one (those are its builds, offered once it is chosen)."""
+class HubGroup:
+    """One model found by a free search, with every variant of it the search turned up — the
+    original and its quantisations side by side, so a variant is chosen in one step (D111)."""
 
-    repo: str
-    #: Billions of parameters, from the weights' own tally; None where the hub has none.
+    #: The original the variants are builds of — the hub's own `base_model:quantized:` link.
+    model: str
+    #: Billions of parameters, from the original's weights; None where the search did not
+    #: return the original (a quantisation's tally counts packed bytes, not weights).
     params_b: Optional[float]
-    precision: Optional[str]
-    size_gb: Optional[float]
     task: Optional[str]
     family: Optional[str]
-    downloads: int
-    gated: bool
-    #: "original", or what it was made from: "fine-tune of …", "merge of …".
-    made_from: Optional[str] = None
+    #: "fine-tune of …" or "merge of …", where the original says so.
+    made_from: Optional[str]
+    variants: list[Build] = field(default_factory=list)
+    downloads: int = 0
 
 
 def params_b(entry: dict[str, Any]) -> Optional[float]:
@@ -367,41 +367,54 @@ def params_b(entry: dict[str, Any]) -> Optional[float]:
     return round(total / 1e9, 2) if total else None
 
 
-def search_result(entry: dict[str, Any]) -> Optional[HubModel]:
-    """A search hit as a model to choose, or None where it is not one: files the engine cannot
-    load, or a quantisation of another model — which is offered as that model's build."""
-    if not_loadable(entry):
-        return None
-    linked = links(entry)
-    if {"quantized", "adapter"} & set(linked):
-        return None
-    config = entry.get("config") or {}
-    tally = (entry.get("safetensors") or {}).get("parameters") or {}
-    made_from = None
-    for kind in ("finetune", "merge"):
-        if linked.get(kind):
-            made_from = f"{'fine-tune' if kind == 'finetune' else 'merge'} of {sorted(linked[kind])[0]}"
-            break
-    return HubModel(
-        repo=entry["id"],
-        params_b=params_b(entry),
-        precision=precision_of(config.get("quantization_config"), tally),
-        size_gb=size_gb(tally),
-        task=_TASKS.get(str(entry.get("pipeline_tag") or "")),
-        family=config.get("model_type") if isinstance(config.get("model_type"), str) else None,
-        downloads=int(entry.get("downloads") or 0),
-        gated=bool(entry.get("gated")),
-        made_from=made_from,
-    )
+def group_search(entries: list[dict[str, Any]]) -> list[HubGroup]:
+    """A search's answer as models, each with its variants. Pure: the tests drive it with the
+    hub's own answers, recorded.
+
+    Files the engine cannot load (GGUF, MLX, no safetensors) and adapters are left out — they
+    are not variants a rented host can run. A quantisation joins the group of the model it is a
+    quantisation of, whether or not the search returned that model itself."""
+    groups: dict[str, HubGroup] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not_loadable(entry):
+            continue
+        linked = links(entry)
+        if linked.get("adapter"):
+            continue
+        quantised = sorted(linked.get("quantized", ()))
+        base = quantised[0] if quantised else entry["id"]
+        group = groups.get(base)
+        if group is None:
+            group = groups[base] = HubGroup(model=base, params_b=None, task=None, family=None, made_from=None)
+        if not quantised:
+            config = entry.get("config") or {}
+            group.params_b = params_b(entry)
+            group.task = _TASKS.get(str(entry.get("pipeline_tag") or ""))
+            group.family = config.get("model_type") if isinstance(config.get("model_type"), str) else None
+            for kind in ("finetune", "merge"):
+                if linked.get(kind):
+                    group.made_from = f"{'fine-tune' if kind == 'finetune' else 'merge'} of {sorted(linked[kind])[0]}"
+                    break
+        group.task = group.task or _TASKS.get(str(entry.get("pipeline_tag") or ""))
+        variant = describe(entry, "build" if quantised else "original", of=base)
+        if (entry.get("config") or {}).get("quantization_config"):
+            # The hub's tally counts packed weights by their container type, so a 4-bit build
+            # can read as larger than its original. Not shown until measured (`exact_size_gb`).
+            variant.size_gb = None
+        group.variants.append(variant)
+        group.downloads = max(group.downloads, int(entry.get("downloads") or 0))
+    for group in groups.values():
+        group.variants.sort(key=lambda v: (v.relation != "original", -v.downloads))
+    return sorted(groups.values(), key=lambda g: -g.downloads)
 
 
-async def search_models(term: str, *, client: Optional[httpx.AsyncClient] = None,
-                        pace: Callable[[], Awaitable[None]] = _unpaced,
-                        limit: int = SEARCH_LIMIT) -> list[HubModel]:
-    """Any model on the hub whose name holds `term`, most downloaded first (D111).
-
-    One request, no credential — what an anonymous machine sees is what a rented host can fetch.
-    Only reads: the operator's choice is saved as a repository name, as every build is."""
+async def search_variants(term: str, *, client: Optional[httpx.AsyncClient] = None,
+                          pace: Callable[[], Awaitable[None]] = _unpaced,
+                          limit: int = SEARCH_LIMIT) -> list[HubGroup]:
+    """Every loadable repository on the hub whose name holds `term`, most downloaded first, as
+    models with their variants (D111). One request, no credential — what an anonymous machine
+    sees is what a rented host can fetch. Sizes are the hub's tally, an estimate; the exact size
+    of the one chosen is read afterwards (`exact_size_gb`)."""
     if not valid_search(term):
         raise ValueError(f"not a model name to search for: {term!r}")
     owned = client is None
@@ -420,13 +433,26 @@ async def search_models(term: str, *, client: Optional[httpx.AsyncClient] = None
     finally:
         if owned:
             await client.aclose()
-    found = []
-    for entry in listed:
-        if isinstance(entry, dict) and isinstance(entry.get("id"), str):
-            model = search_result(entry)
-            if model is not None:
-                found.append(model)
-    return found
+    return group_search(listed)
+
+
+async def exact_size_gb(repo: str, *, client: Optional[httpx.AsyncClient] = None,
+                        pace: Callable[[], Awaitable[None]] = _unpaced) -> Optional[float]:
+    """The weights one repository holds, from its own file listing — the size a profile's
+    minimums are worked out from, where the search only had an estimate."""
+    if not valid_search(repo):
+        raise ValueError(f"not a repository name: {repo!r}")
+    owned = client is None
+    client = client or httpx.AsyncClient(base_url=hub_url(), timeout=20.0, headers={})
+    try:
+        await pace()
+        listing = await client.get(f"/api/models/{repo}/tree/main")
+        return weights_size_gb(listing.json()) if listing.status_code == 200 else None
+    except httpx.HTTPError as exc:
+        raise HubUnavailable(f"the model hub did not answer: {exc or type(exc).__name__}") from exc
+    finally:
+        if owned:
+            await client.aclose()
 
 
 def hub_url() -> str:
