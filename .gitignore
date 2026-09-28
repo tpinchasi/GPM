@@ -23,3 +23,7 @@ gpm-agent.pyz
 env
 .env
 .env.*
+
+# The forwarder's logs, kept beside the pool's database (D110).
+gpm-forwarder.log
+/forwards/

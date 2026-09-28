@@ -1000,7 +1000,7 @@ async def test_an_outbid_host_the_search_cannot_see_is_bid_for_at_its_machines_o
 
     await fleet.handle_evictions()
     eviction = next(e for e in fleet.events.recent() if e["kind"] == "eviction")
-    assert "rebid" in eviction["summary"]
+    assert eviction["numbers"]["action"] == "rebid" and "re-bidding $0.320/h" in eviction["summary"]
     assert host.bid_hourly == pytest.approx(0.32), "the machine's own floor plus the premium"
     assert not host.released
 

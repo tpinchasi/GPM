@@ -51,7 +51,7 @@ def _serve(args: argparse.Namespace) -> int:
         child = _supervisor_child(args.config, args.log_level)
 
     try:
-        app = create_app(config)
+        app = create_app(config, config_path=args.config)
         uvicorn.run(
             app,
             host=config.listen.host,

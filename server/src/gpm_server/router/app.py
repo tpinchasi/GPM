@@ -20,7 +20,7 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from ..config import PoolConfig
+from ..config import ConfigError, PoolConfig, load_config
 from ..contract import CONTRACT_VERSION
 from ..db import Database, RequestRecord
 from ..directory import read_directory
@@ -226,10 +226,45 @@ def _unready_reason(state: RouterState) -> str:
     return "hosts_unreachable"
 
 
+async def follow_config_file(state: RouterState, path: Path) -> None:
+    """Serve under the configuration file as it is now, not as it was when the router started.
+
+    The supervisor applies an edit — from the console or by hand — the moment the file changes,
+    and the router must follow, or the two disagree. Found live: a model added to the set was
+    served by a rented host within minutes, but the router kept answering `/pool/status` with
+    the set it had read at start, and the app, which checks names against that list, refused
+    the model without ever asking. The file is read here, off the request path; one that does
+    not load leaves the running configuration exactly as it was, as it does in the supervisor.
+    """
+    try:
+        seen = path.stat().st_mtime
+    except OSError:
+        seen = None
+    while True:
+        await asyncio.sleep(state.config.pool.host_table_poll_s)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if mtime == seen:
+            continue
+        seen = mtime
+        try:
+            new = await asyncio.to_thread(load_config, path)
+        except ConfigError as exc:
+            log.error("configuration did not load; keeping the running one: %s", exc)
+            continue
+        if new.listen != state.config.listen:
+            log.warning("the listen address or TLS changed in %s; that takes a router restart", path)
+        state.apply(new)
+        log.info("configuration reloaded from %s", path)
+
+
 def create_app(
     config: PoolConfig,
     database: Optional[Database] = None,
     db_path: Optional[str | Path] = None,
+    config_path: Optional[str | Path] = None,
 ) -> FastAPI:
     owns_database = database is None
     database = database or open_database(config, db_path)
@@ -239,15 +274,17 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Pick up whatever the supervisor has already published before taking requests.
         await state.registry.refresh()
-        task = asyncio.create_task(
-            state.registry.run_forever(config.pool.host_table_poll_s)
-        )
+        tasks = [asyncio.create_task(state.registry.run_forever(state.config.pool.host_table_poll_s))]
+        if config_path is not None:
+            tasks.append(asyncio.create_task(follow_config_file(state, Path(config_path))))
         try:
             yield
         finally:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
             await state.aclose()
             if owns_database:
                 database.close()
@@ -282,24 +319,24 @@ def create_app(
             hosts.append(entry)
         return JSONResponse(
             {
-                "pool": config.pool.name,
+                "pool": state.config.pool.name,
                 "contract_version": CONTRACT_VERSION,
                 "engine": state.engine.name,
-                "model_set": config.pool.model_set,
+                "model_set": state.config.pool.model_set,
                 "limits": {
-                    "queue_timeout_s": config.pool.queue_timeout_s,
-                    "client_time_to_first_byte_s": config.pool.client_time_to_first_byte_s,
+                    "queue_timeout_s": state.config.pool.queue_timeout_s,
+                    "client_time_to_first_byte_s": state.config.pool.client_time_to_first_byte_s,
                 },
                 # How a response reaches the app, per host kind (D62). An SDK sizes its
                 # time-to-first-byte from this: a held response arrives whole, so "first byte"
                 # is the end of the generation, not the start.
                 "delivery": {
                     "by_kind": {
-                        kind: config.pool.delivery.for_kind(kind)
+                        kind: state.config.pool.delivery.for_kind(kind)
                         for kind in ("local", "fixed-remote", "rented-interruptible", "rented-on-demand")
                     },
-                    "allow_request_override": config.pool.delivery.allow_request_override,
-                    "max_redispatch": config.pool.delivery.max_redispatch,
+                    "allow_request_override": state.config.pool.delivery.allow_request_override,
+                    "max_redispatch": state.config.pool.delivery.max_redispatch,
                 },
                 "capacity": {
                     "hosts_ready": sum(1 for h in state.hosts if h.state is HostState.READY),
@@ -320,7 +357,7 @@ def create_app(
         """
         if not _authorised(state, request):
             return _error(401, "unauthorized", detail="missing or invalid app key")
-        found = await asyncio.to_thread(read_directory, database, q, tuple(config.pool.model_set))
+        found = await asyncio.to_thread(read_directory, database, q, tuple(state.config.pool.model_set))
         return JSONResponse(found, headers={"X-GPM-Contract": CONTRACT_VERSION})
 
     @app.post("/{full_path:path}")
@@ -361,7 +398,7 @@ def create_app(
             await record("rejected", status_code=400, reason="model_missing")
             return _error(400, "bad_request", "model_missing", "the request body names no model")
 
-        in_pool = requested in config.pool.model_set or state.dispatcher.knows_model(requested)
+        in_pool = requested in state.config.pool.model_set or state.dispatcher.knows_model(requested)
         if not in_pool:
             await record("rejected", status_code=404, reason="model_not_in_pool")
             return _error(
@@ -386,7 +423,7 @@ def create_app(
         if request_deadline is not None and request_deadline <= time.monotonic():
             await record("rejected", status_code=504, reason="deadline_exceeded")
             return _error(504, "deadline_exceeded", "deadline_exceeded", "the request's deadline had already passed")
-        queue_deadline = started + config.pool.queue_timeout_s
+        queue_deadline = started + state.config.pool.queue_timeout_s
         if request_deadline is not None:
             queue_deadline = min(queue_deadline, request_deadline)
 
@@ -400,7 +437,7 @@ def create_app(
         buffered: list[bytes] = []
         attempts = 0
         redispatched = 0
-        max_buffer_bytes = int(config.pool.delivery.max_buffer_mb * 1_000_000)
+        max_buffer_bytes = int(state.config.pool.delivery.max_buffer_mb * 1_000_000)
 
         while True:
             try:
@@ -501,7 +538,7 @@ def create_app(
                     queue_wait_ms=wait_s * 1000, latency_ms=(time.monotonic() - dispatched_at) * 1000,
                     reason="upstream_lost_while_buffering",
                 )
-                if redispatched >= config.pool.delivery.max_redispatch or (
+                if redispatched >= state.config.pool.delivery.max_redispatch or (
                     request_deadline is not None and time.monotonic() >= request_deadline
                 ):
                     await record("failed", status_code=503, reason="host_lost", host_id=host_id)
@@ -512,7 +549,7 @@ def create_app(
                     )
                 redispatched += 1
                 # The client has received nothing, so the pool runs it again itself.
-                queue_deadline = time.monotonic() + config.pool.queue_timeout_s
+                queue_deadline = time.monotonic() + state.config.pool.queue_timeout_s
                 if request_deadline is not None:
                     queue_deadline = min(queue_deadline, request_deadline)
                 continue

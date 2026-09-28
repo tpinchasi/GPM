@@ -39,6 +39,17 @@ class RouterState:
         )
         self.log = RequestLog(database)
 
+    def apply(self, config: PoolConfig) -> None:
+        """Serve under a configuration applied while the router runs: the model set, the
+        catalog's engines, the app keys and every limit the next request reads. The listen
+        address and TLS are the exception — they are the socket itself, and change only with a
+        restart. Hosts come from the supervisor's table, as always."""
+        self.config = config
+        self.engines = {name: get_engine(name) for name in config.engines_in_use()}
+        self.engine = self.engines[config.engine]
+        self.app_hashes = config.auth.app_hashes()
+        self.registry.apply_config(config)
+
     @property
     def hosts(self) -> list[Host]:
         return self.dispatcher.hosts

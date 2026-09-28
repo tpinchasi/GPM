@@ -573,13 +573,22 @@ def decide_eviction(
                 "rebid", rebid.hourly,
                 [f"re-bid ${rebid.hourly:.3f}/h to win the machine back"] + rebid.reasons,
             )
-        reasons.append(f"it cannot be won back within the ceilings: {rebid.reasons[-1]}")
+        # Every step of the bid, not only the last: "below the floor" alone does not say which
+        # ceiling held the bid down. Found live: an eviction read "$0.982 is below the floor
+        # $1.200" and the operator was told the lease was the cause — it was the on-demand
+        # crossover, in the step this dropped.
+        reasons.append("it cannot be won back within the ceilings: " + "; ".join(rebid.reasons))
 
     if best_alternative is None:
         return EvictionDecision(
             "destroy", None, reasons + ["no acceptable alternative offer; stopping billing"]
         )
-    return EvictionDecision("replace", None, reasons + [f"replacing on {best_alternative.machine_id}"])
+    # Replacing is not this decision's to do: a released host is its lease's missing capacity,
+    # and renting for it is the ordinary acquire path (spec §6.2) — which a prepared host's
+    # lease, closing with it, never takes. So this names what is on offer, not a rental.
+    return EvictionDecision(
+        "replace", None, reasons + [f"the best other offer is machine {best_alternative.machine_id}"]
+    )
 
 
 # --- who goes, and park or destroy (spec §9) ---

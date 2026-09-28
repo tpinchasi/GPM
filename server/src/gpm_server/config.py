@@ -935,6 +935,17 @@ class PoolConfig(BaseModel):
         self._every_model_is_held_by_somebody()
         return self
 
+    def models_without_a_host_in_service(self) -> list[str]:
+        """The models in the set that no host in service holds and no rented host is bought
+        for — refused as `no_eligible_host` until a host holding them returns."""
+        covered: set[str] = set()
+        for host in self.hosts:
+            if not host.disabled:
+                covered.update(self.models_held_by(host))
+        if self.rented is not None:
+            covered.update(self._rented_models())
+        return [name for name in self.pool.model_set if name not in covered]
+
     def models_held_by(self, host: "HostConfig") -> list[str]:
         """Which of the pool's models this configured host holds (D89).
 
@@ -1016,14 +1027,20 @@ class PoolConfig(BaseModel):
         Renting counts as holding only when the pool may actually rent for that model: a lease
         is what decides whether renting happens at all, but a configuration that could never
         cover a model however many hosts it bought is wrong on its face.
+
+        A host out of service still counts: it is the model's home, taken out for a while and
+        back with one click (D99, amended by D113). Taking it out leaves its models with no host
+        until it returns — which the plan says — but it is not a configuration that could never
+        serve them. Found live: the owner could not take the laptop out of service to send one
+        model's traffic to a rented host alone, because the laptop was the only host holding the
+        pool's other models.
         """
         profiles = self.rented is not None and bool(self.rented.rent_profiles)
         if self.pool.models_per_host != "declared" and not profiles:
             return
         covered: set[str] = set()
         for host in self.hosts:
-            if not host.disabled:
-                covered.update(self.models_held_by(host))
+            covered.update(self.models_held_by(host))
         if self.rented is not None:
             covered.update(self._rented_models())
         missing = [name for name in self.pool.model_set if name not in covered]

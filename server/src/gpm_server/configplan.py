@@ -93,7 +93,13 @@ def plan_changes(
             else:
                 changes.append(Change("workers_lowered", f"host {host_id!r} goes from {old.workers} to {new.workers} workers; the surplus drain after their current request"))
         if old.disabled != new.disabled:
-            changes.append(Change("host_disabled", f"host {host_id!r} is {'disabled' if new.disabled else 'enabled'}"))
+            detail = f"host {host_id!r} is {'disabled' if new.disabled else 'enabled'}"
+            stranded = [m for m in candidate.models_without_a_host_in_service()
+                        if m not in current.models_without_a_host_in_service()]
+            if stranded:
+                detail += (f"; no host in service holds {', '.join(stranded)} then, so requests for "
+                           f"{'it' if len(stranded) == 1 else 'them'} are refused until it returns")
+            changes.append(Change("host_disabled", detail))
         if old.agent != new.agent:
             if new.agent is None:
                 detail = f"host {host_id!r} loses its agent: the pool goes back to verifying this host only, and stops learning what the machine is"

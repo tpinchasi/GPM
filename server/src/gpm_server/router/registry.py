@@ -49,6 +49,19 @@ class HostRegistry:
         self._host_config = {host.id: host for host in config.hosts}
         self._retired: list[httpx.AsyncClient] = []
 
+    def apply_config(self, config: PoolConfig) -> None:
+        """A configuration applied while the router runs. The table still says which hosts
+        there are; what changes here is how a configured host is reached — its credentials
+        live only in configuration, so a host whose transport changed gets a new client."""
+        before = self._host_config
+        self.config = config
+        self._host_config = {host.id: host for host in config.hosts}
+        for host_id, host in self.by_id.items():
+            old, new = before.get(host_id), self._host_config.get(host_id)
+            if old is not None and new is not None and old.transport != new.transport:
+                self._retired.append(host.client)
+                host.client = build_client(new.transport, config.pool, str(host.client.base_url))
+
     # --- reading the table ---
 
     async def refresh(self) -> bool:

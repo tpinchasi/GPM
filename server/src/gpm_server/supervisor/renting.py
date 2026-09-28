@@ -2212,16 +2212,36 @@ class Fleet:
                 self.rented.bidding,
                 self.rented.policy_in_force,
             )
+            # Say what happens next, not the strategy's label for it. Found live: "was outbid:
+            # replace … replacing on 43532" on a prepared host, whose lease closed with it a
+            # second later and rented nothing.
+            capped = (
+                self._cap_bid(decision.bid, lease, same_machine)
+                if decision.action == "rebid" and decision.bid is not None and same_machine is not None
+                else None
+            )
+            if capped is not None:
+                outcome = f"re-bidding ${capped:.3f}/h to win it back"
+            elif decision.action == "rebid":
+                outcome = "released; the re-bid would cross a ceiling"
+            elif host.prepared and not any(
+                h.lease_id == host.lease_id and h is not host and not h.released for h in self.hosts.values()
+            ):
+                outcome = ("released; it was a prepared host, so its lease closes with it and nothing "
+                           "is rented in its place")
+            else:
+                # The lease stays open, as standing demand; whether it rents again is the
+                # ordinary acquire path's to decide, not this one's (spec §6.2).
+                outcome = "released; its lease rents a replacement if it still needs the capacity"
             self.events.record(
                 "eviction",
-                f"{host.host_id} was outbid: {decision.action}",
-                numbers={"reasons": decision.reasons, "bid": decision.bid},
+                f"{host.host_id} was outbid: {outcome}",
+                numbers={"action": decision.action, "reasons": decision.reasons, "bid": decision.bid},
                 host_id=host.host_id,
                 lease_id=lease.lease_id,
             )
 
-            if decision.action == "rebid" and decision.bid is not None:
-                capped = self._cap_bid(decision.bid, lease, same_machine)
+            if decision.action == "rebid":
                 if capped is None:
                     await self.destroy(host, "re-bid would cross a ceiling")
                     continue
