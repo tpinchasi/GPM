@@ -362,7 +362,7 @@ def test_the_status_offers_each_engines_options_and_says_which_are_on(pool):
     assert engine["offers"]["vllm"]["builds_on_hub"] is True
     assert set(engine["offers"]["vllm"]["options"]) == {"tool_calling", "reasoning"}
     assert "gemma4" in engine["offers"]["vllm"]["options"]["tool_calling"]["families"]
-    assert engine["offers"]["ollama"] == {"builds_on_hub": False, "options": {}}
+    assert engine["offers"]["ollama"] == {"builds_on_hub": False, "splits_across_cards": False, "options": {}}
     assert engine["engine_options"] == []
 
 

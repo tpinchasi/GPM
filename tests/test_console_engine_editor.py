@@ -89,6 +89,11 @@ window.__precision = (value) => {
 window.__engine = (value) => {
   const s = __editor().querySelector("select"); s.value = value; s.dispatchEvent(new Event("change")); return true;
 };
+window.__split = (cards) => {
+  const s = __editing().querySelector('select[aria-label="split each model"]');
+  if (!s) throw new Error("no split choice");
+  s.value = String(cards); s.dispatchEvent(new Event("change")); return true;
+};
 window.__note = () => ([...document.querySelectorAll("button")].find((b) => b.textContent === "Save to configuration")
   .parentElement.querySelector(":scope > span.muted") || {}).textContent || "";
 if (!window.__counting) {
@@ -181,6 +186,11 @@ def test_a_profile_is_made_from_model_and_variant_rows_in_one_step(served):
         page.js("__shape('one model')")
         assert page.js("__held()") == [["gemma-4-26b-a4b-it", NVFP4]], "one model keeps the first"
 
+        # Too large for one card: split across two, and the needs are per card of a pair (D114).
+        page.js("__split(2)")
+        assert page.js("__editing().querySelector('select[aria-label=\"split each model\"]').value") == "2"
+        assert "whole groups of 2" in page.js("__editing().textContent")
+
         # A profile holding nothing is refused in words, and nothing is written.
         page.js("__click('Close', __editing()); __click('+ New profile'); __click('Save to configuration')")
         page.until("__note().includes('not saved')", within=10, what="the refusal")
@@ -197,6 +207,8 @@ def test_a_profile_is_made_from_model_and_variant_rows_in_one_step(served):
     assert written["rented"]["engine"] == "vllm"
     assert written["rented"]["model_profiles"] == {"chat": {new: NVFP4}}
     assert written["rented"]["rent_profiles"] == ["chat"]
+    assert written["rented"]["split_across_cards"] == {"chat": 2}
+    assert supervisor.config.rented.cards_per_copy("chat") == 2
     assert written["pool"]["model_set"] == [EMBED, SMALL, BIG, new]
     # Only the variant a profile uses is written: the FP8 one tried and replaced is not.
     assert [v["tag"] for v in written["catalog"][new]["variants"]] == [NVFP4]

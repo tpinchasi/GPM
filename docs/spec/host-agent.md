@@ -94,6 +94,13 @@ whole preparation in, and folding them into one number would hide it (D97):
   the machine's environment limits it to, or else every card the driver lists. The router is
   started whenever there is more than one process, even for one model. Each copy writes its own
   log, and a copy that dies is reported with its card.
+- **A model too large for one card is split across a group of them** (D114): with
+  `GPM_VLLM_CARDS_PER_COPY` set to N (written by the agent from the pool's `cards_per_copy`), every
+  model runs once per group of N cards as one process with `--tensor-parallel-size N`, pinned to
+  the group (`CUDA_VISIBLE_DEVICES=0,1`), and each card is planned for a 1/N share of every
+  model's weights plus its own cache reserve. Refused before anything starts: cards that do not
+  make whole groups of N (or none listed), and a model whose attention heads — `num_attention_heads`
+  in its `config.json`, or under `text_config` — do not divide by N. A dead copy names its cards.
 
 Three rules the hub fetch keeps:
 
@@ -212,7 +219,7 @@ fails until it is edited on purpose to admit another.
 | `PUT /models` | `{tags, residency}` — the **whole** desired state | Starts working toward it in the background, one pull at a time, and answers at once with where each tag stands (on disk, loaded, pulling with bytes, last error), free disk, the owner's floor, and the surplus. A tag that failed is left alone for a minute, not retried every pass |
 | `DELETE /models` | `{tag}` | §4's deletion, inside its bounds |
 | `POST /heartbeat` | — | Touches the dead-man timer's file on a host the pool created (D63). No body, and no other bound: it can only *postpone* a shutdown the pool could equally cause by going silent. A machine nobody rented carries no timer, and the verb says so |
-| `POST /engine` | `{settings}` — `null`, or `{workers, models_held, context?}` as bounded whole numbers | Writes the engine's start-up environment to the file the owner named, if it changed; runs the owner's restart command; waits for the engine to answer; reports the exit code, the tail of the output, and whether the engine came back |
+| `POST /engine` | `{settings}` — `null`, or `{workers, models_held, context?, cards_per_copy?}` as bounded whole numbers; `cards_per_copy` is 1, 2, 4 or 8, and refused for an engine that cannot split a model (D114) | Writes the engine's start-up environment to the file the owner named, if it changed; runs the owner's restart command; waits for the engine to answer; reports the exit code, the tail of the output, and whether the engine came back |
 
 A tag travels in a body, never a path, and must be a plain model tag — a name, optionally
 namespaced and versioned. Anything with a scheme, a space, `..` or a leading dash is refused

@@ -391,6 +391,10 @@ class OfferPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     min_gpu_memory_gb: float = 0.0
+    #: A machine's cards must come in whole groups of this many (D114): at least this many, and
+    #: a multiple of it. Raised to what the profile the next host is bought as splits its models
+    #: across; a card left over would be paid for and never used.
+    gpus_multiple_of: int = Field(default=1, ge=1)
     #: The disk each host is rented with, and the least a machine must offer to be considered —
     #: one number (D108). A machine is priced for exactly this much storage, so the all-in
     #: price the search compares is the price the host is billed. Required where the pool rents.
@@ -699,6 +703,12 @@ class RentedConfig(BaseModel):
     #: Empty means the pool rents the way it did before profiles: `rented.models` and
     #: `pool.models_per_host` decide. Replaces `rented.models`, so naming both is refused.
     rent_profiles: list[str] = Field(default_factory=list)
+    #: How many cards each copy of a profile's models is split across, by profile (D114). A
+    #: profile not named here runs a copy on every card, as before (D107). With 2, a machine
+    #: runs its models once per pair of cards, each card holding half of every model — so a set
+    #: too large for one card fits two, and the search asks for half the card and at least two
+    #: of them. 1, 2, 4 or 8; only for an engine that can split a model this way.
+    split_across_cards: dict[str, int] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _profiles_are_whole(self) -> "RentedConfig":
@@ -716,12 +726,26 @@ class RentedConfig(BaseModel):
             raise ValueError(f"rent_profiles names {unknown}, which are not among the model_profiles ({known})")
         if len(set(self.rent_profiles)) != len(self.rent_profiles):
             raise ValueError("rent_profiles names a profile twice")
+        for name, cards in self.split_across_cards.items():
+            if name not in self.model_profiles:
+                known = ", ".join(sorted(self.model_profiles)) or "none are defined"
+                raise ValueError(
+                    f"split_across_cards names {name!r}, which is not among the model_profiles ({known})"
+                )
+            if cards not in (1, 2, 4, 8):
+                raise ValueError(
+                    f"split_across_cards.{name} is {cards}; a model can be split across 1, 2, 4 or 8 cards"
+                )
         if self.rent_profiles and self.models is not None:
             raise ValueError(
                 "rented.models and rented.rent_profiles both say what rented hosts hold; keep "
                 "rent_profiles and remove models (D111)"
             )
         return self
+
+    def cards_per_copy(self, profile: Optional[str]) -> int:
+        """How many cards each copy of this profile's models spans (D114); one for no profile."""
+        return self.split_across_cards.get(profile, 1) if profile else 1
 
     def profiles_rented(self) -> dict[str, dict[str, str]]:
         """The profiles the pool may rent as, in the operator's order: {name: {model: build}}."""
@@ -930,6 +954,7 @@ class PoolConfig(BaseModel):
         self._rented_hosts_have_a_build_of_what_they_rent_for()
         self._images_are_built_for_this_engine()
         self._engine_options_are_the_engines()
+        self._splits_are_the_engines()
         self._hosts_can_serve_what_they_are_asked_for()
         self._declared_models_are_in_the_set()
         self._every_model_is_held_by_somebody()
@@ -1211,6 +1236,34 @@ class PoolConfig(BaseModel):
             return get_engine(self.rented_engine()).default_port or 11434
         except EngineNotFound:
             return 11434
+
+    def _splits_are_the_engines(self) -> None:
+        """A profile split across cards needs an engine that splits a model on request, started
+        by the pool's own launcher (D114) — an operator's `engine_start` would never hear of it,
+        and the machine would be searched for half a card per model and start whole ones."""
+        if self.rented is None:
+            return
+        split = sorted(name for name, cards in self.rented.split_across_cards.items() if cards > 1)
+        if not split:
+            return
+        from .engines import EngineNotFound, get_engine
+
+        engine = self.rented_engine()
+        try:
+            splits = bool(getattr(get_engine(engine), "splits_across_cards", False))
+        except EngineNotFound:
+            return  # naming an uninstalled engine is its own error, reported elsewhere
+        if not splits:
+            raise ValueError(
+                f"rented.split_across_cards splits {split} across cards, and rented hosts run "
+                f"{engine!r}, which cannot be told to split a model; remove the split, or rent with an "
+                f"engine that can"
+            )
+        if self.rented.engine_start:
+            raise ValueError(
+                f"rented.split_across_cards splits {split} across cards through the engine's own "
+                f"start, and rented.engine_start replaces it; remove one of them"
+            )
 
     def _engine_options_are_the_engines(self) -> None:
         """Only names the rented engine's own start offers (D100), and only with that start.

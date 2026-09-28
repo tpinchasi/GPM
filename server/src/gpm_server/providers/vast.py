@@ -219,6 +219,8 @@ class VastProvider:
             body["gpu_ram"] = {"gte": query.min_gpu_memory_gb * 1024}
         if query.min_disk_gb:
             body["disk_space"] = {"gte": query.min_disk_gb}
+        if query.min_gpus > 1:
+            body["num_gpus"] = {"gte": query.min_gpus}
         payload = await self._call("POST", "/api/v0/bundles", json=body)
         return payload.get("offers", payload if isinstance(payload, list) else [])
 

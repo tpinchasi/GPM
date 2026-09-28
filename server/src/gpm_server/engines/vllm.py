@@ -57,6 +57,8 @@ class VllmEngine:
     image_words: ClassVar[tuple[str, ...]] = ("vllm",)
     #: It serves what it was started with; a downloaded model is picked up by starting it again.
     loads_by_restart: ClassVar[bool] = True
+    #: The agent's launcher starts a model across a group of cards with `--tensor-parallel-size`.
+    splits_across_cards: ClassVar[bool] = True
     #: Its builds are model-hub repositories, which the pool can look up (D100).
     builds_on_hub: ClassVar[bool] = True
     #: What the agent's launcher can switch on, and for which model families (`model_type` in a

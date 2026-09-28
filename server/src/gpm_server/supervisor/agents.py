@@ -156,10 +156,17 @@ async def restart_engine(
         return 502, {"error": "agent_unreachable", "detail": str(exc) or type(exc).__name__}
 
 
-def wanted_engine_settings(workers: int, models_held: int) -> dict[str, int]:
+def wanted_engine_settings(workers: int, models_held: int, cards_per_copy: int = 1) -> dict[str, int]:
     """What this host's engine must run with for the pool's numbers to be true: as many
-    requests at once as the host has workers, and the whole model set held together."""
-    return {"workers": workers, "models_held": max(1, models_held)}
+    requests at once as the host has workers, the whole model set held together, and each
+    model split across as many cards as it was bought for (D114).
+
+    `cards_per_copy` is sent only when it is more than one: an agent from before it existed
+    refuses a name it does not know, and one card per copy is what every agent already does."""
+    wanted = {"workers": workers, "models_held": max(1, models_held)}
+    if cards_per_copy > 1:
+        wanted["cards_per_copy"] = cards_per_copy
+    return wanted
 
 
 def model_events(before: Optional[dict[str, Any]], after: Optional[dict[str, Any]]) -> list[tuple[str, str, dict[str, Any]]]:

@@ -31,7 +31,7 @@ DISK_HEADROOM_GB = 10.0
 
 @dataclass
 class Needs:
-    """The least card memory (per card) and disk a machine needs for these models."""
+    """The least card memory (per card), cards and disk a machine needs for these models."""
 
     card_memory_gb: float
     disk_gb: float
@@ -39,6 +39,9 @@ class Needs:
     weights_gb: float
     #: Models whose build has not been measured, and so are not counted.
     unknown: list[str] = field(default_factory=list)
+    #: How many cards each copy of the models spans (D114): the machine needs at least this
+    #: many, in whole groups of it.
+    cards_per_copy: int = 1
 
     def as_dict(self) -> dict:
         return {
@@ -46,26 +49,31 @@ class Needs:
             "disk_gb": self.disk_gb,
             "weights_gb": self.weights_gb,
             "unknown": list(self.unknown),
+            "cards_per_copy": self.cards_per_copy,
         }
 
 
-def needs_for(sizes: Mapping[str, Optional[float]]) -> Needs:
+def needs_for(sizes: Mapping[str, Optional[float]], cards_per_copy: int = 1) -> Needs:
     """From each model's build size in GB (None where unknown), what a machine must have.
 
-    Per card, because a machine with several cards runs a copy of the set on each (D107).
-    Rounded up to a whole gigabyte: this becomes a search filter, and a filter a hair under what
-    is needed lets through the one machine that cannot start.
+    Per card, because a machine with several cards runs a copy of the set on each card (D107),
+    or on each group of `cards_per_copy` cards, every card holding that share of each model's
+    weights and a cache reserve of its own (D114). Rounded up to a whole gigabyte: this becomes
+    a search filter, and a filter a hair under what is needed lets through the one machine that
+    cannot start. The disk holds each model once, however it is split.
     """
     known = {model: float(size) for model, size in sizes.items() if size}
     unknown = sorted(model for model, size in sizes.items() if not size)
     if not known:
-        return Needs(card_memory_gb=0.0, disk_gb=0.0, weights_gb=0.0, unknown=unknown)
+        return Needs(card_memory_gb=0.0, disk_gb=0.0, weights_gb=0.0, unknown=unknown,
+                     cards_per_copy=cards_per_copy)
     weights = sum(known.values())
-    memory = (weights * WEIGHT_OVERHEAD + CACHE_RESERVE_GB * len(known)) / TOTAL_MEMORY_SHARE
+    memory = (weights * WEIGHT_OVERHEAD / cards_per_copy + CACHE_RESERVE_GB * len(known)) / TOTAL_MEMORY_SHARE
     disk = weights * DISK_OVERHEAD + DISK_HEADROOM_GB
     return Needs(
         card_memory_gb=float(math.ceil(memory)),
         disk_gb=float(math.ceil(disk)),
         weights_gb=round(weights, 3),
         unknown=unknown,
+        cards_per_copy=cards_per_copy,
     )

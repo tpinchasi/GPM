@@ -77,6 +77,6 @@ def failed_engines(models_dir: Path, served: Sequence[str],
             continue
         reason = last_error_line(engine.get("log") or "") or "no reason in its log"
         card = engine.get("card")
-        on = f" on card {card}" if card is not None else ""
+        on = "" if card is None else f" on cards {card}" if "," in str(card) else f" on card {card}"
         failed[name] = f"its vLLM process{on} exited before serving it: {reason}"
     return failed

@@ -208,6 +208,8 @@ def engine_offers() -> dict[str, Any]:
             continue
         offers[name] = {
             "builds_on_hub": bool(getattr(engine, "builds_on_hub", False)),
+            # Whether a profile may split its models across a group of cards (D114).
+            "splits_across_cards": bool(getattr(engine, "splits_across_cards", False)),
             "options": {
                 key: {"label": option.label, "families": list(option.families)}
                 for key, option in (getattr(engine, "options", None) or {}).items()
@@ -374,12 +376,14 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         view = []
         for name, models in rented.model_profiles.items():
             sizes = fleet.build_sizes(list(models), models) if fleet is not None else {}
-            needs = needs_for(sizes) if fleet is not None else None
+            cards = rented.cards_per_copy(name)
+            needs = needs_for(sizes, cards) if fleet is not None else None
             view.append({
                 "name": name,
                 "rented": name in rented.rent_profiles,
                 "models": [{"model": model, "build": build, "size_gb": sizes.get(model)} for model, build in models.items()],
                 "needs": needs.as_dict() if needs else None,
+                "cards_per_copy": cards,
                 "proxy": fleet.proxy_for(list(models)) if fleet is not None else None,
             })
         return view
@@ -519,6 +523,8 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                         # The model profile it was bought as, and the builds that named (D111).
                         "profile": host.profile,
                         "builds": dict(host.builds),
+                        # How many cards each copy of its models spans (D114).
+                        "cards_per_copy": host.cards_per_copy,
                         # What this machine runs, and what it was bought to serve (D93, D94).
                         # Neither was visible anywhere, so a pool buying the wrong thing looked
                         # exactly like one buying the right thing.
@@ -983,6 +989,23 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         unknown = [name for name in rent if name not in profiles]
         if unknown:
             return text, _error(400, "bad_profile", f"rent names profiles that are not sent: {unknown}")
+        # How many cards each profile's copies span (D114). Not sent, it is kept for the profiles
+        # still here, so a profile removed takes its split with it rather than leave the file
+        # naming a profile that no longer exists.
+        split_sent = body.get("split")
+        if split_sent is None:
+            split = {name: cards for name, cards in config.rented.split_across_cards.items() if name in profiles}
+        elif not isinstance(split_sent, dict):
+            return text, _error(400, "bad_request", "send `split`: {profile name: cards per copy}")
+        else:
+            split = {}
+            for name, cards in split_sent.items():
+                if name not in profiles:
+                    return text, _error(400, "bad_profile", f"split names a profile that is not sent: {name!r}")
+                if isinstance(cards, bool) or cards not in (1, 2, 4, 8):
+                    return text, _error(400, "bad_profile", f"profile {name!r}: a model can be split across 1, 2, 4 or 8 cards")
+                if cards > 1:
+                    split[str(name)] = int(cards)
 
         installed = set(available_engines())
         model_set = list(config.pool.model_set)
@@ -1033,6 +1056,8 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             "model_profiles": {str(k): {str(m): str(b) for m, b in v.items()} for k, v in profiles.items()},
             "rent_profiles": [str(name) for name in rent],
         }
+        if split or config.rented.split_across_cards:
+            rented["split_across_cards"] = split
         # One way to say what rented hosts hold (D111); the router in front of several engine
         # processes follows each profile's size, not a switch for the whole pool.
         if config.rented.models is not None:

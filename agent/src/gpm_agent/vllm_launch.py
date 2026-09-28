@@ -20,6 +20,12 @@ pool placed one model, because the pool still dials one port. The copies share n
 model of any kind — dense, mixture-of-experts, embedding — runs the same way on any number of
 cards, and the set must fit on one card, as it already had to.
 
+**A model too large for one card is split across a group of them** (D114): with
+`GPM_VLLM_CARDS_PER_COPY` set to N, every model runs once per group of N cards, as one vLLM
+process with `--tensor-parallel-size N`, and each card holds a 1/N share of every model. One card
+per copy is the case above. A machine whose cards do not divide into groups of N, or a model whose
+attention heads do not divide by N, is refused before anything starts, as a set that does not fit.
+
 It stops whatever it started last time before starting anything, so calling it twice is a
 restart and not a second copy fighting the first for the same memory.
 """
@@ -85,6 +91,11 @@ NUMBER_FLAGS = (
     ("GPM_VLLM_MAX_NUM_BATCHED_TOKENS", "--max-num-batched-tokens"),
     ("GPM_VLLM_MAX_MODEL_LEN", "--max-model-len"),
 )
+
+#: How many cards each copy of a model spans (D114). Absent means one: a copy on each card.
+CARDS_PER_COPY = "GPM_VLLM_CARDS_PER_COPY"
+#: What vLLM can split a model across: its attention heads are divided between the cards.
+SPLITS = (1, 2, 4, 8)
 
 #: The named options the pool may ask for (D100), and what each means for each model family —
 #: the family read from the model's own `config.json` (`model_type`), on this machine. The pool
@@ -195,25 +206,94 @@ def card_devices(env: Mapping[str, str], run: Callable[..., Any] = subprocess.ru
     return [line.strip() for line in out.splitlines() if line.strip().isdigit()]
 
 
-def memory_plan(sizes: Sequence[int], card_bytes: Optional[int]) -> tuple[list[float], Optional[str]]:
-    """Each model's share of the card, or why the set cannot run on it.
+def cards_per_copy(env: Mapping[str, str]) -> int:
+    """How many cards each copy of a model spans, as the pool's number says; one without it."""
+    value = env.get(CARDS_PER_COPY, "").strip()
+    return int(value) if value.isdigit() and int(value) > 0 else 1
+
+
+def card_groups(cards: Sequence[str], per_copy: int) -> tuple[list[Optional[str]], Optional[str]]:
+    """Where each copy runs — a card, a group of cards, or None for "wherever CUDA puts it" —
+    or why this machine's cards cannot be grouped this way.
+
+    One card per copy keeps D107 exactly: several cards, a copy pinned to each; one or none
+    known, a single unpinned copy. Several per copy needs the cards listed, and a whole number
+    of groups: a card left over would be paid for and never used.
+    """
+    if per_copy == 1:
+        return (list(cards) if len(cards) > 1 else [None]), None
+    if per_copy not in SPLITS:
+        return [], f"a model can be split across {', '.join(map(str, SPLITS))} cards, not {per_copy}"
+    if not cards:
+        return [], f"the models are to be split across {per_copy} cards and the driver lists none here"
+    if len(cards) % per_copy:
+        return [], (
+            f"the models are to be split across {per_copy} cards and this machine has {len(cards)}, "
+            f"which is not a whole number of groups of {per_copy}"
+        )
+    return [",".join(cards[i:i + per_copy]) for i in range(0, len(cards), per_copy)], None
+
+
+def attention_heads(directory: Path) -> Optional[int]:
+    """The model's attention heads, from its own configuration — or None if it does not say.
+    A model built from a text model and another (vision, audio) keeps them under `text_config`."""
+    try:
+        config = json.loads((directory / "config.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(config, dict):
+        return None
+    for section in (config, config.get("text_config")):
+        if isinstance(section, dict) and isinstance(section.get("num_attention_heads"), int):
+            return section["num_attention_heads"]
+    return None
+
+
+def split_refusal(directories: Sequence[Path], per_copy: int) -> Optional[str]:
+    """Why these models cannot be split across `per_copy` cards, if one of them cannot.
+
+    vLLM gives each card an equal share of a model's attention heads, and refuses to start when
+    they do not divide — after the machine has been rented and the weights fetched. Said here,
+    before anything starts, the way a set that does not fit is. A model that does not state its
+    heads is left to vLLM, which will say.
+    """
+    if per_copy == 1:
+        return None
+    for directory in directories:
+        heads = attention_heads(directory)
+        if heads is not None and heads % per_copy:
+            return (
+                f"{served_name(directory)} has {heads} attention heads, which do not divide "
+                f"between {per_copy} cards; split it across fewer cards"
+            )
+    return None
+
+
+def memory_plan(
+    sizes: Sequence[int], card_bytes: Optional[int], per_copy: int = 1
+) -> tuple[list[float], Optional[str]]:
+    """Each model's share of every card it runs on, or why the set cannot run on them.
 
     With the card's size known, each model is given its weights plus a cache reserve, and what
     is left of the launcher's share of the card is spread by weight — so the largest model gets
-    the most cache. A set whose needs exceed that share is refused, with the arithmetic. Without
-    the card's size, the old split by weights with a floor, which is a guess and says so.
+    the most cache. A model split across `per_copy` cards puts a 1/`per_copy` share of its
+    weights on each, and still needs the reserve on each (D114). A set whose needs exceed that
+    share is refused, with the arithmetic. Without the card's size, the old split by weights
+    with a floor, which is a guess and says so.
     """
     if not sizes:
         return [], None
     if card_bytes is None:
         return memory_shares(sizes), None
-    needs = [int(size * WEIGHT_OVERHEAD) + CACHE_RESERVE_BYTES for size in sizes]
+    needs = [int(size * WEIGHT_OVERHEAD / per_copy) + CACHE_RESERVE_BYTES for size in sizes]
     usable = TOTAL_MEMORY_SHARE * card_bytes
     if sum(needs) > usable:
+        split = f", split across {per_copy} cards," if per_copy > 1 else ""
         return [], (
-            f"the models need {sum(needs) / 1e9:.1f} GB together (each its weights plus a "
-            f"{CACHE_RESERVE_BYTES / 1024**3:.0f} GiB cache reserve) and this card gives "
-            f"{usable / 1e9:.1f} GB; fewer models on this host, or a larger card"
+            f"the models{split} need {sum(needs) / 1e9:.1f} GB together on each card (each its "
+            f"share of the weights plus a {CACHE_RESERVE_BYTES / 1024**3:.0f} GiB cache reserve) "
+            f"and this card gives {usable / 1e9:.1f} GB; fewer models on this host, a larger "
+            f"card, or the models split across more cards"
         )
     spare = usable - sum(needs)
     total_weight = sum(sizes) or len(sizes)
@@ -352,17 +432,20 @@ def launch(
     logs = models_dir / ".gpm-logs"
     logs.mkdir(parents=True, exist_ok=True)
     sizes = [size_of(d) for d in found]
+    per_copy = cards_per_copy(env)
     # The smallest card, when they differ: every copy is planned for the card it might get.
     card = card_bytes if card_bytes is not None else probe_card()
-    shares, refused = memory_plan(sizes, card)
+    shares, refused = memory_plan(sizes, card, per_copy)
     cards = list(devices) if devices is not None else probe_devices(env)
-    # One card, or none known: no pinning, exactly as before. Several: a copy on each.
-    placements: list[Optional[str]] = list(cards) if len(cards) > 1 else [None]
+    # A copy on each card — or on each group of cards, for a model split across several (D114).
+    placements, not_grouped = card_groups(cards, per_copy)
+    refused = not_grouped or split_refusal(found, per_copy) or refused
     copies = len(placements)
     router = proxy or copies > 1
     started.plan = {
         "card_bytes": card,
         "cards": cards,
+        "cards_per_copy": per_copy,
         "models": {served_name(d): {"weights_bytes": s} for d, s in zip(found, sizes, strict=True)},
     }
     if refused:
@@ -394,12 +477,13 @@ def launch(
                 "--host", "127.0.0.1",
                 "--port", str(engine_port),
                 "--gpu-memory-utilization", str(share),
+                *(["--tensor-parallel-size", str(per_copy)] if per_copy > 1 else []),
                 *number_flags(env, copies),
                 *extra,
             ]
             process_env = env if device is None else {**env, "CUDA_VISIBLE_DEVICES": device}
             log_path = logs / (f"{directory.name}.log" if device is None
-                               else f"{directory.name}.card{device}.log")
+                               else f"{directory.name}.card{device.replace(',', '-')}.log")
             out = open(log_path, "ab")
             process = popen(argv, stdout=out, stderr=subprocess.STDOUT, env=process_env,
                             start_new_session=True)

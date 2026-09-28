@@ -89,6 +89,9 @@ class RentedHost:
     #: (D111). Empty for a host bought without profiles: its builds are the catalog's first.
     profile: Optional[str] = None
     builds: dict[str, str] = dataclasses.field(default_factory=dict)
+    #: How many cards each copy of its models spans (D114), fixed when it was bought: the
+    #: machine was searched for that many, and every relaunch must ask for the same.
+    cards_per_copy: int = 1
     #: The disk it was rented with — the search's minimum, raised to what its models need.
     disk_gb: Optional[float] = None
     ready_at: Optional[float] = None
@@ -684,30 +687,42 @@ class Fleet:
         self.model_sizes_unknown = sorted(model for model, size in sizes.items() if size is None)
         return round(sum(size for size in sizes.values() if size), 3)
 
-    def needs_of(self, models: Sequence[str], builds: Optional[dict[str, str]] = None) -> Needs:
-        """The least card and disk a machine holding these builds needs (D111)."""
-        return needs_for(self.build_sizes(models, builds))
+    def needs_of(
+        self, models: Sequence[str], builds: Optional[dict[str, str]] = None, cards_per_copy: int = 1
+    ) -> Needs:
+        """The least card, cards and disk a machine holding these builds needs (D111, D114)."""
+        return needs_for(self.build_sizes(models, builds), cards_per_copy)
 
     def policy_for(
         self, models: Sequence[str], builds: Optional[dict[str, str]] = None,
-        base: Optional[OfferPolicy] = None,
+        base: Optional[OfferPolicy] = None, cards_per_copy: int = 1,
     ) -> OfferPolicy:
         """The search for a machine that will hold these models: the search in force, with its
         card-memory and disk minimums raised to what the models need where they are lower
-        (D111). Never lowered — an operator's higher minimum is a choice, and stands. The disk
+        (D111), and its cards to whole groups of those each model is split across (D114).
+        Never lowered — an operator's higher minimum is a choice, and stands. The disk
         searched for is the disk the host is rented with (D108), so it is raised as one."""
         base = base or self.rented.policy_in_force
-        needs = self.needs_of(models, builds)
+        needs = self.needs_of(models, builds, cards_per_copy)
         raised: dict[str, float] = {}
         if needs.card_memory_gb > base.min_gpu_memory_gb:
             raised["min_gpu_memory_gb"] = needs.card_memory_gb
         if needs.disk_gb > base.min_disk_gb:
             raised["min_disk_gb"] = needs.disk_gb
+        if cards_per_copy > base.gpus_multiple_of:
+            raised["gpus_multiple_of"] = cards_per_copy
         return base.model_copy(update=raised) if raised else base
+
+    @property
+    def cards_per_copy_for_new_host(self) -> int:
+        """How many cards each copy spans on the next machine: its profile's split (D114)."""
+        return self.rented.cards_per_copy(self.profile_for_new_host())
 
     def next_host_policy(self, base: Optional[OfferPolicy] = None) -> OfferPolicy:
         """The search for the next machine, sized for what it would be bought for."""
-        return self.policy_for(self.models_for_new_host(), self.builds_for_new_host(), base)
+        return self.policy_for(
+            self.models_for_new_host(), self.builds_for_new_host(), base, self.cards_per_copy_for_new_host
+        )
 
     @property
     def one_model_per_host(self) -> bool:
@@ -1154,7 +1169,7 @@ class Fleet:
                 f"{host.launch_workers} its engine was launched for means relaunching it — "
                 "which only an agent on that host can do"
             )
-        settings = agents.wanted_engine_settings(workers, len(self.tags_for(host)))
+        settings = agents.wanted_engine_settings(workers, len(self.tags_for(host)), host.cards_per_copy)
         status, answer = await agents.restart_engine(
             host.agent, settings, transport=self._agent_transport
         )
@@ -1320,8 +1335,9 @@ class Fleet:
         # Searched as the next host would be: minimums raised to what it would hold (D111).
         typed = policy
         next_models, next_builds = self.models_for_new_host(), self.builds_for_new_host()
-        policy = self.policy_for(next_models, next_builds, typed)
-        needs = self.needs_of(next_models, next_builds)
+        next_cards = self.cards_per_copy_for_new_host
+        policy = self.policy_for(next_models, next_builds, typed, next_cards)
+        needs = self.needs_of(next_models, next_builds, next_cards)
 
         if kinds is not None and kinds not in self._KINDS:
             raise ValueError(f"kinds must be one of {sorted(self._KINDS)}")
@@ -1353,6 +1369,7 @@ class Fleet:
                     "workers": workers,
                     "workers_from": workers_why,
                     "gpu_memory_gb": round(offer.gpu_memory_gb, 1),
+                    "gpus": offer.gpus,
                     "floor": offer.min_bid_hourly,
                     "would_bid": bid.hourly,
                     "all_in": offer.all_in_hourly,
@@ -1386,8 +1403,10 @@ class Fleet:
                 "models": list(next_models),
                 "builds": self.builds_of(next_models, next_builds),
                 "needs": needs.as_dict(),
-                "searched": {"min_gpu_memory_gb": policy.min_gpu_memory_gb, "min_disk_gb": policy.min_disk_gb},
-                "typed": {"min_gpu_memory_gb": typed.min_gpu_memory_gb, "min_disk_gb": typed.min_disk_gb},
+                "searched": {"min_gpu_memory_gb": policy.min_gpu_memory_gb, "min_disk_gb": policy.min_disk_gb,
+                             "gpus_multiple_of": policy.gpus_multiple_of},
+                "typed": {"min_gpu_memory_gb": typed.min_gpu_memory_gb, "min_disk_gb": typed.min_disk_gb,
+                          "gpus_multiple_of": typed.gpus_multiple_of},
             },
             "policy": {
                 "max_all_in_hourly": policy.max_all_in_hourly,
@@ -1733,7 +1752,7 @@ class Fleet:
             host_id=host.host_id,
             lease_id=host.lease_id,
         )
-        settings = agents.wanted_engine_settings(host.launch_workers or host.workers, len(tags))
+        settings = agents.wanted_engine_settings(host.launch_workers or host.workers, len(tags), host.cards_per_copy)
 
         async def ask() -> None:
             status, answer = await agents.restart_engine(
@@ -1928,6 +1947,7 @@ class Fleet:
             "models": list(host.models),
             "profile": host.profile,
             "builds": dict(host.builds),
+            "cards_per_copy": host.cards_per_copy,
             "disk_gb": host.disk_gb,
             "offer": dataclasses.asdict(dataclasses.replace(host.offer, raw={})),
         }
@@ -1981,6 +2001,8 @@ class Fleet:
                 models=tuple(ref.get("models") or ()),
                 profile=ref.get("profile"),
                 builds={str(k): str(v) for k, v in (ref.get("builds") or {}).items()},
+                # A row from before splitting existed ran a copy on every card.
+                cards_per_copy=int(ref.get("cards_per_copy") or 1),
                 disk_gb=ref.get("disk_gb"),
                 when_ready=ref.get("when_ready") or "join",
                 download_cost=float(ref.get("download_cost") or 0.0),
@@ -2524,7 +2546,8 @@ class Fleet:
         profile = self.profile_for_new_host()
         for_this_host = self.models_for_new_host()
         builds = self.builds_for_new_host()
-        policy = self.policy_for(for_this_host, builds)
+        cards_per_copy = self.rented.cards_per_copy(profile)
+        policy = self.policy_for(for_this_host, builds, cards_per_copy=cards_per_copy)
         offers = await self._offers(policy, kinds=kind or ("both" if offer_id else None))
         ranked, rejected = rank_offers(
             offers,
@@ -2663,6 +2686,7 @@ class Fleet:
                 models=for_this_host,
                 profile=profile,
                 builds=builds,
+                cards_per_copy=cards_per_copy,
                 disk_gb=policy.min_disk_gb,
                 engine=self.config.rented_engine(),
                 engine_port=self.engine_port,
@@ -2966,6 +2990,7 @@ class Fleet:
             offers = await self.provider.search_offers(
                 OfferQuery(
                     verified_only=(policy or self.rented.policy_in_force).verified_only,
+                    min_gpus=(policy or self.rented.policy_in_force).gpus_multiple_of,
                     interruptible=bids,
                     on_demand=fixed,
                 )

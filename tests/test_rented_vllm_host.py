@@ -345,6 +345,54 @@ def test_a_two_card_machine_runs_twice_the_work_with_a_copy_on_each_card(monkeyp
             hub_server.stop()
 
 
+# --- a model split across a group of cards (D114) ---
+
+
+def test_a_model_split_across_pairs_of_cards_is_searched_started_and_served(monkeypatch, tmp_path):
+    """A profile split across two cards: the pool searches for whole pairs, the host keeps the
+    split, the agent writes it for the launcher, and the machine runs one copy per pair."""
+    hub = FakeHub(HUB)
+    with pool_harness(
+        [EngineSpec(id="laptop", resident={EMBED}, kind="local", workers=1)],
+        host_overrides={"laptop": {"models": [EMBED]}},
+        rentable=[EngineSpec(id="market-1", resident=set(), workers=2, engine="vllm")],
+        model_set=[BIG, EMBED], catalog=CATALOG,
+        rented=rented(model_profiles={"big": {BIG: BIG_REPO}}, rent_profiles=["big"],
+                      split_across_cards={"big": 2}, workers=3),
+        pool_settings={"models_per_host": "declared"},
+    ) as pool:
+        hub_server = ServerHandle(hub.app, pool.loop)
+        monkeypatch.setenv("HF_ENDPOINT", hub_server.base_url)
+        try:
+            machines = Machines(pool, tmp_path, monkeypatch)
+            machines.devices = ["0", "1", "2", "3"]
+            # A one-card machine at a lower price is never asked about; a four-card one is rented.
+            machines.fleet.provider.offers = [
+                default_offer("o-1", "m-1", min_bid_hourly=0.05),
+                default_offer("o-4", "m-4", hardware="4x FakeGPU 48GB", gpus=4),
+            ]
+            machines.fleet.open_lease(workers=12, max_hours=2, max_spend=2.00, allow_rent=True)
+            (host,) = machines.until_ready(1)
+            machines.check_no_failures()
+
+            assert host.offer.machine_id == "m-4" and host.cards_per_copy == 2
+            env_file = tmp_path / "market-1" / "engine.env"
+            assert "GPM_VLLM_CARDS_PER_COPY=2" in env_file.read_text()
+            assert [card for _, card in machines.commands] == ["0,1", "2,3"], "a copy on each pair"
+            for argv, _ in machines.commands:
+                assert argv[argv.index("--tensor-parallel-size") + 1] == "2"
+                assert argv[argv.index("--served-model-name") + 1] == BIG_REPO
+
+            with pool.client() as client:
+                answer = client.post("/v1/chat/completions", json={
+                    "model": BIG, "messages": [{"role": "user", "content": "hello"}],
+                })
+                assert answer.status_code == 200, answer.text
+                assert answer.headers["X-GPM-Host"] == host.host_id
+        finally:
+            hub_server.stop()
+
+
 # --- every model on one host, behind the router (D96) ---
 
 
