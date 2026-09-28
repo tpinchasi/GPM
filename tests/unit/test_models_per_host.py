@@ -121,19 +121,20 @@ def test_renting_for_one_model_does_not_cover_the_others():
         )
 
 
-def test_a_disabled_host_covers_nothing():
-    """It is not serving, so counting it would have the pool pass a check it fails in fact."""
-    with pytest.raises(ValueError, match="would be held by none"):
-        config(
-            pool={"models_per_host": "declared"},
-            hosts=[
-                {"id": "gpu-1", "kind": "local", "workers": 1, "models": [BIG],
-                 "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}},
-                {"id": "off", "kind": "local", "workers": 1, "models": [SMALL, EMBED],
-                 "disabled": True,
-                 "transport": {"type": "http", "base_url": "http://127.0.0.1:2"}},
-            ],
-        )
+def test_a_host_out_of_service_is_still_its_models_home_and_says_what_has_no_host():
+    """Out of service is for a while, back with one click, so the file is still whole (D113) —
+    but nothing in service holds those models, and the pool says so rather than pretending."""
+    cfg = config(
+        pool={"models_per_host": "declared"},
+        hosts=[
+            {"id": "gpu-1", "kind": "local", "workers": 1, "models": [BIG],
+             "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}},
+            {"id": "off", "kind": "local", "workers": 1, "models": [SMALL, EMBED],
+             "disabled": True,
+             "transport": {"type": "http", "base_url": "http://127.0.0.1:2"}},
+        ],
+    )
+    assert set(cfg.models_without_a_host_in_service()) == {SMALL, EMBED}
 
 
 def test_naming_models_while_every_host_holds_everything_is_refused_not_ignored():

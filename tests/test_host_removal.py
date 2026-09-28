@@ -121,15 +121,33 @@ def test_it_returns_to_service_with_one_click(pool):
     assert not next(h for h in supervisor.config.hosts if h.id == "laptop").disabled
 
 
-def test_the_only_host_serving_a_model_cannot_be_taken_out_of_service(declared_pool):
-    """Otherwise that model would have nowhere to go, and every request for it would fail."""
-    _, url, path = declared_pool
-    before = path.read_text()
+def test_the_only_host_serving_a_model_can_be_taken_out_of_service_and_the_plan_says_so(declared_pool):
+    """Out of service is for a while and back with one click, so it is never refused (D113).
+    Found live: the laptop could not be taken out to send one model's traffic to a rented host
+    alone, because it was the only host holding the pool's other models. What it leaves without
+    a host is said, rather than refused."""
+    supervisor, url, path = declared_pool
     with admin(url) as http:
         answer = http.patch("/pool/config/hosts/laptop", json={"disabled": True})
-    assert answer.status_code == 400
-    assert "would be held by none" in answer.json()["detail"] and "a" in answer.json()["detail"]
-    assert path.read_text() == before
+    assert answer.status_code == 200, answer.text
+    (change,) = [c for c in answer.json()["changes"] if c["kind"] == "host_disabled"]
+    assert "no host in service holds a then" in change["detail"]
+    assert hosts_in(path)["laptop"]["disabled"] is True
+    assert supervisor.config.models_without_a_host_in_service() == ["a"]
+
+    with admin(url) as http:
+        back = http.patch("/pool/config/hosts/laptop", json={"disabled": False})
+    assert back.status_code == 200, back.text
+    assert supervisor.config.models_without_a_host_in_service() == []
+
+
+def test_taking_out_a_host_whose_models_others_hold_strands_nothing(declared_pool):
+    _, url, _ = declared_pool
+    with admin(url) as http:
+        answer = http.patch("/pool/config/hosts/desk", json={"disabled": True})
+    assert answer.status_code == 200, answer.text
+    (change,) = [c for c in answer.json()["changes"] if c["kind"] == "host_disabled"]
+    assert change["detail"] == "host 'desk' is disabled", "b is still bought for by rented hosts"
 
 
 # --- removing ---

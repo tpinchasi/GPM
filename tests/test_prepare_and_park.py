@@ -461,6 +461,45 @@ async def test_a_prepare_lease_closes_when_its_host_is_evicted_and_not_re_bid(fl
     assert not lease_of(fleet, host.lease_id).is_open
 
 
+async def test_an_evicted_prepared_host_is_said_to_be_released_not_replaced(fleet):
+    """Found live: "was outbid: replace … replacing on 43532" on a prepared host whose lease
+    closed with it a second later, renting nothing. And the reasons kept only "$0.982 is below
+    the floor $1.200", dropping the step that said which ceiling held the bid there."""
+    import dataclasses
+
+    host = await fleet.prepare(max_spend=1.00, max_hours=2)
+    rented_on = host.offer
+    # Another machine is on offer — as 43532 was.
+    fleet.provider.offers = [default_offer("o-2", "m-2")]
+    # Won back only at a floor past every ceiling.
+    fleet.provider.held_by_others = [dataclasses.replace(rented_on, min_bid_hourly=5.0, on_demand_hourly=None)]
+    fleet.provider.evict(host.instance.instance_id)
+    await fleet.handle_evictions()
+
+    eviction = next(e for e in fleet.events.recent() if e["kind"] == "eviction")
+    assert "nothing is rented in its place" in eviction["summary"]
+    assert "replac" not in " ".join(eviction["numbers"]["reasons"]).replace("best other offer", "")
+    assert any("clamped" in r for r in eviction["numbers"]["reasons"]), "which ceiling held the bid"
+    assert host.released and not lease_of(fleet, host.lease_id).is_open
+    assert len(fleet.provider.instances) == 0
+
+
+async def test_an_evicted_overflow_host_is_said_to_leave_its_replacement_to_the_lease(fleet):
+    import dataclasses
+
+    fleet.open_lease(workers=6, max_hours=4, max_spend=5.00, allow_rent=True)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    (host,) = fleet.hosts.values()
+    rented_on = host.offer
+    fleet.provider.offers = [default_offer("o-2", "m-2")]
+    fleet.provider.held_by_others = [dataclasses.replace(rented_on, min_bid_hourly=5.0, on_demand_hourly=None)]
+    fleet.provider.evict(host.instance.instance_id)
+    await fleet.handle_evictions()
+
+    eviction = next(e for e in fleet.events.recent() if e["kind"] == "eviction")
+    assert "its lease rents a replacement if it still needs the capacity" in eviction["summary"]
+
+
 async def test_a_prepare_lease_closes_when_its_host_vanishes_at_the_provider(fleet):
     host = await fleet.prepare(max_spend=1.00, max_hours=2)
     del fleet.provider.instances[host.instance.instance_id]

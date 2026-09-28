@@ -263,7 +263,7 @@ not only once its container has stopped.
 | In order | What | When |
 |---|---|---|
 | 1 | **Re-bid in place** — same machine, disk and models kept: the machine's current floor plus the premium | whenever that bid fits the all-in maximum and the on-demand crossover. The floor is read from the market, or, where the machine is not listed because whoever outbid the pool holds it, asked of that machine (`offer_for_machine`) |
-| 2 | **Release** it | the bid cannot fit the ceilings, the machine's price cannot be read, or a re-bid has not brought the instance back once the grace below has run out (`rebid_lost`) |
+| 2 | **Release** it | the bid cannot fit the ceilings, the machine's price cannot be read, or a re-bid has not brought the instance back once the grace below has run out (`rebid_lost`). The `eviction` event says what follows — a prepared host's lease closes with it and nothing is rented in its place; an overflow lease is left to rent a replacement if it needs one — and keeps every step of the re-bid's reasoning (D113) |
 | — | **Replace** | not an eviction response: a released host is a lease's missing capacity, and renting for it is the ordinary acquire path. A prepared host's lease closes with it |
 | — | **Wait it out**, instance stopped, storage only, time-boxed | post-v1 |
 
