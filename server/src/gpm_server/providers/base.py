@@ -243,6 +243,10 @@ class AccountStatus:
 @dataclasses.dataclass(frozen=True)
 class OfferQuery:
     min_gpu_memory_gb: float = 0.0
+    #: The fewest cards a machine may have (D114). Asked of the provider rather than filtered
+    #: after: a search that returns its first hundred listings, nearly all of one card, may
+    #: hold no machine with two.
+    min_gpus: int = 1
     min_disk_gb: float = 0.0
     max_all_in_hourly: Optional[float] = None
     verified_only: bool = False

@@ -189,6 +189,7 @@ class FakeProvider:
             offer
             for offer in self.offers
             if offer.gpu_memory_gb >= query.min_gpu_memory_gb
+            and offer.gpus >= query.min_gpus
             and offer.disk_gb >= query.min_disk_gb
             and (query.max_all_in_hourly is None or offer.all_in_hourly <= query.max_all_in_hourly)
             and (offer.verified or not query.verified_only)

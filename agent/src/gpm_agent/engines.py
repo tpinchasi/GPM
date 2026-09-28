@@ -23,6 +23,8 @@ class OllamaFacts:
     fetches_without_engine = False
     #: A model is loaded by asking the running engine to load it.
     loads_by_restart = False
+    #: Ollama places a model on the machine's cards itself; it cannot be told to split one (D114).
+    splits_across_cards = False
 
     def __init__(self, settings: Any = None) -> None:
         #: Unused here — this engine answers every question about itself over its own API.
@@ -49,9 +51,12 @@ class OllamaFacts:
             "models_loaded": sorted(m.get("name") for m in loaded if m.get("name")),
         }
 
-    def launch_environment(self, workers: int, models_held: int, context: Optional[int] = None) -> dict[str, str]:
+    def launch_environment(
+        self, workers: int, models_held: int, context: Optional[int] = None, cards_per_copy: int = 1
+    ) -> dict[str, str]:
         """The engine's own names for the pool's numbers. Built here, from integers — the pool
         never sends a variable name or a value as text."""
+        # `cards_per_copy` is never more than one here: the agent refuses it first (D114).
         environment = {"OLLAMA_NUM_PARALLEL": str(workers), "OLLAMA_MAX_LOADED_MODELS": str(models_held)}
         if context is not None:
             environment["OLLAMA_CONTEXT_LENGTH"] = str(context)
@@ -202,6 +207,9 @@ class VllmFacts:
     #: A model is "loaded" by starting the engine again with it on disk. The agent fetches and
     #: reports; the pool, seeing a model downloaded and not yet served, asks for the restart.
     loads_by_restart = True
+    #: A model may be split across a group of cards (tensor parallelism, D114); the launcher
+    #: reads how many from the environment written here.
+    splits_across_cards = True
 
     def __init__(self, settings: Any = None) -> None:
         self.settings = settings
@@ -312,7 +320,7 @@ class VllmFacts:
             raise EngineRefused(f"could not remove {tag} from disk: {exc}") from exc
 
     def launch_environment(
-        self, workers: int, models_held: int, context: Optional[int] = None
+        self, workers: int, models_held: int, context: Optional[int] = None, cards_per_copy: int = 1
     ) -> dict[str, str]:
         """The pool's numbers under this engine's names — numbers only, as always.
 
@@ -331,6 +339,10 @@ class VllmFacts:
         }
         if context is not None:
             environment["GPM_VLLM_MAX_MODEL_LEN"] = str(context)
+        if cards_per_copy > 1:
+            # Written only when a model is split, so a host that splits nothing keeps exactly the
+            # file it had (D107 is the case of one card per copy).
+            environment["GPM_VLLM_CARDS_PER_COPY"] = str(cards_per_copy)
         return environment
 
     def settings_from_environment(
@@ -343,13 +355,18 @@ class VllmFacts:
             value = environment.get(name, "")
             return int(value) if value.isdigit() else None
 
-        return {
+        applied = {
             "workers": number("GPM_VLLM_MAX_NUM_SEQS"),
             # Always one, and said rather than left blank: the pool compares what it asked for
             # with what was applied, and a missing number reads as "not applied yet".
             "models_held": 1,
             "context": number("GPM_VLLM_MAX_MODEL_LEN"),
         }
+        split = number("GPM_VLLM_CARDS_PER_COPY")
+        if split and split > 1:
+            # Only where written, as the pool only asks for it then (D114).
+            applied["cards_per_copy"] = split
+        return applied
 
 
 _ENGINES = {"ollama": OllamaFacts, "vllm": VllmFacts}

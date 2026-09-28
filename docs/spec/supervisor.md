@@ -246,6 +246,15 @@ model set. **Parked hosts are tried first** (§8).
    within 90% of the card — the rule the machine's own launcher refuses to start without. Disk is
    the weights plus a tenth, plus 10 GB for the engine's image, logs and caches. The disk searched
    for is still the disk rented, so the host is rented with the raised figure.
+
+   **A profile split across cards searches for whole groups of them (D114).** With
+   `rented.split_across_cards` giving the next host's profile N cards per copy, each card holds a
+   1/N share of every model's weights (plus the reserve), so the card-memory minimum is that; the
+   search's `gpus_multiple_of` is raised to N, the provider is asked for at least N cards (the one
+   filter put in the provider's query — D33's exception, D114), and a
+   machine whose cards are not a whole number of groups of N is rejected with the reason `cards`.
+   The disk still holds each model once. The host keeps its N, and every engine restart the pool
+   asks for carries it.
 4. **Place and confirm** — ask the provider to fail rather than park a losing bid; label the
    instance `<pool>/<host_id>`; wait for running; if it sits stopped with nothing pending for
    60 s the bid lost — destroy and verify. The floor moving between search and create is normal:

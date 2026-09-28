@@ -25,7 +25,12 @@ from .engines import OllamaFacts
 from .models import Refused
 from .settings import Settings
 
-_BOUNDS = {"workers": (1, 64), "models_held": (1, 64), "context": (256, 1_048_576)}
+_BOUNDS = {
+    "workers": (1, 64), "models_held": (1, 64), "context": (256, 1_048_576),
+    # How many cards each copy of a model is split across (D114). A power of two: the engines
+    # that split a model this way divide its attention heads between the cards.
+    "cards_per_copy": (1, 8),
+}
 _HEADER = "# Written by gpm-agent from the pool's settings for this host. Edits are overwritten.\n"
 _OUTPUT_TAIL = 2000
 
@@ -44,6 +49,8 @@ def validated(body: Any) -> Optional[dict[str, int]]:
         low, high = _BOUNDS[name]
         if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
             raise Refused(400, "bad_settings", f"{name} must be a whole number from {low} to {high}")
+    if wanted.get("cards_per_copy", 1) not in (1, 2, 4, 8):
+        raise Refused(400, "bad_settings", "cards_per_copy must be 1, 2, 4 or 8")
     if "workers" not in wanted or "models_held" not in wanted:
         raise Refused(400, "bad_settings", "settings must state workers and models_held")
     return dict(wanted)
@@ -92,6 +99,9 @@ class EngineControl:
         if wanted is not None and not self.settings.engine_env_file:
             raise Refused(409, "owner_has_not_enabled_settings",
                           "this machine's owner has set no engine_env_file in the agent's settings; the pool cannot choose where to write")
+        if wanted is not None and wanted.get("cards_per_copy", 1) > 1 and not getattr(self.engine, "splits_across_cards", False):
+            raise Refused(409, "engine_cannot_split",
+                          f"{self.engine.name} does not split a model across cards on request")
         if self._lock.locked():
             raise Refused(409, "restart_in_progress", "the engine is already being restarted")
         async with self._lock:

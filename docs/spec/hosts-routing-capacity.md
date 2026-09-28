@@ -295,6 +295,7 @@ rented:
     chat-fp8:  { gemma4:26b: RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic }
     small-mix: { gemma4:e4b: google/gemma-4-E4B-it, nomic-embed-text:latest: nomic-ai/nomic-embed-text-v2-moe }
   rent_profiles: [chat, small-mix]      # what the pool may rent hosts as, in preference order
+  split_across_cards: { chat-fp8: 2 }   # cards each copy spans (D114); unnamed profiles: 1
 ```
 
 - **Each machine is bought as exactly one profile**, and holds exactly its builds — whatever the
@@ -306,6 +307,13 @@ rented:
   each in its own process behind the machine's router where the engine serves one model per
   process (D96) — decided per machine by what it holds, not by a switch for the whole pool.
 - **What a profile holds sets the least card and disk searched for** (supervisor.md §6.1).
+- **A profile may be split across cards** (D114): `split_across_cards` gives it N — 1, 2, 4 or 8 —
+  and a machine bought as it runs one copy of its models per group of N cards, each model split
+  across the group by the engine (vLLM's tensor parallelism), each card holding 1/N of every model.
+  This is how a model larger than any one card is served. The search asks for whole groups of N
+  and the card a 1/N share needs. Refused at load for an engine that cannot split a model on
+  request, and beside an operator's own `engine_start`. A small model in a split profile is split
+  too; give a large model a profile of its own to avoid that.
 - The file refuses: a rented profile that is not defined; a profile holding a model outside the
   set; a build the catalog does not list for that model, or one rented hosts cannot run; naming
   `rented.models` beside `rent_profiles`; and a model in the set held by no configured host and
@@ -314,7 +322,7 @@ rented:
   `pool.models_per_host` decide, and `rented.engine_proxy` puts the router on every machine.
   `models_per_host` still says what *configured* hosts hold.
 
-What a rented host was bought as — its models, profile, builds and disk — is kept in the host
+What a rented host was bought as — its models, profile, builds, cards per copy and disk — is kept in the host
 table, so a restarted supervisor asks it for exactly what it holds.
 
 How a host holds what it was given is its **residency** policy, set per host:

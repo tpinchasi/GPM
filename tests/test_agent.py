@@ -641,6 +641,8 @@ async def test_a_plain_restart_writes_nothing(tmp_path):
     {"settings": {"workers": 9999, "models_held": 1}},
     {"settings": {"workers": True, "models_held": 1}},
     {"settings": {"workers": 3}},
+    {"settings": {"workers": 3, "models_held": 1, "cards_per_copy": 3}},
+    {"settings": {"workers": 3, "models_held": 1, "cards_per_copy": 16}},
     {"settings": None, "command": ["sh", "-c", "id"]},
     {"settings": None, "restart_command": ["id"]},
     {"settings": None, "engine_env_file": "/etc/passwd"},
@@ -650,6 +652,27 @@ async def test_the_pool_can_say_numbers_and_nothing_else(tmp_path, body):
     machine = restartable(tmp_path)
     assert (await post_engine(machine, body)).status_code == 400
     assert not machine.marker.exists() and not machine.env_file.exists()
+
+
+async def test_an_engine_that_cannot_split_a_model_is_not_asked_to(tmp_path):
+    """Ollama places a model on the cards itself (D114); the pool refuses this at load, and the
+    agent refuses it again rather than restart the engine as though it had been done."""
+    machine = restartable(tmp_path)
+    refused = await post_engine(machine, {"settings": {"workers": 2, "models_held": 1, "cards_per_copy": 2}})
+    assert refused.status_code == 409 and refused.json()["error"] == "engine_cannot_split"
+    assert not machine.marker.exists() and not machine.env_file.exists()
+
+
+def test_a_split_reaches_vllms_launcher_as_a_number_and_is_read_back():
+    from gpm_agent.engines import VllmFacts
+
+    engine = VllmFacts()
+    written = engine.launch_environment(8, 1, cards_per_copy=2)
+    assert written["GPM_VLLM_CARDS_PER_COPY"] == "2"
+    assert engine.settings_from_environment(written)["cards_per_copy"] == 2
+    unsplit = engine.launch_environment(8, 1)
+    assert "GPM_VLLM_CARDS_PER_COPY" not in unsplit, "a host that splits nothing keeps the file it had"
+    assert "cards_per_copy" not in engine.settings_from_environment(unsplit)
 
 
 async def test_without_the_owners_command_there_is_no_restart_and_the_pool_cannot_supply_one(tmp_path):

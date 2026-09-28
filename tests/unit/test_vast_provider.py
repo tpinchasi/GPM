@@ -199,6 +199,22 @@ async def test_a_refusal_with_no_words_of_its_own_is_quoted_whole():
         await provider(handler).create(offer, InstanceSpec(label="l", image="i", disk_gb=10), bid=0.1)
 
 
+async def test_a_search_for_several_cards_asks_the_market_for_them():
+    """Filtered by the market, not after: its first listings are nearly all one card (D114)."""
+    seen = []
+
+    def handler(request):
+        body = json.loads(request.read())
+        seen.append(body)
+        return httpx.Response(200, json={"offers": [OFFER] if body["type"] == "bid" else [ON_DEMAND]})
+
+    await provider(handler).search_offers(OfferQuery(min_gpus=2))
+    assert seen[0]["num_gpus"] == {"gte": 2}
+    seen.clear()
+    await provider(handler).search_offers(OfferQuery())
+    assert "num_gpus" not in seen[0], "one card is every machine; nothing is asked"
+
+
 async def test_an_offer_that_went_between_search_and_create_is_typed():
     def handler(request):
         return httpx.Response(410, json={"error": "no_such_ask"})

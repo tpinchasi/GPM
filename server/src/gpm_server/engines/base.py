@@ -90,6 +90,11 @@ class Engine(Protocol):
     #: anything; on a host the pool created, the pool restarts it once the models are on disk.
     loads_by_restart: ClassVar[bool] = False
 
+    #: Whether this engine's start can split one model across a group of cards when told to
+    #: (tensor parallelism, D114). Declared: `rented.split_across_cards` is refused at load for
+    #: an engine that cannot, rather than searched for half a card per model and started whole.
+    splits_across_cards: ClassVar[bool] = False
+
     #: Named options of this engine's own start, by name (D100). Empty for an engine whose
     #: start takes none; `rented.engine_options` may only name these.
     options: ClassVar[dict[str, EngineOption]] = {}

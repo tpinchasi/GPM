@@ -917,6 +917,8 @@ function engineDraft(status) {
     image: e.image || "",
     engine_start: e.engine_start || "",
     engine_options: [...(e.engine_options || [])],
+    // What each engine's start can do, for the save to know whether a split may be sent.
+    offers: e.offers || {},
   };
 }
 
@@ -1041,7 +1043,8 @@ function profileCard(status, d, profile, i, draw) {
     profile.models.length ? el("table", { class: "builds held" },
       el("thead", {}, el("tr", {}, ...["Model", "Variant", "Precision", "Size", ""].map((h) => el("th", {}, h)))),
       el("tbody", {}, ...rows)) : el("p", { class: "muted" }, "Holds nothing yet — add a model below."),
-    el("div", { class: "row" }, needsLine(profile.models),
+    splitsAcross(status, d, profile, draw),
+    el("div", { class: "row" }, needsLine(profile.models, profile.cards || 1),
       profile.several && d.rented === "vllm" && profile.models.length > 1
         ? el("span", { class: "muted" }, "· one vLLM process per model, the card's memory split between them") : null),
     finding
@@ -1050,28 +1053,44 @@ function profileCard(status, d, profile, i, draw) {
         full ? "Replace the model…" : "+ Add a model…")));
 }
 
+// A model too large for one card, split across a group of them (D114): offered only for an
+// engine whose start can do it. The search then asks for whole groups of cards, each holding
+// that share of every model.
+function splitsAcross(status, d, profile, draw) {
+  if (!(((status.engine.offers || {})[d.rented] || {}).splits_across_cards)) return null;
+  const select = el("select", { "aria-label": "split each model", onchange: (ev) => { profile.cards = Number(ev.target.value); draw(); } },
+    ...[1, 2, 4, 8].map((n) => el("option", { value: String(n), ...((profile.cards || 1) === n ? { selected: true } : {}) },
+      n === 1 ? "no — a copy on every card" : `across ${n} cards`)));
+  return el("div", { class: "row" },
+    el("span", {}, "split each model"), select,
+    (profile.cards || 1) > 1 ? el("span", { class: "muted" },
+      `one copy per ${profile.cards} cards; a machine's cards must come in whole groups of ${profile.cards}`) : null);
+}
+
 // What a machine holding these needs, per card and on disk: the server's rule (sizing.py), which
 // is the launcher's own. The Finding machines tab shows the number the search actually used.
 const SIZING = { weightOverhead: 1.10, cacheReserveGb: 3 * 1024 ** 3 / 1e9, share: 0.90, diskOverhead: 1.10, diskHeadroomGb: 10 };
 
-function needsFor(models) {
+// Split across `cards` cards (D114), each card holds that share of every model's weights.
+function needsFor(models, cards = 1) {
   const known = models.filter((m) => m.size_gb);
   const unknown = models.filter((m) => !m.size_gb).map((m) => m.model);
   if (!known.length) return { card: 0, disk: 0, weights: 0, unknown };
   const weights = known.reduce((sum, m) => sum + Number(m.size_gb), 0);
   return {
-    card: Math.ceil((weights * SIZING.weightOverhead + SIZING.cacheReserveGb * known.length) / SIZING.share),
+    card: Math.ceil((weights * SIZING.weightOverhead / cards + SIZING.cacheReserveGb * known.length) / SIZING.share),
     disk: Math.ceil(weights * SIZING.diskOverhead + SIZING.diskHeadroomGb),
     weights: Math.round(weights * 10) / 10,
     unknown,
   };
 }
 
-function needsLine(models) {
+function needsLine(models, cards = 1) {
   if (!models.length) return null;
-  const needs = needsFor(models);
+  const needs = needsFor(models, cards);
+  const card = cards > 1 ? `cards in groups of ${cards}, each ≥ ${needs.card} GB,` : `a card of ≥ ${needs.card} GB`;
   return el("span", { class: "needs" },
-    needs.weights ? el("span", {}, `needs a card of ≥ ${needs.card} GB and ≥ ${needs.disk} GB of disk`,
+    needs.weights ? el("span", {}, `needs ${card} and ≥ ${needs.disk} GB of disk`,
       el("span", { class: "muted" }, ` (${needs.weights} GB of weights)`)) : null,
     needs.unknown.length ? el("span", { class: "muted" },
       `${needs.weights ? " · " : ""}size not measured for ${needs.unknown.join(", ")}, so not counted`) : null);
@@ -1090,7 +1109,7 @@ function profilesFromStatus(status, rented) {
     return {
       migrated: false,
       profiles: e.profiles.map((p) => ({
-        name: p.name, rented: p.rented, several: p.models.length > 1,
+        name: p.name, rented: p.rented, several: p.models.length > 1, cards: p.cards_per_copy || 1,
         models: p.models.map((m) => ({ ...row(m.model, m.build), size_gb: m.size_gb ?? about(m.model, m.build).size_gb ?? null })),
       })),
     };
@@ -1446,6 +1465,9 @@ async function saveEngine(event, note) {
     engine_options: (d.engine_start || "").trim() ? [] : d.engine_options,
     profiles: Object.fromEntries(d.profiles.map((p) => [p.name.trim(), Object.fromEntries(p.models.map((m) => [m.model, m.build]))])),
     rent: d.profiles.filter((p) => p.rented).map((p) => p.name.trim()),
+    // Only where the engine can split; another engine's profiles are sent unsplit (D114).
+    split: Object.fromEntries(d.profiles.map((p) => [p.name.trim(),
+      (((d.offers || {})[d.rented] || {}).splits_across_cards ? (p.cards || 1) : 1)])),
     // Only builds a profile still uses: one found and then dropped is not written to the file.
     add: Object.entries(d.adds).map(([name, builds]) => ({ name, builds: builds.filter((b) => used.has(`${name}|${b.tag}`)) }))
       .filter((item) => item.builds.length),
@@ -1598,11 +1620,14 @@ function nextHostNote(market, { onlyWhenRaised = false } = {}) {
   const next = market.next_host;
   if (!next || !next.needs) return null;
   const { searched, typed, needs } = next;
-  const raised = searched.min_gpu_memory_gb > typed.min_gpu_memory_gb || searched.min_disk_gb > typed.min_disk_gb;
+  const raised = searched.min_gpu_memory_gb > typed.min_gpu_memory_gb || searched.min_disk_gb > typed.min_disk_gb
+    || (searched.gpus_multiple_of || 1) > (typed.gpus_multiple_of || 1);
   if (onlyWhenRaised && !raised) return null;
   const what = next.profile ? `bought as ${next.profile}, holding ${next.models.join(", ")}` : `holding ${next.models.join(", ")}`;
+  const cards = (needs.cards_per_copy || 1) > 1
+    ? `cards in whole groups of ${needs.cards_per_copy}, each of ≥ ${needs.card_memory_gb} GB,` : `a card of ≥ ${needs.card_memory_gb} GB`;
   return el("div", { class: "muted", style: "margin-top:6px" },
-    `The next host is ${what}: it needs a card of ≥ ${needs.card_memory_gb} GB and ${needs.disk_gb} GB of disk`,
+    `The next host is ${what}: it needs ${cards} and ${needs.disk_gb} GB of disk`,
     needs.unknown.length ? ` (${needs.unknown.join(", ")} not measured, not counted)` : "",
     raised ? ` — so the search asks for ≥ ${searched.min_gpu_memory_gb} GB of card and ${searched.min_disk_gb} GB of disk, above the ${typed.min_gpu_memory_gb} and ${typed.min_disk_gb} set here.`
       : " — within the minimums set here.");

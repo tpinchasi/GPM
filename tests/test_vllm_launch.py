@@ -477,3 +477,120 @@ def test_a_copy_that_died_is_reported_with_its_card(tmp_path):
     failed = vllm_launch.failed_engines(tmp_path, served=[], alive=lambda pid: pid in processes.alive)
     assert failed[BIG].startswith("its vLLM process on card 1 exited before serving it: torch.OutOfMemoryError")
     assert dead["log"].endswith(".card1.log"), "each copy writes its own log"
+
+
+# --- a model split across a group of cards (D114) ---
+
+
+def split_launch(processes, models_dir, cards, per_copy, **kwargs):
+    return vllm_launch.launch(
+        models_dir, 8000, popen=processes.popen, kill=processes.kill, alive=lambda pid: False,
+        env={"GPM_VLLM_CARDS_PER_COPY": str(per_copy), "GPM_VLLM_MAX_NUM_SEQS": "12"},
+        devices=cards, probe_card=lambda: None, agent="/var/run/gpm/gpm-agent.pyz", python="python3",
+        **kwargs,
+    )
+
+
+def with_heads(directory, heads, *, under_text_config=False):
+    config = {"model_type": "gemma4", "num_attention_heads": heads}
+    if under_text_config:
+        config = {"model_type": "gemma4", "text_config": {"num_attention_heads": heads}}
+    (directory / "config.json").write_text(json.dumps(config))
+
+
+def test_a_model_split_across_two_cards_runs_once_per_pair(tmp_path):
+    """Four cards, two to a copy: two copies, each one vLLM process across its pair."""
+    with_heads(downloaded(tmp_path, BIG, 1000), 32)
+    processes = Processes()
+    started = split_launch(processes, tmp_path, ["0", "1", "2", "3"], 2)
+
+    assert started.refused is None
+    assert [e["card"] for e in started.engines] == ["0,1", "2,3"]
+    assert [env["CUDA_VISIBLE_DEVICES"] for env in processes.envs[:2]] == ["0,1", "2,3"]
+    engines = [argv for argv in processes.started if argv[0] == "vllm"]
+    assert all(argv[argv.index("--tensor-parallel-size") + 1] == "2" for argv in engines)
+    assert [argv[argv.index("--max-num-seqs") + 1] for argv in engines] == ["6", "6"], \
+        "the host's workers are split between its two copies, not its four cards"
+    assert started.proxy and started.proxy["port"] == 8000, "two copies, one port: the router"
+    assert started.engines[0]["log"].endswith(".card0-1.log")
+    assert started.plan["cards_per_copy"] == 2
+
+
+def test_one_group_of_cards_is_one_copy_pinned_to_it(tmp_path):
+    downloaded(tmp_path, BIG, 1000)
+    processes = Processes()
+    started = split_launch(processes, tmp_path, ["0", "1"], 2)
+    (engine,) = started.engines
+    assert engine["card"] == "0,1" and engine["port"] == 8000 and started.proxy is None
+
+
+def test_a_machine_whose_cards_do_not_make_whole_groups_is_refused(tmp_path):
+    downloaded(tmp_path, BIG, 1000)
+    processes = Processes()
+    started = split_launch(processes, tmp_path, ["0", "1", "2"], 2)
+    assert processes.started == []
+    assert "has 3, which is not a whole number of groups of 2" in started.refused
+    assert vllm_launch.read_record(tmp_path)["refused"] == started.refused, "said where the agent reads it"
+
+
+def test_a_split_with_no_cards_listed_is_refused(tmp_path):
+    downloaded(tmp_path, BIG, 1000)
+    processes = Processes()
+    started = split_launch(processes, tmp_path, [], 2)
+    assert processes.started == [] and "the driver lists none" in started.refused
+
+
+def test_a_model_whose_heads_do_not_divide_is_refused_before_anything_starts(tmp_path):
+    """vLLM would refuse at start, after the machine was rented and the weights fetched."""
+    with_heads(downloaded(tmp_path, BIG, 1000), 12)
+    processes = Processes()
+    started = split_launch(processes, tmp_path, ["0", "1", "2", "3", "4", "5", "6", "7"], 8)
+    assert processes.started == []
+    assert started.refused == (
+        f"{BIG} has 12 attention heads, which do not divide between 8 cards; split it across fewer cards"
+    )
+
+
+def test_the_heads_of_a_model_built_around_a_text_model_are_read_from_it(tmp_path):
+    with_heads(downloaded(tmp_path, BIG, 1000), 6, under_text_config=True)
+    assert vllm_launch.attention_heads(modelhub.directory_for(tmp_path, BIG)) == 6
+    assert "6 attention heads" in vllm_launch.split_refusal([modelhub.directory_for(tmp_path, BIG)], 4)
+
+
+def test_a_model_that_does_not_state_its_heads_is_left_to_the_engine(tmp_path):
+    downloaded(tmp_path, BIG, 1000)
+    assert vllm_launch.split_refusal([modelhub.directory_for(tmp_path, BIG)], 2) is None
+
+
+def test_a_split_puts_a_share_of_the_weights_on_each_card():
+    """A set refused on one card fits two: each card holds half of every model."""
+    card = 24 * 10**9
+    _, alone = vllm_launch.memory_plan([30 * 10**9], card)
+    assert alone is not None
+    shares, split = vllm_launch.memory_plan([30 * 10**9], card, 2)
+    assert split is None and shares == [0.9]
+    _, four_ways = vllm_launch.memory_plan([30 * 10**9, 30 * 10**9], card, 2)
+    assert "split across 2 cards" in four_ways and "or the models split across more cards" in four_ways
+
+
+def test_a_split_that_is_not_a_power_of_two_is_refused():
+    placements, why = vllm_launch.card_groups(["0", "1", "2"], 3)
+    assert placements == [] and "not 3" in why
+
+
+def test_one_card_per_copy_is_d107_exactly():
+    assert vllm_launch.card_groups(["0", "1"], 1) == (["0", "1"], None)
+    assert vllm_launch.card_groups(["0"], 1) == ([None], None)
+    assert vllm_launch.cards_per_copy({}) == 1
+    assert vllm_launch.cards_per_copy({"GPM_VLLM_CARDS_PER_COPY": "x"}) == 1
+
+
+def test_a_group_that_died_is_reported_with_its_cards(tmp_path):
+    downloaded(tmp_path, BIG, 100)
+    processes = Processes()
+    split_launch(processes, tmp_path, ["0", "1", "2", "3"], 2)
+    record = vllm_launch.read_record(tmp_path)
+    dead = next(e for e in record["engines"] if e["card"] == "2,3")
+    Path(dead["log"]).write_text("(APIServer pid=9) RuntimeError: NCCL error\n")
+    failed = vllm_launch.failed_engines(tmp_path, served=[], alive=lambda pid: pid != dead["pid"])
+    assert failed[BIG].startswith("its vLLM process on cards 2,3 exited before serving it: RuntimeError: NCCL")

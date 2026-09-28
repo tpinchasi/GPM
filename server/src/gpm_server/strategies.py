@@ -344,6 +344,11 @@ def reject_reasons(offer: Offer, policy: OfferPolicy, model_set_gb: float = 0.0)
         reasons.append(
             f"gpu memory: {offer.gpu_memory_gb}GB below the {policy.min_gpu_memory_gb}GB minimum"
         )
+    if policy.gpus_multiple_of > 1 and (offer.gpus < policy.gpus_multiple_of or offer.gpus % policy.gpus_multiple_of):
+        reasons.append(
+            f"cards: {offer.gpus} is not a whole number of groups of {policy.gpus_multiple_of}, "
+            f"which each model is split across"
+        )
     if offer.disk_gb < policy.min_disk_gb:
         reasons.append(
             f"disk: {offer.disk_gb:g}GB below the {policy.min_disk_gb:g}GB this pool rents a host with"
