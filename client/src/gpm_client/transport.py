@@ -16,6 +16,9 @@ import httpx
 from .errors import PoolAuthError, PoolRequestError, PoolStreamInterrupted, PoolUnavailable
 from .retry import RetryPolicy
 
+#: 503 reasons that no wait will change: the workload has ended (app contract §3).
+FINAL_503 = frozenset({"workload_ended"})
+
 
 def _parse_503(response: httpx.Response) -> tuple[Optional[str], Optional[float], Optional[str]]:
     try:
@@ -131,7 +134,7 @@ class PoolTransport(httpx.BaseTransport):
             if response.status_code == 503:
                 response.read()
                 reason, retry_after, detail = _parse_503(response)
-                if reason == "no_lease" and not policy.wait_without_lease:
+                if reason in FINAL_503 or (reason == "no_lease" and not policy.wait_without_lease):
                     raise PoolUnavailable(reason=reason, detail=detail)
                 wait_s = _next_wait(policy, start, attempt, retry_after)
                 if wait_s is None:
@@ -185,7 +188,7 @@ class AsyncPoolTransport(httpx.AsyncBaseTransport):
             if response.status_code == 503:
                 await response.aread()
                 reason, retry_after, detail = _parse_503(response)
-                if reason == "no_lease" and not policy.wait_without_lease:
+                if reason in FINAL_503 or (reason == "no_lease" and not policy.wait_without_lease):
                     raise PoolUnavailable(reason=reason, detail=detail)
                 wait_s = _next_wait(policy, start, attempt, retry_after)
                 if wait_s is None:

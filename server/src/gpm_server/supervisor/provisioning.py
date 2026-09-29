@@ -252,6 +252,10 @@ class Provisioning:
             raise WorkloadRefused("this key's workloads are reached with a client certificate: send csr")
         if csr is not None and not isinstance(csr, str):
             raise WorkloadRefused("csr is a PEM signing request")
+        if csr and not self.config.listen.client_ca_certfile:
+            # The listener would never ask for the certificate, and the workload could not be reached.
+            raise WorkloadRefused("this pool's listener does not ask for client certificates "
+                                  "(listen.client_ca_certfile); create without certs")
         workload, _, _, certificate = await workloads.create(
             req, key_hash=key_hash, provisioner=provisioner.name, idle_end_minutes=idle,
             may_borrow=may_borrow, csr=csr, ca=self.ca if csr else None,

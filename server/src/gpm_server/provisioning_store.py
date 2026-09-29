@@ -73,6 +73,14 @@ class Provisioner:
                 "expires_at": self.expires_at, "revoked_at": self.revoked_at, "usable": self.usable()}
 
 
+@dataclasses.dataclass(frozen=True)
+class KeyReach:
+    """What a provisioning key reaches, as the router needs it."""
+
+    name: str
+    expires_at: Optional[float]
+
+
 class HashTaken(ValueError):
     """A workload key hash another provisioner already sent."""
 
@@ -135,14 +143,16 @@ class ProvisioningStore:
         self.db.execute("UPDATE provisioners SET revoked_at = ?, updated_at = ? WHERE name = ? AND revoked_at IS NULL",
                         (now, now, name))
 
-    def usable_hashes(self) -> dict[str, str]:
-        """hash → provisioner name, for keys neither revoked nor expired: what the router honours."""
+    def usable_hashes(self) -> dict[str, "KeyReach"]:
+        """hash → (provisioner name, expiry), for keys neither revoked nor expired now. The router
+        reads the expiry again at each request: time passing moves no revision."""
         now = time.time()
         rows = self.db.query(
-            "SELECT name, hashed FROM provisioners WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)",
+            "SELECT name, hashed, expires_at FROM provisioners WHERE revoked_at IS NULL "
+            "AND (expires_at IS NULL OR expires_at > ?)",
             (now,),
         )
-        return {r["hashed"]: r["name"] for r in rows}
+        return {r["hashed"]: KeyReach(r["name"], r["expires_at"]) for r in rows}
 
     def revision(self) -> float:
         a = self.db.query("SELECT COUNT(*) AS n, MAX(updated_at) AS t FROM provisioners")[0]
@@ -182,6 +192,13 @@ class ProvisioningStore:
         if rows[0]["provisioner"] != provisioner:
             raise HashTaken("this key_hash is in use; make a new workload key")
         return rows[0]["request_id"]
+
+    def pending_end(self, provisioner: str, workload: str) -> Optional[str]:
+        """An end of this workload this provisioner asked for and is still waiting on."""
+        rows = self.db.query(
+            "SELECT request_id FROM provisioning_requests WHERE provisioner = ? AND kind = 'end' AND workload = ? "
+            "AND state = 'pending' LIMIT 1", (provisioner, workload))
+        return rows[0]["request_id"] if rows else None
 
     def asked_since(self, provisioner: str, since: float) -> int:
         """How many requests this provisioner made since `since`: the router's rate limit."""

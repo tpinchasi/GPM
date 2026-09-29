@@ -75,17 +75,26 @@ class ClientCA:
         self.key = serialization.load_pem_private_key(keyfile.read_bytes(), password=None)
         self.pem = self.cert.public_bytes(serialization.Encoding.PEM).decode()
 
-    def sign(self, csr_pem: str, workload: str, hours: float) -> tuple[str, str]:
-        """(certificate PEM, its fingerprint) for the workload `workload`, from `csr_pem`."""
+    @staticmethod
+    def public_key_of(csr_pem: str) -> ec.EllipticCurvePublicKey:
+        """The key a signing request carries, once it is shown to be one the pool signs. The
+        request is untrusted input: whatever the library raises on it is a refusal, never an
+        error that escapes (D117)."""
         try:
             csr = x509.load_pem_x509_csr(csr_pem.encode())
-        except (ValueError, TypeError) as exc:
-            raise CertRefused(f"not a certificate signing request: {exc}") from exc
-        if not csr.is_signature_valid:
+            valid = csr.is_signature_valid
+            public = csr.public_key()
+        except Exception as exc:  # noqa: BLE001 - untrusted input; any failure is a refusal
+            raise CertRefused(f"not a signing request the pool can read: {type(exc).__name__}") from exc
+        if not valid:
             raise CertRefused("the signing request is not signed by the key it carries")
-        public = csr.public_key()
         if not isinstance(public, ec.EllipticCurvePublicKey):
             raise CertRefused("only elliptic-curve keys are signed")
+        return public
+
+    def sign(self, csr_pem: str, workload: str, hours: float) -> tuple[str, str]:
+        """(certificate PEM, its fingerprint) for the workload `workload`, from `csr_pem`."""
+        public = self.public_key_of(csr_pem)
         now = datetime.datetime.now(datetime.timezone.utc)
         cert = (
             x509.CertificateBuilder()

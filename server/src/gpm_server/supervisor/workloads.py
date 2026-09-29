@@ -236,7 +236,7 @@ class Workloads:
                     f"{live} rented, {reserved} reserved by workloads still starting")
         limits = self.config.limits
         if limits.max_hourly_burn is not None:
-            burn = sum(h.bid_hourly for h in self.fleet.hosts.values() if not h.released)
+            burn = sum(h.bid_hourly for h in self.fleet.hosts.values() if not h.released) + self.fleet.volume_burn()
             if burn >= limits.max_hourly_burn:
                 return f"the pool already burns ${burn:.2f}/h, at its ${limits.max_hourly_burn:.2f} cap"
         return None
@@ -258,7 +258,9 @@ class Workloads:
                 f"at most, {live} rented, {self._reserved_hosts()} reserved by workloads still starting"
             )
         if limits.max_hourly_burn is not None:
-            burn = sum(h.bid_hourly for h in self.fleet.hosts.values() if not h.released)
+            # Volumes bill too, and the fleet counts them when it rents: a plan that left them out
+            # would pass here and never rent.
+            burn = sum(h.bid_hourly for h in self.fleet.hosts.values() if not h.released) + self.fleet.volume_burn()
             if burn + hosts * hourly > limits.max_hourly_burn:
                 return (
                     f"its {hosts} host(s) at ${hourly:.3f}/h would take the pool's burn to "
@@ -289,6 +291,14 @@ class Workloads:
                 raise WorkloadRefused("a program must say what it will spend: send max_spend")
             if csr is not None and ca is None:
                 raise WorkloadRefused("this pool has no client CA to sign a certificate with")
+            if csr is not None:
+                # Read before anything is opened: a request the pool cannot sign spends nothing.
+                from ..certs import CertRefused
+
+                try:
+                    ca.public_key_of(csr)
+                except CertRefused as exc:
+                    raise WorkloadRefused(str(exc)) from exc
             plan["may_borrow"] = bool(may_borrow)
             if plan["budget_derived"] and (confirm_max_spend is None or abs(confirm_max_spend - budget) > 0.005):
                 raise WorkloadRefused(
@@ -325,9 +335,10 @@ class Workloads:
 
                 try:
                     certificate, print_ = ca.sign(csr, req.name, req.hours)
-                except CertRefused as exc:
+                except Exception as exc:  # noqa: BLE001 - whatever failed, the lease must not outlive it
                     self.end(req.name, "its certificate could not be signed")
-                    raise WorkloadRefused(str(exc)) from exc
+                    raise WorkloadRefused(str(exc) if isinstance(exc, CertRefused)
+                                          else f"its certificate could not be signed: {type(exc).__name__}") from exc
                 self.store.set_cert_fingerprint(req.name, print_)
             if key_hash is not None:
                 # The program made the key and sent its hash: the plaintext never reaches the pool.
@@ -442,10 +453,18 @@ class Workloads:
         while its workload prepares is bounded by the lease, as an operator's is."""
         if workload.provisioner is None or workload.state != "serving":
             return None
+        # A request still being answered is use: the log is written when one finishes, and an
+        # answer can take longer than the cutoff.
+        counters = self.supervisor.counters.all()
+        hosts = self.fleet.hosts_of(workload.name) if self.fleet is not None else []
+        mine = [counters[h.host_id] for h in hosts if h.host_id in counters]
+        if any(c.busy > 0 for c in mine):
+            return None
         cutoff = (workload.idle_end_minutes or 15.0) * 60
         last = self.supervisor.db.query(
             "SELECT MAX(ts) AS t FROM request_log WHERE workload = ?", (workload.name,))[0]["t"]
-        start = max(last or 0.0, workload.serving_at or workload.updated_at)
+        started = max((c.last_request_at or 0.0 for c in mine), default=0.0)
+        start = max(last or 0.0, started, workload.serving_at or workload.updated_at)
         return (now - start - cutoff) / 60 if now - start > cutoff else None
 
     async def advance(self) -> list[Workload]:
@@ -500,7 +519,8 @@ class Workloads:
             **{k: v for k, v in workload.as_dict().items() if k != "plan"},
             "plan": workload.plan,
             # While it starts: are its requests served on shared hosts, or refused until then?
-            "borrowing": workload.state == "preparing" and self._shared_serves(workload.model),
+            "borrowing": (workload.state == "preparing" and (workload.plan or {}).get("may_borrow", True)
+                          and self._shared_serves(workload.model)),
             "hosts": [
                 {"host_id": h.host_id, "state": h.state, "workers": h.workers, "hardware": h.offer.hardware,
                  "kind": "interruptible" if h.interruptible else "on_demand", "hourly": round(h.bid_hourly, 4)}

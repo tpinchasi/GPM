@@ -101,15 +101,14 @@ def _identity(state: RouterState, request: Request) -> Optional[Identity]:
         return None
     if verify(token, state.app_hashes):
         return Identity()
-    provisioner = match(token, state.registry.provisioners)
-    if provisioner is not None:
-        return Identity(provisioner=provisioner)
-    grants = state.registry.grants
-    hashed = match(token, {h: h for h in grants})
-    if hashed is None:
-        return None
-    grant = grants[hashed]
-    if grant.not_after is not None and grant.not_after <= time.time():
+    now = time.time()
+    reach = match(token, state.registry.provisioners)
+    if reach is not None:
+        if reach.expires_at is not None and reach.expires_at <= now:
+            return None
+        return Identity(provisioner=reach.name)
+    grant = match(token, state.registry.grants)
+    if grant is None or (grant.not_after is not None and grant.not_after <= now):
         return None
     return Identity(workload=grant.workload)
 
@@ -436,6 +435,9 @@ def create_app(
             return None, _error(401, "unauthorized", detail="missing or invalid key")
         if who.provisioner is None:
             return None, _error(403, "forbidden", "not_a_provisioning_key", "these calls take a provisioning key")
+        if not state.config.provisioning.enabled:
+            # Nothing would answer a request: say so now, rather than leave it pending for ever.
+            return None, _error(403, "forbidden", "provisioning_disabled", "this pool does not take workloads from programs")
         return who.provisioner, None
 
     @app.post("/pool/provisioning/requests")
@@ -507,6 +509,12 @@ def create_app(
         workload = state.registry.workloads.get(name)
         if workload is None or workload.provisioner != provisioner:
             return _error(404, "not_found", "no_such_workload", "no workload of this key by that name")
+        # An end already waiting is the same end; otherwise the same limits as every request.
+        waiting = await asyncio.to_thread(provisioning.pending_end, provisioner, name)
+        if waiting is not None:
+            return JSONResponse({"request_id": waiting}, status_code=202, headers={"X-GPM-Contract": CONTRACT_VERSION})
+        if await asyncio.to_thread(provisioning.asked_since, provisioner, time.time() - 60) >= REQUESTS_PER_MINUTE:
+            return _error(429, "busy", "too_many_requests", f"at most {REQUESTS_PER_MINUTE} requests a minute per provisioning key")
         request_id, _ = await asyncio.to_thread(provisioning.ask, provisioner, "end", {}, None, name)
         return JSONResponse({"request_id": request_id}, status_code=202, headers={"X-GPM-Contract": CONTRACT_VERSION})
 
@@ -526,8 +534,10 @@ def create_app(
         workload_state, model = _workload_now(name)
         mine = [h for h in state.hosts if h.workload == name]
         ready = [h for h in mine if h.state is HostState.READY]
+        plan = getattr(state.registry.workloads.get(name), "plan", None) or {}
         borrowing = (
             workload_state == "preparing" and not ready and state.config.workloads.borrow_share > 0
+            and bool(plan.get("may_borrow", True))
         )
         return JSONResponse(
             {

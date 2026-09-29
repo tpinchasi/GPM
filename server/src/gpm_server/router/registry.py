@@ -17,7 +17,7 @@ from ..catalog import ResolvedVariant
 from ..config import PoolConfig
 from ..db import CounterRow, HostCounters, HostRow, HostTable
 from ..models import Host, HostState, Worker, WorkerState
-from ..provisioning_store import ProvisioningStore
+from ..provisioning_store import KeyReach, ProvisioningStore
 from ..transports import build_client
 from ..workload_store import KeyGrant, Workload, WorkloadStore
 from .dispatch import Dispatcher
@@ -58,7 +58,7 @@ class HostRegistry:
         self.last_workload_revision: Optional[float] = None
         #: Provisioning keys (D117), as hash → provisioner, for keys neither revoked nor expired.
         self.provisioning_store = ProvisioningStore(table.db)
-        self.provisioners: dict[str, str] = {}
+        self.provisioners: dict[str, KeyReach] = {}
         self.last_provisioner_revision: Optional[float] = None
 
     def apply_config(self, config: PoolConfig) -> None:

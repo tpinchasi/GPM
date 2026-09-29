@@ -147,3 +147,12 @@ class _SyncStream(httpx.SyncByteStream):
 
     def __iter__(self):
         yield from self._iterator
+
+
+def test_an_ended_workload_is_not_waited_for():
+    """`503 workload_ended` has nothing to wait for (app contract §3): raised at once."""
+    ended = httpx.Response(503, json={"error": "workload_ended", "reason": "workload_ended", "detail": "d"})
+    http, inner = client([ended, ok()], RetryPolicy(max_wait_s=60, **FAST))
+    with pytest.raises(PoolUnavailable) as caught:
+        http.post("/api/chat", json={"model": "m"})
+    assert caught.value.reason == "workload_ended" and inner.calls == 1

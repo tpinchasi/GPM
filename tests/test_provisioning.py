@@ -81,6 +81,14 @@ def grant(pool, name="evals", **overrides):
     return answer.json()["key"]
 
 
+def stop_answering(pool):
+    """Stop the supervisor's watcher, so a request stays pending for as long as a test needs."""
+    watcher = pool.supervisor._request_watcher
+    if watcher is not None:
+        pool.loop.loop.call_soon_threadsafe(watcher.cancel)
+        time.sleep(0.1)
+
+
 def refresh(pool):
     pool.loop.run(pool.state.registry.refresh())
 
@@ -226,6 +234,7 @@ def test_one_request_waits_at_a_time_and_a_hash_belongs_to_its_key(pool):
     sent is refused, never answered with that key's request (D117)."""
     mine, theirs = grant(pool), grant(pool, name="other")
     refresh(pool)
+    stop_answering(pool)
     key_hash = hashlib.sha256(("gpmw_" + secrets.token_hex(32)).encode()).hexdigest()
     body = {"kind": "create", "key_hash": key_hash, "model": BIG, **SPEC}
     with httpx.Client(base_url=pool.url, headers={"Authorization": f"Bearer {mine}"}) as http:
@@ -427,3 +436,86 @@ def test_hours_are_not_added_past_a_workloads_certificate(pool):
     pool.supervisor.workloads.store.set_cert_fingerprint(w.name, "ab" * 32)
     with pytest.raises(Refused, match="signed for its hours"):
         pool.supervisor.workloads.extend(w.name, hours=1, confirm_hours=True)
+
+
+def test_a_signing_request_the_pool_cannot_read_opens_nothing(pool, tmp_path):
+    from gpm_server.certs import ClientCA
+    from gpm_server.supervisor.workloads import WorkloadRefused as Refused
+    from gpm_server.supervisor.workloads import WorkloadRequest
+
+    ca = ClientCA(*make_ca(tmp_path))
+    req = WorkloadRequest(name="evals-000001", model=BIG, latency_s=30, parallel=2, hours=1, max_spend=2.0)
+    for junk in ("not a request", "-----BEGIN CERTIFICATE REQUEST-----\nAAAA\n-----END CERTIFICATE REQUEST-----\n"):
+        with pytest.raises(Refused):
+            pool.loop.run(pool.supervisor.workloads.create(req, provisioner="evals", csr=junk, ca=ca))
+    assert pool.supervisor.leases.open_leases() == [] and pool.supervisor.workloads.store.all() == []
+
+
+def test_certificates_are_refused_where_the_listener_asks_for_none(pool):
+    """An optional grant, a program asking for a certificate, a listener with no client CA: the
+    workload could never be reached, so it is not made."""
+    pool.supervisor.provisioning._ca, pool.supervisor.provisioning._ca_loaded = object(), True
+    key = grant(pool)
+    refresh(pool)
+    body = {"kind": "create", "key_hash": "ab" * 32, "model": BIG, "csr": "x", **SPEC}
+    with httpx.Client(base_url=pool.url, headers={"Authorization": f"Bearer {key}"}) as http:
+        request_id = http.post("/pool/provisioning/requests", json=body).json()["request_id"]
+    pool.loop.run(pool.supervisor.provisioning.answer_pending())
+    answered = pool.supervisor.provisioning.store.get_request(request_id)
+    assert answered.state == "refused" and "does not ask for client certificates" in answered.answer["detail"]
+    assert pool.supervisor.leases.open_leases() == []
+
+
+def test_a_workload_answering_a_long_request_is_not_idle(pool):
+    from gpm_server.db import CounterRow
+
+    w = ask(pool, grant(pool), idle_end_minutes=1)
+    pool.reprobe()  # its host rented
+    an_hour_ago = time.time() - 3600
+    pool.database.execute("UPDATE workloads SET state = 'serving', serving_at = ? WHERE name = ?", (an_hour_ago, w.name))
+    workloads = pool.supervisor.workloads
+    (host,) = workloads.fleet.hosts_of(w.name)
+    pool.loop.run(pool.supervisor.counters.publish([CounterRow(host.host_id, busy=1, total=4, requests_served=0,
+                                                               failures=0, last_request_at=an_hour_ago)]))
+    assert workloads._idle_past(workloads.get(w.name), time.time()) is None, "a request is being answered"
+    pool.loop.run(pool.supervisor.counters.publish([CounterRow(host.host_id, busy=0, total=4, requests_served=1,
+                                                               failures=0, last_request_at=an_hour_ago)]))
+    assert workloads._idle_past(workloads.get(w.name), time.time()) is not None
+
+
+def test_a_key_past_its_expiry_is_refused_at_the_request(pool):
+    """Time passing moves no revision: the router reads the expiry at each request."""
+    key = grant(pool, expires_hours=0.5 / 3600)
+    refresh(pool)
+    time.sleep(0.6)  # past its expiry; nothing changed in the table, so the router read nothing new
+    with httpx.Client(base_url=pool.url, headers={"Authorization": f"Bearer {key}"}) as http:
+        assert http.get("/pool/provisioning/workloads/nothing").status_code == 401
+
+
+def test_ends_are_one_at_a_time_per_workload(pool):
+    w = ask(pool, grant(pool, max_open=2))
+    refresh(pool)
+    stop_answering(pool)
+    with httpx.Client(base_url=pool.url, headers={"Authorization": f"Bearer {w._provisioner._key}"}) as http:
+        first = http.post(f"/pool/provisioning/workloads/{w.name}/end")
+        assert first.status_code == 202, first.text
+        first = first.json()["request_id"]
+        again = http.post(f"/pool/provisioning/workloads/{w.name}/end").json()["request_id"]
+    assert first == again, "an end already waiting is the same end"
+
+
+def test_a_pool_that_takes_no_programs_says_so_at_once():
+    with harness() as h:
+        h.supervisor.fleet.provider.offers = [default_offer("o-1", "m-1", min_bid_hourly=0.2)]
+        control = ServerHandle(create_control_app(h.supervisor, h.config), h.loop)
+        try:
+            h.control_url = control.base_url
+            key = grant(h)
+            refresh(h)
+            h.state.config = h.state.config.model_copy(update={
+                "provisioning": h.state.config.provisioning.model_copy(update={"enabled": False})})
+            with httpx.Client(base_url=h.url, headers={"Authorization": f"Bearer {key}"}) as http:
+                answer = http.post("/pool/provisioning/requests", json={"kind": "plan", "model": BIG, **SPEC})
+            assert answer.status_code == 403 and answer.json()["reason"] == "provisioning_disabled"
+        finally:
+            control.stop()

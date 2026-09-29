@@ -22,6 +22,10 @@ STATES = ("preparing", "serving", "ending", "ended")
 ANSWERING = ("preparing", "serving")
 
 
+#: How long an ended workload's keys are still recognised, to be told `workload_ended` rather
+#: than "unknown key"; after that they drop out of what the router compares against.
+ENDED_KEYS_KEPT_S = 7 * 24 * 3600
+
 @dataclasses.dataclass(frozen=True)
 class Workload:
     name: str
@@ -203,12 +207,15 @@ class WorkloadStore:
         return [dict(r) for r in rows]
 
     def grants(self) -> dict[str, KeyGrant]:
-        """hash → what it reaches, for keys not yet past their time, of workloads that answer."""
+        """hash → what it reaches, for keys not yet past their time: of workloads not ended, and
+        of those ended in the last week, which are told `workload_ended` rather than "unknown
+        key". Older ones drop out, so the router's per-request comparison does not grow with
+        every workload ever made."""
         now = time.time()
         rows = self.db.query(
             "SELECT k.hashed, k.workload, k.not_after FROM workload_keys k JOIN workloads w ON w.name = k.workload "
-            "WHERE (k.not_after IS NULL OR k.not_after > ?)",
-            (now,),
+            "WHERE (k.not_after IS NULL OR k.not_after > ?) AND (w.ended_at IS NULL OR w.ended_at > ?)",
+            (now, now - ENDED_KEYS_KEPT_S),
         )
         return {r["hashed"]: KeyGrant(workload=r["workload"], not_after=r["not_after"]) for r in rows}
 
