@@ -463,3 +463,40 @@ def test_a_lease_asking_for_the_old_bid_ceiling_is_told_what_replaced_it(control
         looser = http.post("/pool/leases", json={"workers": 1, "max_spend": 1.0, "allow_rent": True,
                                                   "max_all_in_hourly": 9.0})
         assert looser.status_code == 400 and "tighten" in looser.text
+
+
+def test_a_key_in_both_roles_is_refused_at_start():
+    from gpm_server.config import ConfigError
+
+    config = PoolConfig.model_validate({
+        "pool": {"name": "test", "model_set": [MODEL]},
+        "auth": {"app_keys": [APP_KEY], "admin_keys": [ADMIN_KEY, APP_KEY]},
+        "hosts": [{"id": "local-1", "kind": "local", "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}}],
+    })
+    with pytest.raises(ConfigError, match="both an app key and an admin key"):
+        config.auth.admin_hashes()
+
+
+def test_an_admin_key_revoked_in_its_file_stops_working_without_a_restart(tmp_path):
+    store = KeyStore(tmp_path / "admin.keys")
+    kept, _ = store.create("admin")
+    revoked, record = store.create("admin")
+    config = PoolConfig.model_validate({
+        "pool": {"name": "test", "model_set": [MODEL], "probe_interval_s": 3600},
+        "auth": {"app_keys": [APP_KEY], "admin_keys_file": str(tmp_path / "admin.keys")},
+        "hosts": [{"id": "local-1", "kind": "local", "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}}],
+    })
+    loop = BackgroundLoop()
+    database = Database(tmp_path / "gpm.sqlite3")
+    server = ServerHandle(create_control_app(Supervisor(config, database), config), loop)
+    try:
+        with client(server.base_url, key=revoked) as http:
+            assert http.get("/pool/status").status_code == 200
+            store.revoke(record.key_id)
+            assert http.get("/pool/status").status_code == 401
+        with client(server.base_url, key=kept) as http:
+            assert http.get("/pool/status").status_code == 200
+    finally:
+        server.stop()
+        loop.stop()
+        database.close()

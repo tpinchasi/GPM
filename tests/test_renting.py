@@ -361,6 +361,19 @@ async def test_an_eviction_inside_a_lease_is_recovered_unattended(fleet):
     assert not fleet.hosts or next(iter(fleet.hosts.values())).state != "stopped"
 
 
+async def test_winning_a_host_back_after_an_eviction_respects_the_pools_burn_cap(fleet):
+    """A re-bid is new spending: the pool's hourly cap is checked with the host at its new price."""
+    open_lease(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    host = next(iter(fleet.hosts.values()))
+    fleet.config.limits.max_hourly_burn = host.bid_hourly * 0.9
+    fleet.provider.evict(host.instance.instance_id)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    eviction = next(e for e in fleet.events.recent() if e["kind"] == "eviction")
+    assert "re-bidding" not in eviction["summary"]
+    assert host.released or host.host_id not in fleet.hosts
+
+
 async def test_a_stop_seen_while_the_pools_own_re_bid_restarts_is_not_a_second_eviction(fleet, monkeypatch):
     """Found live: sixteen seconds after re-bidding in place, the instance still read "stopped"
     — the provider takes longer than a pass to bring a container back — and the pool judged a
@@ -632,6 +645,7 @@ async def test_an_on_demand_host_can_be_chosen_while_the_pool_is_set_to_bid(flee
     """Mixed renting: the mode is the default for what the pool rents by itself, not a limit
     on what an operator may choose by hand."""
     fleet.provider.offers = both_kinds()
+    fleet.config.limits.max_rented_hosts = 2  # two hosts, and preparing counts against the limit
     host = await fleet.prepare(max_spend=1.0, max_hours=1.0, offer_id="od-1")
     assert host.interruptible is False and host.bid_hourly == 0.50
 

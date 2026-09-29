@@ -351,3 +351,55 @@ def test_a_list_with_anything_but_urls_is_ignored(tmp_path, bad):
     path = tmp_path / "upstreams.json"
     path.write_text(json.dumps(bad))
     assert Upstreams(path).by_model() == {}
+
+
+# --- a streamed answer says what the engine said (found in review) ---
+
+
+def one_copy_proxy(tmp_path, handler) -> httpx.AsyncClient:
+    app = create_app(
+        upstream_file(tmp_path, {BIG: "http://127.0.0.1:8001"}),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=10),
+    )
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy")
+
+
+async def test_an_engines_refusal_of_a_stream_keeps_its_status(tmp_path):
+    """A 400 from the engine is the app's to read as a 400; a 200 carrying an error body is
+    recorded as a success by the pool."""
+    refused = {"error": {"message": "max_tokens is too large", "type": "BadRequestError"}}
+
+    async def body():
+        yield json.dumps(refused).encode()
+
+    def handler(request):
+        return httpx.Response(400, content=body(), headers={"content-type": "application/json"})
+
+    async with one_copy_proxy(tmp_path, handler) as proxy:
+        answer = await proxy.post("/v1/chat/completions", json={"model": BIG, "stream": True})
+    assert answer.status_code == 400 and answer.json() == refused
+    assert answer.headers["content-type"].startswith("application/json")
+
+
+async def test_a_stream_no_copy_accepts_is_a_bad_gateway_not_an_empty_success(tmp_path):
+    copies = Copies()
+    copies.refusing = {8001, 8002}
+    async with copies_proxy(tmp_path, copies) as proxy:
+        answer = await proxy.post("/v1/chat/completions", json={"model": BIG, "stream": True})
+    assert answer.status_code == 502
+
+
+async def test_an_engine_dying_mid_stream_breaks_the_stream_rather_than_ending_it(tmp_path):
+    """A clean end would pass a truncated answer as whole — under buffered delivery (D62) the
+    pool would deliver it instead of running it again."""
+
+    async def dies():
+        yield b'data: {"choices":[{"delta":{"content":"hal"}}]}\n\n'
+        raise httpx.ReadError("the engine went away")
+
+    handler = lambda r: httpx.Response(200, content=dies(), headers={"content-type": "text/event-stream"})  # noqa: E731
+    async with one_copy_proxy(tmp_path, handler) as proxy:
+        with pytest.raises(httpx.HTTPError):
+            async with proxy.stream("POST", "/v1/chat/completions", json={"model": BIG, "stream": True}) as stream:
+                async for _ in stream.aiter_raw():
+                    pass

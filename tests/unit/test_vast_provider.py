@@ -647,3 +647,24 @@ async def test_a_gone_offer_and_a_gone_endpoint_are_not_the_same_error():
         )
     with pytest.raises(ProviderUnavailable, match="endpoint is gone"):
         await provider(lambda r: gone).list_instances("p/")
+
+
+async def test_boot_logs_are_read_without_the_account_credential(monkeypatch):
+    """The logs sit on the provider's storage, not its API: the account key is never sent there (T5)."""
+    api = provider(lambda r: httpx.Response(200, json={"result_url": "https://logs.example/abc"}))
+    seen = []
+
+    def storage(request):
+        seen.append(dict(request.headers))
+        return httpx.Response(200, text="line 1\nline 2\n")
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr("gpm_server.providers.vast.httpx.AsyncClient",
+                        lambda **kw: real(transport=httpx.MockTransport(storage), **kw))
+    assert await api.instance_logs(Instance("1"), tail=1) == "line 2"
+    assert seen and all("authorization" not in {k.lower() for k in h} for h in seen)
+
+
+async def test_boot_logs_are_not_read_from_a_url_that_is_not_https():
+    api = provider(lambda r: httpx.Response(200, json={"result_url": "http://logs.example/abc"}))
+    assert await api.instance_logs(Instance("1")) is None

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import time
 import uuid
 from typing import Any, Optional
@@ -17,6 +18,16 @@ from .db import Database
 
 class LeaseRefused(Exception):
     """A lease that would spend without saying how much, or one that loosens a pool limit."""
+
+
+def _finite(**limits: Any) -> None:
+    """Every limit given is a real number. NaN passes every comparison a cap is checked with —
+    `NaN <= 0` is false — and SQLite stores it as NULL: a lease that can rent with no cap."""
+    for name, value in limits.items():
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise LeaseRefused(f"{name} must be a finite number, not {value!r}")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -66,6 +77,7 @@ class LeaseStore:
     ) -> Lease:
         """A lease that can rent **must** carry a dollar cap, and may tighten the pool's
         configured limits, never loosen them (spec §2)."""
+        _finite(workers=workers, max_hours=max_hours, max_spend=max_spend, max_all_in_hourly=max_all_in_hourly)
         if allow_rent and max_spend is None:
             raise LeaseRefused(
                 "a lease that can rent must state a dollar cap: pass --max-spend"
@@ -135,11 +147,16 @@ class LeaseStore:
         second lease with any cap they like; refusing it only made them do that, and lose the
         history of the first.
         """
+        _finite(max_spend=max_spend, max_hours=max_hours, workers=workers)
         lease = self.get(lease_id)
         if lease is None:
             raise LeaseRefused(f"no lease {lease_id!r}")
         if not lease.is_open:
             raise LeaseRefused(f"lease {lease_id!r} is closed; open a new one")
+        if max_hours is not None and max_hours <= 0:
+            raise LeaseRefused("a lease must keep a time limit above zero")
+        if workers is not None and workers <= 0:
+            raise LeaseRefused("a lease must keep at least one worker")
         if not loosen:
             if max_spend is not None and max_spend > lease.max_spend:
                 raise LeaseRefused("raising the dollar cap must be confirmed: type the new value again")

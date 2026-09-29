@@ -109,6 +109,13 @@ class RentedHost:
     disk_gb: Optional[float] = None
     ready_at: Optional[float] = None
     parked_at: Optional[float] = None
+    #: Spend settled for its current lease, and from when the rate has run since (see estimate).
+    accrued: float = 0.0
+    accrued_at: Optional[float] = None
+    #: What the provider had reported for this instance when it joined its current lease: that
+    #: much was another lease's.
+    charges_base: float = 0.0
+    reported_spend_total: float = 0.0
     #: The agent the pool installed here, if any, and what it reported. A host without one is
     #: prepared the way it always was (D63).
     agent: Optional[hostagent.RentedAgent] = None
@@ -205,9 +212,29 @@ class RentedHost:
     def hours_held(self) -> float:
         return (time.time() - self.created_at) / 3600
 
+    def rate(self) -> float:
+        """What it bills an hour now: its bid while it runs, only its disk while parked."""
+        return self.offer.storage_hourly if self.state == "parked" else self.bid_hourly
+
     def estimate(self, now: Optional[float] = None) -> float:
+        """What it has cost its current lease: what was settled, then the time since at the rate
+        it bills now. Settled when the rate changes kind (parked, restarted) and when it moves
+        to another lease, which pays only from then."""
         now = now if now is not None else time.time()
-        return (now - self.created_at) / 3600 * self.bid_hourly
+        since = self.accrued_at if self.accrued_at is not None else self.created_at
+        return self.accrued + max(0.0, now - since) / 3600 * self.rate()
+
+    def settle(self, now: Optional[float] = None) -> None:
+        now = now if now is not None else time.time()
+        self.accrued, self.accrued_at = self.estimate(now), now
+
+    def move_to_lease(self, lease_id: str, now: Optional[float] = None) -> None:
+        """From now on it bills `lease_id`, which owes nothing it cost before: neither the pool's
+        estimate nor what the provider had already reported for it."""
+        now = now if now is not None else time.time()
+        self.lease_id = lease_id
+        self.accrued, self.accrued_at = 0.0, now
+        self.charges_base = self.reported_spend_total
 
 
 @dataclasses.dataclass
@@ -383,20 +410,21 @@ class Fleet:
                 charges = None
             if charges is not None:
                 self.charges_ever_reported = True
-                host.reported_spend = charges.total
+                host.reported_spend_total = charges.total
+                host.reported_spend = max(0.0, charges.total - host.charges_base)
                 self.spend.record(
                     lease_id=lease.lease_id,
                     host_id=host.host_id,
                     source="reported",
-                    amount=charges.total,
+                    amount=host.reported_spend,
                 )
-                drift = charges.total - host.estimated_spend
+                drift = host.reported_spend - host.estimated_spend
                 if host.estimated_spend > 0 and drift / host.estimated_spend > self.rented.spend.drift_alert:
                     self.events.record(
                         "spend_drift",
-                        f"provider reports ${charges.total:.4f} against an estimate of "
+                        f"provider reports ${host.reported_spend:.4f} against an estimate of "
                         f"${host.estimated_spend:.4f}",
-                        numbers={"reported": charges.total, "estimate": host.estimated_spend},
+                        numbers={"reported": host.reported_spend, "estimate": host.estimated_spend},
                         host_id=host.host_id,
                         lease_id=lease.lease_id,
                     )
@@ -1646,6 +1674,17 @@ class Fleet:
             raise LeaseRefused("kind must be interruptible or on_demand")
         # A parked host is reused only when the operator did not name a particular one.
         reused = None if (offer_id or kind) else await self.restart_parked(lease)
+        if reused is None:
+            # A new rental counts against the pool's host limit, as every other does: without
+            # this an operator could prepare past it, and the worst case it bounds (D46) was not.
+            live = len([h for h in self.hosts.values() if not h.released])
+            reserved = self.reserved_hosts()
+            if live + reserved >= self.config.limits.max_rented_hosts:
+                self.last_refusal = (f"{live} rented hosts already"
+                                     + (f", and {reserved} reserved for workloads still starting" if reserved else "")
+                                     + f", at the pool's limit of {self.config.limits.max_rented_hosts}")
+                self.leases.close(lease.lease_id, "nothing could be prepared")
+                return None
         host = reused or await self.rent_one(
             lease, ["prepared on request" + (f": chosen offer {offer_id}" if offer_id else "")],
             offer_id=offer_id, kind=kind,
@@ -2039,6 +2078,11 @@ class Fleet:
             capped = self._cap_bid(bid.hourly, lease, same_machine)
             if capped is None:
                 continue
+            refused = self._refuse_rebid(host, capped, lease)
+            if refused is not None:
+                self.events.record("park_restart_refused", f"{host.host_id} stays parked: {refused}",
+                                   host_id=host.host_id, lease_id=lease.lease_id)
+                continue
             try:
                 await self.provider.set_bid(host.instance, capped)
                 await self.provider.start(host.instance)
@@ -2050,8 +2094,10 @@ class Fleet:
                     lease_id=lease.lease_id,
                 )
                 continue
+            host.settle()  # parked until now, at its disk's rate
+            if host.lease_id != lease.lease_id:
+                host.move_to_lease(lease.lease_id)  # the new lease pays from its restart only
             host.bid_hourly = capped
-            host.lease_id = lease.lease_id
             host.mark_preparing()  # its clock starts now, not when it was first rented
             host.parked_at = None
             host.idle_since = None
@@ -2449,10 +2495,13 @@ class Fleet:
                 if decision.action == "rebid" and decision.bid is not None and same_machine is not None
                 else None
             )
+            over_cap = self._refuse_rebid(host, capped, lease) if capped is not None else None
+            if over_cap is not None:
+                capped = None
             if capped is not None:
                 outcome = f"re-bidding ${capped:.3f}/h to win it back"
             elif decision.action == "rebid":
-                outcome = "released; the re-bid would cross a ceiling"
+                outcome = f"released; the re-bid would cross a ceiling{f' ({over_cap})' if over_cap else ''}"
             elif host.prepared and not any(
                 h.lease_id == host.lease_id and h is not host and not h.released for h in self.hosts.values()
             ):
@@ -2476,8 +2525,9 @@ class Fleet:
                     continue
                 try:
                     await self.provider.set_bid(host.instance, capped)
-                    await self.provider.start(host.instance)
+                    # Billed at the new bid from here, whether or not the start below goes through.
                     host.bid_hourly = capped
+                    await self.provider.start(host.instance)
                     host.mark_scheduling()
                     host.rebid_at = time.time()
                 except ProviderError as exc:
@@ -2790,6 +2840,22 @@ class Fleet:
                 f"bidding ${bid:.3f}/h would take the burn to ${burn:.3f}/h, above the "
                 f"${self.config.limits.max_hourly_burn:.2f} cap"
             )
+        return None
+
+    def _refuse_rebid(self, host: "RentedHost", bid: float, lease: Lease) -> Optional[str]:
+        """A new bid on a host the pool already holds — won back after an eviction, or restarted
+        from parked — is spending like any other: the pool's burn with this host at its new
+        price, and the lease's budget, are checked as they are for a new rental."""
+        left = self.budget_left(lease)
+        if left <= 0:
+            return f"the lease has ${left:.4f} left"
+        cap = self.config.limits.max_hourly_burn
+        if cap is None:
+            return None
+        others = sum(h.bid_hourly for h in self.hosts.values() if not h.released and h is not host)
+        burn = others + self.volume_burn() + bid
+        if burn > cap:
+            return f"bidding ${bid:.3f}/h on {host.host_id} would take the burn to ${burn:.3f}/h, above the ${cap:.2f} cap"
         return None
 
     async def rent_one(
@@ -3368,6 +3434,7 @@ class Fleet:
         except ProviderError as exc:
             log.warning("park of %s failed: %s", host.host_id, exc)
             return
+        host.settle()  # what it cost running, before it bills only its disk
         host.state = "parked"
         host.parked_at = time.time()
         break_even_hours = (

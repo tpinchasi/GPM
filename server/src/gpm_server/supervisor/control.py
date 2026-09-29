@@ -300,9 +300,45 @@ def _host_can_serve(config: PoolConfig, host: Any, name: str, added: list[dict[s
     )
 
 
+class _KeyHashes:
+    """The app and admin key hashes, read again when the configuration or a key file changes —
+    so `gpm key revoke` takes effect on the next request, not the next restart. A file that
+    cannot be read keeps the last good set rather than admitting nothing or everything."""
+
+    def __init__(self, auth: Any):
+        self._auth = auth
+        self._stamp: Any = None
+        self._hashes: tuple[set[str], set[str]] = (set(), set())
+
+    def _mtimes(self, auth: Any) -> tuple:
+        stamps = []
+        for path in auth.key_files():
+            try:
+                stamps.append(path.stat().st_mtime_ns)
+            except OSError:
+                stamps.append(None)
+        return (id(auth), tuple(stamps))
+
+    def current(self) -> tuple[set[str], set[str]]:
+        auth = self._auth()
+        stamp = self._mtimes(auth)
+        if stamp != self._stamp:
+            try:
+                self._hashes = (auth.app_hashes(), auth.admin_hashes())
+            except Exception:
+                if self._stamp is None:
+                    raise
+                log.exception("the key files could not be read again; keeping the keys read before")
+                return self._hashes
+            self._stamp = stamp
+        return self._hashes
+
+
 def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
-    admin_hashes = config.auth.admin_hashes()
-    app_hashes = config.auth.app_hashes()
+    # The configuration given here until the supervisor applies a newer one from its file.
+    started_with = supervisor.config
+    keys = _KeyHashes(lambda: config.auth if supervisor.config is started_with else supervisor.config.auth)
+    keys.current()  # a key in both roles, or a missing app key, stops the start
     allowed_hosts = {"127.0.0.1", "localhost", "::1", config.control.host}
 
     @contextlib.asynccontextmanager
@@ -322,7 +358,8 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         scheme, _, token = request.headers.get("authorization", "").partition(" ")
         if scheme.lower() != "bearer" or not token:
             return _error(401, "unauthorized", "the control API requires the admin key")
-        if verify(token, app_hashes) and not verify(token, admin_hashes):
+        app_hashes, admin_hashes = keys.current()
+        if verify(token, app_hashes):
             # Said plainly, because this is a mistake an operator will otherwise repeat.
             return _error(
                 403,
@@ -1720,15 +1757,18 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         if "bid_ceiling" in body:
             return _error(400, "bad_request", _BID_CEILING_GONE)
         try:
-            host = await supervisor.fleet.prepare(
-                max_spend=float(body["max_spend"]),
-                max_hours=float(body.get("max_hours", 1)),
-                max_all_in_hourly=body.get("max_all_in_hourly"),
-                when_ready=body.get("when_ready", "join"),
-                # Optional: exactly this offer, and how to rent it (D55).
-                offer_id=str(body["offer_id"]) if body.get("offer_id") is not None else None,
-                kind=body.get("kind"),
-            )
+            # Under the pass's lock: a pass running meanwhile would find the new instance in the
+            # provider's listing before the fleet knows it, and sweep it as an orphan.
+            async with supervisor.pass_lock:
+                host = await supervisor.fleet.prepare(
+                    max_spend=float(body["max_spend"]),
+                    max_hours=float(body.get("max_hours", 1)),
+                    max_all_in_hourly=body.get("max_all_in_hourly"),
+                    when_ready=body.get("when_ready", "join"),
+                    # Optional: exactly this offer, and how to rent it (D55).
+                    offer_id=str(body["offer_id"]) if body.get("offer_id") is not None else None,
+                    kind=body.get("kind"),
+                )
         except LeaseRefused as exc:
             return _error(400, "lease_refused", str(exc))
         if host is None:

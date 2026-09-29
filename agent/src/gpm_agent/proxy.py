@@ -237,27 +237,50 @@ def create_app(upstream_map: str | Path, *, client: Optional[httpx.AsyncClient] 
                 status_code=502,
             )
 
-        # Streaming: opened here and closed when the client goes, so an abandoned request stops
-        # the work upstream rather than generating into nothing on a machine being paid for.
-        async def relay():
-            for url in candidates:
-                target = f"{url}{request.url.path}"
-                in_flight[url] = in_flight.get(url, 0) + 1
-                try:
-                    async with http.stream("POST", target, content=body, headers=headers) as upstream:
-                        async for chunk in upstream.aiter_raw():
-                            yield chunk
-                    return
-                except httpx.ConnectError as exc:
-                    log.warning("the copy of %s at %s refused the connection: %s", model, url, exc)
-                    continue
-                except httpx.HTTPError as exc:
-                    log.warning("stream to %s for %s ended: %s", target, model, exc)
-                    return
-                finally:
-                    in_flight[url] -= 1
+        # Streaming: the engine's answer is opened before this one is, so its status and type
+        # are the ones the client gets — a refusal is not a 200 — and it is closed when the
+        # client goes, so an abandoned request stops the work upstream rather than generating
+        # into nothing on a machine being paid for.
+        upstream: Optional[httpx.Response] = None
+        chosen = None
+        refused = None
+        for url in candidates:
+            in_flight[url] = in_flight.get(url, 0) + 1
+            try:
+                upstream = await http.send(
+                    http.build_request("POST", f"{url}{request.url.path}", content=body, headers=headers), stream=True)
+                chosen = url
+                break
+            except httpx.ConnectError as exc:
+                log.warning("the copy of %s at %s refused the connection: %s", model, url, exc)
+                refused = exc
+            except httpx.HTTPError as exc:
+                refused = exc
+                in_flight[url] -= 1
+                break
+            in_flight[url] -= 1
+        if upstream is None:
+            return JSONResponse(
+                {"error": {"message": f"the engine for {model!r} did not answer: {refused}",
+                           "type": "upstream_unavailable"}},
+                status_code=502,
+            )
 
-        return StreamingResponse(relay(), media_type="text/event-stream")
+        async def relay():
+            try:
+                async for chunk in upstream.aiter_raw():
+                    yield chunk
+            except httpx.HTTPError as exc:
+                # Raised, not swallowed: a clean end would pass a cut answer as a whole one, and
+                # the pool would deliver it rather than run it again (D62).
+                log.warning("stream from %s for %s broke: %s", chosen, model, exc)
+                raise
+            finally:
+                await upstream.aclose()
+                in_flight[chosen] -= 1
+
+        return StreamingResponse(relay(), status_code=upstream.status_code,
+                                 media_type=upstream.headers.get("content-type", "text/event-stream"))
 
     @contextlib.asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:

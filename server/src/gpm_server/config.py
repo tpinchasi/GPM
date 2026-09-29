@@ -270,7 +270,15 @@ class AuthConfig(BaseModel):
         hashes = {fingerprint(k) for k in self._literal(self.admin_keys, self.admin_keys_env)}
         if self.admin_keys_file:
             hashes |= KeyStore(self.admin_keys_file).hashes("admin")
+        if hashes & self.app_hashes():
+            # The two roles are never interchangeable: a key in both would let an app spend (D16).
+            raise ConfigError("a key is both an app key and an admin key; give each role its own key")
         return hashes
+
+    def key_files(self) -> list[Path]:
+        """The files keys are read from, whose changes a running process follows: a revoked key
+        stops working without a restart."""
+        return [Path(f).expanduser() for f in (self.app_keys_file, self.admin_keys_file) if f]
 
 
 

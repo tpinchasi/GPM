@@ -81,6 +81,15 @@ async def test_preparing_opens_its_own_small_lease(fleet):
     assert "prepare_started" in kinds(fleet)
 
 
+async def test_preparing_counts_against_the_pools_host_limit(fleet):
+    fleet.config.limits.max_rented_hosts = 1
+    assert await fleet.prepare(max_spend=1.00, max_hours=2) is not None
+    before = len(fleet.provider.instances)
+    assert await fleet.prepare(max_spend=1.00, max_hours=2) is None
+    assert len(fleet.provider.instances) == before, "nothing rented past the limit"
+    assert "at the pool's limit of 1" in fleet.last_refusal
+
+
 async def test_a_preparation_cannot_start_without_a_dollar_cap(fleet):
     with pytest.raises(LeaseRefused, match="dollar cap"):
         await fleet.prepare(max_spend=None, max_hours=2)
@@ -251,6 +260,30 @@ async def test_a_parked_host_is_restarted_before_a_new_offer_is_bid_on(fleet):
     assert restarted.host_id == host.host_id
     assert set(fleet.provider.instances) == instances_before  # nothing new was created
     assert "park_restarted" in kinds(fleet)
+
+
+async def test_a_restarted_host_bills_its_new_lease_only_from_the_restart(fleet):
+    """Parked hours bill the disk, not the GPU; and a lease that restarts a host owes nothing
+    it cost before — or it would close on its cap at once, and parking would never pay off."""
+    host = await fleet.prepare(max_spend=1.00, max_hours=2)
+    three_hours = 3 * 3600
+    host.created_at -= 13 * 3600
+    host.accrued_at = host.created_at
+    parked_at = host.created_at + three_hours
+    host.settle(now=parked_at)
+    running = host.accrued
+    assert running == pytest.approx(3 * host.bid_hourly)
+    host.state = "parked"
+    host.parked_at = parked_at
+    assert host.estimate() == pytest.approx(running + 10 * host.offer.storage_hourly, rel=1e-3), \
+        "ten parked hours at the disk's rate"
+
+    lease = fleet.open_lease(workers=4, max_hours=2, max_spend=1.0, allow_rent=True)
+    restarted = await fleet.restart_parked(lease)
+    assert restarted is host and host.lease_id == lease.lease_id
+    await fleet.record_spend(lease)
+    spent, _ = fleet.lease_spend(lease)
+    assert spent < 0.01, "the new lease owes nothing from before its restart"
 
 
 async def test_a_parked_host_whose_machine_is_gone_stays_parked(fleet):

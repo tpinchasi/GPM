@@ -108,3 +108,27 @@ def test_a_file_that_does_not_load_leaves_the_router_as_it_was(router, tmp_path)
     # And the next good edit is still followed.
     edit(path, pool_yaml(tmp_path, model_set=("a", "c")))
     assert until(lambda: status(url).json()["model_set"] == ["a", "c"])
+
+
+def test_a_key_revoked_in_its_file_stops_working_without_a_restart(tmp_path):
+    """`gpm key revoke` rewrites the key file and leaves the configuration alone."""
+    from gpm_server.keys import KeyStore
+
+    store = KeyStore(tmp_path / "app.keys")
+    kept, _ = store.create("app")
+    revoked, record = store.create("app")
+    path = tmp_path / "pool.yaml"
+    path.write_text(pool_yaml(tmp_path).replace(f'app_keys: ["{APP_KEY}"]',
+                                                f"app_keys_file: {tmp_path / 'app.keys'}"))
+    loop = BackgroundLoop()
+    database = Database(tmp_path / "gpm.sqlite3")
+    server = ServerHandle(create_app(load_config(path), database, config_path=path), loop)
+    try:
+        assert status(server.base_url, revoked).status_code == 200
+        store.revoke(record.key_id)
+        assert until(lambda: status(server.base_url, revoked).status_code == 401)
+        assert status(server.base_url, kept).status_code == 200
+    finally:
+        server.stop()
+        loop.stop()
+        database.close()
