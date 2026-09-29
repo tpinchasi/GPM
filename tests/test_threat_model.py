@@ -120,7 +120,7 @@ def test_every_bid_a_strategy_returns_passes_through_the_supervisors_clamp():
             if node.func.id == "price_bid":
                 priced += 1
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            if node.func.attr in ("_cap_bid", "_refuse_bid_for_burn"):
+            if node.func.attr in ("_cap_bid", "_refuse_bid_for_burn", "_refuse_rebid"):
                 capped += 1
     assert priced >= 3  # renting, re-bidding after eviction, restarting a parked host
     assert capped >= priced  # each of them clamped, and the burn cap re-checked too

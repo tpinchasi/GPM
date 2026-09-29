@@ -16,7 +16,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import AsyncIterator, Mapping, Optional
+from typing import Any, AsyncIterator, Mapping, Optional
 
 import anyio
 import httpx
@@ -230,6 +230,27 @@ async def _wait_for_disconnect(request: Request) -> None:
         await asyncio.sleep(0.2)
 
 
+async def _unless_gone(request: Request, work: Any) -> Any:
+    """`work`'s result — unless the client goes away first, when `work` is cancelled and
+    `ClientGone` raised. App contract §5 rule 1: cancel on disconnect, queued *or generating*;
+    a whole answer is generating until its first byte, and a buffered one until its last."""
+    task = asyncio.ensure_future(work)
+    gone = asyncio.create_task(_wait_for_disconnect(request))
+    try:
+        done, _ = await asyncio.wait({task, gone}, return_when=asyncio.FIRST_COMPLETED)
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+    finally:
+        gone.cancel()
+    if task in done:
+        return task.result()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await task
+    raise ClientGone()
+
+
 async def _acquire(state: RouterState, request: Request, need: Need, request_id: str, deadline: float, exclude: frozenset[str]) -> Assignment:
     """Wait for a worker, but stop waiting the moment the client goes away."""
     acquire = asyncio.create_task(
@@ -291,19 +312,28 @@ async def follow_config_file(state: RouterState, path: Path) -> None:
     the model without ever asking. The file is read here, off the request path; one that does
     not load leaves the running configuration exactly as it was, as it does in the supervisor.
     """
-    try:
-        seen = path.stat().st_mtime
-    except OSError:
-        seen = None
+    def stamp() -> Optional[tuple]:
+        # The configuration and the key files it names: `gpm key revoke` rewrites a key file and
+        # leaves the configuration alone, and a revoked key must stop working without a restart.
+        try:
+            own = path.stat().st_mtime_ns
+        except OSError:
+            return None
+        keys = []
+        for key_file in state.config.auth.key_files():
+            try:
+                keys.append(key_file.stat().st_mtime_ns)
+            except OSError:
+                keys.append(None)
+        return (own, tuple(keys))
+
+    seen = stamp()
     while True:
         await asyncio.sleep(state.config.pool.host_table_poll_s)
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
+        now = stamp()
+        if now is None or now == seen:
             continue
-        if mtime == seen:
-            continue
-        seen = mtime
+        seen = now
         try:
             new = await asyncio.to_thread(load_config, path)
         except ConfigError as exc:
@@ -762,7 +792,15 @@ def create_app(
             dispatched_at = time.monotonic()
             attempts += 1
             try:
-                upstream = await assignment.host.client.send(upstream_request, stream=True)
+                upstream = await _unless_gone(request, assignment.host.client.send(upstream_request, stream=True))
+            except ClientGone:
+                # Gone while the engine worked on a whole answer: closing the upstream request
+                # stops the generation, and the worker is free now rather than when it ends.
+                with anyio.CancelScope(shield=True):
+                    await state.dispatcher.release(assignment)
+                    await record("cancelled", reason="client_disconnected", host_id=assignment.host.host_id,
+                                 queue_wait_ms=wait_s * 1000)
+                return Response(status_code=499)
             except httpx.HTTPError as exc:
                 # Failed before the first response byte: retry once, on the next eligible host
                 # in priority order. Never for "no capacity" (docs/spec/app-contract.md §5).
@@ -786,23 +824,29 @@ def create_app(
             # Held until whole (D62). Until the first byte reaches the client, a host lost
             # mid-generation costs a re-run rather than a broken stream.
             buffered = []
-            size = 0
-            overflowed = False
             raw = upstream.aiter_raw()
-            try:
+
+            async def fill(raw: Any = raw, buffered: list = buffered) -> bool:
+                """Hold the answer until whole; True where it outgrew the pool's limit."""
+                size = 0
                 async for chunk in raw:
                     buffered.append(chunk)
                     size += len(chunk)
                     if size > max_buffer_bytes:
                         # Bigger than the pool will hold: stream the rest rather than fail it.
-                        overflowed = True
-                        break
-            except asyncio.CancelledError:
+                        return True
+                return False
+
+            try:
+                overflowed = await _unless_gone(request, fill())
+            except (asyncio.CancelledError, ClientGone) as gone:
                 with anyio.CancelScope(shield=True):
                     await upstream.aclose()
                     await state.dispatcher.release(assignment)
                     await record("cancelled", reason="client_disconnected", host_id=assignment.host.host_id,
                                  queue_wait_ms=wait_s * 1000)
+                if isinstance(gone, ClientGone):
+                    return Response(status_code=499)
                 raise
             except Exception as exc:  # noqa: BLE001 — every upstream failure means the same here
                 host_id = assignment.host.host_id

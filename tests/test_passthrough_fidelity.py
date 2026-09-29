@@ -7,6 +7,7 @@ direct to the engine, compared byte for byte (docs/roadmap.md §2).
 import json
 import time
 
+import httpx
 import pytest
 from fakes.harness import EngineSpec, pool_harness
 
@@ -174,3 +175,31 @@ def test_the_client_going_away_cancels_the_work_upstream():
         with pool.client() as through:
             status = through.get("/pool/status").json()
         assert status["capacity"]["workers_busy"] == 0
+
+
+def busy_workers(pool) -> int:
+    with pool.client() as through:
+        return through.get("/pool/status").json()["capacity"]["workers_busy"]
+
+
+@pytest.mark.parametrize("delivery", ["stream", "buffered"])
+def test_a_client_that_leaves_before_the_answer_starts_frees_its_worker_at_once(delivery):
+    """App contract §5 rule 1: cancel on disconnect, queued *or generating*. Found in review: a
+    whole-answer call whose client gave up while the engine was still working kept its worker
+    until the engine finished — and, where the response had not started when the client went,
+    for ever: a rented host that never reads as idle is never released."""
+    with pool_harness(
+        [EngineSpec(id="local-1", resident={MODEL}, workers=1, chunk_delay_s=3.0)],
+        model_set=[MODEL],
+    ) as pool:
+        with pool.client(timeout=0.5) as through:
+            with pytest.raises(httpx.TimeoutException):
+                through.post("/api/chat", json=chat_body(stream=False), headers={"X-GPM-Delivery": delivery})
+        deadline = time.monotonic() + 1.5
+        while busy_workers(pool) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert busy_workers(pool) == 0, "freed when the client left, not when the engine finished"
+        time.sleep(3.5)  # past the engine's answer
+        assert busy_workers(pool) == 0, "and never taken again by an answer nobody reads"
+        rows = pool.wait_for_log(count=1)
+        assert rows[0]["outcome"] == "cancelled" and rows[0]["reason"] == "client_disconnected"

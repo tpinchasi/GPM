@@ -498,19 +498,22 @@ class VastProvider:
         except ProviderError:
             return None
         url = (asked or {}).get("result_url") if isinstance(asked, dict) else None
-        if not url:
+        if not url or not str(url).startswith("https://"):
             return None
-        # The provider writes the file after answering, so a first read can find nothing there.
-        for attempt in range(6):
-            if attempt:
-                await asyncio.sleep(1.0)
-            try:
-                response = await self.client.get(url)
-            except httpx.HTTPError:
-                return None
-            if response.status_code == 200 and response.text.strip():
-                lines = response.text.splitlines()
-                return "\n".join(lines[-tail:])
+        # Read with a client of its own, carrying no credential: the URL is on the provider's log
+        # storage, not its API, and the account key never leaves this process (T5).
+        async with httpx.AsyncClient(timeout=httpx.Timeout(self._timeout), follow_redirects=False) as plain:
+            # The provider writes the file after answering, so a first read can find nothing there.
+            for attempt in range(6):
+                if attempt:
+                    await asyncio.sleep(1.0)
+                try:
+                    response = await plain.get(url)
+                except httpx.HTTPError:
+                    return None
+                if response.status_code == 200 and response.text.strip():
+                    lines = response.text.splitlines()
+                    return "\n".join(lines[-tail:])
         return None
 
     async def _charges_by_instance(self) -> dict[str, float]:
