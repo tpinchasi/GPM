@@ -19,13 +19,15 @@ import secrets
 import stat
 import time
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal, Mapping, Optional, TypeVar
 
-Role = Literal["app", "admin"]
+Role = Literal["app", "admin", "workload", "provisioner"]
 
 #: Keys are 32 random bytes. That is far beyond what a dictionary attack can reach, so a plain
 #: digest is enough here — a slow KDF defends low-entropy secrets, which these are not.
-_PREFIX = {"app": "gpma", "admin": "gpmx"}
+T = TypeVar("T")
+
+_PREFIX = {"app": "gpma", "admin": "gpmx", "workload": "gpmw", "provisioner": "gpmp"}
 
 
 class KeyFileUnsafe(Exception):
@@ -110,6 +112,20 @@ class KeyStore:
         return {
             record.hashed for record in self.load() if role is None or record.role == role
         }
+
+
+def match(key: Optional[str], allowed: Mapping[str, T]) -> Optional[T]:
+    """Which entry `key` is, by its hash — `allowed` maps a hash to what that key reaches. Every
+    candidate is compared, in constant time each, as `verify` does: the one that matched is only
+    returned after all have been looked at."""
+    if not key or not allowed:
+        return None
+    digest = fingerprint(key)
+    found: Optional[str] = None
+    for candidate, value in allowed.items():
+        if secrets.compare_digest(digest, candidate):
+            found = value
+    return found
 
 
 def verify(key: Optional[str], allowed: set[str]) -> bool:

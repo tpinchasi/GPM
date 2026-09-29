@@ -46,6 +46,8 @@ from . import agents
 from .renting import Fleet
 
 log = logging.getLogger("gpm.supervisor")
+#: Programs' requests answered per look of the watcher, and per pass (D117).
+REQUESTS_PER_LOOK = 4
 
 
 class ProviderCredentialMissing(Exception):
@@ -134,6 +136,8 @@ class Supervisor:
         #: True while the provider could not be asked which rented hosts still exist (D61).
         self._adoption_pending = False
         self._saturated_passes = 0
+        #: Saturated passes in a row, per demand (D115); None is the shared workload.
+        self._saturated_by: dict[Optional[str], int] = {}
         self._stopping = False
         #: How a forward is opened: by the forwarder, where the pool has one (D110), else here.
         self.make_tunnel = tunnel_maker(config, database)
@@ -157,6 +161,17 @@ class Supervisor:
                 self.spend,
             )
             self.fleet.make_tunnel = self.make_tunnel
+        #: Workloads inside the pool (D115): created from the control API, moved along each pass.
+        from .provisioning import Provisioning
+        from .workloads import Workloads
+
+        self.workloads = Workloads(self)
+        #: Programs asking for their own workloads (D117): their requests are answered between
+        #: passes, never during one, under the same lock.
+        self.provisioning = Provisioning(self)
+        self.pass_lock = asyncio.Lock()
+        self._request_watcher: Optional[asyncio.Task] = None
+        self._requests_revision: Optional[float] = None
         #: Clients for hosts the pool rented, keyed by host id.
         self._rented_clients: dict[str, httpx.AsyncClient] = {}
         #: Model-set preparations in flight, keyed by host id.
@@ -261,8 +276,36 @@ class Supervisor:
             if forward is not None:
                 await forward.start()
         await self._refuse_without_a_credential()
+        if self.config.provisioning.enabled:
+            _ = self.provisioning.ca  # a bad client CA stops the start, not a program's first create
         await self.adopt_rented()
         await self.pass_once()
+        if self.config.provisioning.enabled and self._request_watcher is None:
+            self._request_watcher = asyncio.create_task(self._watch_requests(), name="gpm:provisioning")
+
+    async def _watch_requests(self) -> None:
+        """Answer programs' requests within a second or so, rather than a pass (D117): a cheap
+        look at the table's revision, and work only when it moved. Never during a pass."""
+        while not self._stopping:
+            await asyncio.sleep(self.config.provisioning.request_poll_s)
+            try:
+                revision = await asyncio.to_thread(self.provisioning.store.requests_revision)
+                if revision == self._requests_revision:
+                    continue
+                # Remembered as read *before* answering: a request arriving while these are
+                # answered moves the revision again, and is answered on the next look. Reading it
+                # after would count that request as seen, and it would wait for ever.
+                self._requests_revision = revision
+                # One request per hold of the lock, a few per look: a pass — and the lock's
+                # heartbeat, refreshed between passes — never waits behind a queue of them.
+                for _ in range(REQUESTS_PER_LOOK):
+                    async with self.pass_lock:
+                        if not await self.provisioning.answer_pending(limit=1):
+                            break
+                else:
+                    self._requests_revision = None  # more may be waiting: look again next time
+            except Exception:  # noqa: BLE001 - the watcher must outlive a bad request
+                log.exception("answering provisioning requests failed")
 
     async def _refuse_without_a_credential(self) -> None:
         """A pool configured to rent must be able to ask its provider what exists. One that
@@ -338,6 +381,8 @@ class Supervisor:
 
     async def aclose(self) -> None:
         self._stopping = True
+        if self._request_watcher is not None:
+            self._request_watcher.cancel()
         await self.directory.aclose()
         for host in self.hosts.values():
             # Detached, not stopped: with the forwarder (D110) the forwards outlive this
@@ -361,8 +406,15 @@ class Supervisor:
         """Observe → update host states → compare demand → act → record (spec §3).
 
         Acting is strictly ordered inside the fleet: release what should not exist, recover
-        what is broken, then acquire what is missing.
+        what is broken, then acquire what is missing. Programs' requests are answered first,
+        under the same lock the request watcher takes (D117).
         """
+        async with self.pass_lock:
+            if self.config.provisioning.enabled:
+                await self.provisioning.answer_pending(limit=REQUESTS_PER_LOOK)
+            await self._pass()
+
+    async def _pass(self) -> None:
         self._follow_config_file()
         self.ensure_forwarder()
         if self._adoption_pending:
@@ -373,6 +425,7 @@ class Supervisor:
         self._publish_all()
 
         if self.fleet is not None and not self._adoption_pending:
+            active = await self.workloads.advance()
             await self.fleet.pass_once(
                 ready_workers_higher_tiers=self._ready_workers(),
                 idle_seconds=self._idle_seconds(),
@@ -380,6 +433,9 @@ class Supervisor:
                 pressure=self._pressure(),
                 load=self._load() if self.config.rented.allocation == "dynamic" else None,
                 waiting_by_model=self._waiting_by_model(),
+                workloads=active,
+                loads={w.name: self._load(w.name) for w in active},
+                pressures={w.name: self._pressure(w.name) for w in active},
             )
             if self.config.rented and self.config.rented.workers_auto.enabled:
                 await self._adjust_workers()
@@ -581,21 +637,25 @@ class Supervisor:
             else:
                 log.info("not resizing %s: %s", reading.host_id, why)
 
-    def _load(self) -> "strategies.Load":
-        """What the traffic is asking of the pool, from what the router already writes (D66)."""
+    def _own_busy(self, counter: Any) -> int:
+        """A host's busy workers that are its own demand's: lent ones are the borrower's (D115)."""
+        return (counter.busy - counter.borrowed) if counter else 0
+
+    def _load(self, workload: Optional[str] = None) -> "strategies.Load":
+        """What one demand's traffic is asking of it, from what the router already writes (D66,
+        D115). The shared workload's configured hosts, and its rented ones; a workload's own."""
         counters = self.counters.all()
         busy = ready = 0
-        for host in self.hosts.values():
-            if host.state is HostState.READY:
-                ready += host.config.workers
-                counter = counters.get(host.host_id)
-                busy += counter.busy if counter else 0
+        if workload is None:
+            for host in self.hosts.values():
+                if host.state is HostState.READY:
+                    ready += host.config.workers
+                    busy += self._own_busy(counters.get(host.host_id))
         if self.fleet is not None:
-            for rented in self.fleet.hosts.values():
-                if not rented.released and rented.state == "ready":
+            for rented in self.fleet.hosts_of(workload):
+                if rented.state == "ready":
                     ready += rented.workers
-                    counter = counters.get(rented.host_id)
-                    busy += counter.busy if counter else 0
+                    busy += self._own_busy(counters.get(rented.host_id))
         window = (
             self.config.rented.dynamic.window_s
             if self.config.rented
@@ -603,8 +663,9 @@ class Supervisor:
         )
         waiting = len(
             self.db.query(
-                "SELECT 1 FROM request_log WHERE ts > ? AND (queue_wait_ms >= 1000 OR reason = 'queue_timeout') LIMIT 200",
-                (time.time() - min(window, 60.0),),
+                "SELECT 1 FROM request_log WHERE ts > ? AND (queue_wait_ms >= 1000 OR reason = 'queue_timeout') "
+                "AND workload IS ? LIMIT 200",
+                (time.time() - min(window, 60.0), workload),
             )
         )
         return strategies.Load(busy_workers=busy, ready_workers=ready, waiting=waiting)
@@ -617,12 +678,12 @@ class Supervisor:
         rows = self.db.query(
             "SELECT model_requested AS model, COUNT(*) AS n FROM request_log "
             "WHERE ts > ? AND (queue_wait_ms >= 1000 OR reason = 'queue_timeout') "
-            "AND model_requested IS NOT NULL GROUP BY model_requested",
+            "AND model_requested IS NOT NULL AND workload IS NULL GROUP BY model_requested",
             (time.time() - min(window, 60.0),),
         )
         return {row["model"]: int(row["n"]) for row in rows}
 
-    def _pressure(self) -> bool:
+    def _pressure(self, workload: Optional[str] = None) -> bool:
         """Is load asking for more than the ready hosts give? (D64)
 
         Two measurements, both written by the router off the request path: every ready worker
@@ -632,18 +693,23 @@ class Supervisor:
         counters = self.counters.all()
         ready: list[tuple[str, int]] = [
             (host.host_id, host.config.workers) for host in self.hosts.values() if host.state is HostState.READY
-        ]
+        ] if workload is None else []
         if self.fleet is not None:
-            ready += [(h.host_id, h.workers) for h in self.fleet.hosts.values() if not h.released and h.state == "ready"]
+            ready += [(h.host_id, h.workers) for h in self.fleet.hosts_of(workload) if h.state == "ready"]
         saturated = bool(ready) and all(
-            (counters.get(host_id).busy if counters.get(host_id) else 0) >= workers for host_id, workers in ready
+            self._own_busy(counters.get(host_id)) >= workers for host_id, workers in ready
         )
-        self._saturated_passes = self._saturated_passes + 1 if saturated else 0
-        if self._saturated_passes >= 2:
+        passes = self._saturated_by.get(workload, 0)
+        passes = passes + 1 if saturated else 0
+        self._saturated_by[workload] = passes
+        if workload is None:
+            self._saturated_passes = passes
+        if passes >= 2:
             return True
         waited = self.db.query(
-            "SELECT 1 FROM request_log WHERE ts > ? AND (queue_wait_ms >= 1000 OR reason = 'queue_timeout') LIMIT 1",
-            (time.time() - 30,),
+            "SELECT 1 FROM request_log WHERE ts > ? AND (queue_wait_ms >= 1000 OR reason = 'queue_timeout') "
+            "AND workload IS ? LIMIT 1",
+            (time.time() - 30, workload),
         )
         return bool(waited)
 
@@ -844,6 +910,8 @@ class Supervisor:
         if host is None:
             return
         try:
+            if await self.fleet.models_from_sibling_pending(host):
+                return  # a copy from a sibling is still coming (D116); the next pass looks again
             # A host with an agent is fetched by its agent: one pull at a time, each model
             # loaded as its own download finishes (D57). Without one, the pool does it the way
             # it always has, over the engine's own API.
@@ -942,12 +1010,16 @@ class Supervisor:
                     state=host.state if host.state in ("ready", "preparing", "draining") else "preparing",
                     workers=host.workers,
                     capabilities=tuple(rented.capabilities),
-                    variants=self._rented_variants_of(host, variants),
+                    # A workload's host advertises its own model and nothing else; a shared host never
+                    # advertises a workload's (D115, the review's finding 7).
+                    variants=self._rented_variants_of(host, variants if not host.workload else variants_for_host(
+                        list(host.builds or {}), self.config.catalog, capabilities, self.config.rented_engine())),
                     resident=getattr(host, "resident", frozenset()),
                     engine=self.config.rented_engine(),
                     lease_id=host.lease_id,
                     provider_ref=self.fleet.published_ref(host),
                     hourly_rate=host.bid_hourly,
+                    workload=host.workload,
                 )
             )
         for row in self.table.all():

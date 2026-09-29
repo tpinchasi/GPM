@@ -165,6 +165,9 @@ def test_an_adopted_host_under_a_closed_lease_is_released_by_the_first_pass(tmp_
         second = Supervisor(config(), database, provider=provider)
         second.fleet.run_on_host = silent
         loop.run(second.start())
+        # Ready again after its probe, so it is drained rather than cut (D53): gone once the next
+        # pass finds nothing in flight on it.
+        loop.run(second.pass_once())
 
         assert host.instance.instance_id not in provider.instances
         assert host.host_id not in second.fleet.hosts

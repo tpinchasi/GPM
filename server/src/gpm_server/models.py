@@ -43,6 +43,8 @@ class Worker:
     state: WorkerState = WorkerState.IDLE
     request_id: Optional[str] = None
     served: int = 0
+    #: Serving a workload's request on a host the shared workload lent it (D115).
+    borrowed: bool = False
 
     @property
     def is_idle(self) -> bool:
@@ -84,6 +86,8 @@ class Host:
     last_request_at: Optional[float] = None
     requests_served: int = 0
     failures: int = 0
+    #: The workload this host serves (D115); None is the shared workload.
+    workload: Optional[str] = None
 
     @property
     def servable(self) -> frozenset[str]:

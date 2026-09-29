@@ -17,7 +17,9 @@ from ..catalog import ResolvedVariant
 from ..config import PoolConfig
 from ..db import CounterRow, HostCounters, HostRow, HostTable
 from ..models import Host, HostState, Worker, WorkerState
+from ..provisioning_store import KeyReach, ProvisioningStore
 from ..transports import build_client
+from ..workload_store import KeyGrant, Workload, WorkloadStore
 from .dispatch import Dispatcher
 
 log = logging.getLogger("gpm.registry")
@@ -48,6 +50,16 @@ class HostRegistry:
         self.last_seen_at: Optional[float] = None
         self._host_config = {host.id: host for host in config.hosts}
         self._retired: list[httpx.AsyncClient] = []
+        #: Workloads as the supervisor published them (D115): each one's state and model, and
+        #: what each workload key's hash reaches. Read in the background, never on a request.
+        self.workload_store = WorkloadStore(table.db)
+        self.workloads: dict[str, Workload] = {}
+        self.grants: dict[str, KeyGrant] = {}
+        self.last_workload_revision: Optional[float] = None
+        #: Provisioning keys (D117), as hash → provisioner, for keys neither revoked nor expired.
+        self.provisioning_store = ProvisioningStore(table.db)
+        self.provisioners: dict[str, KeyReach] = {}
+        self.last_provisioner_revision: Optional[float] = None
 
     def apply_config(self, config: PoolConfig) -> None:
         """A configuration applied while the router runs. The table still says which hosts
@@ -64,7 +76,26 @@ class HostRegistry:
 
     # --- reading the table ---
 
+    async def refresh_workloads(self) -> bool:
+        """Workloads and their keys, when either changed. A key past its time is still refused at
+        the request, where the clock is read — a revision cannot move for time passing."""
+        provisioner_revision = await asyncio.to_thread(self.provisioning_store.revision)
+        if provisioner_revision != self.last_provisioner_revision:
+            self.provisioners = await asyncio.to_thread(self.provisioning_store.usable_hashes)
+            self.last_provisioner_revision = provisioner_revision
+        revision = await asyncio.to_thread(self.workload_store.revision)
+        if revision == self.last_workload_revision:
+            return False
+        workloads = await asyncio.to_thread(self.workload_store.all)
+        grants = await asyncio.to_thread(self.workload_store.grants)
+        self.workloads = {w.name: w for w in workloads}
+        self.grants = grants
+        self.last_workload_revision = revision
+        await self.dispatcher.wake()
+        return True
+
     async def refresh(self) -> bool:
+        await self.refresh_workloads()
         revision = await asyncio.to_thread(self.table.revision)
         if revision == self.last_revision:
             return False
@@ -115,6 +146,7 @@ class HostRegistry:
             residency=row.residency,
             engine=row.engine,
             last_error=row.last_error,
+            workload=row.workload,
         )
 
     def _client_for(self, row: HostRow) -> httpx.AsyncClient:
@@ -150,6 +182,7 @@ class HostRegistry:
         host.residency = row.residency
         host.engine = row.engine
         host.last_error = row.last_error
+        host.workload = row.workload
         host.capabilities = frozenset(row.capabilities)
         variants = _variants(row)
         host.variants = variants
@@ -190,6 +223,7 @@ class HostRegistry:
                     requests_served=host.requests_served,
                     failures=host.failures,
                     last_request_at=host.last_request_at,
+                    borrowed=sum(1 for w in host.workers if w.borrowed and w.state is WorkerState.BUSY),
                 )
                 for host in self.by_id.values()
             ]

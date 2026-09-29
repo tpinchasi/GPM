@@ -33,6 +33,8 @@ class Lease:
     opened_at: float = dataclasses.field(default_factory=time.time)
     closed_at: Optional[float] = None
     closed_reason: Optional[str] = None
+    #: The workload this lease belongs to (D115); None is the shared workload.
+    workload: Optional[str] = None
 
     @property
     def is_open(self) -> bool:
@@ -60,6 +62,7 @@ class LeaseStore:
         max_all_in_hourly: Optional[float] = None,
         pool_max_all_in_hourly: Optional[float] = None,
         lease_id: Optional[str] = None,
+        workload: Optional[str] = None,
     ) -> Lease:
         """A lease that can rent **must** carry a dollar cap, and may tighten the pool's
         configured limits, never loosen them (spec §2)."""
@@ -85,13 +88,14 @@ class LeaseStore:
             max_spend=max_spend if max_spend is not None else 0.0,
             allow_rent=allow_rent,
             max_all_in_hourly=max_all_in_hourly,
+            workload=workload,
         )
         self.db.execute(
             """
             INSERT INTO leases (
                 lease_id, workers, max_hours, max_spend, allow_rent, bid_ceiling,
-                state, opened_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                state, opened_at, workload
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 lease.lease_id,
@@ -102,6 +106,7 @@ class LeaseStore:
                 lease.max_all_in_hourly,
                 lease.state,
                 lease.opened_at,
+                lease.workload,
             ),
         )
         return lease
@@ -181,6 +186,7 @@ def _to_lease(row: Any) -> Lease:
         opened_at=row["opened_at"],
         closed_at=row["closed_at"],
         closed_reason=row["closed_reason"],
+        workload=row["workload"],
     )
 
 

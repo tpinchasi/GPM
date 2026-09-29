@@ -49,6 +49,9 @@ class CatalogEntry(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     variants: list[Variant] = Field(min_length=1)
+    #: A model only workloads serve (D115): outside the pool's model set, so the shared hosts
+    #: never fetch it and an app key never reaches it; a workload may still be created for it.
+    workloads_only: bool = False
 
 
 class TransportConfig(BaseModel):
@@ -278,6 +281,10 @@ class ListenConfig(BaseModel):
     port: int = 8080
     tls_certfile: Optional[str] = None
     tls_keyfile: Optional[str] = None
+    #: The pool's client CA certificate (public), where workloads may be reached with a client
+    #: certificate (D117): the listener then asks every client for one, verifies it against this
+    #: CA, and the router checks it names the workload. Needs TLS.
+    client_ca_certfile: Optional[str] = None
 
     @model_validator(mode="after")
     def _tls_off_loopback(self) -> "ListenConfig":
@@ -287,6 +294,8 @@ class ListenConfig(BaseModel):
                 "listening off loopback requires TLS: a bearer key over plain HTTP is a "
                 "published key. Set listen.tls_certfile and listen.tls_keyfile."
             )
+        if self.client_ca_certfile and not (self.tls_certfile and self.tls_keyfile):
+            raise ValueError("listen.client_ca_certfile needs TLS: a client certificate is asked for in the TLS handshake")
         return self
 
 
@@ -382,6 +391,72 @@ class PoolSettings(BaseModel):
                 f"queue_timeout_s ({self.queue_timeout_s}) must be below "
                 f"client_time_to_first_byte_s ({self.client_time_to_first_byte_s})"
             )
+        return self
+
+
+class ProvisioningConfig(BaseModel):
+    """Programs that create their own workloads through the SDK (D117, stories/S6). Off unless
+    enabled; then a pool-wide daily cap is required, so the operator's total exposure is a
+    number someone set, not the sum of every grant."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    #: Dollars all provisioned workloads together may commit in any 24 hours.
+    max_spend_per_day: Optional[float] = Field(default=None, gt=0)
+    #: The client CA's certificate and private key, for signing workloads' client certificates.
+    #: The key is read by the supervisor only; it is never in the database or the router.
+    client_ca_certfile: Optional[str] = None
+    client_ca_keyfile: Optional[str] = None
+    #: How often the supervisor looks for new requests, between passes.
+    request_poll_s: float = Field(default=1.0, gt=0)
+    #: A plan asked again within this long is answered from the last one: plans search the
+    #: market, and the provider's rate limit is the whole pool's.
+    plan_cache_s: float = Field(default=60.0, ge=0)
+
+    @model_validator(mode="after")
+    def _bounded(self) -> "ProvisioningConfig":
+        if self.enabled and self.max_spend_per_day is None:
+            raise ValueError("provisioning.enabled needs provisioning.max_spend_per_day: a pool-wide daily cap")
+        if bool(self.client_ca_certfile) != bool(self.client_ca_keyfile):
+            raise ValueError("provisioning.client_ca_certfile and client_ca_keyfile go together")
+        return self
+
+
+class WorkloadsConfig(BaseModel):
+    """Workloads inside the pool (docs/spec/workloads.md §9, D115, D116)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: How many workloads may run at once. Each rents its own hosts; the pool's caps bound them all.
+    max_open: int = Field(default=3, ge=0)
+    #: The share of the shared workload's ready workers a workload may borrow while it prepares.
+    borrow_share: float = Field(default=0.25, ge=0.0, le=1.0)
+    #: How long a rotated-out key keeps working, so a running app is switched without a gap.
+    rotation_grace_minutes: float = Field(default=30.0, ge=0.0)
+    #: A workload's hosts are held to at least this reliability score, whatever the search says.
+    min_reliability: float = Field(default=0.95, ge=0.0, le=1.0)
+    #: Evictions per rented hour assumed for a machine the history knows nothing about.
+    eviction_prior_per_hour: float = Field(default=0.10, ge=0.0)
+    #: How long an engine takes to load a model once it is on disk, for the time to ready.
+    engine_load_s: float = Field(default=180.0, ge=0.0)
+    #: Keep a workload's models on a volume on its machine, for its next host there (D116).
+    keep_models_on_machine: bool = True
+    #: Where a new host of a workload gets its models, tried in order (D116).
+    model_sources: list[Literal["warm", "sibling", "hub"]] = Field(
+        default_factory=lambda: ["warm", "sibling", "hub"]
+    )
+    #: How long a copy from a sibling may take. Past it the host is given up and another rented:
+    #: a copy the provider may still be running is never raced by a fetch into the same place.
+    #: Kept well inside the preparing window, which would otherwise give the host up first.
+    copy_timeout_s: float = Field(default=600.0, gt=0)
+
+    @model_validator(mode="after")
+    def _hub_is_last_resort(self) -> "WorkloadsConfig":
+        if "hub" not in self.model_sources:
+            raise ValueError("workloads.model_sources must keep 'hub': it is the source every other falls back to")
+        if len(set(self.model_sources)) != len(self.model_sources):
+            raise ValueError("workloads.model_sources names a source twice")
         return self
 
 
@@ -935,6 +1010,10 @@ class PoolConfig(BaseModel):
     #: Absent means the pool cannot rent at all — there is nothing to spend with.
     rented: Optional[RentedConfig] = None
     forwarder: ForwarderConfig = Field(default_factory=ForwarderConfig)
+    #: Workloads inside the pool (D115); the pool as configured is the shared workload.
+    workloads: WorkloadsConfig = Field(default_factory=WorkloadsConfig)
+    #: Programs creating their own workloads (D117).
+    provisioning: ProvisioningConfig = Field(default_factory=ProvisioningConfig)
     request_log: str = "gpm.sqlite3"
     directory: DirectoryConfig = Field(default_factory=DirectoryConfig)
 
@@ -947,14 +1026,25 @@ class PoolConfig(BaseModel):
         ids = [h.id for h in self.hosts]
         if len(set(ids)) != len(ids):
             raise ValueError("host ids must be unique")
-        unknown = set(self.catalog) - set(self.pool.model_set)
+        workloads_only = {name for name, entry in self.catalog.items() if entry.workloads_only}
+        unknown = set(self.catalog) - set(self.pool.model_set) - workloads_only
         if unknown:
-            raise ValueError(f"catalog names not in the pool's model set: {sorted(unknown)}")
+            raise ValueError(
+                f"catalog names not in the pool's model set: {sorted(unknown)} — add them to the set, "
+                "or mark them `workloads_only: true` for a model only workloads serve"
+            )
+        both = sorted(workloads_only & set(self.pool.model_set))
+        if both:
+            raise ValueError(
+                f"{both} are in the pool's model set and marked workloads_only: a model is either the "
+                "shared hosts' or workloads' only — remove it from one"
+            )
         self._engine_can_hold_what_the_pool_asks()
         self._rented_hosts_have_a_build_of_what_they_rent_for()
         self._images_are_built_for_this_engine()
         self._engine_options_are_the_engines()
         self._splits_are_the_engines()
+        self._copy_fits_the_preparing_window()
         self._hosts_can_serve_what_they_are_asked_for()
         self._declared_models_are_in_the_set()
         self._every_model_is_held_by_somebody()
@@ -1236,6 +1326,18 @@ class PoolConfig(BaseModel):
             return get_engine(self.rented_engine()).default_port or 11434
         except EngineNotFound:
             return 11434
+
+    def _copy_fits_the_preparing_window(self) -> None:
+        """A copy from a sibling must end well before a host is given up for never being ready,
+        or the host is destroyed mid-copy and its good machine avoided (D116)."""
+        if self.rented is None:
+            return
+        window = self.rented.teardown.max_preparing_minutes * 60
+        if self.workloads.copy_timeout_s > window / 2:
+            raise ValueError(
+                f"workloads.copy_timeout_s ({self.workloads.copy_timeout_s:g}s) must be at most half of "
+                f"rented.teardown.max_preparing_minutes ({window:g}s), so a failed copy leaves time to fetch"
+            )
 
     def _splits_are_the_engines(self) -> None:
         """A profile split across cards needs an engine that splits a model on request, started

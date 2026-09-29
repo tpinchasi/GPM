@@ -54,6 +54,8 @@ class VllmEngine:
     #: pool does not yet ship, so the combination is refused at load rather than at 3 a.m.
     serves_one_model: ClassVar[bool] = True
     default_port: ClassVar[int] = 8000
+    #: The agent fetches into it and the launcher serves from it (D97).
+    models_dir: ClassVar[str] = "/opt/gpm/models"
     image_words: ClassVar[tuple[str, ...]] = ("vllm",)
     #: It serves what it was started with; a downloaded model is picked up by starting it again.
     loads_by_restart: ClassVar[bool] = True

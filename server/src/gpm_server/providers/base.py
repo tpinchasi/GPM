@@ -92,6 +92,12 @@ class ProviderCapabilities:
     #: The provider will hand back an instance's own boot output. Without it, a host that
     #: never answers is given up knowing only that it never answered (D78).
     reports_instance_logs: bool = False
+    #: A volume can be made beside an instance, on its machine, and attached to a later instance
+    #: on the same machine (D116). Without it, a workload's next host always fetches.
+    volumes: bool = False
+    #: The provider copies a directory from one of its instances to another (D116). Without it,
+    #: a new host never takes its models from a sibling.
+    copies: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -152,6 +158,28 @@ class Offer:
 
 
 @dataclasses.dataclass(frozen=True)
+class VolumeSpec:
+    """A volume to attach at creation (D116): one already on the machine (`volume_id`), or a new
+    one of `size_gb`, labelled so the pool's sweep can find it. Mounted where the host keeps its
+    models, so a host created with a warm one finds them there."""
+
+    mount: str
+    label: str
+    size_gb: float = 0.0
+    volume_id: Optional[str] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class VolumeInfo:
+    volume_id: str
+    machine_id: str
+    label: str
+    size_gb: float
+    #: What it costs per hour, where the provider says.
+    hourly: float = 0.0
+
+
+@dataclasses.dataclass(frozen=True)
 class InstanceSpec:
     """What to create. Nothing secret goes in here: the host can read its own environment."""
 
@@ -161,6 +189,8 @@ class InstanceSpec:
     env: dict[str, str] = dataclasses.field(default_factory=dict)
     onstart: Optional[str] = None
     ports: tuple[int, ...] = ()
+    #: Only where `capabilities.volumes` is set (D116).
+    volume: Optional[VolumeSpec] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -169,6 +199,8 @@ class Instance:
     label: Optional[str] = None
     machine_id: Optional[str] = None
     raw: dict[str, Any] = dataclasses.field(default_factory=dict, repr=False)
+    #: The volume it was created with, where one was asked for (D116).
+    volume_id: Optional[str] = None
 
 
 class InstanceState(str):
@@ -301,6 +333,26 @@ class Provider(Protocol):
         return None
 
     async def account(self) -> AccountStatus: ...
+
+    # --- optional: models on a new host without the hub (D116) ---
+
+    async def list_volumes(self, label_prefix: str) -> list[VolumeInfo]:
+        """Every volume carrying the prefix. Only where `capabilities.volumes` is set; raises
+        rather than answers empty when it cannot ask — "could not list" is never "none" (D61)."""
+        raise ProviderError("this provider has no volumes")
+
+    async def delete_volume(self, volume_id: str) -> None:
+        """Idempotent; the pool verifies by listing again."""
+        raise ProviderError("this provider has no volumes")
+
+    async def copy_between(self, source: Instance, destination: Instance, path: str) -> None:
+        """Copy `path` on `source` to the same path on `destination`, as the provider's own
+        operation between its instances — never with an account credential on either host.
+        Only where `capabilities.copies` is set; returns when the copy has finished. **Raises only
+        once the copy has stopped**: the pool then fetches into the same place, and must not race
+        a copy still running. A copy the pool stops waiting for is never trusted to have stopped:
+        its host is given up instead."""
+        raise ProviderError("this provider does not copy between instances")
 
     def self_terminate_request(self, action: str = "destroy") -> SelfTerminateRequest:
         """The call an instance makes to end **itself**, with the provider's instance-scoped

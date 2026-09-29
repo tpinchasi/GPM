@@ -33,8 +33,10 @@ state; a static HTML/JS console with no build step. The client SDK is a separate
   for a tag already on its disk — D39); the provider account credential never goes on a rented
   host, in a log, or to a browser.
 - **The app boundary.** Apps know one URL, one key and the contract in
-  `docs/spec/app-contract.md`. The pool never calls into an app; apps never trigger recovery or
-  spending.
+  `docs/spec/app-contract.md`. The pool never calls into an app; apps never trigger recovery, and
+  never trigger spending **except through a provisioning key** (D117): a separate key an operator
+  grants one application, bounded by its grant and a pool-wide daily cap, that can create and end
+  its own workloads and can never request a completion or reach the control API.
 - **Router and supervisor stay separate processes** sharing SQLite, never calling each other.
   Nothing slow or blocking goes on the router's request path.
 - **The host agent's protocol is a closed list of verbs.** No operation takes a command, a path

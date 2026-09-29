@@ -15,7 +15,7 @@ import pathlib
 import subprocess
 import sys
 import threading
-from typing import Optional
+from typing import Any, Optional
 
 from .config import ConfigError, load_config
 
@@ -40,6 +40,24 @@ def _supervisor_child(config_path: str, log_level: str) -> subprocess.Popen:
     return child
 
 
+def listener_options(config: Any) -> dict[str, Any]:
+    """How the router's listener is served. With a client CA configured (D117) it asks every
+    client for a certificate — optional at the handshake, verified against the CA — and hands the
+    one it verified to the application, which checks it names the workload."""
+    options: dict[str, Any] = {
+        "host": config.listen.host, "port": config.listen.port,
+        "ssl_certfile": config.listen.tls_certfile, "ssl_keyfile": config.listen.tls_keyfile,
+    }
+    if config.listen.client_ca_certfile:
+        import ssl
+
+        from .router.peer import peer_certificate_protocol
+
+        options |= {"ssl_ca_certs": config.listen.client_ca_certfile, "ssl_cert_reqs": ssl.CERT_OPTIONAL,
+                    "http": peer_certificate_protocol()}
+    return options
+
+
 def _serve(args: argparse.Namespace) -> int:
     import uvicorn
 
@@ -52,14 +70,7 @@ def _serve(args: argparse.Namespace) -> int:
 
     try:
         app = create_app(config, config_path=args.config)
-        uvicorn.run(
-            app,
-            host=config.listen.host,
-            port=config.listen.port,
-            ssl_certfile=config.listen.tls_certfile,
-            ssl_keyfile=config.listen.tls_keyfile,
-            log_level=args.log_level,
-        )
+        uvicorn.run(app, **listener_options(config), log_level=args.log_level)
     finally:
         if child is not None:
             child.terminate()
@@ -220,6 +231,146 @@ def _lease(args: argparse.Namespace) -> int:
         ) if v is not None}
         return _control(args, "PATCH", f"/pool/leases/{args.lease_id}", {**body, "confirm": args.confirm})
     return _control(args, "GET", "/pool/leases")
+
+
+def _control_json(args: argparse.Namespace, method: str, path: str, body: Optional[dict] = None) -> tuple[int, Any]:
+    """The control call, answered as data rather than printed — for commands that say more than
+    the JSON does."""
+    import httpx
+
+    key = os.environ.get("GPM_ADMIN_KEY")
+    if not key:
+        return 0, {"error": "no_admin_key", "detail": "GPM_ADMIN_KEY is not set"}
+    url = getattr(args, "url", None) or os.environ.get("GPM_CONTROL_URL", "http://127.0.0.1:8081")
+    try:
+        response = httpx.request(method, f"{url}{path}", headers={"Authorization": f"Bearer {key}"},
+                                 json=body, timeout=120.0)
+    except httpx.HTTPError as exc:
+        return 0, {"error": "unreachable", "detail": f"could not reach the control API at {url}: {exc}"}
+    try:
+        return response.status_code, response.json()
+    except ValueError:
+        return response.status_code, {"error": "not_json", "detail": response.text}
+
+
+def _say_plan(plan: dict) -> None:
+    print(f"workload {plan['name']}: {plan['model']} ({plan['build']}), {plan['parallel']} at once, "
+          f"{plan['latency_s']:g}s p95, for {plan['hours']:g}h")
+    if "hosts_at_start" in plan:
+        first = plan["first_host"]
+        measured = "measured" if plan["workers_measured"] else "not measured yet"
+        print(f"  starts on {plan['hosts_at_start']} host(s) at {plan['workers_per_host']} at once each ({measured})")
+        print(f"  first host: {first['kind'].replace('_', '-')} {first['hardware']} on {first['machine']} "
+              f"at ${first['hourly']:.3f}/h; ready in about {plan['minutes_to_serve']:.0f} min")
+        for reason in plan.get("reasons", []):
+            print(f"  {reason}")
+        print(f"  budget: ${plan['max_spend']:.2f}" + (" (derived)" if plan["budget_derived"] else ""))
+    if plan.get("refused"):
+        print(f"  refused: {plan['refused']}")
+
+
+def _say_connection(connection: dict) -> None:
+    print("\nWhat the application owner configures — the key is shown this once:")
+    print(f"  base_url: {connection['base_url']}")
+    print(f"  api_key:  {connection['api_key']}")
+    if connection.get("tls"):
+        print("  (the pool's certificate must be trusted by the client: a public one, or its CA file)")
+    print("  Any OpenAI-compatible client takes these two; the pool's own SDK too.", file=sys.stderr)
+
+
+def _workload(args: argparse.Namespace) -> int:
+    name = args.name
+    if args.action in ("plan", "create"):
+        if not name or not args.model or args.latency is None or args.parallel is None or args.hours is None:
+            print("give a name, --model, --latency, --parallel and --hours", file=sys.stderr)
+            return 2
+        body = {"name": name, "model": args.model, "latency_s": args.latency, "parallel": args.parallel,
+                "hours": args.hours, "max_spend": args.max_spend, "profile": args.profile, "kind": args.kind}
+        status, answer = _control_json(args, "POST", "/pool/workloads/plan", body)
+        if status != 200:
+            print(answer.get("detail") or json.dumps(answer), file=sys.stderr)
+            return 1
+        plan = answer["plan"]
+        _say_plan(plan)
+        if args.action == "plan" or plan.get("refused"):
+            return 0 if not plan.get("refused") else 1
+        confirm = args.confirm_max_spend
+        if plan["budget_derived"] and confirm is None:
+            if not sys.stdin.isatty():
+                print(f"no budget was typed: re-run with --confirm-max-spend {plan['max_spend']:.2f} to accept "
+                      "the derived one, or give --max-spend", file=sys.stderr)
+                return 1
+            typed = input(f"type the budget again to confirm (${plan['max_spend']:.2f}): ").strip().lstrip("$")
+            try:
+                confirm = float(typed)
+            except ValueError:
+                print("not confirmed; nothing was created", file=sys.stderr)
+                return 1
+        status, answer = _control_json(args, "POST", "/pool/workloads", {**body, "confirm_max_spend": confirm})
+        if status != 201:
+            print(answer.get("detail") or json.dumps(answer), file=sys.stderr)
+            return 1
+        print(f"\ncreated: lease {answer['workload']['lease']['lease_id']}, up to ${answer['workload']['lease']['max_spend']:.2f}")
+        _say_connection(answer["connection"])
+        return 0
+    if args.action == "list":
+        return _control(args, "GET", "/pool/workloads")
+    if not name:
+        print("name the workload", file=sys.stderr)
+        return 2
+    if args.action == "show":
+        return _control(args, "GET", f"/pool/workloads/{name}")
+    if args.action == "end":
+        return _control(args, "POST", f"/pool/workloads/{name}/end")
+    if args.action == "extend":
+        body = {k: v for k, v in (("hours", args.hours), ("max_spend", args.max_spend), ("confirm", args.confirm),
+                                  ("confirm_hours", args.confirm_hours)) if v is not None}
+        return _control(args, "POST", f"/pool/workloads/{name}/extend", body)
+    if args.action == "rotate-key":
+        status, answer = _control_json(args, "POST", f"/pool/workloads/{name}/keys")
+        if status != 200:
+            print(answer.get("detail") or json.dumps(answer), file=sys.stderr)
+            return 1
+        _say_connection(answer["connection"])
+        print(f"  the old key keeps working for {answer['old_keys_valid_minutes']:g} more minutes", file=sys.stderr)
+        return 0
+    return 2
+
+
+def _provisioner(args: argparse.Namespace) -> int:
+    if args.action == "create":
+        if not args.name or not args.models:
+            print("name it, and give --models", file=sys.stderr)
+            return 2
+        body = {"name": args.name, "models": args.models.split(","), "max_open": args.max_open,
+                "max_spend": args.max_spend, "max_spend_per_day": args.max_spend_per_day, "max_hours": args.max_hours,
+                "kinds": args.kinds.split(","), "may_borrow": not args.no_borrow,
+                "idle_end_minutes": args.idle_end_minutes, "max_idle_end_minutes": args.max_idle_end_minutes,
+                "certs": args.certs, "expires_hours": args.expires_hours}
+        status, answer = _control_json(args, "POST", "/pool/provisioners", body)
+        if status != 201:
+            print(answer.get("detail") or json.dumps(answer), file=sys.stderr)
+            return 1
+        print(json.dumps(answer["provisioner"], indent=2))
+        print(f"\nprovisioning key (shown once): {answer['key']}")
+        print("Give it to the application as GPM_PROVISIONING_KEY; it can create workloads within this grant "
+              "and nothing else.", file=sys.stderr)
+        return 0
+    if args.action == "list":
+        return _control(args, "GET", "/pool/provisioners")
+    if args.action == "revoke":
+        suffix = "?end_workloads=true" if args.end_workloads else ""
+        return _control(args, "DELETE", f"/pool/provisioners/{args.name}{suffix}")
+    return 2
+
+
+def _ca(args: argparse.Namespace) -> int:
+    from .certs import make_ca
+
+    cert_path, key_path = make_ca(args.dir)
+    print(f"client CA certificate: {cert_path}   (public: listen.client_ca_certfile and provisioning.client_ca_certfile)")
+    print(f"client CA key:         {key_path}   (secret: provisioning.client_ca_keyfile, for the supervisor only)")
+    return 0
 
 
 def _host(args: argparse.Namespace) -> int:
@@ -391,6 +542,49 @@ def main(argv: list[str] | None = None) -> int:
                        help="extend: the new value again, since raising a limit is loosening")
     lease.add_argument("--url", default=None)
     lease.set_defaults(func=_lease)
+
+    workload = subparsers.add_parser(
+        "workload", help="create, watch and end a workload: a model, a latency, a parallelism and a duration (D115)"
+    )
+    workload.add_argument("action", choices=["plan", "create", "list", "show", "extend", "end", "rotate-key"])
+    workload.add_argument("name", nargs="?", default=None)
+    workload.add_argument("--model", default=None)
+    workload.add_argument("--latency", type=float, default=None, help="the whole answer at p95, in seconds")
+    workload.add_argument("--parallel", type=int, default=None, help="answers at once")
+    workload.add_argument("--hours", type=float, default=None, help="how long it runs (for extend: hours added)")
+    workload.add_argument("--max-spend", type=float, default=None, help="its dollar cap; derived and confirmed if absent")
+    workload.add_argument("--confirm-max-spend", type=float, default=None, help="accept the derived budget without a prompt")
+    workload.add_argument("--profile", default=None, help="a model profile to take the build from")
+    workload.add_argument("--kind", choices=["roi", "on_demand", "interruptible"], default="roi")
+    workload.add_argument("--confirm", type=float, default=None, help="for extend: the raised budget typed again")
+    workload.add_argument("--confirm-hours", type=float, default=None, help="for extend: the hours added, typed again")
+    workload.add_argument("--url", default=None)
+    workload.set_defaults(func=_workload)
+
+    provisioner = subparsers.add_parser(
+        "provisioner", help="keys that let a program create its own workloads, within a grant (D117)"
+    )
+    provisioner.add_argument("action", choices=["create", "list", "revoke"])
+    provisioner.add_argument("name", nargs="?", default=None)
+    provisioner.add_argument("--models", default=None, help="comma-separated: the models it may create workloads for")
+    provisioner.add_argument("--max-open", type=int, default=1)
+    provisioner.add_argument("--max-spend", type=float, default=10.0, help="dollars per workload")
+    provisioner.add_argument("--max-spend-per-day", type=float, default=20.0, help="dollars committed in any 24 hours")
+    provisioner.add_argument("--max-hours", type=float, default=8.0)
+    provisioner.add_argument("--kinds", default="roi,on_demand,interruptible")
+    provisioner.add_argument("--no-borrow", action="store_true", help="its workloads never borrow shared hosts")
+    provisioner.add_argument("--idle-end-minutes", type=float, default=15.0, help="the default idle cutoff")
+    provisioner.add_argument("--max-idle-end-minutes", type=float, default=120.0)
+    provisioner.add_argument("--certs", choices=["optional", "required"], default="optional")
+    provisioner.add_argument("--expires-hours", type=float, default=None)
+    provisioner.add_argument("--end-workloads", action="store_true", help="for revoke: end the workloads it made")
+    provisioner.add_argument("--url", default=None)
+    provisioner.set_defaults(func=_provisioner)
+
+    ca = subparsers.add_parser("ca", help="make the pool's client CA, for workloads' client certificates (D117)")
+    ca.add_argument("action", choices=["create"])
+    ca.add_argument("--dir", default="~/.config/gpm/ca")
+    ca.set_defaults(func=_ca)
 
     config_cmd = subparsers.add_parser("config", help="read, check and apply the pool's configuration")
     config_cmd.add_argument("action", choices=["get", "validate", "plan", "apply", "history", "rollback"])

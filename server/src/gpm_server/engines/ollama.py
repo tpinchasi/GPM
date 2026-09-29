@@ -29,6 +29,8 @@ class OllamaEngine:
     interface_version: ClassVar[str] = "1"
     name: ClassVar[str] = "ollama"
     default_port: ClassVar[int] = 11434
+    #: Ollama's own store for the root user, where its images keep it (unverified on every image).
+    models_dir: ClassVar[str] = "/root/.ollama/models"
     image_words: ClassVar[tuple[str, ...]] = ("ollama",)
     loads_by_restart: ClassVar[bool] = False
     #: Ollama's start takes no named options, and its builds are its own library's names.

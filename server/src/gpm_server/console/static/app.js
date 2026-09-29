@@ -68,6 +68,15 @@ const api = {
   restartEngine: (hostId, applySettings) =>
     call("POST", `/pool/hosts/${hostId}/engine/restart`, { confirm: hostId, apply_settings: applySettings }),
   deleteModel: (hostId, tag) => call("POST", `/pool/hosts/${hostId}/models/delete`, { tag, confirm: tag }),
+  workloads: () => call("GET", "/pool/workloads"),
+  planWorkload: (body) => call("POST", "/pool/workloads/plan", body),
+  createWorkload: (body) => call("POST", "/pool/workloads", body),
+  extendWorkload: (name, body) => call("POST", `/pool/workloads/${encodeURIComponent(name)}/extend`, body),
+  endWorkload: (name) => call("POST", `/pool/workloads/${encodeURIComponent(name)}/end`),
+  rotateWorkloadKey: (name) => call("POST", `/pool/workloads/${encodeURIComponent(name)}/keys`),
+  provisioners: () => call("GET", "/pool/provisioners"),
+  createProvisioner: (body) => call("POST", "/pool/provisioners", body),
+  revokeProvisioner: (name, end) => call("DELETE", `/pool/provisioners/${encodeURIComponent(name)}?end_workloads=${end ? "true" : "false"}`),
 };
 
 // --- small helpers ---
@@ -211,7 +220,7 @@ function hostPanel(d) {
   ];
 }
 
-function confirmAction({ title, body, retype }) {
+function confirmAction({ title, body, retype, retypeLabel, okLabel }) {
   const dialog = document.getElementById("confirm-dialog");
   document.getElementById("confirm-title").textContent = title;
   const holder = document.getElementById("confirm-body");
@@ -219,15 +228,27 @@ function confirmAction({ title, body, retype }) {
   const retypeBox = document.getElementById("confirm-retype");
   const input = document.getElementById("confirm-input");
   const ok = document.getElementById("confirm-ok");
+  document.getElementById("confirm-retype-label").textContent = retypeLabel || "Type the value again to confirm";
+  ok.textContent = okLabel || "Confirm";
   retypeBox.hidden = !retype;
   input.value = "";
-  // Loosening is harder than tightening: the new value must be typed again (spec §1).
-  const check = () => { ok.disabled = retype ? input.value.trim() !== String(retype) : false; };
+  // Loosening is harder than tightening: the new value must be typed again (spec §1). A number
+  // matches however it is written: "$0.57", "0.57" and ".57" are the same budget.
+  const same = (typed) => {
+    const bare = typed.trim().replace(/^\$/, "");
+    const want = String(retype);
+    return /^\d*\.?\d+$/.test(bare) && /^\d*\.?\d+$/.test(want) ? Number(bare) === Number(want) : bare === want;
+  };
+  const check = () => { ok.disabled = retype ? !same(input.value) : false; };
   check();
   input.oninput = check;
+  // A dialog keeps the answer it last closed with, and Escape does not replace it: without this,
+  // Escape after any confirmed dialog confirmed the next one, retype and all.
+  dialog.returnValue = "";
   dialog.showModal();
+  if (retype) input.focus();
   return new Promise((resolve) => {
-    dialog.addEventListener("close", () => resolve(dialog.returnValue === "ok"), { once: true });
+    dialog.addEventListener("close", () => resolve(dialog.returnValue === "ok" && (!retype || same(input.value))), { once: true });
   });
 }
 
@@ -2171,6 +2192,650 @@ const leaseRows = (leases) => el("table", {},
     el("td", { class: "num" }, money(lease.max_spend)),
     el("td", { class: "num" }, money(lease.dollars_left)),
     el("td", {}, leaseActions(lease))))));
+
+// --- workloads (D115, docs/spec/workloads.md) ---
+
+// The form, the last plan, a key just shown and which row is open, kept across redraws. The
+// table refreshes itself every few seconds; the form and a key being copied are never redrawn
+// under the operator.
+const workloadDraft = {
+  name: "", model: "", latency: "30", parallel: "8", hours: "4", budget: "", kind: "roi",
+  plan: null, planning: false, error: null, notice: null, shown: null, open: null,
+  rowErrors: {}, timer: null, holder: null,
+  // The form folds away once any workload is active, so the table stays in view; it opens on
+  // request, and stays open while it holds a draft.
+  formOpen: false, formHolder: null, hasLive: null,
+};
+const KIND_LABELS = { roi: "Cheapest by the numbers", on_demand: "On demand only", interruptible: "Bids only" };
+const KIND_HINTS = {
+  roi: "on demand or a bid, whichever is expected to cost less over its hours, evictions counted",
+  on_demand: "never outbid; the listed price",
+  interruptible: "cheapest; can be taken away, and a replacement is rented",
+};
+const WORKLOAD_STATES = { preparing: "warn", serving: "ok", ending: "", ended: "" };
+const NAME_RULE = /^[a-z0-9][a-z0-9-]{0,39}$/;
+const dollars = (n) => (n === null || n === undefined ? "—" : `$${Number(n).toFixed(2)}`);
+const until = (ts) => (ts ? new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—");
+
+function workloadBody() {
+  const d = workloadDraft;
+  const body = {
+    name: d.name.trim(), model: d.model, latency_s: Number(d.latency), parallel: Number(d.parallel),
+    hours: Number(d.hours), kind: d.kind,
+  };
+  if (d.budget.trim() !== "") body.max_spend = Number(d.budget.replace(/^\$/, ""));
+  return body;
+}
+
+// A model rented hosts can run: a catalog build for the rented engine, or one for any engine.
+function rentable(status, model) {
+  const builds = (status.catalog || {})[model];
+  if (!builds || !builds.length) return true;
+  const engine = (status.engine || {}).rented;
+  return builds.some((b) => b.engine == null || b.engine === engine);
+}
+
+function workloadForm(status) {
+  const d = workloadDraft;
+  const onlyForWorkloads = status.workload_models || [];
+  const models = [...onlyForWorkloads, ...(status.model_set || [])];
+  if (!d.model && models.length) d.model = models.find((m) => rentable(status, m)) || models[0];
+  const label = (m) => `${m}${onlyForWorkloads.includes(m) ? " (workloads only)" : ""}${rentable(status, m) ? "" : " (no build for rented hosts)"}`;
+  let planButton, planHolder, errorHolder, nameCheck;
+  const nameOk = () => NAME_RULE.test(d.name.trim()) && !d.name.trim().startsWith("rented-");
+  const sync = (focusPlan) => {
+    planButton.disabled = d.planning || !nameOk();
+    planButton.textContent = d.planning ? "Working it out…" : "Plan";
+    planButton.title = nameOk() ? "" : "Name it first";
+    nameCheck.textContent = d.name && !nameOk() ? "lower-case letters, digits and -, not starting with rented-" : "";
+    planHolder.replaceChildren(...(d.plan ? [workloadPlanView(d.plan)] : []));
+    errorHolder.textContent = d.error || "";
+    if (focusPlan && d.plan) planHolder.querySelector("[tabindex]")?.focus();
+  };
+  const changed = () => { d.plan = null; d.error = null; d.notice = null; sync(); };
+  let hintId = 0;
+  const wrap = (label, control, hint) => {
+    const id = `wl-hint-${++hintId}`;
+    if (hint) control.setAttribute("aria-describedby", id);
+    return el("label", { class: "field" }, el("span", {}, label), control, hint ? el("small", { class: "muted", id }, hint) : null);
+  };
+  const input = (key, attrs) => el("input", { ...attrs, value: d[key], oninput: (e) => { d[key] = e.target.value; changed(); } });
+  const select = (key, options) => el("select", { onchange: (e) => { d[key] = e.target.value; changed(); } },
+    ...options.map(([v, text]) => el("option", { value: v, ...(v === d[key] ? { selected: true } : {}) }, text)));
+  const kindHint = el("small", { class: "muted" }, KIND_HINTS[d.kind]);
+  const kindSelect = select("kind", Object.entries(KIND_LABELS));
+  kindSelect.addEventListener("change", () => { kindHint.textContent = KIND_HINTS[d.kind]; });
+  nameCheck = el("small", { class: "error", role: "status" });
+  planButton = el("button", { onclick: () => planWorkload(sync) }, "Plan");
+  planHolder = el("div");
+  errorHolder = el("span", { class: "error", role: "status" });
+  const panel = el("div", { class: "panel" },
+    el("h2", {}, "New workload"),
+    el("p", { class: "muted" },
+      "A model at a latency, for a number of answers at once, for a time. It gets its own hosts, its own lease and its own key; nothing is rented until you create it."),
+    el("div", { class: "form-grid" },
+      el("div", { class: "field" }, wrap("Name", input("name", { type: "text", maxlength: "40", placeholder: "e.g. research-run",
+        autocomplete: "off", pattern: "[a-z0-9][a-z0-9-]{0,39}" }), "lower-case letters, digits and -"), nameCheck),
+      wrap("Model", select("model", models.map((m) => [m, label(m)])),
+        "a workloads-only model is never fetched by the shared hosts"),
+      wrap("Answer latency (p95, s)", input("latency", { type: "number", min: "1", step: "1" }), "the whole answer, as the app receives it"),
+      wrap("Answers at once", input("parallel", { type: "number", min: "1", step: "1" }), "the most it serves together"),
+      wrap("Hours", input("hours", { type: "number", min: "0.5", step: "0.5" }), "then its hosts are released"),
+      wrap("Budget ($)", input("budget", { type: "number", min: "0.01", step: "0.01", placeholder: "propose one for me" }),
+        "its dollar cap; left empty, the plan proposes one"),
+      el("label", { class: "field" }, el("span", {}, "Machines"), kindSelect, kindHint)),
+    el("div", { class: "row" }, planButton, errorHolder),
+    d.notice ? el("p", { class: "warn-text", role: "status" }, d.notice) : null,
+    planHolder);
+  sync();
+  return panel;
+}
+
+async function planWorkload(sync) {
+  const d = workloadDraft;
+  d.planning = true; d.error = null; sync();
+  try {
+    d.plan = (await api.planWorkload(workloadBody())).plan;
+  } catch (error) {
+    d.plan = null; d.error = error.message;
+  } finally {
+    d.planning = false; sync(true);
+  }
+}
+
+function workloadPlanView(plan) {
+  if (plan.hosts_at_start === undefined) {
+    const counts = Object.entries(plan.rejected_by_reason || {}).slice(0, 4).map(([why, n]) => `${n} ${why}`);
+    return el("div", { class: "plan refused", tabindex: "-1" }, el("strong", {}, "Cannot start: "), plan.refused,
+      counts.length ? el("p", {}, "Machines turned away: ", counts.join(", "), ". See ",
+        el("a", { href: "#rented/finding" }, "Rented capacity → Finding machines"), ".") : null);
+  }
+  const first = plan.first_host;
+  const hosts = plan.hosts_at_start;
+  const perHour = plan.hourly_total ?? hosts * first.hourly;
+  const bid = first.kind !== "on_demand";
+  const createButton = el("button", { class: "primary", disabled: Boolean(plan.refused),
+    onclick: (e) => createWorkload(e.target) }, `Create — up to ${dollars(plan.max_spend)}`);
+  return el("div", { class: "plan" + (plan.refused ? " refused" : ""), tabindex: "-1" },
+    el("div", { class: "kv" },
+      el("div", { class: "k" }, "starts on"),
+      el("div", {}, `${hosts} host${hosts === 1 ? "" : "s"}, ${plan.workers_per_host} answers at once each `,
+        plan.workers_measured ? pill("measured on this card", "ok")
+          : el("span", { class: "muted" }, "— latency not measured on this card yet: sized from its rated capacity")),
+      el("div", { class: "k" }, "first host"),
+      el("div", {}, `${bid ? "a bid" : "on demand"}: ${first.hardware}, ${rate(first.hourly)}`,
+        bid ? el("span", { class: "muted" }, " — a bid can be taken away; the pool rents a replacement") : null),
+      el("div", { class: "k" }, "cost per hour"),
+      el("div", {}, Math.abs(hosts * first.hourly - perHour) < 0.005
+        ? `${hosts} host${hosts === 1 ? "" : "s"} × ${rate(first.hourly)} = ${rate(perHour)}` : rate(perHour)),
+      el("div", { class: "k" }, "budget"),
+      el("div", {}, el("strong", {}, dollars(plan.max_spend)),
+        plan.budget_derived ? ` — ${rate(perHour)} × ${plan.hours} h, plus 25%` : " — as typed"),
+      plan.pool_burn_cap ? el("div", { class: "k" }, "pool burn") : null,
+      plan.pool_burn_cap ? el("div", {}, `${rate(plan.pool_burn_after)} of the ${rate(plan.pool_burn_cap)} cap after this (now ${rate(plan.pool_burn_now)})`) : null,
+      el("div", { class: "k" }, "serving in about"),
+      el("div", {}, `${Math.round(plan.minutes_to_serve)} minutes`,
+        el("span", { class: "muted" }, plan.borrow_while_starting
+          ? " — meanwhile its requests are served on shared hosts that hold this model"
+          : " — until then its requests are refused: no shared host serves this model")),
+      el("div", { class: "k" }, "at the end"),
+      el("div", {}, "When the hours or the budget run out, its hosts are released and its key gets 503 workload_ended.")),
+    el("details", {}, el("summary", {}, "How this was worked out"),
+      el("ul", {}, ...(plan.reasons || []).map((line) => el("li", {}, line)),
+        ...(plan.sizing || []).map((line) => el("li", {}, line)),
+        ...(first.reasons || []).map((line) => el("li", {}, line)))),
+    plan.refused ? el("p", { class: "error" }, el("strong", {}, "Cannot start: "), plan.refused) : null,
+    el("div", { class: "row" }, createButton));
+}
+
+async function createWorkload(button) {
+  const d = workloadDraft;
+  const plan = d.plan;
+  const body = workloadBody();
+  const budget = plan.max_spend.toFixed(2);
+  const ok = await confirmAction({
+    title: `Create workload ${body.name}?`,
+    body: el("div", {},
+      el("p", {}, `This opens a lease that may spend up to $${budget} over ${body.hours} h, and rents ${plan.hosts_at_start} host${plan.hosts_at_start === 1 ? "" : "s"} now.`)),
+    retype: plan.budget_derived ? budget : null,
+    retypeLabel: `Type ${budget} to accept this budget`,
+    okLabel: "Create workload",
+  });
+  if (!ok) return;
+  if (plan.budget_derived) body.confirm_max_spend = Number(budget);
+  button.disabled = true;
+  try {
+    const made = await api.createWorkload(body);
+    d.shown = { name: body.name, model: body.model, connection: made.connection, rotated: false,
+                endsAt: made.workload.ends_at, parallel: body.parallel, latency: body.latency_s };
+    Object.assign(d, { name: "", budget: "", plan: null, error: null, notice: null, formOpen: false });
+  } catch (error) {
+    if (plan.budget_derived && /derived one is/.test(error.message)) {
+      // The market moved between the plan and now: plan again and say so, rather than dead-end.
+      const before = budget;
+      try {
+        d.plan = (await api.planWorkload(workloadWithout(body))).plan;
+        d.notice = `The price moved: the proposed budget is now ${dollars(d.plan.max_spend)} (was $${before}). Review it and create again.`;
+      } catch (again) { d.error = again.message; }
+    } else {
+      d.error = error.message;
+    }
+  } finally {
+    button.disabled = false;
+    render();
+  }
+}
+
+const workloadWithout = (body) => { const copy = { ...body }; delete copy.confirm_max_spend; return copy; };
+
+function copyButton(text, label = "Copy") {
+  return el("button", { class: "small", onclick: async (e) => {
+    try { await navigator.clipboard.writeText(text); e.target.textContent = "Copied"; }
+    catch { e.target.textContent = "Select it and copy"; }
+    setTimeout(() => { e.target.textContent = label; }, 1500);
+  } }, label);
+}
+
+// Leaving the page while a key is on it loses the key for good.
+const keepKey = (e) => { if (workloadDraft.shown || programDraft.shown) { e.preventDefault(); e.returnValue = ""; } };
+window.addEventListener("beforeunload", keepKey);
+
+function keyPanel() {
+  const shown = workloadDraft.shown;
+  if (!shown) return null;
+  const c = shown.connection;
+  const handoff = [
+    `base_url: ${c.base_url}`, `api_key: ${c.api_key}`, `model: ${shown.model}`,
+    shown.endsAt ? `valid until: ${until(shown.endsAt)} (while the workload runs)` : null,
+    shown.parallel ? `at most ${shown.parallel} answers at once` : null,
+    shown.latency ? `target ${shown.latency} s per answer` : null,
+  ].filter(Boolean).join("\n");
+  const heading = el("h2", { tabindex: "-1" }, shown.rotated ? `New key for ${shown.name}` : `${shown.name} is created — give its app owner these`);
+  const panel = el("div", { class: "panel key-panel", "aria-live": "polite" },
+    heading,
+    el("p", {}, el("strong", {}, "The key is shown this once."), " Only its hash is kept; if it is lost, mint a new one."),
+    el("div", { class: "kv" },
+      el("div", { class: "k" }, "base_url"), el("div", { class: "row" }, el("code", {}, c.base_url), copyButton(c.base_url)),
+      el("div", { class: "k" }, "api_key"), el("div", { class: "row" }, el("code", { class: "secret" }, c.api_key), copyButton(c.api_key)),
+      el("div", { class: "k" }, "model"), el("div", { class: "row" }, el("code", {}, shown.model), copyButton(shown.model))),
+    el("p", { class: "muted" },
+      "Any OpenAI-compatible client takes these: base URL, API key, and the model name. ",
+      c.tls ? "The client must trust the pool's certificate: a public one, or give the app owner the pool's CA file."
+        : "The pool listens without TLS here, so the key must not leave this machine."),
+    shown.rotated ? el("p", { class: "muted" }, `The old key keeps working until ${until(shown.graceUntil)}.`) : null,
+    el("div", { class: "row" },
+      copyButton(handoff, "Copy all for the app owner"),
+      el("button", { onclick: async () => {
+        const ok = await confirmAction({ title: "Put the key away?",
+          body: "It will not be shown again. If it is lost, the workload needs a new key.", okLabel: "I have saved it" });
+        if (ok) { workloadDraft.shown = null; render(); }
+      } }, "I have saved it")));
+  // Focused once, when the key first appears — not on every redraw.
+  if (!shown.focused) { shown.focused = true; setTimeout(() => heading.focus(), 0); }
+  return panel;
+}
+
+function latencyCell(w) {
+  const answers = w.answers || {};
+  if (!answers.count) return el("td", { class: "num" }, "—", el("div", { class: "muted" }, `target ${w.latency_s} s`));
+  if (answers.count < 20) {
+    return el("td", { class: "num" }, "too few answers yet", el("div", { class: "muted" }, `${answers.count} · target ${w.latency_s} s`));
+  }
+  const over = answers.meets_target === false;
+  return el("td", { class: "num" }, `${answers.p95_s.toFixed(1)} s · ${answers.count} answers`,
+    el("div", { class: over ? "error" : "muted" }, over ? `over target (${w.latency_s} s)` : `within ${w.latency_s} s`));
+}
+
+function spendCell(w) {
+  const cap = w.lease.max_spend || 0;
+  const share = cap ? Math.min(1, (w.lease.spent || 0) / cap) : 0;
+  return el("td", { class: "num" }, `${dollars(w.lease.spent)} of ${dollars(cap)}`,
+    el("div", { class: `burn${share >= 0.95 ? " bad" : share >= 0.8 ? " warn" : ""}`,
+      role: "img", "aria-label": `${Math.round(share * 100)}% of its budget spent` },
+      el("div", { style: `width:${(share * 100).toFixed(1)}%` })));
+}
+
+// Whichever limit comes first: its hours, or its budget at what it costs now.
+function timeLeftCell(w) {
+  if (!w.lease.open) {
+    return el("td", { class: "num" }, w.ended_at ? `ended ${until(w.ended_at)}` : "—");
+  }
+  const perHour = w.hosts.reduce((sum, h) => sum + (h.hourly || 0), 0);
+  const money = perHour > 0 ? Math.max(0, (w.lease.max_spend - w.lease.spent)) / perHour : Infinity;
+  const hours = w.lease.hours_left;
+  return money < hours
+    ? el("td", { class: "num" }, `${money.toFixed(1)} h`, el("div", { class: "warn-text" }, "the budget runs out first"))
+    : el("td", { class: "num" }, `${hours.toFixed(1)} h`, el("div", { class: "muted" }, `until ${until(w.ends_at)}`));
+}
+
+function stateCell(w) {
+  const note = w.state === "preparing"
+    ? (w.borrowing ? "borrowing shared hosts" : `waiting — no shared host serves ${w.model}`)
+    : w.state === "ending" ? "draining, key refused" : null;
+  let eta = null;
+  if (w.state === "preparing" && w.plan && w.plan.minutes_to_serve) {
+    const left = Math.max(0, Math.round((w.created_at + w.plan.minutes_to_serve * 60 - Date.now() / 1000) / 60));
+    eta = left > 0 ? `serving in ~${left} min (planned)` : "due to serve any moment";
+  }
+  return el("td", {}, pill(w.state, WORKLOAD_STATES[w.state]),
+    note ? el("div", { class: "muted" }, note) : null, eta ? el("div", { class: "muted" }, eta) : null);
+}
+
+function workloadRow(w) {
+  const open = workloadDraft.open === w.name;
+  const ready = w.hosts.filter((h) => h.state === "ready").length;
+  const planned = Math.max(w.hosts_at_start || 0, w.hosts.length);
+  const rows = [el("tr", {},
+    el("td", {},
+      el("button", { class: "link", "aria-expanded": open ? "true" : "false",
+        onclick: () => { workloadDraft.open = open ? null : w.name; drawWorkloadTables(); } },
+        el("span", { "aria-hidden": "true" }, open ? "▾ " : "▸ "), el("strong", {}, w.name)),
+      el("div", { class: "muted mono" }, w.model),
+      w.provisioner ? el("div", { class: "muted" }, `made by ${w.provisioner}`) : null),
+    stateCell(w),
+    w.state === "preparing" || w.state === "serving"
+      ? el("td", { class: "num" }, `${ready} of ${planned}`, el("div", { class: "muted" }, "planned"))
+      : el("td", { class: "num" }, w.hosts.length ? `${w.hosts.length} draining` : "—"),
+    latencyCell(w),
+    spendCell(w),
+    timeLeftCell(w),
+    el("td", {}, workloadActions(w), workloadDraft.rowErrors[w.name] ? el("div", { class: "error", role: "status" }, workloadDraft.rowErrors[w.name]) : null))];
+  if (open) rows.push(el("tr", { class: "detail" }, el("td", { colspan: "7" }, workloadDetail(w))));
+  return rows;
+}
+
+function workloadActions(w) {
+  const live = w.state === "preparing" || w.state === "serving";
+  if (!live) return el("span", { class: "muted" }, w.state === "ended" ? "" : "ending…");
+  return el("div", { class: "row" },
+    el("button", { class: "small", onclick: (e) => extendWorkload(e.target, w) }, "Extend…"),
+    el("button", { class: "small", onclick: (e) => rotateWorkloadKey(e.target, w) }, "New key…"),
+    el("button", { class: "small danger", onclick: (e) => endWorkload(e.target, w) }, "End…"));
+}
+
+function workloadDetail(w) {
+  const answers = w.answers || {};
+  const keyState = (k) => {
+    if (w.state === "ending") return " — refused: the workload is ending";
+    if (w.state !== "preparing" && w.state !== "serving") return " — refused: the workload has ended";
+    if (k.not_after) return ` — works until ${until(k.not_after)}`;
+    return " — in use";
+  };
+  const hostsLine = w.hosts.length ? null
+    : w.state === "preparing" ? (w.borrowing ? "Its first hosts are being rented; meanwhile it is served on shared hosts."
+      : `Its first hosts are being rented; until one is ready its requests are refused (no shared host serves ${w.model}).`)
+    : w.state === "ending" ? "All its hosts are released; closing." : "No hosts.";
+  return el("div", {},
+    el("div", { class: "kv" },
+      el("div", { class: "k" }, "answers at once"), el("div", {}, `${w.parallel}, on up to ${w.workers_per_host} per host`),
+      el("div", { class: "k" }, "machines"), el("div", {}, `${KIND_LABELS[w.kind] || w.kind} — ${KIND_HINTS[w.kind] || ""}`),
+      el("div", { class: "k" }, "answers so far"),
+      el("div", {}, `${answers.count || 0} served, ${answers.borrowed || 0} on shared hosts while starting, ${answers.refused || 0} refused`),
+      el("div", { class: "k" }, "made by"), el("div", {}, w.provisioner ? `a program, with provisioning key ${w.provisioner}` : "an operator"),
+      el("div", { class: "k" }, "lease"), el("div", { class: "mono" }, w.lease.lease_id),
+      el("div", { class: "k" }, "keys"),
+      el("div", {}, (w.keys || []).map((k) => el("div", {}, el("span", { class: "mono" }, k.key_id),
+        el("span", { class: "muted" }, ` made ${until(k.created_at)}${keyState(k)}`))))),
+    w.state === "ending" && w.hosts.length ? el("p", { class: "muted" }, `Draining: ${w.hosts.length} host${w.hosts.length === 1 ? "" : "s"} finishing their answers, then released.`) : null,
+    w.hosts.length
+      ? el("table", {}, el("thead", {}, el("tr", {}, ...["Host", "State", "Machine", "Kind", "Answers at once", "Price"].map((h) => el("th", {}, h)))),
+          el("tbody", {}, w.hosts.map((h) => el("tr", {},
+            el("td", {}, hostLink(h.host_id)), el("td", {}, pill(h.state)), el("td", {}, h.hardware),
+            el("td", {}, h.kind === "on_demand" ? "on demand" : "bid"), el("td", { class: "num" }, h.workers),
+            el("td", { class: "num" }, rate(h.hourly))))))
+      : el("p", { class: "muted" }, hostsLine));
+}
+
+async function workloadAction(button, w, work) {
+  delete workloadDraft.rowErrors[w.name];
+  button.disabled = true;
+  try { await work(); }
+  catch (error) { workloadDraft.rowErrors[w.name] = error.message; }
+  finally { button.disabled = false; await drawWorkloadTables(); }
+}
+
+async function extendWorkload(button, w) {
+  const hours = el("input", { type: "number", min: "0.5", step: "0.5", placeholder: "none", style: "width:6rem" });
+  const spend = el("input", { type: "number", min: "0.01", step: "0.01", value: (w.lease.max_spend ?? 0).toFixed(2), style: "width:7rem" });
+  const perHour = w.hosts.reduce((sum, h) => sum + (h.hourly || 0), 0);
+  const outcome = el("p", { class: "muted" });
+  const describe = () => {
+    const added = Number(hours.value) || 0;
+    const cap = Number(spend.value) || w.lease.max_spend;
+    const ends = (w.ends_at || 0) + added * 3600;
+    let line = `Ends at ${until(ends)}${added ? ` (was ${until(w.ends_at)})` : ""}.`;
+    if (perHour > 0) {
+      const runsOut = Date.now() / 1000 + Math.max(0, cap - w.lease.spent) / perHour * 3600;
+      line += ` At ${rate(perHour)} the budget of ${dollars(cap)} runs out at ${until(runsOut)}` + (runsOut < ends ? " — before its hours do." : ".");
+    }
+    outcome.textContent = line;
+  };
+  hours.addEventListener("input", describe); spend.addEventListener("input", describe); describe();
+  const ok = await confirmAction({
+    title: `Extend ${w.name}`,
+    body: el("div", {},
+      el("div", { class: "row" }, el("label", {}, "Add hours ", hours), el("label", {}, "Budget ($) ", spend)),
+      outcome,
+      el("p", { class: "muted" }, "Each raise is typed again on the next step.")),
+    okLabel: "Next",
+  });
+  if (!ok) return;
+  const body = {};
+  const added = Number(hours.value);
+  const cap = Number(spend.value);
+  if (added > 0) {
+    if (!(await confirmAction({ title: `Add ${added} hour${added === 1 ? "" : "s"} to ${w.name}?`, body: "More time is more spend.",
+      retype: String(added), retypeLabel: `Type ${added} to add ${added} hour${added === 1 ? "" : "s"}`, okLabel: "Add hours" }))) return;
+    body.hours = added; body.confirm_hours = added;
+  }
+  if (cap && cap !== w.lease.max_spend) {
+    body.max_spend = cap;
+    if (cap > w.lease.max_spend) {
+      if (!(await confirmAction({ title: `Raise ${w.name}'s budget to ${dollars(cap)}?`, body: "Raising a dollar cap is loosening a limit.",
+        retype: cap.toFixed(2), retypeLabel: `Type ${cap.toFixed(2)} to raise the budget`, okLabel: "Raise budget" }))) return;
+      body.confirm = cap;
+    }
+  }
+  if (!Object.keys(body).length) return;
+  workloadAction(button, w, () => api.extendWorkload(w.name, body));
+}
+
+async function rotateWorkloadKey(button, w) {
+  const ok = await confirmAction({ title: `A new key for ${w.name}?`, okLabel: "Make a new key",
+    body: "The new key is shown once. The current one keeps working for the rotation grace, so the app can be switched without a gap." });
+  if (!ok) return;
+  workloadAction(button, w, async () => {
+    const answer = await api.rotateWorkloadKey(w.name);
+    workloadDraft.shown = { name: w.name, model: w.model, connection: answer.connection, rotated: true,
+                            graceUntil: Date.now() / 1000 + answer.old_keys_valid_minutes * 60,
+                            endsAt: w.ends_at, parallel: w.parallel, latency: w.latency_s };
+    render();
+  });
+}
+
+async function endWorkload(button, w) {
+  const ok = await confirmAction({
+    title: `End ${w.name}?`,
+    body: el("div", {},
+      el("p", {}, `Spent so far ${dollars(w.lease.spent)} of ${dollars(w.lease.max_spend)}. Its lease closes, its ${w.hosts.length} host${w.hosts.length === 1 ? "" : "s"} finish what they are serving and are released, and its app gets 503 workload_ended from now.`),
+      el("p", { class: "muted" }, "This cannot be undone: a new workload needs a new name.")),
+    retype: w.name, retypeLabel: `Type ${w.name} to end it`, okLabel: "End workload",
+  });
+  if (ok) workloadAction(button, w, () => api.endWorkload(w.name));
+}
+
+// The tables only: refreshed every few seconds while this screen shows, and after each action,
+// without touching the form or a key being copied.
+async function drawWorkloadTables() {
+  const holder = workloadDraft.holder;
+  if (!holder || !holder.isConnected) return;
+  let workloads;
+  try { ({ workloads } = await api.workloads()); }
+  catch (error) { holder.replaceChildren(el("p", { class: "error" }, error.message)); return; }
+  const live = workloads.filter((w) => w.state !== "ended");
+  const ended = workloads.filter((w) => w.state === "ended");
+  const head = () => el("thead", {}, el("tr", {},
+    el("th", {}, "Workload"), el("th", {}, "State"), el("th", { class: "num" }, "Hosts ready"),
+    el("th", { class: "num" }, "Latency p95"), el("th", { class: "num" }, "Spent"), el("th", { class: "num" }, "Time left"), el("th", {}, "")));
+  const endedOpen = holder.querySelector("details.ended")?.open;
+  const hadLive = workloadDraft.hasLive;
+  workloadDraft.hasLive = live.length > 0;
+  if (hadLive !== workloadDraft.hasLive) drawWorkloadForm();
+  holder.replaceChildren(...[
+    el("h2", {}, `Active (${live.length})`),
+    live.length ? el("table", { class: "workloads" }, head(), el("tbody", {}, live.flatMap(workloadRow)))
+      : el("p", { class: "muted" }, "None. Apps with the pool's app key are served by the shared hosts."),
+    ended.length ? el("details", { class: "ended", ...(endedOpen ? { open: true } : {}) }, el("summary", {}, `Ended (${ended.length})`),
+      el("table", { class: "workloads" }, head(), el("tbody", {}, ended.flatMap(workloadRow)))) : null,
+  ].filter(Boolean));  // replaceChildren would print a null; el() skips them, this does not
+}
+
+function drawWorkloadForm() {
+  const d = workloadDraft;
+  const holder = d.formHolder;
+  if (!holder || !holder.isConnected || !state.status) return;
+  const drafting = d.formOpen || d.name.trim() || d.plan || d.hasLive === false;
+  if (drafting) {
+    holder.replaceChildren(workloadForm(state.status));
+    return;
+  }
+  if (d.hasLive === null) { holder.replaceChildren(); return; }  // not known yet: nothing to fold
+  holder.replaceChildren(el("button", { class: "primary", onclick: () => { d.formOpen = true; drawWorkloadForm(); } },
+    "New workload…"));
+}
+
+// --- applications that create their own workloads (D117) ---
+
+const programDraft = { open: false, name: "", models: [], maxOpen: "1", perWorkload: "10", perDay: "20",
+  hours: "8", certs: "optional", error: null, shown: null, holder: null };
+const PROGRAM_NAME = /^[a-z0-9][a-z0-9-]{0,23}$/;
+
+// Why "Create key" cannot be pressed yet, or null when it can.
+function programBlocker(d) {
+  const name = d.name.trim();
+  if (!PROGRAM_NAME.test(name) || name.startsWith("rented")) return "The name is lower-case letters, digits and '-', up to 24";
+  if (!d.models.length) return "Pick at least one model";
+  if (!(Number(d.maxOpen) >= 1)) return "At least one workload at once";
+  if (!(Number(d.perWorkload) > 0) || !(Number(d.perDay) > 0)) return "Budgets are above zero";
+  if (Number(d.perWorkload) > Number(d.perDay)) return "One workload's budget cannot be above the day's";
+  if (!(Number(d.hours) > 0)) return "Hours are above zero";
+  return null;
+}
+
+function programKeyPanel(d, poolUrl) {
+  const shown = d.shown;
+  const heading = el("h2", { tabindex: "-1" }, `Provisioning key for ${shown.name} — give the application these`);
+  const handoff = `GPM_URL=${poolUrl}\nGPM_PROVISIONING_KEY=${shown.key}`;
+  const panel = el("div", { class: "panel key-panel", "aria-live": "polite" },
+    heading,
+    el("p", {}, el("strong", {}, "The key is shown this once."),
+      " Only its hash is kept. It can create, use and end the application's own workloads within this grant, and nothing else."),
+    el("div", { class: "kv" },
+      el("div", { class: "k" }, "GPM_URL"), el("div", { class: "row" }, el("code", {}, poolUrl), copyButton(poolUrl)),
+      el("div", { class: "k" }, "GPM_PROVISIONING_KEY"),
+      el("div", { class: "row" }, el("code", { class: "secret" }, shown.key), copyButton(shown.key))),
+    el("div", { class: "row" },
+      copyButton(handoff, "Copy both for the application"),
+      el("button", { onclick: async () => {
+        if (await confirmAction({ title: "Put the key away?", body: "It will not be shown again. If it is lost, make a new key.",
+          okLabel: "I have saved it" })) {
+          d.shown = null; drawPrograms();
+        }
+      } }, "I have saved it")));
+  if (!shown.focused) { shown.focused = true; setTimeout(() => { heading.scrollIntoView({ block: "start" }); heading.focus(); }, 0); }
+  return panel;
+}
+
+function programRow(p, d) {
+  const g = p.grant;
+  const revoke = async (e, end) => {
+    const open = p.open_now || 0;
+    const ok = end
+      ? await confirmAction({ title: `Revoke ${p.name} and end its workloads?`, okLabel: `Revoke and end ${open}`,
+        body: el("div", {}, el("p", {}, `It can make no more workloads, and its ${open} open workload${open === 1 ? "" : "s"} end now: their hosts drain and are released.`),
+          el("p", { class: "muted" }, "Answers in flight finish; new ones are refused.")),
+        retype: p.name, retypeLabel: `Type ${p.name} to end them` })
+      : await confirmAction({ title: `Revoke ${p.name}?`, okLabel: "Revoke",
+        body: el("div", {}, el("p", {}, "It can make no more workloads, from now."),
+          el("p", { class: "muted" }, open
+            ? `Its ${open} open workload${open === 1 ? "" : "s"} keep running — and spending — until ended, out of hours or budget, or unused for their idle cutoff. "Revoke and end" stops them now.`
+            : "It has no open workloads.")) });
+    if (!ok) return;
+    e.target.disabled = true;
+    d.error = null;
+    try { await api.revokeProvisioner(p.name, end); } catch (error) { d.error = `Revoking ${p.name}: ${error.message}`; }
+    drawPrograms(); drawWorkloadTables();
+  };
+  return el("tr", {},
+    el("td", {}, el("strong", {}, p.name), p.usable ? null : el("div", { class: "muted" }, p.revoked_at ? "revoked" : "expired")),
+    el("td", {}, g.models.join(", ")),
+    el("td", { class: "num" }, `${p.open_now || 0} of ${g.max_open}`),
+    el("td", { class: "num" }, dollars(g.max_spend)),
+    el("td", { class: "num" }, `${dollars(p.committed_today)} of ${dollars(g.max_spend_per_day)}`),
+    el("td", { class: "num" }, `${g.max_hours} h`),
+    el("td", {}, g.certs === "required" ? "key and certificate" : "key only"),
+    el("td", {}, p.usable ? el("div", { class: "row" },
+      el("button", { class: "small danger", onclick: (e) => revoke(e, false) }, "Revoke…"),
+      p.open_now ? el("button", { class: "small danger", onclick: (e) => revoke(e, true) }, `Revoke and end ${p.open_now}…`) : null) : null));
+}
+
+function programTable(list, d) {
+  return el("table", { class: "programs-table" }, el("thead", {}, el("tr", {},
+    ...["Application", "Models", "Open now", "Per workload", "Committed today", "Hours", "Access", ""]
+      .map((h, i) => el("th", i >= 2 && i <= 5 ? { class: "num" } : {}, h)))),
+  el("tbody", {}, list.map((p) => programRow(p, d))));
+}
+
+function programForm(d, models) {
+  const create = el("button", { class: "primary" }, "Create key");
+  const sync = () => { const why = programBlocker(d); create.disabled = !!why; create.title = why || ""; };
+  const field = (label, key, attrs, hint) => el("label", { class: "field" }, el("span", {}, label),
+    el("input", { ...attrs, value: d[key], oninput: (e) => { d[key] = e.target.value; sync(); } }),
+    hint ? el("small", { class: "muted" }, hint) : null);
+  create.onclick = async (e) => {
+    const body = { name: d.name.trim(), models: d.models, max_open: Number(d.maxOpen), max_spend: Number(d.perWorkload),
+      max_spend_per_day: Number(d.perDay), max_hours: Number(d.hours), certs: d.certs };
+    const ok = await confirmAction({ title: `A provisioning key for ${body.name}?`, okLabel: "Create key",
+      body: `It may commit up to ${dollars(body.max_spend_per_day)} a day, in workloads of up to ${dollars(body.max_spend)} each. Type the daily budget to confirm.`,
+      retype: body.max_spend_per_day.toFixed(2), retypeLabel: `Type ${body.max_spend_per_day.toFixed(2)} to allow it` });
+    if (!ok) return;
+    e.target.disabled = true;
+    try {
+      const made = await api.createProvisioner(body);
+      Object.assign(d, { shown: { name: body.name, key: made.key }, open: false, name: "", models: [], error: null });
+    } catch (error) { d.error = error.message; }
+    drawPrograms();
+  };
+  sync();
+  return el("div", { class: "panel" },
+    el("h3", {}, "New provisioning key"),
+    el("p", { class: "muted" }, "Lets one application create, use and end its own workloads through the SDK, within these limits. The pool's own daily cap still bounds all of them together."),
+    el("div", { class: "form-grid" },
+      field("Application", "name", { type: "text", maxlength: "24", placeholder: "e.g. nightly-evals" },
+        "lower-case letters, digits and '-'"),
+      el("fieldset", { class: "field" }, el("legend", {}, "Models"),
+        ...models.map((m) => el("label", { class: "pick" },
+          el("input", { type: "checkbox", value: m, ...(d.models.includes(m) ? { checked: true } : {}),
+            onchange: (e) => {
+              d.models = e.target.checked ? [...d.models, m] : d.models.filter((x) => x !== m);
+              sync();
+            } }),
+          el("span", { class: "mono" }, m)))),
+      field("Workloads at once", "maxOpen", { type: "number", min: "1", step: "1" }),
+      field("Budget per workload ($)", "perWorkload", { type: "number", min: "0.01", step: "0.01" }),
+      field("Budget per day ($)", "perDay", { type: "number", min: "0.01", step: "0.01" }, "all its workloads together, over any 24 hours"),
+      field("Most hours", "hours", { type: "number", min: "0.5", step: "0.5" }, "per workload"),
+      el("label", { class: "field" }, el("span", {}, "Client certificate"),
+        el("select", { onchange: (e) => { d.certs = e.target.value; } },
+          ...[["optional", "not needed"], ["required", "required"]].map(([v, t]) => el("option", { value: v, ...(d.certs === v ? { selected: true } : {}) }, t))),
+        el("small", { class: "muted" }, "required: the application must also present a certificate the pool signed for the workload"))),
+    el("div", { class: "row" },
+      create,
+      el("button", { onclick: () => { d.open = false; d.error = null; drawPrograms(); } }, "Cancel")));
+}
+
+async function drawPrograms() {
+  const d = programDraft;
+  const holder = d.holder;
+  if (!holder || !holder.isConnected) return;
+  let answer;
+  try { answer = await api.provisioners(); }
+  catch (error) { holder.replaceChildren(el("p", { class: "error" }, error.message)); return; }
+  const provisioners = answer.provisioners || [];
+  const status = state.status || {};
+  const models = [...new Set([...(status.workload_models || []), ...(status.model_set || [])])];
+  const usable = provisioners.filter((p) => p.usable);
+  const gone = provisioners.filter((p) => !p.usable);
+  const goneOpen = holder.querySelector("details.gone")?.open;
+  holder.replaceChildren(...[
+    el("h2", {}, `Applications that create workloads (${usable.length})`),
+    el("p", { class: "muted" }, "An application holding a provisioning key creates its own workloads through the SDK, within its grant.",
+      answer.max_spend_per_day ? ` All of them together commit at most ${dollars(answer.max_spend_per_day)} a day.` : ""),
+    d.error ? el("p", { class: "error", role: "status" }, d.error) : null,
+    d.shown ? programKeyPanel(d, answer.pool_url || "") : null,
+    usable.length ? programTable(usable, d) : el("p", { class: "muted" }, "None: only operators create workloads."),
+    gone.length ? el("details", { class: "gone", ...(goneOpen ? { open: true } : {}) },
+      el("summary", {}, `Revoked or expired (${gone.length})`), programTable(gone, d)) : null,
+    d.open ? programForm(d, models) : el("button", { onclick: () => { d.open = true; drawPrograms(); } }, "New provisioning key…"),
+  ].filter(Boolean));
+}
+
+screens.workloads = (status) => {
+  const holder = el("div", {}, el("p", { class: "muted" }, "Loading workloads…"));
+  workloadDraft.holder = holder;
+  workloadDraft.formHolder = el("div", { class: "form-holder" });
+  clearInterval(workloadDraft.timer);
+  workloadDraft.timer = setInterval(() => {
+    if (state.screen !== "workloads") { clearInterval(workloadDraft.timer); return; }
+    // Not under the operator: a dialog open, focus in the table, or text being selected.
+    if (document.querySelector("dialog[open]") || workloadDraft.holder?.contains(document.activeElement)
+        || String(getSelection()).length) return;
+    drawWorkloadTables();
+  }, 5000);
+  programDraft.holder = el("div", { class: "programs" });
+  setTimeout(() => { drawWorkloadTables(); drawWorkloadForm(); drawPrograms(); }, 0);
+  return [el("h1", {}, "Workloads"), keyPanel(), holder, workloadDraft.formHolder, programDraft.holder];
+};
 
 screens.decisions = async () => {
   const { events } = await api.events(200);

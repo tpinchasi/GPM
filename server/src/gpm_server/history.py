@@ -45,6 +45,16 @@ class MachineRecord:
     tokens_per_s: Optional[float] = None
     #: What an hour on it was bid at, last time.
     last_bid_hourly: Optional[float] = None
+    #: Hours it was held, from each rental to its release (or the log's last word, for one still
+    #: held) — what an eviction rate is measured over (D115).
+    hours_rented: float = 0.0
+
+    @property
+    def evictions_per_hour(self) -> Optional[float]:
+        """Evictions per rented hour; None until it has been held long enough to say (an hour)."""
+        if self.hours_rented < 1.0:
+            return None
+        return self.evictions / self.hours_rented
 
     @property
     def reliability(self) -> Optional[float]:
@@ -56,6 +66,7 @@ class MachineRecord:
     def as_dict(self) -> dict[str, Any]:
         record = dataclasses.asdict(self)
         record["reliability"] = self.reliability
+        record["evictions_per_hour"] = self.evictions_per_hour
         return record
 
 
@@ -88,9 +99,12 @@ def build(events: Iterable[dict[str, Any]], requests: Iterable[dict[str, Any]]) 
     evictions: dict[str, int] = {}
     bid: dict[str, float] = {}
     rented_at: dict[str, float] = {}
+    ended_at: dict[str, float] = {}
     ready_minutes: dict[str, list[float]] = {}
+    last_seen = 0.0
 
     for event in events:
+        last_seen = max(last_seen, float(event.get("ts") or 0.0))
         host_id = event.get("host_id")
         numbers = event.get("numbers") or {}
         kind = event.get("kind")
@@ -119,6 +133,8 @@ def build(events: Iterable[dict[str, Any]], requests: Iterable[dict[str, Any]]) 
                 )
         elif kind == "eviction":
             evictions[machine] = evictions.get(machine, 0) + 1
+        elif kind in ("released", "host_gone"):
+            ended_at.setdefault(host_id or "", float(event.get("ts") or 0.0))
         elif kind in _FAILURES:
             failures[machine] = failures.get(machine, 0) + 1
 
@@ -134,6 +150,12 @@ def build(events: Iterable[dict[str, Any]], requests: Iterable[dict[str, Any]]) 
         if row.get("tokens_out") and row.get("generate_ms"):
             tokens[machine] = tokens.get(machine, 0.0) + float(row["tokens_out"])
             seconds[machine] = seconds.get(machine, 0.0) + float(row["generate_ms"]) / 1000
+
+    held: dict[str, float] = {}
+    for host_id, started in rented_at.items():
+        until = ended_at.get(host_id, last_seen)
+        if until > started:
+            held[machine_of[host_id]] = held.get(machine_of[host_id], 0.0) + (until - started) / 3600
 
     records = {}
     for machine in sorted(set(rentals) | set(served)):
@@ -155,6 +177,7 @@ def build(events: Iterable[dict[str, Any]], requests: Iterable[dict[str, Any]]) 
                 round(tokens[machine] / generated, 1) if machine in tokens and generated > 0 else None
             ),
             last_bid_hourly=bid.get(machine),
+            hours_rented=round(held.get(machine, 0.0), 3),
         )
     return records
 

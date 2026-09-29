@@ -452,7 +452,7 @@ async def test_surplus_capacity_is_released_only_after_the_scale_down_window(fle
     await fleet.pass_once(ready_workers_higher_tiers=2, idle_seconds={})
     assert host.host_id in fleet.hosts
 
-    fleet.overflow_gone_since -= 601
+    fleet.unit().overflow_gone_since -= 601
     await fleet.pass_once(ready_workers_higher_tiers=2, idle_seconds={})
     # Surplus inside an open lease is parked (disk kept), not destroyed; either way it stops
     # serving and the pool does not rent it straight back.

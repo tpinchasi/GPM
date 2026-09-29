@@ -14,6 +14,7 @@ from .errors import (
 )
 from .retry import RetryPolicy
 from .transport import AsyncPoolTransport, PoolTransport, async_pool_transport, pool_transport
+from .workloads import Workload, WorkloadProvisioner, WorkloadRefused
 
 __all__ = [
     "AsyncPoolClient",
@@ -27,6 +28,9 @@ __all__ = [
     "PoolUnavailable",
     "Reply",
     "RetryPolicy",
+    "Workload",
+    "WorkloadProvisioner",
+    "WorkloadRefused",
     "async_pool_transport",
     "pool_transport",
 ]

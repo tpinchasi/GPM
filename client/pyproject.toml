@@ -1,12 +1,16 @@
 [project]
 name = "gpm-client"
-version = "0.4.0"
+version = "0.5.0"
 description = "Client SDK for a GPM pool: an httpx transport that waits and retries for capacity by default."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27,<0.29",
 ]
+
+[project.optional-dependencies]
+# Client certificates for a workload the program creates (D117): a key pair and a signing request.
+certs = ["cryptography>=43"]
 
 [build-system]
 requires = ["hatchling"]
