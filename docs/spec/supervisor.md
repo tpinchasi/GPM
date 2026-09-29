@@ -92,7 +92,8 @@ gpm lease open --workers 12 --max-hours 8 --max-spend 5.00 --allow-rent
 ```
 
 A lease is the unit of demand and of spending authority: wanted workers, a time limit, a dollar
-limit. The models are the pool's own set. `--allow-rent` is what permits money to be spent;
+limit. A lease belongs to a workload ([workloads.md](workloads.md), D115): one opened this way
+belongs to the shared workload; `gpm workload create` opens one bound to the workload it makes. The models are the pool's own set. `--allow-rent` is what permits money to be spent;
 without it the lease is served by local and fixed hosts only. **A lease that can rent must carry
 a dollar cap.** Inside an open lease the supervisor may bid, recover and replace unattended;
 with no lease, or a lease exhausted, rented hosts are drained and released. A lease may tighten

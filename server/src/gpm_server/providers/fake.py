@@ -11,6 +11,7 @@ plug-in tests it against the same scripts.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import itertools
 import time
@@ -30,8 +31,10 @@ from .base import (
     OfferQuery,
     ProviderAuthError,
     ProviderCapabilities,
+    ProviderError,
     ProviderUnavailable,
     SelfTerminateRequest,
+    VolumeInfo,
 )
 
 
@@ -110,6 +113,16 @@ class FakeProvider:
         self.reuse_engine_urls = False
         self._engine_turn = 0
         self.calls: list[str] = []
+        #: Volumes on machines (D116), by id.
+        self.volumes: dict[str, VolumeInfo] = {}
+        self._volume_ids = itertools.count(1)
+        #: Copies asked for, as (source instance, destination instance, path).
+        self.copies: list[tuple[str, str, str]] = []
+        #: Scripted: the next copies fail, or take this long.
+        self.copy_fails = False
+        self.copy_delay_s = 0.0
+        #: Scripted: what a finished copy does — a test puts the files where the host looks.
+        self.on_copy: Optional[Any] = None
 
     # --- scripting helpers ---
 
@@ -216,6 +229,22 @@ class FakeProvider:
             raise BidLost(f"bid {bid} did not win machine {offer.machine_id}",
                           response={"success": False, "msg": "outbid", "offer": offer.offer_id})
 
+        volume_id = None
+        if spec.volume is not None:
+            if not self.capabilities.volumes:
+                raise ProviderError("this provider has no volumes")
+            if spec.volume.volume_id is not None:
+                held = self.volumes.get(spec.volume.volume_id)
+                if held is None or held.machine_id != offer.machine_id:
+                    raise ProviderError(f"volume {spec.volume.volume_id} is not on machine {offer.machine_id}")
+                volume_id = held.volume_id
+            else:
+                volume_id = f"v-{next(self._volume_ids)}"
+                self.volumes[volume_id] = VolumeInfo(
+                    volume_id=volume_id, machine_id=offer.machine_id, label=spec.volume.label,
+                    size_gb=spec.volume.size_gb,
+                    hourly=round(spec.volume.size_gb * (offer.storage_per_gb_hourly or 0.0002), 6),
+                )
         instance_id = f"i-{next(self._ids)}"
         self.instances[instance_id] = FakeInstance(
             instance_id=instance_id,
@@ -230,7 +259,27 @@ class FakeProvider:
             # engines and start creating hosts that can never answer.
             engine_url=self._next_engine_url(),
         )
-        return Instance(instance_id=instance_id, label=spec.label, machine_id=offer.machine_id)
+        return Instance(instance_id=instance_id, label=spec.label, machine_id=offer.machine_id, volume_id=volume_id)
+
+    async def list_volumes(self, label_prefix: str) -> list[VolumeInfo]:
+        self._guard("list_volumes")
+        return [v for v in self.volumes.values() if v.label.startswith(label_prefix)]
+
+    async def delete_volume(self, volume_id: str) -> None:
+        self._guard("delete_volume")
+        self.volumes.pop(volume_id, None)
+
+    async def copy_between(self, source: Instance, destination: Instance, path: str) -> None:
+        self._guard("copy_between")
+        if not self.capabilities.copies:
+            raise ProviderError("this provider does not copy between instances")
+        self.copies.append((source.instance_id, destination.instance_id, path))
+        if self.copy_delay_s:
+            await asyncio.sleep(self.copy_delay_s)
+        if self.copy_fails:
+            raise ProviderUnavailable("the copy did not finish")
+        if self.on_copy is not None:
+            self.on_copy(source, destination, path)
 
     async def set_bid(self, instance: Instance, bid: float) -> None:
         self._guard("set_bid")

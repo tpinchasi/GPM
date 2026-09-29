@@ -85,6 +85,11 @@ class Engine(Protocol):
     #: Where this engine listens by default, so a pool need not state a port it cannot choose.
     default_port: ClassVar[int] = 0
 
+    #: Where this engine keeps its models on a machine the pool rents — where a volume holding
+    #: them is mounted, and what a copy from a sibling fills (D116). Empty: not known, and neither
+    #: is tried.
+    models_dir: ClassVar[str] = ""
+
     #: Whether a downloaded model is served by **starting the engine again** rather than by
     #: asking the running engine to load it (D97). Such an engine cannot be told to load
     #: anything; on a host the pool created, the pool restarts it once the models are on disk.

@@ -16,6 +16,7 @@ import contextlib
 import json
 import logging
 import re
+import socket
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Mapping, Optional, Sequence
@@ -222,7 +223,7 @@ def engine_offers() -> dict[str, Any]:
 _MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 
 
-def _with_builds(text: str, config: PoolConfig, name: str, builds: dict[str, str]) -> str:
+def _with_builds(text: str, config: PoolConfig, name: str, builds: dict[str, str], workloads_only: bool = False) -> str:
     """`text` with the catalog entry for `name` holding `builds` — one per engine — and every
     build it already had for other engines (D98, D101).
 
@@ -235,21 +236,24 @@ def _with_builds(text: str, config: PoolConfig, name: str, builds: dict[str, str
     before = [v.model_dump(exclude_defaults=True) for v in entry.variants] if entry else []
     if entry is not None:
         variants = [v | {"engine": v.get("engine") or config.engine} for v in before]
+    elif workloads_only:
+        variants = []  # no shared host serves it, so no build of the pool's own engine is implied
     else:
         variants = [{"tag": name, "engine": config.engine}]
     for engine, tag in builds.items():
         variants = [v for v in variants if v.get("engine") != engine]
         variants.append({"tag": tag, "engine": engine})
-    if entry is not None and variants == before:
+    written = {"variants": variants, **({"workloads_only": True} if workloads_only else {})}
+    if entry is not None and variants == before and entry.workloads_only == workloads_only:
         return text  # nothing about this model changes
-    if entry is None and variants == [{"tag": name, "engine": config.engine}]:
+    if entry is None and not workloads_only and variants == [{"tag": name, "engine": config.engine}]:
         return text  # served under its own name by the pool's engine: no entry needed
     if entry is not None:
-        return set_values(text, ("catalog", name), {"variants": variants})
+        return set_values(text, ("catalog", name), written)
     try:
-        return set_values(text, ("catalog",), {name: {"variants": variants}})
+        return set_values(text, ("catalog",), {name: written})
     except CannotEdit:
-        return set_values(text, (), {"catalog": {name: {"variants": variants}}})
+        return set_values(text, (), {"catalog": {name: written}})
 
 
 #: A model profile's name, as an operator would write it.
@@ -330,6 +334,17 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             # The third role (docs/spec/host-agent.md §5): it admits the pool to one host's
             # agent, and must never admit anything to the pool.
             return _error(403, "agent_key_refused", "that is an agent key; use the admin key here.")
+        if token.startswith("gpmp_"):
+            # A program's provisioning key (D117): it asks the router for workloads, and reaches
+            # nothing here.
+            return _error(403, "provisioning_key_refused",
+                          "that is a provisioning key: it asks the pool's listener for workloads. Use the admin key here.")
+        if token.startswith("gpmw_"):
+            # A workload's key reaches its workload's hosts and nothing else (D115).
+            return _error(
+                403, "workload_key_refused",
+                "that is a workload key: it reaches its workload's inference only. Use the admin key here.",
+            )
         if not verify(token, admin_hashes):
             return _error(401, "unauthorized", "unknown admin key")
         if not _same_origin(request, allowed_hosts):
@@ -551,6 +566,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         for lease in supervisor.leases.open_leases():
             entry = {
                 "lease_id": lease.lease_id,
+                "workload": lease.workload,
                 "workers": lease.workers,
                 "max_hours": lease.max_hours,
                 "max_spend": lease.max_spend,
@@ -575,6 +591,10 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 # reloaded — so they are read from the supervisor, not from the config the
                 # app was built with.
                 "model_set": list(supervisor.config.pool.model_set),
+                # Models only workloads serve (D115): offered for a workload, never shared.
+                "workload_models": sorted(
+                    name for name, entry in supervisor.config.catalog.items() if entry.workloads_only
+                ),
                 "catalog": {
                     name: [
                         {
@@ -697,6 +717,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         for lease in supervisor.leases.all():
             entry = {
                 "lease_id": lease.lease_id,
+                "workload": lease.workload,
                 "workers": lease.workers,
                 "max_hours": lease.max_hours,
                 "max_spend": lease.max_spend,
@@ -1226,11 +1247,15 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 for tag in builds.values():
                     if not _MODEL_NAME.match(tag):
                         return _error(400, "bad_build", f"not a build name: {tag!r}")
-                if name not in model_set:
+                only = bool(item.get("workloads_only"))
+                if only and name in model_set:
+                    return _error(400, "bad_model", f"{name!r} is already in the shared set; it cannot also be workloads-only")
+                if not only and name not in model_set:
                     model_set.append(name)
-                if item.get("rent_for") and rent_for is not None and name not in rent_for:
+                if not only and item.get("rent_for") and rent_for is not None and name not in rent_for:
                     rent_for.append(name)
-                text = _with_builds(text, config, name, builds)
+                # Outside the shared set when workloads-only: the shared hosts never fetch it (D115).
+                text = _with_builds(text, config, name, builds, workloads_only=only)
             if model_set != list(config.pool.model_set):
                 text = set_values(text, ("pool",), {"model_set": model_set})
             rented: dict[str, Any] = {}
@@ -1439,8 +1464,196 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             status_code=201,
         )
 
+    # --- workloads (D115, docs/spec/workloads.md) ---
+
+    def _workload_request(body: dict) -> Any:
+        from .workloads import WorkloadRequest
+
+        def number(name: str, cast):
+            value = body.get(name)
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                raise ValueError(f"{name} must be a number")
+            return cast(value)
+
+        for required in ("name", "model", "latency_s", "parallel", "hours"):
+            if body.get(required) in (None, ""):
+                raise KeyError(required)
+        return WorkloadRequest(
+            name=str(body.get("name") or "").strip(),
+            model=str(body.get("model") or "").strip(),
+            latency_s=number("latency_s", float),
+            parallel=number("parallel", int),
+            hours=number("hours", float),
+            max_spend=number("max_spend", float),
+            profile=(str(body["profile"]).strip() or None) if body.get("profile") else None,
+            kind=str(body.get("kind") or "roi"),
+        )
+
+    async def _workload_call(fn):
+        from .workloads import WorkloadRefused
+
+        try:
+            return await fn()
+        except WorkloadRefused as exc:
+            return _error(400, "workload_refused", str(exc))
+        except (KeyError, TypeError, ValueError) as exc:
+            return _error(400, "bad_request", f"missing or malformed field: {exc}")
+
+    def _connection(name: str, key: Optional[str]) -> dict:
+        """What the app owner puts in the chat client: one URL, one key (workloads.md §3)."""
+        listen = supervisor.config.listen
+        tls = bool(listen.tls_certfile and listen.tls_keyfile)
+        scheme = "https" if tls else "http"
+        host = listen.host if listen.host not in ("0.0.0.0", "::") else socket.gethostname()
+        return {
+            "base_url": f"{scheme}://{host}:{listen.port}/v1",
+            "path_prefix_url": f"{scheme}://{host}:{listen.port}/w/{name}/v1",
+            "api_key": key,
+            "tls": tls,
+            "shown_once": key is not None,
+        }
+
+    # --- provisioning keys (D117) ---
+
+    @app.post("/pool/provisioners")
+    async def create_provisioner(request: Request) -> JSONResponse:
+        """A provisioning key and its grant; the key is in this answer **once**."""
+        from ..provisioning_store import Grant
+        from .workloads import WorkloadRefused
+
+        body = await request.json()
+        try:
+            fields = {k: body[k] for k in (
+                "max_open", "max_spend", "max_spend_per_day", "max_hours", "models", "kinds", "may_borrow",
+                "idle_end_minutes", "max_idle_end_minutes", "certs") if k in body}
+            grant = Grant.from_dict(fields)
+            key = supervisor.provisioning.grant(str(body.get("name") or ""), grant, body.get("expires_hours"))
+        except WorkloadRefused as exc:
+            return _error(400, "provisioner_refused", str(exc))
+        except (TypeError, ValueError) as exc:
+            return _error(400, "bad_request", str(exc))
+        view = supervisor.provisioning.store.get(body["name"]).view()
+        return JSONResponse({"provisioner": view, "key": key, "shown_once": True}, status_code=201)
+
+    @app.get("/pool/provisioners")
+    async def list_provisioners() -> JSONResponse:
+        provisioning = supervisor.provisioning
+        return JSONResponse({
+            "provisioners": [{**p.view(), **provisioning.usage(p.name)} for p in provisioning.store.all()],
+            "max_spend_per_day": supervisor.config.provisioning.max_spend_per_day,
+            "pool_url": _connection("-", None)["base_url"].removesuffix("/v1"),
+        })
+
+    @app.delete("/pool/provisioners/{name}")
+    async def revoke_provisioner(name: str, end_workloads: bool = False) -> JSONResponse:
+        from .workloads import WorkloadRefused
+
+        try:
+            ended = supervisor.provisioning.revoke(name, end_workloads=end_workloads)
+        except WorkloadRefused as exc:
+            return _error(404, "not_found", str(exc))
+        return JSONResponse({"provisioner": name, "revoked": True, "ended": ended})
+
+    @app.post("/pool/workloads/plan")
+    async def workload_plan(request: Request) -> JSONResponse:
+        """What creating this workload would do: its sizing, start, kind, budget and caps.
+        Nothing is opened, minted or rented."""
+        body = await request.json()
+
+        async def run():
+            return JSONResponse({"plan": await supervisor.workloads.plan(_workload_request(body))})
+
+        return await _workload_call(run)
+
+    @app.post("/pool/workloads")
+    async def create_workload(request: Request) -> JSONResponse:
+        """Create it: one lease bound to it, and its key, **shown once** in this answer. A budget
+        that was not typed must be sent back as `confirm_max_spend` after reading the plan."""
+        body = await request.json()
+
+        async def run():
+            confirm = body.get("confirm_max_spend")
+            workload, key, plan, _ = await supervisor.workloads.create(
+                _workload_request(body), confirm_max_spend=float(confirm) if confirm is not None else None
+            )
+            return JSONResponse(
+                {"workload": supervisor.workloads.view(workload), "plan": plan,
+                 "connection": _connection(workload.name, key)},
+                status_code=201,
+            )
+
+        return await _workload_call(run)
+
+    @app.get("/pool/workloads")
+    async def list_workloads() -> JSONResponse:
+        return JSONResponse({"workloads": [supervisor.workloads.view(w) for w in supervisor.workloads.store.all()]})
+
+    @app.get("/pool/workloads/{name}")
+    async def show_workload(name: str) -> JSONResponse:
+        async def run():
+            workload = supervisor.workloads.get(name)
+            return JSONResponse({"workload": supervisor.workloads.view(workload),
+                                 "connection": _connection(name, None)})
+
+        return await _workload_call(run)
+
+    @app.post("/pool/workloads/{name}/extend")
+    async def extend_workload(name: str, request: Request) -> JSONResponse:
+        """Hours added and/or a new dollar cap. Each raise carries its value typed again (D49):
+        `confirm` for the dollar cap, `confirm_hours` for the hours added."""
+        body = await request.json()
+
+        async def run():
+            hours = body.get("hours")
+            spend = body.get("max_spend")
+            confirm = body.get("confirm")
+            confirm_hours = body.get("confirm_hours")
+            workload = supervisor.workloads.extend(
+                name, hours=float(hours) if hours is not None else None,
+                max_spend=float(spend) if spend is not None else None,
+                confirm=confirm is not None and spend is not None and float(confirm) == float(spend),
+                confirm_hours=confirm_hours is not None and hours is not None and float(confirm_hours) == float(hours),
+            )
+            return JSONResponse({"workload": supervisor.workloads.view(workload)})
+
+        return await _workload_call(run)
+
+    @app.post("/pool/workloads/{name}/end")
+    async def end_workload(name: str) -> JSONResponse:
+        async def run():
+            workload = supervisor.workloads.end(name)
+            return JSONResponse({"workload": supervisor.workloads.view(workload)})
+
+        return await _workload_call(run)
+
+    @app.post("/pool/workloads/{name}/keys")
+    async def rotate_workload_key(name: str) -> JSONResponse:
+        """A new key, shown once; the old ones keep working for the rotation grace."""
+        async def run():
+            key_id, key = supervisor.workloads.rotate_key(name)
+            return JSONResponse({"key_id": key_id, "connection": _connection(name, key),
+                                 "old_keys_valid_minutes": supervisor.config.workloads.rotation_grace_minutes})
+
+        return await _workload_call(run)
+
+    def _workload_lease(lease_id: str) -> Optional[JSONResponse]:
+        """A workload's lease is changed through its workload, which keeps the router's end time
+        and the workload's state in step with it (D115)."""
+        lease = supervisor.leases.get(lease_id)
+        if lease is not None and lease.workload:
+            return _error(
+                409, "workload_lease",
+                f"lease {lease_id} belongs to workload {lease.workload!r}; use /pool/workloads/{lease.workload}/extend or /end",
+            )
+        return None
+
     @app.delete("/pool/leases/{lease_id}")
     async def close_lease(lease_id: str) -> JSONResponse:
+        refused = _workload_lease(lease_id)
+        if refused is not None:
+            return refused
         supervisor.leases.close(lease_id, "closed through the control API")
         return JSONResponse({"lease_id": lease_id, "state": "closed"})
 
@@ -1453,6 +1666,9 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         anywhere else. Extending the hours also pushes out the hold on a host prepared under
         this lease, or the lease would outlive the host it was extended for.
         """
+        refused = _workload_lease(lease_id)
+        if refused is not None:
+            return refused
         body = await request.json()
         before = supervisor.leases.get(lease_id)
         if before is None:

@@ -260,8 +260,8 @@ class VllmFacts:
         if not root.is_dir():
             return found
         for directory in sorted(p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")):
-            if not (directory / modelhub.COMPLETE_MARKER).exists():
-                continue  # a download in progress is not a model on disk
+            if not modelhub.is_complete(directory):
+                continue  # a download (or a copy) in progress is not a model on disk
             # The model's own files; the fetch's bookkeeping is not part of what was downloaded.
             size = sum(
                 f.stat().st_size for f in directory.rglob("*")

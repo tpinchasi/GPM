@@ -91,6 +91,15 @@ It is served from a cached copy, never by asking a third party while the app wai
 ## 3. Keys
 
 - **App key** — permits inference and `GET /pool/status`. Nothing else.
+- **Workload key** (`gpmw_`) — permits inference on one workload's hosts and `GET /pool/status`
+  for that workload's view; nothing else ([workloads.md](workloads.md) §3, D115). Minted when the
+  workload is created, expires with its lease. `/w/<name>/v1/…` means the same as `/v1/…` and is
+  refused `403 wrong_workload` with another workload's key. A workload that has ended answers
+  `503 workload_ended`, with no `Retry-After`: there is nothing to wait for.
+- **Provisioning key** (`gpmp_`) — lets one application create, read and end its own workloads
+  under `/pool/provisioning/…` on this listener, within a grant its operator set (D117). It never
+  requests a completion and never reaches the control API. The SDK's `WorkloadProvisioner` uses it;
+  the workload's own key is made in the program and only its hash is sent.
 - **Admin key** — required for the control API and the console. **Never interchangeable with
   the app key**: an app able to request a completion must not thereby be able to open a lease,
   change a ceiling or release a host.
@@ -102,7 +111,7 @@ It is served from a cached copy, never by asking a third party while the app wai
   published key.
 
 Requests are otherwise anonymous. The pool does not distinguish between apps holding the same
-key; separation is achieved with separate pools.
+key; separation is by workload ([workloads.md](workloads.md), D115), or by separate pools.
 
 ## 4. Client SDK
 

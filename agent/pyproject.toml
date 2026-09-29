@@ -1,6 +1,6 @@
 [project]
 name = "gpm-agent"
-version = "0.10.0"
+version = "0.10.1"
 description = "GPM host agent: tells a pool what a machine is and makes it hold the pool's model set."
 readme = "README.md"
 requires-python = ">=3.11"

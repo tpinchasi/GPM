@@ -158,6 +158,80 @@ CREATE TABLE IF NOT EXISTS forwards (
     updated_at  REAL
 );
 
+-- Workloads (D115, workloads.md): named units inside the pool, each with its own lease, hosts
+-- and key. The supervisor writes them; the router reads name, state and model to route and to
+-- refuse a workload that has ended.
+CREATE TABLE IF NOT EXISTS workloads (
+    name            TEXT PRIMARY KEY,
+    model           TEXT NOT NULL,
+    builds          TEXT NOT NULL,           -- JSON {model: build}
+    latency_s       REAL NOT NULL,
+    parallel        INTEGER NOT NULL,
+    kind            TEXT NOT NULL,           -- roi | on_demand | interruptible
+    lease_id        TEXT NOT NULL,
+    state           TEXT NOT NULL,           -- preparing | serving | ending | ended
+    workers_per_host INTEGER NOT NULL,
+    hosts_at_start  INTEGER NOT NULL,
+    plan            TEXT NOT NULL,           -- JSON: what creation worked out, with its reasons
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    -- When its lease runs out: the router refuses the workload's keys from then, whether or not
+    -- the supervisor has noticed yet.
+    ends_at         REAL,
+    ended_at        REAL
+);
+
+-- A workload's keys, hashed as app keys are (app-contract.md §3). Never the key itself.
+CREATE TABLE IF NOT EXISTS workload_keys (
+    key_id      TEXT PRIMARY KEY,
+    workload    TEXT NOT NULL,
+    hashed      TEXT NOT NULL UNIQUE,
+    created_at  REAL NOT NULL,
+    -- A rotated-out key stays valid until this; NULL means for as long as the workload serves.
+    not_after   REAL,
+    updated_at  REAL NOT NULL
+);
+
+-- Volumes the pool made to keep a workload's models on a machine (D116).
+CREATE TABLE IF NOT EXISTS workload_volumes (
+    volume_id   TEXT PRIMARY KEY,
+    workload    TEXT NOT NULL,
+    machine_id  TEXT NOT NULL,
+    size_gb     REAL NOT NULL,
+    hourly      REAL NOT NULL DEFAULT 0,
+    lease_id    TEXT,
+    created_at  REAL NOT NULL,
+    deleted_at  REAL
+);
+
+-- Provisioning keys (D117): an operator's grant to one application to create, use and end its
+-- own workloads. Only the key's hash is kept; the grant is what the supervisor enforces.
+CREATE TABLE IF NOT EXISTS provisioners (
+    name        TEXT PRIMARY KEY,
+    hashed      TEXT NOT NULL UNIQUE,
+    grant_      TEXT NOT NULL,          -- JSON: the limits the operator set
+    created_at  REAL NOT NULL,
+    expires_at  REAL,
+    revoked_at  REAL,
+    updated_at  REAL NOT NULL
+);
+
+-- What a provisioning key asked for, written by the router and answered by the supervisor
+-- (D117): the two processes never call each other. A create is identified by the hash of the
+-- workload key the program made, so a create sent twice is one request.
+CREATE TABLE IF NOT EXISTS provisioning_requests (
+    request_id  TEXT PRIMARY KEY,
+    provisioner TEXT NOT NULL,
+    kind        TEXT NOT NULL,          -- plan | create | end
+    key_hash    TEXT UNIQUE,            -- create only
+    workload    TEXT,                   -- end: the one to end; create: the one made
+    body        TEXT NOT NULL,          -- JSON, as sent: untrusted until the supervisor checks it
+    state       TEXT NOT NULL,          -- pending | done | refused
+    answer      TEXT,                   -- JSON
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
+
 -- One row per pool. Exactly one supervisor runs at a time (supervisor.md §1).
 CREATE TABLE IF NOT EXISTS supervisor_lock (
     pool       TEXT PRIMARY KEY,
@@ -206,6 +280,12 @@ _ADDED_COLUMNS = {
         # latency alone cannot tell a slow machine from a long answer (D67).
         ("tokens_out", "INTEGER"),
         ("generate_ms", "REAL"),
+        # Which workload the request was for (NULL: the shared one), whether it was served on a
+        # host lent by the shared workload, and how many answers its host was serving at once —
+        # the concurrency a latency is measured at (D115).
+        ("workload", "TEXT"),
+        ("borrowed", "INTEGER NOT NULL DEFAULT 0"),
+        ("concurrency", "INTEGER"),
     ],
     "hosts": [
         ("available", "TEXT NOT NULL DEFAULT '[]'"),
@@ -213,6 +293,28 @@ _ADDED_COLUMNS = {
         # A pool may run more than one engine (D93). The default is the engine every pool ran
         # before this column existed, so a table written by an older version reads correctly.
         ("engine", "TEXT NOT NULL DEFAULT 'ollama'"),
+        # The workload a rented host was bought for (D115); NULL is the shared workload.
+        ("workload", "TEXT"),
+    ],
+    "leases": [
+        # The workload a lease belongs to (D115); NULL is the shared workload.
+        ("workload", "TEXT"),
+    ],
+    "workloads": [
+        # Who made it (D117): an operator (NULL) or a provisioning key's name; how long it may sit
+        # unused before it is ended; and the fingerprint of the one client certificate that
+        # reaches it, where it requires one.
+        ("provisioner", "TEXT"),
+        ("idle_end_minutes", "REAL"),
+        ("cert_fingerprint", "TEXT"),
+        # When its first host became ready: a program's idle cutoff counts from here, never
+        # from while it was still preparing (D117).
+        ("serving_at", "REAL"),
+    ],
+    "host_counters": [
+        # Of `busy`, how many serve a workload's request on a lent host (D115): load the shared
+        # workload did not ask for, and must not scale up for.
+        ("borrowed", "INTEGER NOT NULL DEFAULT 0"),
     ],
 }
 
@@ -223,6 +325,8 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
         for name, definition in columns:
             if name not in present:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+    # On added columns, so after them: a workload's last request, read every pass (D117).
+    conn.execute("CREATE INDEX IF NOT EXISTS request_log_workload ON request_log (workload, ts)")
 
 
 class Database:
@@ -272,6 +376,11 @@ class RequestRecord:
     #: What the engine says it generated, where it says so (D67).
     tokens_out: Optional[int] = None
     generate_ms: Optional[float] = None
+    #: The workload it was for (None: the shared one), whether it ran on a lent host, and how
+    #: many answers its host was serving when it was dispatched (D115).
+    workload: Optional[str] = None
+    borrowed: bool = False
+    concurrency: Optional[int] = None
 
 
 class RequestLog:
@@ -284,8 +393,8 @@ class RequestLog:
             INSERT INTO request_log (
                 ts, request_id, session_id, host_id, worker_id, model_requested,
                 model_served, runtime_class, queue_wait_ms, latency_ms, status_code,
-                outcome, reason, tokens_out, generate_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                outcome, reason, tokens_out, generate_ms, workload, borrowed, concurrency
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.ts,
@@ -303,6 +412,9 @@ class RequestLog:
                 record.reason,
                 record.tokens_out,
                 record.generate_ms,
+                record.workload,
+                int(record.borrowed),
+                record.concurrency,
             ),
         )
 
@@ -340,6 +452,8 @@ class HostRow:
     hourly_rate: Optional[float] = None
     last_error: Optional[str] = None
     updated_at: float = 0.0
+    #: The workload this host serves (D115); None is the shared workload.
+    workload: Optional[str] = None
 
 
 def _row_to_host(row: sqlite3.Row) -> HostRow:
@@ -365,6 +479,7 @@ def _row_to_host(row: sqlite3.Row) -> HostRow:
         hourly_rate=row["hourly_rate"],
         last_error=row["last_error"],
         updated_at=row["updated_at"],
+        workload=row["workload"],
     )
 
 
@@ -378,8 +493,8 @@ class HostTable:
             INSERT INTO hosts (
                 host_id, kind, transport_type, priority, dial_url, state, workers,
                 capabilities, variants, resident, available, residency, engine, lease_id,
-                provider_ref, hourly_rate, last_error, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                provider_ref, hourly_rate, last_error, updated_at, workload
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(host_id) DO UPDATE SET
                 kind=excluded.kind, transport_type=excluded.transport_type,
                 priority=excluded.priority, dial_url=excluded.dial_url,
@@ -389,7 +504,8 @@ class HostTable:
                 residency=excluded.residency, engine=excluded.engine,
                 lease_id=excluded.lease_id,
                 provider_ref=excluded.provider_ref, hourly_rate=excluded.hourly_rate,
-                last_error=excluded.last_error, updated_at=excluded.updated_at
+                last_error=excluded.last_error, updated_at=excluded.updated_at,
+                workload=excluded.workload
             """,
             (
                 host.host_id,
@@ -410,6 +526,7 @@ class HostTable:
                 host.hourly_rate,
                 host.last_error,
                 time.time(),
+                host.workload,
             ),
         )
 
@@ -437,6 +554,8 @@ class CounterRow:
     requests_served: int
     failures: int
     last_request_at: Optional[float]
+    #: Of `busy`, how many serve a borrowing workload (D115).
+    borrowed: int = 0
 
 
 class HostCounters:
@@ -447,12 +566,13 @@ class HostCounters:
         self.db.execute(
             """
             INSERT INTO host_counters (
-                host_id, busy, total, requests_served, failures, last_request_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                host_id, busy, total, requests_served, failures, last_request_at, updated_at, borrowed
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(host_id) DO UPDATE SET
                 busy=excluded.busy, total=excluded.total,
                 requests_served=excluded.requests_served, failures=excluded.failures,
-                last_request_at=excluded.last_request_at, updated_at=excluded.updated_at
+                last_request_at=excluded.last_request_at, updated_at=excluded.updated_at,
+                borrowed=excluded.borrowed
             """,
             (
                 counter.host_id,
@@ -462,6 +582,7 @@ class HostCounters:
                 counter.failures,
                 counter.last_request_at,
                 time.time(),
+                counter.borrowed,
             ),
         )
 
@@ -482,6 +603,7 @@ class HostCounters:
                 requests_served=row["requests_served"],
                 failures=row["failures"],
                 last_request_at=row["last_request_at"],
+                borrowed=row["borrowed"],
             )
             for row in rows
         }

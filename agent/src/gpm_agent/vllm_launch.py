@@ -46,7 +46,10 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 # Written by the hub fetch when every file of a model has landed. A directory without it is a
 # download in progress, and serving half a model is worse than serving none.
-from .modelhub import COMPLETE_MARKER
+from .modelhub import (  # noqa: F401 - the marker's name is part of this module's API
+    COMPLETE_MARKER,
+    is_complete,
+)
 
 log = logging.getLogger("gpm.vllm-start")
 
@@ -156,7 +159,7 @@ def complete_models(models_dir: Path) -> list[Path]:
         return []
     return sorted(
         path for path in models_dir.iterdir()
-        if path.is_dir() and not path.name.startswith(".") and (path / COMPLETE_MARKER).exists()
+        if path.is_dir() and not path.name.startswith(".") and is_complete(path)
     )
 
 

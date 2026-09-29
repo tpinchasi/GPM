@@ -285,6 +285,24 @@ def test_a_model_is_added_with_a_build_for_each_engine_and_rented_for(pool):
     assert "gemma4:31b" in pool.supervisor.config.pool.model_set, "the running pool took it"
 
 
+def test_a_model_can_be_added_for_workloads_only(pool):
+    """Outside the shared set: a workload may be created for it, and no shared host fetches it (D115)."""
+    with pool.admin() as http:
+        answer = http.post("/pool/config/models", json={
+            "add": [{"name": "gemma4:31b", "builds": {"vllm": NVFP4}, "workloads_only": True}],
+        })
+    assert answer.status_code == 200, answer.text
+    written = yaml.safe_load(pool.path.read_text())
+    assert "gemma4:31b" not in written["pool"]["model_set"]
+    assert written["catalog"]["gemma4:31b"]["workloads_only"] is True
+    assert "gemma4:31b" not in pool.supervisor.config.pool.model_set
+    with pool.admin() as http:
+        again = http.post("/pool/config/models", json={
+            "add": [{"name": SMALL, "builds": {"vllm": NVFP4}, "workloads_only": True}],
+        })
+    assert again.status_code == 400 and "already in the shared set" in again.json()["detail"]
+
+
 def test_a_model_nobody_could_hold_is_refused_in_words_and_nothing_is_written(pool):
     before = pool.path.read_text()
     with pool.admin() as http:

@@ -50,7 +50,7 @@ up on purpose rather than rediscovered.
 | Requirement | Why it will matter | Status |
 |---|---|---|
 | **Data trust per host** — a trust level on every host (own / private / untrusted), a maximum per pool, untrusted hosts opt-in. A tunnel or TLS protects the wire, not the machine: the operator of a rented marketplace host can read every prompt and completion | Any adopter routing real data through a pool that can spill onto marketplace hosts | Deferred by the owner (D17). Fits the pool-as-isolation-unit model when taken up: a sensitive pool simply contains no untrusted hosts. **Until then it is a documented residual risk** — see [threat-model.md](threat-model.md) T7 |
-| **Multi-pool management** — fairness between workloads, per-team budgets, an overview across pools | Several teams or workloads sharing hardware | Deferred (D16); open question 5 |
+| **Multi-pool management** — fairness between workloads, per-team budgets, an overview across pools | Several teams or workloads sharing hardware | **Taken up as workloads inside one pool** (D115, [spec/workloads.md](spec/workloads.md)); an overview across separate pools stays deferred |
 | **A separate lane for short calls**, and any request classes | An embedding call of milliseconds can wait minutes behind long generations; retrieval-augmented apps pay that on every turn | Not adopted (D23). Revisit with multi-pool management, or sooner if measured waits justify it |
 | **Per-client identity inside a pool** — several app keys per pool, key id = client | Telling apps apart in the request log; per-client limits | Deferred (D16) |
 | **A lease wrapper** — `gpm run … -- <command>` opens a lease, runs the command, closes it on exit | Removes forgotten leases, and the quiet failure where a run that forgot to open one crawls along on local hosts only | Not adopted (D16); independent of it, may return |
@@ -66,8 +66,8 @@ up on purpose rather than rediscovered.
 3. **Does the first provider charge the bid or a clearing price?** Decides whether re-bidding
    downward is worth building.
 4. **Is price history available from the provider**, or only what the pool samples itself?
-5. **Multi-pool management: can two pools share a physical host?** If yes, a layer above the
-   pools must split a host's workers between them; if no, a host belongs to exactly one pool.
+5. ~~**Multi-pool management: can two pools share a physical host?**~~ — **answered (D115)**: within one pool, a rented host belongs to exactly one workload; the shared workload lends a bounded share of its workers to a workload that is still preparing. Across separate pools, still no.
+   ~~If yes, a layer above the pools must split a host's workers between them; if no, a host belongs to exactly one pool.~~
 6. **On-demand fallback** — may a lease fall back to a non-interruptible instance when bidding
    fails or crosses the on-demand crossover, or should the run always wait? Drafted as off.
 7. **Name and licence** — see [release-checklist.md](release-checklist.md).

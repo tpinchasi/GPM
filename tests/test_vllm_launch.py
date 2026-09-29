@@ -594,3 +594,28 @@ def test_a_group_that_died_is_reported_with_its_cards(tmp_path):
     Path(dead["log"]).write_text("(APIServer pid=9) RuntimeError: NCCL error\n")
     failed = vllm_launch.failed_engines(tmp_path, served=[], alive=lambda pid: pid != dead["pid"])
     assert failed[BIG].startswith("its vLLM process on cards 2,3 exited before serving it: RuntimeError: NCCL")
+
+
+# --- a model that arrived by a copy (D116) ---
+
+
+def test_a_marker_that_arrived_before_the_weights_is_not_a_complete_model(tmp_path):
+    """A provider's copy may bring the complete marker before the files it vouches for."""
+    into = modelhub.directory_for(tmp_path, BIG)
+    into.mkdir(parents=True)
+    (into / modelhub.COMPLETE_MARKER).write_text("1000\n")
+    (into / "model.safetensors").write_bytes(b"w" * 400)
+    assert not modelhub.is_complete(into)
+    assert vllm_launch.complete_models(tmp_path) == []
+    (into / "model.safetensors").write_bytes(b"w" * 1000)
+    assert modelhub.is_complete(into) and vllm_launch.complete_models(tmp_path) == [into]
+
+
+def test_a_marker_that_cannot_be_read_vouches_for_nothing(tmp_path):
+    """Every marker the agent writes carries a size; an empty one is a copy cut short."""
+    into = modelhub.directory_for(tmp_path, BIG)
+    into.mkdir(parents=True)
+    (into / "model.safetensors").write_bytes(b"w" * 1000)
+    for unreadable in ("", "not a size"):
+        (into / modelhub.COMPLETE_MARKER).write_text(unreadable)
+        assert not modelhub.is_complete(into)

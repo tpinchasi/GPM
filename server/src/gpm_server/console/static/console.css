@@ -95,3 +95,28 @@ td .why { margin-top: 4px; font-size: 12.5px; }
 .hub-group { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; margin: 6px 0; }
 details.machine-setup { margin-top: 12px; }
 details.machine-setup summary { margin-top: 0; }
+
+/* Workloads (D115) */
+.form-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 12px 16px; margin: 8px 0 12px; }
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field > span { font-weight: 600; font-size: 12.5px; }
+.field input, .field select { font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--ink); }
+.plan { margin-top: 12px; padding: 10px 12px; border-left: 3px solid var(--accent); background: var(--tag); border-radius: 6px; }
+.plan.refused { border-left-color: var(--bad); }
+.key-panel { border-color: var(--warn); border-width: 2px; margin-bottom: 16px; }
+.key-panel code { font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
+.key-panel code.secret { background: var(--tag); padding: 2px 6px; border-radius: 4px; }
+.key-panel code.secret { user-select: all; }
+.key-panel h2:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
+.warn-text { color: var(--warn); }
+button.link { background: none; border: none; padding: 0; color: var(--accent); cursor: pointer; font: inherit; text-align: left; }
+button.link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+table.workloads td:last-child { min-width: 14rem; }
+.pill.ending, .pill.ended { color: var(--muted); }
+.form-holder { margin-top: 16px; }
+.programs { margin-top: 28px; }
+fieldset.field { border: 0; padding: 0; margin: 0; min-width: 0; }
+fieldset.field > legend { font-weight: 600; font-size: 12.5px; padding: 0; margin-bottom: 4px; }
+.field input[type="checkbox"] { padding: 0; }
+.field > small { font-size: 12px; }
+.programs-table .row { gap: 6px; flex-wrap: wrap; }

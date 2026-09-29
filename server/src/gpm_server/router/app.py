@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
+import hashlib
+import json
 import logging
 import time
 import uuid
@@ -24,13 +27,16 @@ from ..config import ConfigError, PoolConfig, load_config
 from ..contract import CONTRACT_VERSION
 from ..db import Database, RequestRecord
 from ..directory import read_directory
-from ..keys import verify
+from ..keys import match, verify
 from ..models import HostState
+from ..provisioning_store import HashTaken
 from ..state import RouterState, open_database
 from .dispatch import Assignment, Need, NoEligibleHost, NoReadyHost, QueueTimeout
 
 #: How much of a response's end is held to read the engine's own counts out of it (D67).
 _USAGE_TAIL_BYTES = 4096
+#: Requests a provisioning key may make a minute (D117): each may cost a market search.
+REQUESTS_PER_MINUTE = 20
 
 log = logging.getLogger("gpm.router")
 
@@ -72,7 +78,58 @@ _RETRY_AFTER_S = {
     "preparing": 10,
     "hosts_unreachable": 30,
     "no_eligible_host": 30,
+    # A workload whose own hosts are still coming up, and which may not borrow (D115).
+    "workload_preparing": 30,
 }
+
+
+@dataclasses.dataclass(frozen=True)
+class Identity:
+    """Who a request is from, as its key says (D115, D117): the shared workload (an app key), one
+    workload (its `gpmw_` key), or a program's provisioning key (`gpmp_`), which asks for
+    workloads and never for a completion."""
+
+    workload: Optional[str] = None
+    provisioner: Optional[str] = None
+
+
+def _identity(state: RouterState, request: Request) -> Optional[Identity]:
+    """The request's workload, by its key — or None when the key reaches nothing. An app key is
+    the shared workload's; a workload key is its workload's while it has not passed its time."""
+    scheme, _, token = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        return None
+    if verify(token, state.app_hashes):
+        return Identity()
+    provisioner = match(token, state.registry.provisioners)
+    if provisioner is not None:
+        return Identity(provisioner=provisioner)
+    grants = state.registry.grants
+    hashed = match(token, {h: h for h in grants})
+    if hashed is None:
+        return None
+    grant = grants[hashed]
+    if grant.not_after is not None and grant.not_after <= time.time():
+        return None
+    return Identity(workload=grant.workload)
+
+
+def _peer_certificate_matches(request: Request, fingerprint: Optional[str]) -> bool:
+    """Is this connection's client certificate — verified against the pool's client CA in the
+    handshake — the one the workload's was signed as? Compared by fingerprint: the router never
+    parses a certificate (D117). A workload with no fingerprint needs none."""
+    if not fingerprint:
+        return True
+    der = getattr(request.state, "peer_cert", None) if hasattr(request, "state") else None
+    return bool(der) and hashlib.sha256(der).hexdigest() == fingerprint
+
+
+def _workload_prefix(path: str) -> tuple[Optional[str], str]:
+    """`/w/<name>/rest` → (name, `/rest`); any other path → (None, path)."""
+    if not path.startswith("/w/"):
+        return None, path
+    name, _, rest = path[3:].partition("/")
+    return name, "/" + rest
 
 
 class ClientGone(Exception):
@@ -80,10 +137,7 @@ class ClientGone(Exception):
 
 
 def _authorised(state: RouterState, request: Request) -> bool:
-    scheme, _, token = request.headers.get("authorization", "").partition(" ")
-    if scheme.lower() != "bearer" or not token:
-        return False
-    return verify(token, state.app_hashes)
+    return _identity(state, request) is not None
 
 
 def _no_capacity(reason: str, detail: Optional[str] = None) -> JSONResponse:
@@ -221,7 +275,9 @@ def _ineligible_detail(
 
 
 def _unready_reason(state: RouterState) -> str:
-    if any(host.state is HostState.PREPARING for host in state.hosts):
+    """Why the shared workload has no ready host. A workload's hosts coming up is not the
+    shared workload preparing."""
+    if any(host.state is HostState.PREPARING and host.workload is None for host in state.hosts):
         return "preparing"
     return "hosts_unreachable"
 
@@ -301,10 +357,17 @@ def create_app(
 
     @app.get("/pool/status")
     async def pool_status(request: Request) -> Response:
-        if not _authorised(state, request):
+        who = _identity(state, request)
+        if who is None:
             return _error(401, "unauthorized", detail="missing or invalid app key")
+        if who.provisioner is not None:
+            return _error(403, "forbidden", "provisioning_key", "a provisioning key asks for workloads; it reads no pool")
+        if who.workload is not None:
+            return _workload_status(who.workload)
         hosts = []
         for host in state.hosts:
+            if host.workload is not None:
+                continue  # a workload's hosts are its own business, not the shared view's
             entry = {
                 "host_id": host.host_id,
                 "kind": host.kind,
@@ -339,14 +402,168 @@ def create_app(
                     "max_redispatch": state.config.pool.delivery.max_redispatch,
                 },
                 "capacity": {
-                    "hosts_ready": sum(1 for h in state.hosts if h.state is HostState.READY),
-                    "workers_total": sum(h.total_workers for h in state.hosts),
-                    "workers_busy": sum(h.busy for h in state.hosts),
+                    "hosts_ready": sum(1 for h in state.hosts if h.state is HostState.READY and h.workload is None),
+                    "workers_total": sum(h.total_workers for h in state.hosts if h.workload is None),
+                    "workers_busy": sum(h.busy for h in state.hosts if h.workload is None),
                 },
                 "hosts": hosts,
             },
             headers={"X-GPM-Contract": CONTRACT_VERSION},
         )
+
+    def _workload_now(name: str) -> tuple[str, Optional[str]]:
+        """(state, model) as the router sees it now: `ending` from the lease's end time, whether
+        or not the supervisor has noticed yet."""
+        workload = state.registry.workloads.get(name)
+        if workload is None:
+            return "ended", None
+        workload_state = workload.state
+        if workload_state in ("preparing", "serving") and workload.ends_at is not None and workload.ends_at <= time.time():
+            workload_state = "ending"
+        return workload_state, workload.model
+
+    # --- programs asking for their own workloads (D117) ---
+    #
+    # The router only records what was asked and reads back what the supervisor answered: the
+    # two never call each other, and nothing slow runs here. Every field is checked again by the
+    # supervisor; what is checked here only keeps obvious junk out of the table.
+
+    provisioning = state.registry.provisioning_store
+
+    def _provisioner_of(request: Request) -> tuple[Optional[str], Optional[JSONResponse]]:
+        who = _identity(state, request)
+        if who is None:
+            return None, _error(401, "unauthorized", detail="missing or invalid key")
+        if who.provisioner is None:
+            return None, _error(403, "forbidden", "not_a_provisioning_key", "these calls take a provisioning key")
+        return who.provisioner, None
+
+    @app.post("/pool/provisioning/requests")
+    async def provisioning_request(request: Request) -> Response:
+        provisioner, refused = _provisioner_of(request)
+        if refused is not None:
+            return refused
+        raw = await request.body()
+        if len(raw) > 16_384:
+            return _error(413, "too_large", "request_too_large", "a request is a few fields and a signing request")
+        try:
+            body = json.loads(raw or b"{}")
+        except ValueError:
+            return _error(400, "bad_request", "not_json", "the body is JSON")
+        if not isinstance(body, dict) or body.get("kind") not in ("plan", "create"):
+            return _error(400, "bad_request", "bad_kind", "kind is plan or create")
+        key_hash = body.get("key_hash") if body["kind"] == "create" else None
+        if body["kind"] == "create" and not (isinstance(key_hash, str) and len(key_hash) == 64):
+            return _error(400, "bad_request", "key_hash", "a create carries key_hash: the sha256 of the workload key, in hex")
+        try:
+            # A create sent again — its answer lost — is the same request, pending or not.
+            existing = key_hash and await asyncio.to_thread(provisioning.of_key_hash, provisioner, key_hash)
+            if existing:
+                return JSONResponse({"request_id": existing, "new": False}, status_code=202,
+                                    headers={"X-GPM-Contract": CONTRACT_VERSION})
+            # One request at a time per key, and a few a minute: every one may cost the
+            # supervisor a market search, which the whole pool waits on (D117).
+            if await asyncio.to_thread(provisioning.pending_of, provisioner):
+                return _error(429, "busy", "request_pending", "this key has a request waiting; ask again when it is answered")
+            if await asyncio.to_thread(provisioning.asked_since, provisioner, time.time() - 60) >= REQUESTS_PER_MINUTE:
+                return _error(429, "busy", "too_many_requests",
+                              f"at most {REQUESTS_PER_MINUTE} requests a minute per provisioning key")
+            request_id, new = await asyncio.to_thread(provisioning.ask, provisioner, body["kind"], body, key_hash)
+        except HashTaken as exc:
+            return _error(409, "conflict", "key_hash_taken", str(exc))
+        return JSONResponse({"request_id": request_id, "new": new}, status_code=202,
+                            headers={"X-GPM-Contract": CONTRACT_VERSION})
+
+    @app.get("/pool/provisioning/requests/{request_id}")
+    async def provisioning_answer(request: Request, request_id: str) -> Response:
+        provisioner, refused = _provisioner_of(request)
+        if refused is not None:
+            return refused
+        asked = await asyncio.to_thread(provisioning.get_request, request_id)
+        if asked is None or asked.provisioner != provisioner:
+            return _error(404, "not_found", "no_such_request", "no request of this key by that id")
+        return JSONResponse(asked.view(), headers={"X-GPM-Contract": CONTRACT_VERSION})
+
+    @app.get("/pool/provisioning/workloads/{name}")
+    async def provisioning_workload(request: Request, name: str) -> Response:
+        provisioner, refused = _provisioner_of(request)
+        if refused is not None:
+            return refused
+        workload = state.registry.workloads.get(name)
+        if workload is None or workload.provisioner != provisioner:
+            return _error(404, "not_found", "no_such_workload", "no workload of this key by that name")
+        workload_state, _ = _workload_now(name)
+        mine = [h for h in state.hosts if h.workload == name]
+        return JSONResponse({
+            "workload": name, "state": workload_state, "model": workload.model, "ends_at": workload.ends_at,
+            "hosts_ready": sum(1 for h in mine if h.state is HostState.READY), "hosts": len(mine),
+        }, headers={"X-GPM-Contract": CONTRACT_VERSION})
+
+    @app.post("/pool/provisioning/workloads/{name}/end")
+    async def provisioning_end(request: Request, name: str) -> Response:
+        provisioner, refused = _provisioner_of(request)
+        if refused is not None:
+            return refused
+        workload = state.registry.workloads.get(name)
+        if workload is None or workload.provisioner != provisioner:
+            return _error(404, "not_found", "no_such_workload", "no workload of this key by that name")
+        request_id, _ = await asyncio.to_thread(provisioning.ask, provisioner, "end", {}, None, name)
+        return JSONResponse({"request_id": request_id}, status_code=202, headers={"X-GPM-Contract": CONTRACT_VERSION})
+
+    def _delivery() -> dict:
+        return {
+            "by_kind": {
+                kind: state.config.pool.delivery.for_kind(kind)
+                for kind in ("local", "fixed-remote", "rented-interruptible", "rented-on-demand")
+            },
+            "allow_request_override": state.config.pool.delivery.allow_request_override,
+            "max_redispatch": state.config.pool.delivery.max_redispatch,
+        }
+
+    def _workload_status(name: str) -> Response:
+        """One workload's view, for its own key: its hosts, its state, whether it is borrowing
+        — never the rest of the pool (workloads.md §3)."""
+        workload_state, model = _workload_now(name)
+        mine = [h for h in state.hosts if h.workload == name]
+        ready = [h for h in mine if h.state is HostState.READY]
+        borrowing = (
+            workload_state == "preparing" and not ready and state.config.workloads.borrow_share > 0
+        )
+        return JSONResponse(
+            {
+                "pool": state.config.pool.name,
+                "workload": name,
+                "state": workload_state,
+                "contract_version": CONTRACT_VERSION,
+                "model_set": [model] if model else [],
+                "borrowing": borrowing,
+                "limits": {
+                    "queue_timeout_s": state.config.pool.queue_timeout_s,
+                    "client_time_to_first_byte_s": state.config.pool.client_time_to_first_byte_s,
+                },
+                "delivery": _delivery(),
+                "capacity": {
+                    "hosts_ready": len(ready),
+                    "workers_total": sum(h.total_workers for h in mine),
+                    "workers_busy": sum(h.busy for h in mine),
+                },
+                "hosts": [
+                    {"host_id": h.host_id, "kind": h.kind, "state": h.state.value,
+                     "workers": {"total": h.total_workers, "busy": h.busy}}
+                    for h in mine
+                ],
+            },
+            headers={"X-GPM-Contract": CONTRACT_VERSION},
+        )
+
+    @app.get("/w/{name}/pool/status")
+    async def workload_pool_status(request: Request, name: str) -> Response:
+        who = _identity(state, request)
+        if who is None:
+            return _error(401, "unauthorized", detail="missing or invalid app key")
+        if who.workload != name:
+            return _error(403, "forbidden", "wrong_workload", "this key is not for that workload")
+        return _workload_status(name)
 
     @app.get("/pool/directory")
     async def pool_directory(request: Request, q: Optional[str] = None) -> Response:
@@ -355,14 +572,18 @@ def create_app(
         this process carries inference traffic — and nothing here changes the pool: `in_pool`
         says which names a request may use today.
         """
-        if not _authorised(state, request):
+        who = _identity(state, request)
+        if who is None:
             return _error(401, "unauthorized", detail="missing or invalid app key")
+        if who.workload is not None or who.provisioner is not None:
+            # The directory says what the shared pool could serve; a workload serves one model.
+            return _error(403, "forbidden", "workload_key", "a workload key reaches its workload's model only")
         found = await asyncio.to_thread(read_directory, database, q, tuple(state.config.pool.model_set))
         return JSONResponse(found, headers={"X-GPM-Contract": CONTRACT_VERSION})
 
     @app.post("/{full_path:path}")
     async def inference(request: Request, full_path: str) -> Response:
-        path = "/" + full_path
+        named, path = _workload_prefix("/" + full_path)
         # The **path** chooses how the request is read, not the host: it has to be understood
         # before the pool knows where it will go (D93). Engines that serve the same path read it
         # identically, by construction — they share one module for it.
@@ -371,8 +592,31 @@ def create_app(
         session_id = request.headers.get("x-gpm-session")
         started = time.monotonic()
 
-        if not _authorised(state, request):
+        who = _identity(state, request)
+        if who is None:
             return _error(401, "unauthorized", detail="missing or invalid app key")
+        if who.provisioner is not None:
+            return _error(403, "forbidden", "provisioning_key",
+                          "a provisioning key creates workloads; it never requests a completion — use the workload's key")
+        if named is not None and named != who.workload:
+            # A client pointed at one workload with another's key fails loudly, rather than
+            # quietly serving under whichever the key happens to reach.
+            return _error(403, "forbidden", "wrong_workload", f"this key is not for workload {named!r}")
+        workload_state, workload_model = (None, None)
+        if who.workload is not None:
+            workload_state, workload_model = _workload_now(who.workload)
+            spec = state.registry.workloads.get(who.workload)
+            if spec is not None and not _peer_certificate_matches(request, spec.cert_fingerprint):
+                return _error(
+                    403, "forbidden", "client_certificate_required",
+                    f"workload {who.workload!r} is reached with its client certificate; this connection did not present it",
+                )
+            if workload_state not in ("preparing", "serving"):
+                return _error(
+                    503, "workload_ended", "workload_ended",
+                    f"workload {who.workload!r} has ended; its key no longer reaches anything. "
+                    "Ask its operator for a new workload.",
+                )
         if path not in state.paths():
             served = ", ".join(sorted(state.engines))
             return _error(
@@ -390,6 +634,7 @@ def create_app(
                     outcome=outcome,
                     session_id=session_id,
                     model_requested=requested,
+                    workload=who.workload,
                     **fields,  # type: ignore[arg-type]
                 )
             )
@@ -398,7 +643,18 @@ def create_app(
             await record("rejected", status_code=400, reason="model_missing")
             return _error(400, "bad_request", "model_missing", "the request body names no model")
 
-        in_pool = requested in state.config.pool.model_set or state.dispatcher.knows_model(requested)
+        if who.workload is not None:
+            in_pool = requested == workload_model
+            if not in_pool:
+                await record("rejected", status_code=404, reason="model_not_in_workload")
+                return _error(
+                    404, "model_not_in_pool", "model_not_in_workload",
+                    f"workload {who.workload!r} serves {workload_model!r}, not {requested!r}",
+                )
+        in_pool = (
+            who.workload is not None  # its own model, checked above
+            or requested in state.config.pool.model_set or state.dispatcher.knows_model(requested)
+        )
         if not in_pool:
             await record("rejected", status_code=404, reason="model_not_in_pool")
             return _error(
@@ -417,6 +673,12 @@ def create_app(
             engines=frozenset(
                 name for name, candidate in state.engines.items() if path in candidate.inference_paths()
             ),
+            workload=who.workload,
+            # Only while the workload prepares: one that could always borrow would never need
+            # sizing (D115).
+            may_borrow=(workload_state == "preparing" and state.config.workloads.borrow_share > 0
+                        and bool((getattr(state.registry.workloads.get(who.workload), "plan", None) or {}).get("may_borrow", True))),
+            borrow_share=state.config.workloads.borrow_share,
         )
 
         request_deadline = _parse_deadline(request.headers.get("x-gpm-deadline"))
@@ -449,6 +711,13 @@ def create_app(
                 await record("cancelled", reason="client_disconnected", queue_wait_ms=(time.monotonic() - started) * 1000)
                 return Response(status_code=499)
             except NoReadyHost:
+                if who.workload is not None:
+                    await record("rejected", status_code=503, reason="workload_preparing")
+                    return _no_capacity(
+                        "workload_preparing",
+                        f"workload {who.workload!r} has no host ready yet"
+                        + ("" if need.may_borrow else ", and it may not borrow the shared hosts"),
+                    )
                 reason = _unready_reason(state)
                 await record("rejected", status_code=503, reason=reason)
                 return _no_capacity(reason, "no host is ready to serve this request")
@@ -471,6 +740,7 @@ def create_app(
                 return _no_capacity("queue_timeout", "every eligible worker stayed busy past the queue limit")
 
             assignment.host.last_request_at = time.time()
+            concurrency = assignment.concurrency
             host_engine = state.engine_of(assignment.host)
             forwarded = host_engine.with_model(path, body, assignment.variant.tag)
             upstream_request = assignment.host.client.build_request(
@@ -582,6 +852,8 @@ def create_app(
                     status_code=upstream.status_code,
                     tokens_out=tokens_out,
                     generate_ms=generate_ms,
+                    borrowed=held.borrowed,
+                    concurrency=concurrency,
                 )
             return Response(
                 content=prefix,
@@ -631,6 +903,8 @@ def create_app(
                         status_code=upstream.status_code,
                         tokens_out=tokens_out,
                         generate_ms=generate_ms,
+                        borrowed=held.borrowed,
+                        concurrency=concurrency,
                     )
 
         return StreamingResponse(

@@ -211,8 +211,10 @@ class AsyncPoolTransport(httpx.AsyncBaseTransport):
         await self._inner.aclose()
 
 
-def pool_transport(policy: Optional[RetryPolicy] = None) -> PoolTransport:
-    return PoolTransport(policy=policy)
+def pool_transport(policy: Optional[RetryPolicy] = None, transport: Optional[httpx.BaseTransport] = None) -> PoolTransport:
+    """The wait-and-retry transport, over `transport` where one is given — one that presents a
+    client certificate, say (D117)."""
+    return PoolTransport(policy=policy, transport=transport)
 
 
 def async_pool_transport(policy: Optional[RetryPolicy] = None) -> AsyncPoolTransport:

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import logging
 import math
 import re
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
 from .. import agentpkg, history
+from .. import workloads as workload_math
 from ..config import BiddingConfig, OfferPolicy, PoolConfig, RentedConfig, TransportConfig
 from ..deadman import heartbeat_command, onstart_script
 from ..engines import get_engine
@@ -38,6 +40,7 @@ from ..providers.base import (
     Provider,
     ProviderError,
     ProviderRateLimited,
+    VolumeSpec,
     redacted,
 )
 from ..sizing import Needs, needs_for
@@ -57,6 +60,7 @@ from ..strategies import (
     rank_offers,
 )
 from ..transports import SshTunnel, build_ssh_exec_command, run_command
+from ..workload_store import Volume, WorkloadStore
 from . import agents, hostagent
 
 log = logging.getLogger("gpm.renting")
@@ -92,6 +96,15 @@ class RentedHost:
     #: How many cards each copy of its models spans (D114), fixed when it was bought: the
     #: machine was searched for that many, and every relaunch must ask for the same.
     cards_per_copy: int = 1
+    #: The workload it was bought for (D115); None is the shared workload.
+    workload: Optional[str] = None
+    #: The volume it was created with, and where its models came from: "warm" (a volume that
+    #: already held them), "sibling" (copied from a ready host of its workload), or "hub" (D116).
+    volume_id: Optional[str] = None
+    models_source: str = "hub"
+    copy_state: Optional[str] = None
+    copy_task: Optional[asyncio.Task] = dataclasses.field(default=None, repr=False, compare=False)
+    copy_started_at: Optional[float] = None
     #: The disk it was rented with — the search's minimum, raised to what its models need.
     disk_gb: Optional[float] = None
     ready_at: Optional[float] = None
@@ -197,6 +210,25 @@ class RentedHost:
         return (now - self.created_at) / 3600 * self.bid_hourly
 
 
+@dataclasses.dataclass
+class Unit:
+    """One demand inside the pool (D115): the shared workload, or one workload. Its own hosts,
+    its own lease, and the state its scaling keeps between passes. Passed explicitly wherever a
+    decision is about *one* demand, so no decision can act on another's hosts by default."""
+
+    workload: Optional[str] = None
+    #: When the gap between what is wanted and what is ready opened, and when it closed.
+    #: Scale-down waits on the second, deliberately longer than scale-up (spec §9).
+    overflow_since: Optional[float] = None
+    overflow_gone_since: Optional[float] = None
+    #: Set when a host is given up for idleness: from then on the lease's standing demand does
+    #: not bring capacity back by itself — measured load does (D64).
+    idle_gate: bool = False
+    #: The ramp: how many hosts the last round asked for, and when it landed (D66).
+    ramp_round: int = 0
+    ramp_landed_at: float = 0.0
+
+
 class Fleet:
     """The rented half of the pool: what exists, what it costs, and what to do next."""
 
@@ -217,10 +249,17 @@ class Fleet:
         self.spend = spend
         self.hosts: dict[str, RentedHost] = {}
         self.label_prefix = rented.label_prefix or f"gpm/{config.pool.name}/"
-        self.overflow_since: Optional[float] = None
-        #: When demand last became fully covered. Scale-down waits on this, deliberately
-        #: longer than scale-up, so capacity does not flap (spec §9).
-        self.overflow_gone_since: Optional[float] = None
+        #: One demand per workload, and the shared one under None (D115).
+        self.units: dict[Optional[str], Unit] = {None: Unit()}
+        #: The workloads that are not over, as the supervisor read them this pass.
+        self.workloads: dict[str, Any] = {}
+        #: Workloads' volumes, as the database keeps them (D116).
+        self.workload_store = WorkloadStore(leases.db)
+        #: What the request log says a class of machine serves at a latency, read at most every
+        #: thirty seconds; and the last rental-kind choice said, per workload (D82's rule).
+        self._sizing_cache: dict[tuple, tuple[float, Any]] = {}
+        self._hardware_cache: Optional[tuple[float, dict[str, str]]] = None
+        self._said_kind: dict[str, tuple] = {}
         #: Whether the provider has ever returned a charge figure. The narrow cap margin is
         #: only earned once it has.
         self.charges_ever_reported = False
@@ -255,19 +294,37 @@ class Fleet:
         self._said_nothing_passed: Optional[tuple[int, str]] = None
         #: Why the last attempt to rent rented nothing — for whoever asked, in their words.
         self.last_refusal: Optional[str] = None
-        #: A provider that says "too many requests" is answered by asking less often, not by
-        #: asking again next pass. Doubles per refusal, cleared by a search that works.
-        #: Set when a host is given up for idleness: from then on the lease's standing demand
-        #: does not bring capacity back by itself — measured load does (D64).
-        self.idle_gate = False
-        #: The ramp: how many hosts the last round asked for, and when it landed (D66).
-        self.ramp_round = 0
-        self.ramp_landed_at = 0.0
         #: The machine history, rebuilt from the logs every few seconds (D69).
         self._history: Optional[dict] = None
         self._history_at = 0.0
+        #: A provider that says "too many requests" is answered by asking less often, not by
+        #: asking again next pass. Doubles per refusal, cleared by a search that works.
         self._offer_backoff_s = 0.0
         self._offer_retry_at = 0.0
+
+    # --- units (D115) ---
+
+    def unit(self, workload: Optional[str] = None) -> Unit:
+        if workload not in self.units:
+            self.units[workload] = Unit(workload=workload)
+        return self.units[workload]
+
+    def hosts_of(self, workload: Optional[str]) -> list[RentedHost]:
+        """The live hosts one demand holds."""
+        return [h for h in self.hosts.values() if not h.released and h.workload == workload]
+
+    @staticmethod
+    def lease_of(open_leases: Sequence[Lease], workload: Optional[str]) -> Optional[Lease]:
+        """The lease that may rent for this demand: the shared workload's is the first open lease
+        that allows renting and belongs to no workload, as before workloads; a workload's is its own."""
+        return next((lease for lease in open_leases if lease.allow_rent and lease.workload == workload), None)
+
+    def unit_order(self, open_leases: Sequence[Lease]) -> list[Optional[str]]:
+        """The shared workload, then each workload in the order its lease was opened: the room the
+        pool's caps leave is taken in that order (workloads.md §8)."""
+        opened = {lease.workload: lease.opened_at for lease in open_leases if lease.workload}
+        named = sorted(self.workloads, key=lambda name: (opened.get(name, float("inf")), name))
+        return [None, *named]
 
     # --- money ---
 
@@ -291,6 +348,23 @@ class Fleet:
     def budget_left(self, lease: Lease) -> float:
         spent, _ = self.lease_spend(lease)
         return lease.max_spend * (1 - self.margin()) - spent
+
+    async def record_spend_all(self) -> None:
+        """Every live host's spend, under its own lease — open or not. A host draining after its
+        lease closed still bills, and the ledger must say so (D115, the review's finding 2)."""
+        for lease_id in sorted({h.lease_id for h in self.hosts.values() if not h.released and h.lease_id}):
+            lease = self.leases.get(lease_id)
+            if lease is not None:
+                await self.record_spend(lease)
+        # A workload's volume bills its storage whether or not a host has it attached (D116): its
+        # cost goes on the workload's lease, under the volume's own name.
+        now = time.time()
+        for volume in self.workload_store.volumes():
+            if volume.lease_id and volume.hourly:
+                self.spend.record(
+                    lease_id=volume.lease_id, host_id=f"volume:{volume.volume_id}", source="estimate",
+                    amount=round(volume.hourly * max(0.0, now - volume.created_at) / 3600, 6),
+                )
 
     async def record_spend(self, lease: Lease) -> None:
         for host in self.hosts.values():
@@ -337,24 +411,67 @@ class Fleet:
         pressure: bool = False,
         load: Optional[Load] = None,
         waiting_by_model: Optional[Mapping[str, int]] = None,
+        workloads: Optional[Sequence[Any]] = None,
+        loads: Optional[Mapping[str, Load]] = None,
+        pressures: Optional[Mapping[str, bool]] = None,
     ) -> None:
         # What each model's traffic is waiting on, for deciding which model to buy for (D95).
         # Held for this pass only: it is a measurement, not state.
         self._waiting_by_model = dict(waiting_by_model or {})
-        open_leases = self.leases.open_leases()
+        if workloads is not None:
+            self.workloads = {w.name: w for w in workloads if w.active}
         await self.finish_draining(busy or {})
         await self.beat_deadman_timers()
         await self.sweep_orphans()
         await self.expire_parked()
 
-        for lease in open_leases:
-            await self.record_spend(lease)
-            if await self.enforce_lease_limits(lease):
-                continue
+        await self.record_spend_all()
+        for lease in self.leases.open_leases():
+            await self.enforce_lease_limits(lease)
+        # Read again: a lease the limits just closed must not rent anything below.
+        open_leases = self.leases.open_leases()
+        await self.release_unleased(open_leases, busy or {})
 
         await self.handle_evictions()
-        await self.tear_down(open_leases, idle_seconds, ready_workers_higher_tiers)
-        await self.acquire(open_leases, ready_workers_higher_tiers, pressure=pressure, load=load)
+        # Release before acquire, across every demand (spec §3): each unit's tear-down, then each
+        # unit's acquisition, in the order their leases were opened (workloads.md §8).
+        units = self.unit_order(open_leases)
+        for workload in units:
+            await self.tear_down(
+                open_leases, idle_seconds, ready_workers_higher_tiers if workload is None else 0, workload=workload,
+            )
+        for workload in units:
+            await self.acquire(
+                open_leases, ready_workers_higher_tiers if workload is None else 0,
+                pressure=pressure if workload is None else bool((pressures or {}).get(workload)),
+                load=load if workload is None else (loads or {}).get(workload),
+                workload=workload,
+            )
+
+    async def release_unleased(self, open_leases: Sequence[Lease], busy: Mapping[str, int]) -> None:
+        """A host whose lease is no longer open is drained (D53), whatever demand it served —
+        however the lease came to close: its caps, its time, an operator, a workload ended, or
+        closed while no supervisor was running. Without this a host nobody's demand looks at
+        again bills until its dead-man timer fires (the review's finding 1).
+
+        A parked host of the shared workload is left to its own limits, as before: parking is
+        for keeping a machine between runs. A workload's parked host has no run to come back to."""
+        open_ids = {lease.lease_id for lease in open_leases}
+        for host in list(self.hosts.values()):
+            if host.released or host.state == "draining" or host.lease_id in open_ids:
+                continue
+            if host.state == "parked":
+                if host.workload is not None:
+                    await self.destroy(host, "its workload's lease is no longer open")
+                continue
+            if host.state != "ready":
+                # Serving nothing — still coming up, or being re-verified after a restart — so
+                # there is nothing to finish: draining would only bill for longer.
+                await self.destroy(host, "its lease is no longer open")
+                continue
+            # A ready host is drained even when the counters read idle: they are from the start of
+            # the pass, and the router still routes to it until the next publish (D53).
+            await self.drain(host, "its lease is no longer open")
 
     async def enforce_lease_limits(self, lease: Lease) -> bool:
         """Time or dollars reached → release everything the lease holds. Returns True when
@@ -555,7 +672,61 @@ class Fleet:
         what one card runs at once is a fact about the card (D88)."""
         return re.sub(r"^\s*\d+\s*x\s*", "", hardware or "", count=1).strip().lower()
 
-    def workers_for(self, offer: Offer) -> tuple[int, str]:
+    def workers_for(self, offer: Offer, workload: Optional[str] = None) -> tuple[int, str]:
+        """How many workers a host rented from this offer would run, and why (spec §2.1) — for a
+        workload, no more than the class of machine was measured to serve within its latency
+        target (D115); what was not measured is said."""
+        workers, why = self._workers_for_card(offer)
+        spec = self.workloads.get(workload) if workload is not None else None
+        if spec is None:
+            return workers, why
+        at = self.latency_sizing(offer.hardware, spec, ceiling=workers)
+        if at.workers is not None and at.workers < workers:
+            return at.workers, f"{why}; held to {at.workers} for the {spec.latency_s:g}s target: {at.reasons[0]}"
+        return workers, f"{why}; {at.reasons[0]}"
+
+    def latency_sizing(self, hardware: str, spec: Any, ceiling: int) -> workload_math.AtLatency:
+        """What the request log measured for this workload's build on machines of this card: the
+        whole answer, by how many answers the host was serving at once (D115)."""
+        card = self._card_of(hardware)
+        tag = spec.builds.get(spec.model) or spec.model
+        key = (card, tag, float(spec.latency_s), int(ceiling))
+        cached = self._sizing_cache.get(key)
+        if cached is not None and time.monotonic() - cached[0] < 30.0:
+            return cached[1]
+        host_ids = [host_id for host_id, seen in self._hardware_of_hosts().items() if self._card_of(seen) == card]
+        samples: list[tuple[int, float]] = []
+        if host_ids:
+            marks = ",".join("?" * len(host_ids))
+            rows = self.events.db.query(
+                f"SELECT concurrency, latency_ms FROM request_log WHERE outcome = 'ok' AND model_served = ? "
+                f"AND concurrency IS NOT NULL AND latency_ms IS NOT NULL AND host_id IN ({marks}) "
+                "ORDER BY id DESC LIMIT 20000",
+                (tag, *host_ids),
+            )
+            samples = [(int(r["concurrency"]), float(r["latency_ms"]) / 1000) for r in rows]
+        found = workload_math.workers_at_latency(samples, spec.latency_s, ceiling)
+        # Read once in a while, not once per offer: a search weighs dozens (the review's finding 12).
+        self._sizing_cache[key] = (time.monotonic(), found)
+        return found
+
+    def _hardware_of_hosts(self) -> dict[str, str]:
+        """Each rented host's hardware, from the decision log (the `rented` events carry it)."""
+        if self._hardware_cache is not None and time.monotonic() - self._hardware_cache[0] < 30.0:
+            return self._hardware_cache[1]
+        rows = self.events.db.query("SELECT host_id, numbers FROM events WHERE kind = 'rented' AND host_id IS NOT NULL")
+        found: dict[str, str] = {}
+        for row in rows:
+            try:
+                hardware = json.loads(row["numbers"] or "{}").get("hardware")
+            except ValueError:
+                hardware = None
+            if hardware:
+                found[row["host_id"]] = str(hardware)
+        self._hardware_cache = (time.monotonic(), found)
+        return found
+
+    def _workers_for_card(self, offer: Offer) -> tuple[int, str]:
         """How many workers a host rented from this offer would run, and why (spec §2.1).
 
         The first capacity profile the offer matches decides; with none, the rented default,
@@ -595,7 +766,7 @@ class Fleet:
             why += f", held at {self.MOST_WORKERS_A_HOST_MAY_RUN}"
         return workers, why + "; no capacity profile matches this hardware"
 
-    def launch_workers_for(self, starts_at: int) -> int:
+    def launch_workers_for(self, starts_at: int, workload: Optional[str] = None) -> int:
         """What the engine is *launched* to run at once (D68).
 
         Under automatic adjustment a host starts at its profile's number and climbs from there,
@@ -604,7 +775,9 @@ class Fleet:
         with exactly what the host will be given, as before.
         """
         auto = self.rented.workers_auto
-        if not auto.enabled:
+        if not auto.enabled or workload is not None:
+            # A workload's host is held to what meets its latency target: climbing past it would
+            # trade the target for throughput nobody asked for (D115).
             return starts_at
         return max(starts_at, auto.max)
 
@@ -751,7 +924,7 @@ class Fleet:
         if not profiles:
             return None
         names = list(profiles)
-        live = [host for host in self.hosts.values() if not host.released]
+        live = self.hosts_of(None)
         serving: dict[str, int] = {}
         for host in live:
             for model in self.models_of(host):
@@ -795,9 +968,7 @@ class Fleet:
             return tuple(candidates)
 
         serving: dict[str, int] = {name: 0 for name in candidates}
-        for host in self.hosts.values():
-            if host.released:
-                continue
+        for host in self.hosts_of(None):
             for name in host.models:
                 if name in serving:
                     serving[name] += 1
@@ -825,9 +996,8 @@ class Fleet:
             return False
         for name in host.models:
             others = [
-                other for other in self.hosts.values()
+                other for other in self.hosts_of(host.workload)
                 if other.host_id != host.host_id
-                and not other.released
                 and other.state in ("ready", "preparing")
                 and name in other.models
             ]
@@ -1254,18 +1424,14 @@ class Fleet:
                 }
             )
 
-        lease = next((lease for lease in open_leases if lease.allow_rent), None)
-        rented_workers = sum(
-            h.workers for h in self.hosts.values() if not h.released and h.state == "ready"
-        )
+        lease = self.lease_of(open_leases, None)
+        rented_workers = sum(h.workers for h in self.hosts_of(None) if h.state == "ready")
         demand = Demand(
             wanted_workers=lease.workers if lease else 0,
             ready_workers_higher_tiers=ready_workers_higher_tiers,
             rented_workers=rented_workers,
-            overflow_age_s=(time.time() - self.overflow_since) if self.overflow_since else 0.0,
-            hosts_pending=sum(
-                1 for h in self.hosts.values() if not h.released and h.state in ("scheduling", "preparing")
-            ),
+            overflow_age_s=(time.time() - self.unit(None).overflow_since) if self.unit(None).overflow_since else 0.0,
+            hosts_pending=sum(1 for h in self.hosts_of(None) if h.state in ("scheduling", "preparing")),
         )
         decision = decide_rent(
             demand, self._lease_view(lease) if lease else None, self.rented.scale, self.rented.workers
@@ -1858,11 +2024,12 @@ class Fleet:
 
     # --- parking (spec §8) ---
 
-    async def restart_parked(self, lease: Lease) -> Optional[RentedHost]:
+    async def restart_parked(self, lease: Lease, workload: Optional[str] = None) -> Optional[RentedHost]:
         """Parked hosts are tried before new offers: no download, minutes instead of tens of
-        minutes. It must still win the auction on that machine within the ceilings."""
-        for host in self.hosts.values():
-            if host.released or host.state != "parked":
+        minutes. It must still win the auction on that machine within the ceilings. Only this
+        demand's own: another workload's host holds another model (D115)."""
+        for host in self.hosts_of(workload):
+            if host.state != "parked":
                 continue
             offers = await self._offers()
             same_machine = next((o for o in offers if o.machine_id == host.offer.machine_id), None)
@@ -1948,6 +2115,7 @@ class Fleet:
             "profile": host.profile,
             "builds": dict(host.builds),
             "cards_per_copy": host.cards_per_copy,
+            "workload": host.workload,
             "disk_gb": host.disk_gb,
             "offer": dataclasses.asdict(dataclasses.replace(host.offer, raw={})),
         }
@@ -2003,6 +2171,7 @@ class Fleet:
                 builds={str(k): str(v) for k, v in (ref.get("builds") or {}).items()},
                 # A row from before splitting existed ran a copy on every card.
                 cards_per_copy=int(ref.get("cards_per_copy") or 1),
+                workload=ref.get("workload"),
                 disk_gb=ref.get("disk_gb"),
                 when_ready=ref.get("when_ready") or "join",
                 download_cost=float(ref.get("download_cost") or 0.0),
@@ -2018,7 +2187,8 @@ class Fleet:
                 engine_port=int(ref.get("engine_port") or 0),
             )
             if host.idle_since is not None:
-                self.idle_gate = True  # paused for idleness: load, not the lease, brings it back
+                # Paused for idleness: load, not the lease, brings it back.
+                self.unit(host.workload).idle_gate = True
             was_ready = host.state == "ready"
             if was_ready:
                 # Readiness is re-verified, never assumed — and the clock on "not ready in
@@ -2115,6 +2285,43 @@ class Fleet:
                 numbers={"instance": instance.instance_id, "label": instance.label},
             )
             await self._destroy_instance(instance, "orphan")
+        await self.sweep_volumes()
+
+    async def sweep_volumes(self) -> None:
+        """A volume under the pool's label whose workload is over, or that the pool has no record
+        of, is deleted (D116). A provider that cannot be asked leaves every volume where it is:
+        "could not list" is never "none there" (D61)."""
+        if not self.provider.capabilities.volumes:
+            return
+        try:
+            found = await self.provider.list_volumes(self.label_prefix)
+        except ProviderError as exc:
+            log.warning("could not list volumes: %s", exc)
+            return
+        live = {v.volume_id: v for v in self.workload_store.volumes()}
+        for volume in found:
+            record = live.get(volume.volume_id)
+            if record is not None and record.workload in self.workloads:
+                continue
+            await self._delete_volume(volume.volume_id, "its workload is over" if record else "never recorded by this pool")
+
+    async def delete_volumes(self, workload: str) -> None:
+        """Every volume of a workload that is over."""
+        for volume in self.workload_store.volumes(workload):
+            await self._delete_volume(volume.volume_id, f"workload {workload} is over")
+
+    async def _delete_volume(self, volume_id: str, why: str) -> None:
+        try:
+            await self.provider.delete_volume(volume_id)
+            remaining = {v.volume_id for v in await self.provider.list_volumes(self.label_prefix)}
+        except ProviderError as exc:
+            log.warning("could not delete volume %s: %s", volume_id, exc)
+            return
+        if volume_id in remaining:
+            return  # asked again next pass; a delete counts only once the listing agrees
+        self.workload_store.volume_deleted(volume_id)
+        self.events.record("volume_deleted", f"volume {volume_id} deleted and verified: {why}",
+                           numbers={"volume": volume_id})
 
     # --- recover what is broken ---
 
@@ -2299,42 +2506,52 @@ class Fleet:
         ready_workers_higher_tiers: int,
         pressure: bool = False,
         load: Optional[Load] = None,
+        workload: Optional[str] = None,
     ) -> None:
-        lease = next((lease for lease in open_leases if lease.allow_rent), None)
-        if self.rented.allocation == "dynamic" and lease is not None:
-            await self._acquire_dynamically(lease, ready_workers_higher_tiers, load)
+        unit = self.unit(workload)
+        lease = self.lease_of(open_leases, workload)
+        if workload is not None:
+            # A workload always sizes from load, above a floor of the hosts it starts with: its
+            # lease reserved them for the run (D115). Nothing measured is no load, not no floor.
+            spec = self.workloads.get(workload)
+            if lease is None or spec is None:
+                return
+            await self._acquire_dynamically(
+                lease, 0, load or Load(busy_workers=0, ready_workers=0, waiting=0), unit=unit,
+                floor=spec.hosts_at_start, per_host=spec.workers_per_host,
+            )
             return
-        if self.idle_gate:
+        if self.rented.allocation == "dynamic" and lease is not None:
+            await self._acquire_dynamically(lease, ready_workers_higher_tiers, load, unit=unit)
+            return
+        if unit.idle_gate:
             # A host was given up because nothing was using it. The lease says what may be
             # spent, not that it must be: capacity comes back when load asks for it (D64).
             if not pressure:
-                self.overflow_since = None
+                unit.overflow_since = None
                 return
-            self.idle_gate = False
+            unit.idle_gate = False
             if lease is not None and self._refuse_for_caps_quietly(lease) is None:
-                back = await self.restart_idle_parked(lease)
+                back = await self.restart_idle_parked(lease, workload)
                 if back is not None:
                     return
-        rented_workers = sum(
-            h.workers for h in self.hosts.values() if not h.released and h.state == "ready"
-        )
-        pending = sum(
-            1 for h in self.hosts.values() if not h.released and h.state in ("scheduling", "preparing")
-        )
+        mine = self.hosts_of(workload)
+        rented_workers = sum(h.workers for h in mine if h.state == "ready")
+        pending = sum(1 for h in mine if h.state in ("scheduling", "preparing"))
         wanted = lease.workers if lease else 0
         overflow = max(0, wanted - ready_workers_higher_tiers - rented_workers)
 
         now = time.time()
-        if overflow > 0 and self.overflow_since is None:
-            self.overflow_since = now
+        if overflow > 0 and unit.overflow_since is None:
+            unit.overflow_since = now
         elif overflow <= 0:
-            self.overflow_since = None
+            unit.overflow_since = None
 
         demand = Demand(
             wanted_workers=wanted,
             ready_workers_higher_tiers=ready_workers_higher_tiers,
             rented_workers=rented_workers,
-            overflow_age_s=(now - self.overflow_since) if self.overflow_since else 0.0,
+            overflow_age_s=(now - unit.overflow_since) if unit.overflow_since else 0.0,
             hosts_pending=pending,
             rented_hosts=len([h for h in self.hosts.values() if not h.released]),
         )
@@ -2361,7 +2578,8 @@ class Fleet:
         await self.rent_one(lease, decision.reasons)
 
     async def _acquire_dynamically(
-        self, lease: Lease, ready_workers_higher_tiers: int, load: Optional[Load]
+        self, lease: Lease, ready_workers_higher_tiers: int, load: Optional[Load],
+        unit: Optional[Unit] = None, floor: Optional[int] = None, per_host: Optional[int] = None,
     ) -> None:
         """Hosts added from measured load, in rounds that grow while it lasts (D66).
 
@@ -2372,60 +2590,73 @@ class Fleet:
         now = time.time()
         if load is None:
             return
-        live = [h for h in self.hosts.values() if not h.released]
+        unit = unit or self.unit(None)
+        live = [h for h in self.hosts_of(unit.workload) if h.state != "draining"]
         ready = [h for h in live if h.state == "ready"]
         pending = [h for h in live if h.state in ("scheduling", "preparing")]
         rented_workers = sum(h.workers for h in ready)
 
         wanted = min(lease.workers, load.wanted(self.rented.dynamic.target_utilisation))
-        below_floor = len(live) < self.rented.dynamic.min_hosts
+        least = self.rented.dynamic.min_hosts if floor is None else floor
+        below_floor = len(live) < least
         overflow = max(0, wanted - ready_workers_higher_tiers - rented_workers)
 
-        if overflow > 0 and self.overflow_since is None:
-            self.overflow_since = now
+        if overflow > 0 and unit.overflow_since is None:
+            unit.overflow_since = now
         elif overflow <= 0 and not below_floor:
-            self.overflow_since = None
-            if self.ramp_round:
+            unit.overflow_since = None
+            if unit.ramp_round:
                 # The load that started this ramp is gone: the next one starts from one again.
                 self.events.record(
                     "ramp_reset",
                     "the load has cleared; the ramp starts from one host again",
-                    numbers={"was": self.ramp_round},
+                    numbers={"was": unit.ramp_round, "workload": unit.workload},
                     lease_id=lease.lease_id,
                 )
-                self.ramp_round = 0
+                unit.ramp_round = 0
             return
 
-        held = (now - self.overflow_since) if self.overflow_since else 0.0
+        held = (now - unit.overflow_since) if unit.overflow_since else 0.0
         if not below_floor and held < self.rented.dynamic.window_s:
             return  # a burst shorter than the window is not worth a model download
 
-        if not live and self.ramp_round:
+        if not live and unit.ramp_round:
             # Every host the ramp bought is gone — evicted, or given up. There is no new
             # capacity to wait and see about, so the back-off has nothing to measure: the ramp
             # starts again from one, at once. Seen live: a host was outbid three minutes after
             # it was rented, and the pool then sat out its whole back-off while every request
             # was refused.
-            self.ramp_round = 0
-            self.ramp_landed_at = 0.0
+            unit.ramp_round = 0
+            unit.ramp_landed_at = 0.0
         elif pending:
-            self.ramp_landed_at = 0.0  # the round has not landed while a host is still coming
-        elif self.ramp_round and not self.ramp_landed_at:
-            self.ramp_landed_at = now
+            unit.ramp_landed_at = 0.0  # the round has not landed while a host is still coming
+        elif unit.ramp_round and not unit.ramp_landed_at:
+            unit.ramp_landed_at = now
 
         # A paused host is capacity the pool already has: waking one adds nothing to the host
         # count, costs no download, and is the right answer before renting anything. It has to
         # be tried *before* the caps are consulted, or a pool sitting at its host limit with
         # every host paused refuses the load it could serve at once (found by the simulation).
-        woken = await self.restart_idle_parked(lease)
+        woken = await self.restart_idle_parked(lease, unit.workload)
         if woken is not None:
             return
 
+        if below_floor and unit.workload is not None:
+            # A workload below the hosts it starts with: exactly the gap, each host re-checked on
+            # its own, whatever the ramp would say — the ramp is for load above the floor (D115).
+            await self._rent_round(
+                lease, unit, least - len(live), [f"workload {unit.workload}: {len(live)} of the "
+                                                   f"{least} host(s) it runs on at least"],
+                wanted=wanted, rented_workers=rented_workers,
+                ready_workers_higher_tiers=ready_workers_higher_tiers, held=held, load=load, ramp=False,
+            )
+            return
+
         ramp = decide_ramp(
-            round_size=self.ramp_round,
+            round_size=unit.ramp_round,
             load_present=load.present or below_floor,
             previous_round_landed=not pending,
-            since_last_round_s=(now - self.ramp_landed_at) if self.ramp_landed_at else 0.0,
+            since_last_round_s=(now - unit.ramp_landed_at) if unit.ramp_landed_at else 0.0,
             hosts_pending=len(pending),
             cfg=self.rented.dynamic,
         )
@@ -2433,8 +2664,18 @@ class Fleet:
             return
 
         # Never more than the gap itself asks for: a ramp is a rate, not a target.
-        by_overflow = max(1, math.ceil(overflow / max(1, self.rented.workers)))
+        by_overflow = max(1, math.ceil(overflow / max(1, per_host or self.rented.workers)))
         asked = max(1, min(ramp.hosts, by_overflow)) if not below_floor else ramp.hosts
+        await self._rent_round(
+            lease, unit, asked, [f"dynamic allocation: {ramp.reasons[0]}"],
+            wanted=wanted, rented_workers=rented_workers,
+            ready_workers_higher_tiers=ready_workers_higher_tiers, held=held, load=load, ramp=True,
+        )
+
+    async def _rent_round(
+        self, lease: Lease, unit: Unit, asked: int, reasons: list[str], *, wanted: int, rented_workers: int,
+        ready_workers_higher_tiers: int, held: float, load: Load, ramp: bool,
+    ) -> None:
         rented_now = 0
         for _ in range(asked):
             demand = Demand(
@@ -2450,11 +2691,12 @@ class Fleet:
             refusal = self._refuse_for_caps(demand, lease)
             if refusal is not None:
                 self.events.record(
-                    "rent_refused", refusal, numbers={"round": asked, "rented_so_far": rented_now},
+                    "rent_refused", refusal,
+                    numbers={"round": asked, "rented_so_far": rented_now, "workload": unit.workload},
                     lease_id=lease.lease_id,
                 )
                 break
-            host = await self.rent_one(lease, [f"dynamic allocation: {ramp.reasons[0]}"])
+            host = await self.rent_one(lease, list(reasons), workload=unit.workload)
             if host is None:
                 break  # a round that loses its bids does not grow the next one
             rented_now += 1
@@ -2464,7 +2706,7 @@ class Fleet:
             # decides to rent and is then refused by a cap has already said so.
             self.events.record(
                 "ramp_round",
-                f"{ramp.reasons[0]}; rented {rented_now} of {asked}",
+                f"{reasons[0].removeprefix('dynamic allocation: ')}; rented {rented_now} of {asked}",
                 numbers={
                     "round": asked,
                     "rented": rented_now,
@@ -2472,34 +2714,55 @@ class Fleet:
                     "ready_workers": rented_workers + ready_workers_higher_tiers,
                     "waiting": load.waiting,
                     "busy": load.busy_workers,
+                    "workload": unit.workload,
                 },
                 lease_id=lease.lease_id,
             )
-            self.ramp_round = asked
-            self.ramp_landed_at = 0.0
+            if ramp:
+                unit.ramp_round = asked
+            unit.ramp_landed_at = 0.0
 
     def _refuse_for_caps_quietly(self, lease: Lease) -> Optional[str]:
         """The dollar check alone: a parked host is already counted among the pool's hosts."""
         left = self.budget_left(lease)
         return None if left > 0 else f"the lease has ${left:.4f} left"
 
-    async def restart_idle_parked(self, lease: Lease) -> Optional[RentedHost]:
+    async def restart_idle_parked(self, lease: Lease, workload: Optional[str] = None) -> Optional[RentedHost]:
         """Load came back while a host was paused: it returns at once, with no download and no
         wait for the scale-up window, which exists to stop a burst buying a download."""
-        if not any(h.state == "parked" and h.idle_since is not None and not h.released for h in self.hosts.values()):
+        if not any(h.state == "parked" and h.idle_since is not None for h in self.hosts_of(workload)):
             return None
-        return await self.restart_parked(lease)
+        return await self.restart_parked(lease, workload)
+
+    def reserved_hosts(self, besides: Optional[str] = None) -> int:
+        """Hosts workloads still mean to rent to reach the start they were created with: room
+        another demand may not take (workloads.md §8). The shared workload yields to every
+        workload's; a workload yields to those created before it, and they to none of its — the
+        room is taken in the order the workloads were opened, never held back both ways."""
+        mine = self.workloads.get(besides) if besides is not None else None
+        return sum(
+            max(0, spec.hosts_at_start - len(self.hosts_of(name)))
+            for name, spec in self.workloads.items()
+            if name != besides and spec.state in ("preparing", "serving")
+            and (mine is None or spec.created_at < mine.created_at)
+        )
+
+    def volume_burn(self) -> float:
+        """What the pool's live volumes cost per hour (D116): spend the hosts' prices do not show."""
+        return sum(v.hourly for v in self.workload_store.volumes())
 
     def _refuse_for_caps(self, demand: Demand, lease: Optional[Lease]) -> Optional[str]:
         if lease is None:
             return "no lease is open"
         live = [h for h in self.hosts.values() if not h.released]
-        if len(live) >= self.config.limits.max_rented_hosts:
+        reserved = self.reserved_hosts(besides=lease.workload)
+        if len(live) + reserved >= self.config.limits.max_rented_hosts:
             return (
-                f"{len(live)} rented hosts already, at the pool's limit of "
-                f"{self.config.limits.max_rented_hosts}"
+                f"{len(live)} rented hosts already"
+                + (f", and {reserved} reserved for workloads still starting" if reserved else "")
+                + f", at the pool's limit of {self.config.limits.max_rented_hosts}"
             )
-        burn = sum(h.bid_hourly for h in live)
+        burn = sum(h.bid_hourly for h in live) + self.volume_burn()
         total = self.config.limits.max_hourly_burn
         if total is not None and burn >= total:
             return f"hourly burn ${burn:.3f} is at the ${total:.2f} cap"
@@ -2521,7 +2784,7 @@ class Fleet:
         per-host ceiling, and the host count to the pool's limit (D46)."""
         if self.config.limits.max_hourly_burn is None:
             return None
-        burn = sum(h.bid_hourly for h in self.hosts.values() if not h.released) + bid
+        burn = sum(h.bid_hourly for h in self.hosts.values() if not h.released) + self.volume_burn() + bid
         if burn > self.config.limits.max_hourly_burn:
             return (
                 f"bidding ${bid:.3f}/h would take the burn to ${burn:.3f}/h, above the "
@@ -2532,6 +2795,7 @@ class Fleet:
     async def rent_one(
         self, lease: Lease, reasons: list[str],
         offer_id: Optional[str] = None, kind: Optional[str] = None,
+        workload: Optional[str] = None,
     ) -> Optional[RentedHost]:
         """Rent the best offer — or, when an operator named one, exactly that one.
 
@@ -2541,13 +2805,27 @@ class Fleet:
         not for a host (D55).
         """
         self.last_refusal = None
-        # Which profile and models this machine is bought for, decided before the search: what
-        # it will hold sets the least card and disk worth looking at (D94, D111).
-        profile = self.profile_for_new_host()
-        for_this_host = self.models_for_new_host()
-        builds = self.builds_for_new_host()
-        cards_per_copy = self.rented.cards_per_copy(profile)
+        spec = self.workloads.get(workload) if workload is not None else None
+        if spec is not None:
+            # A workload's host holds exactly its model, as the build it was created with (D115).
+            profile = None
+            for_this_host: tuple[str, ...] = (spec.model,)
+            builds = dict(spec.builds)
+            cards_per_copy = int((spec.plan or {}).get("cards_per_copy") or 1)
+            if kind is None and offer_id is None:
+                kind = {"on_demand": "on_demand", "interruptible": "interruptible"}.get(spec.kind, "both")
+        else:
+            # Which profile and models this machine is bought for, decided before the search: what
+            # it will hold sets the least card and disk worth looking at (D94, D111).
+            profile = self.profile_for_new_host()
+            for_this_host = self.models_for_new_host()
+            builds = self.builds_for_new_host()
+            cards_per_copy = self.rented.cards_per_copy(profile)
         policy = self.policy_for(for_this_host, builds, cards_per_copy=cards_per_copy)
+        if spec is not None:
+            policy = policy.model_copy(
+                update={"min_reliability": max(policy.min_reliability, self.config.workloads.min_reliability)}
+            )
         offers = await self._offers(policy, kinds=kind or ("both" if offer_id else None))
         ranked, rejected = rank_offers(
             offers,
@@ -2601,6 +2879,18 @@ class Fleet:
         # The market is offering something again, so the next dry spell is news once more.
         self._said_nothing_passed = None
 
+        if spec is not None and spec.kind == "roi" and offer_id is None:
+            # On demand or a bid, by what each is expected to cost this workload over the hours
+            # its lease has left (D115). Deterministic, with its reasons; every cap still applies.
+            ranked, kind_reasons = self._by_rental_kind(ranked, lease, spec, for_this_host, builds)
+            reasons = [*reasons, *kind_reasons[:1]]
+        warm = self._warm_volumes(spec) if spec is not None else {}
+        if warm and offer_id is None and any(o.machine_id in warm for o, _ in ranked):
+            # A machine that already holds the models downloads nothing: first, whatever else
+            # the ranking said (D116).
+            ranked = sorted(ranked, key=lambda pair: 0 if pair[0].machine_id in warm else 1)
+            reasons = [*reasons, f"a machine holding its models is offered again: {ranked[0][0].machine_id}"]
+
         for offer, offer_score in ranked[: self.rented.bidding.attempts]:
             bid = price_bid(offer, self.rented.bidding, self.rented.policy_in_force, lease.max_all_in_hourly)
             capped = self._cap_bid(bid.hourly, lease, offer)
@@ -2626,20 +2916,23 @@ class Fleet:
                 continue
 
             host_id = f"rented-{uuid.uuid4().hex[:6]}"
-            workers, workers_why = self.workers_for(offer)
-            launch_workers = self.launch_workers_for(workers)
-            spec = InstanceSpec(
-                label=f"{self.label_prefix}{host_id}",
+            workers, workers_why = self.workers_for(offer, workload)
+            launch_workers = self.launch_workers_for(workers, workload)
+            instance_spec = InstanceSpec(
+                # A workload's name sits in the label, under the pool's one prefix, so the one
+                # sweep still finds every instance the pool owns (workloads.md §1).
+                label=f"{self.label_prefix}{workload + '/' if workload else ''}{host_id}",
                 image=image,
                 disk_gb=policy.min_disk_gb,
                 # Launched at what it may be asked for, used at what it is given (D68).
                 env=self.instance_env(launch_workers, for_this_host),
                 # Armed before anything else runs, and carrying no account credential.
                 onstart=self.deadman_onstart(for_this_host),
+                volume=self._volume_for(spec, offer, warm, for_this_host, builds) if spec is not None else None,
             )
             try:
                 # No price on an on-demand rental: the provider's listed rate is what is paid.
-                instance = await self.provider.create(offer, spec, capped if offer.interruptible else None)
+                instance = await self.provider.create(offer, instance_spec, capped if offer.interruptible else None)
             except (BidLost, OfferGone) as exc:
                 numbers = {"bid": capped, "offer": offer.offer_id, "score": offer_score}
                 response = getattr(exc, "response", None)
@@ -2662,7 +2955,7 @@ class Fleet:
                 # next offer while a machine from this one bills is how one lease ends up
                 # paying for three hosts (D43) — so this is checked here, in the pool, and not
                 # left to a plug-in's own discipline. Unprovable means stop, not carry on.
-                if not await self._left_nothing_behind(spec.label, lease):
+                if not await self._left_nothing_behind(instance_spec.label, lease):
                     return None
                 continue
             except ProviderError as exc:
@@ -2687,10 +2980,13 @@ class Fleet:
                 profile=profile,
                 builds=builds,
                 cards_per_copy=cards_per_copy,
+                workload=workload,
                 disk_gb=policy.min_disk_gb,
                 engine=self.config.rented_engine(),
                 engine_port=self.engine_port,
             )
+            if instance.volume_id is not None and spec is not None:
+                self._record_volume(host, instance.volume_id, warm, offer, lease, for_this_host, builds)
             connection = await self.provider.connection(instance)
             host.connection = connection
             host.dial_url = connection.public_url or await self._open_tunnel(host_id, connection, host.engine_port)
@@ -2719,6 +3015,195 @@ class Fleet:
             return host
         return None
 
+    # --- a new host's models without the hub (D116) ---
+
+    def _sources(self) -> list[str]:
+        return list(self.config.workloads.model_sources)
+
+    def _models_dir(self) -> str:
+        return getattr(self.engine, "models_dir", "") or ""
+
+    def _warm_volumes(self, spec: Any) -> dict[str, Volume]:
+        """The machines holding one of this workload's volumes, where warm machines are on."""
+        if (spec is None or "warm" not in self._sources() or not self.config.workloads.keep_models_on_machine
+                or not self.provider.capabilities.volumes or not self._models_dir()):
+            return {}
+        return {v.machine_id: v for v in self.workload_store.volumes(spec.name)}
+
+    def _volume_for(self, spec: Any, offer: Offer, warm: dict[str, Volume],
+                    models: Sequence[str], builds: dict[str, str]) -> Optional[VolumeSpec]:
+        """The volume a workload's new host is created with: the one already on this machine, or
+        — for its first — a new one to keep its models on, so the next host there fetches nothing."""
+        if spec is None or "warm" not in self._sources() or not self.config.workloads.keep_models_on_machine:
+            return None
+        if not self.provider.capabilities.volumes or not self._models_dir():
+            return None
+        label = f"{self.label_prefix}{spec.name}/models"
+        if offer.machine_id in warm:
+            return VolumeSpec(mount=self._models_dir(), label=label, volume_id=warm[offer.machine_id].volume_id)
+        if self.workload_store.volumes(spec.name):
+            return None  # one volume per workload: the first machine keeps its models
+        size = math.ceil(self.model_set_gb(models, builds) * 1.1) + 1
+        return VolumeSpec(mount=self._models_dir(), label=label, size_gb=float(size))
+
+    def _record_volume(self, host: RentedHost, volume_id: str, warm: dict[str, Volume], offer: Offer,
+                       lease: Lease, models: Sequence[str], builds: dict[str, str]) -> None:
+        host.volume_id = volume_id
+        if offer.machine_id in warm and warm[offer.machine_id].volume_id == volume_id:
+            host.models_source = "warm"
+            self.events.record(
+                "models_from_volume",
+                f"{host.host_id} on {offer.machine_id} is created with volume {volume_id}, which holds "
+                f"{', '.join(models)}: nothing is downloaded",
+                numbers={"volume": volume_id, "machine": offer.machine_id, "workload": host.workload},
+                host_id=host.host_id, lease_id=lease.lease_id,
+            )
+            return
+        size = math.ceil(self.model_set_gb(models, builds) * 1.1) + 1
+        hourly = round(size * (offer.storage_per_gb_hourly or 0.0), 6)
+        self.workload_store.add_volume(Volume(
+            volume_id=volume_id, workload=host.workload or "", machine_id=offer.machine_id, size_gb=size,
+            hourly=hourly, lease_id=lease.lease_id, created_at=time.time(),
+        ))
+        self.events.record(
+            "volume_created",
+            f"volume {volume_id} ({size} GB) made on {offer.machine_id} for workload {host.workload}'s models, "
+            f"at ${hourly:.4f}/h while it exists; the next host on this machine fetches nothing",
+            numbers={"volume": volume_id, "machine": offer.machine_id, "size_gb": size, "hourly": hourly},
+            host_id=host.host_id, lease_id=lease.lease_id,
+        )
+
+    async def models_from_sibling_pending(self, host: RentedHost) -> bool:
+        """Is a copy of this host's models from a ready sibling still running? (D116)
+
+        Started the first time a new workload host is prepared, where a sibling holds the same
+        builds; the host's own fetch waits for it, then finds the files already there. A copy
+        that fails or takes too long falls through to the hub, said in the log. False when there
+        is nothing to wait for."""
+        if host.workload is None or host.models_source == "warm" or host.copy_state in ("done", "failed", "none"):
+            return False
+        if "sibling" not in self._sources() or not self.provider.capabilities.copies or not self._models_dir():
+            host.copy_state = "none"
+            return False
+        if host.copy_task is None:
+            sibling = next(
+                (other for other in self.hosts_of(host.workload)
+                 if other is not host and other.state == "ready" and other.builds == host.builds),
+                None,
+            )
+            if sibling is None:
+                host.copy_state = "none"
+                return False
+            host.copy_state, host.copy_started_at = "copying", time.time()
+
+            async def copy(source=sibling.instance, destination=host.instance) -> None:
+                # The provider is asked only once the task runs: one cancelled first asks nothing.
+                await asyncio.wait_for(
+                    self.provider.copy_between(source, destination, self._models_dir()),
+                    timeout=self.config.workloads.copy_timeout_s,
+                )
+
+            host.copy_task = asyncio.create_task(copy(), name=f"gpm:copy:{host.host_id}")
+            self.events.record(
+                "models_copy_started",
+                f"{host.host_id}: copying its models from {sibling.host_id}, which already holds them",
+                numbers={"from": sibling.host_id, "workload": host.workload},
+                host_id=host.host_id, lease_id=host.lease_id,
+            )
+            return True
+        if not host.copy_task.done():
+            return True
+        took = time.time() - (host.copy_started_at or time.time())
+        failure = None if host.copy_task.cancelled() else host.copy_task.exception()
+        if isinstance(failure, (asyncio.TimeoutError, TimeoutError)):
+            # Not waited for any longer, and not known to have stopped: fetching into the same
+            # directory now could race it. The host is given up; the floor rents another.
+            host.copy_state = "failed"
+            self.events.record(
+                "models_copy_failed",
+                f"{host.host_id}: the copy from a sibling did not finish in "
+                f"{self.config.workloads.copy_timeout_s:g}s; giving the host up rather than fetch over it",
+                numbers={"seconds": round(took, 1), "workload": host.workload},
+                host_id=host.host_id, lease_id=host.lease_id,
+            )
+            await self.destroy(host, "its models copy did not finish in time")
+            return True
+        if host.copy_task.cancelled() or failure is not None:
+            host.copy_state = "failed"
+            why = "cancelled" if failure is None else (str(failure) or type(failure).__name__)
+            self.events.record(
+                "models_copy_failed",
+                f"{host.host_id}: the copy from a sibling did not finish ({why}); fetching from the hub",
+                numbers={"seconds": round(took, 1), "workload": host.workload},
+                host_id=host.host_id, lease_id=host.lease_id,
+            )
+            return False
+        host.copy_state, host.models_source = "done", "sibling"
+        self.events.record(
+            "models_copied",
+            f"{host.host_id}: its models were copied from a sibling in {took:.0f}s",
+            numbers={"seconds": round(took, 1), "workload": host.workload},
+            host_id=host.host_id, lease_id=host.lease_id,
+        )
+        return False
+
+    def expected_costs(
+        self, ranked: list[tuple[Offer, float]], hours: float, spec: Any,
+        models: Sequence[str], builds: dict[str, str], max_all_in_hourly: Optional[float] = None,
+    ) -> tuple[list[workload_math.KindCost], list[str]]:
+        """What each accepted offer is expected to cost a workload per worker-hour over `hours`
+        (D115, workloads.md §5), cheapest first, with the line that says why. A bid's expected
+        evictions come from the machine's own history where it has an hour or more of it, else
+        the configured prior; each costs the time to get a replacement ready, paid and not
+        serving, and this host's share of the workload's capacity meanwhile, priced at what that
+        capacity costs on demand. Used by the creation plan and by every rental alike."""
+        hours = max(hours, 1e-6)
+        size = self.model_set_gb(models, builds)
+        record_of = self.machine_history()
+        have = sum(h.workers for h in self.hosts_of(spec.name) if h.state != "draining")
+        on_demand = [o.all_in_hourly for o, _ in ranked if not o.interruptible]
+        costs = []
+        for offer, _ in ranked:
+            card_workers, _ = self._workers_for_card(offer)
+            at = self.latency_sizing(offer.hardware, spec, ceiling=card_workers)
+            workers = min(card_workers, at.workers) if at.workers is not None else card_workers
+            if offer.interruptible:
+                bid = price_bid(offer, self.rented.bidding, self.rented.policy_in_force, max_all_in_hourly)
+                hourly = bid.hourly + offer.storage_hourly
+            else:
+                hourly = offer.all_in_hourly
+            record = record_of.get(offer.machine_id)
+            rate = getattr(record, "evictions_per_hour", None)
+            if rate is None:
+                rate = self.config.workloads.eviction_prior_per_hour
+            costs.append(workload_math.expected_cost(
+                offer_id=offer.offer_id, machine_id=offer.machine_id, interruptible=offer.interruptible,
+                hourly=hourly, hours=hours, workers=workers, evictions_per_hour=rate,
+                ready_hours=workload_math.time_to_ready_hours(size, offer.download_mbps, self.config.workloads.engine_load_s),
+                lost_capacity_hourly=offer.on_demand_hourly or (min(on_demand) if on_demand else hourly),
+                share_of_workload=workers / max(1, have + workers),
+            ))
+        return workload_math.order_by_expected_cost(costs)
+
+    def _by_rental_kind(
+        self, ranked: list[tuple[Offer, float]], lease: Lease, spec: Any,
+        models: Sequence[str], builds: dict[str, str],
+    ) -> tuple[list[tuple[Offer, float]], list[str]]:
+        """The accepted offers in the rental-kind rule's order, over the hours the lease has left."""
+        ordered, why = self.expected_costs(ranked, lease.hours_left(), spec, models, builds, lease.max_all_in_hourly)
+        by_id = {offer.offer_id: (offer, points) for offer, points in ranked}
+        said = (ordered[0].offer_id, ordered[0].interruptible) if ordered else None
+        if self._said_kind.get(spec.name) == said:
+            return [by_id[c.offer_id] for c in ordered], why
+        self._said_kind[spec.name] = said
+        self.events.record(
+            "rental_kind", why[0],
+            numbers={"workload": spec.name, "hours_left": round(lease.hours_left(), 3),
+                     "candidates": [dataclasses.asdict(c) for c in ordered[:5]]},
+            lease_id=lease.lease_id,
+        )
+        return [by_id[c.offer_id] for c in ordered], why
+
     def _cap_bid(self, bid: float, lease: Lease, offer: Offer) -> Optional[float]:
         """The supervisor's own clamp, applied after the strategy returns — a faulty or
         hostile strategy cannot spend past the ceilings. The ceiling is all-in (D108): a bid
@@ -2743,12 +3228,15 @@ class Fleet:
         open_leases: list[Lease],
         idle_seconds: dict[str, float],
         ready_workers_higher_tiers: int = 0,
+        workload: Optional[str] = None,
     ) -> None:
-        live = [h for h in self.hosts.values() if not h.released and h.state != "parked"]
+        unit = self.unit(workload)
+        live = [h for h in self.hosts_of(workload) if h.state != "parked"]
         if not live:
-            self.overflow_gone_since = None
+            unit.overflow_gone_since = None
             return
-        lease = next((lease for lease in open_leases if lease.allow_rent), None)
+        lease = self.lease_of(open_leases, workload)
+        spec = self.workloads.get(workload) if workload is not None else None
         now = time.time()
 
         # A host that is not ready yet is neither idle nor surplus: it is capacity on its
@@ -2787,10 +3275,10 @@ class Fleet:
         wanted = lease.workers if lease else 0
         covered = ready_workers_higher_tiers + sum(h.workers for h in ready)
         if lease is not None and covered >= wanted and wanted > 0:
-            self.overflow_gone_since = self.overflow_gone_since or now
+            unit.overflow_gone_since = unit.overflow_gone_since or now
         else:
-            self.overflow_gone_since = None
-        gone_for = (now - self.overflow_gone_since) if self.overflow_gone_since else 0.0
+            unit.overflow_gone_since = None
+        gone_for = (now - unit.overflow_gone_since) if unit.overflow_gone_since else 0.0
 
         views = [
             HostView(
@@ -2828,6 +3316,10 @@ class Fleet:
             host = self.hosts.get(action.host_id)
             if host is None or host.released:
                 continue
+            if spec is not None and lease is not None and len(ready) <= spec.hosts_at_start:
+                # A workload keeps the hosts it starts with for its whole lease: they were
+                # reserved for the run, and reaping one only rents it again next pass (D115).
+                continue
             if self.last_host_serving(host):
                 # Taking it would leave a model with nowhere to go, and every request for it
                 # would be refused until another machine was bought and prepared — minutes at
@@ -2843,7 +3335,7 @@ class Fleet:
             if action.host_id in held and not idle:
                 continue  # prepared and inside its hold: not surplus yet. Unused is another matter (D64)
             if idle:
-                self.idle_gate = True
+                unit.idle_gate = True
             if "overflow" in action.reasons[0]:
                 if reaped_for_overflow >= 1:
                     continue  # one host at a time (spec §9)
@@ -2894,6 +3386,8 @@ class Fleet:
         )
 
     async def destroy(self, host: RentedHost, reason: str) -> None:
+        if host.copy_task is not None and not host.copy_task.done():
+            host.copy_task.cancel()  # a copy to a host that is going is work for nobody
         ok = await self._destroy_instance(host.instance, reason)
         if ok:
             host.released = True

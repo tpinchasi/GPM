@@ -51,6 +51,23 @@ _CHUNK = 1 << 20
 COMPLETE_MARKER = ".gpm-complete"
 
 
+def is_complete(directory: Path) -> bool:
+    """Is this model all here? Its complete marker, and files adding up to the size the marker
+    records. The marker alone is not enough once models can arrive by other means than this
+    fetch — a provider's copy from another machine (D116) may bring the marker before the weights,
+    and serving half a model is worse than serving none. A marker that cannot be read — empty or
+    half-written by such a copy — vouches for nothing: every marker this module writes has a size."""
+    marker = directory / COMPLETE_MARKER
+    if not marker.is_file():
+        return False
+    try:
+        expected = int(marker.read_text().strip())
+    except (OSError, ValueError):
+        return False
+    have = sum(f.stat().st_size for f in directory.rglob("*") if f.is_file() and not f.name.startswith(".gpm-"))
+    return have >= expected
+
+
 class HubRefused(Exception):
     """The hub said no, or the request was not one this module will make."""
 
