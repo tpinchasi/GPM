@@ -123,8 +123,12 @@ class Dispatcher:
         the second is waiting for its hosts — not ineligible on the first group's."""
         if need.workload is None:
             return self.has_ready_host(None)
+        # Holds the model at all — not "can serve this request": a ready host that lacks the
+        # schema or runtime class asked for makes the request ineligible, not the workload
+        # unready (app contract: `no_eligible_host`).
         return any(
-            h.workload == need.workload and h.state is HostState.READY and self.variant_for(h, need) is not None
+            h.workload == need.workload and h.state is HostState.READY
+            and (need.model in h.variants or need.model in h.literal_variants)
             for h in self.hosts
         )
 

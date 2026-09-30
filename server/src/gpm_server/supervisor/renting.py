@@ -289,7 +289,9 @@ class Fleet:
         #: thirty seconds; and the last rental-kind choice said, per workload (D82's rule).
         self._sizing_cache: dict[tuple, tuple[float, Any]] = {}
         self._hardware_cache: Optional[tuple[float, dict[str, str]]] = None
-        self._said_kind: dict[str, tuple] = {}
+        self._said_kind: dict[tuple, tuple] = {}
+        #: The last "no offer holds this group's split" said, per group (D118).
+        self._said_unfit: dict[tuple, int] = {}
         #: Whether the provider has ever returned a charge figure. The narrow cap margin is
         #: only earned once it has.
         self.charges_ever_reported = False
@@ -764,24 +766,34 @@ class Fleet:
             return at.workers, f"{why}; held to {at.workers} for the {target.latency_s:g}s target: {at.reasons[0]}"
         return workers, f"{why}; {at.reasons[0]}"
 
-    def per_model_on(self, offer: Offer, spec: Any, models: Sequence[str], builds: dict[str, str]) -> dict[str, int]:
+    def per_model_on(self, offer: Offer, spec: Any, models: Sequence[str], builds: dict[str, str],
+                     unrefuted_is_open: bool = False) -> dict[str, int]:
         """How many answers of each model, alone, one host from this offer serves within the
-        model's target: measured where the log has it, else the card's own number (D115, D118)."""
+        model's target: measured where the log has it, else the card's own number (D115, D118).
+
+        `unrefuted_is_open`: a measured number that no higher measured concurrency refutes is a
+        floor, not a ceiling — the card may serve more. A split host only ever runs a model up to
+        its share, so its own answers could otherwise never show the card holds the split, and a
+        lost host of a group could never be replaced on the card it was planned on."""
         card_workers, _ = self._workers_for_card(offer)
         found = {}
         for model in models:
             target = spec.target(model)
             latency = target.latency_s if target is not None else spec.latency_s
             at = self.model_at_latency(offer.hardware, builds.get(model) or model, latency, ceiling=card_workers)
-            found[model] = min(card_workers, at.workers) if at.workers is not None else card_workers
+            if at.workers is None:
+                found[model] = card_workers
+            elif unrefuted_is_open and not any(c > at.workers for c in at.curve):
+                found[model] = card_workers
+            else:
+                found[model] = min(card_workers, at.workers)
         return found
 
     def split_fits_on(self, offer: Offer, spec: Any, group: Any) -> bool:
-        return workload_math.split_fits(group.caps, self.per_model_on(offer, spec, group.models, group.builds))
-
-    def latency_sizing(self, hardware: str, spec: Any, ceiling: int) -> workload_math.AtLatency:
-        """The sizing of a one-model workload's model on this card (D115)."""
-        return self.model_at_latency(hardware, spec.builds.get(spec.model) or spec.model, spec.latency_s, ceiling)
+        """Can a host from this offer run the group's split within every target? Judged by what
+        has been measured to fail, not by what a split host has had the chance to show."""
+        return workload_math.split_fits(
+            group.caps, self.per_model_on(offer, spec, group.models, group.builds, unrefuted_is_open=True))
 
     def model_at_latency(self, hardware: str, tag: str, latency_s: float, ceiling: int) -> workload_math.AtLatency:
         """What the request log measured for this build on machines of this card: the whole
@@ -789,10 +801,12 @@ class Fleet:
         with nothing else on the host, so a model's curve never carries another's load (D118).
         Rows from before the same-model count was logged are kept."""
         card = self._card_of(hardware)
-        key = (card, tag, float(latency_s), int(ceiling))
+        # The samples are cached, not the answer: one read of the log serves every target and
+        # every ceiling asked of the same card and build within the window.
+        key = (card, tag)
         cached = self._sizing_cache.get(key)
         if cached is not None and time.monotonic() - cached[0] < 30.0:
-            return cached[1]
+            return workload_math.workers_at_latency(cached[1], latency_s, ceiling)
         host_ids = [host_id for host_id, seen in self._hardware_of_hosts().items() if self._card_of(seen) == card]
         samples: list[tuple[int, float]] = []
         if host_ids:
@@ -805,10 +819,9 @@ class Fleet:
                 (tag, *host_ids),
             )
             samples = [(int(r["concurrency"]), float(r["latency_ms"]) / 1000) for r in rows]
-        found = workload_math.workers_at_latency(samples, latency_s, ceiling)
         # Read once in a while, not once per offer: a search weighs dozens (the review's finding 12).
-        self._sizing_cache[key] = (time.monotonic(), found)
-        return found
+        self._sizing_cache[key] = (time.monotonic(), samples)
+        return workload_math.workers_at_latency(samples, latency_s, ceiling)
 
     def _hardware_of_hosts(self) -> dict[str, str]:
         """Each rented host's hardware, from the decision log (the `rented` events carry it)."""
@@ -1404,6 +1417,11 @@ class Fleet:
             return False, "a host serves with at least one worker"
         if workers == host.workers:
             return True, f"{host.host_id} already runs {workers} workers"
+        if host.workload is not None and len(host.models) > 1:
+            # Its workers are its models' shares added up (D118): fewer, and one model's share
+            # starves the other's; more, and nothing ever uses them.
+            return False, (f"{host.host_id} runs its workload's split of {', '.join(host.models)}: its worker "
+                           "count is the sum of their shares, and is not changed by hand")
 
         if workers < host.workers:
             was = host.workers
@@ -2868,19 +2886,21 @@ class Fleet:
         another demand may not take (workloads.md §8). Counted per group (D118): one group above
         its floor hides nothing of another still below its own. The shared workload yields to
         every workload's; a workload yields to those created before it, and they to none of its —
-        the room is taken in the order the workloads were opened, never held back both ways; a
-        group yields to its own workload's other groups still short of their start."""
+        the room is taken in the order the workloads were opened, never held back both ways. Within
+        one workload the same holds in the order of its groups: a group yields to those listed
+        before it, never they to it — two groups yielding to each other would both wait for ever."""
         mine = self.workloads.get(besides) if besides is not None else None
         if mine is not None and group is None:
             group = self.first_group(besides)
+        my_index = next((i for i, g in enumerate(mine.groups) if g.key == group), 0) if mine is not None else 0
         total = 0
         for name, spec in self.workloads.items():
             if spec.state not in ("preparing", "serving"):
                 continue
             if mine is not None and name != besides and not spec.created_at < mine.created_at:
                 continue
-            for g in spec.groups:
-                if name == besides and g.key == group:
+            for index, g in enumerate(spec.groups):
+                if name == besides and index >= my_index:
                     continue
                 total += max(0, g.hosts_at_start - len(self.hosts_of(name, g.key)))
         return total
@@ -3045,13 +3065,26 @@ class Fleet:
             if not fitting:
                 self.last_refusal = (f"none of {len(ranked)} accepted offers holds {', '.join(chosen_group.models)} "
                                      f"at {chosen_group.caps} within their targets")
+                # Said when it changes, like "nothing passed the policy" (D82): a group stuck short
+                # of its start must show in the decision log, not only in a field the next call
+                # overwrites.
+                said = (workload, chosen_group.key)
+                if self._said_unfit.get(said) != len(ranked):
+                    self._said_unfit[said] = len(ranked)
+                    self.events.record("split_unfit", self.last_refusal,
+                                       numbers={"workload": workload, "models": list(chosen_group.models),
+                                                "caps": chosen_group.caps, "accepted": len(ranked)},
+                                       lease_id=lease.lease_id)
                 return None
+            self._said_unfit.pop((workload, chosen_group.key), None)
             ranked = fitting
 
         if spec is not None and spec.kind == "roi" and offer_id is None:
             # On demand or a bid, by what each is expected to cost this workload over the hours
             # its lease has left (D115). Deterministic, with its reasons; every cap still applies.
-            ranked, kind_reasons = self._by_rental_kind(ranked, lease, spec, for_this_host, builds)
+            ranked, kind_reasons = self._by_rental_kind(
+                ranked, lease, spec, for_this_host, builds,
+                fixed_workers=chosen_group.workers_per_host if len(chosen_group.models) > 1 else None)
             reasons = [*reasons, *kind_reasons[:1]]
         warm = self._warm_volumes(spec, builds) if spec is not None else {}
         if warm and offer_id is None and any(o.machine_id in warm for o, _ in ranked):
@@ -3326,6 +3359,7 @@ class Fleet:
     def expected_costs(
         self, ranked: list[tuple[Offer, float]], hours: float, spec: Any,
         models: Sequence[str], builds: dict[str, str], max_all_in_hourly: Optional[float] = None,
+        fixed_workers: Optional[int] = None, have: Optional[float] = None,
     ) -> tuple[list[workload_math.KindCost], list[str]]:
         """What each accepted offer is expected to cost a workload per worker-hour over `hours`
         (D115, workloads.md §5), cheapest first, with the line that says why. A bid's expected
@@ -3336,11 +3370,14 @@ class Fleet:
         hours = max(hours, 1e-6)
         size = self.model_set_gb(models, builds)
         record_of = self.machine_history()
-        have = sum(h.workers for h in self.hosts_of(spec.name, group_key(models)) if h.state != "draining")
+        if have is None:
+            have = sum(h.workers for h in self.hosts_of(spec.name, group_key(models)) if h.state != "draining")
         on_demand = [o.all_in_hourly for o, _ in ranked if not o.interruptible]
         costs = []
         for offer, _ in ranked:
-            workers = self.capacity_on(offer, spec, models, builds)
+            # A group of several models runs its fixed split on whatever card it is rented (D118):
+            # a bigger card is not more capacity to it, only more cost.
+            workers = fixed_workers if fixed_workers is not None else self.capacity_on(offer, spec, models, builds)
             if workers <= 0:
                 continue  # holds the models, but not every one within its target at once
             if offer.interruptible:
@@ -3377,10 +3414,11 @@ class Fleet:
 
     def _by_rental_kind(
         self, ranked: list[tuple[Offer, float]], lease: Lease, spec: Any,
-        models: Sequence[str], builds: dict[str, str],
+        models: Sequence[str], builds: dict[str, str], fixed_workers: Optional[int] = None,
     ) -> tuple[list[tuple[Offer, float]], list[str]]:
         """The accepted offers in the rental-kind rule's order, over the hours the lease has left."""
-        ordered, why = self.expected_costs(ranked, lease.hours_left(), spec, models, builds, lease.max_all_in_hourly)
+        ordered, why = self.expected_costs(ranked, lease.hours_left(), spec, models, builds, lease.max_all_in_hourly,
+                                           fixed_workers=fixed_workers)
         by_id = {offer.offer_id: (offer, points) for offer, points in ranked}
         said = (ordered[0].offer_id, ordered[0].interruptible) if ordered else None
         # Per group (D118): two groups choosing differently must not flip the one note.

@@ -134,13 +134,23 @@ def split_together(parallel: Mapping[str, int], per_host: Mapping[str, int]) -> 
         return None
     if sum(1 / per_host[m] for m in models) > 1 + 1e-9:
         return None  # one answer of each already fills the card
-    hosts = max(1, math.ceil(sum(parallel[m] / per_host[m] for m in models) - 1e-9))
-    while True:
-        caps = {m: math.ceil(parallel[m] / hosts) for m in models}
-        load = sum(caps[m] / per_host[m] for m in models)
-        if load <= 1 + 1e-9:
-            return Split(hosts=hosts, caps=caps, workers=sum(caps.values()), load=round(load, 4))
-        hosts += 1
+
+    def load_at(hosts: int) -> float:
+        return sum(math.ceil(parallel[m] / hosts) / per_host[m] for m in models)
+
+    # The load only falls as hosts are added (every cap is a ceiling of parallel / hosts), and at
+    # the largest `parallel` every cap is 1, which fits: so the fewest hosts that fit is found by
+    # halving, in a few dozen steps whatever the numbers — never one host at a time.
+    low = max(1, math.ceil(sum(parallel[m] / per_host[m] for m in models) - 1e-9))
+    high = max(low, max(parallel[m] for m in models))
+    while low < high:
+        middle = (low + high) // 2
+        if load_at(middle) <= 1 + 1e-9:
+            high = middle
+        else:
+            low = middle + 1
+    caps = {m: math.ceil(parallel[m] / low) for m in models}
+    return Split(hosts=low, caps=caps, workers=sum(caps.values()), load=round(load_at(low), 4))
 
 
 def split_fits(caps: Mapping[str, int], per_host: Mapping[str, int]) -> bool:

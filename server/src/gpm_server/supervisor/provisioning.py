@@ -15,8 +15,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from ..certs import load_ca
 from ..provisioning_store import KEY_HASH, NAME, Grant, ProvisioningStore
-from ..workload_store import ModelTarget
-from .workloads import KINDS, WorkloadRefused, WorkloadRequest
+from .workloads import KINDS, WorkloadRefused, WorkloadRequest, parse_targets
 
 if TYPE_CHECKING:
     from .service import Supervisor
@@ -155,27 +154,10 @@ class Provisioning:
     def _request(self, provisioner: Any, body: dict, name: str) -> tuple[WorkloadRequest, float, bool]:
         """The request, checked against the grant: every field is untrusted until here."""
         grant: Grant = provisioner.grant
-        if body.get("models") is not None:
-            # Several models, each with its own target (D118): every one within the grant.
-            if body.get("model") is not None:
-                raise WorkloadRefused("send model, or models — not both")
-            listed = body["models"]
-            if not isinstance(listed, list) or not listed or not all(isinstance(m, dict) for m in listed):
-                raise WorkloadRefused("models is a list of {model, latency_s, parallel}")
-            targets = []
-            for entry in listed:
-                model = entry.get("model")
-                if not isinstance(model, str) or model not in grant.models:
-                    raise WorkloadRefused(f"this key may create workloads for {list(grant.models)}")
-                targets.append(ModelTarget(model, _number(entry, "latency_s"), _number(entry, "parallel", integer=True)))
-        else:
-            model = body.get("model")
-            if not isinstance(model, str) or model not in grant.models:
-                raise WorkloadRefused(f"this key may create workloads for {list(grant.models)}")
-            targets = [ModelTarget(model, _number(body, "latency_s"), _number(body, "parallel", integer=True))]
-        placement = body.get("placement", "auto")
-        if placement not in ("auto", "together", "apart"):
-            raise WorkloadRefused("placement is auto, together or apart")
+        targets, placement = parse_targets(body)
+        refused = [t.model for t in targets if t.model not in grant.models]
+        if refused:
+            raise WorkloadRefused(f"this key may create workloads for {list(grant.models)}")
         kind = body.get("machines", "roi")
         if kind not in grant.kinds:
             raise WorkloadRefused(f"this key may rent {list(grant.kinds)}")

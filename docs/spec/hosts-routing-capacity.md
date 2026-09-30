@@ -448,8 +448,10 @@ class**, derived from the variant and the host's platform, never typed in by han
 ## 5. Routing
 
 **The request's workload comes first** ([workloads.md](workloads.md) §4, D115): a workload's
-request may only reach that workload's hosts — and, while it has none ready, a bounded share of
-the shared workload's, behind the shared workload's own requests. Everything below is within
+request may only reach that workload's hosts — and, while none of them holding the requested model
+is ready (per model, D118), a bounded share of the shared workload's, behind the shared
+workload's own requests. A workload host holding several models takes at most its share of each at
+once (workloads.md §12). Everything below is within
 what the workload allows.
 
 Strict tiers. A lower tier is touched only when every eligible worker above it is busy.

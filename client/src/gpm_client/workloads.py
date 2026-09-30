@@ -86,8 +86,8 @@ class Workload:
         return self._provisioner._get(f"/pool/provisioning/workloads/{self.name}")
 
     def wait_until_serving(self, timeout_s: float = 1800.0, poll_s: float = 5.0) -> None:
-        """Until one of its own hosts is ready. Meanwhile it may already be served on shared
-        hosts, where the pool lets it borrow."""
+        """Until it is serving: a host of its own ready for every model it serves (D118).
+        Meanwhile a model may already be served on shared hosts, where the pool lets it borrow."""
         deadline = time.monotonic() + timeout_s
         while True:
             seen = self.state()
@@ -183,7 +183,6 @@ class WorkloadProvisioner:
                 raise PoolError(f"the pool did not answer request {request_id} within {timeout_s:g}s")
             time.sleep(self._poll_s)
 
-    @staticmethod
     @staticmethod
     def _body(model: Optional[str], latency_s: Optional[float], parallel: Optional[int], hours: float,
               max_spend: float, machines: str, idle_end_minutes: Optional[float],

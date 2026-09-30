@@ -142,3 +142,22 @@ def test_the_cheaper_placement_wins_and_a_tie_goes_together():
     chosen, why = w.choose_placement(None, apart)
     assert chosen is apart and "no card" in why[0]
     assert w.choose_placement(None, None)[0] is None
+
+
+def test_a_split_of_huge_numbers_is_found_at_once():
+    """Found in review: the split was searched one host at a time, and a plan asking for a
+    trillion answers at once held the supervisor's loop for hours."""
+    import time
+
+    started = time.monotonic()
+    split = w.split_together({"a": 10**12, "b": 1}, {"a": 3, "b": 4})
+    assert time.monotonic() - started < 0.1
+    assert split.load <= 1 and split.hosts > 10**11
+
+
+def test_the_split_is_the_fewest_hosts_that_fit():
+    for parallel, per_host in [({"a": 16, "b": 4}, {"a": 8, "b": 32}), ({"a": 7, "b": 5, "c": 3}, {"a": 4, "b": 9, "c": 12}),
+                               ({"a": 1, "b": 1}, {"a": 2, "b": 2}), ({"a": 100, "b": 3}, {"a": 5, "b": 3})]:
+        split = w.split_together(parallel, per_host)
+        fewer = split.hosts - 1
+        assert fewer < 1 or sum(-(-parallel[m] // fewer) / per_host[m] for m in parallel) > 1 + 1e-9

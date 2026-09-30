@@ -212,3 +212,56 @@ async def test_a_model_whose_hosts_are_still_coming_up_is_preparing_not_ineligib
     assert lent.borrowed and lent.host.host_id == "laptop"
     own = await dispatcher.acquire(for_model("chat", may_borrow=True), request_id="c1", deadline=soon())
     assert not own.borrowed and own.host.host_id == "rented-chat", "a model with its own ready host never borrows"
+
+
+async def test_a_ready_host_that_cannot_meet_the_request_is_ineligible_not_unready():
+    """Found in review: a schema the workload's build cannot enforce read as `workload_preparing`."""
+    from gpm_server.router.dispatch import NoEligibleHost
+
+    host = workload_host("rented-a", "research", workers=2)
+    dispatcher = Dispatcher([host])
+    with pytest.raises(NoEligibleHost):
+        await dispatcher.acquire(Need("m1", workload="research", wants_schema=True), request_id="r1", deadline=soon())
+
+
+async def test_under_a_storm_of_requests_no_host_ever_exceeds_a_models_share():
+    """Stress: 400 requests of two models, three split hosts (6 chat + 2 embed each), random hold
+    times, clients giving up. At every moment each host holds at most its share of each model and
+    at most its workers; every request is served or times out; nothing is left busy."""
+    import random
+
+    rng = random.Random(118)
+    hosts = [two_model_host(f"rented-{i}", "research", workers=8) for i in range(3)]
+    dispatcher = Dispatcher(hosts)
+    caps = {"chat": 6, "embed": 2}
+    worst = {"chat": 0, "embed": 0, "total": 0}
+    outcomes = {"served": 0, "timed_out": 0}
+
+    def check():
+        for host in hosts:
+            for model, cap in caps.items():
+                held = dispatcher.busy_with(host, model)
+                assert held <= cap, f"{host.host_id} holds {held} {model}, over its share {cap}"
+                worst[model] = max(worst[model], held)
+            assert host.busy <= len(host.workers)
+            worst["total"] = max(worst["total"], host.busy)
+
+    async def one(i):
+        model = "chat" if rng.random() < 0.75 else "embed"
+        await asyncio.sleep(rng.random() * 0.2)
+        try:
+            got = await dispatcher.acquire(for_model(model, cap=caps[model]), request_id=f"r{i}",
+                                           deadline=time.monotonic() + rng.choice([0.05, 0.5, 2.0]))
+        except QueueTimeout:
+            outcomes["timed_out"] += 1
+            return
+        check()
+        await asyncio.sleep(rng.random() * 0.02)
+        check()
+        await dispatcher.release(got)
+        outcomes["served"] += 1
+
+    await asyncio.gather(*(one(i) for i in range(400)))
+    assert outcomes["served"] + outcomes["timed_out"] == 400 and outcomes["served"] > 300
+    assert worst["chat"] == 6 and worst["embed"] == 2, "the shares were reached, and never passed"
+    assert all(h.busy == 0 for h in hosts), "every worker handed back"

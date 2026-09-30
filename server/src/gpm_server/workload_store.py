@@ -126,10 +126,6 @@ class Workload:
     def target(self, model: str) -> Optional[ModelTarget]:
         return next((t for t in self.targets if t.model == model), None)
 
-    def group_of(self, models: Any) -> Optional[Group]:
-        """The group of hosts holding exactly these models."""
-        return next((g for g in self.groups if g.holds(models)), None)
-
     def group_serving(self, model: str) -> Optional[Group]:
         return next((g for g in self.groups if model in g.models), None)
 
@@ -218,12 +214,6 @@ class WorkloadStore:
     def set_cert_fingerprint(self, name: str, fingerprint: str) -> None:
         self.db.execute("UPDATE workloads SET cert_fingerprint = ?, updated_at = ? WHERE name = ?",
                         (fingerprint, time.time(), name))
-
-    def set_serving_at(self, name: str) -> None:
-        """When its first host became ready (D117, D118)."""
-        now = time.time()
-        self.db.execute("UPDATE workloads SET serving_at = COALESCE(serving_at, ?), updated_at = ? WHERE name = ?",
-                        (now, now, name))
 
     def set_ends_at(self, name: str, ends_at: float) -> None:
         self.db.execute("UPDATE workloads SET ends_at = ?, updated_at = ? WHERE name = ?", (ends_at, time.time(), name))

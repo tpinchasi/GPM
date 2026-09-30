@@ -191,6 +191,11 @@ def test_a_workload_of_two_models_is_planned_and_created_from_the_console(pool):
         assert "Placement" not in page.js("__text()"), "no placement to choose with one model"
         page.js("__click('Add model')")
         page.until("document.querySelectorAll('.model-row').length === 2", within=10, what="a second row")
+        page.until("document.activeElement === document.querySelectorAll('.model-row')[1].querySelector('select')",
+                   within=5, what="focus on the new row")
+        assert page.js(f"[...document.querySelectorAll('.model-row')[1].querySelector('select').options]"
+                       f".find(o => o.value === {json.dumps(BIG)}).disabled"), "a model already in a row cannot be picked twice"
+        assert page.js("document.querySelectorAll('.model-row')[1].getAttribute('aria-label')") == "Model 2 of 2"
         page.js(f"const s = document.querySelectorAll('.model-row')[1].querySelector('select'); s.value = {json.dumps(SOLO)};"
                 "s.dispatchEvent(new Event('change')); true")
         assert "Placement" in page.js("__text()")
@@ -199,6 +204,7 @@ def test_a_workload_of_two_models_is_planned_and_created_from_the_console(pool):
         page.until("__text().includes('placement')", within=30, what="the plan")
         text = page.js("__text()")
         assert "together:" in text and "apart:" in text and "expected over" in text, text
+        assert "kept:" in text and "(kept)" in text and "in all)" in text
         shot(page, "08-two-models-planned")
         page.js("__click('Create — up to')")
         page.until("document.getElementById('confirm-dialog').open", within=10, what="the confirmation")

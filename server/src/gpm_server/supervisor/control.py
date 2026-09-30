@@ -632,6 +632,8 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 "workload_models": sorted(
                     name for name, entry in supervisor.config.catalog.items() if entry.workloads_only
                 ),
+                # How many models one workload may serve (D118): the console's form stops there.
+                "workload_max_models": supervisor.config.workloads.max_models,
                 "catalog": {
                     name: [
                         {
@@ -1504,53 +1506,21 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
     # --- workloads (D115, docs/spec/workloads.md) ---
 
     def _workload_request(body: dict) -> Any:
-        from ..workload_store import ModelTarget
-        from .workloads import WorkloadRequest
+        from .workloads import WorkloadRefused, WorkloadRequest, parse_targets
 
-        def number(name: str, cast, source: Optional[dict] = None):
-            value = (source if source is not None else body).get(name)
-            if value is None:
-                return None
-            if isinstance(value, bool):
-                raise ValueError(f"{name} must be a number")
-            return cast(value)
-
-        if body.get("models") is not None:
-            # Several models, each with its own target (D118): [{model, latency_s, parallel}, ...].
-            if body.get("model") is not None:
-                raise ValueError("send model, or models — not both")
-            listed = body["models"]
-            if not isinstance(listed, list) or not listed or not all(isinstance(m, dict) for m in listed):
-                raise ValueError("models is a list of {model, latency_s, parallel}")
-            for required in ("name", "hours"):
-                if body.get(required) in (None, ""):
-                    raise KeyError(required)
-            targets = []
-            for entry in listed:
-                for required in ("model", "latency_s", "parallel"):
-                    if entry.get(required) in (None, ""):
-                        raise KeyError(f"models[].{required}")
-                targets.append(ModelTarget(str(entry["model"]).strip(), number("latency_s", float, entry),
-                                           number("parallel", int, entry)))
-            return WorkloadRequest.of(
-                str(body.get("name") or "").strip(), targets, number("hours", float),
-                max_spend=number("max_spend", float),
-                profile=(str(body["profile"]).strip() or None) if body.get("profile") else None,
-                kind=str(body.get("kind") or "roi"), placement=str(body.get("placement") or "auto"),
-            )
-        for required in ("name", "model", "latency_s", "parallel", "hours"):
+        for required in ("name", "hours"):
             if body.get(required) in (None, ""):
                 raise KeyError(required)
-        return WorkloadRequest(
-            name=str(body.get("name") or "").strip(),
-            model=str(body.get("model") or "").strip(),
-            latency_s=number("latency_s", float),
-            parallel=number("parallel", int),
-            hours=number("hours", float),
-            max_spend=number("max_spend", float),
+        hours, spend = body.get("hours"), body.get("max_spend")
+        for name, value in (("hours", hours), ("max_spend", spend)):
+            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
+                raise WorkloadRefused(f"{name} must be a number")
+        targets, placement = parse_targets(body)
+        return WorkloadRequest.of(
+            str(body.get("name") or "").strip(), targets, float(hours),
+            max_spend=float(spend) if spend is not None else None,
             profile=(str(body["profile"]).strip() or None) if body.get("profile") else None,
-            kind=str(body.get("kind") or "roi"),
-            placement=str(body.get("placement") or "auto"),
+            kind=str(body.get("kind") or "roi"), placement=placement,
         )
 
     async def _workload_call(fn):

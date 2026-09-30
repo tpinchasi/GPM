@@ -21,14 +21,14 @@ It is always there, and it needs no change to keep working exactly as it did.
 | | |
 |---|---|
 | `name` | Plain, unique in the pool; part of the host labels and the log |
-| `profile` | The model profile its hosts are bought as (hosts-routing-capacity.md §3.1): one model, one build for the rented engine. Named by the operator, or made from the catalog's first build of `--model` |
+| `profile` | The model profile its hosts are bought as (hosts-routing-capacity.md §3.1): one build per model for the rented engine, and with several models the profile holds them all. Named by the operator, or made from the catalog's first build of `--model` |
 | `models` | One to four, each with its own `latency_s` and `parallel` (§12, D118). With one, the rows below are that model's |
 | `latency_s` | The whole answer, at p95, measured where the router hands the response to the app — after buffering, for a host that buffers (app-contract.md §5.1). Time to first byte is not a target: buffered delivery already makes it the whole generation |
 | `parallel` | How many answers at once it must serve: the lease's `workers`, the ceiling of its scaling |
 | `lease` | Its spending authority: `workers = parallel`, `max_hours`, `max_spend`, `allow_rent`, opened by the create command and bound to the workload. Every rule of supervisor.md §2 applies; a lease that can rent must carry a dollar cap |
 | `key` | Its own bearer key, `gpmw_…`, minted at creation, stored hashed, valid while the lease is open |
 | `hosts` | The rented hosts bought for it. A workload owns no configured host; local and fixed hosts belong to the shared workload |
-| `state` | `preparing` (no host of its own ready; borrowing) → `serving` → `ending` (lease closed or expired; draining) → `ended` |
+| `state` | `preparing` (some model without a ready host of its own; that model borrows) → `serving` → `ending` (lease closed or expired; draining) → `ended` |
 
 ## 2. Creating one
 
@@ -54,7 +54,8 @@ these steps — and does nothing until the budget is confirmed:
    adjustment (D67) does not climb past it.
 3. **Hosts at the start** `= ceil(parallel ÷ workers per host)`.
 4. **The budget.** `--max-spend` typed, or derived: hosts × hours × the hourly price of the first
-   host the plan would rent × 1.25 — shown, and accepted only by sending it back
+   host the plan would rent × 1.25 — with several groups, the sum over them of each group's
+   hosts × its first host's price, × hours × 1.25 (§12) — shown, and accepted only by sending it back
    (`--confirm-max-spend`, or typed again in the console), as every loosening is.
 5. **The lease** is opened, bound to the workload. Its hosts are searched for with the profile's
    card and disk minimums (D111) and the reliability floor `workloads.min_reliability`; download
@@ -107,16 +108,18 @@ workload decides which hosts are eligible at all.**
 - A workload's request goes to that workload's `ready` hosts that hold the model. They are all
   rented, so they sit in one tier; the least-loaded takes it; all busy → the queue, first come
   first served, as before.
-- **Borrowing, only while preparing.** While the workload has no ready host of its own, its
-  requests may go to the shared workload's ready hosts that serve the model — after the shared
+- **Borrowing, only while preparing.** While the workload has no ready host of its own holding the
+  requested model (per model, §12), requests for that model may go to the shared workload's ready
+  hosts that serve the model — after the shared
   workload's own requests, never before them, and never more than `borrow_share` (default 0.25)
   of the shared workload's ready workers at once — **for every borrowing workload together**, so
   three workloads starting at once cannot take three quarters — rounded down, at least one where
   the share rounds to nothing. A borrower does not take a shared worker that a queued shared
   request could use; a shared request that stops waiting (served, timed out, gone) wakes the
   borrowers it held back. The shared workload does not scale up for lent work: a host's borrowed
-  workers are published apart from its own. The moment one host of the workload is ready, borrowing stops and the workload queues on
-  its own hosts: a workload that could always borrow would have no reason to be sized.
+  workers are published apart from its own. The moment one host of the workload holding the model is
+  ready, borrowing for that model stops and its requests queue on the workload's own hosts: a
+  workload that could always borrow would have no reason to be sized.
 - The shared workload never borrows. Two workloads never see each other's hosts.
 - Every request is logged with its workload; the borrowed ones are marked, so the shared
   workload's operator sees what was lent and the workload's owner sees what was borrowed.
@@ -170,7 +173,8 @@ it took, so the history shows what each saved:
 
 1. **A warm machine.** With `workloads.keep_models_on_machine: true`, the pool creates a local
    volume with the workload's first host, mounted where its engine keeps models (the engine's
-   `models_dir`), labelled with the pool and workload (`gpm/<pool>/<workload>/models`). When the workload next needs a host — scale-up, or after an eviction — an offer
+   `models_dir`), labelled with the pool and workload (`gpm/<pool>/<workload>/models`; with several
+   groups, one volume per group, `…/models-<n>`, holding that group's builds — §12). When the workload next needs a host — scale-up, or after an eviction — an offer
    on a machine holding such a volume is preferred in the ranking, and a host prepared from it is
    created with the volume attached and fetches nothing. The volume's storage is spend: it is
    estimated into the lease's ledger at the provider's rate while it exists, and it is deleted
@@ -331,5 +335,6 @@ gpm workload create research --hours 6 --max-spend 25 \
   shared host that serves it, where the workload may borrow, or is refused `503 workload_preparing`
   — even while another group serves.
 - **State.** `serving` once every group has a ready host; until then the models without one borrow.
-  The idle cutoff (§11) counts from the first ready host of any group.
+  The idle cutoff (§11) counts from then: a workload whose groups do not all come up is bounded by
+  its lease.
 
