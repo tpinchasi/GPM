@@ -149,3 +149,66 @@ async def test_concurrency_is_read_when_the_worker_is_taken():
     first = await dispatcher.acquire(need(), request_id="r1", deadline=soon())
     second = await dispatcher.acquire(need(), request_id="r2", deadline=soon())
     assert (first.concurrency, second.concurrency) == (1, 2)
+
+
+# --- several models on one host (D118) ---
+
+
+def two_model_host(host_id, workload, workers, models=("chat", "embed"), state=HostState.READY):
+    from test_dispatch import PLAIN
+
+    host = workload_host(host_id, workload, workers=workers, state=state)
+    host.variants = {m: (PLAIN,) for m in models}
+    host.resident = frozenset(PLAIN.tag for _ in models)
+    return host
+
+
+def for_model(model, cap=None, workload="research", may_borrow=False):
+    return Need(model, workload=workload, cap=cap, may_borrow=may_borrow, borrow_share=0.5)
+
+
+async def test_a_model_past_its_share_of_a_host_waits_and_the_other_still_gets_its_own():
+    """Caps of 6 chat and 2 embed on an 8-worker host: chat never takes embed's two."""
+    host = two_model_host("rented-a", "research", workers=8)
+    dispatcher = Dispatcher([host])
+    chats = [await dispatcher.acquire(for_model("chat", cap=6), request_id=f"c{i}", deadline=soon()) for i in range(6)]
+    assert chats[-1].model_concurrency == 6 and chats[-1].concurrency == 6
+    with pytest.raises(QueueTimeout):
+        await dispatcher.acquire(for_model("chat", cap=6), request_id="c7", deadline=soon(0.05))
+    embeds = [await dispatcher.acquire(for_model("embed", cap=2), request_id=f"e{i}", deadline=soon()) for i in range(2)]
+    assert embeds[-1].model_concurrency == 2 and embeds[-1].concurrency == 8
+
+
+async def test_a_capped_request_is_served_the_moment_its_model_frees_a_worker():
+    host = two_model_host("rented-a", "research", workers=3)
+    dispatcher = Dispatcher([host])
+    first = await dispatcher.acquire(for_model("chat", cap=1), request_id="c1", deadline=soon())
+    waiting = asyncio.create_task(dispatcher.acquire(for_model("chat", cap=1), request_id="c2", deadline=soon(2)))
+    await asyncio.sleep(0.05)
+    assert not waiting.done(), "one chat at a time on this host, though two workers are idle"
+    await dispatcher.release(first)
+    second = await asyncio.wait_for(waiting, 1)
+    assert second.worker.model == "chat" and dispatcher.busy_with(host, "chat") == 1
+
+
+async def test_no_cap_on_a_one_model_workload_or_the_shared_workload():
+    host = two_model_host("rented-a", "research", workers=3)
+    dispatcher = Dispatcher([host])
+    for i in range(3):
+        await dispatcher.acquire(for_model("chat"), request_id=f"c{i}", deadline=soon())
+
+
+async def test_a_model_whose_hosts_are_still_coming_up_is_preparing_not_ineligible():
+    """Apart: the chat group serves, the embed group prepares. An embed request is waiting on its
+    own hosts — it borrows where it may, and is `no ready host` where it may not."""
+    chat = two_model_host("rented-chat", "research", workers=4, models=("chat",))
+    embed = two_model_host("rented-embed", "research", workers=4, models=("embed",), state=HostState.PREPARING)
+    shared = make_host("laptop", 0, workers=4)
+    shared.variants = {"embed": shared.variants["m1"]}
+    dispatcher = Dispatcher([chat, embed, shared])
+    with pytest.raises(NoReadyHost):
+        await dispatcher.acquire(for_model("embed"), request_id="e1", deadline=soon(0.05))
+    lent = await dispatcher.acquire(for_model("embed", may_borrow=True), request_id="e2", deadline=soon())
+    assert lent.borrowed and lent.host.host_id == "laptop"
+    own = await dispatcher.acquire(for_model("chat", may_borrow=True), request_id="c1", deadline=soon())
+    assert not own.borrowed and own.host.host_id == "rented-chat", "a model with its own ready host never borrows"

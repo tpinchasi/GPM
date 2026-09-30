@@ -38,6 +38,10 @@ class Need:
     #: share of the shared workload's ready workers all borrowers together may hold.
     may_borrow: bool = False
     borrow_share: float = 0.0
+    #: The most answers of this model one host of the workload takes at once, where the host
+    #: holds several of its models (D118) — a fixed share of the card, so no model starves
+    #: another and each stays within its target. None: no such limit (one model, or shared).
+    cap: Optional[int] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -50,6 +54,8 @@ class Assignment:
     #: How many answers the host was serving once this one was given it — the concurrency its
     #: latency is measured at, read under the dispatch lock where it cannot move (D115).
     concurrency: int = 1
+    #: Of those, how many were of the same model (D118).
+    model_concurrency: int = 1
 
 
 class NoReadyHost(Exception):
@@ -103,12 +109,28 @@ class Dispatcher:
             if variant is None:
                 continue
             (own if host.workload == need.workload else shared).append((host, variant))
-        if need.workload is not None and need.may_borrow and not self.has_ready_host(need.workload):
+        if need.workload is not None and need.may_borrow and not self.ready_for(need):
             return own + shared
         return own
 
     def has_ready_host(self, workload: Optional[str]) -> bool:
         return any(h.workload == workload and h.state is HostState.READY for h in self.hosts)
+
+    def ready_for(self, need: Need) -> bool:
+        """Is a host of the request's own workload ready that holds its model? For the shared
+        workload, any ready host of it, as always. For a workload, per model (D118): with its
+        models apart, one group may be serving while another still comes up, and a request for
+        the second is waiting for its hosts — not ineligible on the first group's."""
+        if need.workload is None:
+            return self.has_ready_host(None)
+        return any(
+            h.workload == need.workload and h.state is HostState.READY and self.variant_for(h, need) is not None
+            for h in self.hosts
+        )
+
+    @staticmethod
+    def busy_with(host: Host, model: str) -> int:
+        return sum(1 for w in host.workers if w.state is WorkerState.BUSY and w.model == model)
 
     def lent_workers(self) -> int:
         """Shared workers serving a borrower right now."""
@@ -166,7 +188,9 @@ class Dispatcher:
                     if not candidates:
                         # Judged within the request's own workload: a workload with no ready host
                         # is not "ready but ineligible" because the shared hosts are up, and the
-                        # other way round.
+                        # other way round. A workload's request is judged by its own model's hosts.
+                        if need.workload is not None and not self.ready_for(need):
+                            raise NoReadyHost()
                         if self.has_ready_host(need.workload):
                             raise NoEligibleHost()
                         raise NoReadyHost()
@@ -200,6 +224,10 @@ class Dispatcher:
             tier = [
                 (h, v) for h, v in candidates
                 if h.priority == priority and h.idle_worker() is not None and self._may_take(h, need)
+                # A host holding several of the workload's models takes its share of each, and a
+                # request past its model's share waits for one to finish — never refused (D118).
+                and not (need.cap is not None and h.workload == need.workload
+                         and self.busy_with(h, need.model) >= need.cap)
             ]
             if not tier:
                 continue
@@ -209,8 +237,10 @@ class Dispatcher:
             worker.state = WorkerState.BUSY
             worker.request_id = request_id
             worker.borrowed = host.workload != need.workload
+            worker.model = need.model
             return Assignment(
                 host=host, worker=worker, variant=variant, borrowed=worker.borrowed, concurrency=host.busy,
+                model_concurrency=self.busy_with(host, need.model),
             )
         return None
 
@@ -220,6 +250,7 @@ class Dispatcher:
             worker.state = WorkerState.IDLE
             worker.request_id = None
             worker.borrowed = False
+            worker.model = None
             worker.served += 1
             self._condition.notify_all()
 

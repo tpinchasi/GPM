@@ -27,6 +27,59 @@ ANSWERING = ("preparing", "serving")
 ENDED_KEYS_KEPT_S = 7 * 24 * 3600
 
 @dataclasses.dataclass(frozen=True)
+class ModelTarget:
+    """One model a workload serves, with its own target (D118): the whole answer's p95 within
+    `latency_s`, `parallel` answers at once."""
+
+    model: str
+    latency_s: float
+    parallel: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class Group:
+    """A set of models every one of its hosts holds, and what scales (D118). A workload placed
+    *together* has one group of every model; *apart*, one group per model. A host's group is the
+    set of models it was bought for (`RentedHost.models`), so it needs no column of its own."""
+
+    models: tuple[str, ...]
+    builds: dict[str, str]
+    hosts_at_start: int
+    #: Workers each host runs: for several models, the sum of the caps.
+    workers_per_host: int
+    #: For several models on one host: at most this many answers of each at once, a fixed share
+    #: of the card. Empty for one model, whose host has no other to share with.
+    caps: dict[str, int] = dataclasses.field(default_factory=dict)
+    cards_per_copy: int = 1
+
+    @property
+    def key(self) -> tuple[str, ...]:
+        return tuple(sorted(self.models))
+
+    def holds(self, models: Any) -> bool:
+        return set(models) == set(self.models)
+
+    def as_dict(self) -> dict[str, Any]:
+        record = dataclasses.asdict(self)
+        record["models"] = list(self.models)
+        return record
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "Group":
+        return cls(models=tuple(raw["models"]), builds=dict(raw.get("builds") or {}),
+                   hosts_at_start=int(raw.get("hosts_at_start") or 0), workers_per_host=int(raw.get("workers_per_host") or 0),
+                   caps={k: int(v) for k, v in (raw.get("caps") or {}).items()},
+                   cards_per_copy=int(raw.get("cards_per_copy") or 1))
+
+
+def group_key(models: Any) -> tuple[str, ...]:
+    return tuple(sorted(models))
+
+
+@dataclasses.dataclass(frozen=True)
 class Workload:
     name: str
     model: str
@@ -50,13 +103,52 @@ class Workload:
     idle_end_minutes: Optional[float] = None
     cert_fingerprint: Optional[str] = None
     serving_at: Optional[float] = None
+    #: Every model it serves, each with its target (D118); and how they are placed on hosts. A
+    #: workload made before D118 — or with one model — is one target and one group, filled in
+    #: from the fields above; those fields stay for everything that reads one model.
+    targets: tuple[ModelTarget, ...] = ()
+    placement: str = "together"
+    groups: tuple[Group, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.targets:
+            object.__setattr__(self, "targets", (ModelTarget(self.model, self.latency_s, self.parallel),))
+        if not self.groups:
+            object.__setattr__(self, "groups", (Group(
+                models=(self.model,), builds={self.model: self.builds.get(self.model, self.model)},
+                hosts_at_start=self.hosts_at_start, workers_per_host=self.workers_per_host,
+                cards_per_copy=int((self.plan or {}).get("cards_per_copy") or 1)),))
+
+    @property
+    def models(self) -> tuple[str, ...]:
+        return tuple(t.model for t in self.targets)
+
+    def target(self, model: str) -> Optional[ModelTarget]:
+        return next((t for t in self.targets if t.model == model), None)
+
+    def group_of(self, models: Any) -> Optional[Group]:
+        """The group of hosts holding exactly these models."""
+        return next((g for g in self.groups if g.holds(models)), None)
+
+    def group_serving(self, model: str) -> Optional[Group]:
+        return next((g for g in self.groups if model in g.models), None)
+
+    def cap(self, model: str) -> Optional[int]:
+        """The most answers of `model` one host of its group takes at once, where it shares the
+        host with other models; None where it does not."""
+        group = self.group_serving(model)
+        return group.caps.get(model) if group is not None and len(group.models) > 1 else None
 
     @property
     def active(self) -> bool:
         return self.state != "ended"
 
     def as_dict(self) -> dict[str, Any]:
-        return dataclasses.asdict(self)
+        record = dataclasses.asdict(self)
+        record["models"] = list(self.models)
+        record["targets"] = [t.as_dict() for t in self.targets]
+        record["groups"] = [g.as_dict() for g in self.groups]
+        return record
 
 
 def _to_workload(row: Any) -> Workload:
@@ -69,6 +161,9 @@ def _to_workload(row: Any) -> Workload:
         ends_at=row["ends_at"],
         provisioner=row["provisioner"], idle_end_minutes=row["idle_end_minutes"],
         cert_fingerprint=row["cert_fingerprint"], serving_at=row["serving_at"],
+        targets=tuple(ModelTarget(**t) for t in json.loads(row["targets"])) if row["targets"] else (),
+        placement=row["placement"] or "together",
+        groups=tuple(Group.from_dict(g) for g in json.loads(row["groups"])) if row["groups"] else (),
     )
 
 
@@ -90,6 +185,8 @@ class Volume:
     lease_id: Optional[str]
     created_at: float
     deleted_at: Optional[float] = None
+    #: The builds it holds: its group's (D118). None for one made before groups: the workload's.
+    builds: Optional[dict[str, str]] = None
 
 
 class WorkloadStore:
@@ -104,8 +201,8 @@ class WorkloadStore:
             INSERT INTO workloads (
                 name, model, builds, latency_s, parallel, kind, lease_id, state,
                 workers_per_host, hosts_at_start, plan, created_at, updated_at, ended_at, ends_at,
-                provisioner, idle_end_minutes, cert_fingerprint
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                provisioner, idle_end_minutes, cert_fingerprint, targets, placement, groups
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 workload.name, workload.model, json.dumps(workload.builds), workload.latency_s,
@@ -113,12 +210,20 @@ class WorkloadStore:
                 workload.workers_per_host, workload.hosts_at_start, json.dumps(workload.plan),
                 workload.created_at, workload.updated_at, workload.ended_at, workload.ends_at,
                 workload.provisioner, workload.idle_end_minutes, workload.cert_fingerprint,
+                json.dumps([t.as_dict() for t in workload.targets]), workload.placement,
+                json.dumps([g.as_dict() for g in workload.groups]),
             ),
         )
 
     def set_cert_fingerprint(self, name: str, fingerprint: str) -> None:
         self.db.execute("UPDATE workloads SET cert_fingerprint = ?, updated_at = ? WHERE name = ?",
                         (fingerprint, time.time(), name))
+
+    def set_serving_at(self, name: str) -> None:
+        """When its first host became ready (D117, D118)."""
+        now = time.time()
+        self.db.execute("UPDATE workloads SET serving_at = COALESCE(serving_at, ?), updated_at = ? WHERE name = ?",
+                        (now, now, name))
 
     def set_ends_at(self, name: str, ends_at: float) -> None:
         self.db.execute("UPDATE workloads SET ends_at = ?, updated_at = ? WHERE name = ?", (ends_at, time.time(), name))
@@ -229,10 +334,10 @@ class WorkloadStore:
 
     def add_volume(self, volume: Volume) -> None:
         self.db.execute(
-            "INSERT INTO workload_volumes (volume_id, workload, machine_id, size_gb, hourly, lease_id, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO workload_volumes (volume_id, workload, machine_id, size_gb, hourly, lease_id, created_at, builds) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (volume.volume_id, volume.workload, volume.machine_id, volume.size_gb, volume.hourly,
-             volume.lease_id, volume.created_at),
+             volume.lease_id, volume.created_at, json.dumps(volume.builds) if volume.builds is not None else None),
         )
 
     def volumes(self, workload: Optional[str] = None, live_only: bool = True) -> list[Volume]:
@@ -245,7 +350,7 @@ class WorkloadStore:
             sql += " AND deleted_at IS NULL"
         return [
             Volume(r["volume_id"], r["workload"], r["machine_id"], r["size_gb"], r["hourly"], r["lease_id"],
-                   r["created_at"], r["deleted_at"])
+                   r["created_at"], r["deleted_at"], json.loads(r["builds"]) if r["builds"] else None)
             for r in self.db.query(sql + " ORDER BY created_at", params)
         ]
 

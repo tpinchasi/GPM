@@ -440,16 +440,28 @@ def create_app(
             headers={"X-GPM-Contract": CONTRACT_VERSION},
         )
 
-    def _workload_now(name: str) -> tuple[str, Optional[str]]:
-        """(state, model) as the router sees it now: `ending` from the lease's end time, whether
+    def _workload_now(name: str) -> tuple[str, tuple[str, ...]]:
+        """(state, models) as the router sees it now: `ending` from the lease's end time, whether
         or not the supervisor has noticed yet."""
         workload = state.registry.workloads.get(name)
         if workload is None:
-            return "ended", None
+            return "ended", ()
         workload_state = workload.state
         if workload_state in ("preparing", "serving") and workload.ends_at is not None and workload.ends_at <= time.time():
             workload_state = "ending"
-        return workload_state, workload.model
+        return workload_state, tuple(workload.models)
+
+    def _cap_of(name: Optional[str], model: Optional[str]) -> Optional[int]:
+        """A host's share of this model, where the workload's hosts hold several (D118)."""
+        workload = state.registry.workloads.get(name) if name is not None else None
+        return workload.cap(model) if workload is not None and model is not None else None
+
+    def _ready_models(name: str) -> set[str]:
+        """The workload's models one of its own ready hosts holds."""
+        return {
+            model for h in state.hosts if h.workload == name and h.state is HostState.READY
+            for model in (*h.variants, *h.literal_variants)
+        }
 
     # --- programs asking for their own workloads (D117) ---
     #
@@ -524,10 +536,11 @@ def create_app(
         workload = state.registry.workloads.get(name)
         if workload is None or workload.provisioner != provisioner:
             return _error(404, "not_found", "no_such_workload", "no workload of this key by that name")
-        workload_state, _ = _workload_now(name)
+        workload_state, models = _workload_now(name)
         mine = [h for h in state.hosts if h.workload == name]
         return JSONResponse({
-            "workload": name, "state": workload_state, "model": workload.model, "ends_at": workload.ends_at,
+            "workload": name, "state": workload_state, "model": workload.model, "models": list(models),
+            "ends_at": workload.ends_at,
             "hosts_ready": sum(1 for h in mine if h.state is HostState.READY), "hosts": len(mine),
         }, headers={"X-GPM-Contract": CONTRACT_VERSION})
 
@@ -561,12 +574,14 @@ def create_app(
     def _workload_status(name: str) -> Response:
         """One workload's view, for its own key: its hosts, its state, whether it is borrowing
         — never the rest of the pool (workloads.md §3)."""
-        workload_state, model = _workload_now(name)
+        workload_state, models = _workload_now(name)
         mine = [h for h in state.hosts if h.workload == name]
         ready = [h for h in mine if h.state is HostState.READY]
         plan = getattr(state.registry.workloads.get(name), "plan", None) or {}
+        # Per model (D118): a model borrows while none of the workload's ready hosts holds it.
+        waiting_for = [m for m in models if m not in _ready_models(name)]
         borrowing = (
-            workload_state == "preparing" and not ready and state.config.workloads.borrow_share > 0
+            workload_state == "preparing" and bool(waiting_for) and state.config.workloads.borrow_share > 0
             and bool(plan.get("may_borrow", True))
         )
         return JSONResponse(
@@ -575,8 +590,9 @@ def create_app(
                 "workload": name,
                 "state": workload_state,
                 "contract_version": CONTRACT_VERSION,
-                "model_set": [model] if model else [],
+                "model_set": list(models),
                 "borrowing": borrowing,
+                "borrowing_models": waiting_for if borrowing else [],
                 "limits": {
                     "queue_timeout_s": state.config.pool.queue_timeout_s,
                     "client_time_to_first_byte_s": state.config.pool.client_time_to_first_byte_s,
@@ -642,9 +658,9 @@ def create_app(
             # A client pointed at one workload with another's key fails loudly, rather than
             # quietly serving under whichever the key happens to reach.
             return _error(403, "forbidden", "wrong_workload", f"this key is not for workload {named!r}")
-        workload_state, workload_model = (None, None)
+        workload_state, workload_models = (None, ())
         if who.workload is not None:
-            workload_state, workload_model = _workload_now(who.workload)
+            workload_state, workload_models = _workload_now(who.workload)
             spec = state.registry.workloads.get(who.workload)
             if spec is not None and not _peer_certificate_matches(request, spec.cert_fingerprint):
                 return _error(
@@ -684,12 +700,12 @@ def create_app(
             return _error(400, "bad_request", "model_missing", "the request body names no model")
 
         if who.workload is not None:
-            in_pool = requested == workload_model
+            in_pool = requested in workload_models
             if not in_pool:
                 await record("rejected", status_code=404, reason="model_not_in_workload")
                 return _error(
                     404, "model_not_in_pool", "model_not_in_workload",
-                    f"workload {who.workload!r} serves {workload_model!r}, not {requested!r}",
+                    f"workload {who.workload!r} serves {', '.join(repr(m) for m in workload_models)}, not {requested!r}",
                 )
         in_pool = (
             who.workload is not None  # its own model, checked above
@@ -719,6 +735,7 @@ def create_app(
             may_borrow=(workload_state == "preparing" and state.config.workloads.borrow_share > 0
                         and bool((getattr(state.registry.workloads.get(who.workload), "plan", None) or {}).get("may_borrow", True))),
             borrow_share=state.config.workloads.borrow_share,
+            cap=_cap_of(who.workload, requested),
         )
 
         request_deadline = _parse_deadline(request.headers.get("x-gpm-deadline"))
@@ -781,6 +798,7 @@ def create_app(
 
             assignment.host.last_request_at = time.time()
             concurrency = assignment.concurrency
+            model_concurrency = assignment.model_concurrency
             host_engine = state.engine_of(assignment.host)
             forwarded = host_engine.with_model(path, body, assignment.variant.tag)
             upstream_request = assignment.host.client.build_request(
@@ -908,6 +926,7 @@ def create_app(
                     generate_ms=generate_ms,
                     borrowed=held.borrowed,
                     concurrency=concurrency,
+                    model_concurrency=model_concurrency,
                 )
             return Response(
                 content=prefix,
@@ -959,6 +978,7 @@ def create_app(
                         generate_ms=generate_ms,
                         borrowed=held.borrowed,
                         concurrency=concurrency,
+                        model_concurrency=model_concurrency,
                     )
 
         return StreamingResponse(

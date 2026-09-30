@@ -95,7 +95,10 @@ It is served from a cached copy, never by asking a third party while the app wai
   for that workload's view; nothing else ([workloads.md](workloads.md) §3, D115). Minted when the
   workload is created, expires with its lease. `/w/<name>/v1/…` means the same as `/v1/…` and is
   refused `403 wrong_workload` with another workload's key. A workload that has ended answers
-  `503 workload_ended`, with no `Retry-After`: there is nothing to wait for.
+  `503 workload_ended`, with no `Retry-After`: there is nothing to wait for. A workload may serve
+  several models (D118): the request names one of them, as always; any other is `404`, naming the
+  workload's models, and `GET /pool/status` lists them in `model_set` and, while some are still
+  coming up, in `borrowing_models`.
 - **Provisioning key** (`gpmp_`) — lets one application create, read and end its own workloads
   under `/pool/provisioning/…` on this listener, within a grant its operator set (D117). It never
   requests a completion and never reaches the control API. The SDK's `WorkloadProvisioner` uses it;

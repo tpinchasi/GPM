@@ -434,8 +434,11 @@ class Supervisor:
                 load=self._load() if self.config.rented.allocation == "dynamic" else None,
                 waiting_by_model=self._waiting_by_model(),
                 workloads=active,
-                loads={w.name: self._load(w.name) for w in active},
-                pressures={w.name: self._pressure(w.name) for w in active},
+                # Per group of each workload's hosts (D118); a one-group workload's is its own.
+                loads={(w.name, g.key): self._load(w.name, g.key if len(w.groups) > 1 else None)
+                       for w in active for g in w.groups},
+                pressures={(w.name, g.key): self._pressure(w.name, g.key if len(w.groups) > 1 else None)
+                           for w in active for g in w.groups},
             )
             if self.config.rented and self.config.rented.workers_auto.enabled:
                 await self._adjust_workers()
@@ -586,6 +589,11 @@ class Supervisor:
         for host_id, host in self.fleet.hosts.items():
             if host.released or host.state != "ready":
                 continue
+            if host.workload is not None and len(host.models) > 1:
+                # Runs a fixed split of its models (D118): slower than the pool's median for a
+                # model by design, since it shares the card, and never to be stepped down —
+                # the split's shares are what keep each model within its target.
+                continue
             mine = [r for r in recent if r["host_id"] == host_id and r["latency_ms"] is not None]
             busiest = max(
                 ({r["model_served"] for r in mine} or {""}),
@@ -641,9 +649,16 @@ class Supervisor:
         """A host's busy workers that are its own demand's: lent ones are the borrower's (D115)."""
         return (counter.busy - counter.borrowed) if counter else 0
 
-    def _load(self, workload: Optional[str] = None) -> "strategies.Load":
+    def _in_group(self, models: Optional[tuple]) -> tuple[str, tuple]:
+        """The request-log condition for one group's models (D118): its waiting only."""
+        if not models:
+            return "", ()
+        return f" AND model_requested IN ({','.join('?' * len(models))})", tuple(models)
+
+    def _load(self, workload: Optional[str] = None, group: Optional[tuple] = None) -> "strategies.Load":
         """What one demand's traffic is asking of it, from what the router already writes (D66,
-        D115). The shared workload's configured hosts, and its rented ones; a workload's own."""
+        D115). The shared workload's configured hosts, and its rented ones; a workload's own —
+        one group of them where it has several (D118)."""
         counters = self.counters.all()
         busy = ready = 0
         if workload is None:
@@ -652,10 +667,11 @@ class Supervisor:
                     ready += host.config.workers
                     busy += self._own_busy(counters.get(host.host_id))
         if self.fleet is not None:
-            for rented in self.fleet.hosts_of(workload):
+            for rented in self.fleet.hosts_of(workload, group):
                 if rented.state == "ready":
                     ready += rented.workers
                     busy += self._own_busy(counters.get(rented.host_id))
+        only, models = self._in_group(group)
         window = (
             self.config.rented.dynamic.window_s
             if self.config.rented
@@ -664,8 +680,8 @@ class Supervisor:
         waiting = len(
             self.db.query(
                 "SELECT 1 FROM request_log WHERE ts > ? AND (queue_wait_ms >= 1000 OR reason = 'queue_timeout') "
-                "AND workload IS ? LIMIT 200",
-                (time.time() - min(window, 60.0), workload),
+                f"AND workload IS ?{only} LIMIT 200",
+                (time.time() - min(window, 60.0), workload, *models),
             )
         )
         return strategies.Load(busy_workers=busy, ready_workers=ready, waiting=waiting)
@@ -683,7 +699,7 @@ class Supervisor:
         )
         return {row["model"]: int(row["n"]) for row in rows}
 
-    def _pressure(self, workload: Optional[str] = None) -> bool:
+    def _pressure(self, workload: Optional[str] = None, group: Optional[tuple] = None) -> bool:
         """Is load asking for more than the ready hosts give? (D64)
 
         Two measurements, both written by the router off the request path: every ready worker
@@ -695,21 +711,22 @@ class Supervisor:
             (host.host_id, host.config.workers) for host in self.hosts.values() if host.state is HostState.READY
         ] if workload is None else []
         if self.fleet is not None:
-            ready += [(h.host_id, h.workers) for h in self.fleet.hosts_of(workload) if h.state == "ready"]
+            ready += [(h.host_id, h.workers) for h in self.fleet.hosts_of(workload, group) if h.state == "ready"]
         saturated = bool(ready) and all(
             self._own_busy(counters.get(host_id)) >= workers for host_id, workers in ready
         )
-        passes = self._saturated_by.get(workload, 0)
+        passes = self._saturated_by.get((workload, group) if group else workload, 0)
         passes = passes + 1 if saturated else 0
-        self._saturated_by[workload] = passes
+        self._saturated_by[(workload, group) if group else workload] = passes
         if workload is None:
             self._saturated_passes = passes
         if passes >= 2:
             return True
+        only, models = self._in_group(group)
         waited = self.db.query(
             "SELECT 1 FROM request_log WHERE ts > ? AND (queue_wait_ms >= 1000 OR reason = 'queue_timeout') "
-            "AND workload IS ? LIMIT 1",
-            (time.time() - 30, workload),
+            f"AND workload IS ?{only} LIMIT 1",
+            (time.time() - 30, workload, *models),
         )
         return bool(waited)
 

@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from ..certs import load_ca
 from ..provisioning_store import KEY_HASH, NAME, Grant, ProvisioningStore
+from ..workload_store import ModelTarget
 from .workloads import KINDS, WorkloadRefused, WorkloadRequest
 
 if TYPE_CHECKING:
@@ -154,9 +155,27 @@ class Provisioning:
     def _request(self, provisioner: Any, body: dict, name: str) -> tuple[WorkloadRequest, float, bool]:
         """The request, checked against the grant: every field is untrusted until here."""
         grant: Grant = provisioner.grant
-        model = body.get("model")
-        if not isinstance(model, str) or model not in grant.models:
-            raise WorkloadRefused(f"this key may create workloads for {list(grant.models)}")
+        if body.get("models") is not None:
+            # Several models, each with its own target (D118): every one within the grant.
+            if body.get("model") is not None:
+                raise WorkloadRefused("send model, or models — not both")
+            listed = body["models"]
+            if not isinstance(listed, list) or not listed or not all(isinstance(m, dict) for m in listed):
+                raise WorkloadRefused("models is a list of {model, latency_s, parallel}")
+            targets = []
+            for entry in listed:
+                model = entry.get("model")
+                if not isinstance(model, str) or model not in grant.models:
+                    raise WorkloadRefused(f"this key may create workloads for {list(grant.models)}")
+                targets.append(ModelTarget(model, _number(entry, "latency_s"), _number(entry, "parallel", integer=True)))
+        else:
+            model = body.get("model")
+            if not isinstance(model, str) or model not in grant.models:
+                raise WorkloadRefused(f"this key may create workloads for {list(grant.models)}")
+            targets = [ModelTarget(model, _number(body, "latency_s"), _number(body, "parallel", integer=True))]
+        placement = body.get("placement", "auto")
+        if placement not in ("auto", "together", "apart"):
+            raise WorkloadRefused("placement is auto, together or apart")
         kind = body.get("machines", "roi")
         if kind not in grant.kinds:
             raise WorkloadRefused(f"this key may rent {list(grant.kinds)}")
@@ -170,10 +189,7 @@ class Provisioning:
         idle = grant.idle_end_minutes if idle is None else idle
         if idle > grant.max_idle_end_minutes:
             raise WorkloadRefused(f"an idle cutoff of at most {grant.max_idle_end_minutes:g} minutes")
-        req = WorkloadRequest(
-            name=name, model=model, latency_s=_number(body, "latency_s"),
-            parallel=_number(body, "parallel", integer=True), hours=hours, max_spend=spend, kind=kind,
-        )
+        req = WorkloadRequest.of(name, targets, hours, max_spend=spend, kind=kind, placement=placement)
         return req, idle, grant.may_borrow
 
     async def _plan(self, provisioner: Any, body: dict) -> dict:
@@ -265,7 +281,7 @@ class Provisioning:
     def _made(self, workload: Any, certificate: Optional[str]) -> dict:
         lease = self.supervisor.leases.get(workload.lease_id)
         return {
-            "workload": workload.name, "state": workload.state, "model": workload.model,
+            "workload": workload.name, "state": workload.state, "model": workload.model, "models": list(workload.models),
             "ends_at": workload.ends_at, "max_spend": lease.max_spend if lease else None,
             "idle_end_minutes": workload.idle_end_minutes, "path_prefix": f"/w/{workload.name}/v1",
             "certificate": certificate, "ca": self.ca.pem if (certificate and self.ca) else None,

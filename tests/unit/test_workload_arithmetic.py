@@ -95,3 +95,50 @@ def test_cost_is_compared_per_worker_hour():
 
 def test_nothing_to_compare_says_so():
     assert w.order_by_expected_cost([]) == ([], ["no candidate to compare"])
+
+
+# --- several models on one host (D118) ---
+
+
+def test_a_together_split_keeps_every_model_within_its_target():
+    """The review's example: chat serves 8 alone, embeddings 32; 16 and 4 wanted at once."""
+    split = w.split_together({"chat": 16, "embed": 4}, {"chat": 8, "embed": 32})
+    assert split.hosts == 3 and split.caps == {"chat": 6, "embed": 2} and split.workers == 8
+    assert split.load <= 1
+
+
+def test_the_caps_are_shares_not_ceilings_each():
+    """Caps of w_m each would let a host run 8 + 32 at once and miss both targets."""
+    split = w.split_together({"chat": 8, "embed": 32}, {"chat": 8, "embed": 32})
+    assert split.caps["chat"] / 8 + split.caps["embed"] / 32 <= 1
+    assert split.hosts == 2
+
+
+def test_no_split_where_one_answer_of_each_already_fills_the_card():
+    assert w.split_together({"a": 1, "b": 1}, {"a": 1, "b": 2}) is None
+    assert w.split_together({"a": 1}, {"a": 0}) is None
+
+
+def test_one_model_is_the_single_model_sizing():
+    split = w.split_together({"chat": 16}, {"chat": 6})
+    assert split.hosts == w.hosts_at_start(16, 6) and split.caps == {"chat": 6}
+
+
+def test_a_split_fits_a_card_only_within_its_share():
+    assert w.split_fits({"chat": 6, "embed": 2}, {"chat": 8, "embed": 32})
+    assert not w.split_fits({"chat": 6, "embed": 2}, {"chat": 6, "embed": 32})
+    assert not w.split_fits({"chat": 6}, {})
+
+
+def test_the_cheaper_placement_wins_and_a_tie_goes_together():
+    together = w.Placement("together", 10.0, 2, [])
+    apart = w.Placement("apart", 9.0, 3, [])
+    chosen, why = w.choose_placement(together, apart)
+    assert chosen is apart and why[0].startswith("apart:") and "$9.0000 apart" in why[0]
+    chosen, _ = w.choose_placement(w.Placement("together", 9.0, 2, []), apart)
+    assert chosen.name == "together"
+    chosen, why = w.choose_placement(w.Placement("together", 9.05, 2, []), apart)
+    assert chosen.name == "together" and "within 1%" in why[0], "a hair apart is equal"
+    chosen, why = w.choose_placement(None, apart)
+    assert chosen is apart and "no card" in why[0]
+    assert w.choose_placement(None, None)[0] is None

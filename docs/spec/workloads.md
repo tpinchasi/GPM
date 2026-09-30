@@ -1,10 +1,11 @@
 # Specification — Workloads
 
-> Status: **built, not deployed** (D115, D116; 2026-09-28), against the fake provider. The first
+> Status: **built and deployed** (D115, D116, D117; 2026-09-29); **several models per workload
+> built** (D118, §12; 2026-09-30), against the fake provider. The first
 > provider (Vast) does not yet offer volumes or copies to the pool (§6): both stay off there until
 > checked live.
 
-A **workload** is a named unit inside one pool that owns a model, a lease, its own rented
+A **workload** is a named unit inside one pool that owns one to four models (§12), a lease, its own rented
 hosts, its own key, and its own sizing and machine choice. Several workloads run side by side in
 the one router and the one supervisor, and are kept apart by construction: a workload's key
 reaches only that workload's hosts (and, while they prepare, a bounded share of the shared
@@ -21,6 +22,7 @@ It is always there, and it needs no change to keep working exactly as it did.
 |---|---|
 | `name` | Plain, unique in the pool; part of the host labels and the log |
 | `profile` | The model profile its hosts are bought as (hosts-routing-capacity.md §3.1): one model, one build for the rented engine. Named by the operator, or made from the catalog's first build of `--model` |
+| `models` | One to four, each with its own `latency_s` and `parallel` (§12, D118). With one, the rows below are that model's |
 | `latency_s` | The whole answer, at p95, measured where the router hands the response to the app — after buffering, for a host that buffers (app-contract.md §5.1). Time to first byte is not a target: buffered delivery already makes it the whole generation |
 | `parallel` | How many answers at once it must serve: the lease's `workers`, the ceiling of its scaling |
 | `lease` | Its spending authority: `workers = parallel`, `max_hours`, `max_spend`, `allow_rent`, opened by the create command and bound to the workload. Every rule of supervisor.md §2 applies; a lease that can rent must carry a dollar cap |
@@ -288,3 +290,46 @@ with WorkloadProvisioner(url, os.environ["GPM_PROVISIONING_KEY"]) as pool:
 - A program's workload key is never rotated by the pool, which never had it; the program creates a
   new workload. Revoking a key stops new workloads at once; revoking it with `--end-workloads`
   (the console's "Revoke and end") also ends the ones it made.
+
+## 12. Several models in one workload (D118)
+
+A workload names one to four models (`workloads.max_models`), each with its own `latency_s` and
+`parallel`; hours, budget, kind of machine, borrowing, the idle cutoff, the lease and the key are
+the workload's.
+
+```
+gpm workload create research --hours 6 --max-spend 25 \
+    --model gemma4:31b --latency 20 --parallel 16 \
+    --model embed-small --latency 2 --parallel 4 [--placement auto|together|apart]
+```
+
+`POST /pool/workloads` takes `models: [{model, latency_s, parallel}, …]` and `placement` in place of
+`model`, `latency_s`, `parallel`; the SDK takes `models={name: {latency_s, parallel}}`.
+
+- **Groups.** A workload's hosts are divided into groups: a set of models every one of its hosts
+  holds. *Together* is one group of every model; *apart* is one group per model. A host's group is
+  the set of models it was bought for. A group is what scales — its own floor (its hosts at the
+  start), its load and waiting requests (for its models only), its ceiling (its models' answers at
+  once), its reservation, its parked hosts, its warm volume and its sibling copies. The lease's
+  `workers` is every model's answers at once together.
+- **Placement.** `auto` prices both from one market search, re-priced and ranked per group, by the
+  rental-kind rule (§5): the cheaper expected cost over the hours is kept; within 1% they are equal
+  and together is kept. The plan shows both, and why. `together` or `apart` forces one; together
+  is refused where no card on offer holds every model within its target.
+- **The split.** A together host runs a fixed share of each model. With `w_m` how many answers of
+  model *m* alone one host of that card serves within *m*'s target (§5), the plan takes the fewest
+  hosts `H` for which caps `k_m = ceil(parallel_m / H)` keep `Σ k_m / w_m ≤ 1`; every host runs
+  `Σ k_m` workers, and an offer whose card cannot hold the split is not rented for it. The router
+  takes at most `k_m` answers of *m* on one host at once: a request past its model's share waits for
+  one to finish, as a request waits for any busy worker; it is never refused for it. Load that moves
+  from one model to another is not absorbed by the other's share.
+- **Measuring.** A model's latency curve is built from answers served with nothing else on the
+  host — the request log records, beside the concurrency, how many of those answers were of the
+  same model. Automatic worker adjustment leaves a split host alone.
+- **Routing.** The key reaches the workload's hosts; the model picks among them. A model outside
+  the workload is `404`, naming its models. A model whose group has no ready host yet borrows a
+  shared host that serves it, where the workload may borrow, or is refused `503 workload_preparing`
+  — even while another group serves.
+- **State.** `serving` once every group has a ready host; until then the models without one borrow.
+  The idle cutoff (§11) counts from the first ready host of any group.
+
