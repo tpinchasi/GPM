@@ -753,6 +753,13 @@ async def test_a_rate_limited_market_is_backed_off_rather_than_asked_again_next_
     preview = loop.run(supervisor.fleet.market_preview(hours=1))
     assert "not asking again" in preview["problem"]
 
+    # Refused again after the wait: a minute again, never longer (D119).
+    for _ in range(3):
+        supervisor.fleet._offer_retry_at = 0.0
+        loop.run(supervisor.fleet.market_preview(hours=1))
+        assert supervisor.fleet._offer_backoff_s == 60.0
+    assert len(asked) == 4
+
     # Once the window passes and the provider answers, the backoff clears.
     supervisor.fleet._offer_retry_at = 0.0
 

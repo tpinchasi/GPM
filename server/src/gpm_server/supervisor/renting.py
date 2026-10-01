@@ -259,6 +259,10 @@ class Unit:
     ramp_landed_at: float = 0.0
 
 
+#: How long the market is not asked again after the provider says it is asked too often (D119).
+OFFER_RATE_LIMIT_WAIT_S = 60.0
+
+
 class Fleet:
     """The rented half of the pool: what exists, what it costs, and what to do next."""
 
@@ -3722,9 +3726,10 @@ class Fleet:
                 )
             )
         except ProviderRateLimited as exc:
-            # Asking again on the next pass is what earned the refusal. Back off instead, and
-            # keep backing off until it works (D44).
-            self._offer_backoff_s = min(max(self._offer_backoff_s * 2, 60.0), 900.0)
+            # Asking again on the next pass is what earned the refusal: wait a minute instead, and
+            # again after every refusal (D44, D119 — a flat minute, the owner's choice: no longer
+            # doubling to fifteen).
+            self._offer_backoff_s = OFFER_RATE_LIMIT_WAIT_S
             self._offer_retry_at = now + self._offer_backoff_s
             log.warning("offer search rate limited; not asking again for %.0fs", self._offer_backoff_s)
             self._offer_refusal = str(exc)
