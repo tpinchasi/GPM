@@ -60,7 +60,7 @@ from ..strategies import (
     rank_offers,
 )
 from ..transports import SshTunnel, build_ssh_exec_command, run_command
-from ..workload_store import Volume, WorkloadStore
+from ..workload_store import Volume, WorkloadStore, group_key
 from . import agents, hostagent
 
 log = logging.getLogger("gpm.renting")
@@ -239,11 +239,14 @@ class RentedHost:
 
 @dataclasses.dataclass
 class Unit:
-    """One demand inside the pool (D115): the shared workload, or one workload. Its own hosts,
-    its own lease, and the state its scaling keeps between passes. Passed explicitly wherever a
-    decision is about *one* demand, so no decision can act on another's hosts by default."""
+    """One demand inside the pool (D115): the shared workload, or one group of one workload's
+    hosts (D118). Its own hosts, and the state its scaling keeps between passes. Passed explicitly
+    wherever a decision is about *one* demand, so no decision can act on another's hosts by
+    default. A workload's lease is its groups' together."""
 
     workload: Optional[str] = None
+    #: The models every host of the group holds, sorted; None for the shared workload.
+    group: Optional[tuple[str, ...]] = None
     #: When the gap between what is wanted and what is ready opened, and when it closed.
     #: Scale-down waits on the second, deliberately longer than scale-up (spec §9).
     overflow_since: Optional[float] = None
@@ -277,7 +280,7 @@ class Fleet:
         self.hosts: dict[str, RentedHost] = {}
         self.label_prefix = rented.label_prefix or f"gpm/{config.pool.name}/"
         #: One demand per workload, and the shared one under None (D115).
-        self.units: dict[Optional[str], Unit] = {None: Unit()}
+        self.units: dict[tuple, Unit] = {(None, None): Unit()}
         #: The workloads that are not over, as the supervisor read them this pass.
         self.workloads: dict[str, Any] = {}
         #: Workloads' volumes, as the database keeps them (D116).
@@ -286,7 +289,9 @@ class Fleet:
         #: thirty seconds; and the last rental-kind choice said, per workload (D82's rule).
         self._sizing_cache: dict[tuple, tuple[float, Any]] = {}
         self._hardware_cache: Optional[tuple[float, dict[str, str]]] = None
-        self._said_kind: dict[str, tuple] = {}
+        self._said_kind: dict[tuple, tuple] = {}
+        #: The last "no offer holds this group's split" said, per group (D118).
+        self._said_unfit: dict[tuple, int] = {}
         #: Whether the provider has ever returned a charge figure. The narrow cap margin is
         #: only earned once it has.
         self.charges_ever_reported = False
@@ -331,14 +336,45 @@ class Fleet:
 
     # --- units (D115) ---
 
-    def unit(self, workload: Optional[str] = None) -> Unit:
-        if workload not in self.units:
-            self.units[workload] = Unit(workload=workload)
-        return self.units[workload]
+    def unit(self, workload: Optional[str] = None, group: Optional[tuple[str, ...]] = None) -> Unit:
+        if workload is not None and group is None:
+            group = self.first_group(workload)
+        key = (workload, group)
+        if key not in self.units:
+            self.units[key] = Unit(workload=workload, group=group)
+        return self.units[key]
 
-    def hosts_of(self, workload: Optional[str]) -> list[RentedHost]:
-        """The live hosts one demand holds."""
-        return [h for h in self.hosts.values() if not h.released and h.workload == workload]
+    def first_group(self, workload: Optional[str]) -> Optional[tuple[str, ...]]:
+        spec = self.workloads.get(workload) if workload is not None else None
+        return spec.groups[0].key if spec is not None and spec.groups else None
+
+    def hosts_of(self, workload: Optional[str], group: Optional[tuple[str, ...]] = None) -> list[RentedHost]:
+        """The live hosts one demand holds: a workload's, or one group of them (D118)."""
+        return [
+            h for h in self.hosts.values()
+            if not h.released and h.workload == workload and (group is None or group_key(h.models) == group)
+        ]
+
+    @staticmethod
+    def group_of_host(host: "RentedHost") -> Optional[tuple[str, ...]]:
+        """A workload host's group is the models it was bought for (D118)."""
+        return group_key(host.models) if host.workload is not None else None
+
+    def group_spec(self, workload: Optional[str], group: Optional[tuple[str, ...]]) -> Any:
+        spec = self.workloads.get(workload) if workload is not None else None
+        if spec is None:
+            return None
+        return next((g for g in spec.groups if group is None or g.key == group), None)
+
+    def group_ceiling(self, lease: Optional[Lease], workload: Optional[str], group: Optional[tuple[str, ...]]) -> int:
+        """The most workers a demand may reach: the lease's for the shared workload; for a group,
+        the answers at once its models were asked for (D118) — the lease holds every group's."""
+        spec = self.workloads.get(workload) if workload is not None else None
+        chosen = self.group_spec(workload, group)
+        if spec is None or chosen is None:
+            return lease.workers if lease else 0
+        wanted = sum(t.parallel for t in spec.targets if t.model in chosen.models)
+        return min(wanted, lease.workers) if lease else wanted
 
     @staticmethod
     def lease_of(open_leases: Sequence[Lease], workload: Optional[str]) -> Optional[Lease]:
@@ -346,12 +382,13 @@ class Fleet:
         that allows renting and belongs to no workload, as before workloads; a workload's is its own."""
         return next((lease for lease in open_leases if lease.allow_rent and lease.workload == workload), None)
 
-    def unit_order(self, open_leases: Sequence[Lease]) -> list[Optional[str]]:
-        """The shared workload, then each workload in the order its lease was opened: the room the
-        pool's caps leave is taken in that order (workloads.md §8)."""
+    def unit_order(self, open_leases: Sequence[Lease]) -> list[tuple[Optional[str], Optional[tuple[str, ...]]]]:
+        """The shared workload, then each workload in the order its lease was opened, and each of
+        its groups in order: the room the pool's caps leave is taken in that order (workloads.md
+        §8, D118)."""
         opened = {lease.workload: lease.opened_at for lease in open_leases if lease.workload}
         named = sorted(self.workloads, key=lambda name: (opened.get(name, float("inf")), name))
-        return [None, *named]
+        return [(None, None), *((name, g.key) for name in named for g in self.workloads[name].groups)]
 
     # --- money ---
 
@@ -464,16 +501,23 @@ class Fleet:
         # Release before acquire, across every demand (spec §3): each unit's tear-down, then each
         # unit's acquisition, in the order their leases were opened (workloads.md §8).
         units = self.unit_order(open_leases)
-        for workload in units:
+
+        def per_unit(values: Optional[Mapping], workload: str, group: Any) -> Any:
+            # Keyed by (workload, group); a workload's own name is its first group's (D118).
+            values = values or {}
+            return values.get((workload, group), values.get(workload) if group == self.first_group(workload) else None)
+
+        for workload, group in units:
             await self.tear_down(
-                open_leases, idle_seconds, ready_workers_higher_tiers if workload is None else 0, workload=workload,
+                open_leases, idle_seconds, ready_workers_higher_tiers if workload is None else 0,
+                workload=workload, group=group,
             )
-        for workload in units:
+        for workload, group in units:
             await self.acquire(
                 open_leases, ready_workers_higher_tiers if workload is None else 0,
-                pressure=pressure if workload is None else bool((pressures or {}).get(workload)),
-                load=load if workload is None else (loads or {}).get(workload),
-                workload=workload,
+                pressure=pressure if workload is None else bool(per_unit(pressures, workload, group)),
+                load=load if workload is None else per_unit(loads, workload, group),
+                workload=workload, group=group,
             )
 
     async def release_unleased(self, open_leases: Sequence[Lease], busy: Mapping[str, int]) -> None:
@@ -700,28 +744,70 @@ class Fleet:
         what one card runs at once is a fact about the card (D88)."""
         return re.sub(r"^\s*\d+\s*x\s*", "", hardware or "", count=1).strip().lower()
 
-    def workers_for(self, offer: Offer, workload: Optional[str] = None) -> tuple[int, str]:
+    def workers_for(self, offer: Offer, workload: Optional[str] = None,
+                    models: Optional[Sequence[str]] = None) -> tuple[int, str]:
         """How many workers a host rented from this offer would run, and why (spec §2.1) — for a
         workload, no more than the class of machine was measured to serve within its latency
-        target (D115); what was not measured is said."""
+        target (D115); what was not measured is said. A host of several of a workload's models
+        runs its group's split: the sum of each model's share (D118)."""
         workers, why = self._workers_for_card(offer)
         spec = self.workloads.get(workload) if workload is not None else None
         if spec is None:
             return workers, why
-        at = self.latency_sizing(offer.hardware, spec, ceiling=workers)
+        chosen = self.group_spec(workload, group_key(models) if models else None)
+        if chosen is not None and len(chosen.models) > 1:
+            split = ", ".join(f"{m} {chosen.caps.get(m, 0)}" for m in chosen.models)
+            return chosen.workers_per_host, f"{why}; its group's split: {split} at once"
+        model = chosen.models[0] if chosen is not None else spec.model
+        target = spec.target(model) or spec.targets[0]
+        at = self.model_at_latency(offer.hardware, (chosen.builds if chosen else spec.builds).get(model) or model,
+                                   target.latency_s, ceiling=workers)
         if at.workers is not None and at.workers < workers:
-            return at.workers, f"{why}; held to {at.workers} for the {spec.latency_s:g}s target: {at.reasons[0]}"
+            return at.workers, f"{why}; held to {at.workers} for the {target.latency_s:g}s target: {at.reasons[0]}"
         return workers, f"{why}; {at.reasons[0]}"
 
-    def latency_sizing(self, hardware: str, spec: Any, ceiling: int) -> workload_math.AtLatency:
-        """What the request log measured for this workload's build on machines of this card: the
-        whole answer, by how many answers the host was serving at once (D115)."""
+    def per_model_on(self, offer: Offer, spec: Any, models: Sequence[str], builds: dict[str, str],
+                     unrefuted_is_open: bool = False) -> dict[str, int]:
+        """How many answers of each model, alone, one host from this offer serves within the
+        model's target: measured where the log has it, else the card's own number (D115, D118).
+
+        `unrefuted_is_open`: a measured number that no higher measured concurrency refutes is a
+        floor, not a ceiling — the card may serve more. A split host only ever runs a model up to
+        its share, so its own answers could otherwise never show the card holds the split, and a
+        lost host of a group could never be replaced on the card it was planned on."""
+        card_workers, _ = self._workers_for_card(offer)
+        found = {}
+        for model in models:
+            target = spec.target(model)
+            latency = target.latency_s if target is not None else spec.latency_s
+            at = self.model_at_latency(offer.hardware, builds.get(model) or model, latency, ceiling=card_workers)
+            if at.workers is None:
+                found[model] = card_workers
+            elif unrefuted_is_open and not any(c > at.workers and p95 > latency for c, p95 in at.curve.items()):
+                # Nothing measured above it missed the target: it is a floor, not a ceiling.
+                found[model] = card_workers
+            else:
+                found[model] = min(card_workers, at.workers)
+        return found
+
+    def split_fits_on(self, offer: Offer, spec: Any, group: Any) -> bool:
+        """Can a host from this offer run the group's split within every target? Judged by what
+        has been measured to fail, not by what a split host has had the chance to show."""
+        return workload_math.split_fits(
+            group.caps, self.per_model_on(offer, spec, group.models, group.builds, unrefuted_is_open=True))
+
+    def model_at_latency(self, hardware: str, tag: str, latency_s: float, ceiling: int) -> workload_math.AtLatency:
+        """What the request log measured for this build on machines of this card: the whole
+        answer, by how many answers the host was serving at once (D115) — from answers served
+        with nothing else on the host, so a model's curve never carries another's load (D118).
+        Rows from before the same-model count was logged are kept."""
         card = self._card_of(hardware)
-        tag = spec.builds.get(spec.model) or spec.model
-        key = (card, tag, float(spec.latency_s), int(ceiling))
+        # The samples are cached, not the answer: one read of the log serves every target and
+        # every ceiling asked of the same card and build within the window.
+        key = (card, tag)
         cached = self._sizing_cache.get(key)
         if cached is not None and time.monotonic() - cached[0] < 30.0:
-            return cached[1]
+            return workload_math.workers_at_latency(cached[1], latency_s, ceiling)
         host_ids = [host_id for host_id, seen in self._hardware_of_hosts().items() if self._card_of(seen) == card]
         samples: list[tuple[int, float]] = []
         if host_ids:
@@ -729,14 +815,14 @@ class Fleet:
             rows = self.events.db.query(
                 f"SELECT concurrency, latency_ms FROM request_log WHERE outcome = 'ok' AND model_served = ? "
                 f"AND concurrency IS NOT NULL AND latency_ms IS NOT NULL AND host_id IN ({marks}) "
+                "AND (model_concurrency IS NULL OR model_concurrency = concurrency) "
                 "ORDER BY id DESC LIMIT 20000",
                 (tag, *host_ids),
             )
             samples = [(int(r["concurrency"]), float(r["latency_ms"]) / 1000) for r in rows]
-        found = workload_math.workers_at_latency(samples, spec.latency_s, ceiling)
         # Read once in a while, not once per offer: a search weighs dozens (the review's finding 12).
-        self._sizing_cache[key] = (time.monotonic(), found)
-        return found
+        self._sizing_cache[key] = (time.monotonic(), samples)
+        return workload_math.workers_at_latency(samples, latency_s, ceiling)
 
     def _hardware_of_hosts(self) -> dict[str, str]:
         """Each rented host's hardware, from the decision log (the `rented` events carry it)."""
@@ -1332,6 +1418,11 @@ class Fleet:
             return False, "a host serves with at least one worker"
         if workers == host.workers:
             return True, f"{host.host_id} already runs {workers} workers"
+        if host.workload is not None and len(host.models) > 1:
+            # Its workers are its models' shares added up (D118): fewer, and one model's share
+            # starves the other's; more, and nothing ever uses them.
+            return False, (f"{host.host_id} runs its workload's split of {', '.join(host.models)}: its worker "
+                           "count is the sum of their shares, and is not changed by hand")
 
         if workers < host.workers:
             was = host.workers
@@ -2063,11 +2154,13 @@ class Fleet:
 
     # --- parking (spec §8) ---
 
-    async def restart_parked(self, lease: Lease, workload: Optional[str] = None) -> Optional[RentedHost]:
+    async def restart_parked(self, lease: Lease, workload: Optional[str] = None,
+                             group: Optional[tuple[str, ...]] = None) -> Optional[RentedHost]:
         """Parked hosts are tried before new offers: no download, minutes instead of tens of
         minutes. It must still win the auction on that machine within the ceilings. Only this
-        demand's own: another workload's host holds another model (D115)."""
-        for host in self.hosts_of(workload):
+        demand's own: another workload's host holds another model (D115), and another group's
+        other models (D118)."""
+        for host in self.hosts_of(workload, group):
             if host.state != "parked":
                 continue
             offers = await self._offers()
@@ -2234,7 +2327,7 @@ class Fleet:
             )
             if host.idle_since is not None:
                 # Paused for idleness: load, not the lease, brings it back.
-                self.unit(host.workload).idle_gate = True
+                self.unit(host.workload, self.group_of_host(host)).idle_gate = True
             was_ready = host.state == "ready"
             if was_ready:
                 # Readiness is re-verified, never assumed — and the clock on "not ready in
@@ -2557,18 +2650,21 @@ class Fleet:
         pressure: bool = False,
         load: Optional[Load] = None,
         workload: Optional[str] = None,
+        group: Optional[tuple[str, ...]] = None,
     ) -> None:
-        unit = self.unit(workload)
+        unit = self.unit(workload, group)
         lease = self.lease_of(open_leases, workload)
         if workload is not None:
             # A workload always sizes from load, above a floor of the hosts it starts with: its
             # lease reserved them for the run (D115). Nothing measured is no load, not no floor.
-            spec = self.workloads.get(workload)
-            if lease is None or spec is None:
+            # Each group of its hosts on its own (D118).
+            chosen = self.group_spec(workload, unit.group)
+            if lease is None or chosen is None:
                 return
             await self._acquire_dynamically(
                 lease, 0, load or Load(busy_workers=0, ready_workers=0, waiting=0), unit=unit,
-                floor=spec.hosts_at_start, per_host=spec.workers_per_host,
+                floor=chosen.hosts_at_start, per_host=chosen.workers_per_host,
+                ceiling=self.group_ceiling(lease, workload, unit.group),
             )
             return
         if self.rented.allocation == "dynamic" and lease is not None:
@@ -2630,6 +2726,7 @@ class Fleet:
     async def _acquire_dynamically(
         self, lease: Lease, ready_workers_higher_tiers: int, load: Optional[Load],
         unit: Optional[Unit] = None, floor: Optional[int] = None, per_host: Optional[int] = None,
+        ceiling: Optional[int] = None,
     ) -> None:
         """Hosts added from measured load, in rounds that grow while it lasts (D66).
 
@@ -2641,12 +2738,12 @@ class Fleet:
         if load is None:
             return
         unit = unit or self.unit(None)
-        live = [h for h in self.hosts_of(unit.workload) if h.state != "draining"]
+        live = [h for h in self.hosts_of(unit.workload, unit.group) if h.state != "draining"]
         ready = [h for h in live if h.state == "ready"]
         pending = [h for h in live if h.state in ("scheduling", "preparing")]
         rented_workers = sum(h.workers for h in ready)
 
-        wanted = min(lease.workers, load.wanted(self.rented.dynamic.target_utilisation))
+        wanted = min(lease.workers if ceiling is None else ceiling, load.wanted(self.rented.dynamic.target_utilisation))
         least = self.rented.dynamic.min_hosts if floor is None else floor
         below_floor = len(live) < least
         overflow = max(0, wanted - ready_workers_higher_tiers - rented_workers)
@@ -2687,7 +2784,7 @@ class Fleet:
         # count, costs no download, and is the right answer before renting anything. It has to
         # be tried *before* the caps are consulted, or a pool sitting at its host limit with
         # every host paused refuses the load it could serve at once (found by the simulation).
-        woken = await self.restart_idle_parked(lease, unit.workload)
+        woken = await self.restart_idle_parked(lease, unit.workload, unit.group)
         if woken is not None:
             return
 
@@ -2738,7 +2835,7 @@ class Fleet:
             )
             # Every host in a round is re-checked on its own: a round is a number of attempts,
             # never a bulk purchase (D66).
-            refusal = self._refuse_for_caps(demand, lease)
+            refusal = self._refuse_for_caps(demand, lease, group=unit.group)
             if refusal is not None:
                 self.events.record(
                     "rent_refused", refusal,
@@ -2746,7 +2843,7 @@ class Fleet:
                     lease_id=lease.lease_id,
                 )
                 break
-            host = await self.rent_one(lease, list(reasons), workload=unit.workload)
+            host = await self.rent_one(lease, list(reasons), workload=unit.workload, group=unit.group)
             if host is None:
                 break  # a round that loses its bids does not grow the next one
             rented_now += 1
@@ -2777,35 +2874,48 @@ class Fleet:
         left = self.budget_left(lease)
         return None if left > 0 else f"the lease has ${left:.4f} left"
 
-    async def restart_idle_parked(self, lease: Lease, workload: Optional[str] = None) -> Optional[RentedHost]:
+    async def restart_idle_parked(self, lease: Lease, workload: Optional[str] = None,
+                                  group: Optional[tuple[str, ...]] = None) -> Optional[RentedHost]:
         """Load came back while a host was paused: it returns at once, with no download and no
         wait for the scale-up window, which exists to stop a burst buying a download."""
-        if not any(h.state == "parked" and h.idle_since is not None for h in self.hosts_of(workload)):
+        if not any(h.state == "parked" and h.idle_since is not None for h in self.hosts_of(workload, group)):
             return None
-        return await self.restart_parked(lease, workload)
+        return await self.restart_parked(lease, workload, group)
 
-    def reserved_hosts(self, besides: Optional[str] = None) -> int:
+    def reserved_hosts(self, besides: Optional[str] = None, group: Optional[tuple[str, ...]] = None) -> int:
         """Hosts workloads still mean to rent to reach the start they were created with: room
-        another demand may not take (workloads.md §8). The shared workload yields to every
-        workload's; a workload yields to those created before it, and they to none of its — the
-        room is taken in the order the workloads were opened, never held back both ways."""
+        another demand may not take (workloads.md §8). Counted per group (D118): one group above
+        its floor hides nothing of another still below its own. The shared workload yields to
+        every workload's; a workload yields to those created before it, and they to none of its —
+        the room is taken in the order the workloads were opened, never held back both ways. Within
+        one workload the same holds in the order of its groups: a group yields to those listed
+        before it, never they to it — two groups yielding to each other would both wait for ever."""
         mine = self.workloads.get(besides) if besides is not None else None
-        return sum(
-            max(0, spec.hosts_at_start - len(self.hosts_of(name)))
-            for name, spec in self.workloads.items()
-            if name != besides and spec.state in ("preparing", "serving")
-            and (mine is None or spec.created_at < mine.created_at)
-        )
+        if mine is not None and group is None:
+            group = self.first_group(besides)
+        my_index = next((i for i, g in enumerate(mine.groups) if g.key == group), 0) if mine is not None else 0
+        total = 0
+        for name, spec in self.workloads.items():
+            if spec.state not in ("preparing", "serving"):
+                continue
+            if mine is not None and name != besides and not spec.created_at < mine.created_at:
+                continue
+            for index, g in enumerate(spec.groups):
+                if name == besides and index >= my_index:
+                    continue
+                total += max(0, g.hosts_at_start - len(self.hosts_of(name, g.key)))
+        return total
 
     def volume_burn(self) -> float:
         """What the pool's live volumes cost per hour (D116): spend the hosts' prices do not show."""
         return sum(v.hourly for v in self.workload_store.volumes())
 
-    def _refuse_for_caps(self, demand: Demand, lease: Optional[Lease]) -> Optional[str]:
+    def _refuse_for_caps(self, demand: Demand, lease: Optional[Lease],
+                         group: Optional[tuple[str, ...]] = None) -> Optional[str]:
         if lease is None:
             return "no lease is open"
         live = [h for h in self.hosts.values() if not h.released]
-        reserved = self.reserved_hosts(besides=lease.workload)
+        reserved = self.reserved_hosts(besides=lease.workload, group=group)
         if len(live) + reserved >= self.config.limits.max_rented_hosts:
             return (
                 f"{len(live)} rented hosts already"
@@ -2861,7 +2971,7 @@ class Fleet:
     async def rent_one(
         self, lease: Lease, reasons: list[str],
         offer_id: Optional[str] = None, kind: Optional[str] = None,
-        workload: Optional[str] = None,
+        workload: Optional[str] = None, group: Optional[tuple[str, ...]] = None,
     ) -> Optional[RentedHost]:
         """Rent the best offer — or, when an operator named one, exactly that one.
 
@@ -2872,12 +2982,16 @@ class Fleet:
         """
         self.last_refusal = None
         spec = self.workloads.get(workload) if workload is not None else None
+        chosen_group = self.group_spec(workload, group) if spec is not None else None
+        if spec is not None and chosen_group is None:
+            return None
         if spec is not None:
-            # A workload's host holds exactly its model, as the build it was created with (D115).
+            # A workload's host holds exactly its group's models, as the builds it was created
+            # with (D115, D118).
             profile = None
-            for_this_host: tuple[str, ...] = (spec.model,)
-            builds = dict(spec.builds)
-            cards_per_copy = int((spec.plan or {}).get("cards_per_copy") or 1)
+            for_this_host: tuple[str, ...] = tuple(chosen_group.models)
+            builds = dict(chosen_group.builds)
+            cards_per_copy = chosen_group.cards_per_copy
             if kind is None and offer_id is None:
                 kind = {"on_demand": "on_demand", "interruptible": "interruptible"}.get(spec.kind, "both")
         else:
@@ -2945,12 +3059,35 @@ class Fleet:
         # The market is offering something again, so the next dry spell is news once more.
         self._said_nothing_passed = None
 
+        if chosen_group is not None and len(chosen_group.models) > 1:
+            # Every host of a group of several models runs the same split (D118): a card that
+            # cannot hold it within every model's target is not rented for it.
+            fitting = [pair for pair in ranked if self.split_fits_on(pair[0], spec, chosen_group)]
+            if not fitting:
+                self.last_refusal = (f"none of {len(ranked)} accepted offers holds {', '.join(chosen_group.models)} "
+                                     f"at {chosen_group.caps} within their targets")
+                # Said when it changes, like "nothing passed the policy" (D82): a group stuck short
+                # of its start must show in the decision log, not only in a field the next call
+                # overwrites.
+                said = (workload, chosen_group.key)
+                if self._said_unfit.get(said) != len(ranked):
+                    self._said_unfit[said] = len(ranked)
+                    self.events.record("split_unfit", self.last_refusal,
+                                       numbers={"workload": workload, "models": list(chosen_group.models),
+                                                "caps": chosen_group.caps, "accepted": len(ranked)},
+                                       lease_id=lease.lease_id)
+                return None
+            self._said_unfit.pop((workload, chosen_group.key), None)
+            ranked = fitting
+
         if spec is not None and spec.kind == "roi" and offer_id is None:
             # On demand or a bid, by what each is expected to cost this workload over the hours
             # its lease has left (D115). Deterministic, with its reasons; every cap still applies.
-            ranked, kind_reasons = self._by_rental_kind(ranked, lease, spec, for_this_host, builds)
+            ranked, kind_reasons = self._by_rental_kind(
+                ranked, lease, spec, for_this_host, builds,
+                fixed_workers=chosen_group.workers_per_host if len(chosen_group.models) > 1 else None)
             reasons = [*reasons, *kind_reasons[:1]]
-        warm = self._warm_volumes(spec) if spec is not None else {}
+        warm = self._warm_volumes(spec, builds) if spec is not None else {}
         if warm and offer_id is None and any(o.machine_id in warm for o, _ in ranked):
             # A machine that already holds the models downloads nothing: first, whatever else
             # the ranking said (D116).
@@ -2982,7 +3119,7 @@ class Fleet:
                 continue
 
             host_id = f"rented-{uuid.uuid4().hex[:6]}"
-            workers, workers_why = self.workers_for(offer, workload)
+            workers, workers_why = self.workers_for(offer, workload, tuple(for_this_host) if spec is not None else None)
             launch_workers = self.launch_workers_for(workers, workload)
             instance_spec = InstanceSpec(
                 # A workload's name sits in the label, under the pool's one prefix, so the one
@@ -3089,12 +3226,18 @@ class Fleet:
     def _models_dir(self) -> str:
         return getattr(self.engine, "models_dir", "") or ""
 
-    def _warm_volumes(self, spec: Any) -> dict[str, Volume]:
-        """The machines holding one of this workload's volumes, where warm machines are on."""
+    def _group_volumes(self, spec: Any, builds: dict[str, str]) -> list[Volume]:
+        """This group's volumes (D118). One made before groups belongs to the workload's only group."""
+        return [v for v in self.workload_store.volumes(spec.name)
+                if (v.builds == builds) or (v.builds is None and len(spec.groups) == 1)]
+
+    def _warm_volumes(self, spec: Any, builds: Optional[dict[str, str]] = None) -> dict[str, Volume]:
+        """The machines holding one of this group's volumes, where warm machines are on."""
         if (spec is None or "warm" not in self._sources() or not self.config.workloads.keep_models_on_machine
                 or not self.provider.capabilities.volumes or not self._models_dir()):
             return {}
-        return {v.machine_id: v for v in self.workload_store.volumes(spec.name)}
+        builds = builds if builds is not None else dict(spec.groups[0].builds)
+        return {v.machine_id: v for v in self._group_volumes(spec, builds)}
 
     def _volume_for(self, spec: Any, offer: Offer, warm: dict[str, Volume],
                     models: Sequence[str], builds: dict[str, str]) -> Optional[VolumeSpec]:
@@ -3104,11 +3247,12 @@ class Fleet:
             return None
         if not self.provider.capabilities.volumes or not self._models_dir():
             return None
-        label = f"{self.label_prefix}{spec.name}/models"
+        index = next((i for i, g in enumerate(spec.groups) if g.builds == builds), 0)
+        label = f"{self.label_prefix}{spec.name}/models" + (f"-{index}" if len(spec.groups) > 1 else "")
         if offer.machine_id in warm:
             return VolumeSpec(mount=self._models_dir(), label=label, volume_id=warm[offer.machine_id].volume_id)
-        if self.workload_store.volumes(spec.name):
-            return None  # one volume per workload: the first machine keeps its models
+        if self._group_volumes(spec, builds):
+            return None  # one volume per group: the first machine keeps its models
         size = math.ceil(self.model_set_gb(models, builds) * 1.1) + 1
         return VolumeSpec(mount=self._models_dir(), label=label, size_gb=float(size))
 
@@ -3129,7 +3273,7 @@ class Fleet:
         hourly = round(size * (offer.storage_per_gb_hourly or 0.0), 6)
         self.workload_store.add_volume(Volume(
             volume_id=volume_id, workload=host.workload or "", machine_id=offer.machine_id, size_gb=size,
-            hourly=hourly, lease_id=lease.lease_id, created_at=time.time(),
+            hourly=hourly, lease_id=lease.lease_id, created_at=time.time(), builds=dict(builds),
         ))
         self.events.record(
             "volume_created",
@@ -3216,6 +3360,7 @@ class Fleet:
     def expected_costs(
         self, ranked: list[tuple[Offer, float]], hours: float, spec: Any,
         models: Sequence[str], builds: dict[str, str], max_all_in_hourly: Optional[float] = None,
+        fixed_workers: Optional[int] = None, have: Optional[float] = None,
     ) -> tuple[list[workload_math.KindCost], list[str]]:
         """What each accepted offer is expected to cost a workload per worker-hour over `hours`
         (D115, workloads.md §5), cheapest first, with the line that says why. A bid's expected
@@ -3226,13 +3371,16 @@ class Fleet:
         hours = max(hours, 1e-6)
         size = self.model_set_gb(models, builds)
         record_of = self.machine_history()
-        have = sum(h.workers for h in self.hosts_of(spec.name) if h.state != "draining")
+        if have is None:
+            have = sum(h.workers for h in self.hosts_of(spec.name, group_key(models)) if h.state != "draining")
         on_demand = [o.all_in_hourly for o, _ in ranked if not o.interruptible]
         costs = []
         for offer, _ in ranked:
-            card_workers, _ = self._workers_for_card(offer)
-            at = self.latency_sizing(offer.hardware, spec, ceiling=card_workers)
-            workers = min(card_workers, at.workers) if at.workers is not None else card_workers
+            # A group of several models runs its fixed split on whatever card it is rented (D118):
+            # a bigger card is not more capacity to it, only more cost.
+            workers = fixed_workers if fixed_workers is not None else self.capacity_on(offer, spec, models, builds)
+            if workers <= 0:
+                continue  # holds the models, but not every one within its target at once
             if offer.interruptible:
                 bid = price_bid(offer, self.rented.bidding, self.rented.policy_in_force, max_all_in_hourly)
                 hourly = bid.hourly + offer.storage_hourly
@@ -3251,17 +3399,33 @@ class Fleet:
             ))
         return workload_math.order_by_expected_cost(costs)
 
+    def capacity_on(self, offer: Offer, spec: Any, models: Sequence[str], builds: dict[str, str]) -> float:
+        """Answers at once one host from this offer gives the workload, for pricing it per
+        worker-hour: one model's measured number; for several on one host, the answers of the
+        workload's own mix it holds within every target, `P / Σ p_m / w_m` (D118). Zero where
+        one answer of each already fills the card."""
+        per_model = self.per_model_on(offer, spec, models, builds)
+        if len(models) == 1:
+            return float(per_model[models[0]])
+        parallel = {m: (spec.target(m).parallel if spec.target(m) else 1) for m in models}
+        share = sum(parallel[m] / per_model[m] for m in models if per_model[m] > 0)
+        if any(per_model[m] < 1 for m in models) or sum(1 / per_model[m] for m in models) > 1 + 1e-9:
+            return 0.0
+        return sum(parallel.values()) / share if share else 0.0
+
     def _by_rental_kind(
         self, ranked: list[tuple[Offer, float]], lease: Lease, spec: Any,
-        models: Sequence[str], builds: dict[str, str],
+        models: Sequence[str], builds: dict[str, str], fixed_workers: Optional[int] = None,
     ) -> tuple[list[tuple[Offer, float]], list[str]]:
         """The accepted offers in the rental-kind rule's order, over the hours the lease has left."""
-        ordered, why = self.expected_costs(ranked, lease.hours_left(), spec, models, builds, lease.max_all_in_hourly)
+        ordered, why = self.expected_costs(ranked, lease.hours_left(), spec, models, builds, lease.max_all_in_hourly,
+                                           fixed_workers=fixed_workers)
         by_id = {offer.offer_id: (offer, points) for offer, points in ranked}
         said = (ordered[0].offer_id, ordered[0].interruptible) if ordered else None
-        if self._said_kind.get(spec.name) == said:
+        # Per group (D118): two groups choosing differently must not flip the one note.
+        if self._said_kind.get((spec.name, group_key(models))) == said:
             return [by_id[c.offer_id] for c in ordered], why
-        self._said_kind[spec.name] = said
+        self._said_kind[(spec.name, group_key(models))] = said
         self.events.record(
             "rental_kind", why[0],
             numbers={"workload": spec.name, "hours_left": round(lease.hours_left(), 3),
@@ -3295,14 +3459,15 @@ class Fleet:
         idle_seconds: dict[str, float],
         ready_workers_higher_tiers: int = 0,
         workload: Optional[str] = None,
+        group: Optional[tuple[str, ...]] = None,
     ) -> None:
-        unit = self.unit(workload)
-        live = [h for h in self.hosts_of(workload) if h.state != "parked"]
+        unit = self.unit(workload, group)
+        live = [h for h in self.hosts_of(workload, unit.group) if h.state != "parked"]
         if not live:
             unit.overflow_gone_since = None
             return
         lease = self.lease_of(open_leases, workload)
-        spec = self.workloads.get(workload) if workload is not None else None
+        spec = self.group_spec(workload, unit.group)
         now = time.time()
 
         # A host that is not ready yet is neither idle nor surplus: it is capacity on its
@@ -3338,7 +3503,7 @@ class Fleet:
                     f"not ready after {self.rented.teardown.max_preparing_minutes:g} minutes",
                 )
 
-        wanted = lease.workers if lease else 0
+        wanted = self.group_ceiling(lease, workload, unit.group) if lease else 0
         covered = ready_workers_higher_tiers + sum(h.workers for h in ready)
         if lease is not None and covered >= wanted and wanted > 0:
             unit.overflow_gone_since = unit.overflow_gone_since or now

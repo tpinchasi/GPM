@@ -519,3 +519,21 @@ def test_a_pool_that_takes_no_programs_says_so_at_once():
             assert answer.status_code == 403 and answer.json()["reason"] == "provisioning_disabled"
         finally:
             control.stop()
+
+
+
+def test_a_program_creates_a_workload_of_two_models(pool):
+    """Several models through the SDK (D118): the grant checks every one."""
+    key = grant(pool, models=[BIG, SHARED], max_spend=5.0, max_spend_per_day=8.0)
+    with provisioner(pool, key) as side:
+        with pytest.raises(WorkloadRefused, match="may create workloads for"):
+            side.workload(models={BIG: {"latency_s": 30, "parallel": 1}, "not-granted": {"latency_s": 5, "parallel": 1}},
+                          hours=1, max_spend=2.0)
+        with side.workload(models={BIG: {"latency_s": 30, "parallel": 1}, SHARED: {"latency_s": 5, "parallel": 1}},
+                           hours=1, max_spend=2.0) as w:
+            assert set(w.models) == {BIG, SHARED}
+            made = pool.supervisor.workloads.get(w.name)
+            assert set(made.models) == {BIG, SHARED} and made.placement in ("together", "apart")
+            refresh(pool)
+    with pytest.raises(ValueError, match="not both"):
+        WorkloadProvisioner.__dict__["_body"].__func__(BIG, 1, 1, 1, 1, "roi", None, {BIG: {}}, "auto")

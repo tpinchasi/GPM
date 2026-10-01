@@ -14,15 +14,16 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import math
 import time
 import uuid
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 from .. import workloads as math_
 from ..catalog import variants_for_host
 from ..ledger import LeaseRefused
 from ..strategies import rank_offers
-from ..workload_store import Workload, WorkloadStore
+from ..workload_store import Group, ModelTarget, Workload, WorkloadStore
 
 if TYPE_CHECKING:
     from .service import Supervisor
@@ -42,9 +43,81 @@ class WorkloadRequest:
     max_spend: Optional[float] = None
     profile: Optional[str] = None
     kind: str = "roi"
+    #: Several models, each with its own target (D118); empty for one: `model`, `latency_s`
+    #: and `parallel` above. With several, those three are the first model's.
+    targets: tuple[ModelTarget, ...] = ()
+    #: auto (the cheaper), together (every host holds every model) or apart (a group per model).
+    placement: str = "auto"
+
+    @classmethod
+    def of(cls, name: str, targets: Sequence[ModelTarget], hours: float, **rest: Any) -> "WorkloadRequest":
+        targets = tuple(targets)
+        if not targets:
+            raise WorkloadRefused("a workload names at least one model")
+        first = targets[0]
+        return cls(name=name, model=first.model, latency_s=first.latency_s, parallel=first.parallel, hours=hours,
+                   targets=targets if len(targets) > 1 else (), **rest)
+
+    @property
+    def all_targets(self) -> tuple[ModelTarget, ...]:
+        return self.targets or (ModelTarget(self.model, self.latency_s, self.parallel),)
+
+    @property
+    def models(self) -> tuple[str, ...]:
+        return tuple(t.model for t in self.all_targets)
+
+    @property
+    def total_parallel(self) -> int:
+        return sum(t.parallel for t in self.all_targets)
 
 
 KINDS = ("roi", "on_demand", "interruptible")
+PLACEMENTS = ("auto", "together", "apart")
+#: The most answers at once one model may ask for: far past any pool's hosts, and a bound on the
+#: work sizing it takes.
+MAX_PARALLEL = 100_000
+
+
+def _finite(value: Any, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        raise WorkloadRefused(f"{name} must be a number above zero")
+    return float(value)
+
+
+def _whole(value: Any, name: str) -> int:
+    number = _finite(value, name)
+    if number != int(number):
+        raise WorkloadRefused(f"{name} must be a whole number")
+    if number > MAX_PARALLEL:
+        raise WorkloadRefused(f"{name} is at most {MAX_PARALLEL}")
+    return int(number)
+
+
+def parse_targets(body: dict) -> tuple[list[ModelTarget], str]:
+    """A request's models and placement, from untrusted JSON (D118): one model — `model`,
+    `latency_s`, `parallel` — or several as `models: [{model, latency_s, parallel}, ...]`. Every
+    number is refused in words, never truncated. Shared by the control API and by programs."""
+    placement = body.get("placement") or "auto"
+    if placement not in PLACEMENTS:
+        raise WorkloadRefused(f"placement is one of {', '.join(PLACEMENTS)}")
+    if body.get("models") is not None:
+        if body.get("model") is not None:
+            raise WorkloadRefused("send model, or models — not both")
+        listed = body["models"]
+        if not isinstance(listed, list) or not listed or not all(isinstance(m, dict) for m in listed):
+            raise WorkloadRefused("models is a list of {model, latency_s, parallel}")
+    else:
+        listed = [body]
+    targets = []
+    for entry in listed:
+        model = entry.get("model")
+        if not isinstance(model, str) or not model.strip():
+            raise WorkloadRefused("each model is named: model is required")
+        if entry.get("latency_s") is None or entry.get("parallel") is None:
+            raise WorkloadRefused(f"{model}: latency_s and parallel are required")
+        targets.append(ModelTarget(model.strip(), _finite(entry["latency_s"], f"{model}: latency_s"),
+                                   _whole(entry["parallel"], f"{model}: parallel")))
+    return targets, placement
 
 
 class Workloads:
@@ -66,31 +139,37 @@ class Workloads:
     # --- what a workload would be ---
 
     def _build(self, req: WorkloadRequest) -> tuple[dict[str, str], int]:
-        """The build its hosts fetch, and how many cards each copy spans: a profile's, where one
-        is named, otherwise the catalog's first build rented machines can run (D98's rule)."""
+        """The build each model's hosts fetch, and how many cards each copy spans: a profile's,
+        where one is named, otherwise the catalog's first build rented machines can run (D98's
+        rule)."""
         rented = self.config.rented
-        entry = self.config.catalog.get(req.model)
-        if req.model not in self.config.pool.model_set and not (entry and entry.workloads_only):
-            raise WorkloadRefused(
-                f"{req.model!r} is neither in the pool's model set nor a workloads-only model in its catalog; "
-                "add it — as workloads-only, and the shared hosts never fetch it"
-            )
+        for model in req.models:
+            entry = self.config.catalog.get(model)
+            if model not in self.config.pool.model_set and not (entry and entry.workloads_only):
+                raise WorkloadRefused(
+                    f"{model!r} is neither in the pool's model set nor a workloads-only model in its catalog; "
+                    "add it — as workloads-only, and the shared hosts never fetch it"
+                )
         if req.profile:
             models = rented.model_profiles.get(req.profile)
             if models is None:
                 raise WorkloadRefused(f"no model profile {req.profile!r}; known: {sorted(rented.model_profiles)}")
-            if req.model not in models:
-                raise WorkloadRefused(f"profile {req.profile!r} does not hold {req.model!r}")
-            return {req.model: models[req.model]}, rented.cards_per_copy(req.profile)
+            missing = [m for m in req.models if m not in models]
+            if missing:
+                raise WorkloadRefused(f"profile {req.profile!r} does not hold {', '.join(repr(m) for m in missing)}")
+            return {m: models[m] for m in req.models}, rented.cards_per_copy(req.profile)
         variants = variants_for_host(
-            [req.model], self.config.catalog, frozenset(rented.capabilities), self.config.rented_engine()
+            list(req.models), self.config.catalog, frozenset(rented.capabilities), self.config.rented_engine()
         )
-        group = variants.get(req.model) or ()
-        if not group:
-            raise WorkloadRefused(
-                f"{req.model!r} has no build rented hosts can run ({self.config.rented_engine()}); add one to the catalog"
-            )
-        return {req.model: group[0].tag}, 1
+        builds = {}
+        for model in req.models:
+            group = variants.get(model) or ()
+            if not group:
+                raise WorkloadRefused(
+                    f"{model!r} has no build rented hosts can run ({self.config.rented_engine()}); add one to the catalog"
+                )
+            builds[model] = group[0].tag
+        return builds, 1
 
     def _check_request(self, req: WorkloadRequest) -> None:
         if self.fleet is None or self.config.rented is None:
@@ -104,114 +183,248 @@ class Workloads:
             )
         if req.kind not in KINDS:
             raise WorkloadRefused(f"kind is one of {', '.join(KINDS)}")
-        if req.parallel < 1:
-            raise WorkloadRefused("parallel is how many answers at once: at least 1")
-        if req.hours <= 0:
+        if req.placement not in PLACEMENTS:
+            raise WorkloadRefused(f"placement is one of {', '.join(PLACEMENTS)}")
+        targets = req.all_targets
+        most = self.config.workloads.max_models
+        if len(targets) > most:
+            raise WorkloadRefused(f"a workload serves at most {most} models, not {len(targets)}")
+        if len({t.model for t in targets}) != len(targets):
+            raise WorkloadRefused("each model is named once")
+        for t in targets:
+            if not isinstance(t.parallel, int) or isinstance(t.parallel, bool) or t.parallel < 1:
+                raise WorkloadRefused(f"{t.model}: parallel is how many answers at once: at least 1")
+            if t.parallel > MAX_PARALLEL:
+                raise WorkloadRefused(f"{t.model}: parallel is at most {MAX_PARALLEL}")
+            if not (isinstance(t.latency_s, (int, float)) and math.isfinite(t.latency_s) and t.latency_s > 0):
+                raise WorkloadRefused(f"{t.model}: the latency target must be above zero seconds")
+        if not (math.isfinite(req.hours) and req.hours > 0):
             raise WorkloadRefused("hours must be above zero")
-        if req.latency_s <= 0:
-            raise WorkloadRefused("the latency target must be above zero seconds")
-        if req.max_spend is not None and req.max_spend <= 0:
+        if req.max_spend is not None and not (math.isfinite(req.max_spend) and req.max_spend > 0):
             raise WorkloadRefused("a dollar cap must be above zero")
 
     def _reserved_hosts(self) -> int:
-        """Hosts other workloads still mean to rent: their start, less what they have. Counted
-        against the pool's host limit, so two workloads created back to back cannot both pass
-        and the second starve (the review's finding 8)."""
+        """Hosts other workloads still mean to rent: their start, less what they have — per group
+        (D118). Counted against the pool's host limit, so two workloads created back to back
+        cannot both pass and the second starve (the review's finding 8)."""
         reserved = 0
         for workload in self.store.active():
             if workload.state not in ("preparing", "serving"):
                 continue
-            have = len(self.fleet.hosts_of(workload.name))
-            reserved += max(0, workload.hosts_at_start - have)
+            for group in workload.groups:
+                have = len(self.fleet.hosts_of(workload.name, group.key))
+                reserved += max(0, group.hosts_at_start - have)
         return reserved
 
     async def plan(self, req: WorkloadRequest) -> dict[str, Any]:
-        """Everything creating it would do, and nothing else: nothing is opened or rented."""
+        """Everything creating it would do, and nothing else: nothing is opened or rented.
+
+        With several models, both placements are priced from one market search — every host
+        holding every model, and a group of hosts per model — and the cheaper kept (D118)."""
         self._check_request(req)
+        targets = req.all_targets
         builds, cards = self._build(req)
         now = time.time()
         sketch = Workload(
-            name=req.name, model=req.model, builds=builds, latency_s=req.latency_s, parallel=req.parallel,
-            kind=req.kind, lease_id="", state="preparing", workers_per_host=0, hosts_at_start=0,
-            plan={"cards_per_copy": cards}, created_at=now, updated_at=now,
+            name=req.name, model=targets[0].model, builds=builds, latency_s=targets[0].latency_s,
+            parallel=req.total_parallel, kind=req.kind, lease_id="", state="preparing", workers_per_host=0,
+            hosts_at_start=0, plan={"cards_per_copy": cards}, created_at=now, updated_at=now, targets=targets,
         )
         fleet = self.fleet
-        models = (req.model,)
-        policy = fleet.policy_for(models, builds, cards_per_copy=cards)
-        policy = policy.model_copy(update={"min_reliability": max(policy.min_reliability, self.config.workloads.min_reliability)})
+        models = req.models
         kinds = {"on_demand": "on_demand", "interruptible": "interruptible"}.get(req.kind, "both")
-        offers = await fleet._offers(policy, kinds)
-        ranked, rejected = rank_offers(
-            offers, fleet._policy_with_avoided(policy), self.config.rented.bidding, req.hours,
-            fleet.model_set_gb(models, builds), history=fleet.machine_history(), history_cfg=self.config.rented.history,
-        )
+        # One search for every placement: the market is asked broadly and filtered here, so each
+        # group re-prices and ranks the same offers for its own disk and card (the review's finding 7).
+        offers = await fleet._offers(fleet.policy_for(models, builds, cards_per_copy=cards), kinds)
         plan: dict[str, Any] = {
-            "name": req.name, "model": req.model, "build": builds[req.model], "cards_per_copy": cards,
-            "latency_s": req.latency_s, "parallel": req.parallel, "hours": req.hours, "kind": req.kind,
-            "offers_seen": len(offers), "offers_passed": len(ranked), "refused": None, "reasons": [],
+            "name": req.name, "model": targets[0].model, "build": builds[targets[0].model], "cards_per_copy": cards,
+            "latency_s": targets[0].latency_s, "parallel": req.total_parallel, "hours": req.hours, "kind": req.kind,
+            "models": [t.as_dict() for t in targets], "builds": builds,
+            "offers_seen": len(offers), "refused": None, "reasons": [],
         }
-        if not ranked:
-            plan["refused"] = (
-                f"no machine on the market passes this workload's search ({len(offers)} seen"
-                + (f"; {fleet.last_offer_error}" if fleet.last_offer_error else "") + ")"
-            )
-            plan["rejected_by_reason"] = _count_reasons(rejected)
+        options: dict[str, Any] = {}
+        if len(targets) == 1 or req.placement in ("auto", "together"):
+            options["together"] = self._price(req, sketch, [models], offers, builds, cards)
+        if len(targets) > 1 and req.placement in ("auto", "apart"):
+            options["apart"] = self._price(req, sketch, [(m,) for m in models], offers, builds, cards)
+        # The pool's caps are judged per placement, before one is chosen: `auto` must not pick the
+        # cheaper and then be refused, when the other would have passed (the review's finding).
+        for option in options.values():
+            if option.get("refused") is None:
+                option["derived"] = math_.derived_budget(1, req.hours, option["hourly"])
+                budget_here = req.max_spend if req.max_spend is not None else option["derived"]
+                option["cap_refused"] = self._cap_refusal(option["hosts"], option["hourly"] / max(1, option["hosts"]),
+                                                          budget_here, req.hours)
+        placed = {name: o for name, o in options.items() if o.get("refused") is None}
+        allowed = {name: o for name, o in placed.items() if o.get("cap_refused") is None} or placed
+        if len(targets) > 1:
+            plan["placements"] = {
+                name: {"expected": o.get("expected"), "hosts": o.get("hosts"), "hourly": o.get("hourly"),
+                       "refused": o.get("refused") or o.get("cap_refused")}
+                for name, o in options.items()
+            }
+        if not placed:
+            said = [f"{name}: {o['refused']}" for name, o in options.items()] if len(options) > 1 else [
+                next(iter(options.values()))["refused"]]
+            plan["refused"] = "; ".join(said)
+            first_refused = next(iter(options.values()))
+            plan["offers_passed"] = max(o.get("offers_passed", 0) for o in options.values())
+            if first_refused.get("rejected_by_reason"):
+                plan["rejected_by_reason"] = first_refused["rejected_by_reason"]
             return plan
-
-        if req.kind == "roi":
-            ordered, why = fleet.expected_costs(ranked, req.hours, sketch, models, builds)
-            first = next(o for o, _ in ranked if o.offer_id == ordered[0].offer_id)
-            first_cost = ordered[0]
-            plan["reasons"] += why[:1]
+        if req.placement != "auto" or len(targets) == 1:
+            chosen_name, why = next(iter(allowed)), [f"{next(iter(allowed))}, as asked"]
         else:
-            first = ranked[0][0]
-            ordered, _ = fleet.expected_costs([ranked[0]], req.hours, sketch, models, builds)
-            first_cost = ordered[0]
-
-        card_workers, card_why = fleet._workers_for_card(first)
-        at = fleet.latency_sizing(first.hardware, sketch, ceiling=card_workers)
-        per_host = min(card_workers, at.workers) if at.workers is not None else card_workers
-        hosts = math_.hosts_at_start(req.parallel, per_host)
-        ready_h = math_.time_to_ready_hours(fleet.model_set_gb(models, builds), first.download_mbps,
-                                            self.config.workloads.engine_load_s)
-        derived = math_.derived_budget(hosts, req.hours, first_cost.hourly)
+            chosen, why = math_.choose_placement(allowed.get("together") and math_.Placement(
+                "together", allowed["together"]["expected"], allowed["together"]["hosts"], []),
+                allowed.get("apart") and math_.Placement("apart", allowed["apart"]["expected"], allowed["apart"]["hosts"], []))
+            chosen_name = chosen.name
+            skipped = [f"{name} is refused by the pool's caps ({o['cap_refused']})" for name, o in placed.items()
+                       if name not in allowed or (o.get("cap_refused") and name != chosen_name)]
+            if len(placed) > len(allowed) and skipped:
+                why = [f"{chosen_name}: the only placement the pool's caps allow; {skipped[0]}"]
+        option = placed[chosen_name]
+        if len(targets) > 1:
+            plan["reasons"].append(f"placement: {why[0]}")
+        groups = option["groups"]
+        first = groups[0]
+        hosts = option["hosts"]
+        derived = option["derived"]
         budget = req.max_spend if req.max_spend is not None else derived
+        plan["reasons"] += [r for g in groups for r in g["kind_reasons"]]
         plan.update({
-            "workers_per_host": per_host,
-            "workers_measured": at.measured and at.workers is not None,
-            "sizing": [card_why, *at.reasons],
-            "latency_curve": {str(k): v for k, v in at.curve.items()},
+            "placement": chosen_name,
+            "groups": [{k: g[k] for k in ("models", "builds", "hosts_at_start", "workers_per_host", "caps",
+                                          "cards_per_copy", "first_host", "sizing", "latency_curves",
+                                          "minutes_to_serve", "hourly_total")} for g in groups],
+            "offers_passed": option["offers_passed"],
+            "workers_per_host": first["workers_per_host"],
+            "workers_measured": all(g["measured"] for g in groups),
+            "sizing": [s for g in groups for s in g["sizing"]],
+            "latency_curve": first["latency_curves"].get(targets[0].model, {}),
             "hosts_at_start": hosts,
-            "first_host": {
-                "offer_id": first.offer_id, "machine": first.machine_id, "hardware": first.hardware,
-                "kind": "interruptible" if first.interruptible else "on_demand",
-                "hourly": round(first_cost.hourly, 4), "expected_per_worker_hour": first_cost.per_worker_hour,
-                "reasons": first_cost.reasons,
-            },
-            "minutes_to_serve": round(ready_h * 60, 1),
+            "first_host": first["first_host"],
+            "minutes_to_serve": max(g["minutes_to_serve"] for g in groups),
             "max_spend": round(budget, 2),
             "budget_derived": req.max_spend is None,
             "derived_budget": derived,
         })
-        entry = self.config.catalog.get(req.model)
-        if (self.config.pool.models_per_host == "all" and not self.config.rented.rent_profiles
-                and not (entry and entry.workloads_only)):
-            # The model must be in the pool's set, and with every rented host holding the whole
-            # set, the shared workload's rented hosts would fetch it too.
-            plan["reasons"].append(
-                "note: this model is in the pool's shared set, and this pool rents shared hosts for its "
-                "whole set, so they fetch it too; marking it workloads-only keeps it to workloads"
-            )
+        for model in models:
+            entry = self.config.catalog.get(model)
+            if (self.config.pool.models_per_host == "all" and not self.config.rented.rent_profiles
+                    and not (entry and entry.workloads_only)):
+                # The model must be in the pool's set, and with every rented host holding the whole
+                # set, the shared workload's rented hosts would fetch it too.
+                plan["reasons"].append(
+                    f"note: {model} is in the pool's shared set, and this pool rents shared hosts for its "
+                    "whole set, so they fetch it too; marking it workloads-only keeps it to workloads"
+                )
         burn_now = sum(h.bid_hourly for h in fleet.hosts.values() if not h.released) + fleet.volume_burn()
+        borrow = {m: self._shared_serves(m) for m in models}
         plan.update({
-            "hourly_total": round(hosts * first_cost.hourly, 4),
+            "hourly_total": round(option["hourly"], 4),
             "pool_burn_now": round(burn_now, 4),
-            "pool_burn_after": round(burn_now + hosts * first_cost.hourly, 4),
+            "pool_burn_after": round(burn_now + option["hourly"], 4),
             "pool_burn_cap": self.config.limits.max_hourly_burn,
-            "borrow_while_starting": self._shared_serves(req.model),
+            "borrow_while_starting": any(borrow.values()),
+            "borrow_by_model": borrow,
         })
-        plan["refused"] = self._cap_refusal(hosts, first_cost.hourly, budget, req.hours)
+        plan["refused"] = option["cap_refused"]
         return plan
+
+    def _price(self, req: WorkloadRequest, sketch: Workload, placement: list[tuple[str, ...]], offers: list,
+               builds: dict[str, str], cards: int) -> dict[str, Any]:
+        """One placement priced: each group's first host, its sizing and its hosts, and the whole
+        placement's expected cost over the hours — or why it cannot be placed."""
+        fleet = self.fleet
+        groups = []
+        for models in placement:
+            group_builds = {m: builds[m] for m in models}
+            policy = fleet.policy_for(models, group_builds, cards_per_copy=cards)
+            policy = policy.model_copy(update={"min_reliability": max(policy.min_reliability, self.config.workloads.min_reliability)})
+            ranked, rejected = rank_offers(
+                [o.priced_for(policy.min_disk_gb) for o in offers], fleet._policy_with_avoided(policy),
+                self.config.rented.bidding, req.hours, fleet.model_set_gb(models, group_builds),
+                history=fleet.machine_history(), history_cfg=self.config.rented.history,
+            )
+            named = ", ".join(models)
+            if not ranked:
+                return {
+                    "refused": (f"no machine on the market passes the search for {named} ({len(offers)} seen"
+                                + (f"; {fleet.last_offer_error}" if fleet.last_offer_error else "") + ")"),
+                    "rejected_by_reason": _count_reasons(rejected), "offers_passed": 0,
+                }
+            if len(models) > 1:
+                # Every model on one host within its own target, or not at all (D118).
+                passed = len(ranked)
+                ranked = [pair for pair in ranked if fleet.capacity_on(pair[0], sketch, models, group_builds) > 0]
+                if not ranked:
+                    return {"refused": (f"{passed} machine(s) pass the search, and none holds {named} together "
+                                        "within every model's target"), "offers_passed": passed}
+            if req.kind == "roi":
+                ordered, why = fleet.expected_costs(ranked, req.hours, sketch, models, group_builds)
+                kind_reasons = why[:1]
+            else:
+                ordered, _ = fleet.expected_costs([ranked[0]], req.hours, sketch, models, group_builds)
+                kind_reasons = []
+            if not ordered:
+                return {"refused": f"no machine holds {named} within every target", "offers_passed": len(ranked)}
+            first = next(o for o, _ in ranked if o.offer_id == ordered[0].offer_id)
+            first_cost = ordered[0]
+            if len(placement) > 1 or len(models) > 1:
+                kind_reasons = [f"{named}: {r}" for r in kind_reasons]
+            card_workers, card_why = fleet._workers_for_card(first)
+            sizing, curves, measured = [card_why], {}, True
+            per_model = {}
+            for model in models:
+                target = sketch.target(model)
+                at = fleet.model_at_latency(first.hardware, group_builds[model], target.latency_s, ceiling=card_workers)
+                per_model[model] = min(card_workers, at.workers) if at.workers is not None else card_workers
+                sizing += [f"{model}: {r}" if len(sketch.targets) > 1 else r for r in at.reasons]
+                curves[model] = {str(k): v for k, v in at.curve.items()}
+                measured = measured and at.measured and at.workers is not None
+            if len(models) == 1:
+                per_host = per_model[models[0]]
+                hosts = math_.hosts_at_start(sketch.target(models[0]).parallel, per_host)
+                caps: dict[str, int] = {}
+            else:
+                split = math_.split_together({m: sketch.target(m).parallel for m in models}, per_model)
+                if split is None:
+                    return {"refused": f"one answer of each of {named} already fills a {first.hardware}", "offers_passed": 0}
+                per_host, hosts, caps = split.workers, split.hosts, dict(split.caps)
+                sizing.append("split: " + ", ".join(f"{m} {caps[m]} of {per_model[m]}" for m in models)
+                              + f" at once per host, {split.load:.0%} of the card")
+            ready_h = math_.time_to_ready_hours(fleet.model_set_gb(models, group_builds), first.download_mbps,
+                                                self.config.workloads.engine_load_s)
+            # Each host priced at its own share of the group: an eviction of one of H hosts takes
+            # 1/H of the capacity away, not all of it (the review's finding). Priced as one of
+            # the whole group, a placement with more hosts looked dearer than it is.
+            if hosts > 1:
+                # Against the same offers as before, so the capacity an eviction loses is priced at
+                # the same on-demand rate; only this host's share of the group changes.
+                shared, _ = fleet.expected_costs(ranked, req.hours, sketch, models, group_builds,
+                                                 fixed_workers=per_host, have=per_host * (hosts - 1))
+                first_cost = next((c for c in shared if c.offer_id == first.offer_id), first_cost)
+            groups.append({
+                "models": list(models), "builds": group_builds, "hosts_at_start": hosts, "workers_per_host": per_host,
+                "caps": caps, "cards_per_copy": cards, "sizing": sizing, "latency_curves": curves, "measured": measured,
+                "kind_reasons": kind_reasons, "offers_passed": len(ranked),
+                "first_host": {
+                    "offer_id": first.offer_id, "machine": first.machine_id, "hardware": first.hardware,
+                    "kind": "interruptible" if first.interruptible else "on_demand",
+                    "hourly": round(first_cost.hourly, 4), "expected_per_worker_hour": first_cost.per_worker_hour,
+                    "reasons": first_cost.reasons,
+                },
+                "hourly_total": round(hosts * first_cost.hourly, 4),
+                "expected": first_cost.expected * hosts,
+                "minutes_to_serve": round(ready_h * 60, 1),
+            })
+        return {
+            "refused": None, "groups": groups, "hosts": sum(g["hosts_at_start"] for g in groups),
+            "hourly": sum(g["hosts_at_start"] * g["first_host"]["hourly"] for g in groups),
+            "expected": round(sum(g["expected"] for g in groups), 4),
+            "offers_passed": min(g["offers_passed"] for g in groups),
+        }
 
     def _shared_serves(self, model: str) -> bool:
         """Can a starting workload borrow for this model: does a ready shared host serve it?"""
@@ -306,12 +519,18 @@ class Workloads:
                 )
             now = time.time()
             lease_id = f"lease-{uuid.uuid4().hex[:8]}"
+            targets = req.all_targets
+            groups = tuple(Group(
+                models=tuple(g["models"]), builds=dict(g["builds"]), hosts_at_start=int(g["hosts_at_start"]),
+                workers_per_host=int(g["workers_per_host"]), caps=dict(g["caps"]), cards_per_copy=int(g["cards_per_copy"]),
+            ) for g in plan["groups"])
             workload = Workload(
-                name=req.name, model=req.model, builds={req.model: plan["build"]}, latency_s=req.latency_s,
-                parallel=req.parallel, kind=req.kind, lease_id=lease_id, state="preparing",
+                name=req.name, model=targets[0].model, builds=dict(plan["builds"]), latency_s=min(t.latency_s for t in targets),
+                parallel=req.total_parallel, kind=req.kind, lease_id=lease_id, state="preparing",
                 workers_per_host=plan["workers_per_host"], hosts_at_start=plan["hosts_at_start"], plan=plan,
                 created_at=now, updated_at=now, ends_at=now + req.hours * 3600,
                 provisioner=provisioner, idle_end_minutes=idle_end_minutes,
+                targets=targets, placement=plan["placement"], groups=groups,
             )
             # The row first: a name taken meanwhile fails here, before any spending authority
             # exists. The lease second, under the id the row already names.
@@ -321,8 +540,9 @@ class Workloads:
                 raise WorkloadRefused(f"workload {req.name!r} could not be recorded: {exc}") from exc
             try:
                 # Through the fleet: a lease longer than the dead-man timer covers is refused there.
+                # Its workers are every model's answers at once: the lease bounds its groups together.
                 lease = self.fleet.open_lease(
-                    workers=req.parallel, max_hours=req.hours, max_spend=budget, allow_rent=True,
+                    workers=req.total_parallel, max_hours=req.hours, max_spend=budget, allow_rent=True,
                     workload=req.name, lease_id=lease_id,
                 )
             except LeaseRefused as exc:
@@ -347,8 +567,11 @@ class Workloads:
                 key_id, key = self.store.mint_key(req.name)
         self.supervisor.events.record(
             "workload_created",
-            f"workload {req.name}: {req.model} at {req.parallel} at once, {req.latency_s:g}s p95, for "
-            f"{req.hours:g}h — {plan['hosts_at_start']} host(s) at {plan['workers_per_host']} each, up to ${budget:.2f}",
+            f"workload {req.name}: "
+            + "; ".join(f"{t.model} at {t.parallel} at once, {t.latency_s:g}s p95" for t in req.all_targets)
+            + f", for {req.hours:g}h — {plan['hosts_at_start']} host(s)"
+            + (f" placed {plan['placement']}" if len(req.all_targets) > 1 else f" at {plan['workers_per_host']} each")
+            + f", up to ${budget:.2f}",
             numbers={"workload": req.name, "key_id": key_id, "plan": plan, "provisioner": provisioner},
             lease_id=lease.lease_id,
         )
@@ -448,9 +671,11 @@ class Workloads:
     def _idle_past(self, workload: Workload, now: float) -> Optional[float]:
         """Minutes a program's workload has gone unused past its cutoff, or None (D117).
 
-        Only once serving, and counted from the later of its last request and the moment it
-        began serving: a program waiting for a slow preparation is not idle. A program that dies
-        while its workload prepares is bounded by the lease, as an operator's is."""
+        Only once serving — with several models, once every group has a host (D118) — and counted
+        from the later of its last request and the moment it began serving: a program waiting for
+        a slow preparation is not idle, and polls for its state write nothing a cutoff could read.
+        A program that dies while its workload prepares is bounded by the lease, as an operator's
+        is, whether none of its groups came up or only some did."""
         if workload.provisioner is None or workload.state != "serving":
             return None
         # A request still being answered is use: the log is written when one finishes, and an
@@ -481,10 +706,17 @@ class Workloads:
             if workload.state in ("preparing", "serving") and (lease is None or not lease.is_open):
                 self._ending(workload, f"its lease closed ({lease.closed_reason if lease else 'gone'})")
                 continue
-            if workload.state == "preparing" and any(h.state == "ready" for h in hosts):
+            ready_groups = [g for g in workload.groups
+                            if any(h.state == "ready" for h in hosts if g.holds(h.models))]
+            if workload.state == "preparing" and len(ready_groups) == len(workload.groups):
+                # Serving once every model has a host of its own: until then a model still coming
+                # up borrows where it may (D118).
                 self.store.set_state(workload.name, "serving")
                 self.supervisor.events.record(
-                    "workload_serving", f"workload {workload.name}: its first host is ready; borrowing stops",
+                    "workload_serving",
+                    f"workload {workload.name}: "
+                    + ("its first host is ready" if len(workload.groups) == 1 else "every group of its hosts is ready")
+                    + "; borrowing stops",
                     numbers={"workload": workload.name}, lease_id=workload.lease_id,
                 )
             elif workload.state == "ending" and not hosts:
@@ -504,10 +736,11 @@ class Workloads:
         hosts = self.fleet.hosts_of(workload.name) if self.fleet is not None else []
         spent = self.fleet.lease_spend(lease)[0] if (self.fleet is not None and lease is not None) else 0.0
         rows = self.supervisor.db.query(
-            "SELECT latency_ms FROM request_log WHERE workload = ? AND outcome = 'ok' AND latency_ms IS NOT NULL "
-            "ORDER BY id DESC LIMIT 2000",
+            "SELECT latency_ms, model_requested FROM request_log WHERE workload = ? AND outcome = 'ok' "
+            "AND latency_ms IS NOT NULL ORDER BY id DESC LIMIT 2000",
             (workload.name,),
         )
+        several = len(workload.targets) > 1
         refused = self.supervisor.db.query(
             "SELECT COUNT(*) AS n FROM request_log WHERE workload = ? AND status_code >= 500", (workload.name,),
         )[0]["n"]
@@ -515,15 +748,36 @@ class Workloads:
             "SELECT COUNT(*) AS n FROM request_log WHERE workload = ? AND borrowed = 1", (workload.name,),
         )[0]["n"]
         latencies = [r["latency_ms"] / 1000 for r in rows]
+        by_model = {}
+        for target in workload.targets:
+            # Each model's own window: a busy model must not crowd a quiet one out of the answers.
+            mine = [r["latency_ms"] / 1000 for r in self.supervisor.db.query(
+                "SELECT latency_ms FROM request_log WHERE workload = ? AND model_requested = ? AND outcome = 'ok' "
+                "AND latency_ms IS NOT NULL ORDER BY id DESC LIMIT 2000", (workload.name, target.model))] if several \
+                else [r["latency_ms"] / 1000 for r in rows]
+            by_model[target.model] = {
+                "count": len(mine), "latency_s": target.latency_s, "parallel": target.parallel,
+                "p95_s": round(math_.p95(mine), 3) if mine else None,
+                "meets_target": (math_.p95(mine) <= target.latency_s) if mine else None,
+                "cap_per_host": workload.cap(target.model),
+            }
+        ready_models = {m for h in hosts if h.state == "ready" for m in h.models}
+        borrowing_models = [
+            m for m in workload.models
+            if workload.state == "preparing" and (workload.plan or {}).get("may_borrow", True)
+            and m not in ready_models and self._shared_serves(m)
+        ]
         return {
             **{k: v for k, v in workload.as_dict().items() if k != "plan"},
             "plan": workload.plan,
             # While it starts: are its requests served on shared hosts, or refused until then?
-            "borrowing": (workload.state == "preparing" and (workload.plan or {}).get("may_borrow", True)
-                          and self._shared_serves(workload.model)),
+            # Per model (D118): borrowing while none of its own hosts holding it is ready.
+            "borrowing_models": borrowing_models,
+            "borrowing": bool(borrowing_models),
             "hosts": [
                 {"host_id": h.host_id, "state": h.state, "workers": h.workers, "hardware": h.offer.hardware,
-                 "kind": "interruptible" if h.interruptible else "on_demand", "hourly": round(h.bid_hourly, 4)}
+                 "kind": "interruptible" if h.interruptible else "on_demand", "hourly": round(h.bid_hourly, 4),
+                 "models": list(h.models)}
                 for h in hosts
             ],
             "lease": {
@@ -536,9 +790,15 @@ class Workloads:
             "answers": {
                 "count": len(latencies),
                 "p95_s": round(math_.p95(latencies), 3) if latencies else None,
-                "meets_target": (math_.p95(latencies) <= workload.latency_s) if latencies else None,
+                # With several models, each against its own target (D118): one mixed p95 against
+                # the tightest target says nothing true about either.
+                "meets_target": (
+                    all(m["meets_target"] for m in by_model.values() if m["meets_target"] is not None)
+                    if any(m["meets_target"] is not None for m in by_model.values()) else None
+                ) if several else ((math_.p95(latencies) <= workload.latency_s) if latencies else None),
                 "refused": int(refused),
                 "borrowed": int(borrowed),
+                "by_model": by_model,
             },
             "keys": self.store.keys(workload.name),
         }

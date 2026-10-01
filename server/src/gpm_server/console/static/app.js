@@ -2199,7 +2199,8 @@ const leaseRows = (leases) => el("table", {},
 // table refreshes itself every few seconds; the form and a key being copied are never redrawn
 // under the operator.
 const workloadDraft = {
-  name: "", model: "", latency: "30", parallel: "8", hours: "4", budget: "", kind: "roi",
+  // One row per model, each with its own target (D118).
+  name: "", rows: [{ model: "", latency: "30", parallel: "8" }], placement: "auto", hours: "4", budget: "", kind: "roi",
   plan: null, planning: false, error: null, notice: null, shown: null, open: null,
   rowErrors: {}, timer: null, holder: null,
   // The form folds away once any workload is active, so the table stays in view; it opens on
@@ -2217,12 +2218,25 @@ const NAME_RULE = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const dollars = (n) => (n === null || n === undefined ? "—" : `$${Number(n).toFixed(2)}`);
 const until = (ts) => (ts ? new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—");
 
+// One set of names everywhere — form, plan, table, CLI, spec (D118).
+const PLACEMENT_LABELS = { auto: "Whichever costs less", together: "Together — every host holds every model",
+  apart: "Apart — each model on hosts of its own" };
+const PLACEMENT_HINTS = {
+  auto: "priced both ways when you plan; the cheaper is kept (within 1% they count as equal: together)",
+  together: "each host keeps a fixed share of its answers for each model",
+  apart: "each model scales on hosts that hold only it",
+};
+
 function workloadBody() {
   const d = workloadDraft;
-  const body = {
-    name: d.name.trim(), model: d.model, latency_s: Number(d.latency), parallel: Number(d.parallel),
-    hours: Number(d.hours), kind: d.kind,
-  };
+  const body = { name: d.name.trim(), hours: Number(d.hours), kind: d.kind };
+  if (d.rows.length === 1) {
+    const [row] = d.rows;
+    Object.assign(body, { model: row.model, latency_s: Number(row.latency), parallel: Number(row.parallel) });
+  } else {
+    body.models = d.rows.map((r) => ({ model: r.model, latency_s: Number(r.latency), parallel: Number(r.parallel) }));
+    body.placement = d.placement;
+  }
   if (d.budget.trim() !== "") body.max_spend = Number(d.budget.replace(/^\$/, ""));
   return body;
 }
@@ -2238,15 +2252,26 @@ function rentable(status, model) {
 function workloadForm(status) {
   const d = workloadDraft;
   const onlyForWorkloads = status.workload_models || [];
-  const models = [...onlyForWorkloads, ...(status.model_set || [])];
-  if (!d.model && models.length) d.model = models.find((m) => rentable(status, m)) || models[0];
+  const models = [...new Set([...onlyForWorkloads, ...(status.model_set || [])])];
+  const firstFree = () => models.find((m) => rentable(status, m) && !d.rows.some((r) => r.model === m))
+    || models.find((m) => !d.rows.some((r) => r.model === m)) || models[0];
+  for (const row of d.rows) if (!row.model && models.length) row.model = firstFree();
   const label = (m) => `${m}${onlyForWorkloads.includes(m) ? " (workloads only)" : ""}${rentable(status, m) ? "" : " (no build for rented hosts)"}`;
-  let planButton, planHolder, errorHolder, nameCheck;
+  let planButton, planHolder, errorHolder, nameCheck, dupNote;
+  const rowSelects = [];
+  const mostModels = Math.min(status.workload_max_models || 4, models.length);
   const nameOk = () => NAME_RULE.test(d.name.trim()) && !d.name.trim().startsWith("rented-");
+  const twice = () => new Set(d.rows.map((r) => r.model)).size !== d.rows.length;
   const sync = (focusPlan) => {
-    planButton.disabled = d.planning || !nameOk();
+    // A model another row holds cannot be picked again: duplicates are prevented, not reported.
+    rowSelects.forEach((select, i) => {
+      for (const option of select.options) option.disabled = d.rows.some((r, j) => j !== i && r.model === option.value);
+      select.setAttribute("aria-invalid", d.rows.some((r, j) => j !== i && r.model === d.rows[i].model) ? "true" : "false");
+    });
+    dupNote.textContent = twice() ? "Each model once: pick another for the repeated row." : "";
+    planButton.disabled = d.planning || !nameOk() || twice();
     planButton.textContent = d.planning ? "Working it out…" : "Plan";
-    planButton.title = nameOk() ? "" : "Name it first";
+    planButton.title = !nameOk() ? "Name it first" : twice() ? "Each model once" : "";
     nameCheck.textContent = d.name && !nameOk() ? "lower-case letters, digits and -, not starting with rented-" : "";
     planHolder.replaceChildren(...(d.plan ? [workloadPlanView(d.plan)] : []));
     errorHolder.textContent = d.error || "";
@@ -2262,24 +2287,59 @@ function workloadForm(status) {
   const input = (key, attrs) => el("input", { ...attrs, value: d[key], oninput: (e) => { d[key] = e.target.value; changed(); } });
   const select = (key, options) => el("select", { onchange: (e) => { d[key] = e.target.value; changed(); } },
     ...options.map(([v, text]) => el("option", { value: v, ...(v === d[key] ? { selected: true } : {}) }, text)));
+  // A row's own fields: bound to that row, not to the draft's top level. Their hints are said
+  // once, under the rows, and every row's fields point at them.
+  const rowHints = "wl-row-hints";
+  const rowField = (text, control) => {
+    control.setAttribute("aria-describedby", rowHints);
+    return el("label", { class: "field" }, el("span", {}, text), control);
+  };
+  const rowInput = (row, key, attrs) => el("input", { ...attrs, value: row[key], oninput: (e) => { row[key] = e.target.value; changed(); } });
+  const rowSelect = (row) => {
+    const select = el("select", { onchange: (e) => { row.model = e.target.value; changed(); } },
+      ...models.map((m) => el("option", { value: m, ...(m === row.model ? { selected: true } : {}) }, label(m))));
+    rowSelects.push(select);
+    return select;
+  };
+  const several = d.rows.length > 1;
+  const modelRows = d.rows.map((row, i) => el("div", { class: "model-row", role: "group",
+    "aria-label": several ? `Model ${i + 1} of ${d.rows.length}` : "Model" },
+    rowField("Model", rowSelect(row)),
+    rowField("Answer latency (p95, s)", rowInput(row, "latency", { type: "number", min: "0.1", step: "any" })),
+    rowField("Answers at once", rowInput(row, "parallel", { type: "number", min: "1", step: "1" })),
+    several ? el("button", { class: "small", "aria-label": `Remove model ${i + 1}`,
+      onclick: () => { d.rows.splice(i, 1); d.plan = null; d.focusRow = Math.min(i, d.rows.length - 1); drawWorkloadForm(); } },
+    "Remove") : null));
+  const full = d.rows.length >= mostModels;
+  const addModel = el("button", { class: "small", disabled: full,
+    onclick: () => { d.rows.push({ model: firstFree(), latency: "30", parallel: "4" }); d.plan = null; d.focusRow = d.rows.length - 1; drawWorkloadForm(); } },
+  "Add model");
+  const placementHint = el("small", { class: "muted" }, PLACEMENT_HINTS[d.placement]);
+  const placementSelect = select("placement", Object.entries(PLACEMENT_LABELS));
+  placementSelect.addEventListener("change", () => { placementHint.textContent = PLACEMENT_HINTS[d.placement]; });
   const kindHint = el("small", { class: "muted" }, KIND_HINTS[d.kind]);
   const kindSelect = select("kind", Object.entries(KIND_LABELS));
   kindSelect.addEventListener("change", () => { kindHint.textContent = KIND_HINTS[d.kind]; });
   nameCheck = el("small", { class: "error", role: "status" });
+  dupNote = el("small", { class: "error", role: "status" });
   planButton = el("button", { onclick: () => planWorkload(sync) }, "Plan");
   planHolder = el("div");
   errorHolder = el("span", { class: "error", role: "status" });
   const panel = el("div", { class: "panel" },
     el("h2", {}, "New workload"),
     el("p", { class: "muted" },
-      "A model at a latency, for a number of answers at once, for a time. It gets its own hosts, its own lease and its own key; nothing is rented until you create it."),
+      "One or more models, each at its own latency and answers at once, for a time. It gets its own hosts, its own lease and its own key; nothing is rented until you create it."),
     el("div", { class: "form-grid" },
       el("div", { class: "field" }, wrap("Name", input("name", { type: "text", maxlength: "40", placeholder: "e.g. research-run",
-        autocomplete: "off", pattern: "[a-z0-9][a-z0-9-]{0,39}" }), "lower-case letters, digits and -"), nameCheck),
-      wrap("Model", select("model", models.map((m) => [m, label(m)])),
-        "a workloads-only model is never fetched by the shared hosts"),
-      wrap("Answer latency (p95, s)", input("latency", { type: "number", min: "1", step: "1" }), "the whole answer, as the app receives it"),
-      wrap("Answers at once", input("parallel", { type: "number", min: "1", step: "1" }), "the most it serves together"),
+        autocomplete: "off", pattern: "[a-z0-9][a-z0-9-]{0,39}" }), "lower-case letters, digits and -"), nameCheck)),
+    el("div", { class: "model-rows", role: "group", "aria-label": "Models" }, ...modelRows,
+      el("small", { class: "muted", id: rowHints },
+        "Latency: the whole answer at p95, as the app receives it. Answers at once: the most answers of this model at the same time, across its hosts. A workloads-only model is never fetched by the shared hosts."),
+      el("div", { class: "row" }, addModel,
+        full ? el("small", { class: "muted" }, models.length <= d.rows.length ? "every model is already in it"
+          : `at most ${mostModels} models in one workload`) : null, dupNote)),
+    el("div", { class: "form-grid" },
+      several ? el("label", { class: "field" }, el("span", {}, "Placement"), placementSelect, placementHint) : null,
       wrap("Hours", input("hours", { type: "number", min: "0.5", step: "0.5" }), "then its hosts are released"),
       wrap("Budget ($)", input("budget", { type: "number", min: "0.01", step: "0.01", placeholder: "propose one for me" }),
         "its dollar cap; left empty, the plan proposes one"),
@@ -2288,6 +2348,11 @@ function workloadForm(status) {
     d.notice ? el("p", { class: "warn-text", role: "status" }, d.notice) : null,
     planHolder);
   sync();
+  if (d.focusRow != null) {
+    const at = d.focusRow;
+    d.focusRow = null;
+    setTimeout(() => rowSelects[at]?.focus(), 0);
+  }
   return panel;
 }
 
@@ -2316,17 +2381,63 @@ function workloadPlanView(plan) {
   const bid = first.kind !== "on_demand";
   const createButton = el("button", { class: "primary", disabled: Boolean(plan.refused),
     onclick: (e) => createWorkload(e.target) }, `Create — up to ${dollars(plan.max_spend)}`);
+  const several = (plan.models || []).length > 1;
+  const measured = plan.workers_measured ? pill("measured on this card", "ok")
+    : el("span", { class: "muted" }, "— latency not measured on this card yet: sized from its rated capacity");
+  const placementNames = { together: "Together — every host holds every model", apart: "Apart — each model on hosts of its own" };
+  const hostsWord = (n) => `${n} host${n === 1 ? "" : "s"}`;
+  // Why the kept placement was kept, in one line: asked for, cheaper, equal, or the only one the
+  // pool's caps allow.
+  const priced = plan.placements || {};
+  const other = Object.entries(priced).find(([name]) => name !== plan.placement);
+  const kept = priced[plan.placement] || {};
+  let keptWhy = "as chosen";
+  if (other) {
+    const [otherName, o] = other;
+    if (o.refused) keptWhy = `${otherName} is not possible here`;
+    else if (kept.expected <= o.expected) keptWhy = `${dollars(o.expected - kept.expected)} less than ${otherName}`;
+    else keptWhy = `within 1% of ${otherName}: equal, so together is kept`;
+  }
+  const splitLine = (g) => {
+    const kind = `${g.first_host.kind !== "on_demand" ? "a bid" : "on demand"}, ${g.first_host.hardware}, ${rate(g.first_host.hourly)}`;
+    if (!Object.keys(g.caps || {}).length) {
+      return `${g.models[0]} — ${hostsWord(g.hosts_at_start)} × ${g.workers_per_host} answers at once (${g.hosts_at_start * g.workers_per_host} in all) · ${kind}`;
+    }
+    const each = g.models.map((m) => `${g.caps[m]} ${m}`).join(" and ");
+    const all = g.models.map((m) => `${g.caps[m] * g.hosts_at_start} ${m}`).join(", ");
+    return `${g.models.join(" + ")} — ${hostsWord(g.hosts_at_start)}, each takes at most ${each} answer${g.workers_per_host === 1 ? "" : "s"} at once (${all} in all) · ${kind}`;
+  };
+  // Several models (D118): both placements as priced, which was kept and why, and each group's split.
+  const placementRows = several ? [
+    el("div", { class: "k" }, "placement"),
+    el("div", {}, el("strong", {}, placementNames[plan.placement] || plan.placement), ` — kept: ${keptWhy}`,
+      ...Object.entries(priced).map(([name, o]) => el("div", { class: "muted" },
+        `${name}: ${o.refused ? `not possible — ${o.refused}` : `${hostsWord(o.hosts)}, ${dollars(o.expected)} expected over ${plan.hours} h`}`
+        + (name === plan.placement ? " (kept)" : "")))),
+    el("div", { class: "k" }, "starts on"),
+    el("div", {}, ...plan.groups.map((g) => el("div", {}, splitLine(g))), measured,
+      plan.groups.some((g) => Object.keys(g.caps || {}).length)
+        ? el("div", { class: "muted" }, "Fixed shares: a request past its model's share on a host waits, even while another model's share there is idle.")
+        : null),
+  ] : [
+    el("div", { class: "k" }, "starts on"),
+    el("div", {}, `${hosts} host${hosts === 1 ? "" : "s"}, ${plan.workers_per_host} answers at once each `, measured),
+    el("div", { class: "k" }, "first host"),
+    el("div", {}, `${bid ? "a bid" : "on demand"}: ${first.hardware}, ${rate(first.hourly)}`,
+      bid ? el("span", { class: "muted" }, " — a bid can be taken away; the pool rents a replacement") : null),
+  ];
+  const borrowing = Object.entries(plan.borrow_by_model || {});
+  const listed = (names) => `${names.join(", ")} ${names.length === 1 ? "is" : "are"}`;
+  const whileStarting = several && borrowing.some(([, yes]) => yes) && borrowing.some(([, yes]) => !yes)
+    ? ` — meanwhile ${listed(borrowing.filter(([, yes]) => yes).map(([m]) => m))} served on shared hosts; ${listed(borrowing.filter(([, yes]) => !yes).map(([m]) => m))} refused until ${plan.placement === "together" ? "the workload's first host is" : "its own hosts are"} ready`
+    : plan.borrow_while_starting
+      ? ` — meanwhile its requests are served on shared hosts that hold ${several ? "these models" : "this model"}`
+      : ` — until then its requests are refused: no shared host serves ${several ? "these models" : "this model"}`;
   return el("div", { class: "plan" + (plan.refused ? " refused" : ""), tabindex: "-1" },
     el("div", { class: "kv" },
-      el("div", { class: "k" }, "starts on"),
-      el("div", {}, `${hosts} host${hosts === 1 ? "" : "s"}, ${plan.workers_per_host} answers at once each `,
-        plan.workers_measured ? pill("measured on this card", "ok")
-          : el("span", { class: "muted" }, "— latency not measured on this card yet: sized from its rated capacity")),
-      el("div", { class: "k" }, "first host"),
-      el("div", {}, `${bid ? "a bid" : "on demand"}: ${first.hardware}, ${rate(first.hourly)}`,
-        bid ? el("span", { class: "muted" }, " — a bid can be taken away; the pool rents a replacement") : null),
+      ...placementRows,
       el("div", { class: "k" }, "cost per hour"),
-      el("div", {}, Math.abs(hosts * first.hourly - perHour) < 0.005
+      el("div", {}, !several && Math.abs(hosts * first.hourly - perHour) < 0.005
         ? `${hosts} host${hosts === 1 ? "" : "s"} × ${rate(first.hourly)} = ${rate(perHour)}` : rate(perHour)),
       el("div", { class: "k" }, "budget"),
       el("div", {}, el("strong", {}, dollars(plan.max_spend)),
@@ -2334,10 +2445,7 @@ function workloadPlanView(plan) {
       plan.pool_burn_cap ? el("div", { class: "k" }, "pool burn") : null,
       plan.pool_burn_cap ? el("div", {}, `${rate(plan.pool_burn_after)} of the ${rate(plan.pool_burn_cap)} cap after this (now ${rate(plan.pool_burn_now)})`) : null,
       el("div", { class: "k" }, "serving in about"),
-      el("div", {}, `${Math.round(plan.minutes_to_serve)} minutes`,
-        el("span", { class: "muted" }, plan.borrow_while_starting
-          ? " — meanwhile its requests are served on shared hosts that hold this model"
-          : " — until then its requests are refused: no shared host serves this model")),
+      el("div", {}, `${Math.round(plan.minutes_to_serve)} minutes`, el("span", { class: "muted" }, whileStarting)),
       el("div", { class: "k" }, "at the end"),
       el("div", {}, "When the hours or the budget run out, its hosts are released and its key gets 503 workload_ended.")),
     el("details", {}, el("summary", {}, "How this was worked out"),
@@ -2366,9 +2474,11 @@ async function createWorkload(button) {
   button.disabled = true;
   try {
     const made = await api.createWorkload(body);
-    d.shown = { name: body.name, model: body.model, connection: made.connection, rotated: false,
-                endsAt: made.workload.ends_at, parallel: body.parallel, latency: body.latency_s };
-    Object.assign(d, { name: "", budget: "", plan: null, error: null, notice: null, formOpen: false });
+    const targets = body.models || [{ model: body.model, latency_s: body.latency_s, parallel: body.parallel }];
+    d.shown = { name: body.name, model: targets.map((t) => t.model).join(", "), connection: made.connection, rotated: false,
+                endsAt: made.workload.ends_at, targets };
+    Object.assign(d, { name: "", budget: "", plan: null, error: null, notice: null, formOpen: false,
+      rows: [{ model: "", latency: "30", parallel: "8" }], placement: "auto" });
   } catch (error) {
     if (plan.budget_derived && /derived one is/.test(error.message)) {
       // The market moved between the plan and now: plan again and say so, rather than dead-end.
@@ -2388,8 +2498,8 @@ async function createWorkload(button) {
 
 const workloadWithout = (body) => { const copy = { ...body }; delete copy.confirm_max_spend; return copy; };
 
-function copyButton(text, label = "Copy") {
-  return el("button", { class: "small", onclick: async (e) => {
+function copyButton(text, label = "Copy", ariaLabel = null) {
+  return el("button", { class: "small", ...(ariaLabel ? { "aria-label": ariaLabel } : {}), onclick: async (e) => {
     try { await navigator.clipboard.writeText(text); e.target.textContent = "Copied"; }
     catch { e.target.textContent = "Select it and copy"; }
     setTimeout(() => { e.target.textContent = label; }, 1500);
@@ -2404,22 +2514,29 @@ function keyPanel() {
   const shown = workloadDraft.shown;
   if (!shown) return null;
   const c = shown.connection;
+  const targets = shown.targets || [];
+  const several = targets.length > 1;
   const handoff = [
-    `base_url: ${c.base_url}`, `api_key: ${c.api_key}`, `model: ${shown.model}`,
+    `base_url: ${c.base_url}`, `api_key: ${c.api_key}`, `${several ? "models" : "model"}: ${shown.model}`,
     shown.endsAt ? `valid until: ${until(shown.endsAt)} (while the workload runs)` : null,
-    shown.parallel ? `at most ${shown.parallel} answers at once` : null,
-    shown.latency ? `target ${shown.latency} s per answer` : null,
+    ...targets.map((t) => `${several ? `${t.model}: ` : ""}at most ${t.parallel} answers at once, target ${t.latency_s} s per answer`),
   ].filter(Boolean).join("\n");
   const heading = el("h2", { tabindex: "-1" }, shown.rotated ? `New key for ${shown.name}` : `${shown.name} is created — give its app owner these`);
   const panel = el("div", { class: "panel key-panel", "aria-live": "polite" },
     heading,
     el("p", {}, el("strong", {}, "The key is shown this once."), " Only its hash is kept; if it is lost, mint a new one."),
     el("div", { class: "kv" },
-      el("div", { class: "k" }, "base_url"), el("div", { class: "row" }, el("code", {}, c.base_url), copyButton(c.base_url)),
-      el("div", { class: "k" }, "api_key"), el("div", { class: "row" }, el("code", { class: "secret" }, c.api_key), copyButton(c.api_key)),
-      el("div", { class: "k" }, "model"), el("div", { class: "row" }, el("code", {}, shown.model), copyButton(shown.model))),
+      el("div", { class: "k" }, "base_url"), el("div", { class: "row" }, el("code", {}, c.base_url), copyButton(c.base_url, "Copy", "Copy base URL")),
+      el("div", { class: "k" }, "api_key"), el("div", { class: "row" }, el("code", { class: "secret" }, c.api_key), copyButton(c.api_key, "Copy", "Copy API key")),
+      el("div", { class: "k" }, several ? "models" : "model"),
+      several
+        ? el("div", {}, ...targets.map((t) => el("div", { class: "row" }, el("code", {}, t.model),
+          copyButton(t.model, "Copy", `Copy model name ${t.model}`),
+          el("span", { class: "muted" }, `up to ${t.parallel} at once, p95 ${t.latency_s} s`))))
+        : el("div", { class: "row" }, el("code", {}, shown.model), copyButton(shown.model, "Copy", "Copy model name"))),
     el("p", { class: "muted" },
-      "Any OpenAI-compatible client takes these: base URL, API key, and the model name. ",
+      several ? "One URL and one key for all its models; each request names its model. "
+        : "Any OpenAI-compatible client takes these: base URL, API key, and the model name. ",
       c.tls ? "The client must trust the pool's certificate: a public one, or give the app owner the pool's CA file."
         : "The pool listens without TLS here, so the key must not leave this machine."),
     shown.rotated ? el("p", { class: "muted" }, `The old key keeps working until ${until(shown.graceUntil)}.`) : null,
@@ -2437,6 +2554,17 @@ function keyPanel() {
 
 function latencyCell(w) {
   const answers = w.answers || {};
+  const byModel = Object.entries(answers.by_model || {});
+  if (byModel.length > 1) {
+    // One line per model, against its own target (D118).
+    return el("td", { class: "num" }, ...byModel.map(([model, a]) => {
+      const over = a.meets_target === false;
+      const said = !a.count ? "no answers yet" : a.count < 20 ? `too few (${a.count})` : `${a.p95_s.toFixed(1)} s`;
+      // Said in words, not only in colour.
+      return el("div", { class: over ? "error" : "" }, `${model}: ${said}`,
+        el("span", { class: over ? "" : "muted" }, ` of ${a.latency_s} s target${over ? " — over" : ""}`));
+    }));
+  }
   if (!answers.count) return el("td", { class: "num" }, "—", el("div", { class: "muted" }, `target ${w.latency_s} s`));
   if (answers.count < 20) {
     return el("td", { class: "num" }, "too few answers yet", el("div", { class: "muted" }, `${answers.count} · target ${w.latency_s} s`));
@@ -2468,17 +2596,27 @@ function timeLeftCell(w) {
     : el("td", { class: "num" }, `${hours.toFixed(1)} h`, el("div", { class: "muted" }, `until ${until(w.ends_at)}`));
 }
 
+// While it starts, where each model's requests go now: its own hosts, shared hosts, or refused.
+function modelStartLines(w) {
+  const ready = new Set(w.hosts.filter((h) => h.state === "ready").flatMap((h) => h.models || []));
+  return (w.models || [w.model]).map((m) => ready.has(m) ? `${m}: served on its hosts`
+    : (w.borrowing_models || []).includes(m) ? `${m}: on shared hosts meanwhile`
+      : `${m}: refused (503) until its hosts are ready`);
+}
+
 function stateCell(w) {
+  const several = (w.models || []).length > 1;
   const note = w.state === "preparing"
-    ? (w.borrowing ? "borrowing shared hosts" : `waiting — no shared host serves ${w.model}`)
+    ? (several ? null : w.borrowing ? "borrowing shared hosts" : `waiting — no shared host serves ${w.model}`)
     : w.state === "ending" ? "draining, key refused" : null;
+  const perModel = w.state === "preparing" && several ? modelStartLines(w).map((line) => el("div", { class: "muted" }, line)) : [];
   let eta = null;
   if (w.state === "preparing" && w.plan && w.plan.minutes_to_serve) {
     const left = Math.max(0, Math.round((w.created_at + w.plan.minutes_to_serve * 60 - Date.now() / 1000) / 60));
     eta = left > 0 ? `serving in ~${left} min (planned)` : "due to serve any moment";
   }
   return el("td", {}, pill(w.state, WORKLOAD_STATES[w.state]),
-    note ? el("div", { class: "muted" }, note) : null, eta ? el("div", { class: "muted" }, eta) : null);
+    note ? el("div", { class: "muted" }, note) : null, ...perModel, eta ? el("div", { class: "muted" }, eta) : null);
 }
 
 function workloadRow(w) {
@@ -2490,7 +2628,8 @@ function workloadRow(w) {
       el("button", { class: "link", "aria-expanded": open ? "true" : "false",
         onclick: () => { workloadDraft.open = open ? null : w.name; drawWorkloadTables(); } },
         el("span", { "aria-hidden": "true" }, open ? "▾ " : "▸ "), el("strong", {}, w.name)),
-      el("div", { class: "muted mono" }, w.model),
+      el("div", { class: "muted mono" }, (w.models || [w.model]).join(", ")),
+      (w.models || []).length > 1 ? el("div", { class: "muted" }, w.placement === "apart" ? "apart" : "together") : null,
       w.provisioner ? el("div", { class: "muted" }, `made by ${w.provisioner}`) : null),
     stateCell(w),
     w.state === "preparing" || w.state === "serving"
@@ -2522,12 +2661,27 @@ function workloadDetail(w) {
     return " — in use";
   };
   const hostsLine = w.hosts.length ? null
-    : w.state === "preparing" ? (w.borrowing ? "Its first hosts are being rented; meanwhile it is served on shared hosts."
-      : `Its first hosts are being rented; until one is ready its requests are refused (no shared host serves ${w.model}).`)
+    : w.state === "preparing" ? ((w.models || []).length > 1 ? `Its first hosts are being rented. ${modelStartLines(w).join("; ")}.`
+      : w.borrowing ? "Its first hosts are being rented; meanwhile it is served on shared hosts."
+        : `Its first hosts are being rented; until one is ready its requests are refused (no shared host serves ${w.model}).`)
     : w.state === "ending" ? "All its hosts are released; closing." : "No hosts.";
   return el("div", {},
     el("div", { class: "kv" },
-      el("div", { class: "k" }, "answers at once"), el("div", {}, `${w.parallel}, on up to ${w.workers_per_host} per host`),
+      ...((w.models || []).length > 1 ? [
+        el("div", { class: "k" }, "models"),
+        el("div", {}, ...(w.targets || []).map((t) => {
+          const share = (w.answers?.by_model || {})[t.model]?.cap_per_host;
+          return el("div", {}, `${t.model}: ${t.parallel} answers at once in all, p95 within ${t.latency_s} s`
+            + (share ? `; at most ${share} per host` : ""));
+        })),
+        el("div", { class: "k" }, "hosts"),
+        el("div", {}, `${w.placement === "apart" ? "Apart" : "Together"} — `, ...(w.groups || []).map((g) => {
+          const ready = w.hosts.filter((h) => h.state === "ready" && (h.models || []).join() === g.models.join()).length;
+          return el("div", {}, `${g.models.join(" + ")}: ${ready} of ${g.hosts_at_start} ready, ${g.workers_per_host} answers at once each`);
+        })),
+      ] : [
+        el("div", { class: "k" }, "answers at once"), el("div", {}, `${w.parallel}, on up to ${w.workers_per_host} per host`),
+      ]),
       el("div", { class: "k" }, "machines"), el("div", {}, `${KIND_LABELS[w.kind] || w.kind} — ${KIND_HINTS[w.kind] || ""}`),
       el("div", { class: "k" }, "answers so far"),
       el("div", {}, `${answers.count || 0} served, ${answers.borrowed || 0} on shared hosts while starting, ${answers.refused || 0} refused`),
@@ -2538,9 +2692,10 @@ function workloadDetail(w) {
         el("span", { class: "muted" }, ` made ${until(k.created_at)}${keyState(k)}`))))),
     w.state === "ending" && w.hosts.length ? el("p", { class: "muted" }, `Draining: ${w.hosts.length} host${w.hosts.length === 1 ? "" : "s"} finishing their answers, then released.`) : null,
     w.hosts.length
-      ? el("table", {}, el("thead", {}, el("tr", {}, ...["Host", "State", "Machine", "Kind", "Answers at once", "Price"].map((h) => el("th", {}, h)))),
+      ? el("table", {}, el("thead", {}, el("tr", {}, ...["Host", "State", "Models", "Machine", "Kind", "Answers at once", "Price"].map((h) => el("th", {}, h)))),
           el("tbody", {}, w.hosts.map((h) => el("tr", {},
-            el("td", {}, hostLink(h.host_id)), el("td", {}, pill(h.state)), el("td", {}, h.hardware),
+            el("td", {}, hostLink(h.host_id)), el("td", {}, pill(h.state)),
+            el("td", { class: "mono" }, (h.models || []).join(", ")), el("td", {}, h.hardware),
             el("td", {}, h.kind === "on_demand" ? "on demand" : "bid"), el("td", { class: "num" }, h.workers),
             el("td", { class: "num" }, rate(h.hourly))))))
       : el("p", { class: "muted" }, hostsLine));
@@ -2606,9 +2761,9 @@ async function rotateWorkloadKey(button, w) {
   if (!ok) return;
   workloadAction(button, w, async () => {
     const answer = await api.rotateWorkloadKey(w.name);
-    workloadDraft.shown = { name: w.name, model: w.model, connection: answer.connection, rotated: true,
+    workloadDraft.shown = { name: w.name, model: (w.models || [w.model]).join(", "), connection: answer.connection, rotated: true,
                             graceUntil: Date.now() / 1000 + answer.old_keys_valid_minutes * 60,
-                            endsAt: w.ends_at, parallel: w.parallel, latency: w.latency_s };
+                            endsAt: w.ends_at, targets: w.targets || [] };
     render();
   });
 }

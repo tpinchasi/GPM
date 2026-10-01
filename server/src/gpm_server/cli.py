@@ -254,9 +254,30 @@ def _control_json(args: argparse.Namespace, method: str, path: str, body: Option
 
 
 def _say_plan(plan: dict) -> None:
-    print(f"workload {plan['name']}: {plan['model']} ({plan['build']}), {plan['parallel']} at once, "
-          f"{plan['latency_s']:g}s p95, for {plan['hours']:g}h")
-    if "hosts_at_start" in plan:
+    models = plan.get("models") or []
+    if len(models) > 1:
+        print(f"workload {plan['name']}, for {plan['hours']:g}h:")
+        for target in models:
+            print(f"  {target['model']} ({plan['builds'][target['model']]}): {target['parallel']} at once, "
+                  f"{target['latency_s']:g}s p95")
+    else:
+        print(f"workload {plan['name']}: {plan['model']} ({plan['build']}), {plan['parallel']} at once, "
+              f"{plan['latency_s']:g}s p95, for {plan['hours']:g}h")
+    if len(models) > 1 and "groups" in plan:
+        for name, option in (plan.get("placements") or {}).items():
+            priced = f"{option['hosts']} host(s), ${option['expected']:.2f} expected" if not option.get("refused") \
+                else f"not possible: {option['refused']}"
+            print(f"  {name}: {priced}")
+        for group in plan["groups"]:
+            first = group["first_host"]
+            split = ", ".join(f"{m} {group['caps'][m]}" for m in group["models"]) if group["caps"] else \
+                f"{group['workers_per_host']} at once"
+            print(f"  {' + '.join(group['models'])}: {group['hosts_at_start']} host(s), {split} each; "
+                  f"{first['kind'].replace('_', '-')} {first['hardware']} at ${first['hourly']:.3f}/h")
+        for reason in plan.get("reasons", []):
+            print(f"  {reason}")
+        print(f"  budget: ${plan['max_spend']:.2f}" + (" (derived)" if plan["budget_derived"] else ""))
+    elif "hosts_at_start" in plan:
         first = plan["first_host"]
         measured = "measured" if plan["workers_measured"] else "not measured yet"
         print(f"  starts on {plan['hosts_at_start']} host(s) at {plan['workers_per_host']} at once each ({measured})")
@@ -281,11 +302,18 @@ def _say_connection(connection: dict) -> None:
 def _workload(args: argparse.Namespace) -> int:
     name = args.name
     if args.action in ("plan", "create"):
-        if not name or not args.model or args.latency is None or args.parallel is None or args.hours is None:
-            print("give a name, --model, --latency, --parallel and --hours", file=sys.stderr)
+        models, latencies, parallels = args.model or [], args.latency or [], args.parallel or []
+        if not name or not models or args.hours is None or not (len(models) == len(latencies) == len(parallels)):
+            print("give a name, --hours, and for each model --model, --latency and --parallel "
+                  "(repeat the three for several models)", file=sys.stderr)
             return 2
-        body = {"name": name, "model": args.model, "latency_s": args.latency, "parallel": args.parallel,
-                "hours": args.hours, "max_spend": args.max_spend, "profile": args.profile, "kind": args.kind}
+        body = {"name": name, "hours": args.hours, "max_spend": args.max_spend, "profile": args.profile,
+                "kind": args.kind, "placement": args.placement}
+        if len(models) == 1:
+            body.update({"model": models[0], "latency_s": latencies[0], "parallel": parallels[0]})
+        else:
+            body["models"] = [{"model": m, "latency_s": lat, "parallel": par}
+                              for m, lat, par in zip(models, latencies, parallels, strict=True)]
         status, answer = _control_json(args, "POST", "/pool/workloads/plan", body)
         if status != 200:
             print(answer.get("detail") or json.dumps(answer), file=sys.stderr)
@@ -548,9 +576,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     workload.add_argument("action", choices=["plan", "create", "list", "show", "extend", "end", "rotate-key"])
     workload.add_argument("name", nargs="?", default=None)
-    workload.add_argument("--model", default=None)
-    workload.add_argument("--latency", type=float, default=None, help="the whole answer at p95, in seconds")
-    workload.add_argument("--parallel", type=int, default=None, help="answers at once")
+    # Repeated in step for several models (D118): --model a --latency 20 --parallel 8 --model b ...
+    workload.add_argument("--model", action="append", default=None, help="a model it serves; repeat for several")
+    workload.add_argument("--latency", type=float, action="append", default=None,
+                          help="that model's whole answer at p95, in seconds")
+    workload.add_argument("--parallel", type=int, action="append", default=None, help="that model's answers at once")
+    workload.add_argument("--placement", choices=["auto", "together", "apart"], default="auto",
+                          help="several models: every host holds all (together), a group per model "
+                               "(apart), or whichever is expected to cost less (auto)")
     workload.add_argument("--hours", type=float, default=None, help="how long it runs (for extend: hours added)")
     workload.add_argument("--max-spend", type=float, default=None, help="its dollar cap; derived and confirmed if absent")
     workload.add_argument("--confirm-max-spend", type=float, default=None, help="accept the derived budget without a prompt")

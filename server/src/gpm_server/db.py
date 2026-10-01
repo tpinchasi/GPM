@@ -286,6 +286,9 @@ _ADDED_COLUMNS = {
         ("workload", "TEXT"),
         ("borrowed", "INTEGER NOT NULL DEFAULT 0"),
         ("concurrency", "INTEGER"),
+        # Of those, how many were of the same model (D118). Where the two are equal nothing else
+        # ran on the host: the only answers a model's own latency curve is built from.
+        ("model_concurrency", "INTEGER"),
     ],
     "hosts": [
         ("available", "TEXT NOT NULL DEFAULT '[]'"),
@@ -310,6 +313,15 @@ _ADDED_COLUMNS = {
         # When its first host became ready: a program's idle cutoff counts from here, never
         # from while it was still preparing (D117).
         ("serving_at", "REAL"),
+        # Every model with its target, how they are placed, and the groups of hosts (D118). NULL
+        # for a workload made before: one model, one group, read from the columns above.
+        ("targets", "TEXT"),
+        ("placement", "TEXT"),
+        ("groups", "TEXT"),
+    ],
+    "workload_volumes": [
+        # The group's builds the volume holds (D118); NULL for one made before: the workload's.
+        ("builds", "TEXT"),
     ],
     "host_counters": [
         # Of `busy`, how many serve a workload's request on a lent host (D115): load the shared
@@ -381,6 +393,8 @@ class RequestRecord:
     workload: Optional[str] = None
     borrowed: bool = False
     concurrency: Optional[int] = None
+    #: Of `concurrency`, the answers of the same model (D118).
+    model_concurrency: Optional[int] = None
 
 
 class RequestLog:
@@ -393,8 +407,8 @@ class RequestLog:
             INSERT INTO request_log (
                 ts, request_id, session_id, host_id, worker_id, model_requested,
                 model_served, runtime_class, queue_wait_ms, latency_ms, status_code,
-                outcome, reason, tokens_out, generate_ms, workload, borrowed, concurrency
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                outcome, reason, tokens_out, generate_ms, workload, borrowed, concurrency, model_concurrency
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.ts,
@@ -415,6 +429,7 @@ class RequestLog:
                 record.workload,
                 int(record.borrowed),
                 record.concurrency,
+                record.model_concurrency,
             ),
         )
 

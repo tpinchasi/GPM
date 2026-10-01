@@ -25,7 +25,7 @@ import ssl
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 import httpx
 
@@ -77,12 +77,17 @@ class Workload:
     def base_url(self) -> str:
         return self._provisioner.base_url
 
+    @property
+    def models(self) -> list[str]:
+        """The models it serves: send any of them through `client` (D118)."""
+        return list(self.answer.get("models") or [self.answer.get("model")])
+
     def state(self) -> dict:
         return self._provisioner._get(f"/pool/provisioning/workloads/{self.name}")
 
     def wait_until_serving(self, timeout_s: float = 1800.0, poll_s: float = 5.0) -> None:
-        """Until one of its own hosts is ready. Meanwhile it may already be served on shared
-        hosts, where the pool lets it borrow."""
+        """Until it is serving: a host of its own ready for every model it serves (D118).
+        Meanwhile a model may already be served on shared hosts, where the pool lets it borrow."""
         deadline = time.monotonic() + timeout_s
         while True:
             seen = self.state()
@@ -179,31 +184,54 @@ class WorkloadProvisioner:
             time.sleep(self._poll_s)
 
     @staticmethod
-    def _body(model: str, latency_s: float, parallel: int, hours: float, max_spend: float,
-              machines: str, idle_end_minutes: Optional[float]) -> dict:
-        body = {"model": model, "latency_s": latency_s, "parallel": parallel, "hours": hours,
-                "max_spend": max_spend, "machines": machines}
+    def _body(model: Optional[str], latency_s: Optional[float], parallel: Optional[int], hours: float,
+              max_spend: float, machines: str, idle_end_minutes: Optional[float],
+              models: Optional[Mapping[str, Mapping[str, Any]]] = None, placement: str = "auto") -> dict:
+        """One model — `model`, `latency_s`, `parallel` — or several, each with its own target:
+        `models={"chat": {"latency_s": 20, "parallel": 16}, "embed": {...}}` (D118)."""
+        if (model is None) == (models is None):
+            raise ValueError("name one model, or several with models= — not both, not neither")
+        if models is not None:
+            listed = []
+            for name, target in models.items():
+                if not isinstance(target, Mapping) or "latency_s" not in target or "parallel" not in target:
+                    raise ValueError(f"models[{name!r}] needs latency_s and parallel")
+                listed.append({"model": name, "latency_s": target["latency_s"], "parallel": target["parallel"]})
+            body: dict[str, Any] = {"models": listed, "placement": placement}
+        else:
+            if latency_s is None or parallel is None:
+                raise ValueError("a model needs latency_s and parallel")
+            body = {"model": model, "latency_s": latency_s, "parallel": parallel}
+        body.update({"hours": hours, "max_spend": max_spend, "machines": machines})
         if idle_end_minutes is not None:
             body["idle_end_minutes"] = idle_end_minutes
         return body
 
-    def plan_workload(self, model: str, *, latency_s: float, parallel: int, hours: float, max_spend: float,
+    def plan_workload(self, model: Optional[str] = None, *, latency_s: Optional[float] = None,
+                      parallel: Optional[int] = None, hours: float, max_spend: float,
+                      models: Optional[Mapping[str, Mapping[str, Any]]] = None, placement: str = "auto",
                       machines: str = "roi", timeout_s: float = 120.0) -> dict:
         """What creating it would do — its start, its first host, its price. Spends nothing."""
-        body = {"kind": "plan", **self._body(model, latency_s, parallel, hours, max_spend, machines, None)}
+        body = {"kind": "plan", **self._body(model, latency_s, parallel, hours, max_spend, machines, None,
+                                             models, placement)}
         return self._ask(body, timeout_s)["plan"]
 
-    def workload(self, model: str, *, latency_s: float, parallel: int, hours: float, max_spend: float,
+    def workload(self, model: Optional[str] = None, *, latency_s: Optional[float] = None,
+                 parallel: Optional[int] = None, hours: float, max_spend: float,
+                 models: Optional[Mapping[str, Mapping[str, Any]]] = None, placement: str = "auto",
                  machines: str = "roi", idle_end_minutes: Optional[float] = None, certs: bool = False,
                  wait_until: str = "created", timeout_s: float = 1800.0) -> Workload:
         """Create a workload and hand back a `Workload` bound to it — a context manager that ends
-        it on leaving. `wait_until` is "created" (return at once; it may be served on shared
-        hosts while its own come up) or "serving" (wait for one of its own)."""
+        it on leaving. One model, or several with `models=` — each with its own latency target and
+        answers at once, placed on the pool's hosts as it prices cheaper (D118). `wait_until` is
+        "created" (return at once; it may be served on shared hosts while its own come up) or
+        "serving" (wait until every model has hosts of its own)."""
         if wait_until not in ("created", "serving"):
             raise ValueError("wait_until is 'created' or 'serving'")
         key = "gpmw_" + secrets.token_hex(32)
         body = {"kind": "create", "key_hash": hashlib.sha256(key.encode()).hexdigest(),
-                **self._body(model, latency_s, parallel, hours, max_spend, machines, idle_end_minutes)}
+                **self._body(model, latency_s, parallel, hours, max_spend, machines, idle_end_minutes,
+                             models, placement)}
         private_pem = None
         if certs:
             private_pem, body["csr"] = _certificate_request()

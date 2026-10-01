@@ -45,6 +45,9 @@ class Worker:
     served: int = 0
     #: Serving a workload's request on a host the shared workload lent it (D115).
     borrowed: bool = False
+    #: The model it is answering, while busy: a host holding several models of one workload
+    #: takes at most its share of each (D118).
+    model: Optional[str] = None
 
     @property
     def is_idle(self) -> bool:

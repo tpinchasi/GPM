@@ -438,6 +438,8 @@ class WorkloadsConfig(BaseModel):
 
     #: How many workloads may run at once. Each rents its own hosts; the pool's caps bound them all.
     max_open: int = Field(default=3, ge=0)
+    #: How many models one workload may serve (D118). Each more is one more group to price.
+    max_models: int = Field(default=4, ge=1, le=8)
     #: The share of the shared workload's ready workers a workload may borrow while it prepares.
     borrow_share: float = Field(default=0.25, ge=0.0, le=1.0)
     #: How long a rotated-out key keeps working, so a running app is switched without a gap.

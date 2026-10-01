@@ -166,3 +166,52 @@ def test_a_provisioning_key_is_made_and_revoked_from_the_console():
             assert not h.supervisor.provisioning.store.get("evals").usable()
         finally:
             control.stop()
+
+
+@pytest.mark.timeout(180)
+def test_a_workload_of_two_models_is_planned_and_created_from_the_console(pool):  # noqa: F811
+    """Several models (D118): a row per model, the placement priced both ways, the key handed over
+    with every model named."""
+    from test_workloads_end_to_end import BIG, SOLO
+
+    pool.supervisor.config.limits.max_rented_hosts = 4
+    pool.supervisor.fleet.provider.offers = [
+        __import__("gpm_server.providers", fromlist=["default_offer"]).default_offer(f"o-{i}", f"m-{i}", min_bid_hourly=0.20)
+        for i in range(4)
+    ]
+    with open_page(f"{pool.control_url}/ui/#workloads") as page:
+        page.until("(document.getElementById('key-dialog') || {}).open === true", within=60, what="the page")
+        page.js(f"document.getElementById('key-input').value = {json.dumps(ADMIN)};"
+                "document.getElementById('key-form').requestSubmit(); true")
+        page.js(HELPERS)
+        page.until("__text().includes('New workload')", within=30, what="the workloads screen")
+        page.js("__set('Name', 'pair')")
+        page.js(f"__set('Model', {json.dumps(BIG)})")
+        page.js("__set('Answers at once', '2')")
+        assert "Placement" not in page.js("__text()"), "no placement to choose with one model"
+        page.js("__click('Add model')")
+        page.until("document.querySelectorAll('.model-row').length === 2", within=10, what="a second row")
+        page.until("document.activeElement === document.querySelectorAll('.model-row')[1].querySelector('select')",
+                   within=5, what="focus on the new row")
+        assert page.js(f"[...document.querySelectorAll('.model-row')[1].querySelector('select').options]"
+                       f".find(o => o.value === {json.dumps(BIG)}).disabled"), "a model already in a row cannot be picked twice"
+        assert page.js("document.querySelectorAll('.model-row')[1].getAttribute('aria-label')") == "Model 2 of 2"
+        page.js(f"const s = document.querySelectorAll('.model-row')[1].querySelector('select'); s.value = {json.dumps(SOLO)};"
+                "s.dispatchEvent(new Event('change')); true")
+        assert "Placement" in page.js("__text()")
+        page.js("__set('Budget ($)', '5')")
+        page.js("__click('Plan')")
+        page.until("__text().includes('placement')", within=30, what="the plan")
+        text = page.js("__text()")
+        assert "together:" in text and "apart:" in text and "expected over" in text, text
+        assert "kept:" in text and "(kept)" in text and "in all)" in text
+        shot(page, "08-two-models-planned")
+        page.js("__click('Create — up to')")
+        page.until("document.getElementById('confirm-dialog').open", within=10, what="the confirmation")
+        page.js("__confirm('')")
+        page.until("__text().includes('The key is shown this once')", within=30, what="the key")
+        panel = page.js("document.querySelector('.key-panel').textContent")
+        assert "models" in panel and BIG in panel and SOLO in panel
+        shot(page, "09-two-models-key")
+    made = pool.supervisor.workloads.get("pair")
+    assert set(made.models) == {BIG, SOLO}

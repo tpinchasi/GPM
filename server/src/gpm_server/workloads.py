@@ -15,7 +15,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import re
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Mapping, Optional, Sequence
 
 #: A workload's name is part of its URL prefix and its log lines: plain, short, unambiguous.
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
@@ -105,6 +105,91 @@ def derived_budget(hosts: int, hours: float, hourly: float, margin: float = BUDG
     """A dollar cap when none is typed: every host for every hour at the price found, with a
     margin — rounded up to the cent. Shown and confirmed before anything is opened."""
     return math.ceil(hosts * hours * hourly * margin * 100) / 100
+
+
+@dataclasses.dataclass(frozen=True)
+class Split:
+    """How a host holding several models divides its workers between them (S7, D118): at most
+    `caps[m]` answers of model *m* at once, `workers` = the sum of the caps, and `hosts` of them
+    for the workload's answers at once."""
+
+    hosts: int
+    caps: dict[str, int]
+    workers: int
+    #: The share of the card the split uses, Σ caps[m] / w[m]: at most 1.
+    load: float
+
+
+def split_together(parallel: Mapping[str, int], per_host: Mapping[str, int]) -> Optional[Split]:
+    """The fewest hosts that serve `parallel[m]` answers of each model at once, every host holding
+    every model, each model within its target — or None where no split fits one host.
+
+    `per_host[m]` is how many answers of model *m* alone one host serves within *m*'s target. An
+    answer of *m* takes `1/per_host[m]` of the host (the linear-mixing assumption, D118): a host is
+    within every target while `Σ caps[m] / per_host[m] ≤ 1`. The caps are fixed shares — a host
+    runs exactly their sum — so no model starves another, and load that moves between models is
+    not absorbed: it is what each model asked for, on the same cards."""
+    models = [m for m in parallel if parallel[m] > 0]
+    if not models or any(per_host.get(m, 0) < 1 for m in models):
+        return None
+    if sum(1 / per_host[m] for m in models) > 1 + 1e-9:
+        return None  # one answer of each already fills the card
+
+    def load_at(hosts: int) -> float:
+        return sum(math.ceil(parallel[m] / hosts) / per_host[m] for m in models)
+
+    # The load only falls as hosts are added (every cap is a ceiling of parallel / hosts), and at
+    # the largest `parallel` every cap is 1, which fits: so the fewest hosts that fit is found by
+    # halving, in a few dozen steps whatever the numbers — never one host at a time.
+    low = max(1, math.ceil(sum(parallel[m] / per_host[m] for m in models) - 1e-9))
+    high = max(low, max(parallel[m] for m in models))
+    while low < high:
+        middle = (low + high) // 2
+        if load_at(middle) <= 1 + 1e-9:
+            high = middle
+        else:
+            low = middle + 1
+    caps = {m: math.ceil(parallel[m] / low) for m in models}
+    return Split(hosts=low, caps=caps, workers=sum(caps.values()), load=round(load_at(low), 4))
+
+
+def split_fits(caps: Mapping[str, int], per_host: Mapping[str, int]) -> bool:
+    """Does a card serving `per_host[m]` of each model alone hold this split within every target?"""
+    if any(per_host.get(m, 0) < 1 for m in caps):
+        return False
+    return sum(caps[m] / per_host[m] for m in caps) <= 1 + 1e-9
+
+
+@dataclasses.dataclass(frozen=True)
+class Placement:
+    """One way to place a workload's models, priced (D118)."""
+
+    name: str                    # "together" or "apart"
+    expected: float              # dollars over the hours, the rental-kind rule's
+    hosts: int
+    reasons: list[str]
+
+
+#: Placements whose expected costs are this close are equal: the estimate is not finer than that.
+PLACEMENT_TIE = 0.01
+
+
+def choose_placement(together: Optional[Placement], apart: Optional[Placement]) -> tuple[Optional[Placement], list[str]]:
+    """The cheaper placement by expected cost, and why. Within `PLACEMENT_TIE` of each other they
+    are equal, and together wins: one kind of host and one card to rent, whole hosts rounded once
+    rather than per model. (It does not absorb load moving between models: each host keeps a
+    fixed share for each, D118.)"""
+    if together is None and apart is None:
+        return None, ["no placement can be rented"]
+    if together is None:
+        return apart, ["apart: no card on offer holds every model within its target"]
+    if apart is None:
+        return together, ["together: no placement apart could be rented"]
+    against = f"${together.expected:.4f} together on {together.hosts} host(s), ${apart.expected:.4f} apart on {apart.hosts}"
+    if together.expected <= apart.expected * (1 + PLACEMENT_TIE) + 1e-9:
+        close = together.expected > apart.expected
+        return together, [f"together: {against}" + (" — within 1%, so equal, and together is simpler" if close else "")]
+    return apart, [f"apart: {against}"]
 
 
 def time_to_ready_hours(model_gb: float, download_mbps: float, load_s: float = 180.0) -> float:
