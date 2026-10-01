@@ -783,7 +783,8 @@ class Fleet:
             at = self.model_at_latency(offer.hardware, builds.get(model) or model, latency, ceiling=card_workers)
             if at.workers is None:
                 found[model] = card_workers
-            elif unrefuted_is_open and not any(c > at.workers for c in at.curve):
+            elif unrefuted_is_open and not any(c > at.workers and p95 > latency for c, p95 in at.curve.items()):
+                # Nothing measured above it missed the target: it is a floor, not a ceiling.
                 found[model] = card_workers
             else:
                 found[model] = min(card_workers, at.workers)

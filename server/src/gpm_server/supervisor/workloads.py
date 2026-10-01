@@ -194,6 +194,8 @@ class Workloads:
         for t in targets:
             if not isinstance(t.parallel, int) or isinstance(t.parallel, bool) or t.parallel < 1:
                 raise WorkloadRefused(f"{t.model}: parallel is how many answers at once: at least 1")
+            if t.parallel > MAX_PARALLEL:
+                raise WorkloadRefused(f"{t.model}: parallel is at most {MAX_PARALLEL}")
             if not (isinstance(t.latency_s, (int, float)) and math.isfinite(t.latency_s) and t.latency_s > 0):
                 raise WorkloadRefused(f"{t.model}: the latency target must be above zero seconds")
         if not (math.isfinite(req.hours) and req.hours > 0):
@@ -398,10 +400,11 @@ class Workloads:
             # 1/H of the capacity away, not all of it (the review's finding). Priced as one of
             # the whole group, a placement with more hosts looked dearer than it is.
             if hosts > 1:
-                score = next(points for o, points in ranked if o.offer_id == first.offer_id)
-                shared, _ = fleet.expected_costs([(first, score)], req.hours, sketch, models, group_builds,
+                # Against the same offers as before, so the capacity an eviction loses is priced at
+                # the same on-demand rate; only this host's share of the group changes.
+                shared, _ = fleet.expected_costs(ranked, req.hours, sketch, models, group_builds,
                                                  fixed_workers=per_host, have=per_host * (hosts - 1))
-                first_cost = shared[0] if shared else first_cost
+                first_cost = next((c for c in shared if c.offer_id == first.offer_id), first_cost)
             groups.append({
                 "models": list(models), "builds": group_builds, "hosts_at_start": hosts, "workers_per_host": per_host,
                 "caps": caps, "cards_per_copy": cards, "sizing": sizing, "latency_curves": curves, "measured": measured,
