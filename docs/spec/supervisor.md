@@ -208,6 +208,8 @@ model set. **Parked hosts are tried first** (§8).
    **Never relaxed unattended** — an empty result means stay paused. The filters are applied by
    the pool, not pushed into the provider's own query, so every rejected offer carries the
    reason it was rejected; a market that merely *looks* empty teaches an operator nothing.
+   A search that fails is said as such, never as an empty market (D44); one the provider refuses
+   as too frequent is not asked again for a minute — after every refusal, a minute (D119).
 2. **Rank** by throughput proxy per run-dollar, **moved by what the machine has done for this
    pool** (D69): a machine whose rentals rarely ended up serving scores worse, one that served
    well scores better, and a machine nobody has tried is left alone — unknown and bad are
