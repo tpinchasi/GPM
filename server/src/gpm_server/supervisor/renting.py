@@ -1606,8 +1606,13 @@ class Fleet:
         offer_policy: Optional[dict] = None,
         bidding: Optional[dict] = None,
         kinds: Optional[str] = None,
+        search: bool = True,
     ) -> dict:
         """The offer pipeline, read-only (docs/spec/console-and-control-api.md §2.2).
+
+        `search=False` answers with the settings and the next host's needs, and asks the market
+        nothing: the provider counts every offer a search returns against a daily quota, which
+        a screen merely being open must not spend (D120).
 
         Moving a ceiling and watching "4 pass" become "0 pass" is the fastest way to learn what
         a number means — so this runs the *same* filters and the same bid strategy the
@@ -1630,13 +1635,13 @@ class Fleet:
 
         if kinds is not None and kinds not in self._KINDS:
             raise ValueError(f"kinds must be one of {sorted(self._KINDS)}")
-        offers = await self._offers(policy, kinds)
+        offers = await self._offers(policy, kinds) if search else []
         ranked, rejected = rank_offers(
             offers, self._policy_with_avoided(policy), bid_config, hours,
             self.model_set_gb(next_models, next_builds),
             history=self.machine_history(), history_cfg=self.rented.history,
         )
-        problem = self.last_offer_error
+        problem = self.last_offer_error if search else None
         by_reason: dict[str, int] = {}
         for reasons in rejected.values():
             # An offer is counted against the first filter that stopped it.
@@ -1671,6 +1676,9 @@ class Fleet:
                 }
             )
         return {
+            "searched": search,
+            # What this search, and the day's others, have used of the provider's quota (D121).
+            "search_quota": self.search_quota(),
             "seen": len(offers),
             "passed": len(ranked),
             "rejected": len(rejected),
@@ -2639,7 +2647,7 @@ class Fleet:
         if finder is None:
             return None
         try:
-            offer = await finder(host.offer.machine_id, host.offer.gpus)
+            offer = await self._counted(finder(host.offer.machine_id, host.offer.gpus))
         except ProviderError as exc:
             log.warning("the price of %s could not be read: %s", host.offer.machine_id, exc)
             return None
@@ -3697,6 +3705,67 @@ class Fleet:
     _KINDS = {"interruptible": (True, False), "on_demand": (False, True),
               "cheaper": (True, True), "both": (True, True)}
 
+    # --- the provider's daily search quota (D121) ---
+
+    async def _counted(self, search: Any) -> Any:
+        """Run a search, then add what it returned to the day's count — refused or not."""
+        try:
+            return await search
+        finally:
+            self.note_search_usage()
+
+    @staticmethod
+    def _utc_day(now: float) -> str:
+        return time.strftime("%Y-%m-%d", time.gmtime(now))
+
+    def note_search_usage(self) -> None:
+        """Take the rows the provider counted since last asked, and its last refusal, into the
+        day's row. A provider without a search quota has nothing to take."""
+        take = getattr(self.provider, "take_search_usage", None)
+        if take is None:
+            return
+        usage = take()
+        refusal = usage.get("refusal")
+        if not usage.get("rows") and refusal is None:
+            return
+        now = time.time()
+        day = self._utc_day(now)
+        db = self.events.db
+        db.execute("INSERT INTO search_usage (day, rows, updated_at) VALUES (?, 0, ?) ON CONFLICT(day) DO NOTHING",
+                   (day, now))
+        db.execute("UPDATE search_usage SET rows = rows + ?, quota = ?, updated_at = ? WHERE day = ?",
+                   (int(usage.get("rows") or 0), usage.get("limit"), now, day))
+        if refusal is not None:
+            # The provider's own count beats ours: other tools on the same key spend it too.
+            spent = int(refusal["limit"]) - int(refusal.get("remaining") or 0)
+            db.execute(
+                "UPDATE search_usage SET rows = MAX(rows, ?), quota = ?, exhausted_at = ?, resets_at = ? WHERE day = ?",
+                (spent, int(refusal["limit"]), refusal["at"], refusal["at"] + float(refusal.get("retry_after_s") or 0), day),
+            )
+
+    def search_quota(self) -> Optional[dict]:
+        """Today's use of the provider's search quota, for the console: what the pool's own
+        searches returned (other tools on the same key are not seen until the provider refuses),
+        the quota, and when it resets. None for a provider without one."""
+        limit = getattr(self.provider, "daily_search_rows", None)
+        if limit is None:
+            return None
+        now = time.time()
+        rows = self.events.db.query("SELECT * FROM search_usage WHERE day = ?", (self._utc_day(now),))
+        row = rows[0] if rows else None
+        quota = int((row["quota"] if row and row["quota"] else None) or limit)
+        used = int(row["rows"]) if row else 0
+        midnight = (int(now // 86400) + 1) * 86400
+        exhausted = bool(row and row["exhausted_at"] and (row["resets_at"] or midnight) > now)
+        return {
+            "used": min(used, quota) if not exhausted else quota,
+            "limit": quota,
+            "remaining": 0 if exhausted else max(0, quota - used),
+            "exhausted": exhausted,
+            "resets_at": (row["resets_at"] if row and row["resets_at"] else None) or midnight,
+            "source": "provider" if exhausted else "counted",
+        }
+
     async def _offers(self, policy: Optional[OfferPolicy] = None, kinds: Optional[str] = None) -> list[Offer]:
         """Ask the market broadly and filter here.
 
@@ -3717,14 +3786,14 @@ class Fleet:
             # The pool's mode decides what it rents *by itself*. One request — a preview, or an
             # operator preparing a particular host — may name its own (D55).
             bids, fixed = self._KINDS[kinds or self.rented.mode]
-            offers = await self.provider.search_offers(
+            offers = await self._counted(self.provider.search_offers(
                 OfferQuery(
                     verified_only=(policy or self.rented.policy_in_force).verified_only,
                     min_gpus=(policy or self.rented.policy_in_force).gpus_multiple_of,
                     interruptible=bids,
                     on_demand=fixed,
                 )
-            )
+            ))
         except ProviderRateLimited as exc:
             # Asking again on the next pass is what earned the refusal: wait a minute instead, and
             # again after every refusal (D44, D119 — a flat minute, the owner's choice: no longer

@@ -1241,3 +1241,63 @@ def test_the_search_profile_is_chosen_from_a_dropdown():
     assert "saved.search_profiles" in script, "the saved names are never listed"
     assert "save these as" in script, "there is no way to save one"
     assert "body.save_profile_as" in script
+
+
+async def test_the_market_settings_are_read_without_searching(console):
+    """A screen being open must not spend the provider's daily search quota (D120)."""
+    supervisor, url, _, loop = console
+    asked = []
+    real = supervisor.fleet.provider.search_offers
+
+    async def counted(query):
+        asked.append(1)
+        return await real(query)
+
+    supervisor.fleet.provider.search_offers = counted
+    settings = loop.run(supervisor.fleet.market_preview(hours=1, search=False))
+    assert asked == [] and settings["searched"] is False and settings["saved"]["offer_policy"]
+    assert loop.run(supervisor.fleet.market_preview(hours=1))["searched"] is True and asked
+
+
+async def test_the_days_search_quota_is_counted_and_kept_across_a_restart(console):
+    """What the pool's own searches used today, out of the provider's daily quota (D121) — and,
+    once the provider refuses, its own numbers instead of ours."""
+    import time as clock
+
+    supervisor, url, _, loop = console
+    fleet = supervisor.fleet
+    provider = fleet.provider
+    assert fleet.search_quota() is None, "a provider with no quota shows none"
+    pending = {"rows": 0, "refusal": None}
+    provider.daily_search_rows = 1000
+    provider.take_search_usage = lambda: {**pending, "limit": 1000}
+
+    async def search(_query):
+        pending["rows"] += 300
+        return []
+
+    provider.search_offers = search
+    loop.run(fleet.market_preview(hours=1))
+    pending["rows"] = 0  # taken
+    quota = loop.run(fleet.market_preview(hours=1))["search_quota"]
+    assert quota["used"] == 600 and quota["remaining"] == 400 and not quota["exhausted"]
+    assert quota["resets_at"] == (int(clock.time() // 86400) + 1) * 86400, "midnight UTC"
+
+    # The count is the database's, not this process's.
+    assert fleet.search_quota()["used"] == 600
+
+    async def refused(_query):
+        from gpm_server.providers.base import ProviderRateLimited
+
+        pending["refusal"] = {"limit": 1000, "remaining": 0, "retry_after_s": 3600.0, "at": clock.time()}
+        raise ProviderRateLimited("the provider's daily search quota of 1,000 offers is used up")
+
+    provider.search_offers = refused
+    fleet._offer_retry_at = 0.0
+    loop.run(fleet.market_preview(hours=1))
+    pending["refusal"] = None
+    quota = fleet.search_quota()
+    assert quota["exhausted"] and quota["used"] == 1000 and quota["remaining"] == 0 and quota["source"] == "provider"
+    assert abs(quota["resets_at"] - (clock.time() + 3600)) < 5, "the provider's own reset time"
+    with httpx.Client(base_url=url, headers={"Authorization": f"Bearer {ADMIN_KEY}"}) as http:
+        assert http.get("/pool/status").json()["provider"]["search_quota"]["exhausted"] is True

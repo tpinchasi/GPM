@@ -40,10 +40,11 @@ const api = {
   leases: () => call("GET", "/pool/leases"),
   plan: () => call("GET", "/pool/plan"),
   account: () => call("GET", "/pool/account"),
-  market: (hours = 4, policy) =>
+  // `search: false` reads the settings and asks the provider nothing (D120).
+  market: (hours = 4, policy, search = true) =>
     policy
       ? call("POST", `/pool/market/preview?hours=${hours}&kinds=both`, policy)
-      : call("GET", `/pool/market/preview?hours=${hours}&kinds=both`),
+      : call("GET", `/pool/market/preview?hours=${hours}&kinds=both${search ? "" : "&search=false"}`),
   openLease: (body) => call("POST", "/pool/leases", body),
   closeLease: (id) => call("DELETE", `/pool/leases/${id}`),
   tightenLease: (id, body) => call("PATCH", `/pool/leases/${id}`, body),
@@ -653,7 +654,9 @@ const RENTED_TABS = [
   { id: "scaling", label: "Scaling", about: "How many machines at most, how much per hour at most, and how the pool decides when to rent another." },
   { id: "teardown", label: "Tear-down", about: "When an unused or failing machine is paused, destroyed or given up." },
 ];
-// Which tabs read the saved settings and the market — the only ones that ask the provider.
+// Which tabs read the saved settings. Opening one never searches the market: the provider
+// counts every offer a search returns against a daily quota (D120), so the console searches
+// only when the operator presses "Search the market" or "Try these".
 const RENTED_TABS_WITH_MARKET = new Set(["finding", "scaling", "teardown"]);
 
 function rentedTabs(current) {
@@ -665,7 +668,7 @@ function rentedTabs(current) {
 screens.rented = async (status) => {
   if (!status.provider) return [el("h1", {}, "Rented capacity"), el("p", { class: "muted" }, "This pool has no rented capacity configured, so it cannot spend.")];
   const tab = RENTED_TABS.find((t) => t.id === state.sub) || RENTED_TABS[0];
-  const market = RENTED_TABS_WITH_MARKET.has(tab.id) ? await api.market(1).catch((e) => ({ error: e.message })) : null;
+  const market = RENTED_TABS_WITH_MARKET.has(tab.id) ? await api.market(1, null, false).catch((e) => ({ error: e.message })) : null;
   const head = [el("h1", {}, "Rented capacity"), rentedTabs(tab.id), el("p", { class: "muted tab-about" }, tab.about)];
   if (tab.id === "engine") return [...head, ...engineSection(status)];
   if (tab.id === "finding") return [...head, ...searchSection(market), ...marketSection(market)];
@@ -673,6 +676,18 @@ screens.rented = async (status) => {
   if (tab.id === "teardown") return [...head, ...teardownSection(market)];
   return [...head, ...await rentedHostsTab(status)];
 };
+
+// Today's use of the provider's daily search quota (D121): counted from the pool's own searches,
+// and the provider's own figure once it has refused.
+function searchQuotaText(quota) {
+  if (!quota) return null;
+  const resets = new Date(quota.resets_at * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const share = quota.limit ? quota.used / quota.limit : 0;
+  return el("span", { class: quota.exhausted ? "error" : share >= 0.8 ? "warn-text" : "muted" },
+    quota.exhausted
+      ? `search quota used up (${quota.limit.toLocaleString()} offers today) — every search is refused until ${resets}`
+      : `search quota: ${quota.used.toLocaleString()} of ${quota.limit.toLocaleString()} offers used today (${Math.round(share * 100)}%) · resets at ${resets}`);
+}
 
 function providerPanel(status, account) {
   const capabilities = Object.entries(status.provider.capabilities).filter(([, on]) => on).map(([name]) => name);
@@ -682,6 +697,11 @@ function providerPanel(status, account) {
       el("div", { class: "k" }, "credential"), el("div", {}, account.error ? pill("error", "bad") : pill(account.credential_valid ? "valid ✓" : "invalid ✗", account.credential_valid ? "ok" : "bad")),
       el("div", { class: "k" }, "credit left"), el("div", {}, account.error ? account.error : money(account.credit_remaining)),
       el("div", { class: "k" }, "can"), el("div", { class: "muted" }, capabilities.join(", ")),
+      ...(status.provider.search_quota ? [
+        el("div", { class: "k" }, "search quota"),
+        el("div", {}, searchQuotaText(status.provider.search_quota),
+          el("div", { class: "muted" }, "Offers returned by this pool's searches today. Renting and replacing hosts need it; other tools using the same account key are counted only once the provider refuses.")),
+      ] : []),
       el("div", { class: "k" }, "cap margin"), el("div", {}, `${(status.provider.cap_safety_margin * 100).toFixed(0)}%`,
         el("span", { class: "muted" }, status.provider.capabilities.reports_charges ? " — narrows once a charge is reported" : " — wider: this provider reports no charges"))));
 }
@@ -699,6 +719,9 @@ function limitsPanel(status) {
 
 async function rentedHostsTab(status) {
   const account = await api.account().catch((e) => ({ error: e.message }));
+  // Read again on opening: the day's search quota (D121) moves with every search, and the
+  // status the page holds may be from before the last one.
+  status = await api.status().catch(() => status);
   const burn = status.rented.reduce((n, h) => n + (h.bid_hourly || 0), 0);
   return [
     el("div", { class: "grid" },
@@ -1710,7 +1733,9 @@ function searchSection(market) {
           try {
             const fresh = await api.market(1, searchValues());
             marketView.box.replaceChildren(marketPanel(fresh));
+            if (fresh.search_quota) marketView.quota.replaceChildren(searchQuotaText(fresh.search_quota));
             marketView.at = Date.now();
+            marketView.last = fresh;
             stampMarket();
             search.message = fresh.problem
               ? ` the market could not be asked: ${fresh.problem}`
@@ -1873,18 +1898,22 @@ async function saveSearch(event, note, mode) {
   }
 }
 
-const MARKET_REFRESH_S = 60;
-const marketView = { box: null, stamp: null, button: null, busy: false, at: 0 };
+// The last search this page made, kept so moving between tabs shows it again without asking
+// the provider. There is no timer: a search spends the provider's daily quota (D120).
+const marketView = { box: null, stamp: null, button: null, quota: null, busy: false, at: 0, last: null };
 
-function marketSection(initial) {
-  marketView.box = el("div", {}, marketPanel(initial));
+function marketSection(settings) {
+  const shown = marketView.last || settings;
+  marketView.box = el("div", {}, marketPanel(shown));
   marketView.stamp = el("span", { class: "muted" });
-  marketView.button = el("button", { class: "small", onclick: () => refreshMarket() }, "Refresh");
-  marketView.at = Date.now();
+  marketView.button = el("button", { class: "small", onclick: () => refreshMarket() }, "Search the market");
+  marketView.quota = el("div", {}, searchQuotaText(shown.search_quota));
+  if (!marketView.last) marketView.at = 0;
   stampMarket();
   return [
     el("div", { class: "row" },
       el("h2", {}, "Live market — the real offer pipeline, read-only"), marketView.button, marketView.stamp),
+    marketView.quota,
     marketView.box,
   ];
 }
@@ -1894,10 +1923,9 @@ const marketOnScreen = () =>
 
 function stampMarket() {
   if (!marketView.stamp) return;
-  const next = Math.max(0, Math.round(MARKET_REFRESH_S - (Date.now() - marketView.at) / 1000));
   marketView.stamp.textContent = marketView.busy
     ? " asking the provider…"
-    : ` updated ${new Date(marketView.at).toLocaleTimeString()} · refreshes in ${next}s`;
+    : marketView.at ? ` searched at ${new Date(marketView.at).toLocaleTimeString()}` : " not searched yet";
 }
 
 async function refreshMarket() {
@@ -1907,8 +1935,10 @@ async function refreshMarket() {
   stampMarket();
   try {
     const fresh = await api.market(1).catch((error) => ({ error: error.message }));
+    marketView.last = fresh.error ? marketView.last : fresh;
     if (marketOnScreen()) {  // the operator may have moved on while it was asked
       marketView.box.replaceChildren(marketPanel(fresh));
+      if (fresh.search_quota) marketView.quota.replaceChildren(searchQuotaText(fresh.search_quota));
     }
   } finally {
     marketView.at = Date.now();
@@ -1917,13 +1947,6 @@ async function refreshMarket() {
     stampMarket();
   }
 }
-
-// One timer for the life of the page, not one per visit to the screen.
-setInterval(() => {
-  if (!marketOnScreen()) return;
-  if (Date.now() - marketView.at >= MARKET_REFRESH_S * 1000) refreshMarket();
-  else stampMarket();
-}, 1000);
 
 // The number of hosts the pool may rent at once. A configuration change like any other, so it
 // goes validate → plan → apply, and raising it must be typed again (spec §1): more hosts is
@@ -1964,6 +1987,13 @@ function hostLimitControl(current) {
 
 const marketPanel = (market) => {
   if (market.error) return el("p", { class: "error" }, market.error);
+  if (market.searched === false) {
+    return el("div", { class: "panel" },
+      el("p", {}, "The market has not been searched from this page."),
+      el("p", { class: "muted" },
+        "The provider counts every offer a search returns against a daily quota, and the pool needs that quota to rent "
+        + "and to replace hosts — so this page searches only when you press Search the market or Try these."));
+  }
   const skipped = Object.entries(market.avoided || {});
   const avoidedNote = skipped.length ? el("p", { class: "muted" },
     "Skipped for now because they just failed: ",
@@ -1974,7 +2004,7 @@ const marketPanel = (market) => {
     return el("div", { class: "panel" },
       el("p", { class: "error" }, "The market could not be asked, so this is not a picture of what is out there."),
       el("p", { class: "mono" }, market.problem),
-      el("p", { class: "muted" }, "Nothing will be rented until this clears. A provider that is rate-limiting usually just needs fewer passes: raise probe_interval_s, or close leases you are not using."));
+      el("p", { class: "muted" }, "Nothing can be rented until this clears. The provider limits searches by a daily quota of offers returned (Vast: 20,000, reset at 00:00 UTC) — once it is spent, every search is refused until the reset."));
   }
   return el("div", {}, avoidedNote, el("div", { class: "grid" },
     el("div", { class: "panel" },

@@ -107,6 +107,13 @@ class VastProvider:
         self.base_url = base_url
         self._client = client
         self._timeout = timeout
+        #: The offer search is limited by a daily quota of offer rows returned, not by request
+        #: rate (D121): 20,000 a day, reset at 00:00 UTC, as the provider's own refusal states
+        #: it. Rows the searches returned since the pool last took the count, and the last
+        #: refusal's own numbers.
+        self.daily_search_rows = 20_000
+        self._rows_untaken = 0
+        self._quota_refusal: Optional[dict[str, Any]] = None
         #: Instance payloads seen recently, by id. Status, charges and connection details all
         #: come from the same payload, and the provider rate-limits repeated fetches of it;
         #: within one control-loop pass the answer does not change.
@@ -158,6 +165,20 @@ class VastProvider:
         if response.status_code in (401, 403):
             raise ProviderAuthError(f"{method} {path}: the account credential was refused")
         if response.status_code == 429:
+            try:
+                said = response.json()
+            except ValueError:
+                said = {}
+            if isinstance(said, dict) and said.get("error") == "search_quota_exceeded":
+                # The day's offer rows are spent: the provider says how many, and for how long.
+                limit = int(said.get("limit") or self.daily_search_rows)
+                wait = float(said.get("retry_after") or 0)
+                self.daily_search_rows = limit
+                self._quota_refusal = {"limit": limit, "remaining": int(said.get("remaining") or 0),
+                                       "retry_after_s": wait, "at": time.time()}
+                raise ProviderRateLimited(
+                    f"the provider's daily search quota of {limit:,} offers is used up; it resets in {wait / 3600:.1f}h"
+                )
             raise ProviderRateLimited(f"{method} {path}: rate limited")
         if response.status_code == 410:
             # On an offer, "gone" is ordinary in a live market: it went between search and
@@ -178,6 +199,22 @@ class VastProvider:
             return response.json()
         except ValueError as exc:
             raise ProviderUnavailable(f"{method} {path}: response was not JSON") from exc
+
+    # --- the daily search quota (D121) ---
+
+    async def _search(self, body: dict[str, Any]) -> list[dict[str, Any]]:
+        """One offer search, its rows counted against the day's quota."""
+        payload = await self._call("POST", "/api/v0/bundles", json=body)
+        entries = payload.get("offers", payload if isinstance(payload, list) else [])
+        self._rows_untaken += len(entries)
+        return entries
+
+    def take_search_usage(self) -> dict[str, Any]:
+        """Rows returned since last asked, and the last quota refusal — then forgotten here: the
+        pool keeps the day's count, which outlives this process."""
+        usage = {"rows": self._rows_untaken, "refusal": self._quota_refusal, "limit": self.daily_search_rows}
+        self._rows_untaken, self._quota_refusal = 0, None
+        return usage
 
     # --- the interface ---
 
@@ -202,10 +239,7 @@ class VastProvider:
             wanted = int(machine_id)
         except ValueError:
             return None
-        payload = await self._call(
-            "POST", "/api/v0/bundles", json={"machine_id": {"eq": wanted}, "type": "bid", "limit": 20},
-        )
-        entries = payload.get("offers", payload if isinstance(payload, list) else [])
+        entries = await self._search({"machine_id": {"eq": wanted}, "type": "bid", "limit": 20})
         entry = next((e for e in entries if int(e.get("num_gpus") or 1) == gpus), None)
         if entry is None:
             return None
@@ -221,8 +255,7 @@ class VastProvider:
             body["disk_space"] = {"gte": query.min_disk_gb}
         if query.min_gpus > 1:
             body["num_gpus"] = {"gte": query.min_gpus}
-        payload = await self._call("POST", "/api/v0/bundles", json=body)
-        return payload.get("offers", payload if isinstance(payload, list) else [])
+        return await self._search(body)
 
     async def _on_demand_prices(self, bid_offers: list[dict[str, Any]]) -> dict[str, float]:
         """The on-demand price of each machine, from the on-demand listing.
@@ -235,17 +268,13 @@ class VastProvider:
         machine_ids = sorted({str(entry.get("machine_id")) for entry in bid_offers if entry.get("machine_id")})
         if not machine_ids:
             return {}
-        payload = await self._call(
-            "POST",
-            "/api/v0/bundles",
-            json={
-                "limit": max(len(machine_ids) * 4, 100),
-                "type": "on-demand",
-                "machine_id": {"in": [int(m) for m in machine_ids]},
-            },
-        )
+        entries = await self._search({
+            "limit": max(len(machine_ids) * 4, 100),
+            "type": "on-demand",
+            "machine_id": {"in": [int(m) for m in machine_ids]},
+        })
         prices: dict[str, float] = {}
-        for entry in payload.get("offers", payload if isinstance(payload, list) else []):
+        for entry in entries:
             machine = str(entry.get("machine_id"))
             price = entry.get("dph_total")
             if price is None:
