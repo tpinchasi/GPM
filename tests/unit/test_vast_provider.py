@@ -668,3 +668,25 @@ async def test_boot_logs_are_read_without_the_account_credential(monkeypatch):
 async def test_boot_logs_are_not_read_from_a_url_that_is_not_https():
     api = provider(lambda r: httpx.Response(200, json={"result_url": "http://logs.example/abc"}))
     assert await api.instance_logs(Instance("1")) is None
+
+
+# --- the daily search quota (D121) ---
+
+
+async def test_every_offer_a_search_returns_is_counted_against_the_day():
+    api = provider(market())
+    await api.search_offers(OfferQuery(interruptible=True, on_demand=True))
+    usage = api.take_search_usage()
+    # The bid listing (1), the on-demand prices for its machines (1), the on-demand listing (1).
+    assert usage["rows"] == 3 and usage["refusal"] is None and usage["limit"] == 20_000
+    assert api.take_search_usage()["rows"] == 0, "taken once"
+
+
+async def test_a_spent_quota_is_read_from_the_providers_own_refusal():
+    said = {"error": "search_quota_exceeded", "msg": "Daily search row quota exhausted",
+            "retry_after": 44237, "limit": 20000, "remaining": 0}
+    api = provider(lambda r: httpx.Response(429, json=said))
+    with pytest.raises(ProviderRateLimited, match="daily search quota of 20,000 offers is used up; it resets in 12.3h"):
+        await api.search_offers(OfferQuery(interruptible=True))
+    refusal = api.take_search_usage()["refusal"]
+    assert refusal["limit"] == 20000 and refusal["remaining"] == 0 and refusal["retry_after_s"] == 44237

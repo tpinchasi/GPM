@@ -666,6 +666,8 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                         "name": fleet.provider.name,
                         "capabilities": vars(fleet.provider.capabilities),
                         "cap_safety_margin": fleet.margin(),
+                        # Today's use of its daily search quota, where it has one (D121).
+                        "search_quota": fleet.search_quota(),
                     }
                     if fleet is not None
                     else None
@@ -783,12 +785,13 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         return JSONResponse({"plan": await supervisor.fleet.plan(supervisor._ready_workers())})
 
     @app.get("/pool/market/preview")
-    async def market_preview(hours: float = 4.0, kinds: Optional[str] = None) -> JSONResponse:
-        """Read-only: the live market through the pool's own filters. Spends nothing."""
+    async def market_preview(hours: float = 4.0, kinds: Optional[str] = None, search: bool = True) -> JSONResponse:
+        """Read-only: the live market through the pool's own filters. Spends nothing. With
+        `search=false`, the settings only: the market is not asked (D120)."""
         if supervisor.fleet is None:
             return _error(400, "cannot_rent", "this pool has no rented capacity configured")
         try:
-            return JSONResponse(await supervisor.fleet.market_preview(hours=hours, kinds=kinds))
+            return JSONResponse(await supervisor.fleet.market_preview(hours=hours, kinds=kinds, search=search))
         except ValueError as exc:
             return _error(400, "bad_kinds", str(exc))
 

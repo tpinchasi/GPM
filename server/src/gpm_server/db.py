@@ -98,6 +98,17 @@ CREATE TABLE IF NOT EXISTS leases (
 );
 
 -- Every decision, with the numbers that produced it (supervisor.md §3).
+-- The provider's daily search quota (D121): offer rows the pool's own searches returned, per UTC
+-- day, and what the provider said when it refused. Kept here so a restart does not forget it.
+CREATE TABLE IF NOT EXISTS search_usage (
+    day          TEXT PRIMARY KEY,
+    rows         INTEGER NOT NULL DEFAULT 0,
+    quota        INTEGER,
+    exhausted_at REAL,
+    resets_at    REAL,
+    updated_at   REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     ts       REAL NOT NULL,
