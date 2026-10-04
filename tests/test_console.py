@@ -493,9 +493,9 @@ def test_history_keeps_what_was_applied_and_rollback_restores_it(console):
 def test_the_market_preview_can_use_the_forms_unsaved_values(console):
     _, url, _, _ = console
     with client(url) as http:
-        saved = http.get("/pool/market/preview").json()
+        saved = http.get("/pool/market/preview?search=true").json()
         tightened = http.post(
-            "/pool/market/preview", json={"offer_policy": {"min_gpu_memory_gb": 999}}
+            "/pool/market/preview?search=true", json={"offer_policy": {"min_gpu_memory_gb": 999}}
         ).json()
 
     assert saved["passed"] == 1
@@ -506,7 +506,7 @@ def test_the_market_preview_can_use_the_forms_unsaved_values(console):
 def test_an_unsaved_policy_that_makes_no_sense_is_a_400_not_something_the_pool_acts_on(console):
     _, url, _, _ = console
     with client(url) as http:
-        response = http.post("/pool/market/preview", json={"offer_policy": {"max_all_in_hourly": "not a number"}})
+        response = http.post("/pool/market/preview?search=true", json={"offer_policy": {"max_all_in_hourly": "not a number"}})
     assert response.status_code == 400
 
 
@@ -1153,9 +1153,9 @@ async def test_how_the_pool_rents_is_set_where_renting_is_watched(console):
     assert was != "cheaper", "this pool already rents both ways; the test proves nothing"
 
     with client(url) as http:
-        before = http.get("/pool/market/preview?hours=1").json()
+        before = http.get("/pool/market/preview?hours=1&search=true").json()
         answer = http.patch("/pool/config/rented", json={"mode": "cheaper"})
-        after = http.get("/pool/market/preview?hours=1").json()
+        after = http.get("/pool/market/preview?hours=1&search=true").json()
 
     assert before["saved"]["mode"] == was, "the screen did not show the mode in force"
     assert answer.status_code == 200, answer.text
@@ -1178,9 +1178,9 @@ async def test_every_teardown_lever_is_editable_in_the_console(console):
     supervisor, url, _, loop = console
 
     with client(url) as http:
-        before = http.get("/pool/market/preview?hours=1").json()
+        before = http.get("/pool/market/preview?hours=1&search=true").json()
         answer = http.patch("/pool/config/rented", json={"teardown": {"max_starting_minutes": 4}})
-        after = http.get("/pool/market/preview?hours=1").json()
+        after = http.get("/pool/market/preview?hours=1&search=true").json()
 
     assert "teardown" in before["saved"], "the console is never told the tear-down settings"
     assert answer.status_code == 200, answer.text
@@ -1213,7 +1213,7 @@ async def test_a_search_can_be_saved_under_a_name_and_chosen_again(console):
             "save_profile_as": "cheap-and-slow",
             "offer_policy": {"max_all_in_hourly": 0.40, "min_download_mbps": 10},
         })
-        after = http.get("/pool/market/preview?hours=1").json()
+        after = http.get("/pool/market/preview?hours=1&search=true").json()
 
     assert saved.status_code == 200, saved.text
     rented = supervisor.config.rented
@@ -1301,3 +1301,26 @@ async def test_the_days_search_quota_is_counted_and_kept_across_a_restart(consol
     assert abs(quota["resets_at"] - (clock.time() + 3600)) < 5, "the provider's own reset time"
     with httpx.Client(base_url=url, headers={"Authorization": f"Bearer {ADMIN_KEY}"}) as http:
         assert http.get("/pool/status").json()["provider"]["search_quota"]["exhausted"] is True
+
+
+def test_the_market_is_searched_only_when_a_request_asks_by_name(console):
+    """A page or script that asks for the preview by habit never spends the provider's daily
+    search quota: a search needs `search=true` (D122). Found live: a console tab from before
+    the change kept searching every two minutes, and spent the day's quota each morning."""
+    supervisor, url, _, loop = console
+    asked = []
+    real = supervisor.fleet.provider.search_offers
+
+    async def counted(query):
+        asked.append(1)
+        return await real(query)
+
+    supervisor.fleet.provider.search_offers = counted
+    with httpx.Client(base_url=url, headers={"Authorization": f"Bearer {ADMIN_KEY}"}) as http:
+        assert http.get("/pool/market/preview").json()["searched"] is False
+        assert http.post("/pool/market/preview", json={"offer_policy": {}}).json()["searched"] is False
+        assert asked == []
+        assert http.get("/pool/market/preview?search=true").json()["searched"] is True
+        assert http.post("/pool/market/preview?search=true", json={"offer_policy": {}}).json()["searched"] is True
+        assert len(asked) == 2
+        assert http.get("/pool/status").json()["server_version"]

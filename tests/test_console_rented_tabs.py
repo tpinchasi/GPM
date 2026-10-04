@@ -145,3 +145,28 @@ def test_the_days_search_quota_is_shown_beside_the_market_and_the_provider(tmp_p
         server.stop()
         loop.stop()
         database.close()
+
+
+@pytest.mark.timeout(180)
+def test_a_page_from_an_older_release_reloads_itself_unless_the_operator_is_busy(served, monkeypatch):
+    """D122: a forgotten tab must not keep running an older release's code after a deploy."""
+    from gpm_server.supervisor import control
+
+    with open_page(f"{served}/ui/#overview") as page:
+        page.until("(document.getElementById('key-dialog') || {}).open === true", within=60, what="the page")
+        page.js(f"document.getElementById('key-input').value = {json.dumps(ADMIN_KEY)};"
+                "document.getElementById('key-form').requestSubmit(); true")
+        page.until("typeof state !== 'undefined' && state.loadedRelease != null", within=30, what="the page's release")
+        page.js("window.__same_page = true; true")
+
+        # Busy: typing into a field — told, not reloaded.
+        page.js("const i = document.createElement('input'); i.id = '__typing'; document.body.append(i); i.focus(); true")
+        monkeypatch.setattr(control, "_server_version", lambda: "99.0.0")
+        page.until("!!document.getElementById('release-banner')", within=15, what="the banner")
+        assert page.js("window.__same_page === true"), "not reloaded under the operator"
+        assert "now runs 99.0.0" in page.js("document.getElementById('release-banner').textContent")
+
+        # Not busy: it reloads, and asks for the key again (the key is never stored).
+        page.js("document.getElementById('__typing').remove(); document.activeElement.blur(); true")
+        page.until("window.__same_page === undefined", within=15, what="the reload")
+        page.until("(document.getElementById('key-dialog') || {}).open === true", within=30, what="the key asked again")

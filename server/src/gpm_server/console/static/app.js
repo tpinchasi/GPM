@@ -40,11 +40,11 @@ const api = {
   leases: () => call("GET", "/pool/leases"),
   plan: () => call("GET", "/pool/plan"),
   account: () => call("GET", "/pool/account"),
-  // `search: false` reads the settings and asks the provider nothing (D120).
+  // The server searches only when asked to, by name (D120, D122); without it, the settings.
   market: (hours = 4, policy, search = true) =>
     policy
-      ? call("POST", `/pool/market/preview?hours=${hours}&kinds=both`, policy)
-      : call("GET", `/pool/market/preview?hours=${hours}&kinds=both${search ? "" : "&search=false"}`),
+      ? call("POST", `/pool/market/preview?hours=${hours}&kinds=both&search=true`, policy)
+      : call("GET", `/pool/market/preview?hours=${hours}&kinds=both&search=${search ? "true" : "false"}`),
   openLease: (body) => call("POST", "/pool/leases", body),
   closeLease: (id) => call("DELETE", `/pool/leases/${id}`),
   tightenLease: (id, body) => call("PATCH", `/pool/leases/${id}`, body),
@@ -3150,8 +3150,34 @@ async function render() {
   }
 }
 
+// The release this page's code came from. A page keeps its code until it is reloaded, so after a
+// deploy a forgotten tab would go on running the old one — found live: a tab from before the
+// fix spent the provider's daily search quota every day (D122). On a newer release it reloads
+// itself, unless the operator is in the middle of something; then it says so instead.
+function operatorIsBusy() {
+  const active = document.activeElement;
+  return Boolean(
+    workloadDraft.shown || programDraft.shown || document.querySelector("dialog[open]")
+    || (active && ["INPUT", "TEXTAREA", "SELECT"].includes(active.tagName))
+    || workloadDraft.plan || (workloadDraft.name || "").trim() || programDraft.open);
+}
+
+function checkRelease(status) {
+  const running = status && status.server_version;
+  if (!running) return;
+  if (state.loadedRelease == null) { state.loadedRelease = running; return; }
+  if (running === state.loadedRelease) return;
+  if (!operatorIsBusy()) { location.reload(); return; }
+  if (document.getElementById("release-banner")) return;
+  const banner = el("div", { id: "release-banner", class: "panel warn-text", role: "status" },
+    `The pool now runs ${running}; this page is from ${state.loadedRelease}. Reload it when you are done here. `,
+    el("button", { class: "small", onclick: () => location.reload() }, "Reload now"));
+  document.getElementById("screen").before(banner);
+}
+
 async function refresh() {
   state.status = await api.status();
+  checkRelease(state.status);
   document.getElementById("pool-name").textContent = state.status.pool;
   await render();
 }
@@ -3202,6 +3228,7 @@ function handleFrame(chunk) {
     if (state.screen === "overview") render();
   } else if (type === "status") {
     state.status = payload;
+    checkRelease(payload);
     document.getElementById("pool-name").textContent = payload.pool;
     if (["overview", "hosts", "models"].includes(state.screen)) render();
   }

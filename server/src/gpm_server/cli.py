@@ -671,7 +671,7 @@ def main(argv: list[str] | None = None) -> int:
     market = subparsers.add_parser("market", help="the live market through your policy; spends nothing")
     market.add_argument("--hours", type=float, default=4.0)
     market.add_argument("--url", default=None)
-    market.set_defaults(func=lambda a: _control(a, "GET", f"/pool/market/preview?hours={a.hours}"))
+    market.set_defaults(func=lambda a: _control(a, "GET", f"/pool/market/preview?hours={a.hours}&search=true"))
 
     account = subparsers.add_parser("account", help="is the provider credential valid; spends nothing")
     account.add_argument("--url", default=None)
