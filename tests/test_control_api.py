@@ -265,7 +265,7 @@ def test_one_offer_from_the_market_can_be_rented_as_listed(control):
         offer_id="od-1", machine_id="m-9", min_bid_hourly=0.50, all_in_hourly=0.50,
         on_demand_hourly=0.50, interruptible=False))
     with client(url) as http:
-        rows = http.get("/pool/market/preview?kinds=both").json()["best"]
+        rows = http.get("/pool/market/preview?kinds=both&search=true").json()["best"]
         fixed = next(row for row in rows if row["kind"] == "on_demand")
         response = http.post("/pool/hosts/prepare", json={
             "max_spend": 1.0, "max_hours": 1, "offer_id": fixed["offer_id"], "kind": fixed["kind"]})
@@ -307,7 +307,7 @@ def test_the_market_preview_runs_the_real_filters_and_creates_nothing(control):
     learns what a number means."""
     supervisor, url, _ = control
     with client(url) as http:
-        preview = http.get("/pool/market/preview").json()
+        preview = http.get("/pool/market/preview?search=true").json()
 
     assert preview["seen"] == 1
     assert preview["passed"] == 1
@@ -320,7 +320,7 @@ def test_a_ceiling_that_bites_shows_up_as_a_rejection_reason(control):
     supervisor, url, _ = control
     supervisor.fleet.rented.offer_policy.min_gpu_memory_gb = 999
     with client(url) as http:
-        preview = http.get("/pool/market/preview").json()
+        preview = http.get("/pool/market/preview?search=true").json()
 
     assert preview["passed"] == 0
     assert preview["rejected"] == 1

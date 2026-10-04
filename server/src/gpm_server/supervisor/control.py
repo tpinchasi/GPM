@@ -334,6 +334,15 @@ class _KeyHashes:
         return self._hashes
 
 
+def _server_version() -> str:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("gpm-server")
+    except PackageNotFoundError:
+        return "unknown"
+
+
 def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
     # The configuration given here until the supervisor applies a newer one from its file.
     started_with = supervisor.config
@@ -622,6 +631,8 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
 
         return {
                 "pool": supervisor.config.pool.name,
+                # The release running: a console page loaded from an older one reloads (D122).
+                "server_version": _server_version(),
                 "contract_version": CONTRACT_VERSION,
                 "as_of": time.time(),
                 # The Models screen draws these, and they change when configuration is
@@ -785,9 +796,10 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         return JSONResponse({"plan": await supervisor.fleet.plan(supervisor._ready_workers())})
 
     @app.get("/pool/market/preview")
-    async def market_preview(hours: float = 4.0, kinds: Optional[str] = None, search: bool = True) -> JSONResponse:
-        """Read-only: the live market through the pool's own filters. Spends nothing. With
-        `search=false`, the settings only: the market is not asked (D120)."""
+    async def market_preview(hours: float = 4.0, kinds: Optional[str] = None, search: bool = False) -> JSONResponse:
+        """Read-only: the live market through the pool's own filters. Spends nothing. The market
+        is asked only with `search=true`; without it, the settings only (D120, D122) — a page or
+        script that asks by habit never spends the provider's daily search quota."""
         if supervisor.fleet is None:
             return _error(400, "cannot_rent", "this pool has no rented capacity configured")
         try:
@@ -796,7 +808,8 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             return _error(400, "bad_kinds", str(exc))
 
     @app.post("/pool/market/preview")
-    async def market_preview_unsaved(request: Request, hours: float = 4.0, kinds: Optional[str] = None) -> JSONResponse:
+    async def market_preview_unsaved(request: Request, hours: float = 4.0, kinds: Optional[str] = None,
+                                     search: bool = False) -> JSONResponse:
         """The same pipeline with the values **currently in the form, not yet saved** — which
         is what makes moving a ceiling and watching "4 pass" become "0 pass" possible."""
         if supervisor.fleet is None:
@@ -809,6 +822,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     offer_policy=body.get("offer_policy"),
                     bidding=body.get("bidding"),
                     kinds=kinds,
+                    search=search,
                 )
             )
         except (TypeError, ValueError) as exc:
