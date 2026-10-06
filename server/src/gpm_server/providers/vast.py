@@ -204,7 +204,7 @@ class VastProvider:
 
     async def _search(self, body: dict[str, Any]) -> list[dict[str, Any]]:
         """One offer search, its rows counted against the day's quota."""
-        payload = await self._call("POST", "/api/v0/bundles", json=body)
+        payload = await self._call("POST", "/api/v0/bundles/", json=body)
         entries = payload.get("offers", payload if isinstance(payload, list) else [])
         self._rows_untaken += len(entries)
         return entries
