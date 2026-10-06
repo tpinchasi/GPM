@@ -187,18 +187,25 @@ class Provisioning:
         return plan
 
     def _committed(self, provisioner: Optional[str], since: float) -> float:
-        """Dollars committed by workloads made by programs since `since`, or still open: their
-        budgets, not what has been recorded yet — a program could open several before any spend
-        showed (D117). One made 23 hours ago and still running still counts: otherwise a day
-        could see the cap plus every workload still spending from the day before."""
+        """Dollars committed by workloads made by programs since `since`, or still open. One not
+        yet ended counts its whole budget, not what has been recorded yet — a program could open
+        several before any spend showed (D117); one made 23 hours ago and still running still
+        counts, or a day could see the cap plus every workload still spending from the day
+        before. One ended — its last host gone — counts what it spent, which is final (D125)."""
         total = 0.0
+        fleet = self.supervisor.fleet
         for workload in self.supervisor.workloads.store.all():
             if workload.provisioner is None or (workload.created_at < since and workload.state == "ended"):
                 continue
             if provisioner is not None and workload.provisioner != provisioner:
                 continue
             lease = self.supervisor.leases.get(workload.lease_id)
-            total += lease.max_spend if lease is not None else 0.0
+            if lease is None:
+                continue
+            if workload.state == "ended" and fleet is not None:
+                total += fleet.lease_spend(lease)[0]
+            else:
+                total += lease.max_spend
         return total
 
     def usage(self, name: str) -> dict[str, Any]:

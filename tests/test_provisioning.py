@@ -171,6 +171,18 @@ def test_the_day_counts_what_was_committed(pool):
         ask(pool, key, max_spend=3.0)
 
 
+def test_an_ended_workload_counts_what_it_spent_not_its_budget(pool):
+    key = grant(pool, max_spend_per_day=5.0)
+    first = ask(pool, key, max_spend=3.0)
+    made = pool.supervisor.workloads.get(first.name)
+    pool.supervisor.fleet.spend.record(lease_id=made.lease_id, host_id="h-gone", source="estimate", amount=0.4)
+    with pytest.raises(WorkloadRefused, match="committed \\$3.00"):
+        ask(pool, key, max_spend=3.0)       # still open: its whole budget counts
+    pool.database.execute("UPDATE workloads SET state = 'ended', ended_at = ? WHERE name = ?", (time.time(), first.name))
+    assert pool.supervisor.provisioning.usage("evals")["committed_today"] == 0.4
+    ask(pool, key, max_spend=3.0)           # $0.40 spent + $3.00 fits the $5.00 a day
+
+
 def test_the_pool_wide_day_bounds_every_key_together(pool):
     first, second = grant(pool, name="one", max_spend_per_day=8.0), grant(pool, name="two", max_spend_per_day=8.0)
     ask(pool, first, max_spend=5.0)
