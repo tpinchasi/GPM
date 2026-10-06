@@ -444,3 +444,29 @@ def test_a_workload_its_budget_cannot_grow_stops_searching_until_something_chang
     pool.reprobe()
     assert fleet.provider.calls.count("search_offers") > searched
     assert len(fleet.hosts_of("research")) >= 1
+
+
+def test_a_group_short_of_its_hosts_runs_more_of_each_card_until_they_come(pool):
+    """D128. Found live: a workload planned on three hosts at 10 + 10 of a 24-a-card machine got
+    two, and served 20 of each model where its two cards held 24 — the shares spread the targets
+    over hosts that never came. While short, each host takes more; back to the plan when they come."""
+    fleet = pool.supervisor.fleet
+    pool.supervisor.config.rented.workers = 8
+    fleet.provider.offers = [default_offer("o-0", "m-0", min_bid_hourly=0.20)]
+    create(pool, request("together", (CHAT, 30, 6), (EMBED, 5, 6)))
+    (group,) = pool.supervisor.workloads.get("research").groups
+    assert group.caps == {CHAT: 3, EMBED: 3} and group.hosts_at_start == 2, "8 a card alone: 3 + 3 on two hosts"
+
+    until(pool, lambda: [h.state for h in fleet.hosts_of("research")] == ["ready"], "the one host ready")
+    pool.reprobe()
+    (host,) = fleet.hosts_of("research")
+    assert host.launch_workers == 8, "launched with room for the card's whole split"
+    widened = pool.supervisor.workloads.get("research")
+    assert widened.cap(CHAT) == 4 and widened.cap(EMBED) == 4 and host.workers == 8
+    assert any(e["kind"] == "workload_resplit" for e in pool.supervisor.events.recent(50))
+
+    fleet.provider.offers = [default_offer("o-1", "m-1", min_bid_hourly=0.20)]
+    until(pool, lambda: len([h for h in fleet.hosts_of("research") if h.state == "ready"]) == 2, "both ready")
+    pool.reprobe()
+    planned = pool.supervisor.workloads.get("research")
+    assert planned.cap(CHAT) == 3 and all(h.workers == 6 for h in fleet.hosts_of("research"))

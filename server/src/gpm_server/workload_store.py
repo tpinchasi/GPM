@@ -54,6 +54,14 @@ class Group:
     #: of the card. Empty for one model, whose host has no other to share with.
     caps: dict[str, int] = dataclasses.field(default_factory=dict)
     cards_per_copy: int = 1
+    #: The shares its hosts run while the group has fewer ready than it planned (D128): more of
+    #: each card, so fewer hosts still serve as much as fits. Empty when it runs its plan.
+    caps_now: dict[str, int] = dataclasses.field(default_factory=dict)
+
+    @property
+    def shares(self) -> dict[str, int]:
+        """The shares in force: while short, the wider ones; else the planned."""
+        return self.caps_now or self.caps
 
     @property
     def key(self) -> tuple[str, ...]:
@@ -72,7 +80,8 @@ class Group:
         return cls(models=tuple(raw["models"]), builds=dict(raw.get("builds") or {}),
                    hosts_at_start=int(raw.get("hosts_at_start") or 0), workers_per_host=int(raw.get("workers_per_host") or 0),
                    caps={k: int(v) for k, v in (raw.get("caps") or {}).items()},
-                   cards_per_copy=int(raw.get("cards_per_copy") or 1))
+                   cards_per_copy=int(raw.get("cards_per_copy") or 1),
+                   caps_now={k: int(v) for k, v in (raw.get("caps_now") or {}).items()})
 
 
 def group_key(models: Any) -> tuple[str, ...]:
@@ -133,7 +142,7 @@ class Workload:
         """The most answers of `model` one host of its group takes at once, where it shares the
         host with other models; None where it does not."""
         group = self.group_serving(model)
-        return group.caps.get(model) if group is not None and len(group.models) > 1 else None
+        return group.shares.get(model) if group is not None and len(group.models) > 1 else None
 
     @property
     def active(self) -> bool:
@@ -237,6 +246,15 @@ class WorkloadStore:
             "serving_at = CASE WHEN ? = 'serving' AND serving_at IS NULL THEN ? ELSE serving_at END WHERE name = ?",
             (state, now, state, now, state, now, name),
         )
+
+    def set_caps_now(self, name: str, key: tuple[str, ...], caps_now: dict[str, int]) -> None:
+        """The shares one group's hosts run while it is short of its plan; empty to return to it (D128)."""
+        workload = self.get(name)
+        if workload is None:
+            return
+        groups = [dataclasses.replace(g, caps_now=dict(caps_now)) if g.key == key else g for g in workload.groups]
+        self.db.execute("UPDATE workloads SET groups = ?, updated_at = ? WHERE name = ?",
+                        (json.dumps([g.as_dict() for g in groups]), time.time(), name))
 
     def set_plan(self, name: str, plan: dict[str, Any], workers_per_host: Optional[int] = None) -> None:
         workload = self.get(name)

@@ -230,6 +230,20 @@ async def test_a_bid_wins_when_evictions_are_rare(db):
     assert host.interruptible
 
 
+async def test_a_bid_chosen_is_a_bid_rented_when_the_provider_lists_both_under_one_id(db):
+    """D127. Found live: the provider lists one machine's bid and its fixed price under the same
+    offer id; the rule chose the bid, and the pool rented the machine on demand at twice the price."""
+    bid = default_offer("ask-1", "m-1", min_bid_hourly=0.5, interruptible=True, on_demand_hourly=1.5)
+    od = default_offer("ask-1", "m-1", min_bid_hourly=1.5, all_in_hourly=1.5, interruptible=False,
+                       on_demand_hourly=1.5)
+    fleet = make_fleet(db, FakeProvider(offers=[bid, od]), mode="cheaper")
+    fleet.config.workloads.eviction_prior_per_hour = 0.0
+    workload, _ = open_workload(fleet, hosts_at_start=1, kind="roi")
+    await run(fleet, [workload])
+    (host,) = mine(fleet, "research")
+    assert host.interruptible and host.bid_hourly < 1.0
+
+
 async def test_a_fixed_kind_is_what_it_says(db):
     fleet = make_fleet(db, FakeProvider(offers=market_both_kinds()), mode="cheaper")
     workload, _ = open_workload(fleet, hosts_at_start=1, kind="on_demand")

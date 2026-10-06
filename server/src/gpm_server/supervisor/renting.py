@@ -2710,6 +2710,7 @@ class Fleet:
             chosen = self.group_spec(workload, unit.group)
             if lease is None or chosen is None:
                 return
+            self.widen_while_short(workload, chosen)
             await self._acquire_dynamically(
                 lease, 0, load or Load(busy_workers=0, ready_workers=0, waiting=0), unit=unit,
                 floor=chosen.hosts_at_start, per_host=chosen.workers_per_host,
@@ -2935,6 +2936,44 @@ class Fleet:
             if ramp:
                 unit.ramp_round = asked
             unit.ramp_landed_at = 0.0
+
+    def widen_while_short(self, workload: str, chosen: Any) -> None:
+        """A group of several models with fewer ready hosts than it planned runs more of each card
+        (D128): its planned shares spread the models' targets over every planned host, so two of
+        three hosts would serve two thirds of the target with a sixth of each card unused. Back
+        to the plan when its hosts are. Never past what the engines were launched for."""
+        if len(chosen.models) < 2:
+            return
+        spec = self.workloads.get(workload)
+        live = [h for h in self.hosts_of(workload, chosen.key) if h.state != "draining"]
+        ready = [h for h in live if h.state == "ready"]
+        shares = dict(chosen.caps)
+        if spec is not None and ready and len(ready) < chosen.hosts_at_start:
+            per_model = {m: min(self.per_model_on(h.offer, spec, chosen.models, chosen.builds)[m] for h in ready)
+                         for m in chosen.models}
+            most = min(h.launch_workers or h.workers for h in ready)
+            wider = workload_math.split_short({m: spec.target(m).parallel for m in chosen.models},
+                                              per_model, len(ready), most)
+            if wider is not None and sum(wider.values()) > sum(shares.values()):
+                shares = wider
+        if shares != chosen.shares:
+            self.workload_store.set_caps_now(workload, chosen.key, {} if shares == chosen.caps else shares)
+            fresh = self.workload_store.get(workload)
+            if fresh is not None:
+                self.workloads[workload] = fresh
+            said = ", ".join(f"{m} {shares[m]}" for m in chosen.models)
+            self.events.record(
+                "workload_resplit",
+                (f"workload {workload}: {len(ready)} of its {chosen.hosts_at_start} planned host(s) ready; each "
+                 f"takes {said} at once until the rest are" if shares != chosen.caps
+                 else f"workload {workload}: its planned hosts are ready; each takes {said} at once, as planned"),
+                numbers={"workload": workload, "models": list(chosen.models), "shares": shares,
+                         "planned": chosen.caps, "ready": len(ready)},
+            )
+        workers = sum(shares.values())
+        for host in live:
+            if host.workers != workers and workers <= (host.launch_workers or host.workers):
+                host.workers = workers
 
     def _budget_situation(self, lease: Lease, workload: Optional[str]) -> tuple:
         """What a workload's budget for another host depends on, but for the market: its hosts
@@ -3225,6 +3264,14 @@ class Fleet:
             host_id = f"rented-{uuid.uuid4().hex[:6]}"
             workers, workers_why = self.workers_for(offer, workload, tuple(for_this_host) if spec is not None else None)
             launch_workers = self.launch_workers_for(workers, workload)
+            if chosen_group is not None and len(chosen_group.models) > 1:
+                # Launched with room for the card's whole split, so a group left short of its
+                # plan can widen its shares on this host without relaunching the engine (D128).
+                whole = workload_math.split_short(
+                    {m: spec.target(m).parallel for m in chosen_group.models},
+                    self.per_model_on(offer, spec, chosen_group.models, chosen_group.builds), 1, 10**6)
+                if whole:
+                    launch_workers = max(launch_workers, sum(whole.values()))
             instance_spec = InstanceSpec(
                 # A workload's name sits in the label, under the pool's one prefix, so the one
                 # sweep still finds every instance the pool owns (workloads.md §1).
@@ -3532,11 +3579,14 @@ class Fleet:
         """The accepted offers in the rental-kind rule's order, over the hours the lease has left."""
         ordered, why = self.expected_costs(ranked, lease.hours_left(), spec, models, builds, lease.max_all_in_hourly,
                                            fixed_workers=fixed_workers)
-        by_id = {offer.offer_id: (offer, points) for offer, points in ranked}
+        # By id and kind: a provider may list one machine's bid and its fixed price under the same
+        # id, and keyed by id alone the second overwrote the first — the rule chose a bid and the
+        # pool rented the same machine on demand, at twice the price (D127).
+        by_id = {(offer.offer_id, offer.interruptible): (offer, points) for offer, points in ranked}
         said = (ordered[0].offer_id, ordered[0].interruptible) if ordered else None
         # Per group (D118): two groups choosing differently must not flip the one note.
         if self._said_kind.get((spec.name, group_key(models))) == said:
-            return [by_id[c.offer_id] for c in ordered], why
+            return [by_id[(c.offer_id, c.interruptible)] for c in ordered], why
         self._said_kind[(spec.name, group_key(models))] = said
         self.events.record(
             "rental_kind", why[0],
@@ -3544,7 +3594,7 @@ class Fleet:
                      "candidates": [dataclasses.asdict(c) for c in ordered[:5]]},
             lease_id=lease.lease_id,
         )
-        return [by_id[c.offer_id] for c in ordered], why
+        return [by_id[(c.offer_id, c.interruptible)] for c in ordered], why
 
     def _cap_bid(self, bid: float, lease: Lease, offer: Offer) -> Optional[float]:
         """The supervisor's own clamp, applied after the strategy returns — a faulty or

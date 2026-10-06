@@ -156,7 +156,8 @@ cost_bid       = bid_all_in × H  +  P_evict(H) × (time_to_ready × bid_all_in 
 - `lost_work` is the answers in flight on one host, priced at their mean generation time — a
   host with siblings loses a share of the workload's throughput, a lone host loses all of it.
 
-It chooses the cheaper kind and **returns its reasons** — both numbers and every input — and
+An offer is known by its id *and* its kind: a provider may list one machine's bid and its fixed
+price under one id (D127). It chooses the cheaper kind and **returns its reasons** — both numbers and every input — and
 the supervisor clamps and re-checks as it does for every strategy. `--kind on_demand` or
 `interruptible` at creation fixes the kind instead; `roi` is the default. The owner's rule of
 thumb — on-demand for the first host, bids for the scale-up — is what the numbers usually
@@ -331,6 +332,11 @@ gpm workload create research --hours 6 --max-spend 25 \
   takes at most `k_m` answers of *m* on one host at once: a request past its model's share waits for
   one to finish, as a request waits for any busy worker; it is never refused for it. Load that moves
   from one model to another is not absorbed by the other's share.
+- **Short of its hosts** (D128). While a group has fewer ready hosts than it planned, its shares are
+  each model's target spread over the hosts it has — or, where that is more than a card holds, the
+  card filled in the proportion the models asked for — never past what the hosts' engines were
+  launched for; a host is launched with room for its card's whole split, so this restarts nothing.
+  The planned shares return when its hosts do (`workload_resplit` in the decision log).
 - **Measuring.** A model's latency curve is built from answers served with nothing else on the
   host — the request log records, beside the concurrency, how many of those answers were of the
   same model. Automatic worker adjustment leaves a split host alone.

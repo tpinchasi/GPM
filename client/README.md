@@ -85,6 +85,113 @@ For a batch driver that should not start until there is somewhere to run:
 pool.wait_until_ready(timeout=600)     # raises PoolUnavailable if nothing becomes ready
 ```
 
+### 3. A workload of your own, created from code
+
+A **workload** is capacity reserved for one program: its own hosts, its own key, its own latency
+target, and a dollar budget it cannot pass. An operator can create one for you, or, if they give
+your program a **provisioning key** (`gpmp_…`), the program creates, uses and ends its own,
+entirely from code.
+
+**What you need from the operator.** A provisioning key and the limits it carries. The operator
+makes it with:
+
+```sh
+gpm provisioner create my-app --models gemma4:26b,gemma4:e4b \
+    --max-spend 5 --max-spend-per-day 10 --max-hours 4 --max-open 1
+```
+
+The key can create workloads only for those models, up to those limits. It cannot request a
+completion and cannot reach the control API. Put it in `GPM_PROVISIONING_KEY`, and the pool's
+URL in `GPM_URL`.
+
+**Price it first, then create it.** Pricing spends no money. Creating opens a lease and starts
+renting hosts:
+
+```python
+from gpm_client import WorkloadProvisioner, WorkloadRefused
+
+with WorkloadProvisioner() as provisioner:            # reads GPM_URL and GPM_PROVISIONING_KEY
+    plan = provisioner.plan_workload("gemma4:26b", latency_s=30, parallel=30, hours=2, max_spend=5)
+    if plan["refused"] or not plan["within_grant"]:
+        raise SystemExit(plan["refused"] or "outside this key's grant")
+    print(plan["hosts_at_start"], plan["placement"], plan["reasons"])
+
+    with provisioner.workload("gemma4:26b", latency_s=30, parallel=30, hours=2, max_spend=5) as w:
+        reply = w.client.chat("gemma4:26b", [{"role": "user", "content": "hello"}])
+        print(reply.content)
+    # leaving the block ends the workload, and its hosts are released
+```
+
+- `latency_s`: the 95th-percentile answer time each request should meet.
+- `parallel`: how many requests you will send at once. The pool sizes hosts for it.
+- `hours`: the most it runs. `max_spend`: the most it spends, in dollars. Both are hard limits.
+- `machines`: `"roi"` (the default) lets the pool choose bid or fixed-price machines by expected
+  cost. `"on_demand"` and `"interruptible"` fix the choice.
+- `idle_end_minutes`: once serving, the workload ends after this many minutes with no request.
+  It defaults to the grant's (usually 15).
+
+A plan searches the provider's market, which has a daily limit on searches, so plan once rather
+than in a loop.
+
+**Several models in one workload.** Each model gets its own target. Send requests for any of
+them through the same `w.client`:
+
+```python
+w = provisioner.workload(
+    models={"gemma4:26b": {"latency_s": 30, "parallel": 30},
+            "gemma4:e4b": {"latency_s": 30, "parallel": 30}},
+    placement="auto",          # "together": every host holds both; "apart": hosts per model;
+    hours=1.75, max_spend=5,   # "auto": whichever is expected to cost less
+)
+```
+
+**Waiting for it.** `workload()` returns as soon as the workload is created. Its own hosts take
+minutes to rent, download the models and start. Meanwhile your requests may be answered on the
+pool's shared hosts, a small share of them, if the grant allows borrowing. The SDK waits and
+retries when they are busy. To wait for hosts of its own instead:
+
+```python
+w = provisioner.workload("gemma4:26b", latency_s=30, parallel=30, hours=2, max_spend=5,
+                         wait_until="serving", timeout_s=1800)   # ends it again if it never serves
+```
+
+`w.state()` returns its state at any time: `preparing`, `serving`, `ending` or `ended`, whether
+it is borrowing, its hosts and their busy workers.
+
+**Without a `with` block**, for a service that keeps a workload across many calls:
+
+```python
+w = provisioner.workload("gemma4:26b", latency_s=30, parallel=30, hours=4, max_spend=10)
+...                         # w.client, w.state(), w.name, w.models
+w.end()                     # always end it when done; ending twice is harmless
+```
+
+**Using your own HTTP client.** `w.key` is the workload's key and `w.base_url` the pool's URL.
+Use them as in section 1, with `pool_transport()`. The key is made in your program and only its
+hash is sent, so the pool never holds it. **Keep it in memory only:** if the process loses it,
+nothing can recover it.
+
+**When creating is refused.** `workload()` and `plan_workload()` raise `WorkloadRefused`, with
+the pool's reason in `detail`, for example:
+- "this key has 1 workload(s), at its limit of 1";
+- "at most $5.00 per workload";
+- "programs committed $8.00 in the last 24 hours; $5.00 more would pass the pool's $10.00 a day".
+
+For the daily limit, a workload that has ended counts what it actually spent; one still open
+counts its whole budget.
+
+**If your program dies without ending it**, the pool ends it on its own:
+- once serving, after its idle cutoff with no requests;
+- whatever its state, when its hours or its budget run out.
+
+It never spends more than `max_spend`. A program that is restarted cannot take back a workload
+it made, because the key existed only in the old process. Create a new one; the old one ends at
+its idle cutoff.
+
+**Client certificates.** `workload(..., certs=True)` also has the pool sign a client
+certificate, and the SDK uses it for every request (`pip install 'gpm-client[certs]'`). The
+private key never leaves your machine. Some grants require it.
+
 ## Configuration
 
 | Variable | Default | What it sets |
@@ -92,6 +199,7 @@ pool.wait_until_ready(timeout=600)     # raises PoolUnavailable if nothing becom
 | `GPM_URL` | `http://127.0.0.1:8080` | The pool's app-facing endpoint |
 | `GPM_API_KEY` | — | Your app key. **Required**, loopback included |
 | `GPM_MAX_WAIT_S` | `1800` | Total seconds the SDK will spend waiting for capacity |
+| `GPM_PROVISIONING_KEY` | — | A provisioning key, for `WorkloadProvisioner` only (section 3) |
 
 `PoolClient(base_url=..., api_key=...)` overrides the first two per client.
 
@@ -224,7 +332,8 @@ pool's queue timeout re-introduces exactly the abandoned-work problem the contra
 ## What this package deliberately does not have
 
 No host lists, no provider names, no bids, no leases, no tear-down. Those belong to the
-operator and the admin key. If you find yourself wanting one of them in application code, the
+operator and the admin key. The one exception is section 3: a program the operator has given a
+provisioning key may create and end its own workloads, within the limits the operator set. If you find yourself wanting one of them in application code, the
 thing you actually want is for the operator to change the pool's configuration.
 
 ## Versioning
