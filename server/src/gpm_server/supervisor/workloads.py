@@ -377,7 +377,8 @@ class Workloads:
                 kind_reasons = []
             if not ordered:
                 return {"refused": f"no machine holds {named} within every target", "offers_passed": len(ranked)}
-            first = next(o for o, _ in ranked if o.offer_id == ordered[0].offer_id)
+            first = next(o for o, _ in ranked
+                         if (o.offer_id, o.interruptible) == (ordered[0].offer_id, ordered[0].interruptible))
             first_cost = ordered[0]
             if len(placement) > 1 or len(models) > 1:
                 kind_reasons = [f"{named}: {r}" for r in kind_reasons]
@@ -412,7 +413,8 @@ class Workloads:
                 # the same on-demand rate; only this host's share of the group changes.
                 shared, _ = fleet.expected_costs(ranked, req.hours, sketch, models, group_builds,
                                                  fixed_workers=per_host, have=per_host * (hosts - 1))
-                first_cost = next((c for c in shared if c.offer_id == first.offer_id), first_cost)
+                first_cost = next((c for c in shared if (c.offer_id, c.interruptible) == (first.offer_id, first.interruptible)),
+                                  first_cost)
             groups.append({
                 "models": list(models), "builds": group_builds, "hosts_at_start": hosts, "workers_per_host": per_host,
                 "caps": caps, "cards_per_copy": cards, "sizing": sizing, "latency_curves": curves, "measured": measured,

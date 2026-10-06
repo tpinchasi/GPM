@@ -153,6 +153,23 @@ def split_together(parallel: Mapping[str, int], per_host: Mapping[str, int]) -> 
     return Split(hosts=low, caps=caps, workers=sum(caps.values()), load=round(load_at(low), 4))
 
 
+def split_short(parallel: Mapping[str, int], per_host: Mapping[str, int], hosts: int, most: int) -> Optional[dict[str, int]]:
+    """Each model's share on `hosts` hosts, where a group has fewer than it planned (D128): what
+    each model asked for spread over them, or — where that is more than a card holds — the card
+    filled in the proportion the models asked for, never more than `most` answers in all (what
+    the hosts' engines were launched for). None where not even one of each fits."""
+    models = [m for m in parallel if parallel[m] > 0]
+    if not models or hosts < 1 or any(per_host.get(m, 0) < 1 for m in models):
+        return None
+    caps = {m: math.ceil(parallel[m] / hosts) for m in models}
+    if sum(caps[m] / per_host[m] for m in models) > 1 + 1e-9 or sum(caps.values()) > most:
+        scale = min(1 / sum(parallel[m] / per_host[m] for m in models), most / sum(parallel[m] for m in models))
+        caps = {m: max(1, math.floor(scale * parallel[m] + 1e-9)) for m in models}
+    if sum(caps[m] / per_host[m] for m in models) > 1 + 1e-9 or sum(caps.values()) > most:
+        return None
+    return caps
+
+
 def split_fits(caps: Mapping[str, int], per_host: Mapping[str, int]) -> bool:
     """Does a card serving `per_host[m]` of each model alone hold this split within every target?"""
     if any(per_host.get(m, 0) < 1 for m in caps):
