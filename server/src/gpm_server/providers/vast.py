@@ -255,6 +255,24 @@ class VastProvider:
             body["disk_space"] = {"gte": query.min_disk_gb}
         if query.min_gpus > 1:
             body["num_gpus"] = {"gte": query.min_gpus}
+        # The rest of the pool's filters, as conditions they imply (D123): every offer returned
+        # counts against the provider's daily quota, so what the pool would only throw away is
+        # better never returned. The pool still filters each offer itself.
+        if query.max_all_in_hourly is not None:
+            # The pool's all-in price is `dph_base` plus storage for its own disk, so it is never
+            # below `dph_base`: an offer whose base is above the ceiling cannot pass.
+            body["dph_base"] = {"lte": query.max_all_in_hourly}
+        if query.min_download_mbps:
+            body["inet_down"] = {"gte": query.min_download_mbps}
+        if query.max_download_per_gb is not None:
+            body["inet_down_cost"] = {"lte": query.max_download_per_gb}
+        if query.min_reliability:
+            body["reliability"] = {"gte": query.min_reliability}
+        if query.exclude_hardware:
+            body["gpu_name"] = {"notin": list(query.exclude_hardware)}
+        avoided = [int(m) for m in query.avoid_machines if str(m).isdigit()]
+        if avoided:
+            body["machine_id"] = {"notin": avoided}
         return await self._search(body)
 
     async def _on_demand_prices(self, bid_offers: list[dict[str, Any]]) -> dict[str, float]:

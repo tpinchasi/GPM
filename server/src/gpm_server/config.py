@@ -588,6 +588,9 @@ class TeardownConfig(BaseModel):
     #: A machine that failed to start or to download is not bid on again for this long, or the
     #: best-ranked offer — the same machine — is simply rented again.
     avoid_failed_machine_minutes: float = Field(default=60.0, ge=0)
+    #: A machine a bid just lost is not bid on again for this long (D124): the listing shows its
+    #: least bid, not the bid holding it, so the same bid would lose again.
+    avoid_lost_bid_minutes: float = Field(default=30.0, ge=0)
     #: How many times one model's download is tried before the host is given up. A cut
     #: download resumes from what arrived, so a retry is cheap; a host is not.
     pull_attempts: int = Field(default=4, ge=1, le=10)

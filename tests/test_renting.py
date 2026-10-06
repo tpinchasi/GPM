@@ -172,7 +172,11 @@ async def test_the_hourly_burn_cap_refuses_a_bid_that_would_cross_it(fleet):
     assert any("burn" in e["summary"] for e in fleet.events.recent())
 
 
-async def test_a_lost_bid_leaves_nothing_behind_and_tries_the_next_offer(fleet):
+async def test_a_lost_bid_leaves_nothing_behind_and_the_machine_is_not_bid_on_again(fleet):
+    """D124. Found live: a bid that lost on a machine someone held above its listed least bid
+    was placed again on the same machine at the same price five times in ninety seconds, and the
+    creates and deletes tripped the provider's request limits. A lost bid now ends the round and
+    puts the machine aside; the next pass rents elsewhere."""
     fleet.provider.offers = [
         default_offer(offer_id="o-1", machine_id="m-1", min_bid_hourly=0.10),
         default_offer(offer_id="o-2", machine_id="m-2", min_bid_hourly=0.20),
@@ -181,13 +185,17 @@ async def test_a_lost_bid_leaves_nothing_behind_and_tries_the_next_offer(fleet):
     open_lease(fleet)
     await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
 
-    assert len(fleet.hosts) == 1
-    assert next(iter(fleet.hosts.values())).offer.machine_id == "m-2"
-    assert "bid_failed" in kinds(fleet)
-    assert len(fleet.provider.instances) == 1  # the losing bid left nothing
+    assert fleet.hosts == {}, "the round stopped at the lost bid: no second create in the same moment"
+    assert len(fleet.provider.instances) == 0  # the losing bid left nothing
     (failed,) = [e for e in fleet.events.recent() if e["kind"] == "bid_failed"]
     assert failed["numbers"]["provider_response"] == {"success": False, "msg": "outbid", "offer": "o-1"}, \
         "the provider's own answer is kept beside the summary"
+    assert "m-1" in fleet.avoided_now() and "lost" in fleet.avoided_now()["m-1"]
+
+    for _ in range(3):
+        await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    assert [h.offer.machine_id for h in fleet.hosts.values()] == ["m-2"]
+    assert [e["kind"] for e in fleet.events.recent()].count("bid_failed") == 1, "never the same losing bid again"
 
 
 async def test_an_empty_market_stays_paused_rather_than_relaxing_a_filter(fleet):
@@ -197,7 +205,9 @@ async def test_an_empty_market_stays_paused_rather_than_relaxing_a_filter(fleet)
 
     assert fleet.hosts == {}
     no_offer = [e for e in fleet.events.recent() if e["kind"] == "no_offer"][0]
-    assert no_offer["numbers"]["rejected"]  # every rejection, with its reason
+    # What the provider was asked to filter is said, since it returned nothing (D123).
+    assert any(f.startswith("card memory") for f in no_offer["numbers"]["asked_of_provider"])
+    assert "asked of the provider" in no_offer["summary"]
 
 
 async def test_a_bid_over_the_ceiling_is_clamped_by_the_supervisor_not_trusted(fleet):
@@ -939,7 +949,7 @@ async def test_a_market_that_refuses_everything_is_recorded_once_not_once_a_pass
 
     said = [e for e in fleet.events.recent(50) if e["kind"] == "no_offer"]
     assert len(said) == 1, f"{len(said)} identical refusals written"
-    assert said[0]["numbers"]["seen"] >= 1
+    assert said[0]["numbers"]["asked_of_provider"]
 
 
 async def test_a_market_that_changes_its_mind_is_recorded_again(fleet):
@@ -1110,3 +1120,35 @@ async def test_a_re_bid_host_is_given_its_own_time_to_come_back(fleet):
 
     await fleet.tear_down(fleet.leases.open_leases(), {})
     assert host.host_id in fleet.hosts, "given up as never ready seconds after its re-bid"
+
+
+
+async def test_a_provider_that_ignores_the_query_still_has_every_offer_filtered_by_the_pool(fleet):
+    """Asking the provider to filter (D123) only saves rows: the pool's own filters still judge
+    every offer, and say why each was rejected."""
+    everything = list(fleet.provider.offers) + [default_offer("tiny", "m-tiny", gpu_memory_gb=8)]
+
+    async def ignores_the_query(_query):
+        return everything
+
+    fleet.provider.search_offers = ignores_the_query
+    fleet.rented.offer_policy = OfferPolicy(min_gpu_memory_gb=16, min_disk_gb=10, max_all_in_hourly=0.60)
+    preview = await fleet.market_preview(hours=1)
+    assert "gpu memory" in preview["rejected_by_reason"]
+    assert all(o["offer_id"] != "tiny" for o in preview["best"])
+
+
+async def test_the_provider_is_asked_to_filter_only_what_the_pool_would_also_reject(fleet):
+    """D123: every condition sent is one the pool's own filters imply."""
+    from gpm_server.supervisor.renting import describe_query
+
+    policy = OfferPolicy(min_gpu_memory_gb=24, min_disk_gb=50, max_all_in_hourly=1.5, min_download_mbps=200,
+                         max_download_per_gb=0.01, min_reliability=0.95, exclude_hardware=["RTX 3090"],
+                         avoid_machines=["123"], gpus_multiple_of=2)
+    query = fleet.query_for(policy, True, False)
+    assert (query.min_gpu_memory_gb, query.min_disk_gb, query.max_all_in_hourly, query.min_gpus) == (24, 50, 1.5, 2)
+    assert (query.min_download_mbps, query.max_download_per_gb, query.min_reliability) == (200, 0.01, 0.95)
+    assert query.exclude_hardware == ("RTX 3090",) and query.avoid_machines == ("123",)
+    assert "card memory ≥ 24 GB" in describe_query(query)
+    broad = fleet.query_for(None, True, False)
+    assert broad.min_gpu_memory_gb == 0 and broad.max_all_in_hourly is None, "finding a held machine asks broadly"

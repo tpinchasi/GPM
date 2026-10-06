@@ -323,8 +323,8 @@ def test_a_ceiling_that_bites_shows_up_as_a_rejection_reason(control):
         preview = http.get("/pool/market/preview?search=true").json()
 
     assert preview["passed"] == 0
-    assert preview["rejected"] == 1
-    assert any("gpu memory" in reason for reason in preview["rejected_by_reason"])
+    # Asked of the provider (D123): the offer is never returned, and what was asked is said.
+    assert preview["seen"] == 0 and "card memory ≥ 999 GB" in preview["filtered_by_provider"]
 
 
 def test_the_account_check_spends_nothing(control):

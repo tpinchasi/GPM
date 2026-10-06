@@ -206,6 +206,12 @@ class FakeProvider:
             and offer.disk_gb >= query.min_disk_gb
             and (query.max_all_in_hourly is None or offer.all_in_hourly <= query.max_all_in_hourly)
             and (offer.verified or not query.verified_only)
+            # As a provider that applies the whole query would (D123).
+            and offer.download_mbps >= query.min_download_mbps
+            and (query.max_download_per_gb is None or offer.download_per_gb <= query.max_download_per_gb)
+            and offer.reliability >= query.min_reliability
+            and offer.hardware.split("x ", 1)[-1] not in query.exclude_hardware
+            and offer.machine_id not in query.avoid_machines
             # Two listings, as on a real marketplace: a query gets only the ones it asked for.
             and (query.interruptible if offer.interruptible else query.on_demand)
         ]

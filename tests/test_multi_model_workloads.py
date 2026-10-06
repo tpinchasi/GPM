@@ -365,3 +365,59 @@ def test_no_host_takes_more_than_its_share_of_a_model_under_load(pool):
     assert max(r["model_concurrency"] for r in served) == 1, "a host's share of each model is one"
     assert max(r["concurrency"] for r in served) <= 2, "and its workers are the shares' sum"
     assert {r["host_id"] for r in served} <= {h.host_id for h in fleet.hosts_of("research")}
+
+
+def test_a_workload_host_is_shown_holding_its_own_models_not_the_shared_set(pool):
+    """Found live (2026-10-06): a workload's host serving gemma4:26b and e4b was shown on its
+    page as still to download the shared pool's gemma4:31b — the host page read the shared
+    rented set, not what the host was bought for. The host itself was prepared correctly."""
+    create(pool, request())
+    fleet = pool.supervisor.fleet
+    until(pool, lambda: any(h.state == "ready" for h in fleet.hosts_of("research")), "a host ready")
+    host = next(h for h in fleet.hosts_of("research") if h.state == "ready")
+    with admin(pool) as control:
+        detail = control.get(f"/pool/hosts/{host.host_id}").json()
+        status = control.get("/pool/status").json()
+    assert set(detail["required_tags"]) == {CHAT, EMBED}, detail["required_tags"]
+    assert SHARED not in detail["required_tags"]
+    row = next(r for r in status["rented"] if r["host_id"] == host.host_id)
+    assert set(row["served"]) == {CHAT, EMBED}, row["served"]
+
+
+def test_a_two_model_plan_still_sees_the_cards_that_hold_one_model(pool):
+    """D123: the plan's one search asks the provider to filter, and must ask for the loosest
+    needs of any placement it prices — a search sized for both models on one card would hide
+    the cards that hold one, and apart could never be priced."""
+    from gpm_server.providers import default_offer
+
+    fleet = pool.supervisor.fleet
+    builds = {CHAT: CHAT, EMBED: EMBED}
+    both = fleet.policy_for((CHAT, EMBED), builds).min_gpu_memory_gb
+    alone = max(fleet.policy_for((m,), {m: m}).min_gpu_memory_gb for m in (CHAT, EMBED))
+    assert alone < both, "the fixture's models must need more card together than apart"
+    fleet.provider.offers = [default_offer(f"one-{i}", f"m-one-{i}", min_bid_hourly=0.20, gpu_memory_gb=alone)
+                             for i in range(4)]
+    with admin(pool) as control:
+        plan = control.post("/pool/workloads/plan", json=request()).json()["plan"]
+    assert plan["refused"] is None, plan
+    assert plan["placement"] == "apart" and plan["placements"]["together"]["refused"]
+
+
+
+def test_a_workload_never_rents_a_host_its_budget_cannot_carry(pool):
+    """D124. Found live: a $5, 1.75-hour workload fell back to a $7.17/h on-demand host, which
+    would have spent its budget in forty minutes. A host the budget cannot pay for over the
+    hours left is refused; a cheaper one is taken, or nothing, said in words."""
+    from gpm_server.providers import default_offer
+
+    fleet = pool.supervisor.fleet
+    pool.supervisor.config.rented.offer_policy.max_all_in_hourly = 10.0
+    # Planned on cheap machines, as it was live; by the time it rents, only a dear one is left.
+    create(pool, {**request(placement="apart"), "max_spend": 5.0})
+    fleet.provider.offers = [default_offer("dear", "m-dear", min_bid_hourly=7.00, on_demand_hourly=7.20,
+                                           all_in_hourly=7.20, interruptible=False)]
+    for _ in range(3):
+        pool.reprobe()
+    assert fleet.hosts_of("research") == [], "a host the budget cannot carry is never rented"
+    refused = [e for e in pool.supervisor.events.recent(100) if e["kind"] == "rent_refused"]
+    assert any("more than the $" in e["summary"] and "budget has left" in e["summary"] for e in refused)

@@ -819,6 +819,7 @@ const TEARDOWN_FIELDS = [
   ["teardown", "pull_attempts", "range", "tries per model before the host is given up", 1, 10, 1],
   ["teardown", "pull_retry_after_s", "range", "wait before the second try; it doubles after", 1, 120, 1],
   ["teardown", "avoid_failed_machine_minutes", "range", "a machine that just failed is skipped for this long", 0, 240, 10],
+  ["teardown", "avoid_lost_bid_minutes", "range", "a machine a bid just lost on is not bid on again for this long", 0, 240, 5],
   ["teardown", "max_hours_without_deadman", "range", "the longest lease allowed where nothing on the host can stop it billing", 0.5, 12, 0.5],
 ];
 
@@ -2010,6 +2011,10 @@ const marketPanel = (market) => {
     el("div", { class: "panel" },
       el("div", { class: "stat" }, `${market.passed} pass · ${market.rejected} rejected`),
       el("div", { class: "muted" }, `${market.seen} offers seen through your policy`),
+      // Asked of the provider (D123): an offer failing these is never returned, so it is not
+      // among the rejections below — and is not counted against the daily search quota.
+      (market.filtered_by_provider || []).length ? el("div", { class: "muted" },
+        `The provider was asked for only: ${market.filtered_by_provider.join(" · ")}`) : null,
       // What the disk has to hold, from the builds' own sizes (D108) — beside the disk the
       // host is rented with, so the two can be compared at a glance.
       market.policy ? el("div", { class: "muted" },

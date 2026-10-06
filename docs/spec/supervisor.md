@@ -205,9 +205,12 @@ model set. **Parked hosts are tried first** (§8).
    ceiling, "the model set fits at the pool's context length", and the machine avoid list —
    which always includes every machine the pool already rents: it is still listed, to be outbid,
    and the tenant it would outbid is the pool (D59).
-   **Never relaxed unattended** — an empty result means stay paused. The filters are applied by
-   the pool, not pushed into the provider's own query, so every rejected offer carries the
-   reason it was rejected; a market that merely *looks* empty teaches an operator nothing.
+   **Never relaxed unattended** — an empty result means stay paused. The filters are also asked
+   of the provider, as conditions they imply, so fewer offers are returned against its daily
+   quota (D123); the pool still applies every filter itself, every offer it rejects carries its
+   reason, and what the provider was asked is said beside the result — a market that merely
+   *looks* empty teaches an operator nothing. A search for a machine already held asks broadly.
+   A bid that loses puts its machine aside for `avoid_lost_bid_minutes` and ends the round (D124).
    A search that fails is said as such, never as an empty market (D44); one the provider refuses
    as too frequent is not asked again for a minute — after every refusal, a minute (D119).
 2. **Rank** by throughput proxy per run-dollar, **moved by what the machine has done for this
