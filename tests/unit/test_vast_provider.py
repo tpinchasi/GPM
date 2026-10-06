@@ -46,7 +46,7 @@ def market(bid_offers=(OFFER,), on_demand_offers=(ON_DEMAND,)):
     """A handler answering both listings — which one by the `type` in the request body."""
 
     def handler(request):
-        if request.url.path != "/api/v0/bundles":
+        if request.url.path != "/api/v0/bundles/":
             return httpx.Response(404, json={})
         body = json.loads(request.read())
         if body.get("type") == "on-demand":
@@ -72,7 +72,7 @@ async def test_offers_map_on_to_what_ranking_and_the_ceilings_need():
     seen = []
 
     def handler(request):
-        assert request.url.path == "/api/v0/bundles"
+        assert request.url.path == "/api/v0/bundles/"
         body = json.loads(request.read())
         seen.append(body)
         if body["type"] == "on-demand":
