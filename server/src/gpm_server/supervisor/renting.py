@@ -263,6 +263,32 @@ class Unit:
 OFFER_RATE_LIMIT_WAIT_S = 60.0
 
 
+def describe_query(query: OfferQuery) -> list[str]:
+    """What a search asks the provider to filter, in words (D123)."""
+    said = []
+    if query.min_gpu_memory_gb:
+        said.append(f"card memory ≥ {query.min_gpu_memory_gb:g} GB")
+    if query.min_gpus > 1:
+        said.append(f"≥ {query.min_gpus} cards")
+    if query.min_disk_gb:
+        said.append(f"disk ≥ {query.min_disk_gb:g} GB")
+    if query.max_all_in_hourly is not None:
+        said.append(f"base price ≤ ${query.max_all_in_hourly:.3f}/h")
+    if query.min_download_mbps:
+        said.append(f"download ≥ {query.min_download_mbps:g} Mb/s")
+    if query.max_download_per_gb is not None:
+        said.append(f"download price ≤ ${query.max_download_per_gb:g}/GB")
+    if query.min_reliability:
+        said.append(f"reliability ≥ {query.min_reliability:g}")
+    if query.verified_only:
+        said.append("verified only")
+    if query.exclude_hardware:
+        said.append("not " + ", ".join(query.exclude_hardware))
+    if query.avoid_machines:
+        said.append(f"not machines {', '.join(query.avoid_machines)}")
+    return said
+
+
 class Fleet:
     """The rented half of the pool: what exists, what it costs, and what to do next."""
 
@@ -327,7 +353,9 @@ class Fleet:
         self._offer_refusal: Optional[str] = None
         #: The last "nothing passed the policy" written down, so a market that has not changed
         #: is not written down again on every pass (D82).
-        self._said_nothing_passed: Optional[tuple[int, str]] = None
+        self._said_nothing_passed: Optional[tuple] = None
+        #: What the provider was last asked to filter (D123), in words, for what a search says.
+        self.last_query_filters: list[str] = []
         #: Why the last attempt to rent rented nothing — for whoever asked, in their words.
         self.last_refusal: Optional[str] = None
         #: The machine history, rebuilt from the logs every few seconds (D69).
@@ -1683,6 +1711,9 @@ class Fleet:
             "passed": len(ranked),
             "rejected": len(rejected),
             "rejected_by_reason": dict(sorted(by_reason.items(), key=lambda kv: -kv[1])),
+            # Filters the provider applied before answering (D123): an offer failing one is never
+            # returned, so it is not counted among the rejections — said here instead.
+            "filtered_by_provider": self.last_query_filters if search else [],
             # None when the market really was asked. Set when it could not be, so nobody
             # reads "0 offers seen" as "there is nothing out there" (D44).
             "problem": problem,
@@ -1801,10 +1832,10 @@ class Fleet:
         host.when_ready = when_ready
         return host
 
-    def avoid(self, machine_id: str, why: str) -> None:
+    def avoid(self, machine_id: str, why: str, minutes: Optional[float] = None) -> None:
         """Do not bid on this machine again for a while. Without this the best-ranked offer —
         the machine that just failed — is simply rented again (seen live: four times running)."""
-        minutes = self.rented.teardown.avoid_failed_machine_minutes
+        minutes = self.rented.teardown.avoid_failed_machine_minutes if minutes is None else minutes
         if minutes <= 0:
             return
         self.avoided[machine_id] = (time.time() + minutes * 60, why)
@@ -2950,6 +2981,22 @@ class Fleet:
         total = self.config.limits.max_hourly_burn
         return bound if total is None else min(bound, total)
 
+    def _refuse_for_workload_budget(self, offer: Offer, bid: float, lease: Lease, workload: Optional[str]) -> Optional[str]:
+        """A workload's host it cannot pay for to the end of its hours (D124): what the
+        workload's hosts already burn, with this one at its price, over the hours the lease has
+        left, beyond what the budget has left. Seen live: a $5, 1.75-hour workload fell back to a
+        $7.17/h on-demand host, which would have spent the budget in forty minutes."""
+        hourly = (bid + offer.storage_hourly) if offer.interruptible else offer.all_in_hourly
+        burning = sum(h.bid_hourly for h in self.hosts_of(workload) if h.state != "draining")
+        hours = lease.hours_left()
+        # The dollars left, not the margin-reduced figure the cap is enforced on: the margin
+        # stops a lease early, it says nothing about whether a host fits the budget.
+        left = lease.max_spend - self.lease_spend(lease)[0]
+        if (burning + hourly) * hours > left:
+            return (f"{offer.machine_id} at ${hourly:.3f}/h: with its hosts' ${burning:.3f}/h, "
+                    f"${(burning + hourly) * hours:.2f} over the {hours:.2f}h left, more than the ${left:.2f} its budget has left")
+        return None
+
     def _refuse_bid_for_burn(self, bid: float) -> Optional[str]:
         """The cap applies to the burn this bid *would* create, not only to today's. With no
         overall cap set there is nothing to refuse here: the bid is already clamped to the
@@ -3050,9 +3097,13 @@ class Fleet:
             # A market that refuses everything refuses it again ten seconds later, and a
             # decision log filling with the same line is one an operator stops reading. Said
             # when it changes — a different count, or a different set of reasons (D82).
-            fingerprint = (len(offers), repr(sorted({r for rs in rejected.values() for r in rs})))
+            # What the provider was asked to filter is part of what was said: a policy changed
+            # to one the provider answers with nothing is news, though nothing came back twice.
+            fingerprint = (len(offers), repr(sorted({r for rs in rejected.values() for r in rs})),
+                           tuple(self.last_query_filters))
             if fingerprint != self._said_nothing_passed:
                 self._said_nothing_passed = fingerprint
+                asked = f" (asked of the provider: {'; '.join(self.last_query_filters)})" if self.last_query_filters else ""
                 self.events.record(
                     "no_offer",
                     f"{len(offers)} offers seen, none passed the policy; staying paused rather "
@@ -3061,9 +3112,9 @@ class Fleet:
                     else (
                         f"the market could not be asked: {self.last_offer_error}"
                         if self.last_offer_error
-                        else "the market returned no offers at all"
+                        else f"no offer matches the search{asked}"
                     ),
-                    numbers={"seen": len(offers), "rejected": rejected},
+                    numbers={"seen": len(offers), "rejected": rejected, "asked_of_provider": self.last_query_filters},
                     lease_id=lease.lease_id,
                 )
             return None
@@ -3119,6 +3170,13 @@ class Fleet:
                     "rent_refused", refusal, numbers={"bid": capped}, lease_id=lease.lease_id
                 )
                 continue
+            if spec is not None:
+                unaffordable = self._refuse_for_workload_budget(offer, capped, lease, workload)
+                if unaffordable is not None:
+                    self.last_refusal = unaffordable
+                    self.events.record("rent_refused", unaffordable,
+                                       numbers={"offer": offer.offer_id, "workload": workload}, lease_id=lease.lease_id)
+                    continue
 
             image, image_why = self.image_for(offer)
             if image is None:
@@ -3171,6 +3229,13 @@ class Fleet:
                 # paying for three hosts (D43) — so this is checked here, in the pool, and not
                 # left to a plug-in's own discipline. Unprovable means stop, not carry on.
                 if not await self._left_nothing_behind(instance_spec.label, lease):
+                    return None
+                if isinstance(exc, BidLost):
+                    # Lost: someone holds the machine above the listed least bid, and the same bid
+                    # loses again. Avoided for a while, and this round stops here — firing the next
+                    # create at once, and the next, tripped the provider's request limits (D124).
+                    self.avoid(offer.machine_id, f"a bid of ${capped:.3f} on it lost",
+                               minutes=self.rented.teardown.avoid_lost_bid_minutes)
                     return None
                 continue
             except ProviderError as exc:
@@ -3705,6 +3770,28 @@ class Fleet:
     _KINDS = {"interruptible": (True, False), "on_demand": (False, True),
               "cheaper": (True, True), "both": (True, True)}
 
+    def query_for(self, policy: Optional[OfferPolicy], bids: bool, fixed: bool) -> OfferQuery:
+        """The provider's query for a search: the listings asked for, and — with a policy — every
+        filter of it that a provider can apply without hiding an offer the pool would take (D123)."""
+        broad = policy or self.rented.policy_in_force
+        if policy is None:
+            return OfferQuery(verified_only=broad.verified_only, min_gpus=broad.gpus_multiple_of,
+                              interruptible=bids, on_demand=fixed)
+        return OfferQuery(
+            verified_only=policy.verified_only,
+            min_gpus=policy.gpus_multiple_of,
+            min_gpu_memory_gb=policy.min_gpu_memory_gb,
+            min_disk_gb=policy.min_disk_gb,
+            max_all_in_hourly=policy.max_all_in_hourly,
+            min_download_mbps=policy.min_download_mbps,
+            max_download_per_gb=policy.max_download_per_gb,
+            min_reliability=policy.min_reliability,
+            exclude_hardware=tuple(policy.exclude_hardware),
+            avoid_machines=tuple(policy.avoid_machines),
+            interruptible=bids,
+            on_demand=fixed,
+        )
+
     # --- the provider's daily search quota (D121) ---
 
     async def _counted(self, search: Any) -> Any:
@@ -3767,12 +3854,14 @@ class Fleet:
         }
 
     async def _offers(self, policy: Optional[OfferPolicy] = None, kinds: Optional[str] = None) -> list[Offer]:
-        """Ask the market broadly and filter here.
+        """Ask the market, then filter here.
 
-        Pushing the policy into the provider's query would make the market look empty
-        whenever a filter bites, and the operator could never see *which* filter — but
-        "4 pass, 76 rejected, and here is why" is the whole point of the offer policy.
-        """
+        With a `policy`, the filters it implies are also asked of the provider (D123): every
+        offer a search returns counts against the provider's daily quota, so what the pool would
+        only throw away is better never returned. The pool still applies every filter itself,
+        and what it says was rejected, and why, is what came back. Without a policy — finding the
+        very machine a host is on, to re-bid or restart it — the market is asked broadly, as a
+        machine already held need not pass today's search."""
         now = time.monotonic()
         if now < self._offer_retry_at:
             # The reason is the provider's, said once; only the remaining wait moves. Nesting
@@ -3786,14 +3875,9 @@ class Fleet:
             # The pool's mode decides what it rents *by itself*. One request — a preview, or an
             # operator preparing a particular host — may name its own (D55).
             bids, fixed = self._KINDS[kinds or self.rented.mode]
-            offers = await self._counted(self.provider.search_offers(
-                OfferQuery(
-                    verified_only=(policy or self.rented.policy_in_force).verified_only,
-                    min_gpus=(policy or self.rented.policy_in_force).gpus_multiple_of,
-                    interruptible=bids,
-                    on_demand=fixed,
-                )
-            ))
+            query = self.query_for(policy, bids, fixed)
+            self.last_query_filters = describe_query(query)
+            offers = await self._counted(self.provider.search_offers(query))
         except ProviderRateLimited as exc:
             # Asking again on the next pass is what earned the refusal: wait a minute instead, and
             # again after every refusal (D44, D119 — a flat minute, the owner's choice: no longer

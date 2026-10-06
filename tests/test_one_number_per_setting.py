@@ -94,7 +94,7 @@ async def test_a_machine_with_less_disk_than_the_pool_rents_with_is_never_bid_on
     await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
     assert created(fleet) == []
     preview = await fleet.market_preview(hours=1)
-    assert preview["passed"] == 0 and "disk" in preview["rejected_by_reason"]
+    assert preview["passed"] == 0 and "disk ≥ 150 GB" in preview["filtered_by_provider"]
 
 
 # --- price ---
@@ -168,7 +168,8 @@ async def test_a_card_too_small_for_the_models_is_not_bid_on_and_says_why(make_f
     assert created(fleet) == [], "a 48 GB card cannot hold 36.7 GB of weights with room to batch"
     preview = await fleet.market_preview(hours=1)
     assert preview["model_set_gb"] == pytest.approx(36.7)
-    assert preview["passed"] == 0 and "gpu memory" in preview["rejected_by_reason"]
+    assert preview["passed"] == 0
+    assert any(f.startswith("card memory ≥") for f in preview["filtered_by_provider"]), "raised to what the models need"
 
 
 # --- the old second numbers are refused by name ---

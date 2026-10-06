@@ -287,6 +287,18 @@ class OfferQuery:
     #: listed price, or both and let ranking choose.
     interruptible: bool = True
     on_demand: bool = False
+    #: More of the search, for a provider to apply where it can (D123): each is a condition the
+    #: pool's own filters would also impose, so a provider that applies it returns fewer rows
+    #: and never hides an offer the pool would take; one that ignores it loses nothing, as the
+    #: pool filters every offer again. A provider that bills searches by the row (Vast: a daily
+    #: quota of offers returned) should apply all it can.
+    min_download_mbps: float = 0.0
+    max_download_per_gb: Optional[float] = None
+    min_reliability: float = 0.0
+    #: Hardware names to leave out — only exact names, so never stricter than the pool's own
+    #: substring match — and machines the operator listed to avoid.
+    exclude_hardware: tuple[str, ...] = ()
+    avoid_machines: tuple[str, ...] = ()
 
 
 @runtime_checkable

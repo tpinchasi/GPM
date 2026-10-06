@@ -577,7 +577,13 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                         # on disk by definition, and the rest is not probed separately.
                         "residency": "pinned",
                         "served": served_on(
-                            _pinned(rented_variants, host.builds),
+                            # A host bought for its own models (a workload's group, a profile)
+                            # serves those, whether or not the shared set names them.
+                            _pinned(
+                                variants_for_host(list(host.builds), supervisor.config.catalog,
+                                                  frozenset(fleet.rented.capabilities), supervisor.config.rented_engine())
+                                if host.builds else rented_variants,
+                                host.builds),
                             getattr(host, "resident", frozenset()),
                             getattr(host, "resident", frozenset()),
                         ),
@@ -1820,7 +1826,11 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 tunnel=supervisor.tunnel_status(host_id),
             )
         else:
-            required = set(supervisor._rented_required_tags())
+            # What *this* host was bought for — its workload's group, its profile, or the rented
+            # set — exactly as the supervisor prepares it (service: `fleet.tags_for`). Read from
+            # the shared set, a workload's host serving gemma4:26b and e4b was shown as still to
+            # download the shared pool's gemma4:31b (found live, 2026-10-06).
+            required = set(supervisor.fleet.tags_for(rented))
             client = supervisor._rented_clients.get(host_id)
             detail.update(
                 kind="rented-interruptible" if rented.interruptible else "rented-on-demand",

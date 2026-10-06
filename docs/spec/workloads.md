@@ -274,6 +274,8 @@ with WorkloadProvisioner(url, os.environ["GPM_PROVISIONING_KEY"]) as pool:
   workload, dollars committed in any 24 hours (the budgets of the workloads it made in that time or
   still has open, not what has been recorded), hours, models, kinds of machine, whether it may borrow, its idle cutoff's maximum,
   an expiry — and by `provisioning.max_spend_per_day` across every key. A budget is always typed.
+- **A host the budget cannot carry is never rented** (D124): what the workload's hosts burn, with the new
+  one at its price, over the hours its lease has left, must fit the dollars it has left.
 - **Hours** stay within what the provider's dead-man timer covers (`max_hours_without_deadman`
   where it has none): a grant, a plan and an extension past it are refused, as for any lease.
 - **Idle-end**: a program's workload that is serving and has had no request for its cutoff — 15

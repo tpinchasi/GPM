@@ -500,7 +500,8 @@ def test_the_market_preview_can_use_the_forms_unsaved_values(console):
 
     assert saved["passed"] == 1
     assert tightened["passed"] == 0  # moving a ceiling and watching "1 pass" become "0 pass"
-    assert "gpu memory" in " ".join(tightened["rejected_by_reason"])
+    # Asked of the provider (D123), so said as what was asked rather than counted as rejected.
+    assert "card memory ≥ 999 GB" in tightened["filtered_by_provider"]
 
 
 def test_an_unsaved_policy_that_makes_no_sense_is_a_400_not_something_the_pool_acts_on(console):

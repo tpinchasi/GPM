@@ -235,7 +235,15 @@ class Workloads:
         kinds = {"on_demand": "on_demand", "interruptible": "interruptible"}.get(req.kind, "both")
         # One search for every placement: the market is asked broadly and filtered here, so each
         # group re-prices and ranks the same offers for its own disk and card (the review's finding 7).
-        offers = await fleet._offers(fleet.policy_for(models, builds, cards_per_copy=cards), kinds)
+        # The loosest needs of any group it may price: the provider is asked to filter (D123), and
+        # a search sized for every model on one card would hide the cards that hold one model.
+        candidates = [models] + ([(m,) for m in models] if len(models) > 1 else [])
+        needs = [fleet.policy_for(g, {m: builds[m] for m in g}, cards_per_copy=cards) for g in candidates]
+        search = needs[0].model_copy(update={
+            "min_gpu_memory_gb": min(p.min_gpu_memory_gb for p in needs),
+            "min_disk_gb": min(p.min_disk_gb for p in needs),
+        })
+        offers = await fleet._offers(search, kinds)
         plan: dict[str, Any] = {
             "name": req.name, "model": targets[0].model, "build": builds[targets[0].model], "cards_per_copy": cards,
             "latency_s": targets[0].latency_s, "parallel": req.total_parallel, "hours": req.hours, "kind": req.kind,
