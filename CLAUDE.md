@@ -65,5 +65,27 @@ the source.
 - Use plain, descriptive names; no internal jargon or staging tags.
 - The owner usually prefers the simpler mechanism when one exists — offer it first, and state
   plainly what it gives up.
-- Before the repository is made public, the adopter-internal files listed in STATUS.md must be
-  dealt with. Do not make anything public, and do not push, without being asked.
+- **The repository is public** (since 2026-10-06): every push, branch, pull request and tag is
+  published. The adopter-internal files listed in STATUS.md are still an open owner decision. Do
+  not push without being asked.
+
+## No secret reaches the repository
+
+A key committed is a key published, and deleting it in a later commit does not unpublish it:
+history, branches and pull-request refs stay public.
+
+- **Credentials live only in gitignored files**: `env` at the root, `pool.yaml`, `~/.config/gpm/`.
+  Never paste a key, token, password, private key or provider credential into code, tests, docs,
+  examples, commit messages, pull-request text, issues or logs that are committed. Read keys from
+  the environment; when one must be used in a command, load it from `env` and never print it.
+- **Tests and examples use keys that are obviously not real** and shorter than any real one
+  (`gpmx_multi_admin`, `APP_KEY` from the harness), never a value copied from a running pool.
+- **Every commit is scanned**: the tracked hook in `.githooks/pre-commit` runs gitleaks on what
+  is staged and refuses the commit on a finding (enable once per clone:
+  `git config core.hooksPath .githooks`). Never commit with `--no-verify`. CI scans every pull
+  request again, and GitHub's secret scanning with push protection is on for the repository.
+- **Before every push**, scan what is being pushed: `gitleaks git --log-opts="origin/main..HEAD" --redact`.
+- **A new kind of local file that holds a credential is added to `.gitignore` before it is
+  created**, and checked with `git check-ignore`.
+- **If a secret ever reaches GitHub, revoke and replace it first**, then tell the owner; removing
+  it from history comes after, never instead.

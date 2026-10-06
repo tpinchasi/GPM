@@ -11,6 +11,18 @@ uv sync                  # one workspace, two packages
 uv run pytest            # the whole default suite: no GPU, no cloud account, ~60s
 ```
 
+Then turn on the secret check, once per clone. It refuses any commit that carries a key, token or
+private key: a credential committed to a public repository is published, and a later commit
+does not take it back.
+
+```sh
+brew install gitleaks            # or see https://github.com/gitleaks/gitleaks
+git config core.hooksPath .githooks
+```
+
+Credentials belong in the environment or in gitignored files (`env`, `pool.yaml`), never in
+code, tests or docs; tests use keys that are obviously not real.
+
 Two optional suites need something extra, and neither runs by default:
 
 ```sh
