@@ -257,6 +257,9 @@ class Unit:
     #: The ramp: how many hosts the last round asked for, and when it landed (D66).
     ramp_round: int = 0
     ramp_landed_at: float = 0.0
+    #: A workload whose budget could not carry any offer: the hosts and lease it was found with.
+    #: No search is made for it again until one of them changes (D126).
+    budget_bound: Optional[tuple] = None
 
 
 #: How long the market is not asked again after the provider says it is asked too often (D119).
@@ -358,6 +361,9 @@ class Fleet:
         self.last_query_filters: list[str] = []
         #: Why the last attempt to rent rented nothing — for whoever asked, in their words.
         self.last_refusal: Optional[str] = None
+        #: The last attempt rented nothing because the workload's budget carried none of its
+        #: offers, and nothing else was tried (D126).
+        self.last_budget_bound = False
         #: The machine history, rebuilt from the logs every few seconds (D69).
         self._history: Optional[dict] = None
         self._history_at = 0.0
@@ -2831,6 +2837,11 @@ class Fleet:
         if woken is not None:
             return
 
+        if unit.budget_bound is not None:
+            if unit.budget_bound == self._budget_situation(lease, unit.workload):
+                return  # its budget carried no offer, and nothing has changed since (D126)
+            unit.budget_bound = None
+
         if below_floor and unit.workload is not None:
             # A workload below the hosts it starts with: exactly the gap, each host re-checked on
             # its own, whatever the ramp would say — the ramp is for load above the floor (D115).
@@ -2888,6 +2899,19 @@ class Fleet:
                 break
             host = await self.rent_one(lease, list(reasons), workload=unit.workload, group=unit.group)
             if host is None:
+                if self.last_budget_bound and unit.workload is not None:
+                    # Searching again finds the same offers beyond the same budget, and every
+                    # search spends the provider's daily quota: seen live, ten a minute for a
+                    # host no offer could be afforded for (D126).
+                    unit.budget_bound = self._budget_situation(lease, unit.workload)
+                    live = len([h for h in self.hosts_of(unit.workload, unit.group) if h.state != "draining"])
+                    self.events.record(
+                        "workload_budget_bound",
+                        f"workload {unit.workload}: its budget carries no further host; it runs on the "
+                        f"{live} it has, and looks again when a host leaves or its lease is extended",
+                        numbers={"workload": unit.workload, "hosts": live, "last_refusal": self.last_refusal},
+                        lease_id=lease.lease_id,
+                    )
                 break  # a round that loses its bids does not grow the next one
             rented_now += 1
 
@@ -2911,6 +2935,12 @@ class Fleet:
             if ramp:
                 unit.ramp_round = asked
             unit.ramp_landed_at = 0.0
+
+    def _budget_situation(self, lease: Lease, workload: Optional[str]) -> tuple:
+        """What a workload's budget for another host depends on, but for the market: its hosts
+        and its lease's dollars and hours (D126)."""
+        hosts = tuple(sorted(h.host_id for h in self.hosts_of(workload) if h.state != "draining"))
+        return (hosts, lease.max_spend, lease.max_hours)
 
     def _refuse_for_caps_quietly(self, lease: Lease) -> Optional[str]:
         """The dollar check alone: a parked host is already counted among the pool's hosts."""
@@ -3040,6 +3070,7 @@ class Fleet:
         not for a host (D55).
         """
         self.last_refusal = None
+        self.last_budget_bound = False
         spec = self.workloads.get(workload) if workload is not None else None
         chosen_group = self.group_spec(workload, group) if spec is not None else None
         if spec is not None and chosen_group is None:
@@ -3157,6 +3188,7 @@ class Fleet:
             ranked = sorted(ranked, key=lambda pair: 0 if pair[0].machine_id in warm else 1)
             reasons = [*reasons, f"a machine holding its models is offered again: {ranked[0][0].machine_id}"]
 
+        unaffordable_offers, created = 0, False
         for offer, offer_score in ranked[: self.rented.bidding.attempts]:
             bid = price_bid(offer, self.rented.bidding, self.rented.policy_in_force, lease.max_all_in_hourly)
             capped = self._cap_bid(bid.hourly, lease, offer)
@@ -3173,6 +3205,7 @@ class Fleet:
             if spec is not None:
                 unaffordable = self._refuse_for_workload_budget(offer, capped, lease, workload)
                 if unaffordable is not None:
+                    unaffordable_offers += 1
                     self.last_refusal = unaffordable
                     self.events.record("rent_refused", unaffordable,
                                        numbers={"offer": offer.offer_id, "workload": workload}, lease_id=lease.lease_id)
@@ -3188,6 +3221,7 @@ class Fleet:
                 )
                 continue
 
+            created = True
             host_id = f"rented-{uuid.uuid4().hex[:6]}"
             workers, workers_why = self.workers_for(offer, workload, tuple(for_this_host) if spec is not None else None)
             launch_workers = self.launch_workers_for(workers, workload)
@@ -3293,6 +3327,7 @@ class Fleet:
                 lease_id=lease.lease_id,
             )
             return host
+        self.last_budget_bound = unaffordable_offers > 0 and not created
         return None
 
     # --- a new host's models without the hub (D116) ---

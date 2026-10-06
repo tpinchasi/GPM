@@ -211,6 +211,8 @@ model set. **Parked hosts are tried first** (§8).
    reason, and what the provider was asked is said beside the result — a market that merely
    *looks* empty teaches an operator nothing. A search for a machine already held asks broadly.
    A bid that loses puts its machine aside for `avoid_lost_bid_minutes` and ends the round (D124).
+   A workload whose budget carries none of a round's offers is not searched for again until its
+   hosts or its lease change (D126).
    A search that fails is said as such, never as an empty market (D44); one the provider refuses
    as too frequent is not asked again for a minute — after every refusal, a minute (D119).
 2. **Rank** by throughput proxy per run-dollar, **moved by what the machine has done for this
