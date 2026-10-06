@@ -421,3 +421,26 @@ def test_a_workload_never_rents_a_host_its_budget_cannot_carry(pool):
     assert fleet.hosts_of("research") == [], "a host the budget cannot carry is never rented"
     refused = [e for e in pool.supervisor.events.recent(100) if e["kind"] == "rent_refused"]
     assert any("more than the $" in e["summary"] and "budget has left" in e["summary"] for e in refused)
+
+
+def test_a_workload_its_budget_cannot_grow_stops_searching_until_something_changes(pool):
+    """D126. Found live: a workload two hosts short of nothing, its budget carrying no third,
+    searched ten times a minute — every search spending the provider's daily quota."""
+    from gpm_server.providers import default_offer
+
+    fleet = pool.supervisor.fleet
+    pool.supervisor.config.rented.offer_policy.max_all_in_hourly = 10.0
+    create(pool, {**request(placement="apart"), "max_spend": 5.0})
+    fleet.provider.offers = [default_offer("dear", "m-dear", min_bid_hourly=7.00, on_demand_hourly=7.20,
+                                           all_in_hourly=7.20, interruptible=False)]
+    pool.reprobe()
+    assert any(e["kind"] == "workload_budget_bound" for e in pool.supervisor.events.recent(100))
+    searched = fleet.provider.calls.count("search_offers")
+    for _ in range(3):
+        pool.reprobe()
+    assert fleet.provider.calls.count("search_offers") == searched, "nothing changed: no search"
+    # More dollars: the budget may carry a host now, so the market is asked again.
+    pool.supervisor.workloads.extend("research", max_spend=50.0, confirm=True)
+    pool.reprobe()
+    assert fleet.provider.calls.count("search_offers") > searched
+    assert len(fleet.hosts_of("research")) >= 1
