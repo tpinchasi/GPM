@@ -472,8 +472,11 @@ engine is vLLM; it matters the first time an Ollama host with more than one card
 
 ## Before anything here becomes public
 
-The repository is **private**, so everything can be committed now. Before it is made public,
-decide what happens to three adopter-internal items — they describe another private codebase's
+**The repository was made public on 2026-10-06, before this was decided.** A scan that day
+(gitleaks over every commit, branch and pull-request ref, and a search of the history for each
+real credential's value) found **no credential anywhere**. The three adopter-internal items below
+are public, in the tree and in history; what to do about them is still the owner's decision —
+removing them from history means rewriting it and force-pushing. They are three adopter-internal items — they describe another private codebase's
 files, measurements, prices and plans (they contain **no credentials**; scanned 2026-09-17):
 
 | Path | Contains | Suggested |
@@ -512,6 +515,7 @@ In `~/workspace/Aletheia`: backlog entries `GPU-POOL-01` and `GPU-CLOUD-01` in
 
 | Date | What happened |
 |---|---|
+| 2026-10-06 | **The repository went public; no credential is in it, and a rule keeps it so.** gitleaks over the whole history (every branch and pull-request ref) found nothing, and none of the seven real credentials in `env`, `pool.yaml` or `~/.config/gpm` appears in any commit. Added: a CLAUDE.md section, “No secret reaches the repository”; a tracked pre-commit hook (`.githooks/pre-commit`, gitleaks on what is staged, refusing when gitleaks is missing); a scan before every push; and GitHub secret scanning with push protection, turned on. Open for the owner: the three adopter-internal items are public (see “Before anything here becomes public”). Also shipped 0.28.3 (D127, D128) and the client README's section on creating a workload from code. |
 | 2026-10-06 | **Why the workload got two on-demand hosts, and why each ran 20.** The provider lists a machine's bid and its fixed price under one offer id; looked up by id alone, the pool rented the fixed price ($1.49/h) where the rule chose the bid ($0.56/h) — fixed (D127). And a group short of its planned hosts now runs more of each card, 12 + 12 on two hosts where the plan was 10 + 10 on three (D128). The client README has a section on creating a workload from code. gpm-server 0.28.3. |
 | 2026-10-06 | **A workload its budget could not grow searched ten times a minute.** Planned on three hosts, it got two on demand at $2.78/h; D124 refused every third, and the pool searched again on every pass — about 460 offer rows a minute, the day's quota gone in twenty minutes. It now stops searching until a host leaves or its lease is raised (D126). gpm-server 0.28.2. |
 | 2026-10-06 | **A program's next workload was refused by the daily cap after spending $0.22.** The pool's `provisioning.max_spend_per_day` ($10) counted each program workload's whole $5 budget for 24 hours, even after it ended — one had lasted eight seconds. An ended workload now counts what it spent; one still open counts its budget (D125). gpm-server 0.28.1. |
