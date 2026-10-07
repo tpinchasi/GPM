@@ -20,9 +20,19 @@ from typing import Any, Callable, Optional, Sequence
 STARTED_FILE = ".gpm-vllm.started.json"
 
 
+def state_dir_for(models_dir: str | Path) -> Path:
+    """Where the launcher keeps what it started — process ids, its record, logs, the router's
+    map: beside the models directory, never in it (D139). What arrives in the models directory
+    from elsewhere — a provider's copy from a sibling, a volume another machine wrote — must not
+    bring that machine's process ids with it: the next start would signal those numbers here, and
+    read every model as failed because they are not running."""
+    models_dir = Path(models_dir).expanduser().resolve()
+    return models_dir.parent / f"{models_dir.name or 'models'}.gpm-state"
+
+
 def read_record(models_dir: Path) -> Optional[dict[str, Any]]:
     try:
-        return json.loads((models_dir / STARTED_FILE).read_text())
+        return json.loads((state_dir_for(models_dir) / STARTED_FILE).read_text())
     except (OSError, ValueError):
         return None
 

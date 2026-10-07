@@ -332,7 +332,7 @@ def test_a_two_card_machine_runs_twice_the_work_with_a_copy_on_each_card(monkeyp
             ((_, _, _, proxy),) = machines.launches
             assert proxy is False, "the pool placed one model; the router came with the copies"
             disk = machines.disks["agent-market-1"]
-            upstreams = (disk / vllm_launch.UPSTREAMS_FILE).read_text()
+            upstreams = (vllm_launch.state_dir_for(disk) / vllm_launch.UPSTREAMS_FILE).read_text()
             assert "8001" in upstreams and "8002" in upstreams
 
             with pool.client() as client:
@@ -461,7 +461,7 @@ def test_every_model_on_one_host_starts_an_engine_each_behind_the_router(monkeyp
             assert proxy is True
             assert on_disk == sorted(["nvidia__Gemma-4-26B-A4B-NVFP4", "nomic-ai__nomic-embed-text-v1.5"])
             assert sorted(started) == sorted([BIG_REPO, EMBED_REPO])
-            assert (machines.disks[name] / vllm_launch.UPSTREAMS_FILE).exists(), "the router's map"
+            assert (vllm_launch.state_dir_for(machines.disks[name]) / vllm_launch.UPSTREAMS_FILE).exists(), "the router's map"
 
             with pool.client() as client:
                 for model in (BIG, EMBED):

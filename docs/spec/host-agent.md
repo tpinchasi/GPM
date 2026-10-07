@@ -79,7 +79,8 @@ whole preparation in, and folding them into one number would hide it (D97):
 - With the router, each model is given **its weights plus a cache reserve** of the card the driver
   reports, the rest spread by weight; a set that needs more than nine tenths of the card is
   **refused before anything starts**, and the refusal is reported for every model (D104). What
-  was started is recorded in `.gpm-vllm.started.json`; a process that has exited without ever
+  was started is recorded beside the models directory, never in it (`<models>.gpm-state/`, with the
+  process ids, logs and the router's map — D139); a process that has exited without ever
   serving its model is reported as that model's error, with the last error line of its log, and
   the pool gives the host up saying so — never as "still preparing".
 - It takes **named options** (`--option tool_calling`, `--option reasoning`, D100) from a closed
