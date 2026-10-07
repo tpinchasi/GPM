@@ -102,6 +102,26 @@ whole preparation in, and folding them into one number would hide it (D97):
   make whole groups of N (or none listed), and a model whose attention heads — `num_attention_heads`
   in its `config.json`, or under `text_config` — do not divide by N. A dead copy names its cards.
 
+**A model volume** (D139), on a host the pool created with one, is mounted at one of two paths
+that are the agent's own constants — one to *read*, one to *fill* — never named by the pool. The
+engine never runs from it:
+
+- **Reading.** Before the hub, the fetch copies the build's files from the volume to the models
+  directory, **by the hub's own file list** — never by listing the volume, so nothing else comes
+  across, and no link is followed — in parallel, **each checked against the hash the hub publishes**
+  (Hugging Face: sha256 for large files, the git blob sha1 for small ones). A file missing,
+  mismatched or with no published hash comes from the hub. Hashing runs off the event loop. For
+  Ollama, blobs are copied into the engine's store only when they hash to the digest they are
+  named by, and the engine's own pull then fetches the manifest and whatever is missing.
+- **Filling.** After its own fetch, the host copies its verified files up into a fresh directory on
+  the volume (created exclusively, no link followed), renames it into place, and writes a marker
+  last naming the hub revision and each file's hash. A filler that stops leaves a directory no one
+  reads.
+- **The engine's own state** — process ids, start record, logs — is never kept in the models
+  directory, so nothing of one host's engine reaches another through a volume.
+- What it did, and how long it took, is in the agent's facts: files from the volume, files from the
+  hub, files that did not match.
+
 Three rules the hub fetch keeps:
 
 - **The pool names a repository, never a path.** The agent decides what that means and where it

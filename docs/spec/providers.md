@@ -18,7 +18,7 @@ every enabled provider's offers together, and the pool chooses among them by one
 rented:
   providers:
     vast:   { type: vast,   enabled: true,  settings: {} }
-    runpod: { type: runpod, enabled: false, settings: {} }
+    runpod: { type: runpod, enabled: false, keep_models: true, settings: {} }
 ```
 
 - **A connection** — a *provider account*, in the console — has a name (the key), a `type` (an
@@ -42,6 +42,12 @@ rented:
   never searched — until it holds nothing. **A running connection is never rebuilt**: a change to
   its settings or credential source, or a rename, waits for the supervisor's restart, and its card
   says so.
+- **Keep models between hosts** (`keep_models`, D139; off unless set) — each workload renting on
+  this account gets a model volume in its first host's data center, which its later hosts copy
+  their models from (workloads.md §6). Offered only where the plug-in declares volumes that reach a
+  data center; set on any other connection it is refused with the reason. Turning it on or off
+  takes effect at once for hosts not yet created: turned off, no volume is made, and each one
+  already made is deleted once no host has it attached — the plan says which.
 - **Limits are the pool's** (D129). Leases, the most rented hosts and the hourly burn cap hold
   across every connection together. A connection has no limits of its own in this version.
 
@@ -229,6 +235,11 @@ first (*needs a credential*, *credential refused*, *cannot be reached*, *off*, *
 used up*, *searches failing*, *searching*):
 - its type, and what it can do: on demand; interruptible, by bid or spot price; park; dead-man
   timer; interruption notice; reports charges;
+- a **Keep models between hosts** checkbox (D139), with its cost per GB-month and how many model
+  volumes it holds now. Where the provider cannot do it the box is greyed, and its tooltip says
+  why in the provider's terms — for Vast: *“Vast keeps a volume on one machine only. It would help
+  only when that same machine is free again, which is rare, and it is billed the whole time.”*;
+  for a provider with no volumes: *“This provider keeps no storage between hosts.”*;
 - its credential's state and the credit left;
 - the day's search use against its quota;
 - what is rented on it and burning;
