@@ -13,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import re
+import statistics
 from typing import Any, Optional, Sequence
 
 from .config import BiddingConfig, EngineImage, OfferPolicy, ScaleConfig, TeardownConfig
@@ -250,6 +251,100 @@ def decide_workers(reading: WorkerReading, cfg) -> WorkerDecision:
         reading.host_id, workers + 1,
         [f"every worker busy with {reading.waiting} waiting, and the last step up paid"],
     )
+
+
+# --- a host that is bad value (D75) ---
+
+
+@dataclasses.dataclass(frozen=True)
+class ValueReading:
+    """What one ready host costs for the work it does, over the last window (D75)."""
+
+    host_id: str
+    #: The model it served most: hosts are compared only with others serving the same one, since
+    #: a larger model is slower everywhere and that does not make its host bad value.
+    model: str
+    #: What it costs an hour, all-in.
+    hourly: float
+    #: Tokens a second while it was serving in the window, and how many answers that rests on.
+    throughput: Optional[float]
+    requests: int
+    #: Since when it has been found far worse than the others, while it still is; None if not.
+    bad_since: Optional[float] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class ValueVerdict:
+    host_id: str
+    #: Far worse than the others now.
+    worse: bool
+    #: Worse for long enough: to be given up.
+    replace: bool
+    #: Its cost per unit of work over the others' median, where both are known.
+    ratio: Optional[float]
+    reasons: tuple[str, ...]
+
+
+def busy_seconds(spans: Sequence[tuple[float, float]]) -> float:
+    """How long a host had at least one answer in hand, from each answer's (start, end).
+
+    Value is judged on the tokens a second a host serves *while serving*: over the whole window
+    it would read how much traffic the router happened to give it, so a host idle half the
+    window — or ready only for its last minutes — would look like bad value (D75)."""
+    total, reach = 0.0, None
+    for start, end in sorted(spans):
+        if reach is None or start > reach:
+            total += end - start
+            reach = end
+        elif end > reach:
+            total += end - reach
+            reach = end
+    return total
+
+
+def _per_million_tokens(hourly: float, throughput: float) -> float:
+    return hourly / (throughput * 3600) * 1e6
+
+
+def judge_value(readings: Sequence[ValueReading], cfg, now: float) -> list[ValueVerdict]:
+    """Which hosts cost far more per unit of work than the rest (D75).
+
+    Cost per unit of work is what a host costs an hour over the tokens a second it serves —
+    counted in work, not in slots, because a host with six slow workers is exactly the machine
+    this is for. Each is compared with the **median of the other hosts serving the same model**:
+    the pool's own yardstick, so a dear market has no bad host, only dear hosts; and without the
+    host itself in it, so two hosts are enough to tell one from the other. A host is judged only
+    on `replace_min_requests` answers or more, and given up only once it has stayed worse than
+    `replace_above_factor` times that median for `replace_after_s`.
+    """
+    def cost(r: ValueReading) -> Optional[float]:
+        if not r.throughput or r.throughput <= 0 or r.requests < cfg.replace_min_requests:
+            return None
+        return _per_million_tokens(r.hourly, r.throughput)
+
+    known = {r.host_id: cost(r) for r in readings}
+    verdicts = []
+    for r in readings:
+        mine = known[r.host_id]
+        others = [known[o.host_id] for o in readings
+                  if o.host_id != r.host_id and o.model == r.model and known[o.host_id] is not None]
+        if mine is None or not others:
+            verdicts.append(ValueVerdict(r.host_id, False, False, None, ()))
+            continue
+        median = statistics.median(others)
+        ratio = mine / median if median > 0 else None
+        worse = ratio is not None and ratio > cfg.replace_above_factor
+        if not worse:
+            verdicts.append(ValueVerdict(r.host_id, False, False, ratio, ()))
+            continue
+        said = (f"${mine:.2f} per million tokens of {r.model}, {ratio:.1f}x the ${median:.2f} the other "
+                f"{len(others)} host(s) serving it cost — over the {cfg.replace_above_factor:g}x the pool gives up at")
+        lasted = now - r.bad_since if r.bad_since is not None else 0.0
+        replace = r.bad_since is not None and lasted >= cfg.replace_after_s
+        verdicts.append(ValueVerdict(
+            r.host_id, True, replace, ratio,
+            (said + (f", for {lasted / 60:.0f} minutes" if replace else ""),)))
+    return verdicts
 
 
 # --- when to rent, and how many (spec §5) ---

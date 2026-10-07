@@ -108,6 +108,8 @@ class RentedHost:
     models_source: str = "hub"
     #: Whether what its agent said about its volume has been taken in (D139): once per host.
     volume_reported: bool = False
+    #: Since when it has been far worse value than the hosts serving the same model (D75).
+    bad_value_since: Optional[float] = None
     copy_state: Optional[str] = None
     copy_task: Optional[asyncio.Task] = dataclasses.field(default=None, repr=False, compare=False)
     copy_started_at: Optional[float] = None
@@ -353,6 +355,9 @@ def describe_query(query: OfferQuery) -> list[str]:
 #: How an assumed field is said (providers.md §6).
 _ASSUMED_WORDS = {"download_mbps": "download speed", "reliability": "reliability", "verified": "verified",
                   "download_per_gb": "download price"}
+
+#: What a drain for bad value says first, so the next one waits for it (D75).
+BAD_VALUE = "bad value"
 
 #: How long after a volume is made the pool waits before taking its absence from the provider's
 #: listing as its deletion (D139).
@@ -841,6 +846,50 @@ class Fleet:
                 # Not destroyed outright: a lease ending is not a reason to drop the requests
                 # already running on its host (D53).
                 await self.drain(host, reason)
+
+    # --- a host that is bad value (D75) ---
+
+    def may_replace(self, host: RentedHost) -> Optional[str]:
+        """Why this host may not be given up for bad value now, or None. The bounds D75 sets:
+        one at a time; never the last ready host of its demand; never without an open lease whose
+        budget covers what its replacement costs to get ready."""
+        if host.released or host.state != "ready":
+            return f"{host.host_id} is {host.state}"
+        if any(h.state == "draining" and (h.drain_reason or "").startswith(BAD_VALUE) for h in self.hosts.values()):
+            return "another host given up for bad value is still draining: one at a time"
+        group = self.group_of_host(host)
+        mine = [h for h in self.hosts_of(host.workload, group) if not h.released and h.host_id != host.host_id]
+        if any(h.state in ("preparing", "adopting") for h in mine):
+            return "a host of the same demand is still being prepared: one at a time"
+        if not any(h.state == "ready" for h in mine):
+            return "it is the only ready host serving its demand"
+        lease = self.leases.get(host.lease_id) if host.lease_id else None
+        if lease is None or not lease.is_open:
+            return "its lease is not open"
+        ready_h = workload_math.time_to_ready_hours(
+            self.model_set_gb(host.models, host.builds), host.offer.download_mbps or 100.0,
+            self.config.workloads.engine_load_s)
+        needed = host.download_cost + host.bid_hourly * ready_h
+        left = lease.max_spend - self.lease_spend(lease)[0]
+        if left < needed:
+            return f"its lease has ${left:.2f} left, less than the ${needed:.2f} a replacement costs to get ready"
+        return None
+
+    async def give_up_for_value(self, host: RentedHost, why: str, ratio: Optional[float]) -> None:
+        """Drain it, then destroy it; avoid its machine for the rest of its lease, so the next
+        round does not buy it straight back; the ordinary allocation rents the replacement — one
+        way capacity is acquired, not two (D75)."""
+        lease = self.leases.get(host.lease_id) if host.lease_id else None
+        hours = lease.hours_left() if lease is not None else 1.0
+        self.avoid(host.offer.machine_id, f"given up for bad value: {why}", minutes=max(60.0, hours * 60))
+        self.events.record(
+            "replaced_for_value",
+            f"{host.host_id} on {host.offer.machine_id} ({host.offer.hardware}) is given up: {why}; "
+            "the pool rents its replacement as it rents any host",
+            numbers={"machine": host.offer.machine_id, "hardware": host.offer.hardware,
+                     "ratio": round(ratio, 2) if ratio is not None else None, "hourly": host.bid_hourly},
+            host_id=host.host_id, lease_id=host.lease_id)
+        await self.drain(host, f"{BAD_VALUE}: {why}")
 
     async def drain(self, host: RentedHost, reason: str, then: str = "destroy") -> None:
         """Stop sending this host new work, let what it has finish, then end it.

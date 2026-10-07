@@ -494,6 +494,8 @@ class Supervisor:
             )
             if self.config.rented and self.config.rented.workers_auto.enabled:
                 await self._adjust_workers()
+                if self.config.rented.workers_auto.replace_bad_value:
+                    await self._replace_bad_value()
             self._publish_rented()
 
         self.lock.beat()
@@ -703,6 +705,60 @@ class Supervisor:
                 )
             else:
                 log.info("not resizing %s: %s", reading.host_id, why)
+
+    async def _replace_bad_value(self) -> None:
+        """Give up a host whose cost per unit of work stays far worse than the others' (D75).
+
+        Measured from the request log the router already writes — tokens served per host, per
+        model, over the time it had an answer in hand within `workers_auto.window_s`; judged by
+        a pure function; acted on within D75's bounds, one host a pass at most."""
+        from ..strategies import ValueReading, busy_seconds, judge_value
+
+        assert self.fleet is not None
+        cfg = self.config.rented.workers_auto
+        now = time.time()
+        rows = self.db.query(
+            "SELECT host_id, model_served, tokens_out, latency_ms, ts FROM request_log "
+            "WHERE outcome = 'ok' AND ts > ? AND latency_ms IS NOT NULL",
+            (now - cfg.window_s,),
+        )
+        readings = []
+        for host_id, host in self.fleet.hosts.items():
+            if host.released or host.state != "ready":
+                continue
+            if host.workload is not None and len(host.models) > 1:
+                continue  # a fixed split of several models (D118): slower by design, as in D67
+            # All-in: a bid is the card's price, its disk billed beside it.
+            hourly = host.bid_hourly + (host.offer.storage_hourly if host.offer.interruptible else 0.0)
+            mine = [r for r in rows if r["host_id"] == host_id]
+            if not mine:
+                readings.append(ValueReading(host_id, "", hourly, None, 0, host.bad_value_since))
+                continue
+            busiest = max({r["model_served"] for r in mine},
+                          key=lambda model: sum(1 for r in mine if r["model_served"] == model))
+            served = [r for r in mine if r["model_served"] == busiest]
+            tokens = sum(r["tokens_out"] or 0 for r in served)
+            busy = busy_seconds([(r["ts"] - r["latency_ms"] / 1000, r["ts"]) for r in served])
+            readings.append(ValueReading(host_id, busiest, hourly, tokens / busy if tokens and busy > 0 else None,
+                                         len(served), host.bad_value_since))
+        acted = False
+        for verdict in judge_value(readings, cfg, now):
+            host = self.fleet.hosts.get(verdict.host_id)
+            if host is None:
+                continue
+            if not verdict.worse:
+                host.bad_value_since = None
+                continue
+            if host.bad_value_since is None:
+                host.bad_value_since = now
+            if not verdict.replace or acted:
+                continue
+            refused = self.fleet.may_replace(host)
+            if refused is not None:
+                log.info("not giving %s up for bad value: %s", host.host_id, refused)
+                continue
+            await self.fleet.give_up_for_value(host, verdict.reasons[0], verdict.ratio)
+            acted = True
 
     def _own_busy(self, counter: Any) -> int:
         """A host's busy workers that are its own demand's: lent ones are the borrower's (D115)."""

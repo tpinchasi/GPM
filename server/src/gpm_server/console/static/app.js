@@ -1485,6 +1485,10 @@ const ALLOCATION_FIELDS = [
   ["workers_auto", "max", "range", "the most any host's engine is launched to run at once", 1, 64, 1],
   ["workers_auto", "min_gain", "range", "a step up must raise throughput by this much to count", 0, 1, 0.01],
   ["workers_auto", "slow_host_factor", "range", "service time this far over the pool's median steps a host down", 1, 5, 0.1],
+  ["workers_auto", "replace_bad_value", "checkbox", "give up a host far worse value than the others serving its model, and rent another"],
+  ["workers_auto", "replace_above_factor", "range", "worse value means costing this many times the others' median per token", 1.5, 10, 0.5],
+  ["workers_auto", "replace_after_s", "range", "and staying that bad this long, in seconds", 60, 3600, 60],
+  ["workers_auto", "replace_min_requests", "range", "judged only on at least this many answers", 5, 200, 5],
 ];
 
 // When a host is given up, and how hard the pool tries first (D86). Sliders, because every
