@@ -713,7 +713,7 @@ def test_how_it_presents_itself():
     assert shown["endpoint_settings"] == ["base_url", "graphql_url"]
     assert shown["offered"] is True and shown["takes_credential"] is True
     caps = shown["capabilities"]
-    assert caps["interruptible"] is False and caps["parkable"] is True and caps["self_terminate"] is False
+    assert caps["interruptible"] is False and caps["parkable"] is True and caps["self_terminate"] is True
     assert caps["reports_charges"] and caps["direct_port_mapping"] and caps["reports_instance_logs"]
 
 

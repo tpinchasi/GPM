@@ -130,10 +130,10 @@ class RunPodProvider:
         #: same machine — and fails if its GPU has been taken meanwhile.
         parkable=True,
         same_machine_rebid=False,
-        #: Unverified: a pod carries a pod-scoped key (`RUNPOD_API_KEY`), but whether it may delete
-        #: its own pod through v2 is not documented. Until it is checked, no dead-man timer is
-        #: claimed, and leases on this provider are held to the short maximum.
-        self_terminate=False,
+        #: Checked live (2026-10-07): the pod-scoped key RunPod puts in every pod (`RUNPOD_API_KEY`)
+        #: deleted its own pod through v2 (`DELETE /v2/pods/$RUNPOD_POD_ID`, 204), and was refused
+        #: listing the account's pods, its volumes and creating a pod (403).
+        self_terminate=True,
         #: `GET /v2/billing/pods`: per-pod amounts in time buckets.
         reports_charges=True,
         price_history=False,
