@@ -4,6 +4,7 @@ against the other hosts serving the same model, for long enough, on enough answe
 within the bounds — one at a time, never the last ready host, never without a lease that covers
 the replacement's download. Against the fake provider; nothing here spends money."""
 
+import dataclasses
 import time
 from types import SimpleNamespace
 
@@ -165,3 +166,90 @@ def test_busy_time_counts_overlapping_answers_once():
 
     assert busy_seconds([(0, 10), (5, 12), (20, 25), (21, 22)]) == 17
     assert busy_seconds([]) == 0
+
+
+# --- after the review ---
+
+
+async def test_a_host_whose_worker_count_is_still_moving_is_not_judged(db):
+    # A host that just came up runs fewer answers at once than one the controller has raised,
+    # and so serves fewer tokens a second; it is a yardstick, not a candidate, until it settles.
+    from gpm_server.supervisor.service import Supervisor
+
+    fleet, workload, first, second = await two_ready(db)
+    now = time.time()
+    log_answers(db, first, answers=30, tokens=400, seconds=1.0, every=2.0, now=now)
+    log_answers(db, second, answers=30, tokens=80, seconds=1.0, every=2.0, now=now)
+    second.bad_value_since = now - 3600
+    second.workers_changed_at = now - 60
+    await Supervisor._replace_bad_value(bare_supervisor(fleet, db))
+    assert second.state == "ready" and second.bad_value_since is None
+
+
+async def test_answers_that_failed_or_reported_no_tokens_are_not_counted(db):
+    from gpm_server.supervisor.service import Supervisor
+
+    fleet, workload, first, second = await two_ready(db)
+    now = time.time()
+    log_answers(db, first, answers=30, tokens=400, seconds=1.0, every=2.0, now=now)
+    for i in range(30):  # an engine's errors, passed through as `ok`, fast and tokenless
+        db.execute("INSERT INTO request_log (ts, request_id, host_id, model_served, outcome, status_code, "
+                   "tokens_out, latency_ms) VALUES (?, ?, ?, 'big', 'ok', 500, 1, 5000)",
+                   (now - i, f"err-{i}", second.host_id))
+    second.bad_value_since = now - 3600
+    await Supervisor._replace_bad_value(bare_supervisor(fleet, db))
+    assert second.state == "ready"
+
+
+async def test_a_host_leaving_ready_loses_its_timer(db):
+    from gpm_server.supervisor.service import Supervisor
+
+    fleet, workload, first, second = await two_ready(db)
+    second.bad_value_since = time.time() - 3600
+    second.state = "unhealthy"
+    await Supervisor._replace_bad_value(bare_supervisor(fleet, db))
+    assert second.bad_value_since is None
+
+
+async def test_a_host_being_scheduled_counts_as_one_coming_up(db):
+    fleet, _, first, second = await two_ready(db)
+    first.state = "scheduling"
+    assert "still being prepared" in fleet.may_replace(second)
+
+
+async def test_no_second_host_is_given_up_before_one_has_become_ready_since(db):
+    fleet, _, first, second = await two_ready(db)
+    await fleet.give_up_for_value(second, "worse", 5.0)
+    await fleet._end_drain(second, "its work had finished")
+    # The demand still has the first host and gains a third, still coming up: no second give-up.
+    third = dataclasses.replace(first, host_id="rented-third", ready_at=None, state="ready")
+    fleet.hosts[third.host_id] = third
+    assert "become ready since" in fleet.may_replace(first)
+    third.ready_at = time.time() + 1
+    assert fleet.may_replace(first) is None  # a host became ready since: one more is allowed
+
+
+async def test_at_most_two_a_lease(db):
+    from gpm_server.supervisor import renting
+
+    fleet, _, first, second = await two_ready(db)
+    for _ in range(renting.MAX_VALUE_REPLACEMENTS_PER_LEASE):
+        fleet.events.record("replaced_for_value", "earlier", numbers={}, lease_id=second.lease_id)
+    first.ready_at = second.ready_at = time.time() + 1
+    assert "already given up" in fleet.may_replace(second)
+
+
+async def test_a_machine_given_up_stays_avoided_across_a_restart(db):
+    fleet, _, first, second = await two_ready(db)
+    machine = second.offer.machine_id
+    await fleet.give_up_for_value(second, "worse", 5.0)
+    again = make_fleet(db, FakeProvider(offers=offers()))
+    assert machine in again.avoided_now()
+
+
+async def test_a_class_of_machine_is_not_avoided(db):
+    # Where an id names a GPU type in a cloud, avoiding it would bar the good hosts' class too.
+    fleet, _, first, second = await two_ready(db)
+    fleet._capability = lambda host, name, default: False if name == "machine_ids_are_machines" else default
+    await fleet.give_up_for_value(second, "worse", 5.0)
+    assert second.offer.machine_id not in fleet.avoided

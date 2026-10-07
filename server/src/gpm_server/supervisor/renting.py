@@ -110,6 +110,8 @@ class RentedHost:
     volume_reported: bool = False
     #: Since when it has been far worse value than the hosts serving the same model (D75).
     bad_value_since: Optional[float] = None
+    #: When its worker count last changed: value is judged only on a count that has settled (D75).
+    workers_changed_at: Optional[float] = None
     copy_state: Optional[str] = None
     copy_task: Optional[asyncio.Task] = dataclasses.field(default=None, repr=False, compare=False)
     copy_started_at: Optional[float] = None
@@ -358,6 +360,9 @@ _ASSUMED_WORDS = {"download_mbps": "download speed", "reliability": "reliability
 
 #: What a drain for bad value says first, so the next one waits for it (D75).
 BAD_VALUE = "bad value"
+#: Hosts given up for bad value on one lease, at most: a market whose cheapest offers are all poor
+#: hardware would otherwise have the pool pay a download every half hour for the lease's life.
+MAX_VALUE_REPLACEMENTS_PER_LEASE = 2
 
 #: How long after a volume is made the pool waits before taking its absence from the provider's
 #: listing as its deletion (D139).
@@ -481,6 +486,7 @@ class Fleet:
         #: Machines that just failed to start or to download, and until when they are skipped.
         #: In memory only: a restart forgets, which costs at most one more try.
         self.avoided: dict[str, tuple[float, str]] = {}
+        self._value_avoids_restored = False
         #: Models whose build the directory has not measured, from the last size worked out: the
         #: disk check and the download cost leave them out, and the preview says so (D108).
         self.model_sizes_unknown: list[str] = []
@@ -851,26 +857,40 @@ class Fleet:
 
     def may_replace(self, host: RentedHost) -> Optional[str]:
         """Why this host may not be given up for bad value now, or None. The bounds D75 sets:
-        one at a time; never the last ready host of its demand; never without an open lease whose
-        budget covers what its replacement costs to get ready."""
+        one at a time — none while another is draining or a host of its demand is coming up, and
+        none on a lease until a host on it has become ready since the last; at most
+        MAX_VALUE_REPLACEMENTS_PER_LEASE a lease; never the last ready host of its demand; never
+        without an open lease that may rent and whose budget and hours cover a replacement."""
         if host.released or host.state != "ready":
             return f"{host.host_id} is {host.state}"
         if any(h.state == "draining" and (h.drain_reason or "").startswith(BAD_VALUE) for h in self.hosts.values()):
             return "another host given up for bad value is still draining: one at a time"
         group = self.group_of_host(host)
         mine = [h for h in self.hosts_of(host.workload, group) if not h.released and h.host_id != host.host_id]
-        if any(h.state in ("preparing", "adopting") for h in mine):
+        if any(h.state in ("scheduling", "preparing", "adopting") for h in mine):
             return "a host of the same demand is still being prepared: one at a time"
         if not any(h.state == "ready" for h in mine):
             return "it is the only ready host serving its demand"
         lease = self.leases.get(host.lease_id) if host.lease_id else None
-        if lease is None or not lease.is_open:
-            return "its lease is not open"
+        if lease is None or not lease.is_open or not lease.allow_rent:
+            return "its lease is not open for renting"
+        # From the event log, so a restart forgets none of it.
+        before = [e for e in self.events.recent(200, kind="replaced_for_value") if e.get("lease_id") == lease.lease_id]
+        if len(before) >= MAX_VALUE_REPLACEMENTS_PER_LEASE:
+            return f"{len(before)} hosts were already given up for bad value on this lease"
+        if before:
+            last = before[0]["ts"]
+            if not any(h.lease_id == lease.lease_id and h.ready_at is not None and h.ready_at > last
+                       for h in self.hosts.values() if not h.released):
+                return "no host on its lease has become ready since the last one given up: one at a time"
+        sizes = self.build_sizes(host.models, host.builds)  # not model_set_gb: it rewrites the unknowns
         ready_h = workload_math.time_to_ready_hours(
-            self.model_set_gb(host.models, host.builds), host.offer.download_mbps or 100.0,
+            sum(size for size in sizes.values() if size), host.offer.download_mbps or 100.0,
             self.config.workloads.engine_load_s)
+        if lease.hours_left() <= ready_h:
+            return f"its lease has {lease.hours_left() * 60:.0f} minutes left, too few for a replacement to get ready"
         needed = host.download_cost + host.bid_hourly * ready_h
-        left = lease.max_spend - self.lease_spend(lease)[0]
+        left = self.budget_left(lease)
         if left < needed:
             return f"its lease has ${left:.2f} left, less than the ${needed:.2f} a replacement costs to get ready"
         return None
@@ -880,14 +900,19 @@ class Fleet:
         round does not buy it straight back; the ordinary allocation rents the replacement — one
         way capacity is acquired, not two (D75)."""
         lease = self.leases.get(host.lease_id) if host.lease_id else None
-        hours = lease.hours_left() if lease is not None else 1.0
-        self.avoid(host.offer.machine_id, f"given up for bad value: {why}", minutes=max(60.0, hours * 60))
+        minutes = max(60.0, (lease.hours_left() if lease is not None else 1.0) * 60)
+        # Where an id names a class of machine (a GPU type in a cloud), avoiding it would bar every
+        # host of that class — the good ones' too — for the lease's hours.
+        machine = self._capability(host, "machine_ids_are_machines", True)
+        if machine:
+            self.avoid(host.offer.machine_id, f"given up for bad value: {why}", minutes=minutes)
         self.events.record(
             "replaced_for_value",
             f"{host.host_id} on {host.offer.machine_id} ({host.offer.hardware}) is given up: {why}; "
             "the pool rents its replacement as it rents any host",
             numbers={"machine": host.offer.machine_id, "hardware": host.offer.hardware,
-                     "ratio": round(ratio, 2) if ratio is not None else None, "hourly": host.bid_hourly},
+                     "ratio": round(ratio, 2) if ratio is not None else None, "hourly": host.bid_hourly,
+                     "avoid_until": time.time() + minutes * 60 if machine else None},
             host_id=host.host_id, lease_id=host.lease_id)
         await self.drain(host, f"{BAD_VALUE}: {why}")
 
@@ -1775,6 +1800,7 @@ class Fleet:
         if workers < host.workers:
             was = host.workers
             host.workers = workers
+            host.workers_changed_at = time.time()
             self.events.record(
                 "host_resized",
                 f"{host.host_id} now takes {workers} requests at once, down from {was}; the "
@@ -1790,6 +1816,7 @@ class Fleet:
             # slots that exist: instant, graceful, and nothing is restarted (D68).
             was = host.workers
             host.workers = workers
+            host.workers_changed_at = time.time()
             self.events.record(
                 "host_resized",
                 f"{host.host_id} now takes {workers} requests at once, up from {was}; its "
@@ -2242,6 +2269,14 @@ class Fleet:
 
     def avoided_now(self) -> dict[str, str]:
         now = time.time()
+        if not self._value_avoids_restored:
+            # The rest of the list is forgotten at a restart at the cost of one more try; a machine
+            # given up for bad value would be bought straight back, as the cheapest (D75).
+            self._value_avoids_restored = True
+            for event in self.events.recent(200, kind="replaced_for_value"):
+                until, machine = event["numbers"].get("avoid_until"), event["numbers"].get("machine")
+                if until and machine and until > now:
+                    self.avoided.setdefault(machine, (until, "given up for bad value"))
         self.avoided = {m: (until, why) for m, (until, why) in self.avoided.items() if until > now}
         skipped = {m: why for m, (_, why) in self.avoided.items()}
         # A machine this pool already rents still appears in the interruptible listing — its

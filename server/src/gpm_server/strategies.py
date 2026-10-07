@@ -271,6 +271,13 @@ class ValueReading:
     requests: int
     #: Since when it has been found far worse than the others, while it still is; None if not.
     bad_since: Optional[float] = None
+    #: False while its worker count is still moving, or it became ready only lately: a host that
+    #: runs fewer answers at once serves fewer tokens a second, and the controller may yet raise
+    #: it. Such a host is a yardstick for the others, and is not judged itself.
+    settled: bool = True
+    #: Hosts are compared only within one kind: the same model for the same demand — a workload
+    #: sending long prompts for short answers serves fewer tokens a second on any machine.
+    kind: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -327,8 +334,8 @@ def judge_value(readings: Sequence[ValueReading], cfg, now: float) -> list[Value
     for r in readings:
         mine = known[r.host_id]
         others = [known[o.host_id] for o in readings
-                  if o.host_id != r.host_id and o.model == r.model and known[o.host_id] is not None]
-        if mine is None or not others:
+                  if o.host_id != r.host_id and (o.kind, o.model) == (r.kind, r.model) and known[o.host_id] is not None]
+        if mine is None or not others or not r.settled:
             verdicts.append(ValueVerdict(r.host_id, False, False, None, ()))
             continue
         median = statistics.median(others)
