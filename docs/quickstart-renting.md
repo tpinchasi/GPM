@@ -164,11 +164,23 @@ A pool may rent from several providers at once; each is a **provider account** u
 rented:
   providers:
     vast:   { type: vast }
-    runpod: { type: runpod, settings: { api_key_env: RUNPOD_API_KEY } }   # once its plug-in is installed
+    runpod: { type: runpod, keep_models: true }   # RUNPOD_API_KEY, or a credential typed in
 ```
 
-Vast is the provider the framework ships with; another is a plug-in (see
+Vast and RunPod ship with the framework; another provider is a plug-in (see
 [writing-a-plugin.md](writing-a-plugin.md)).
+
+- **RunPod** rents on demand only (it offers no spot), from its Secure and Community clouds
+  (`settings: { clouds: [SECURE] }` for one). It does not report a machine's download speed or
+  reliability, so its offers carry stated defaults (`assumed_download_mbps`,
+  `assumed_reliability`), marked *assumed* wherever they are shown. Its hosts get the dead-man
+  timer: a pod's own key, which RunPod puts in every pod, ends that pod and cannot list, create or
+  read anything else of the account.
+- **Keep models between hosts** (`keep_models: true`, or the checkbox on the account's card) is
+  offered only where the provider's storage reaches a data center — RunPod's network volumes, on
+  Secure Cloud. Each workload then keeps its models on a volume in its first host's data center,
+  and later hosts copy from it in about a minute instead of downloading them; the volume is billed
+  to the workload's lease and deleted when it ends. Hosts that start together never wait for it.
 
 - **A credential can be typed into the console** — Rented capacity → Providers → Add provider, or
   *Type in a credential* on an account's card. It is tested, kept by the supervisor in an

@@ -220,7 +220,10 @@ preview lists offers in the order the pool rents them, each with its expected co
 worker-hour.
 
 `rented.mode` still says which kinds may be rented at all. A field one provider does not report
-(reliability, download speed or price) takes a stated default, and the decision says so.
+(reliability, download speed or price) takes a stated default from the connection's settings, and
+the offer carries it in `assumed` (D138): the market marks it (download speed as *≈*), and the
+rental's event names what was assumed. RunPod's are `assumed_download_mbps` (1000) and
+`assumed_reliability` (0.99); *verified* there means its Secure Cloud.
 
 ## 7. Console
 
@@ -264,7 +267,7 @@ the dialog closes, however it closes.
 Not built yet: one connection's own page — its status history, its hosts and spend, and its slice
 of the decision log.
 
-### 7.2 The market, across providers (Rented capacity → Finding machines)
+### 7.2 The market, across providers (Rented capacity → Finding machines) — built
 
 - **Choosing what to search.** A chip per enabled connection and per kind (on demand, interruptible) narrows
   the search. A search still happens only when **Search the market** is pressed (D120).
@@ -309,7 +312,7 @@ Each step ships on its own and keeps a single-provider pool working as it does t
    **fake providers** with different capabilities: one that takes bids; one that offers spot at a
    price it changes, with an interruption notice; and one fixed-price only that cannot park.
 3. Credentials typed in once (§5), and the Providers screen. **Built** (0.31.0).
-4. The market across providers, then the connection columns everywhere else.
+4. The market across providers, then the connection columns everywhere else. **Built** (0.32.0).
 5. The second real provider plug-in, **RunPod** (on demand, with park), built on its v2 API and
    checked live on the smallest case with the owner's go-ahead. **Plug-in built (D138)**; checked live
    2026-10-07 on one pod: it offers no spot; its pod-scoped key ends its own pod, so its hosts get the

@@ -43,10 +43,14 @@ const api = {
   plan: () => call("GET", "/pool/plan"),
   account: () => call("GET", "/pool/account"),
   // The server searches only when asked to, by name (D120, D122); without it, the settings.
-  market: (hours = 4, policy, search = true) =>
-    policy
-      ? call("POST", `/pool/market/preview?hours=${hours}&kinds=both&search=true`, policy)
-      : call("GET", `/pool/market/preview?hours=${hours}&kinds=both&search=${search ? "true" : "false"}`),
+  // What to search narrows by the market's chips: which providers, which kinds (providers.md §7.2).
+  market: (hours = 4, policy, search = true) => {
+    const narrow = `&kinds=${marketView.kinds}` + (marketView.connections
+      ? `&connections=${[...marketView.connections].map(encodeURIComponent).join(",")}` : "");
+    return policy
+      ? call("POST", `/pool/market/preview?hours=${hours}${narrow}&search=true`, policy)
+      : call("GET", `/pool/market/preview?hours=${hours}${narrow}&search=${search ? "true" : "false"}`);
+  },
   openLease: (body) => call("POST", "/pool/leases", body),
   closeLease: (id) => call("DELETE", `/pool/leases/${id}`),
   tightenLease: (id, body) => call("PATCH", `/pool/leases/${id}`, body),
@@ -2564,7 +2568,50 @@ async function saveSearch(event, note, mode) {
 
 // The last search this page made, kept so moving between tabs shows it again without asking
 // the provider. There is no timer: a search spends the provider's daily quota (D120).
-const marketView = { box: null, stamp: null, button: null, quota: null, busy: false, at: 0, last: null };
+const marketView = { box: null, stamp: null, button: null, quota: null, busy: false, at: 0, last: null,
+  // What the next search asks: every provider (null) or the ones chosen, and which kinds.
+  connections: null, kinds: "both" };
+
+// The chips that narrow a search (providers.md §7.2): a provider each, and the two kinds. A
+// search still happens only when a button is pressed (D120).
+function marketChips(shown) {
+  const lines = shown.by_connection || {};
+  const choosable = Object.entries(lines).filter(([, line]) => line.asked || line.why_not === "not chosen for this search"
+    || line.why_not === "no search yet");
+  const chip = (label, on, toggle, title) => el("button", { type: "button", class: `chip${on ? " on" : ""}`,
+    "aria-pressed": on ? "true" : "false", title, onclick: (e) => { toggle(); e.target.closest(".chips").replaceWith(marketChips(marketView.last || shown)); } }, label);
+  const chosen = (name) => !marketView.connections || marketView.connections.has(name);
+  const providers = choosable.length > 1 ? choosable.map(([name]) => chip(name, chosen(name), () => {
+    const next = new Set(marketView.connections || choosable.map(([n]) => n));
+    if (next.has(name)) { if (next.size > 1) next.delete(name); } else next.add(name);
+    marketView.connections = next.size === choosable.length ? null : next;
+  }, `search ${name}`)) : [];
+  const kinds = { both: ["interruptible", "on_demand"], interruptible: ["interruptible"], on_demand: ["on_demand"] };
+  const has = (k) => (kinds[marketView.kinds] || kinds.both).includes(k);
+  const kindChip = (k, label) => chip(label, has(k), () => {
+    const now = new Set(kinds[marketView.kinds] || kinds.both);
+    if (now.has(k)) { if (now.size > 1) now.delete(k); } else now.add(k);
+    marketView.kinds = now.size === 2 ? "both" : [...now][0];
+  }, label);
+  return el("div", { class: "row chips", role: "group", "aria-label": "What the next search asks" },
+    el("span", { class: "muted" }, "Search"), ...providers,
+    providers.length ? el("span", { class: "muted" }, "·") : null,
+    kindChip("interruptible", "interruptible"), kindChip("on_demand", "on demand"));
+}
+
+// A line per provider: asked or why not, what it returned, what passed, its quota.
+function marketLines(market) {
+  const lines = Object.entries(market.by_connection || {});
+  if (lines.length < 2) return null;
+  return el("table", { class: "market-lines" },
+    el("thead", {}, el("tr", {}, ...["Provider", "Seen", "Pass", "Search quota", ""].map((h) => el("th", {}, h)))),
+    el("tbody", {}, lines.map(([name, line]) => el("tr", {},
+      el("td", {}, name),
+      el("td", { class: "num" }, line.asked ? line.seen : "—"),
+      el("td", { class: "num" }, line.asked ? line.passed : "—"),
+      el("td", { class: "muted small-text" }, line.search_quota ? searchQuotaText(line.search_quota) : "none"),
+      el("td", { class: line.error ? "error" : "muted" }, line.error || line.why_not || "")))));
+}
 
 function marketSection(settings) {
   const shown = marketView.last || settings;
@@ -2578,6 +2625,7 @@ function marketSection(settings) {
     el("div", { class: "row" },
       el("h2", {}, "Live market — the real offer pipeline, read-only"), marketView.button, marketView.stamp),
     marketView.quota,
+    marketChips(shown),
     marketView.box,
   ];
 }
@@ -2673,7 +2721,10 @@ const marketPanel = (market) => {
   const unasked = Object.entries(market.provider_errors || {});
   const unaskedNote = unasked.length ? el("p", { class: "warn-text" },
     `${unasked.map(([name, why]) => `${name} could not be asked (${why})`).join("; ")} — the offers below are the other providers' only.`) : null;
-  return el("div", {}, unaskedNote, avoidedNote, el("div", { class: "grid" },
+  // Rejections with a column per provider, where more than one was asked.
+  const askedNames = Object.entries(market.by_connection || {}).filter(([, l]) => l.asked).map(([n]) => n);
+  const perProvider = askedNames.length > 1;
+  return el("div", {}, unaskedNote, avoidedNote, marketLines(market), el("div", { class: "grid" },
     el("div", { class: "panel" },
       el("div", { class: "stat" }, `${market.passed} pass · ${market.rejected} rejected`),
       el("div", { class: "muted" }, `${market.seen} offers seen through your policy`),
@@ -2690,8 +2741,13 @@ const marketPanel = (market) => {
           ? ` (not measured yet: ${market.model_sizes_unknown.join(", ")})` : "")) : null,
       nextHostNote(market),
       el("h2", {}, "Rejected, by reason"),
-      el("table", {}, el("tbody", {}, Object.entries(market.rejected_by_reason || {}).map(([reason, count]) =>
-        el("tr", {}, el("td", { class: "num" }, count), el("td", { class: "muted" }, reason)))))),
+      el("table", {},
+        perProvider ? el("thead", {}, el("tr", {}, el("th", {}, "Reason"),
+          ...askedNames.map((n) => el("th", { class: "num" }, n)))) : null,
+        el("tbody", {}, Object.entries(market.rejected_by_reason || {}).map(([reason, count]) => perProvider
+          ? el("tr", {}, el("td", { class: "muted" }, reason),
+            ...askedNames.map((n) => el("td", { class: "num" }, (market.by_connection[n].rejected_by_reason || {})[reason] || 0)))
+          : el("tr", {}, el("td", { class: "num" }, count), el("td", { class: "muted" }, reason)))))),
     el("div", { class: "panel wide" }, el("h2", {}, "Best offers"),
       el("table", {},
         el("thead", {}, el("tr", {},
@@ -2702,7 +2758,8 @@ const marketPanel = (market) => {
           el("th", { class: "num", title: "Expected cost per worker-hour: the price, interruptions, the download and this machine's record here — the pool rents the lowest" }, "Per worker-hour"),
           el("th", {}, ""))),
         el("tbody", {}, (market.best || []).map((offer, index) => el("tr", {},
-          el("td", {}, index === 0 ? el("strong", {}, offer.hardware) : offer.hardware,
+          el("td", {}, offer.would_rent ?? index === 0 ? el("strong", {}, offer.hardware) : offer.hardware,
+            offer.would_rent ? el("span", { title: "the offer the pool's own rule picks, across every provider asked" }, " ", pill("would rent", "ok")) : null,
             el("div", { class: "muted mono" }, `${offer.machine} · ${offer.gpu_memory_gb}GB · `,
               // A value the provider does not report is marked as assumed, never shown as measured (§6).
               (offer.assumed || []).includes("download_mbps")

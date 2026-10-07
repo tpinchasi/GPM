@@ -1841,8 +1841,10 @@ class Fleet:
         bidding: Optional[dict] = None,
         kinds: Optional[str] = None,
         search: bool = True,
+        connections: Optional[Sequence[str]] = None,
     ) -> dict:
-        """The offer pipeline, read-only (docs/spec/console-and-control-api.md §2.2).
+        """The offer pipeline, read-only (docs/spec/console-and-control-api.md §2.2), across every
+        provider or the ones named (providers.md §7.2).
 
         `search=False` answers with the settings and the next host's needs, and asks the market
         nothing: the provider counts every offer a search returns against a daily quota, which
@@ -1869,7 +1871,13 @@ class Fleet:
 
         if kinds is not None and kinds not in self._KINDS:
             raise ValueError(f"kinds must be one of {sorted(self._KINDS)}")
-        offers = await self._offers(policy, kinds) if search else []
+        searchable = self.searchable()
+        if connections is not None:
+            unknown = [n for n in connections if n not in searchable]
+            if unknown:
+                raise ValueError(f"not a provider this pool searches now: {', '.join(unknown)}")
+        chosen = list(connections) if connections is not None else searchable
+        offers = await self._offers(policy, kinds, connections=chosen) if search else []
         ranked, rejected = rank_offers(
             offers, self._policy_with_avoided(policy), bid_config, hours,
             self.model_set_gb(next_models, next_builds),
@@ -1895,7 +1903,7 @@ class Fleet:
             by_reason[key] = by_reason.get(key, 0) + 1
 
         accepted = []
-        for offer, offer_score in ranked[:10]:
+        for index, (offer, offer_score) in enumerate(ranked[:10]):
             bid = price_bid(offer, bid_config, policy)
             workers, workers_why = self.workers_for(offer)
             accepted.append(
@@ -1926,8 +1934,34 @@ class Fleet:
                     # What the provider does not report, filled with a stated default (§6).
                     "assumed": list(offer.assumed),
                     "score": round(offer_score, 3),
+                    # The row the pool's own rule picks, across every provider asked (D131).
+                    "would_rent": index == 0,
                 }
             )
+        # A line per provider (providers.md §7.2): asked or not and why, what it returned, what
+        # passed, what stopped the rest, and its quota.
+        by_connection: dict[str, dict] = {}
+        for name, settings in self.rented.providers.items():
+            mine = [o for o in offers if o.connection == name]
+            stopped: dict[str, int] = {}
+            for offer in mine:
+                reasons = rejected.get(offer.offer_id)
+                if reasons:
+                    stopped[filter_name(reasons[0])] = stopped.get(filter_name(reasons[0]), 0) + 1
+            asked = search and name in chosen
+            state = self.searching.get(name)
+            by_connection[name] = {
+                "asked": asked,
+                "why_not": None if asked else (
+                    "no search yet" if not search else "turned off" if not settings.enabled
+                    else "not running — it needs a credential, or waits for a restart" if name not in self.providers
+                    else "not chosen for this search"),
+                "error": state.error if asked and state is not None and state.error else None,
+                "seen": len(mine),
+                "passed": sum(1 for o, _ in ranked if o.connection == name),
+                "rejected_by_reason": dict(sorted(stopped.items(), key=lambda kv: -kv[1])),
+                "search_quota": self.search_quota(name) if name in self.providers else None,
+            }
         return {
             "searched": search,
             # What this search, and the day's others, have used of the provider's quota (D121).
@@ -1936,6 +1970,7 @@ class Fleet:
             "passed": len(ranked),
             "rejected": len(rejected),
             "rejected_by_reason": dict(sorted(by_reason.items(), key=lambda kv: -kv[1])),
+            "by_connection": by_connection,
             # Filters the provider applied before answering (D123): an offer failing one is never
             # returned, so it is not counted among the rejections — said here instead.
             "filtered_by_provider": self.last_query_filters if search else [],

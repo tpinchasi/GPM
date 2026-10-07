@@ -315,7 +315,7 @@ class Workloads:
             "placement": chosen_name,
             "groups": [{k: g[k] for k in ("models", "builds", "hosts_at_start", "workers_per_host", "caps",
                                           "cards_per_copy", "first_host", "sizing", "latency_curves",
-                                          "minutes_to_serve", "hourly_total")} for g in groups],
+                                          "minutes_to_serve", "hourly_total", "model_volume")} for g in groups],
             "offers_passed": option["offers_passed"],
             "workers_per_host": first["workers_per_host"],
             "workers_measured": all(g["measured"] for g in groups),
@@ -425,8 +425,21 @@ class Workloads:
                                                  fixed_workers=per_host, have=per_host * (hosts - 1))
                 first_cost = next((c for c in shared if (c.connection, c.offer_id, c.interruptible)
                                    == (first.connection, first.offer_id, first.interruptible)), first_cost)
+            # Where the first host's provider keeps models between hosts (D139), the volume it would
+            # make: said before anything is spent, in the workload's own hours and budget.
+            volume = None
+            if fleet.keeps_models(first.connection) and first.locations:
+                size = fleet._volume_size(models, group_builds)
+                volume_hourly = size * (first.volume_per_gb_hourly or 0.0)
+                volume = {"connection": first.connection, "size_gb": size, "hourly": round(volume_hourly, 6),
+                          "over_hours": round(volume_hourly * req.hours, 4)}
+                kind_reasons = [*kind_reasons,
+                                f"keeps a {size} GB model volume at {first.connection}, in the first host's data "
+                                f"center — ${volume_hourly:.4f}/h, ${volume_hourly * req.hours:.2f} over "
+                                f"{req.hours:g} h, in the budget; deleted when the workload ends"]
             groups.append({
                 "models": list(models), "builds": group_builds, "hosts_at_start": hosts, "workers_per_host": per_host,
+                "model_volume": volume,
                 "caps": caps, "cards_per_copy": cards, "sizing": sizing, "latency_curves": curves, "measured": measured,
                 "kind_reasons": kind_reasons, "offers_passed": len(ranked),
                 "first_host": {
@@ -436,7 +449,7 @@ class Workloads:
                     "reasons": first_cost.reasons,
                 },
                 "hourly_total": round(hosts * first_cost.hourly, 4),
-                "expected": first_cost.expected * hosts,
+                "expected": first_cost.expected * hosts + (volume["over_hours"] if volume else 0.0),
                 "minutes_to_serve": round(ready_h * 60, 1),
             })
         return {
