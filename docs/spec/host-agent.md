@@ -79,7 +79,8 @@ whole preparation in, and folding them into one number would hide it (D97):
 - With the router, each model is given **its weights plus a cache reserve** of the card the driver
   reports, the rest spread by weight; a set that needs more than nine tenths of the card is
   **refused before anything starts**, and the refusal is reported for every model (D104). What
-  was started is recorded in `.gpm-vllm.started.json`; a process that has exited without ever
+  was started is recorded beside the models directory, never in it (`<models>.gpm-state/`, with the
+  process ids, logs and the router's map — D139); a process that has exited without ever
   serving its model is reported as that model's error, with the last error line of its log, and
   the pool gives the host up saying so — never as "still preparing".
 - It takes **named options** (`--option tool_calling`, `--option reasoning`, D100) from a closed
@@ -101,6 +102,31 @@ whole preparation in, and folding them into one number would hide it (D97):
   model's weights plus its own cache reserve. Refused before anything starts: cards that do not
   make whole groups of N (or none listed), and a model whose attention heads — `num_attention_heads`
   in its `config.json`, or under `text_config` — do not divide by N. A dead copy names its cards.
+
+**A model volume** (D139), on a host the pool created with one, is mounted at one of two paths
+that are the agent's own constants — one to *read*, one to *fill* — never named by the pool. The
+engine never runs from it:
+
+- **Reading.** Before the hub, the fetch copies the build's files from the volume to the models
+  directory, **by the hub's own file list** — never by listing the volume, so nothing else comes
+  across, and no link is followed — in parallel, **each checked against the hash the hub publishes**
+  (Hugging Face: sha256 for large files, the git blob sha1 for small ones). A file missing,
+  mismatched or with no published hash comes from the hub. Hashing runs off the event loop. For
+  Ollama, blobs are copied into the engine's store only when they hash to the digest they are
+  named by, and the engine's own pull then fetches the manifest and whatever is missing.
+- **Filling.** After its own fetch — in the background, so the host is ready once its models are on
+  its own disk, and its facts say `filling` until the copy ends — the host copies its verified files up into a fresh directory on
+  the volume (created exclusively, no link followed), each checked against the hub's hash as it is
+  copied, and renames it into place under its build's name — a digest of the hub's file list with
+  each file's hash, which every host computes alike from the hub's listing. A filler that stops
+  leaves a directory no one reads. A build already there, by its marker, is left as it is; anything
+  else in the repository's directory — an older build, a stopped fill's draft, junk under the
+  build's name — is cleared first, so a volume sized for one build never fills up for good. For Ollama the blobs are
+  copied up under their own names.
+- **The engine's own state** — process ids, start record, logs — is never kept in the models
+  directory, so nothing of one host's engine reaches another through a volume.
+- What it did, and how long it took, is in the agent's facts: files from the volume, files from the
+  hub, files that did not match.
 
 Three rules the hub fetch keeps:
 

@@ -93,12 +93,28 @@ class ProviderCapabilities:
     #: The provider will hand back an instance's own boot output. Without it, a host that
     #: never answers is given up knowing only that it never answered (D78).
     reports_instance_logs: bool = False
-    #: A volume can be made beside an instance, on its machine, and attached to a later instance
-    #: on the same machine (D116). Without it, a workload's next host always fetches.
+    #: A volume can be made with an instance and attached to a later one (D116, D139). Without
+    #: it, a workload's next host always fetches.
     volumes: bool = False
+    #: How far a volume reaches (D139): `"machine"` — only a later instance on the machine it was
+    #: made on — or `"data_center"` — any later instance in its data center, several at once.
+    #: Unset with `volumes`: `"machine"`. Only a data-center volume is offered to the operator
+    #: ("Keep models between hosts"); a machine-bound one helps only when that machine is free
+    #: again, while it bills the whole time. A plug-in may state it without `volumes`, for storage
+    #: the provider sells but the plug-in does not use, so the console can say why it is not offered.
+    volume_reach: Optional[str] = None
+
+    @property
+    def reach(self) -> Optional[str]:
+        """How far this provider's volumes reach, or None without volumes."""
+        return (self.volume_reach or "machine") if self.volumes else None
     #: The provider copies a directory from one of its instances to another (D116). Without it,
     #: a new host never takes its models from a sibling.
     copies: bool = False
+    #: An offer's `machine_id` names one machine, so an offer listing a machine the pool already
+    #: rents is that very machine. False where it names a class — a GPU type in a cloud — that
+    #: many instances share: then a live host never keeps another of its class from being rented.
+    machine_ids_are_machines: bool = True
     #: The provider warns before it takes an instance away, and `status` says so (`interrupting`).
     #: With it, the pool drains the host at once (D132).
     interruption_notice: bool = False
@@ -146,6 +162,17 @@ class Offer:
     #: plug-in, which does not know the name it was configured under. A machine identifier is
     #: unique only within its connection.
     connection: str = ""
+    #: Fields the provider does not report, filled with a stated default (providers.md §6): by
+    #: name — `download_mbps`, `reliability`, `verified`, `download_per_gb`. The value is used
+    #: like any other, and every place that shows or decides by it says it was assumed.
+    assumed: tuple[str, ...] = ()
+    #: Where this offer can land now that a data-center volume can follow it (D139): the
+    #: provider's own names for its data centers, those with this offer in stock *and* taking a
+    #: volume. Empty where the provider has no such volumes or does not say. A search never
+    #: narrows to one: an offer elsewhere stays an offer (D123).
+    locations: tuple[str, ...] = ()
+    #: A data-center volume's price, per GB per hour, where this offer lands (D139).
+    volume_per_gb_hourly: Optional[float] = None
     raw: dict[str, Any] = dataclasses.field(default_factory=dict, repr=False)
 
     def priced_for(self, disk_gb: float) -> "Offer":
@@ -180,6 +207,11 @@ class VolumeSpec:
     label: str
     size_gb: float = 0.0
     volume_id: Optional[str] = None
+    #: For a data-center volume (D139): the data center it is in — an existing one's, which the
+    #: instance must land in, or where a new one is made (one of the offer's `locations`; unset,
+    #: the plug-in chooses among them). A create that cannot put the instance there fails as
+    #: `OfferGone`, leaving nothing behind — never an instance elsewhere without its volume.
+    location: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -190,6 +222,8 @@ class VolumeInfo:
     size_gb: float
     #: What it costs per hour, where the provider says.
     hourly: float = 0.0
+    #: A data-center volume's data center (D139).
+    location: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -214,6 +248,8 @@ class Instance:
     raw: dict[str, Any] = dataclasses.field(default_factory=dict, repr=False)
     #: The volume it was created with, where one was asked for (D116).
     volume_id: Optional[str] = None
+    #: The data center it landed in, where the provider says (D139).
+    location: Optional[str] = None
 
 
 class InstanceState(str):
@@ -448,7 +484,19 @@ def presentation(plugin: Any, type_name: str) -> dict[str, Any]:
         "endpoint_settings": list(getattr(plugin, "endpoint_settings", ()) or ()),
         "offered": bool(getattr(plugin, "offered", True)),
         "capabilities": dataclasses.asdict(capabilities) if dataclasses.is_dataclass(capabilities) else {},
+        # Keeping models between hosts (D139): what a volume costs, and the one thing to know about
+        # where it works — said by the plug-in, so the core names no provider.
+        "volume_price_per_gb_month": _number_or_none(getattr(plugin, "volume_price_per_gb_month", None)),
+        "volume_note": _short_text_or_none(getattr(plugin, "volume_note", None)),
     }
+
+
+def _number_or_none(value: Any) -> Optional[float]:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _short_text_or_none(value: Any) -> Optional[str]:
+    return value if isinstance(value, str) and 0 < len(value) <= 200 else None
 
 
 #: The group third-party providers register under. The ones shipped here use it too: there is

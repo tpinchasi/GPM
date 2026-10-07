@@ -1083,3 +1083,19 @@ async def test_a_refusal_that_is_not_about_the_endpoint_is_not_retried_elsewhere
         await engines.OllamaFacts().hold(Broken(), "a-model", pinned=True)
 
     assert tried.count("/api/embed") == 0, "a real failure was retried on the wrong endpoint"
+
+
+def test_an_answer_not_in_the_shape_of_facts_is_no_answer_never_an_exception(monkeypatch):
+    # A rented host is not trusted: its agent's JSON of the wrong shape must not reach the pass
+    # (the security review's finding).
+    import asyncio
+
+    import httpx
+    from gpm_server.config import AgentConfig
+
+    monkeypatch.setenv("GPM_TEST_AGENT_KEY", "agent-key-for-tests")
+    agent = AgentConfig(url="https://agent.invalid", bearer_env="GPM_TEST_AGENT_KEY")
+    for body in ([1, 2], {"agent": "x"}, {"agent": {"protocol": "1"}, "engine": "x"}):
+        transport = httpx.MockTransport(lambda request, body=body: httpx.Response(200, json=body))
+        view = asyncio.run(agents.ask(agent, transport=transport))
+        assert not view.reachable and "shape" in view.detail

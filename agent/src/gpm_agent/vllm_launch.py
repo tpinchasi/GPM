@@ -60,6 +60,10 @@ PIDS_FILE = ".gpm-vllm.pids"
 #: The router's map of model to engine, when there is more than one model.
 UPSTREAMS_FILE = ".gpm-upstreams.json"
 
+#: Where an older launcher kept its state, in the models directory itself. Found there now, they
+#: came with the models from another machine, or from before: removed, never acted on (D139).
+LEGACY_STATE = (PIDS_FILE, ".gpm-vllm.started.json", UPSTREAMS_FILE)
+
 #: The share of the accelerator one process may take. vLLM's own recommendation for a single
 #: model; the rest is headroom the driver and the runtime need.
 TOTAL_MEMORY_SHARE = 0.90
@@ -85,6 +89,7 @@ from .vllm_state import (  # noqa: E402,F401
     failed_engines,
     last_error_line,
     read_record,
+    state_dir_for,
 )
 
 #: The pool's numbers, under the names the agent writes them in (D41). Only those present are
@@ -352,13 +357,40 @@ def option_flags(options: Sequence[str], family: Optional[str]) -> tuple[list[st
     return flags, missing
 
 
+def _cmdline(pid: int) -> Optional[bytes]:
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+
+
+def _ours(pid: int, cmdline: Callable[[int], Optional[bytes]]) -> bool:
+    """Is this process one an older launcher on this machine started — an engine or the router? A
+    number from a file is only a number: it may be another machine's, brought with its models."""
+    said = cmdline(pid) or b""
+    return b"vllm" in said or (b"proxy" in said and b"--upstreams" in said)
+
+
 def stop_previous(models_dir: Path, *, kill: Callable[[int, int], None] = os.kill,
-                  alive: Optional[Callable[[int], bool]] = None, grace_s: float = 30.0) -> list[int]:
-    """Stop what the last call started. A process already gone is not an error."""
-    pids_file = models_dir / PIDS_FILE
+                  alive: Optional[Callable[[int], bool]] = None, grace_s: float = 30.0,
+                  cmdline: Callable[[int], Optional[bytes]] = _cmdline) -> list[int]:
+    """Stop what the last call started. A process already gone is not an error.
+
+    What an older launcher started is listed in the models directory, where it kept its state
+    then: on a host upgraded in place those engines still hold the cards and ports. They are
+    stopped too — but only processes that are an engine or the router by their own command line,
+    since that file may equally have come from another machine with the models (D139)."""
+    pids_file = state_dir_for(models_dir) / PIDS_FILE
     try:
         pids = [int(p) for p in json.loads(pids_file.read_text())]
     except (OSError, ValueError, TypeError):
+        pids = []
+    try:
+        older = [int(p) for p in json.loads((Path(models_dir) / PIDS_FILE).read_text())]
+    except (OSError, ValueError, TypeError):
+        older = []
+    pids += [p for p in older if p not in pids and _ours(p, cmdline)]
+    if not pids:
         return []
 
     def is_alive(pid: int) -> bool:
@@ -409,6 +441,7 @@ def launch(
     probe_card: Callable[[], Optional[int]] = card_memory_bytes,
     devices: Optional[Sequence[str]] = None,
     probe_devices: Callable[[Mapping[str, str]], list[str]] = card_devices,
+    cmdline: Callable[[int], Optional[bytes]] = _cmdline,
 ) -> Started:
     """Stop what ran before, then start vLLM for every complete model on disk.
 
@@ -416,9 +449,13 @@ def launch(
     error: this returns having started nothing, and is called again once the fetch has finished.
     """
     models_dir = Path(models_dir).expanduser()
+    state = state_dir_for(models_dir)
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
     env = dict(os.environ if env is None else env)
-    stop_previous(models_dir, kill=kill, alive=alive)
-    (models_dir / STARTED_FILE).unlink(missing_ok=True)
+    stop_previous(models_dir, kill=kill, alive=alive, cmdline=cmdline)
+    for name in LEGACY_STATE:
+        (models_dir / name).unlink(missing_ok=True)
+    (state / STARTED_FILE).unlink(missing_ok=True)
 
     started = Started()
     found = complete_models(models_dir)
@@ -432,7 +469,7 @@ def launch(
         log.warning("several models on disk and no router; serving %s only", served_name(found[0]))
         found = found[:1]
 
-    logs = models_dir / ".gpm-logs"
+    logs = state / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     sizes = [size_of(d) for d in found]
     per_copy = cards_per_copy(env)
@@ -496,7 +533,7 @@ def launch(
             upstreams.setdefault(name, []).append(f"http://127.0.0.1:{engine_port}")
 
     if router:
-        map_file = models_dir / UPSTREAMS_FILE
+        map_file = state / UPSTREAMS_FILE
         draft = map_file.with_suffix(".new")
         draft.write_text(json.dumps(upstreams, indent=2, sort_keys=True))
         draft.replace(map_file)
@@ -506,7 +543,7 @@ def launch(
         process = popen(argv, stdout=out, stderr=subprocess.STDOUT, env=env, start_new_session=True)
         started.proxy = {"port": port, "pid": getattr(process, "pid", None), "argv": argv}
 
-    (models_dir / PIDS_FILE).write_text(json.dumps(started.pids()))
+    (state / PIDS_FILE).write_text(json.dumps(started.pids()))
     _record(models_dir, started)
     return started
 
@@ -520,9 +557,10 @@ def _record(models_dir: Path, started: Started) -> None:
         "engines": [{k: v for k, v in e.items() if k != "argv"} for e in started.engines],
         "proxy": {k: v for k, v in started.proxy.items() if k != "argv"} if started.proxy else None,
     }
-    draft = (models_dir / STARTED_FILE).with_suffix(".new")
+    target = state_dir_for(models_dir) / STARTED_FILE
+    draft = target.with_suffix(".new")
     draft.write_text(json.dumps(record, indent=2))
-    draft.replace(models_dir / STARTED_FILE)
+    draft.replace(target)
 
 
 def add_arguments(parser: Any) -> None:

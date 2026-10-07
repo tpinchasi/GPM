@@ -437,3 +437,39 @@ async def test_the_markets_best_offer_is_the_one_the_pool_would_rent(db):
     preview = await fleet.market_preview(search=True)
     first = preview["best"][0]
     assert (first["connection"], first["priced"]) == ("spot", "spot") and first["per_worker_hour"] is not None
+
+
+# --- the market across providers (providers.md §7.2, step 4) ---
+
+
+async def test_the_market_says_what_each_provider_returned_and_which_offer_the_pool_would_rent(db):
+    fleet = make_fleet(db, {
+        "bids": FakeProvider(offers=[bid_offer("b-1", "mb-1", 0.30), bid_offer("b-2", "mb-2", 5.0)]),
+        "fixed": FakeProvider(offers=[fixed_offer("f-1", "mf-1", 0.20)], capabilities=FIXED_CAPS),
+        "off": FakeProvider(offers=[fixed_offer("o-1", "mo-1", 0.01)], capabilities=FIXED_CAPS),
+    }, enabled=["bids", "fixed"])
+    preview = await fleet.market_preview(search=True, kinds="both")
+    lines = preview["by_connection"]
+    # The $5 one is filtered by the provider itself (D123): never returned, never seen.
+    assert lines["bids"]["asked"] and lines["bids"]["seen"] == 1 and lines["bids"]["passed"] == 1
+    assert lines["fixed"]["seen"] == 1 and lines["fixed"]["rejected_by_reason"] == {}
+    assert not lines["off"]["asked"] and lines["off"]["why_not"] == "turned off"
+    (picked,) = [row for row in preview["best"] if row["would_rent"]]
+    # The first, in the order the pool rents in, of the kinds its mode lets it rent by itself — this
+    # pool bids only, so not the cheaper fixed price the market also lists (the UX review's finding).
+    allowed = [row for row in preview["best"] if row["kind"] == "interruptible"]
+    assert fleet.rented.mode == "interruptible" and picked == allowed[0]
+    narrowed = await fleet.market_preview(search=True, kinds="both", connections=["bids"])
+    assert not any(row["would_rent"] for row in narrowed["best"]), "a narrowed search is not the pool's pick"
+
+
+async def test_a_search_can_be_narrowed_to_some_providers(db):
+    bids = FakeProvider(offers=[bid_offer("b-1", "mb-1", 0.30)])
+    fixed = FakeProvider(offers=[fixed_offer("f-1", "mf-1", 0.20)], capabilities=FIXED_CAPS)
+    fleet = make_fleet(db, {"bids": bids, "fixed": fixed})
+    preview = await fleet.market_preview(search=True, kinds="both", connections=["fixed"])
+    assert {row["connection"] for row in preview["best"]} == {"fixed"}
+    assert preview["by_connection"]["bids"]["why_not"] == "not chosen for this search"
+    assert "search_offers" not in bids.calls, "a provider not chosen is not asked"
+    with pytest.raises(ValueError, match="not a provider this pool searches"):
+        await fleet.market_preview(search=True, connections=["elsewhere"])

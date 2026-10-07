@@ -3,7 +3,8 @@
 > Status: **built and deployed** (D115, D116, D117; 2026-09-29); **several models per workload
 > built** (D118, §12; 2026-09-30), against the fake provider. The first
 > provider (Vast) does not yet offer volumes or copies to the pool (§6): both stay off there until
-> checked live.
+> checked live. **Keeping models between hosts on a model volume** (D139, §6) is built against the fake provider
+> and RunPod's API, and checked live on RunPod end to end (2026-10-07: filled, copied, served, deleted).
 
 A **workload** is a named unit inside one pool that owns one to four models (§12), a lease, its own rented
 hosts, its own key, and its own sizing and machine choice. Several workloads run side by side in
@@ -172,15 +173,43 @@ Preparing a host means getting its models onto its disk. Three ways, tried in th
 provider capability the fake provider implements and each recording what it did and how long
 it took, so the history shows what each saved:
 
-1. **A warm machine.** With `workloads.keep_models_on_machine: true`, the pool creates a local
-   volume with the workload's first host, mounted where its engine keeps models (the engine's
-   `models_dir`), labelled with the pool and workload (`gpm/<pool>/<workload>/models`; with several
-   groups, one volume per group, `…/models-<n>`, holding that group's builds — §12). When the workload next needs a host — scale-up, or after an eviction — an offer
-   on a machine holding such a volume is preferred in the ranking, and a host prepared from it is
-   created with the volume attached and fetches nothing. The volume's storage is spend: it is
-   estimated into the lease's ledger at the provider's rate while it exists, and it is deleted
-   when the workload ends (the sweep deletes any volume under the pool's label whose workload is
-   gone). A machine that is not free again is simply not offered; nothing waits for it.
+1. **A model volume** (D139). Where the operator has turned on **Keep models between hosts** for
+   a provider account (providers.md §1) — offered only by a provider whose storage reaches a data
+   center — the pool creates a volume with a workload's first host there, in that host's data
+   center, labelled with the pool and workload (`gpm/<pool>/<workload>/models`; with several
+   groups, one per group, `…/models-<n>`, holding that group's builds — §12). It is the workload's
+   own: its storage is spend, estimated into the lease's ledger at the provider's rate while it
+   exists and counted when a budget is checked, and it is deleted when the workload ends (the sweep
+   deletes any volume under the pool's label whose workload is gone).
+   - **The engine never runs from it.** Every host keeps its models on its own disk. The first host
+     is ready as soon as its own fetch ends, and fills the volume behind that, while it serves; the
+     volume is ready once its agent says the fill is done. It fills by copying its verified files up into a fresh directory
+     that is renamed into place, named by its *build* — a digest of the hub's file list with each
+     file's hash, so a repository changed upstream is a new build that replaces the old; only one host
+     fills at a time, and another is named only once the provider shows the first gone. Every later
+     host copies from the volume **by the hub's file list, each file checked against the hash the hub
+     publishes**, and fetches from the hub whatever is missing or does not match (host-agent.md
+     §2.1). The volume is a cache never trusted: a host that wrote junk into it harms no other host.
+     A build is never changed in place: a new one is filled into a directory of its own, and the
+     filler clears the older one first — a host still copying it takes those files from the hub.
+     Hosts that start together never wait for it: while one fills it, the others are created without
+     it and fetch from the hub at once — only a host created once it is ready copies from it.
+   - **The ranking** prefers an offer that lands in the volume's data center by no more than the
+     download it saves, priced at the offer's hourly rate — from the pool's own times for the two
+     ways, an estimate until it has them. A data center with nothing that fits is passed over, and
+     those hosts fetch from the hub; nothing waits for it. A volume that no longer holds the hub's
+     current build — its hosts report every file missing — is marked stale: not preferred, and the
+     next host there fills the new build. A file that did not match marks it stale the same way.
+   - **With a volume, a host is released, not parked**: the models outlive it anyway.
+   - **The workload's plan says it before anything is spent**, in the workload's own hours and
+     budget, not per month: *“keeps a 40 GB model volume at runpod, in the first host's data center —
+     $0.0039/h, $0.02 over 6 h, in the budget; deleted when the workload ends”*.
+   - **Each host records where its models came from and how long it took** — from the volume, from
+     the hub, or both with how many files did not match — on the host, in the feed and summed on the
+     workload, so the operator can see whether the volume pays.
+   - A provider whose volumes are bound to one machine (Vast) is not offered this: the machine is
+     rarely free again, and the volume bills the whole time. D116's warm machine and
+     `keep_models_on_machine` are retired (D139); the plug-in interface keeps the machine-bound kind.
 2. **A copy from a sibling.** With a ready host of the workload, the provider copies the models
    directory from it to the new instance before the agent is asked to fetch. The agent's fetch
    then finds every file and the complete marker already there and holds the model at once.
@@ -192,7 +221,8 @@ it took, so the history shows what each saved:
 A way that fails falls through to the next, with the failure in the event log. A copy that does
 not finish within `workloads.copy_timeout_s` (at most half the preparing window) gives its host up
 instead: a copy the provider may still be running is never raced by a fetch into the same place. Which way to
-try is per workload (`workloads.model_sources`, default `[warm, sibling, hub]`).
+try is per workload (`workloads.model_sources`, default `[volume, sibling, hub]`; `warm` is read as
+`volume`).
 
 ## 7. Lifecycle
 
@@ -233,8 +263,7 @@ workloads:
   rotation_grace_minutes: 30
   min_reliability: 0.95
   eviction_prior_per_hour: 0.10   # until a machine has a history of its own
-  keep_models_on_machine: true    # D116 §6.1: a local volume with the models, reused
-  model_sources: [warm, sibling, hub]
+  model_sources: [volume, sibling, hub]   # the volume where the provider account keeps models (D139)
 ```
 
 ## 10. What is refused
@@ -319,7 +348,7 @@ gpm workload create research --hours 6 --max-spend 25 \
   holds. *Together* is one group of every model; *apart* is one group per model. A host's group is
   the set of models it was bought for. A group is what scales — its own floor (its hosts at the
   start), its load and waiting requests (for its models only), its ceiling (its models' answers at
-  once), its reservation, its parked hosts, its warm volume and its sibling copies. The lease's
+  once), its reservation, its parked hosts, its model volume and its sibling copies. The lease's
   `workers` is every model's answers at once together.
 - **Placement.** `auto` prices both from one market search, re-priced and ranked per group, by the
   rental-kind rule (§5): the cheaper expected cost over the hours is kept; within 1% they are equal

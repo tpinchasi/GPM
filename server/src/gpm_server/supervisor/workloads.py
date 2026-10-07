@@ -315,7 +315,7 @@ class Workloads:
             "placement": chosen_name,
             "groups": [{k: g[k] for k in ("models", "builds", "hosts_at_start", "workers_per_host", "caps",
                                           "cards_per_copy", "first_host", "sizing", "latency_curves",
-                                          "minutes_to_serve", "hourly_total")} for g in groups],
+                                          "minutes_to_serve", "hourly_total", "model_volume")} for g in groups],
             "offers_passed": option["offers_passed"],
             "workers_per_host": first["workers_per_host"],
             "workers_measured": all(g["measured"] for g in groups),
@@ -425,8 +425,21 @@ class Workloads:
                                                  fixed_workers=per_host, have=per_host * (hosts - 1))
                 first_cost = next((c for c in shared if (c.connection, c.offer_id, c.interruptible)
                                    == (first.connection, first.offer_id, first.interruptible)), first_cost)
+            # Where the first host's provider keeps models between hosts (D139), the volume it would
+            # make: said before anything is spent, in the workload's own hours and budget.
+            volume = None
+            if fleet.keeps_models(first.connection) and first.locations:
+                size = fleet._volume_size(models, group_builds)
+                volume_hourly = size * (first.volume_per_gb_hourly or 0.0)
+                volume = {"connection": first.connection, "size_gb": size, "hourly": round(volume_hourly, 6),
+                          "over_hours": round(volume_hourly * req.hours, 4)}
+                kind_reasons = [*kind_reasons,
+                                f"keeps a {size} GB model volume at {first.connection}, in the first host's data "
+                                f"center — ${volume_hourly:.4f}/h, ${volume_hourly * req.hours:.2f} over "
+                                f"{req.hours:g} h, in the budget; deleted when the workload ends"]
             groups.append({
                 "models": list(models), "builds": group_builds, "hosts_at_start": hosts, "workers_per_host": per_host,
+                "model_volume": volume,
                 "caps": caps, "cards_per_copy": cards, "sizing": sizing, "latency_curves": curves, "measured": measured,
                 "kind_reasons": kind_reasons, "offers_passed": len(ranked),
                 "first_host": {
@@ -435,13 +448,15 @@ class Workloads:
                     "hourly": round(first_cost.hourly, 4), "expected_per_worker_hour": first_cost.per_worker_hour,
                     "reasons": first_cost.reasons,
                 },
-                "hourly_total": round(hosts * first_cost.hourly, 4),
-                "expected": first_cost.expected * hosts,
+                "hourly_total": round(hosts * first_cost.hourly + (volume["hourly"] if volume else 0.0), 4),
+                "expected": first_cost.expected * hosts + (volume["over_hours"] if volume else 0.0),
                 "minutes_to_serve": round(ready_h * 60, 1),
             })
         return {
             "refused": None, "groups": groups, "hosts": sum(g["hosts_at_start"] for g in groups),
-            "hourly": sum(g["hosts_at_start"] * g["first_host"]["hourly"] for g in groups),
+            # The hosts and their model volumes (D139): a volume bills whether or not a host has it.
+            "hourly": sum(g["hosts_at_start"] * g["first_host"]["hourly"]
+                          + (g["model_volume"]["hourly"] if g.get("model_volume") else 0.0) for g in groups),
             "expected": round(sum(g["expected"] for g in groups), 4),
             "offers_passed": min(g["offers_passed"] for g in groups),
         }
@@ -802,8 +817,17 @@ class Workloads:
                  "kind": "interruptible" if h.interruptible else "on_demand", "hourly": round(h.bid_hourly, 4),
                  "priced": ("bid" if h.offer.bidding else "spot") if h.interruptible else "on_demand",
                  "connection": h.connection_name,
-                 "models": list(h.models)}
+                 "models": list(h.models),
+                 # Where its models came from: its workload's model volume, a sibling, the hub (D139).
+                 "models_source": h.models_source}
                 for h in hosts
+            ],
+            # Its model volumes, where models are kept between hosts (D139).
+            "volumes": [
+                {"volume_id": v.volume_id, "connection": v.connection, "location": v.location, "size_gb": v.size_gb,
+                 "hourly": v.hourly, "state": v.state, "filler": v.filler, "models": sorted((v.builds or {}).keys()),
+                 "spent": round(v.hourly * max(0.0, time.time() - v.created_at) / 3600, 4)}
+                for v in self.store.volumes(workload.name) if v.location is not None
             ],
             "lease": {
                 "lease_id": workload.lease_id,

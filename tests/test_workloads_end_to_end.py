@@ -308,3 +308,25 @@ def test_a_model_is_either_shared_or_workloads_only():
         PoolConfig.model_validate({**base, "catalog": {"w": {"variants": [{"tag": "w"}]}}})
     with pytest.raises(ValueError, match="either the shared hosts'"):
         PoolConfig.model_validate({**base, "catalog": {"a": {"variants": [{"tag": "a"}], "workloads_only": True}}})
+
+
+def test_a_plan_where_models_are_kept_says_what_the_volume_costs_in_the_workloads_hours(pool):
+    # D139: said before anything is spent — in the workload's own hours and budget, not per month.
+    import dataclasses
+
+    from gpm_server.supervisor.workloads import WorkloadRequest
+
+    fleet = pool.supervisor.fleet
+    fleet.provider.capabilities = dataclasses.replace(fleet.provider.capabilities, volumes=True,
+                                                      volume_reach="data_center")
+    fleet.provider.offers = [default_offer("o-1", "m-1", min_bid_hourly=0.20, locations=("EU-1",),
+                                           volume_per_gb_hourly=0.0001)]
+    request = WorkloadRequest(name="kept", model=BIG, latency_s=30, parallel=2, hours=6, max_spend=3.0)
+    plain = pool.loop.run(pool.supervisor.workloads.plan(request))
+    assert plain["groups"][0]["model_volume"] is None, "not kept unless the account keeps models"
+
+    fleet.rented.providers["fake"].keep_models = True
+    plan = pool.loop.run(pool.supervisor.workloads.plan(request))
+    volume = plan["groups"][0]["model_volume"]
+    assert volume["size_gb"] >= 10 and volume["over_hours"] == pytest.approx(volume["hourly"] * 6, rel=0.01)
+    assert any("model volume" in r and "over 6 h, in the budget" in r for r in plan["reasons"])

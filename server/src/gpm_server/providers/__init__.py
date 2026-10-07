@@ -24,6 +24,7 @@ from .base import (
     takes_credential,
 )
 from .fake import FakeProvider, default_offer
+from .runpod import RunPodProvider
 from .vast import VastProvider
 
 __all__ = [
@@ -46,6 +47,7 @@ __all__ = [
     "ProviderNotFound",
     "ProviderRateLimited",
     "ProviderUnavailable",
+    "RunPodProvider",
     "VastProvider",
     "default_offer",
     "get_provider",

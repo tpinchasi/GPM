@@ -96,12 +96,27 @@ def register(
         live = [h for h in fleet.hosts.values() if not h.released and fleet.resolve(h.connection_name) == name]
         held = fleet.held_at(name)
         view = accounts.presentation_of(type_name, provider)
+        if provider is None:
+            # Not running yet: what its class says of itself, for the card's price and note.
+            try:
+                known = plugin_presentation(type_name)
+                view.update({k: known.get(k) for k in ("volume_price_per_gb_month", "volume_note")})
+            except Exception:  # noqa: BLE001 — an unknown plug-in: nothing more to say
+                pass
         view.update({
             "connection": name,
             "configured": conn is not None,
             "enabled": bool(conn is not None and conn.enabled),
             "settings": redacted(dict(conn.settings)) if conn is not None else {},
             "interruption_prior_per_hour": conn.interruption_prior_per_hour if conn is not None else None,
+            # Keep models between hosts (D139): on or off, and whether this provider can at all —
+            # only where its volumes reach a data center.
+            "keep_models": bool(conn is not None and conn.keep_models),
+            # From the running plug-in, else its class: an account not running yet still says truly
+            # what its provider can keep.
+            "volume_reach": _reach(provider) if provider is not None else _reach_of_type(type_name),
+            "model_volumes": sum(1 for v in fleet.workload_store.volumes()
+                                 if v.location is not None and fleet.resolve(v.connection or fleet.legacy_connection) == name),
             "credential_env": conn.credential_env if conn is not None else None,
             "credential": accounts.describe(name, provider) if provider is not None and name in accounts.built else None,
             "pending": accounts.pending.get(name),
@@ -110,7 +125,10 @@ def register(
             "search_error": fleet.searching[name].error if name in fleet.searching else None,
             "rented": sum(1 for h in live if h.state != "parked"),
             "parked": sum(1 for h in live if h.state == "parked"),
-            "hourly": round(sum(h.bid_hourly for h in live), 4),
+            # Hosts and their model volumes' storage, which bills whether or not a host has one.
+            "hourly": round(sum(h.bid_hourly for h in live) + sum(
+                v.hourly for v in fleet.workload_store.volumes()
+                if v.location is not None and fleet.resolve(v.connection or fleet.legacy_connection) == name), 4),
             "volumes": sum(1 for record, _ in held if record.startswith("volume:")),
             "held_back": len(fleet.pending_adoption.get(name, [])),
             "holds": len(held),
@@ -292,6 +310,17 @@ def register(
         for key in ("interruption_prior_per_hour", "credential_env"):
             if key in body:
                 wanted[key] = body[key]
+        if "keep_models" in body:
+            if not isinstance(body["keep_models"], bool):
+                return error(400, "bad_request", "`keep_models` is true or false")
+            provider = supervisor.fleet.providers.get(name)
+            reach = _reach(provider) if provider is not None else _reach_of_type(conn.type)
+            if body["keep_models"] and reach != "data_center":
+                return error(409, "cannot_keep_models", (
+                    f"{name} keeps a volume on one machine only: it would help only when that same machine is "
+                    "free again, which is rare, and it is billed the whole time" if reach == "machine"
+                    else f"{name} keeps no storage between hosts"))
+            wanted["keep_models"] = body["keep_models"]
         if not wanted:
             return error(400, "bad_request", "nothing to change")
         text, version = supervisor.store.read()
@@ -511,6 +540,22 @@ def _unredacted(sent: Any, kept: Any) -> Any:
             continue
         out[key] = _unredacted(value, was) if isinstance(value, dict) else value
     return out
+
+
+def _reach(provider: Any) -> Optional[str]:
+    """How far a provider's kept storage reaches, as its plug-in declares it (D139)."""
+    capabilities = provider.capabilities
+    return capabilities.reach or capabilities.volume_reach
+
+
+def _reach_of_type(type_name: str) -> Optional[str]:
+    try:
+        capabilities = plugin_presentation(type_name).get("capabilities") or {}
+    except Exception:  # noqa: BLE001 — an unknown or broken plug-in: nothing to say
+        return None
+    if capabilities.get("volumes"):
+        return capabilities.get("volume_reach") or "machine"
+    return capabilities.get("volume_reach")
 
 
 async def _steps(provider: Any, label_prefix: str, credential: Optional[str], unsaved: bool) -> list[dict[str, Any]]:

@@ -840,21 +840,27 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             return JSONResponse({"plan": [], "detail": "this pool cannot rent"})
         return JSONResponse({"plan": await supervisor.fleet.plan(supervisor._ready_workers())})
 
+    def _named(connections: Optional[str]) -> Optional[list[str]]:
+        """`connections=a,b`: search only these providers (providers.md §7.2)."""
+        return [n for n in connections.split(",") if n] if connections is not None else None
+
     @app.get("/pool/market/preview")
-    async def market_preview(hours: float = 4.0, kinds: Optional[str] = None, search: bool = False) -> JSONResponse:
+    async def market_preview(hours: float = 4.0, kinds: Optional[str] = None, search: bool = False,
+                             connections: Optional[str] = None) -> JSONResponse:
         """Read-only: the live market through the pool's own filters. Spends nothing. The market
         is asked only with `search=true`; without it, the settings only (D120, D122) — a page or
         script that asks by habit never spends the provider's daily search quota."""
         if supervisor.fleet is None:
             return _error(400, "cannot_rent", "this pool has no rented capacity configured")
         try:
-            return JSONResponse(await supervisor.fleet.market_preview(hours=hours, kinds=kinds, search=search))
+            return JSONResponse(await supervisor.fleet.market_preview(
+                hours=hours, kinds=kinds, search=search, connections=_named(connections)))
         except ValueError as exc:
             return _error(400, "bad_kinds", str(exc))
 
     @app.post("/pool/market/preview")
     async def market_preview_unsaved(request: Request, hours: float = 4.0, kinds: Optional[str] = None,
-                                     search: bool = False) -> JSONResponse:
+                                     search: bool = False, connections: Optional[str] = None) -> JSONResponse:
         """The same pipeline with the values **currently in the form, not yet saved** — which
         is what makes moving a ceiling and watching "4 pass" become "0 pass" possible."""
         if supervisor.fleet is None:
@@ -868,6 +874,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     bidding=body.get("bidding"),
                     kinds=kinds,
                     search=search,
+                    connections=_named(connections),
                 )
             )
         except (TypeError, ValueError) as exc:

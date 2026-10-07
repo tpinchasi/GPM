@@ -65,7 +65,12 @@ async def ask(agent: AgentConfig, *, transport: Optional[httpx.AsyncBaseTranspor
         facts = response.json()
     except ValueError:
         return AgentView(False, "the agent's answer was not JSON")
-    spoken = str((facts.get("agent") or {}).get("protocol"))
+    # The host is not trusted: an answer of the wrong shape is no answer, never an exception in
+    # the supervisor's pass.
+    if not isinstance(facts, dict) or not isinstance(facts.get("agent"), dict) or (
+            "engine" in facts and not isinstance(facts["engine"], dict)):
+        return AgentView(False, "the agent's answer was not in the shape of its facts")
+    spoken = str(facts["agent"].get("protocol"))
     if spoken != PROTOCOL:
         return AgentView(False, f"the agent speaks protocol {spoken}; this pool speaks {PROTOCOL}")
     return AgentView(True, facts=facts)

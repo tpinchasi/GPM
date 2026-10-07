@@ -137,7 +137,7 @@ def test_each_model_gets_its_own_engine_and_the_router_takes_the_pools_port(tmp_
     router = processes.started[-1]
     assert router[:3] == ["python3", "/var/run/gpm/gpm-agent.pyz", "proxy"]
 
-    upstreams = json.loads((tmp_path / vllm_launch.UPSTREAMS_FILE).read_text())
+    upstreams = json.loads((vllm_launch.state_dir_for(tmp_path) / vllm_launch.UPSTREAMS_FILE).read_text())
     assert upstreams == {name: [f"http://127.0.0.1:{e['port']}"] for name, e in engines.items()}
 
 
@@ -167,6 +167,31 @@ def test_starting_again_stops_what_the_last_start_began(tmp_path):
 
     assert (first_pid, signal.SIGTERM) in processes.killed
     assert len(processes.started) == 2
+
+
+def test_models_that_arrive_with_another_machines_state_bring_none_of_it(tmp_path):
+    # A sibling's copy or a reused volume brings whatever was in its models directory (D139).
+    # Another machine's process ids must never be signalled here, nor its record read as ours.
+    models = tmp_path / "models"
+    downloaded(models, BIG, 1000)
+    elsewhere = tmp_path / "elsewhere"
+    downloaded(elsewhere, BIG, 1000)
+    processes = Processes()
+    theirs = processes.launch(elsewhere)
+    for name in vllm_launch.LEGACY_STATE[:2]:
+        source = vllm_launch.state_dir_for(elsewhere) / name
+        (models / name).write_text(source.read_text())
+    (their_pid,) = theirs.pids()
+    processes.killed.clear()
+
+    assert vllm_launch.read_record(models) is None, "their record is not this machine's"
+    assert vllm_launch.failed_engines(models, served=[]) == {}
+    processes.launch(models)
+
+    assert (their_pid, signal.SIGTERM) not in processes.killed
+    assert not any((models / name).exists() for name in vllm_launch.LEGACY_STATE), "removed, unread"
+    assert not any(p.name.startswith(".gpm") for p in models.iterdir()), "nothing of ours in the models"
+    assert vllm_launch.read_record(models)["engines"], "ours is kept beside them"
 
 
 def test_a_process_already_gone_is_not_an_error(tmp_path):
@@ -410,7 +435,7 @@ def test_every_model_runs_once_on_each_card_pinned_to_it(tmp_path):
     shares = {(e["model"], e["card"]): e["memory_share"] for e in engines}
     assert all(shares[(m, "0")] == shares[(m, "1")] for m in (BIG, SMALL, EMBED))
 
-    upstreams = json.loads((tmp_path / vllm_launch.UPSTREAMS_FILE).read_text())
+    upstreams = json.loads((vllm_launch.state_dir_for(tmp_path) / vllm_launch.UPSTREAMS_FILE).read_text())
     for model in (BIG, SMALL, EMBED):
         assert len(upstreams[model]) == 2, "the router is told about both copies"
     assert started.proxy["port"] == 8000
@@ -619,3 +644,17 @@ def test_a_marker_that_cannot_be_read_vouches_for_nothing(tmp_path):
     for unreadable in ("", "not a size"):
         (into / modelhub.COMPLETE_MARKER).write_text(unreadable)
         assert not modelhub.is_complete(into)
+
+
+def test_an_upgraded_host_stops_its_older_launchers_engines_and_nothing_else(tmp_path):
+    # On a host upgraded in place, the older launcher's engines still hold the cards; its list is
+    # in the models directory. Only processes that are an engine by their own command line are
+    # stopped — the list may as well be another machine's (the code review's finding).
+    downloaded(tmp_path, BIG, 1000)
+    processes = Processes()
+    processes.alive.update({4242, 4343})
+    (tmp_path / vllm_launch.PIDS_FILE).write_text("[4242, 4343]")
+    lines = {4242: b"python3\x00-m\x00vllm\x00serve", 4343: b"/usr/sbin/sshd"}
+    processes.launch(tmp_path, cmdline=lines.get)
+    assert (4242, signal.SIGTERM) in processes.killed and not any(pid == 4343 for pid, _ in processes.killed)
+    assert not (tmp_path / vllm_launch.PIDS_FILE).exists()
