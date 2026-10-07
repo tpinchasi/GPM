@@ -24,6 +24,10 @@ env
 .env
 .env.*
 
+# Provider credentials typed into the console (D134): the supervisor keeps them in owner-only
+# files beside the pool's database, which in a working copy is often this directory.
+provider-credentials/
+
 # The forwarder's logs, kept beside the pool's database (D110).
 gpm-forwarder.log
 /forwards/
