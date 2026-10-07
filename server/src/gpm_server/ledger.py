@@ -258,10 +258,13 @@ class SpendLedger:
     def __init__(self, database: Database):
         self.db = database
 
-    def record(self, *, lease_id: Optional[str], host_id: Optional[str], source: str, amount: float) -> None:
+    def record(self, *, lease_id: Optional[str], host_id: Optional[str], source: str, amount: float,
+               connection: Optional[str] = None) -> None:
+        """`connection`: the provider connection the money went to (D129); None for a row from
+        before connections, read as the pool's legacy connection."""
         self.db.execute(
-            "INSERT INTO spend (ts, lease_id, host_id, source, amount) VALUES (?, ?, ?, ?, ?)",
-            (time.time(), lease_id, host_id, source, amount),
+            "INSERT INTO spend (ts, lease_id, host_id, source, amount, connection) VALUES (?, ?, ?, ?, ?, ?)",
+            (time.time(), lease_id, host_id, source, amount, connection),
         )
 
     def latest_for_lease(self, lease_id: str) -> dict[str, float]:

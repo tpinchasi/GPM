@@ -50,7 +50,8 @@ limits:
   max_hourly_burn: 0.50
 
 rented:
-  provider: vast
+  providers:
+    vast: { type: vast }       # a connection: a name, and the provider plug-in it uses
   image: ollama/ollama:0.34.2  # pinned, never a floating tag
   workers: 2                   # per card: a two-card machine runs twice this
   capabilities: [cuda]

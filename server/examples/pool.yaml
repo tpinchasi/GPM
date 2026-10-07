@@ -97,7 +97,8 @@ limits:
   max_hourly_burn: 1.00
 
 rented:
-  provider: vast               # the account credential is read from VAST_API_KEY, never from here
+  providers:                   # one connection per provider account, by name (D129)
+    vast: { type: vast }       # the account credential is read from VAST_API_KEY, never from here
   image: ollama/ollama:0.34.2  # pinned, never a floating tag
   workers: 2                   # per card: a two-card machine runs twice this
   capabilities: [cuda]

@@ -145,6 +145,17 @@ def plan_changes(
             needs_restart=True,
         ))
 
+    # --- provider connections (D129) ---
+    were = current.rented.providers if current.rented else {}
+    become = candidate.rented.providers if candidate.rented else {}
+    if were != become:
+        changes.append(Change(
+            "providers",
+            "the provider connections change; the supervisor rents through the connection it was started "
+            "with until it is restarted — renaming the connection also starts a new count of today's searches",
+            needs_restart=True,
+        ))
+
     # --- capacity profiles ---
     def profiles(config: PoolConfig) -> dict[str, tuple[int, Optional[str]]]:
         found = {}

@@ -155,7 +155,7 @@ class Supervisor:
             self.fleet = Fleet(
                 config,
                 config.rented,
-                provider or get_provider(config.rented.provider, config.rented.provider_settings),
+                provider or get_provider(config.rented.connection.type, config.rented.connection.settings),
                 self.leases,
                 self.events,
                 self.spend,
@@ -268,6 +268,8 @@ class Supervisor:
 
     async def start(self) -> None:
         self.lock.acquire()
+        if self.fleet is not None:
+            self.fleet.claim_records()
         self.ensure_forwarder()
         for host in self.hosts.values():
             if host.tunnel is not None:

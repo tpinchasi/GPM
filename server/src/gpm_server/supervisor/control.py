@@ -681,6 +681,8 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 "provider": (
                     {
                         "name": fleet.provider.name,
+                        # The connection it is configured as (D129).
+                        "connection": fleet.connection,
                         "capabilities": vars(fleet.provider.capabilities),
                         "cap_safety_margin": fleet.margin(),
                         # Today's use of its daily search quota, where it has one (D121).
@@ -1479,6 +1481,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         return JSONResponse(
             {
                 "provider": supervisor.fleet.provider.name,
+                "connection": supervisor.fleet.connection,
                 "credential_valid": status.credential_valid,
                 "credit_remaining": status.credit_remaining,
             }
