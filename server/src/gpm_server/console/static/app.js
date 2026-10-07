@@ -161,8 +161,8 @@ function hostPanel(d) {
     ["workers", String(d.workers ?? "—")],
   ];
   if (d.bid_hourly !== undefined) {
-    facts.push(["rented as", d.interruptible === false
-      ? "on demand — a fixed price, cannot be outbid" : "a bid — can be outbid at any moment"]);
+    facts.push(["rented as", (PRICED[pricedOf(d)] || PRICED.bid)[2]
+      + (d.connection ? ` · through ${d.connection}` : "")]);
     facts.push(["cost", `${rate(d.bid_hourly)} · held ${((d.hours_held || 0) * 60).toFixed(0)} min · spent ${money(d.estimated_spend)} (provider says ${money(d.reported_spend)})`]);
     facts.push(["lease", d.lease_id || "—"]);
   }
@@ -703,7 +703,16 @@ function providerPanel(status, account) {
           el("div", { class: "muted" }, "Offers returned by this pool's searches today. Renting and replacing hosts need it; other tools using the same account key are counted only once the provider refuses.")),
       ] : []),
       el("div", { class: "k" }, "cap margin"), el("div", {}, `${(status.provider.cap_safety_margin * 100).toFixed(0)}%`,
-        el("span", { class: "muted" }, status.provider.capabilities.reports_charges ? " — narrows once a charge is reported" : " — wider: this provider reports no charges"))));
+        el("span", { class: "muted" }, status.provider.capabilities.reports_charges ? " — narrows once a charge is reported" : " — wider: this provider reports no charges"))),
+    (status.providers || []).length > 1 ? el("div", {},
+      el("h3", {}, "Provider accounts"),
+      el("p", { class: "muted" }, "The credential and credit above are the first account's. Each account's own:"),
+      el("table", {}, el("tbody", {}, status.providers.map((p) => el("tr", {},
+        el("td", {}, el("strong", {}, p.connection), el("div", { class: "muted" }, p.type)),
+        el("td", {}, p.enabled ? pill("searched", "ok") : pill("off")),
+        el("td", { class: "num" }, `${p.rented} rented · ${rate(p.hourly)}`),
+        el("td", {}, p.search_quota ? searchQuotaText(p.search_quota) : el("span", { class: "muted" }, "no search quota")),
+        el("td", {}, p.search_error ? el("span", { class: "error" }, p.search_error) : null)))))) : null);
 }
 
 function limitsPanel(status) {
@@ -747,7 +756,7 @@ async function rentedHostsTab(status) {
         // the wrong thing used to look exactly like one buying the right thing.
         el("td", {}, boughtFor(host)),
         el("td", { class: "muted" }, `${host.machine} · ${host.hardware || ""}`),
-        el("td", {}, host.interruptible === false ? pill("on demand", "ok") : pill("bid", "warn")),
+        el("td", {}, pricedPill(host), host.connection ? el("div", { class: "muted" }, host.connection) : null),
         el("td", { class: "num" }, rate(host.bid_hourly)),
         el("td", { class: "num" }, rate(host.storage_hourly)),
         el("td", { class: "num" }, `${(host.hours_held ?? 0).toFixed(2)}h`),
@@ -1654,8 +1663,8 @@ const allocation = { inputs: {}, mode: null, message: "" };
 // never asks the on-demand listing, so a fixed-price host is not rejected, it is never seen.
 // That was invisible here: the rejection list only names offers that were looked at.
 const MODES = [
-  ["interruptible", "interruptible — bid, and accept being outbid"],
-  ["on_demand", "on demand — fixed price, cannot be outbid"],
+  ["interruptible", "interruptible — a bid or a spot price; can be taken away"],
+  ["on_demand", "on demand — fixed price; nothing can take it away"],
   ["cheaper", "cheaper — search both listings, take whichever costs less"],
 ];
 
@@ -2005,9 +2014,12 @@ const marketPanel = (market) => {
     return el("div", { class: "panel" },
       el("p", { class: "error" }, "The market could not be asked, so this is not a picture of what is out there."),
       el("p", { class: "mono" }, market.problem),
-      el("p", { class: "muted" }, "Nothing can be rented until this clears. The provider limits searches by a daily quota of offers returned (Vast: 20,000, reset at 00:00 UTC) — once it is spent, every search is refused until the reset."));
+      el("p", { class: "muted" }, "Nothing can be rented until a provider answers. A provider may limit searches by a daily quota of offers returned — once it is spent, every search is refused until it resets."));
   }
-  return el("div", {}, avoidedNote, el("div", { class: "grid" },
+  const unasked = Object.entries(market.provider_errors || {});
+  const unaskedNote = unasked.length ? el("p", { class: "warn-text" },
+    `${unasked.map(([name, why]) => `${name} could not be asked (${why})`).join("; ")} — the offers below are the other providers' only.`) : null;
+  return el("div", {}, unaskedNote, avoidedNote, el("div", { class: "grid" },
     el("div", { class: "panel" },
       el("div", { class: "stat" }, `${market.passed} pass · ${market.rejected} rejected`),
       el("div", { class: "muted" }, `${market.seen} offers seen through your policy`),
@@ -2032,14 +2044,15 @@ const marketPanel = (market) => {
           el("th", {}, "Hardware"), el("th", {}, "Kind"), el("th", { class: "num" }, "Floor"), el("th", { class: "num" }, "Would pay"),
           el("th", { class: "num" }, "On-demand"), el("th", { class: "num" }, "$/GB"),
           el("th", { class: "num", title: "Workers a host rented from this offer would run" }, "Workers"),
-          el("th", { class: "num" }, "Score"), el("th", {}, ""))),
+          // What the list is ordered by, and what the pool rents by (D131); the score only filters.
+          el("th", { class: "num", title: "Expected cost per worker-hour: the price, interruptions, the download and this machine's record here — the pool rents the lowest" }, "Per worker-hour"),
+          el("th", {}, ""))),
         el("tbody", {}, (market.best || []).map((offer, index) => el("tr", {},
           el("td", {}, index === 0 ? el("strong", {}, offer.hardware) : offer.hardware,
             el("div", { class: "muted mono" }, `${offer.machine} · ${offer.gpu_memory_gb}GB · ${offer.download_mbps}Mbps`)),
-          // A bid can be outbid at any moment; a fixed price cannot. Same machine, different deal.
-          el("td", {}, offer.kind === "on_demand"
-            ? pill("on demand", "ok") : pill("bid", "warn")),
-          el("td", { class: "num" }, offer.kind === "on_demand" ? "—" : rate(offer.floor)),
+          // A bid or a spot price can be taken away; a fixed price cannot. Same machine, different deal.
+          el("td", {}, pricedPill(offer), offer.connection ? el("div", { class: "muted" }, offer.connection) : null),
+          el("td", { class: "num" }, pricedOf(offer) === "bid" ? rate(offer.floor) : "—"),
           el("td", { class: "num" }, el("strong", {}, rate(offer.would_bid))),
           el("td", { class: "num" }, rate(offer.on_demand)),
           el("td", { class: "num" }, `$${Number(offer.download_per_gb).toFixed(4)}`),
@@ -2047,7 +2060,8 @@ const marketPanel = (market) => {
           el("td", { class: "num", title: offer.workers_from || "" },
             offer.workers ?? "—",
             offer.workers_from && offer.workers_from.startsWith("capacity profile") ? "" : el("span", { class: "muted" }, " default")),
-          el("td", { class: "num" }, Math.round(offer.score)),
+          el("td", { class: "num", title: `score ${Math.round(offer.score)}` },
+            offer.per_worker_hour == null ? "—" : `$${Number(offer.per_worker_hour).toFixed(4)}`),
           el("td", {}, offer.offer_id
             ? el("button", { class: "small", onclick: (e) => rentThis(e, offer) }, "Rent")
             : null))))))));
@@ -2056,23 +2070,41 @@ const marketPanel = (market) => {
 // Renting one particular offer, the way it is listed: this machine, as a bid or at its fixed
 // price. It is still the pool's policy deciding what may be rented — the list only shows what
 // passes — and if the offer has gone by the time it is asked for, nothing is rented instead.
+// How a host or offer is paid for (D132): a bid the pool sets, the provider's spot price, or a
+// fixed on-demand price. Both bid and spot can be taken away; on demand cannot.
+const PRICED = {
+  bid: ["bid", "warn", "a bid — can be outbid at any moment"],
+  spot: ["spot", "warn", "spot — the provider's price, which can change; it can be taken back at any time"],
+  on_demand: ["on demand", "ok", "on demand — a fixed price; nothing can take it away"],
+};
+function pricedOf(row) {
+  return row.priced || (row.interruptible === false || row.kind === "on_demand" ? "on_demand" : "bid");
+}
+function pricedPill(row) {
+  const [label, tone] = PRICED[pricedOf(row)] || PRICED.bid;
+  return pill(label, tone);
+}
+
 async function rentThis(event, offer) {
   const spend = Number(document.getElementById("prepare-spend")?.value || 1);
   const hours = Number(document.getElementById("prepare-hours")?.value || 1);
   const when = document.getElementById("prepare-when")?.value || "join";
-  const fixed = offer.kind === "on_demand";
+  const priced = pricedOf(offer);
   const ok = await confirmAction({
-    title: `Rent ${offer.hardware}?`,
+    title: `Rent ${offer.hardware}${offer.connection ? ` from ${offer.connection}` : ""}?`,
     body: el("div", {},
-      el("p", {}, fixed
-        ? `On demand at ${rate(offer.would_bid)} — a fixed price. Nobody can outbid it; it runs until the lease ends or you release it.`
-        : `A bid of ${rate(offer.would_bid)} (floor ${rate(offer.floor)}). Cheaper, and it can be outbid at any moment.`),
+      el("p", {}, priced === "on_demand"
+        ? `On demand at ${rate(offer.would_bid)} — a fixed price. Nobody can take it away; it runs until the lease ends or you release it.`
+        : priced === "spot"
+          ? `At the spot price, ${rate(offer.would_bid)}, set by the provider. It can change while the host runs, and the host can be taken back at any time.`
+          : `A bid of ${rate(offer.would_bid)} (floor ${rate(offer.floor)}). Cheaper, and it can be outbid at any moment.`),
       el("p", {}, `Worst case: ${money(spend)} over ${hours}h, this one host. Machine ${offer.machine} · ${offer.gpu_memory_gb} GB · ${offer.workers} workers.`),
       el("p", { class: "muted" }, "Cap and time limit come from the Prepare a host panel above. If this offer has gone, nothing else is rented in its place.")),
   });
   if (!ok) return;
   run(event.target, () => api.prepare({
     max_spend: spend, max_hours: hours, when_ready: when, offer_id: offer.offer_id, kind: offer.kind,
+    connection: offer.connection,
   }));
 }
 
@@ -2082,8 +2114,8 @@ function preparePanel() {
   const when = el("select", { id: "prepare-when" }, el("option", { value: "join" }, "join the pool"), el("option", { value: "park" }, "park it"), el("option", { value: "destroy" }, "destroy"));
   const kind = el("select", {},
     el("option", { value: "" }, "as the pool is configured"),
-    el("option", { value: "interruptible" }, "bid — cheaper, can be outbid"),
-    el("option", { value: "on_demand" }, "on demand — fixed price, cannot be outbid"));
+    el("option", { value: "interruptible" }, "interruptible — a bid or a spot price; cheaper, can be taken away"),
+    el("option", { value: "on_demand" }, "on demand — fixed price; nothing can take it away"));
   return el("div", { class: "panel" }, el("h2", {}, "Prepare a host"),
     el("p", { class: "muted" }, "Its own small lease: rent, load the model set, verify, then join, park or destroy. Borrows no authority from any other lease."),
     el("label", {}, "Dollar cap ", spend),
@@ -2242,10 +2274,10 @@ const workloadDraft = {
   // request, and stays open while it holds a draft.
   formOpen: false, formHolder: null, hasLive: null,
 };
-const KIND_LABELS = { roi: "Cheapest by the numbers", on_demand: "On demand only", interruptible: "Bids only" };
+const KIND_LABELS = { roi: "Cheapest by the numbers", on_demand: "On demand only", interruptible: "Interruptible only (bid or spot)" };
 const KIND_HINTS = {
-  roi: "on demand or a bid, whichever is expected to cost less over its hours, evictions counted",
-  on_demand: "never outbid; the listed price",
+  roi: "on demand, a bid or a spot price — whichever is expected to cost less over its hours, interruptions counted",
+  on_demand: "nothing can take it away; the listed price",
   interruptible: "cheapest; can be taken away, and a replacement is rented",
 };
 const WORKLOAD_STATES = { preparing: "warn", serving: "ok", ending: "", ended: "" };
@@ -2731,7 +2763,8 @@ function workloadDetail(w) {
           el("tbody", {}, w.hosts.map((h) => el("tr", {},
             el("td", {}, hostLink(h.host_id)), el("td", {}, pill(h.state)),
             el("td", { class: "mono" }, (h.models || []).join(", ")), el("td", {}, h.hardware),
-            el("td", {}, h.kind === "on_demand" ? "on demand" : "bid"), el("td", { class: "num" }, h.workers),
+            el("td", {}, pricedPill(h), h.connection ? el("div", { class: "muted" }, h.connection) : null),
+            el("td", { class: "num" }, h.workers),
             el("td", { class: "num" }, rate(h.hourly))))))
       : el("p", { class: "muted" }, hostsLine));
 }
@@ -3070,7 +3103,8 @@ screens.config = async () => {
                 ? el("ul", {}, plan.changes.map((change) => el("li", {},
                     change.detail,
                     change.requires_retype ? el("span", { class: "pill warn" }, " must be retyped ") : null,
-                    change.needs_restart ? el("span", { class: "pill warn" }, " needs a router restart ") : null)))
+                    change.needs_restart ? el("span", { class: "pill warn" }, ` needs a ${change.restarts || "router"} restart `) : null,
+                    change.refused ? el("div", { class: "error" }, `Refused: ${change.refused}`) : null)))
                 : el("p", { class: "muted" }, "The file parses to the same configuration."))
       );
     } catch (error) {

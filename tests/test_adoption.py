@@ -423,3 +423,171 @@ def test_a_host_recorded_before_connections_is_adopted_as_the_pools_first_connec
         loop.run(second.aclose())
     finally:
         database.close()
+
+
+def two_accounts(second_enabled=False, keep_second=True):
+    """`fake` as before, and a second provider beside it (D129)."""
+    made = config()
+    data = made.model_dump()
+    data["rented"].pop("provider", None)
+    data["rented"].pop("provider_settings", None)
+    data["rented"]["providers"] = {"fake": {"type": "fake"}}
+    if keep_second:
+        data["rented"]["providers"]["other"] = {"type": "other", "enabled": second_enabled}
+    data["limits"]["max_rented_hosts"] = 4  # a host at each account
+    return PoolConfig.model_validate(data)
+
+
+def test_a_second_account_that_cannot_be_asked_holds_back_only_its_own_hosts(tmp_path, market):
+    """Found by the review: adoption waited for every connection, so one disabled account with
+    no credential stopped every other account's caps, lease ends, sweep and renting."""
+    loop, provider, _ = market
+    other = FakeProvider()
+    database = Database(tmp_path / "gpm.sqlite3")
+    try:
+        first = Supervisor(two_accounts(), database, provider={"fake": provider, "other": other})
+        first.fleet.run_on_host = silent
+        loop.run(first.start())
+        host = rent_one(loop, first)
+        loop.run(first.aclose())
+
+        other.unavailable = True  # the disabled account cannot be asked
+        second = Supervisor(two_accounts(), database, provider={"fake": provider, "other": other})
+        second.fleet.run_on_host = silent
+        loop.run(second.start())
+        assert host.host_id in second.fleet.hosts, "the answering account's host is taken back"
+        assert not second._adoption_pending, "and the pass is not held for the other account"
+        loop.run(second.aclose())
+    finally:
+        database.close()
+
+
+def test_a_host_on_a_provider_removed_from_the_file_is_never_dropped(tmp_path, market):
+    """Found by the review: a row whose provider is no longer configured was dropped as gone —
+    nobody had asked — and its instance billed on, unswept."""
+    loop, provider, _ = market
+    other = FakeProvider(engine_urls=provider.engine_urls)
+    other.offers = list(provider.offers)
+    database = Database(tmp_path / "gpm.sqlite3")
+    try:
+        first = Supervisor(two_accounts(second_enabled=True), database, provider={"fake": provider, "other": other})
+        first.fleet.run_on_host = silent
+        loop.run(first.start())
+        first.config.rented.providers["fake"].enabled = False  # rent this one at the other account
+        host = rent_one(loop, first)
+        assert host.connection_name == "other"
+        loop.run(first.aclose())
+
+        second = Supervisor(two_accounts(keep_second=False), database, provider={"fake": provider})
+        second.fleet.run_on_host = silent
+        loop.run(second.start())
+        rows = {row.host_id for row in HostTable(database).all()}
+        assert host.host_id in rows, "kept: nothing was asked, so nothing is known"
+        assert any(e["kind"] == "adoption_deferred" and "no longer configured" in e["summary"]
+                   for e in second.events.recent(50))
+        loop.run(second.aclose())
+    finally:
+        database.close()
+
+
+def test_a_restart_with_one_account_unreachable_neither_freezes_nor_forgets_its_hosts(tmp_path, market):
+    """The second review: the retry handed adoption only the held-back rows, read "all held back"
+    as "nobody answered", and froze every pass; then publishing deleted those rows, and the next
+    supervisor would have swept the healthy hosts as strays (D61)."""
+    loop, provider, _ = market
+    other = FakeProvider(engine_urls=provider.engine_urls)
+    other.offers = list(provider.offers)
+    database = Database(tmp_path / "gpm.sqlite3")
+    try:
+        first = Supervisor(two_accounts(second_enabled=True), database, provider={"fake": provider, "other": other})
+        first.fleet.run_on_host = silent
+        loop.run(first.start())
+        first.config.rented.providers["fake"].enabled = False
+        at_other = rent_one(loop, first)
+        loop.run(first.aclose())
+
+        other.unavailable = True
+        second = Supervisor(two_accounts(second_enabled=True), database, provider={"fake": provider, "other": other})
+        second.fleet.run_on_host = silent
+        loop.run(second.start())
+        for _ in range(3):
+            loop.run(second.pass_once())
+        assert not second._adoption_pending, "the pass is not held for one account: the other one answered"
+        assert at_other.host_id in {row.host_id for row in HostTable(database).all()}, "the held-back record is kept"
+        deferred = [e for e in second.events.recent(100) if e["kind"] == "adoption_deferred"]
+        assert len(deferred) == 1, "said once, not every pass"
+
+        other.unavailable = False
+        loop.run(second.pass_once())
+        assert at_other.host_id in second.fleet.hosts, "taken back once its account answers"
+        assert at_other.instance.instance_id in other.instances, "and never swept as a stray"
+        loop.run(second.aclose())
+    finally:
+        database.close()
+
+
+def test_hosts_held_back_on_an_unreachable_account_are_not_rented_again_elsewhere(tmp_path, market):
+    """The third review: held-back hosts were outside the pool's limits — with one account
+    unreachable after a restart, the pool rented their demand again at the other, and both billed
+    (D129: the limits stay the pool's)."""
+    loop, provider, _ = market
+    other = FakeProvider(engine_urls=provider.engine_urls)
+    other.offers = list(provider.offers)
+    database = Database(tmp_path / "gpm.sqlite3")
+    try:
+        first = Supervisor(two_accounts(second_enabled=True), database, provider={"fake": provider, "other": other})
+        first.fleet.run_on_host = silent
+        loop.run(first.start())
+        first.config.rented.providers["fake"].enabled = False
+        at_other = rent_one(loop, first)
+        loop.run(first.aclose())
+
+        other.unavailable = True
+        second = Supervisor(two_accounts(second_enabled=True), database, provider={"fake": provider, "other": other})
+        second.fleet.run_on_host = silent
+        loop.run(second.start())
+        for _ in range(4):
+            loop.run(second.pass_once())
+        assert not provider.instances, "nothing rented at the answering account in the held host's place"
+        assert any(e["kind"] == "rent_refused" and "not yet asked" in e["summary"]
+                   for e in second.events.recent(30)), "and says why"
+        assert len(second.fleet.held_back_rows()) == 1
+        assert second.fleet.held_back_burn() == pytest.approx(at_other.bid_hourly)
+        loop.run(second.aclose())
+    finally:
+        database.close()
+
+
+def test_a_provider_gone_from_the_file_is_not_asked_about_every_pass(tmp_path, market):
+    """The third review: rows on a provider no longer configured kept adoption retrying, which
+    listed every provider again on every pass, against their request limits, for ever."""
+    loop, provider, _ = market
+    other = FakeProvider(engine_urls=provider.engine_urls)
+    other.offers = list(provider.offers)
+    database = Database(tmp_path / "gpm.sqlite3")
+    try:
+        first = Supervisor(two_accounts(second_enabled=True), database, provider={"fake": provider, "other": other})
+        first.fleet.run_on_host = silent
+        loop.run(first.start())
+        first.config.rented.providers["fake"].enabled = False
+        rent_one(loop, first)
+        loop.run(first.aclose())
+
+        second = Supervisor(two_accounts(keep_second=False), database, provider={"fake": provider})
+        second.fleet.run_on_host = silent
+        loop.run(second.start())
+        assert second.fleet.pending_adoption and not second.fleet.adoption_retry_due
+        listed = []
+        real = second.fleet.adopt
+
+        async def counted(rows):
+            listed.append(rows)
+            return await real(rows)
+
+        second.fleet.adopt = counted
+        for _ in range(3):
+            loop.run(second.pass_once())
+        assert not listed, "not asked again: no configured provider is holding anything back"
+        loop.run(second.aclose())
+    finally:
+        database.close()

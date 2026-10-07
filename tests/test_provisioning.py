@@ -435,7 +435,7 @@ def test_without_a_dead_man_timer_workloads_are_short(pool):
     with admin(pool) as control:
         refused = control.post("/pool/provisioners", json={
             "name": "long", "models": [BIG], "max_open": 1, "max_spend": 5.0, "max_spend_per_day": 8.0, "max_hours": 4})
-        assert refused.status_code == 400 and "no dead-man timer" in refused.json()["detail"]
+        assert refused.status_code == 400 and "dead-man timer" in refused.json()["detail"]
         plan = control.post("/pool/workloads/plan", json={
             "name": "research", "model": BIG, "latency_s": 30, "parallel": 2, "hours": 2, "max_spend": 5}).json()["plan"]
         assert "no dead-man timer" in (plan["refused"] or "")

@@ -60,6 +60,11 @@ _BID_CEILING_GONE = (
 )
 
 
+
+def _priced(offer) -> str:
+    """How a host or offer is paid for, in the console's words: bid, spot or on demand (D132)."""
+    return ("bid" if offer.bidding else "spot") if offer.interruptible else "on_demand"
+
 def _error(status_code: int, error: str, detail: Optional[str] = None) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"error": error, "detail": detail})
 
@@ -603,6 +608,9 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                         "bid_hourly": host.bid_hourly,
                         # A pool may hold both at once (D55): which can be outbid, which cannot.
                         "interruptible": host.interruptible,
+                        # Which provider account, and how it is paid for: bid, spot or on demand (D129, D132).
+                        "connection": host.connection_name,
+                        "priced": _priced(host.offer),
                         "storage_hourly": round(host.offer.storage_hourly, 5),
                         "estimated_spend": round(host.estimate(), 4),
                         "reported_spend": round(host.reported_spend, 4),
@@ -688,6 +696,26 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                         # Today's use of its daily search quota, where it has one (D121).
                         "search_quota": fleet.search_quota(),
                     }
+                    if fleet is not None
+                    else None
+                ),
+                # Every connection (D129): the console's Providers screen reads these. `provider`
+                # above is the first enabled one's, for what reads one.
+                "providers": (
+                    [
+                        {
+                            "connection": name,
+                            "type": p.name,
+                            "enabled": name in fleet.rented.enabled_connections,
+                            "capabilities": vars(p.capabilities),
+                            "search_quota": fleet.search_quota(name),
+                            "search_error": fleet.searching[name].error if name in fleet.searching else None,
+                            "rented": sum(1 for h in fleet.hosts.values() if not h.released and h.connection_name == name),
+                            "hourly": round(sum(h.bid_hourly for h in fleet.hosts.values()
+                                                if not h.released and h.connection_name == name), 4),
+                        }
+                        for name, p in fleet.providers.items()
+                    ]
                     if fleet is not None
                     else None
                 ),
@@ -845,9 +873,18 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         if supervisor.fleet is None:
             return []
         return [
-            RentedNow(host_id=h.host_id, bid_hourly=h.bid_hourly, storage_hourly=h.offer.storage_hourly)
+            RentedNow(host_id=h.host_id, bid_hourly=h.bid_hourly, storage_hourly=h.offer.storage_hourly,
+                      provider=supervisor.fleet.connection_types.get(h.connection_name, ""))
             for h in supervisor.fleet.hosts.values()
             if not h.released
+        ] + [
+            # A host kept back at a restart is as much the pool's as one it watches (D129).
+            RentedNow(host_id=row.host_id, bid_hourly=0.0, provider=supervisor.fleet.connection_types.get(name, ""))
+            for name, rows in supervisor.fleet.pending_adoption.items() for row in rows
+        ] + [
+            RentedNow(host_id=f"volume:{v.volume_id}", bid_hourly=v.hourly,
+                      provider=supervisor.fleet.connection_types.get(v.connection or supervisor.fleet.legacy_connection, ""))
+            for v in supervisor.fleet.workload_store.volumes()
         ]
 
     @app.get("/pool/config")
@@ -1416,6 +1453,9 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             return _error(400, "invalid_config", "; ".join(errors))
         candidate = store().parse(text)
         changes = plan_changes(supervisor.config, candidate, rented_now(), machines_now())
+        refused = [c for c in changes if c.refused]
+        if refused:
+            return _error(409, "change_refused", "; ".join(c.refused for c in refused))
         loosening = [c for c in changes if c.requires_retype]
         if loosening and str(body.get("confirm")) not in {str(c.requires_retype) for c in loosening}:
             return JSONResponse(
@@ -1789,6 +1829,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     # Optional: exactly this offer, and how to rent it (D55).
                     offer_id=str(body["offer_id"]) if body.get("offer_id") is not None else None,
                     kind=body.get("kind"),
+                    connection=str(body["connection"]) if body.get("connection") else None,
                 )
         except LeaseRefused as exc:
             return _error(400, "lease_refused", str(exc))
@@ -1841,6 +1882,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 residency="pinned", hardware=rented.offer.hardware, machine=rented.offer.machine_id,
                 instance=rented.instance.instance_id, bid_hourly=rented.bid_hourly,
                 interruptible=rented.interruptible,
+                connection=rented.connection_name, priced=_priced(rented.offer),
                 hours_held=round(rented.hours_held, 3), lease_id=rented.lease_id,
                 estimated_spend=round(rented.estimate(), 4), reported_spend=round(rented.reported_spend, 4),
                 stage=rented.stage, progress=rented.progress, prepared=rented.prepared,
@@ -1858,7 +1900,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 ),
             )
             try:  # what the provider itself says — "Pulling from ollama/ollama", and the like
-                status = await supervisor.fleet.provider.status(rented.instance)
+                status = await supervisor.fleet.provider_for(rented).status(rented.instance)
                 detail["provider"] = {"state": str(status.state), "detail": status.detail}
             except Exception as exc:  # noqa: BLE001 - a detail view never fails over a detail
                 detail["provider"] = {"state": "unknown", "detail": str(exc)}

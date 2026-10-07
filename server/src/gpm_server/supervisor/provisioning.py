@@ -84,7 +84,7 @@ class Provisioning:
         fleet = self.supervisor.workloads.fleet
         longest = fleet.max_lease_hours() if fleet is not None else None
         if longest is not None and grant.max_hours > longest:
-            raise WorkloadRefused(f"{fleet.provider.name} has no dead-man timer, so a workload there runs at most "
+            raise WorkloadRefused(f"{fleet._without_deadman()}, so a workload runs at most "
                                   f"{longest:g}h; the grant's most hours cannot be {grant.max_hours:g}")
         expires = time.time() + expires_hours * 3600 if expires_hours else None
         key = self.store.create(name, grant, expires)

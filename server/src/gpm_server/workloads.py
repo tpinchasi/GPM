@@ -227,6 +227,19 @@ class KindCost:
     expected: float
     per_worker_hour: float
     reasons: list[str]
+    #: The provider connection it is offered through, and — interruptible — whether the pool
+    #: bids for it or pays the provider's spot price (D129, D132).
+    connection: str = ""
+    bidding: bool = True
+
+    @property
+    def priced(self) -> str:
+        """How it is paid for, in words: a bid, spot, or on demand."""
+        return ("a bid" if self.bidding else "spot") if self.interruptible else "on demand"
+
+    @property
+    def where(self) -> str:
+        return f"{self.machine_id} ({self.connection})" if self.connection else self.machine_id
 
 
 def expected_cost(
@@ -241,6 +254,9 @@ def expected_cost(
     ready_hours: float,
     lost_capacity_hourly: float,
     share_of_workload: float,
+    connection: str = "",
+    bidding: bool = True,
+    download: float = 0.0,
 ) -> KindCost:
     """Expected spend over `hours`, counting what an eviction costs a workload.
 
@@ -250,20 +266,25 @@ def expected_cost(
     this host's share of the workload's workers: a lone host takes the whole workload down with it,
     one of four takes a quarter.
     """
-    base = hourly * hours
+    # What fetching the models costs on this machine, once (D108): a cheap host with a dear
+    # download is not cheap for a short lease.
+    fetch = f", plus ${download:.2f} to fetch the models" if download else ""
+    base = hourly * hours + download
     if not interruptible:
         return KindCost(
             offer_id, machine_id, False, hourly, round(base, 4), round(base / max(1, workers) / max(hours, 1e-9), 5),
-            [f"on demand ${hourly:.3f}/h x {hours:g}h = ${base:.2f}; nothing can take it away"],
+            [f"on demand ${hourly:.3f}/h x {hours:g}h{fetch} = ${base:.2f}; nothing can take it away"],
+            connection, True,
         )
     evictions = evictions_per_hour * hours
     per_eviction = ready_hours * hourly + ready_hours * lost_capacity_hourly * share_of_workload
     total = base + evictions * per_eviction
     return KindCost(
         offer_id, machine_id, True, hourly, round(total, 4), round(total / max(1, workers) / max(hours, 1e-9), 5),
-        [f"bid ${hourly:.3f}/h x {hours:g}h = ${base:.2f}, plus {evictions:.2f} expected evictions "
+        [f"{'bid' if bidding else 'spot'} ${hourly:.3f}/h x {hours:g}h{fetch} = ${base:.2f}, plus {evictions:.2f} expected interruptions "
          f"({evictions_per_hour:.3f}/h) at ${per_eviction:.2f} each: {ready_hours * 60:.0f} min to replace, "
          f"{share_of_workload:.0%} of the workload's capacity lost meanwhile = ${total:.2f}"],
+        connection, bidding,
     )
 
 
@@ -273,10 +294,10 @@ def order_by_expected_cost(costs: Sequence[KindCost]) -> tuple[list[KindCost], l
     if not ordered:
         return [], ["no candidate to compare"]
     first = ordered[0]
-    kind = "a bid" if first.interruptible else "on demand"
-    other = next((c for c in ordered[1:] if c.interruptible != first.interruptible), None)
-    why = f"rental kind: {kind} on {first.machine_id} at ${first.per_worker_hour:.4f} per worker-hour expected"
+    # The runner-up of another kind, or else another provider: what the first won against.
+    other = next((c for c in ordered[1:] if c.priced != first.priced), None) or next(
+        (c for c in ordered[1:] if c.connection != first.connection), None)
+    why = f"rental kind: {first.priced} on {first.where} at ${first.per_worker_hour:.4f} per worker-hour expected"
     if other is not None:
-        why += (f", against {'a bid' if other.interruptible else 'on demand'} on {other.machine_id} at "
-                f"${other.per_worker_hour:.4f}")
+        why += f", against {other.priced} on {other.where} at ${other.per_worker_hour:.4f}"
     return ordered, [why, *first.reasons]

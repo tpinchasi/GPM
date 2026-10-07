@@ -85,6 +85,7 @@ def _supervise(args: argparse.Namespace) -> int:
     from .db import SupervisorBusy
     from .state import open_database
     from .supervisor import run
+    from .supervisor.renting import ConnectionNameReused
     from .supervisor.service import ProviderCredentialMissing
 
     config = load_config(args.config)
@@ -111,6 +112,9 @@ def _supervise(args: argparse.Namespace) -> int:
         print(str(exc), file=sys.stderr)
         return 3
     except ProviderCredentialMissing as exc:
+        print(str(exc), file=sys.stderr)
+        return 4
+    except ConnectionNameReused as exc:
         print(str(exc), file=sys.stderr)
         return 4
     finally:
