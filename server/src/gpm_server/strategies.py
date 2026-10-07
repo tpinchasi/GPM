@@ -516,6 +516,17 @@ def price_bid(
             return Bid(hourly=0.0, reasons=reasons)
         return Bid(hourly=round(price, 4), reasons=reasons)
 
+    if not offer.bidding:
+        # A spot price: the provider's, paid as listed. Nothing to bid, so no premium, and a
+        # ceiling it passes is a refusal, not a clamp (D132).
+        price = offer.min_bid_hourly
+        reasons = [f"spot at ${price:.3f}/h — the provider's price, not a bid; it can be taken away"]
+        if price + offer.storage_hourly > ceiling:
+            reasons.append(f"above {which} with ${offer.storage_hourly:.3f}/h of storage, and a spot price "
+                           "cannot be lowered to meet it")
+            return Bid(hourly=0.0, reasons=reasons)
+        return Bid(hourly=round(price, 4), reasons=reasons)
+
     reasons = [f"floor ${offer.min_bid_hourly:.3f} + premium ${cfg.premium:.3f}"]
     bid = offer.min_bid_hourly + cfg.premium
 

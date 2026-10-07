@@ -54,6 +54,10 @@ class FakeInstance:
     billed: float = 0.0
     #: What the provider *says* it cost — may deliberately drift from the pool's estimate.
     charge_multiplier: float = 1.0
+    #: Scripted: an interruption warning has been given (D132).
+    interrupting: bool = False
+    #: The most the pool said it would pay for a spot instance, where it said (D132).
+    max_price: Optional[float] = None
 
 
 class FakeProvider:
@@ -140,6 +144,14 @@ class FakeProvider:
         instance.state = InstanceState.STOPPED
         instance.stopped_by_provider = True
         instance.running_since = None
+
+    def set_spot_price(self, instance_id: str, price: float) -> None:
+        """The provider moves a spot instance's price while it runs (D132)."""
+        self.instances[instance_id].bid_hourly = price
+
+    def warn_interruption(self, instance_id: str) -> None:
+        """The provider says it is about to take a spot instance back (D132)."""
+        self.instances[instance_id].interrupting = True
 
     def bring_up(self, instance_id: str) -> None:
         instance = self.instances[instance_id]
@@ -256,7 +268,10 @@ class FakeProvider:
             instance_id=instance_id,
             label=spec.label,
             machine_id=offer.machine_id,
-            bid_hourly=bid if bid is not None else offer.all_in_hourly,
+            # A spot instance is billed the provider's price; the pool's figure is only its maximum.
+            bid_hourly=(offer.min_bid_hourly if offer.interruptible and not offer.bidding
+                        else bid if bid is not None else offer.all_in_hourly),
+            max_price=bid if offer.interruptible and not offer.bidding else None,
             offer=offer,
             spec=dataclasses.replace(spec, onstart=None) if self.drop_startup_material else spec,
             state=InstanceState.RUNNING,
@@ -289,6 +304,8 @@ class FakeProvider:
 
     async def set_bid(self, instance: Instance, bid: float) -> None:
         self._guard("set_bid")
+        if not self.instances[instance.instance_id].offer.bidding:
+            raise ProviderError("a spot instance's price is the provider's: there is no bid to set")
         self.instances[instance.instance_id].bid_hourly = bid
 
     async def start(self, instance: Instance) -> None:
@@ -321,6 +338,7 @@ class FakeProvider:
             stopped_by_provider=found.stopped_by_provider,
             bid_hourly=found.bid_hourly,
             startup_material=bool(found.spec.onstart),
+            interrupting=found.interrupting if self.capabilities.interruption_notice else None,
         )
 
     async def connection(self, instance: Instance) -> ConnectionInfo:

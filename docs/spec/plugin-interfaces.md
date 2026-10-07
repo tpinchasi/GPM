@@ -51,7 +51,7 @@ class Provider(Protocol):
 | Operation | Guarantee |
 |---|---|
 | `list_instances` | Returns **every** instance carrying the label prefix, in any state, including stopped ones that still bill storage. The orphan sweep and crash recovery rest on this |
-| `create` | Either returns a running-or-scheduling instance, or raises and **leaves nothing behind**. A bid that loses must fail, not leave a parked instance |
+| `create` | Either returns a running-or-scheduling instance, or raises and **leaves nothing behind**. A bid that loses must fail, not leave a parked instance. Its price is the bid for a bid offer; for a spot offer, the most the pool pays, which a provider that takes a maximum price holds the instance to (D132); none on demand |
 | `destroy` | Idempotent. The pool verifies by calling `list_instances` again; it never trusts a return value |
 | `status` | Distinguishes at least: running, scheduling, stopped-by-us, **outbid / stopped-by-provider**, gone. An instance the provider has decided not to run is stopped **whatever its container is doing** — outbid while still loading its image included (D109) |
 | `search_offers` | Each `Offer` carries what ranking needs: hardware, memory, a throughput proxy, the current minimum bid, on-demand price if any, storage price, download price per gigabyte, download speed, reliability, provider verification flag, a stable machine identifier |
@@ -82,7 +82,8 @@ A provider states what it can do; the pool adapts rather than assumes.
 
 | Capability | If absent |
 |---|---|
-| `interruptible` — instances are bid for and can be outbid | No bidding strategies apply; `create` takes no bid |
+| `interruptible` — instances can be taken away: outbid, or reclaimed at a spot price. Each offer's `bidding` says whether the pool sets its price (a bid) or the provider does (a spot price, which may move while the instance runs; `status` reports it as `bid_hourly`) (D132) | Every offer is on demand; `create` takes no price |
+| `interruption_notice` — the provider warns before taking an instance away, and `status` says `interrupting` | The pool learns of an interruption only when the instance stops |
 | `parkable` — an instance can be stopped with its disk kept | "Park" is unavailable; tear-down is always destroy |
 | `same_machine_rebid` — a stopped instance can be restarted by raising its bid | Eviction choice is "replace" only |
 | `self_terminate` — an **instance-scoped** credential lets an instance end itself | No dead-man timer; the pool refuses leases longer than a short maximum on this provider |

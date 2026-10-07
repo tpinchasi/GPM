@@ -244,12 +244,23 @@ class Workloads:
             "min_disk_gb": min(p.min_disk_gb for p in needs),
         })
         offers = await fleet._offers(search, kinds)
+        # Priced only on what it could rent: a provider with no dead-man timer serves no lease
+        # longer than it may run, so its offers would quote a price the workload never pays (D129).
+        short = [o for o in offers if (fleet.lease_hours_on(o.connection) or float("inf")) < req.hours]
+        offers = [o for o in offers if o not in short]
         plan: dict[str, Any] = {
             "name": req.name, "model": targets[0].model, "build": builds[targets[0].model], "cards_per_copy": cards,
             "latency_s": targets[0].latency_s, "parallel": req.total_parallel, "hours": req.hours, "kind": req.kind,
             "models": [t.as_dict() for t in targets], "builds": builds,
             "offers_seen": len(offers), "refused": None, "reasons": [],
         }
+        if short and not offers:
+            limit = min(fleet.lease_hours_on(o.connection) for o in short)
+            # Said to applications too: how long, never where the pool rents.
+            plan["refused"] = (f"a workload here runs at most {limit:g}h, not {req.hours:g}h: where it would rent, "
+                               "no dead-man timer could stop a host billing")
+            plan["offers_passed"] = 0
+            return plan
         options: dict[str, Any] = {}
         if len(targets) == 1 or req.placement in ("auto", "together"):
             options["together"] = self._price(req, sketch, [models], offers, builds, cards)
@@ -369,16 +380,15 @@ class Workloads:
                 if not ranked:
                     return {"refused": (f"{passed} machine(s) pass the search, and none holds {named} together "
                                         "within every model's target"), "offers_passed": passed}
-            if req.kind == "roi":
-                ordered, why = fleet.expected_costs(ranked, req.hours, sketch, models, group_builds)
-                kind_reasons = why[:1]
-            else:
-                ordered, _ = fleet.expected_costs([ranked[0]], req.hours, sketch, models, group_builds)
-                kind_reasons = []
+            # As the rental will choose (D131): the least expected cost per worker-hour, of any kind
+            # the request allows, across every provider.
+            ordered, why = fleet.expected_costs(ranked, req.hours, sketch, models, group_builds)
+            kind_reasons = why[:1]
             if not ordered:
                 return {"refused": f"no machine holds {named} within every target", "offers_passed": len(ranked)}
             first = next(o for o, _ in ranked
-                         if (o.offer_id, o.interruptible) == (ordered[0].offer_id, ordered[0].interruptible))
+                         if (o.connection, o.offer_id, o.interruptible)
+                         == (ordered[0].connection, ordered[0].offer_id, ordered[0].interruptible))
             first_cost = ordered[0]
             if len(placement) > 1 or len(models) > 1:
                 kind_reasons = [f"{named}: {r}" for r in kind_reasons]
@@ -413,8 +423,8 @@ class Workloads:
                 # the same on-demand rate; only this host's share of the group changes.
                 shared, _ = fleet.expected_costs(ranked, req.hours, sketch, models, group_builds,
                                                  fixed_workers=per_host, have=per_host * (hosts - 1))
-                first_cost = next((c for c in shared if (c.offer_id, c.interruptible) == (first.offer_id, first.interruptible)),
-                                  first_cost)
+                first_cost = next((c for c in shared if (c.connection, c.offer_id, c.interruptible)
+                                   == (first.connection, first.offer_id, first.interruptible)), first_cost)
             groups.append({
                 "models": list(models), "builds": group_builds, "hosts_at_start": hosts, "workers_per_host": per_host,
                 "caps": caps, "cards_per_copy": cards, "sizing": sizing, "latency_curves": curves, "measured": measured,
@@ -452,14 +462,15 @@ class Workloads:
         open_now = [w for w in self.store.active() if w.state in ("preparing", "serving")]
         if len(open_now) >= self.config.workloads.max_open:
             return f"{len(open_now)} workloads are running, at the pool's limit of {self.config.workloads.max_open}"
-        live = len([h for h in self.fleet.hosts.values() if not h.released])
+        live = len([h for h in self.fleet.hosts.values() if not h.released]) + len(self.fleet.held_back_rows())
         reserved = self._reserved_hosts()
         if self.config.limits.max_rented_hosts - live - reserved <= 0:
             return (f"the pool has room for 0 more hosts: {self.config.limits.max_rented_hosts} at most, "
                     f"{live} rented, {reserved} reserved by workloads still starting")
         limits = self.config.limits
         if limits.max_hourly_burn is not None:
-            burn = sum(h.bid_hourly for h in self.fleet.hosts.values() if not h.released) + self.fleet.volume_burn()
+            burn = (sum(h.bid_hourly for h in self.fleet.hosts.values() if not h.released) + self.fleet.volume_burn()
+                    + self.fleet.held_back_burn())
             if burn >= limits.max_hourly_burn:
                 return f"the pool already burns ${burn:.2f}/h, at its ${limits.max_hourly_burn:.2f} cap"
         return None
@@ -468,12 +479,13 @@ class Workloads:
         limits = self.config.limits
         longest = self.fleet.max_lease_hours()
         if longest is not None and hours > longest:
-            return (f"{self.fleet.provider.name} has no dead-man timer, so a lease there runs at most "
-                    f"{longest:g}h, not {hours:g}h")
+            # Said to applications too (a program's plan): how long, never where the pool rents.
+            return (f"a workload here runs at most {longest:g}h, not {hours:g}h: where it would rent, no "
+                    "dead-man timer could stop a host billing")
         full = self.full()
         if full is not None:
             return full
-        live = len([h for h in self.fleet.hosts.values() if not h.released])
+        live = len([h for h in self.fleet.hosts.values() if not h.released]) + len(self.fleet.held_back_rows())
         room = limits.max_rented_hosts - live - self._reserved_hosts()
         if hosts > room:
             return (
@@ -483,7 +495,8 @@ class Workloads:
         if limits.max_hourly_burn is not None:
             # Volumes bill too, and the fleet counts them when it rents: a plan that left them out
             # would pass here and never rent.
-            burn = sum(h.bid_hourly for h in self.fleet.hosts.values() if not h.released) + self.fleet.volume_burn()
+            burn = (sum(h.bid_hourly for h in self.fleet.hosts.values() if not h.released) + self.fleet.volume_burn()
+                    + self.fleet.held_back_burn())
             if burn + hosts * hourly > limits.max_hourly_burn:
                 return (
                     f"its {hosts} host(s) at ${hourly:.3f}/h would take the pool's burn to "
@@ -615,7 +628,7 @@ class Workloads:
             raise WorkloadRefused("raising the dollar cap must be confirmed: type the new value again")
         longest = self.fleet.max_lease_hours() if self.fleet is not None else None
         if hours and longest is not None and lease.max_hours + hours > longest:
-            raise WorkloadRefused(f"{self.fleet.provider.name} has no dead-man timer, so a lease there runs at most "
+            raise WorkloadRefused(f"{self.fleet._without_deadman()}, so a lease runs at most "
                                   f"{longest:g}h, not {lease.max_hours + hours:g}h")
         try:
             changed = self.supervisor.leases.tighten(
@@ -787,6 +800,8 @@ class Workloads:
             "hosts": [
                 {"host_id": h.host_id, "state": h.state, "workers": h.workers, "hardware": h.offer.hardware,
                  "kind": "interruptible" if h.interruptible else "on_demand", "hourly": round(h.bid_hourly, 4),
+                 "priced": ("bid" if h.offer.bidding else "spot") if h.interruptible else "on_demand",
+                 "connection": h.connection_name,
                  "models": list(h.models)}
                 for h in hosts
             ],

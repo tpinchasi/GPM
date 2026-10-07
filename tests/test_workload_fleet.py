@@ -250,7 +250,8 @@ async def test_a_fixed_kind_is_what_it_says(db):
     await run(fleet, [workload])
     (host,) = mine(fleet, "research")
     assert not host.interruptible
-    assert not any(e["kind"] == "rental_kind" for e in fleet.events.recent())
+    # Chosen by what it costs, among on-demand offers only (D131): the note never names a bid.
+    assert all(e["summary"].startswith("rental kind: on demand") for e in fleet.events.recent() if e["kind"] == "rental_kind")
 
 
 # --- workers per host at the latency target ---

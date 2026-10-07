@@ -11,8 +11,16 @@ import time
 import httpx
 import pytest
 from fakes.harness import APP_KEY, EngineSpec, ServerHandle, pool_harness
-from gpm_server.providers import default_offer
+from gpm_server.providers import default_offer as market_offer
 from gpm_server.supervisor.control import create_control_app
+
+
+def default_offer(*args, **overrides):
+    """Downloads free here: these tests are about placing models, and the choice counts the
+    download (D131) — under together every host fetches every model, apart only its own."""
+    overrides.setdefault("download_per_gb", 0.0)
+    return market_offer(*args, **overrides)
+
 
 ADMIN = "gpmx_multi_admin"
 SHARED, CHAT, EMBED, THIRD = "m1", "chat", "embed", "third"
@@ -294,7 +302,6 @@ def test_a_split_group_is_rented_on_the_cheaper_card_not_the_bigger(pool):
     """Found in review: at rent time a group's offers were ranked by what a card could hold, so a
     bigger card won — and then ran the same fixed split as the smaller one, at a higher price."""
     from gpm_server.config import CapacityProfile
-    from gpm_server.providers import default_offer
 
     fleet = pool.supervisor.fleet
     fleet.provider.offers = [default_offer(f"small-{i}", f"m-small-{i}", min_bid_hourly=0.20) for i in range(3)]
@@ -307,11 +314,14 @@ def test_a_split_group_is_rented_on_the_cheaper_card_not_the_bigger(pool):
     fleet.provider.offers.append(default_offer("big", "m-big", min_bid_hourly=0.36, hardware="FakeGPU 96GB",
                                                gpu_memory_gb=96.0))
     spec = pool.supervisor.workloads.get("research")
+    assert spec.placement == "together", (spec.placement, spec.plan.get("reasons"))
     assert fleet.capacity_on(fleet.provider.offers[-1], spec, (CHAT, EMBED), spec.builds) > spec.groups[0].workers_per_host
     lost = fleet.hosts_of("research")[0]
     pool.loop.run(fleet.destroy(lost, "evicted, in this test"))
     until(pool, lambda: len([h for h in fleet.hosts_of("research") if h.state == "ready"]) == 2, "replaced")
-    assert {h.offer.machine_id for h in fleet.hosts_of("research")} <= {"m-small-0", "m-small-1", "m-small-2"}
+    assert {h.offer.machine_id for h in fleet.hosts_of("research")} <= {"m-small-0", "m-small-1", "m-small-2"}, [
+        (c["machine_id"], c["per_worker_hour"], c["reasons"]) for e in pool.supervisor.events.recent(80)
+        if e["kind"] == "rental_kind" for c in e["numbers"]["candidates"]]
 
 
 def test_a_split_hosts_worker_count_is_not_changed_by_hand(pool):

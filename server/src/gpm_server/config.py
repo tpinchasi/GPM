@@ -783,6 +783,10 @@ class ProviderConnection(BaseModel):
     #: watched, charged and swept.
     enabled: bool = True
     settings: dict[str, Any] = Field(default_factory=dict)
+    #: How often an interruptible host here is expected to be taken away, per hour, where the
+    #: machine has no history of its own (D131). Unset: `workloads.eviction_prior_per_hour`.
+    #: Providers differ — a bid market's hosts are outbid, a spot market's reclaimed.
+    interruption_prior_per_hour: Optional[float] = Field(default=None, ge=0)
 
 
 class RentedConfig(BaseModel):
@@ -906,24 +910,36 @@ class RentedConfig(BaseModel):
 
     @model_validator(mode="after")
     def _one_connection(self) -> "RentedConfig":
-        """Named, and — until the supervisor rents from several (providers.md §9, step 2) —
-        exactly one enabled."""
+        """Named, and at least one enabled: a pool with none could watch its hosts but never
+        rent (D129)."""
         if not self.providers:
             raise ValueError("rented needs a provider: `providers: {name: {type: ...}}` (D129)")
         for name in self.providers:
             if not CONNECTION_NAME.match(name):
                 raise ValueError(f"provider connection {name!r}: a lower-case name of letters, digits, '-' "
                                  "and '_', starting with a letter, at most 32 characters")
-        enabled = [name for name, conn in self.providers.items() if conn.enabled]
-        if len(enabled) != 1:
-            raise ValueError(f"exactly one provider connection must be enabled for now ({len(enabled)} are): "
-                             "renting from several at once is not built yet (D129)")
+        seen: dict[str, str] = {}
+        for name, conn in self.providers.items():
+            if conn.type in seen:
+                # One account per provider (D133): two connections to one provider could be one
+                # account, each sweeping the other's hosts as strays — nothing needs it.
+                raise ValueError(f"provider connections {seen[conn.type]!r} and {name!r} are both {conn.type!r}: "
+                                 "a pool has at most one connection per provider (D133)")
+            seen[conn.type] = name
+        if not self.enabled_connections:
+            raise ValueError("at least one provider connection must be enabled (D129)")
         return self
 
     @property
+    def enabled_connections(self) -> list[str]:
+        """The connections the pool searches and rents through, in the file's order (D129)."""
+        return [name for name, conn in self.providers.items() if conn.enabled]
+
+    @property
     def connection_name(self) -> str:
-        """The connection the pool rents through (D129): the one enabled."""
-        return next(name for name, conn in self.providers.items() if conn.enabled)
+        """The first enabled connection: the one a single-provider pool rents through, and
+        what a record from before connections is read as on a new pool."""
+        return self.enabled_connections[0]
 
     @property
     def connection(self) -> ProviderConnection:

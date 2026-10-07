@@ -26,8 +26,11 @@
 - **The admin key is required on every control-API request**, sent as a header, never a cookie,
   with `Host` / `Origin` checked — on loopback too, because any web page open in the same
   browser can send requests to `127.0.0.1`. The app key is refused here.
-- **Several providers** are designed, not built: their connections, credentials and the market
-  across them are in [providers.md](providers.md) (D129–D132).
+- **Several providers** rent side by side (D129–D133); their accounts, credentials and the market
+  across them are in [providers.md](providers.md). Until its screens are built, the console shows
+  the first account in the Provider panel and every account's line beneath it, marks each host
+  and offer with its account and with how it is paid for — **bid**, **spot** or **on demand** —
+  and says when a provider could not be asked while the others answered.
 - **Secrets never reach the browser.** The console shows only "set ✓ / missing ✗" against the
   environment variable or file a secret is read from.
 

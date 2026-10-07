@@ -57,15 +57,17 @@ def test_an_old_plugin_name_that_is_no_connection_name_still_loads():
     assert len(_connection_name_for("x" * 40)) == 32
 
 
-def test_connections_are_named_and_one_is_enabled():
-    two = pool_config(providers={"a": {"type": "fake", "enabled": False}, "b": {"type": "fake"}}).rented
+def test_connections_are_named_and_at_least_one_is_enabled():
+    two = pool_config(providers={"a": {"type": "fake-a", "enabled": False}, "b": {"type": "fake-b"}}).rented
     assert two.connection_name == "b", "the one enabled is the one rented through"
     with pytest.raises(ValueError, match="both `provider` and `providers`"):
         pool_config(provider="fake", providers={"a": {"type": "fake"}})
-    with pytest.raises(ValueError, match="exactly one provider connection must be enabled"):
-        pool_config(providers={"a": {"type": "fake"}, "b": {"type": "fake"}})
-    with pytest.raises(ValueError, match="exactly one provider connection must be enabled"):
+    both = pool_config(providers={"a": {"type": "fake-a"}, "b": {"type": "fake-b"}}).rented
+    assert both.enabled_connections == ["a", "b"] and both.connection_name == "a"
+    with pytest.raises(ValueError, match="at least one provider connection must be enabled"):
         pool_config(providers={"a": {"type": "fake", "enabled": False}})
+    with pytest.raises(ValueError, match="at most one connection per provider"):
+        pool_config(providers={"a": {"type": "fake"}, "b": {"type": "fake", "enabled": False}})
     with pytest.raises(ValueError, match="lower-case name"):
         pool_config(providers={"Bad Name": {"type": "fake"}})
     with pytest.raises(ValueError, match="needs a provider"):
@@ -113,14 +115,25 @@ def test_a_record_from_before_connections_is_the_connection_the_pool_first_had(d
     assert db.query("SELECT COUNT(*) AS n FROM provider_search_usage")[0]["n"] == 1, "carried over once"
 
 
-def test_a_change_to_the_connections_is_planned_as_needing_a_supervisor_restart():
-    """The supervisor rents through the connection it started with; the plan says so rather
-    than let a reload look applied (D129)."""
-    from gpm_server.configplan import plan_changes
+def test_a_change_to_the_connections_is_planned_restarted_retyped_and_never_strands_a_host():
+    """The supervisor rents through the accounts it started with; the plan says so, asks for an
+    account turned on to be typed again, and refuses dropping a provider the pool still holds
+    hosts at — nothing could stop them billing (D129, D133)."""
+    from gpm_server.configplan import RentedNow, plan_changes
 
     old_shape = pool_config(provider="fake")
     assert not [c for c in plan_changes(old_shape, pool_config(providers={"fake": {"type": "fake"}}))
                 if c.kind == "providers"], "the same connection in the new shape is no change"
+    added = pool_config(providers={"fake": {"type": "fake"}, "other": {"type": "other"}})
+    (change,) = [c for c in plan_changes(old_shape, added) if c.kind == "providers"]
+    assert change.needs_restart and change.restarts == "supervisor"
+    assert "when the supervisor restarts" in change.detail and "other will be searched" in change.detail
+    assert change.requires_retype == "other", "renting somewhere new is typed again"
+    assert change.refused is None
+    holding = [RentedNow("rented-a", 0.4, provider="fake")]
+    (dropped,) = [c for c in plan_changes(added, pool_config(providers={"other": {"type": "other"}}), holding)
+                  if c.kind == "providers"]
+    assert dropped.refused and "rented-a" in dropped.refused
     renamed = pool_config(providers={"main": {"type": "fake"}})
-    (change,) = [c for c in plan_changes(old_shape, renamed) if c.kind == "providers"]
-    assert change.needs_restart and "until it is restarted" in change.detail
+    (kept,) = [c for c in plan_changes(old_shape, renamed, holding) if c.kind == "providers"]
+    assert kept.refused is None, "renamed, the provider is still there: its hosts are found by it"

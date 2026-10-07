@@ -74,7 +74,8 @@ class ProviderCapabilities:
     """What this provider can do. Each absent capability removes a behaviour rather than
     silently degrading one."""
 
-    #: Instances are bid for and can be outbid. Without it, no bidding strategy applies.
+    #: Instances can be taken away — outbid, or reclaimed at a spot price (D132). Without it,
+    #: every offer is on demand. Whether the pool sets the price is each offer's `bidding`.
     interruptible: bool = False
     #: An instance can be stopped with its disk kept. Without it, tear-down is always destroy.
     parkable: bool = False
@@ -98,6 +99,9 @@ class ProviderCapabilities:
     #: The provider copies a directory from one of its instances to another (D116). Without it,
     #: a new host never takes its models from a sibling.
     copies: bool = False
+    #: The provider warns before it takes an instance away, and `status` says so (`interrupting`).
+    #: With it, the pool drains the host at once (D132).
+    interruption_notice: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -133,6 +137,11 @@ class Offer:
     #: Whether this offer is bid for and can be outbid. False is an on-demand rental: it costs
     #: `all_in_hourly`, there is nothing to bid, and nobody can take it away (D52).
     interruptible: bool = True
+    #: For an interruptible offer, whether the pool sets the price — a bid, from
+    #: `min_bid_hourly` up — or the provider does: a **spot** price, `min_bid_hourly` paid as
+    #: listed, which may change while the host runs (D132). Bid strategies and re-bidding apply
+    #: only where it is True. Meaningless for an on-demand offer.
+    bidding: bool = True
     #: The provider connection it was found through (D129) — stamped by the pool, never by a
     #: plug-in, which does not know the name it was configured under. A machine identifier is
     #: unique only within its connection.
@@ -249,6 +258,9 @@ class InstanceStatus:
     #: provider reports it absent; None when the provider cannot say. A host without it has no
     #: dead-man timer and no way in for the pool, and can never join (D65).
     startup_material: Optional[bool] = None
+    #: The provider has warned that it is about to take the instance away (D132), where it can
+    #: say (`interruption_notice`). None where it cannot.
+    interrupting: Optional[bool] = None
 
 
 @dataclasses.dataclass(frozen=True)

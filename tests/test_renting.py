@@ -7,7 +7,6 @@ lease stops before its dollar cap, and a release counts only once the provider a
 
 import dataclasses
 import time
-from pathlib import Path
 
 import pytest
 from gpm_server.config import OfferPolicy, PoolConfig
@@ -965,13 +964,18 @@ async def test_a_market_that_changes_its_mind_is_recorded_again(fleet):
     assert len(said) == 2, "a market refusing for a new reason was not recorded"
 
 
-def test_a_provider_back_off_note_does_not_nest():
+async def test_a_provider_back_off_note_does_not_nest(fleet):
     """Live: 'rate limited — not asking again for 60s — not asking again for 44s'."""
-    source = (Path(__file__).resolve().parent.parent / "server/src/gpm_server/supervisor/renting.py").read_text()
-    waiting = source[source.index("if now < self._offer_retry_at:"):]
-    waiting = waiting[: waiting.index("return []")]
-    assert "self._offer_refusal" in waiting
-    assert "self.last_offer_error or" not in waiting, "the note is built from itself again"
+    from gpm_server.providers.base import ProviderRateLimited
+
+    async def refused(query):
+        raise ProviderRateLimited("too many requests")
+
+    fleet.provider.search_offers = refused
+    for _ in range(3):  # refused, then waiting, then waiting again
+        await fleet._offers()
+    assert fleet.last_offer_error.count("not asking again") == 1, fleet.last_offer_error
+    assert fleet.last_offer_error.startswith("too many requests"), "the provider's own words, said once"
 
 
 # --- a ceiling per accelerator, not per machine (D85) ---

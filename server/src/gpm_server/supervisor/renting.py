@@ -27,6 +27,7 @@ from ..config import BiddingConfig, OfferPolicy, PoolConfig, RentedConfig, Trans
 from ..deadman import heartbeat_command, onstart_script
 from ..engines import get_engine
 from ..engines.base import PullResult
+from ..history import adjustment as history_adjustment
 from ..ledger import EventLog, Lease, LeaseRefused, LeaseStore, SpendLedger
 from ..providers.base import (
     BidLost,
@@ -268,22 +269,40 @@ class Unit:
     budget_bound: Optional[tuple] = None
 
 
+@dataclasses.dataclass
+class SearchState:
+    """One connection's searching (D119, D129): asked again only after `retry_at`."""
+
+    backoff_s: float = 0.0
+    retry_at: float = 0.0
+    #: The provider's own words for why it refused, kept apart from the wait they earned.
+    refusal: Optional[str] = None
+    #: Why its last search came back empty, when it was not the market's doing.
+    error: Optional[str] = None
+
+
 class ConnectionEvents:
     """The decision log, as the fleet writes it: an event that names a machine also names the
     connection it is on (D129), since a machine identifier is unique only within one. The
     machine history is built from these."""
 
-    def __init__(self, events: EventLog, connection: str):
+    def __init__(self, events: EventLog, connection: str, hosts: Optional[dict] = None):
         self._events = events
         self._connection = connection
+        self._hosts = hosts if hosts is not None else {}
 
     def record(self, kind: str, summary: str, *, numbers: Optional[dict] = None, **where: Any) -> Any:
         if numbers and numbers.get("machine") and not numbers.get("connection"):
-            numbers = {**numbers, "connection": self._connection}
+            host = self._hosts.get(where.get("host_id") or "")
+            numbers = {**numbers, "connection": host.connection_name if host is not None else self._connection}
         return self._events.record(kind, summary, numbers=numbers, **where)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._events, name)
+
+
+class ConnectionNameReused(ValueError):
+    """A connection's name, once one provider's, configured as another's (D133)."""
 
 
 def legacy_connection(db: Any, current: str) -> str:
@@ -340,18 +359,30 @@ class Fleet:
     ):
         self.config = config
         self.rented = rented
-        self.provider = provider
-        #: The connection this provider was configured as (D129).
+        #: Every configured connection's provider, enabled or not (D129): a disabled connection's
+        #: hosts are still watched, charged and swept. A single provider is the pool's one connection.
+        self.providers: dict[str, Provider] = (
+            dict(provider) if isinstance(provider, dict) else {rented.connection_name: provider})
+        #: The first enabled connection: whose provider `provider` is, for everything that asks of
+        #: "the" provider — a single-provider pool's, and the default where none is named.
         self.connection = rented.connection_name
         #: What a record from before connections existed belongs to: the connection the pool's
         #: configuration became the first time this version ran, remembered so a later rename or
         #: a second connection does not reassign those records.
         #: Settled by `claim_records`, under the pool lock; until then, this connection's.
         self.legacy_connection = self.connection
+        #: Every name a connection has been configured under, with its provider (D133). At most
+        #: one connection per provider, so a record naming a connection that has since been
+        #: renamed is found by its provider; one whose provider is gone is never guessed at.
+        self.connection_types: dict[str, str] = {name: conn.type for name, conn in rented.providers.items()}
+        #: Hosts whose connection could not be listed at a restart, or is no longer configured,
+        #: by connection: kept exactly as found, and that connection is not swept, until it can be.
+        self.pending_adoption: dict[str, list] = {}
+        self._said_pending: dict[str, tuple] = {}
         self.leases = leases
-        self.events = ConnectionEvents(events, self.connection)
         self.spend = spend
         self.hosts: dict[str, RentedHost] = {}
+        self.events = ConnectionEvents(events, self.connection, self.hosts)
         self.label_prefix = rented.label_prefix or f"gpm/{config.pool.name}/"
         #: One demand per workload, and the shared one under None (D115).
         self.units: dict[tuple, Unit] = {(None, None): Unit()}
@@ -368,7 +399,9 @@ class Fleet:
         self._said_unfit: dict[tuple, int] = {}
         #: Whether the provider has ever returned a charge figure. The narrow cap margin is
         #: only earned once it has.
-        self.charges_ever_reported = False
+        #: The connections whose provider has actually reported a charge (spec §4): one that only
+        #: *says* it can keeps the wide margin, whatever another connection does.
+        self.charges_seen: set[str] = set()
         #: How a command is run on a rented host. Substituted in tests; ssh otherwise.
         self.run_on_host = self._ssh_run
         self.push_to_host = self._ssh_push
@@ -391,10 +424,9 @@ class Fleet:
         #: Models whose build the directory has not measured, from the last size worked out: the
         #: disk check and the download cost leave them out, and the preview says so (D108).
         self.model_sizes_unknown: list[str] = []
-        #: Why the last offer search came back empty, when it was not the market's doing.
+        #: Why the last offer search came back empty, when it was not the market's doing: every
+        #: connection asked failed. One that failed beside others that answered is in `searching`.
         self.last_offer_error: Optional[str] = None
-        #: The provider's own words for why it refused, kept apart from the wait they earned.
-        self._offer_refusal: Optional[str] = None
         #: The last "nothing passed the policy" written down, so a market that has not changed
         #: is not written down again on every pass (D82).
         self._said_nothing_passed: Optional[tuple] = None
@@ -408,10 +440,66 @@ class Fleet:
         #: The machine history, rebuilt from the logs every few seconds (D69).
         self._history: Optional[dict] = None
         self._history_at = 0.0
-        #: A provider that says "too many requests" is answered by asking less often, not by
-        #: asking again next pass. Doubles per refusal, cleared by a search that works.
-        self._offer_backoff_s = 0.0
-        self._offer_retry_at = 0.0
+        #: Each connection's searching: its back-off after "too many requests", the provider's own
+        #: words for it, and why its last search came back empty (D119, D129).
+        self.searching: dict[str, SearchState] = {name: SearchState() for name in self.providers}
+
+    # --- connections (D129) ---
+
+    @property
+    def provider(self) -> Provider:
+        return self.providers[self.connection]
+
+    @provider.setter
+    def provider(self, value: Provider) -> None:
+        self.providers[self.connection] = value
+
+    def searchable(self) -> list[str]:
+        """The connections a search asks: the enabled ones the pool has a provider for."""
+        return [name for name in self.rented.enabled_connections if name in self.providers]
+
+    def provider_for(self, what: Any) -> Provider:
+        """The provider a host, an offer or a connection's name belongs to. A record whose
+        connection is no longer configured belongs to the only one, where there is only one — a
+        renamed connection's hosts; otherwise it cannot be acted on, and saying so is the answer."""
+        name = what if isinstance(what, str) else (
+            what.connection_name if isinstance(what, RentedHost) else getattr(what, "connection", ""))
+        resolved = self.resolve(name or self.legacy_connection)
+        if resolved is None:
+            raise ProviderError(f"provider connection {name!r} is no longer configured: restore it to manage "
+                                "what the pool holds there")
+        return self.providers[resolved]
+
+    def resolve(self, name: str) -> Optional[str]:
+        """The configured connection a record's connection name is now: itself, or — renamed —
+        the one with its provider (D133). None where its provider is no longer configured."""
+        if name in self.providers:
+            return name
+        kind = self.connection_types.get(name)
+        return next((n for n, conn in self.rented.providers.items() if kind and conn.type == kind
+                     and n in self.providers), None)
+
+    def _at(self, offer: Offer) -> tuple[str, str]:
+        """Where a machine is: a machine identifier is unique only within its connection."""
+        named = offer.connection or self.legacy_connection
+        return (self.resolve(named) or named, offer.machine_id)
+
+    # Before connections, one provider's back-off; kept for whatever reads it as one.
+    @property
+    def _offer_retry_at(self) -> float:
+        return self.searching[self.connection].retry_at
+
+    @_offer_retry_at.setter
+    def _offer_retry_at(self, value: float) -> None:
+        self.searching[self.connection].retry_at = value
+
+    @property
+    def _offer_backoff_s(self) -> float:
+        return self.searching[self.connection].backoff_s
+
+    @_offer_backoff_s.setter
+    def _offer_backoff_s(self, value: float) -> None:
+        self.searching[self.connection].backoff_s = value
 
     # --- units (D115) ---
 
@@ -426,6 +514,24 @@ class Fleet:
     def first_group(self, workload: Optional[str]) -> Optional[tuple[str, ...]]:
         spec = self.workloads.get(workload) if workload is not None else None
         return spec.groups[0].key if spec is not None and spec.groups else None
+
+    def held_back_rows(self, workload: Any = ...) -> list:
+        """Records kept at a restart for hosts on a provider not yet asked (D61, D129): hosts the
+        pool may still be paying for, so they count against its limits as held hosts do — or a
+        pool with one account unreachable would rent past them on the others. Given a workload,
+        only its own (None is the shared workload's)."""
+        return [r for held in self.pending_adoption.values() for r in held
+                if workload is ... or r.workload == workload]
+
+    def held_back_burn(self) -> float:
+        return sum(float((r.provider_ref or {}).get("bid_hourly") or r.hourly_rate or 0.0)
+                   for r in self.held_back_rows())
+
+    @property
+    def adoption_retry_due(self) -> bool:
+        """A configured connection still holds hosts back: worth asking again each pass. One no
+        longer configured is not — asking every provider for it would never end (D129)."""
+        return any(name in self.providers for name in self.pending_adoption)
 
     def hosts_of(self, workload: Optional[str], group: Optional[tuple[str, ...]] = None) -> list[RentedHost]:
         """The live hosts one demand holds: a workload's, or one group of them (D118)."""
@@ -476,9 +582,15 @@ class Fleet:
         one that *says* it can but has never actually done so. Found live: the declaration
         was true of the API in general and false of every instance payload, which would have
         left the cap on estimate-only with the narrow margin, silently."""
-        if self.provider.capabilities.reports_charges and self.charges_ever_reported:
+        counted = set(self.searchable()) | {h.connection_name for h in self.hosts.values() if not h.released}
+        if counted and all(name in self.providers and self.providers[name].capabilities.reports_charges
+                           and name in self.charges_seen for name in counted):
             return self.rented.spend.cap_safety_margin
         return self.rented.spend.margin_without_reported_charges
+
+    @property
+    def charges_ever_reported(self) -> bool:
+        return bool(self.charges_seen)
 
     def lease_spend(self, lease: Lease) -> tuple[float, float]:
         """(the figure caps are enforced on, the raw estimate). Caps use whichever of the
@@ -523,11 +635,11 @@ class Fleet:
                 connection=host.connection_name,
             )
             try:
-                charges = await self.provider.reported_charges(host.instance)
+                charges = await self.provider_for(host).reported_charges(host.instance)
             except ProviderError:
                 charges = None
             if charges is not None:
-                self.charges_ever_reported = True
+                self.charges_seen.add(host.connection_name)
                 host.reported_spend_total = charges.total
                 host.reported_spend = max(0.0, charges.total - host.charges_base)
                 self.spend.record(
@@ -726,14 +838,14 @@ class Fleet:
         requested = kwargs.get("max_hours")
         if limit is not None and requested is not None and requested > limit:
             raise LeaseRefused(
-                f"{self.provider.name} offers no instance-scoped credential, so no dead-man "
-                f"timer can be armed; leases there are limited to {limit}h, not {requested}h"
+                f"{self._without_deadman()} (it has no instance-scoped credential), so leases are "
+                f"limited to {limit}h, not {requested}h"
             )
         return self.leases.open(pool_max_all_in_hourly=self.rented.max_all_in_hourly, **kwargs)
 
     # --- the dead-man timer ---
 
-    def deadman_onstart(self, models: Optional[Sequence[str]] = None) -> Optional[str]:
+    def deadman_onstart(self, models: Optional[Sequence[str]] = None, connection: Optional[str] = None) -> Optional[str]:
         """The start-up script that arms the timer, or None where the provider has no
         instance-scoped credential.
 
@@ -741,10 +853,11 @@ class Fleet:
         machine it does not trust and having no timer at all. It does neither: it refuses long
         leases on that provider instead (spec §7).
         """
-        if not self.provider.capabilities.self_terminate:
+        provider = self.provider_for(connection or self.connection)
+        if not provider.capabilities.self_terminate:
             return None
         return onstart_script(
-            self.provider.self_terminate_request(self.rented.teardown.deadman_action),
+            provider.self_terminate_request(self.rented.teardown.deadman_action),
             window_s=int(self.rented.teardown.deadman_minutes * 60),
             engine_port=self.engine_port,
             public_key=self.pool_public_key(),
@@ -1243,10 +1356,25 @@ class Fleet:
 
     def max_lease_hours(self) -> Optional[float]:
         """Without a dead-man timer, nothing on the host can stop it billing — so leases are
-        capped short there."""
-        if self.provider.capabilities.self_terminate:
+        capped short there. With several connections, a lease is as long as the one that can arm
+        a timer allows; the others are not rented from for it (`lease_hours_on`)."""
+        if any(self.lease_hours_on(name) is None for name in self.searchable()):
             return None
         return self.rented.teardown.max_hours_without_deadman
+
+    def lease_hours_on(self, connection: str) -> Optional[float]:
+        """The longest lease a host on this connection may serve: None where it arms a timer."""
+        if self.provider_for(connection).capabilities.self_terminate:
+            return None
+        return self.rented.teardown.max_hours_without_deadman
+
+    def _without_deadman(self) -> str:
+        """For an operator: which provider accounts cannot arm a dead-man timer, as the start of a
+        sentence. Never for an application, which is not told where the pool rents."""
+        names = [n for n in self.searchable() if self.lease_hours_on(n) is not None] or [self.connection]
+        if len(names) == 1:
+            return f"provider account {names[0]!r} cannot arm a dead-man timer"
+        return f"none of the provider accounts ({', '.join(names)}) can arm a dead-man timer"
 
     async def beat_deadman_timers(self) -> None:
         """Refresh the timestamp on every live host, over the connection already held.
@@ -1461,10 +1589,16 @@ class Fleet:
         comes back is a machine's output: recorded and shown, never executed, and never used to
         decide anything.
         """
-        if not self.provider.capabilities.reports_instance_logs or host.instance is None:
+        if host.instance is None:
             return None
         try:
-            text = await self.provider.instance_logs(host.instance, tail=tail)
+            provider = self.provider_for(host)
+        except ProviderError:
+            return None
+        if not provider.capabilities.reports_instance_logs:
+            return None
+        try:
+            text = await provider.instance_logs(host.instance, tail=tail)
         except Exception as exc:  # noqa: BLE001 - diagnosis must never delay a tear-down
             log.debug("could not read %s's boot output: %s", host.host_id, exc)
             return None
@@ -1593,15 +1727,16 @@ class Fleet:
         steps: list[dict] = []
         open_leases = self.leases.open_leases()
 
-        try:
-            instances = await self.provider.list_instances(self.label_prefix)
-        except ProviderError as exc:
-            steps.append({"step": "observe", "detail": f"the provider is not answering: {exc}"})
-            instances = []
+        instances = []
+        for name, provider in self.providers.items():
+            try:
+                instances += [(name, i) for i in await provider.list_instances(self.label_prefix)]
+            except ProviderError as exc:
+                steps.append({"step": "observe", "detail": f"{name} is not answering: {exc}"})
 
-        known = {h.instance.instance_id for h in self.hosts.values() if not h.released}
-        for instance in instances:
-            if instance.instance_id not in known:
+        known = {(h.connection_name, h.instance.instance_id) for h in self.hosts.values() if not h.released}
+        for name, instance in instances:
+            if (name, instance.instance_id) not in known:
                 steps.append(
                     {
                         "step": "sweep",
@@ -1719,6 +1854,18 @@ class Fleet:
             self.model_set_gb(next_models, next_builds),
             history=self.machine_history(), history_cfg=self.rented.history,
         )
+        if ranked:
+            # The order the pool rents in: least expected cost per worker-hour (D131), not the score.
+            lease_hours = max((lease.hours_left() for lease in self.leases.open_leases() if lease.workload is None),
+                              default=hours or 1.0)
+            ordered, _why = self.expected_costs(ranked, lease_hours, None, next_models, next_builds,
+                                                policy.max_all_in_hourly)
+            by_key = {(o.connection, o.offer_id, o.interruptible): (o, s) for o, s in ranked}
+            cost_of = {(c.connection, c.offer_id, c.interruptible): c.per_worker_hour for c in ordered}
+            ranked = [by_key[(c.connection, c.offer_id, c.interruptible)] for c in ordered] + [
+                pair for pair in ranked if (pair[0].connection, pair[0].offer_id, pair[0].interruptible) not in cost_of]
+        else:
+            cost_of = {}
         problem = self.last_offer_error if search else None
         by_reason: dict[str, int] = {}
         for reasons in rejected.values():
@@ -1735,6 +1882,11 @@ class Fleet:
                     # What to name to rent exactly this one, and how it would be rented.
                     "offer_id": offer.offer_id,
                     "kind": "interruptible" if offer.interruptible else "on_demand",
+                    # Which provider lists it, and how it is paid for: bid, spot or on demand (D129, D132).
+                    "connection": offer.connection,
+                    "priced": ("bid" if offer.bidding else "spot") if offer.interruptible else "on_demand",
+                    # What the pool chooses by (D131): expected dollars per worker-hour.
+                    "per_worker_hour": cost_of.get((offer.connection, offer.offer_id, offer.interruptible)),
                     "machine": offer.machine_id,
                     "hardware": offer.hardware,
                     # What a host rented from this offer would run, and whether a profile says so.
@@ -1767,6 +1919,9 @@ class Fleet:
             # None when the market really was asked. Set when it could not be, so nobody
             # reads "0 offers seen" as "there is nothing out there" (D44).
             "problem": problem,
+            # A provider that could not be asked while others answered: what is shown is theirs (D129).
+            "provider_errors": ({n: self.searching[n].error for n in self.searchable()
+                                 if n in self.searching and self.searching[n].error} if search and not problem else {}),
             # Machines skipped for now because they just failed, and why.
             "avoided": self.avoided_now(),
             "best": accepted,
@@ -1833,6 +1988,7 @@ class Fleet:
         client_for: Optional[object] = None,
         offer_id: Optional[str] = None,
         kind: Optional[str] = None,
+        connection: Optional[str] = None,
     ) -> Optional[RentedHost]:
         """Get a host ready *before* a run, or keep one warm between runs.
 
@@ -1861,7 +2017,7 @@ class Fleet:
         if reused is None:
             # A new rental counts against the pool's host limit, as every other does: without
             # this an operator could prepare past it, and the worst case it bounds (D46) was not.
-            live = len([h for h in self.hosts.values() if not h.released])
+            live = len([h for h in self.hosts.values() if not h.released]) + len(self.held_back_rows())
             reserved = self.reserved_hosts()
             if live + reserved >= self.config.limits.max_rented_hosts:
                 self.last_refusal = (f"{live} rented hosts already"
@@ -1871,7 +2027,7 @@ class Fleet:
                 return None
         host = reused or await self.rent_one(
             lease, ["prepared on request" + (f": chosen offer {offer_id}" if offer_id else "")],
-            offer_id=offer_id, kind=kind,
+            offer_id=offer_id, kind=kind, connection=connection,
         )
         if host is None:
             self.leases.close(lease.lease_id, "nothing could be prepared")
@@ -2256,8 +2412,15 @@ class Fleet:
         for host in self.hosts_of(workload, group):
             if host.state != "parked":
                 continue
-            offers = await self._offers()
-            same_machine = next((o for o in offers if o.machine_id == host.offer.machine_id), None)
+            if host.connection_name not in self.searchable():
+                continue  # a disabled connection rents nothing, a restart included (D129)
+            limit = self.lease_hours_on(host.connection_name)
+            if limit is not None and (limit < lease.max_hours or host.hours_held >= limit):
+                continue  # no dead-man timer there: this lease, or this host's hours, run past it
+            offers = await self._offers(connections=[host.connection_name])
+            same_machine = next((o for o in offers if self._at(o) == self._at(host.offer)
+                                 and o.interruptible == host.offer.interruptible
+                                 and o.bidding == host.offer.bidding), None)
             if same_machine is None:
                 continue
             bid = price_bid(same_machine, self.rented.bidding, self.rented.policy_in_force, lease.max_all_in_hourly)
@@ -2270,8 +2433,10 @@ class Fleet:
                                    host_id=host.host_id, lease_id=lease.lease_id)
                 continue
             try:
-                await self.provider.set_bid(host.instance, capped)
-                await self.provider.start(host.instance)
+                provider = self.provider_for(host)
+                if same_machine.bidding:
+                    await provider.set_bid(host.instance, capped)
+                await provider.start(host.instance)
             except ProviderError as exc:
                 self.events.record(
                     "park_restart_failed",
@@ -2364,14 +2529,54 @@ class Fleet:
         intended. A restart is not a reason to destroy a good host — nor to keep billing for
         one that is gone.
         """
-        try:
-            existing = {i.instance_id: i for i in await self.provider.list_instances(self.label_prefix)}
-        except ProviderError as exc:
-            # "Could not ask" is not "nothing there" (D44, D61). Returning an empty list here
-            # once told the caller to drop every row — and the next supervisor, finding the
-            # instances with no record of them, destroyed healthy hosts as orphans (seen live).
-            log.warning("could not list instances to adopt: %s", exc)
-            return None
+        # "Could not ask" is not "nothing there" (D44, D61). Dropping rows on it once told the
+        # caller to forget a host — and the next supervisor, finding the instance with no record
+        # of it, destroyed a healthy host as an orphan (seen live). Per connection (D129): one
+        # that cannot be asked, or is no longer configured, holds back only its own hosts.
+        by_connection: dict[str, list] = {}
+        for row in rows:
+            ref = row.provider_ref or {}
+            named = ref.get("connection") or (ref.get("offer") or {}).get("connection") or self.legacy_connection
+            by_connection.setdefault(self.resolve(named) or f"?{named}", []).append(row)
+        pending: dict[str, list] = {}
+        existing: dict[tuple[str, str], Instance] = {}
+        answered = 0
+        # Every configured connection is asked, rows or not: "nobody could be asked" must mean
+        # exactly that, or a retry holding only one account's rows reads as the whole pool down.
+        for name, provider in self.providers.items():
+            try:
+                existing.update({(name, i.instance_id): i for i in await provider.list_instances(self.label_prefix)})
+                answered += 1
+            except Exception as exc:  # a plug-in's own failure, of any kind, stays its own (D129)
+                log.warning("could not list %s's instances to adopt: %s", name, exc)
+                if name in by_connection:
+                    pending[name] = by_connection[name]
+        for name, held in by_connection.items():
+            if name.startswith("?"):
+                pending[name[1:]] = held
+        if rows and not answered:
+            self.pending_adoption = pending
+            return None  # nothing could be asked: every record kept, and the pass waits (D61)
+        for name, held in pending.items():
+            # Said when it changes, not every pass (D82).
+            ids = tuple(sorted(r.host_id for r in held))
+            if self._said_pending.get(name) == ids:
+                continue
+            self._said_pending[name] = ids
+            gone = name not in self.providers
+            self.events.record(
+                "adoption_deferred",
+                (f"{len(held)} rented host(s) are on provider connection {name!r}, which is no longer configured: "
+                 "their records are kept, and nothing is done to them until it is again") if gone else
+                (f"provider connection {name!r} could not be asked about {len(held)} rented host(s); their records "
+                 "are kept and it is not swept until it can be — the other connections carry on"),
+                numbers={"hosts": list(ids), "connection": name},
+            )
+        for name in [n for n in self._said_pending if n not in pending]:
+            del self._said_pending[name]
+        self.pending_adoption = pending
+        held_back = {r.host_id for held in pending.values() for r in held}
+        rows = [row for row in rows if row.host_id not in held_back]
 
         adopted: list[str] = []
         for row in rows:
@@ -2379,7 +2584,9 @@ class Fleet:
             instance_id = ref.get("instance_id")
             if not instance_id or "offer" not in ref:
                 continue
-            instance = existing.get(instance_id)
+            row_connection = self.resolve(
+                ref.get("connection") or (ref.get("offer") or {}).get("connection") or self.legacy_connection) or ""
+            instance = existing.get((row_connection, instance_id))
             if instance is None:
                 self.events.record(
                     "host_gone",
@@ -2395,7 +2602,7 @@ class Fleet:
                 host_id=row.host_id,
                 instance=instance,
                 offer=Offer(**{**{k: v for k, v in ref["offer"].items() if k != "connection"},
-                               "connection": ref.get("connection") or self.legacy_connection}),
+                               "connection": row_connection}),
                 bid_hourly=float(ref.get("bid_hourly") or row.hourly_rate or 0.0),
                 lease_id=row.lease_id or "",
                 created_at=float(ref.get("created_at") or time.time()),
@@ -2433,7 +2640,7 @@ class Fleet:
                 host.state = "adopting"
             host.mark_preparing()
             try:
-                host.connection = await self.provider.connection(instance)
+                host.connection = await self.provider_for(row_connection).connection(instance)
             except ProviderError as exc:
                 log.warning("no connection details for %s yet: %s", row.host_id, exc)
             if host.state != "parked" and host.connection is not None:
@@ -2459,7 +2666,7 @@ class Fleet:
             )
         return adopted
 
-    async def _left_nothing_behind(self, label: str, lease: Lease) -> bool:
+    async def _left_nothing_behind(self, label: str, lease: Lease, connection: Optional[str] = None) -> bool:
         """After a bid the provider reported lost: is anything running under its label?
 
         Returns False when something was left and could not be ended, or when the provider
@@ -2467,7 +2674,7 @@ class Fleet:
         second machine on top of one that may be billing.
         """
         try:
-            stray = await self.provider.list_instances(label)
+            stray = await self.provider_for(connection or self.connection).list_instances(label)
         except ProviderError as exc:
             self.events.record(
                 "bid_unverifiable",
@@ -2488,7 +2695,7 @@ class Fleet:
                 numbers={"instance": instance.instance_id, "label": label},
                 lease_id=lease.lease_id,
             )
-            if await self._destroy_instance(instance, "left behind by a failed bid"):
+            if await self._destroy_instance(instance, "left behind by a failed bid", connection):
                 ended.append(instance.instance_id)
         if len(ended) == len(stray):
             return True
@@ -2505,52 +2712,59 @@ class Fleet:
     async def sweep_orphans(self) -> None:
         """The provider is the source of truth for what exists; the database for what was
         intended. Anything carrying this pool's label that we did not intend is swept."""
-        try:
-            instances = await self.provider.list_instances(self.label_prefix)
-        except ProviderError as exc:
-            log.warning("could not list instances: %s", exc)
-            return
-
-        known = {host.instance.instance_id for host in self.hosts.values() if not host.released}
-        for instance in instances:
-            if instance.instance_id in known:
+        known = {(self.resolve(host.connection_name), host.instance.instance_id)
+                 for host in self.hosts.values() if not host.released}
+        for name, provider in self.providers.items():
+            if name in self.pending_adoption:
+                continue  # its hosts are not taken back yet: what it lists may be ours
+            try:
+                instances = await provider.list_instances(self.label_prefix)
+            except ProviderError as exc:
+                log.warning("could not list %s's instances: %s", name, exc)
                 continue
-            self.events.record(
-                "orphan_swept",
-                f"instance {instance.instance_id} carries this pool's label but was never "
-                "intended; destroying so it stops billing",
-                numbers={"instance": instance.instance_id, "label": instance.label},
-            )
-            await self._destroy_instance(instance, "orphan")
+            for instance in instances:
+                if (name, instance.instance_id) in known:
+                    continue
+                self.events.record(
+                    "orphan_swept",
+                    f"instance {instance.instance_id} carries this pool's label but was never "
+                    "intended; destroying so it stops billing",
+                    numbers={"instance": instance.instance_id, "label": instance.label, "connection": name},
+                )
+                await self._destroy_instance(instance, "orphan", name)
         await self.sweep_volumes()
 
     async def sweep_volumes(self) -> None:
         """A volume under the pool's label whose workload is over, or that the pool has no record
         of, is deleted (D116). A provider that cannot be asked leaves every volume where it is:
         "could not list" is never "none there" (D61)."""
-        if not self.provider.capabilities.volumes:
-            return
-        try:
-            found = await self.provider.list_volumes(self.label_prefix)
-        except ProviderError as exc:
-            log.warning("could not list volumes: %s", exc)
-            return
-        live = {v.volume_id: v for v in self.workload_store.volumes()}
-        for volume in found:
-            record = live.get(volume.volume_id)
-            if record is not None and record.workload in self.workloads:
+        live = {(self.resolve(v.connection or self.legacy_connection) or v.connection, v.volume_id): v
+                for v in self.workload_store.volumes()}
+        for name, provider in self.providers.items():
+            if not provider.capabilities.volumes:
                 continue
-            await self._delete_volume(volume.volume_id, "its workload is over" if record else "never recorded by this pool")
+            try:
+                found = await provider.list_volumes(self.label_prefix)
+            except ProviderError as exc:
+                log.warning("could not list %s's volumes: %s", name, exc)
+                continue
+            for volume in found:
+                record = live.get((name, volume.volume_id))
+                if record is not None and record.workload in self.workloads:
+                    continue
+                await self._delete_volume(volume.volume_id, "its workload is over" if record else "never recorded by this pool",
+                                          name)
 
     async def delete_volumes(self, workload: str) -> None:
         """Every volume of a workload that is over."""
         for volume in self.workload_store.volumes(workload):
-            await self._delete_volume(volume.volume_id, f"workload {workload} is over")
+            await self._delete_volume(volume.volume_id, f"workload {workload} is over", volume.connection or None)
 
-    async def _delete_volume(self, volume_id: str, why: str) -> None:
+    async def _delete_volume(self, volume_id: str, why: str, connection: Optional[str] = None) -> None:
         try:
-            await self.provider.delete_volume(volume_id)
-            remaining = {v.volume_id for v in await self.provider.list_volumes(self.label_prefix)}
+            provider = self.provider_for(connection or self.legacy_connection)
+            await provider.delete_volume(volume_id)
+            remaining = {v.volume_id for v in await provider.list_volumes(self.label_prefix)}
         except ProviderError as exc:
             log.warning("could not delete volume %s: %s", volume_id, exc)
             return
@@ -2567,9 +2781,13 @@ class Fleet:
             if host.released:
                 continue
             try:
-                status = await self.provider.status(host.instance)
+                status = await self.provider_for(host).status(host.instance)
             except ProviderError as exc:
                 log.warning("status for %s failed: %s", host.host_id, exc)
+                continue
+            if await self._spot_moved(host, status):
+                continue
+            if await self._past_its_timerless_hours(host):
                 continue
 
             if status.state == InstanceState.GONE:
@@ -2587,7 +2805,7 @@ class Fleet:
             if (
                 status.startup_material is False
                 and host.state != "ready"
-                and self.deadman_onstart() is not None
+                and self.deadman_onstart(connection=host.connection_name) is not None
             ):
                 # Created with a start-up script and reported back without one (seen live): no
                 # dead-man timer, no key for the pool, so it can never join and nothing on it
@@ -2653,12 +2871,14 @@ class Fleet:
                 continue
 
             offers = await self._offers()
-            same_machine = next((o for o in offers if o.machine_id == host.offer.machine_id), None)
-            if same_machine is None and host.interruptible:
+            same_machine = next((o for o in offers if self._at(o) == self._at(host.offer) and o.bidding), None)
+            if not host.offer.bidding:
+                same_machine = None  # a spot host taken back is replaced: there is no bid to win it with
+            elif same_machine is None and host.interruptible:
                 # Outbid means someone else holds it now, so the search does not list it: ask
                 # for this machine's own price (D109).
                 same_machine = await self._machine_price(host)
-            alternatives = [o for o in offers if o.machine_id != host.offer.machine_id]
+            alternatives = [o for o in offers if self._at(o) != self._at(host.offer)]
             best_alternative = alternatives[0] if alternatives else None
 
             decision = decide_eviction(
@@ -2715,10 +2935,11 @@ class Fleet:
                     await self.destroy(host, "re-bid would cross a ceiling")
                     continue
                 try:
-                    await self.provider.set_bid(host.instance, capped)
+                    provider = self.provider_for(host)
+                    await provider.set_bid(host.instance, capped)
                     # Billed at the new bid from here, whether or not the start below goes through.
                     host.bid_hourly = capped
-                    await self.provider.start(host.instance)
+                    await provider.start(host.instance)
                     host.mark_scheduling()
                     host.rebid_at = time.time()
                 except ProviderError as exc:
@@ -2729,11 +2950,16 @@ class Fleet:
     async def _machine_price(self, host: "RentedHost") -> Optional[Offer]:
         """The current bid listing for the machine this host was rented on, asked of the machine
         itself — or None where the provider cannot say, which releases rather than guesses."""
-        finder = getattr(self.provider, "offer_for_machine", None)
+        if not host.offer.bidding:
+            return None  # a spot price is not won back with a bid
+        try:
+            finder = getattr(self.provider_for(host), "offer_for_machine", None)
+        except ProviderError:
+            return None
         if finder is None:
             return None
         try:
-            offer = await self._counted(finder(host.offer.machine_id, host.offer.gpus))
+            offer = await self._counted(finder(host.offer.machine_id, host.offer.gpus), host.connection_name)
         except ProviderError as exc:
             log.warning("the price of %s could not be read: %s", host.offer.machine_id, exc)
             return None
@@ -2994,6 +3220,23 @@ class Fleet:
         supervisor started on the same database, which then exits on the lock, must not decide it."""
         db = self.leases.db
         self.legacy_connection = legacy_connection(db, self.connection)
+        for row in db.query("SELECT key, value FROM pool_meta WHERE key LIKE 'connection_type:%'"):
+            name, was = str(row["key"]).split(":", 1)[1], str(row["value"])
+            now = self.rented.providers[name].type if name in self.rented.providers else None
+            if now is not None and now != was:
+                # Its records — hosts, volumes, spend — are that provider's: read as another's, the
+                # pool would act on them at the wrong provider.
+                raise ConnectionNameReused(
+                    f"provider connection {name!r} was {was!r} and is now configured as {now!r}: give the new "
+                    f"provider another name — {name!r} names {was!r}'s records (D133)")
+            self.connection_types.setdefault(name, was)
+        if self.legacy_connection not in self.connection_types:
+            # The first pool with connections had only this one; its records are its provider's.
+            self.connection_types[self.legacy_connection] = self.rented.providers[self.connection].type
+        for name, conn in self.rented.providers.items():
+            db.execute("INSERT OR REPLACE INTO pool_meta (key, value) VALUES (?, ?)", (f"connection_type:{name}", conn.type))
+        db.execute("INSERT OR IGNORE INTO pool_meta (key, value) VALUES (?, ?)",
+                   (f"connection_type:{self.legacy_connection}", self.connection_types[self.legacy_connection]))
         db.execute(
             "INSERT OR IGNORE INTO provider_search_usage (connection, day, rows, quota, exhausted_at, resets_at, "
             "updated_at) SELECT ?, day, rows, quota, exhausted_at, resets_at, updated_at FROM search_usage",
@@ -3088,15 +3331,23 @@ class Fleet:
                          group: Optional[tuple[str, ...]] = None) -> Optional[str]:
         if lease is None:
             return "no lease is open"
+        mine = self.held_back_rows(lease.workload)
+        if mine:
+            # Its hosts there may still be serving and billing: one rented in their place would
+            # bill beside them until the provider answers.
+            return (f"{len(mine)} of its hosts are on a provider not yet asked since the restart; "
+                    "nothing is rented in their place until it answers")
         live = [h for h in self.hosts.values() if not h.released]
+        held = len(self.held_back_rows())
         reserved = self.reserved_hosts(besides=lease.workload, group=group)
-        if len(live) + reserved >= self.config.limits.max_rented_hosts:
+        if len(live) + held + reserved >= self.config.limits.max_rented_hosts:
             return (
-                f"{len(live)} rented hosts already"
+                f"{len(live) + held} rented hosts already"
+                + (f" ({held} on a provider not yet asked)" if held else "")
                 + (f", and {reserved} reserved for workloads still starting" if reserved else "")
                 + f", at the pool's limit of {self.config.limits.max_rented_hosts}"
             )
-        burn = sum(h.bid_hourly for h in live) + self.volume_burn()
+        burn = sum(h.bid_hourly for h in live) + self.volume_burn() + self.held_back_burn()
         total = self.config.limits.max_hourly_burn
         if total is not None and burn >= total:
             return f"hourly burn ${burn:.3f} is at the ${total:.2f} cap"
@@ -3134,7 +3385,8 @@ class Fleet:
         per-host ceiling, and the host count to the pool's limit (D46)."""
         if self.config.limits.max_hourly_burn is None:
             return None
-        burn = sum(h.bid_hourly for h in self.hosts.values() if not h.released) + self.volume_burn() + bid
+        burn = (sum(h.bid_hourly for h in self.hosts.values() if not h.released) + self.volume_burn()
+                + self.held_back_burn() + bid)
         if burn > self.config.limits.max_hourly_burn:
             return (
                 f"bidding ${bid:.3f}/h would take the burn to ${burn:.3f}/h, above the "
@@ -3153,7 +3405,7 @@ class Fleet:
         if cap is None:
             return None
         others = sum(h.bid_hourly for h in self.hosts.values() if not h.released and h is not host)
-        burn = others + self.volume_burn() + bid
+        burn = others + self.volume_burn() + self.held_back_burn() + bid
         if burn > cap:
             return f"bidding ${bid:.3f}/h on {host.host_id} would take the burn to ${burn:.3f}/h, above the ${cap:.2f} cap"
         return None
@@ -3162,6 +3414,7 @@ class Fleet:
         self, lease: Lease, reasons: list[str],
         offer_id: Optional[str] = None, kind: Optional[str] = None,
         workload: Optional[str] = None, group: Optional[tuple[str, ...]] = None,
+        connection: Optional[str] = None,
     ) -> Optional[RentedHost]:
         """Rent the best offer — or, when an operator named one, exactly that one.
 
@@ -3198,6 +3451,11 @@ class Fleet:
                 update={"min_reliability": max(policy.min_reliability, self.config.workloads.min_reliability)}
             )
         offers = await self._offers(policy, kinds=kind or ("both" if offer_id else None))
+        # A connection with no dead-man timer serves only short leases (spec §7): for a longer
+        # one, its offers are not among those this lease may rent (D129).
+        too_long = {(o.connection, o.offer_id) for o in offers
+                    if (self.lease_hours_on(o.connection) or float("inf")) < lease.max_hours}
+        offers = [o for o in offers if (o.connection, o.offer_id) not in too_long]
         ranked, rejected = rank_offers(
             offers,
             self._policy_with_avoided(policy),
@@ -3208,7 +3466,21 @@ class Fleet:
             history_cfg=self.rented.history,
         )
         if offer_id is not None:
-            chosen = [pair for pair in ranked if pair[0].offer_id == offer_id]
+            chosen = [pair for pair in ranked if pair[0].offer_id == offer_id
+                      and (connection is None or pair[0].connection == connection)]
+            if len({pair[0].connection for pair in chosen}) > 1:
+                why = (f"offer {offer_id} is listed by more than one provider "
+                       f"({', '.join(sorted({p[0].connection for p in chosen}))}); say which")
+                self.last_refusal = why
+                self.events.record("chosen_offer_unavailable", why, numbers={"offer": offer_id}, lease_id=lease.lease_id)
+                return None
+            stopped = next((name for name, oid in too_long if oid == offer_id and connection in (None, name)), None)
+            if not chosen and stopped is not None:
+                why = (f"{stopped} cannot arm a dead-man timer, so it serves leases of at most "
+                       f"{self.lease_hours_on(stopped):g}h, and this one is {lease.max_hours:g}h")
+                self.last_refusal = why
+                self.events.record("chosen_offer_unavailable", why, numbers={"offer": offer_id}, lease_id=lease.lease_id)
+                return None
             if not chosen:
                 # Say exactly why, from the same filters — gone, or refused and by which rule.
                 if offer_id in rejected:
@@ -3275,18 +3547,21 @@ class Fleet:
             self._said_unfit.pop((workload, chosen_group.key), None)
             ranked = fitting
 
-        if spec is not None and spec.kind == "roi" and offer_id is None:
-            # On demand or a bid, by what each is expected to cost this workload over the hours
-            # its lease has left (D115). Deterministic, with its reasons; every cap still applies.
+        if offer_id is None:
+            # Every rental — the shared pool's and each workload's, of any kind — takes the offer
+            # expected to cost least per worker-hour over the hours its lease has left, across
+            # every provider: a bid, a spot price or on demand, each with what its interruptions
+            # cost (D115, D131). Deterministic, with its reasons; every cap still applies.
             ranked, kind_reasons = self._by_rental_kind(
                 ranked, lease, spec, for_this_host, builds,
-                fixed_workers=chosen_group.workers_per_host if len(chosen_group.models) > 1 else None)
+                fixed_workers=(chosen_group.workers_per_host
+                               if chosen_group is not None and len(chosen_group.models) > 1 else None))
             reasons = [*reasons, *kind_reasons[:1]]
         warm = self._warm_volumes(spec, builds) if spec is not None else {}
-        if warm and offer_id is None and any(o.machine_id in warm for o, _ in ranked):
+        if warm and offer_id is None and any(self._at(o) in warm for o, _ in ranked):
             # A machine that already holds the models downloads nothing: first, whatever else
             # the ranking said (D116).
-            ranked = sorted(ranked, key=lambda pair: 0 if pair[0].machine_id in warm else 1)
+            ranked = sorted(ranked, key=lambda pair: 0 if self._at(pair[0]) in warm else 1)
             reasons = [*reasons, f"a machine holding its models is offered again: {ranked[0][0].machine_id}"]
 
         unaffordable_offers, created = 0, False
@@ -3343,12 +3618,14 @@ class Fleet:
                 # Launched at what it may be asked for, used at what it is given (D68).
                 env=self.instance_env(launch_workers, for_this_host),
                 # Armed before anything else runs, and carrying no account credential.
-                onstart=self.deadman_onstart(for_this_host),
+                onstart=self.deadman_onstart(for_this_host, offer.connection),
                 volume=self._volume_for(spec, offer, warm, for_this_host, builds) if spec is not None else None,
             )
             try:
-                # No price on an on-demand rental: the provider's listed rate is what is paid.
-                instance = await self.provider.create(offer, instance_spec, capped if offer.interruptible else None)
+                # No price on an on-demand rental: the provider's listed rate is what is paid. A spot
+                # rental is told the most the pool pays, which a provider that takes a maximum price
+                # holds it to (D132).
+                instance = await self.provider_for(offer).create(offer, instance_spec, self._price_for_create(offer, capped, lease))
             except (BidLost, OfferGone) as exc:
                 numbers = {"bid": capped, "offer": offer.offer_id, "score": offer_score}
                 response = getattr(exc, "response", None)
@@ -3371,7 +3648,7 @@ class Fleet:
                 # next offer while a machine from this one bills is how one lease ends up
                 # paying for three hosts (D43) — so this is checked here, in the pool, and not
                 # left to a plug-in's own discipline. Unprovable means stop, not carry on.
-                if not await self._left_nothing_behind(instance_spec.label, lease):
+                if not await self._left_nothing_behind(instance_spec.label, lease, offer.connection):
                     return None
                 if isinstance(exc, BidLost):
                     # Lost: someone holds the machine above the listed least bid, and the same bid
@@ -3410,7 +3687,7 @@ class Fleet:
             )
             if instance.volume_id is not None and spec is not None:
                 self._record_volume(host, instance.volume_id, warm, offer, lease, for_this_host, builds)
-            connection = await self.provider.connection(instance)
+            connection = await self.provider_for(offer).connection(instance)
             host.connection = connection
             host.dial_url = connection.public_url or await self._open_tunnel(host_id, connection, host.engine_port)
             host.mark_preparing()
@@ -3452,26 +3729,27 @@ class Fleet:
         return [v for v in self.workload_store.volumes(spec.name)
                 if (v.builds == builds) or (v.builds is None and len(spec.groups) == 1)]
 
-    def _warm_volumes(self, spec: Any, builds: Optional[dict[str, str]] = None) -> dict[str, Volume]:
+    def _warm_volumes(self, spec: Any, builds: Optional[dict[str, str]] = None) -> dict[tuple[str, str], Volume]:
         """The machines holding one of this group's volumes, where warm machines are on."""
         if (spec is None or "warm" not in self._sources() or not self.config.workloads.keep_models_on_machine
-                or not self.provider.capabilities.volumes or not self._models_dir()):
+                or not any(p.capabilities.volumes for p in self.providers.values()) or not self._models_dir()):
             return {}
         builds = builds if builds is not None else dict(spec.groups[0].builds)
-        return {v.machine_id: v for v in self._group_volumes(spec, builds)}
+        return {(self.resolve(v.connection or self.legacy_connection) or v.connection, v.machine_id): v
+                for v in self._group_volumes(spec, builds)}
 
-    def _volume_for(self, spec: Any, offer: Offer, warm: dict[str, Volume],
+    def _volume_for(self, spec: Any, offer: Offer, warm: dict[tuple[str, str], Volume],
                     models: Sequence[str], builds: dict[str, str]) -> Optional[VolumeSpec]:
         """The volume a workload's new host is created with: the one already on this machine, or
         — for its first — a new one to keep its models on, so the next host there fetches nothing."""
         if spec is None or "warm" not in self._sources() or not self.config.workloads.keep_models_on_machine:
             return None
-        if not self.provider.capabilities.volumes or not self._models_dir():
+        if not self.provider_for(offer).capabilities.volumes or not self._models_dir():
             return None
         index = next((i for i, g in enumerate(spec.groups) if g.builds == builds), 0)
         label = f"{self.label_prefix}{spec.name}/models" + (f"-{index}" if len(spec.groups) > 1 else "")
-        if offer.machine_id in warm:
-            return VolumeSpec(mount=self._models_dir(), label=label, volume_id=warm[offer.machine_id].volume_id)
+        if self._at(offer) in warm:
+            return VolumeSpec(mount=self._models_dir(), label=label, volume_id=warm[self._at(offer)].volume_id)
         if self._group_volumes(spec, builds):
             return None  # one volume per group: the first machine keeps its models
         size = math.ceil(self.model_set_gb(models, builds) * 1.1) + 1
@@ -3480,7 +3758,7 @@ class Fleet:
     def _record_volume(self, host: RentedHost, volume_id: str, warm: dict[str, Volume], offer: Offer,
                        lease: Lease, models: Sequence[str], builds: dict[str, str]) -> None:
         host.volume_id = volume_id
-        if offer.machine_id in warm and warm[offer.machine_id].volume_id == volume_id:
+        if self._at(offer) in warm and warm[self._at(offer)].volume_id == volume_id:
             host.models_source = "warm"
             self.events.record(
                 "models_from_volume",
@@ -3514,13 +3792,15 @@ class Fleet:
         is nothing to wait for."""
         if host.workload is None or host.models_source == "warm" or host.copy_state in ("done", "failed", "none"):
             return False
-        if "sibling" not in self._sources() or not self.provider.capabilities.copies or not self._models_dir():
+        if ("sibling" not in self._sources() or not self.provider_for(host).capabilities.copies
+                or not self._models_dir()):
             host.copy_state = "none"
             return False
         if host.copy_task is None:
             sibling = next(
                 (other for other in self.hosts_of(host.workload)
-                 if other is not host and other.state == "ready" and other.builds == host.builds),
+                 if other is not host and other.state == "ready" and other.builds == host.builds
+                 and other.connection_name == host.connection_name),
                 None,
             )
             if sibling is None:
@@ -3531,7 +3811,7 @@ class Fleet:
             async def copy(source=sibling.instance, destination=host.instance) -> None:
                 # The provider is asked only once the task runs: one cancelled first asks nothing.
                 await asyncio.wait_for(
-                    self.provider.copy_between(source, destination, self._models_dir()),
+                    self.provider_for(host).copy_between(source, destination, self._models_dir()),
                     timeout=self.config.workloads.copy_timeout_s,
                 )
 
@@ -3593,14 +3873,18 @@ class Fleet:
         hours = max(hours, 1e-6)
         size = self.model_set_gb(models, builds)
         record_of = self.machine_history()
+        name = spec.name if spec is not None else None
         if have is None:
-            have = sum(h.workers for h in self.hosts_of(spec.name, group_key(models)) if h.state != "draining")
+            have = sum(h.workers for h in self.hosts_of(name, group_key(models) if spec is not None else None)
+                       if h.state != "draining")
         on_demand = [o.all_in_hourly for o, _ in ranked if not o.interruptible]
         costs = []
         for offer, _ in ranked:
             # A group of several models runs its fixed split on whatever card it is rented (D118):
             # a bigger card is not more capacity to it, only more cost.
-            workers = fixed_workers if fixed_workers is not None else self.capacity_on(offer, spec, models, builds)
+            workers = (fixed_workers if fixed_workers is not None
+                       else self.capacity_on(offer, spec, models, builds) if spec is not None
+                       else self.workers_for(offer)[0])  # the shared pool: what the card runs
             if workers <= 0:
                 continue  # holds the models, but not every one within its target at once
             if offer.interruptible:
@@ -3611,14 +3895,29 @@ class Fleet:
             record = record_of.get(offer.machine_id)
             rate = getattr(record, "evictions_per_hour", None)
             if rate is None:
-                rate = self.config.workloads.eviction_prior_per_hour
+                # The machine has no history: its connection's prior, where it has one — a bid
+                # market's hosts are outbid, a spot market's reclaimed, at their own rates (D131).
+                conn = self.rented.providers.get(offer.connection)
+                rate = (conn.interruption_prior_per_hour
+                        if conn is not None and conn.interruption_prior_per_hour is not None
+                        else self.config.workloads.eviction_prior_per_hour)
             costs.append(workload_math.expected_cost(
                 offer_id=offer.offer_id, machine_id=offer.machine_id, interruptible=offer.interruptible,
+                connection=offer.connection, bidding=offer.bidding,
                 hourly=hourly, hours=hours, workers=workers, evictions_per_hour=rate,
                 ready_hours=workload_math.time_to_ready_hours(size, offer.download_mbps, self.config.workloads.engine_load_s),
                 lost_capacity_hourly=offer.on_demand_hourly or (min(on_demand) if on_demand else hourly),
                 share_of_workload=workers / max(1, have + workers),
+                download=round(offer.download_per_gb * size, 4),
             ))
+            # The machine's own record, as the score weighed it (D69): one that failed to come up
+            # here, or served slowly, costs more per worker-hour than its price says; one that
+            # served fast, less.
+            factor, why = history_adjustment(record, self.rented.history)
+            if factor != 1.0:
+                cost = costs[-1]
+                costs[-1] = dataclasses.replace(cost, per_worker_hour=round(cost.per_worker_hour / factor, 5),
+                                                reasons=[*cost.reasons, f"its record here: {why} (x{1 / factor:.2f})"])
         return workload_math.order_by_expected_cost(costs)
 
     def capacity_on(self, offer: Offer, spec: Any, models: Sequence[str], builds: dict[str, str]) -> float:
@@ -3645,19 +3944,95 @@ class Fleet:
         # By id and kind: a provider may list one machine's bid and its fixed price under the same
         # id, and keyed by id alone the second overwrote the first — the rule chose a bid and the
         # pool rented the same machine on demand, at twice the price (D127).
-        by_id = {(offer.offer_id, offer.interruptible): (offer, points) for offer, points in ranked}
-        said = (ordered[0].offer_id, ordered[0].interruptible) if ordered else None
+        # And by connection: two providers may number their offers alike (D129).
+        by_id = {(offer.connection, offer.offer_id, offer.interruptible): (offer, points) for offer, points in ranked}
+        said = (ordered[0].connection, ordered[0].offer_id, ordered[0].interruptible) if ordered else None
+        name = spec.name if spec is not None else None
         # Per group (D118): two groups choosing differently must not flip the one note.
-        if self._said_kind.get((spec.name, group_key(models))) == said:
-            return [by_id[(c.offer_id, c.interruptible)] for c in ordered], why
-        self._said_kind[(spec.name, group_key(models))] = said
+        if self._said_kind.get((name, group_key(models))) == said:
+            return [by_id[(c.connection, c.offer_id, c.interruptible)] for c in ordered], why
+        self._said_kind[(name, group_key(models))] = said
         self.events.record(
             "rental_kind", why[0],
-            numbers={"workload": spec.name, "hours_left": round(lease.hours_left(), 3),
+            numbers={"workload": name, "hours_left": round(lease.hours_left(), 3),
                      "candidates": [dataclasses.asdict(c) for c in ordered[:5]]},
             lease_id=lease.lease_id,
         )
-        return [by_id[(c.offer_id, c.interruptible)] for c in ordered], why
+        return [by_id[(c.connection, c.offer_id, c.interruptible)] for c in ordered], why
+
+    def _price_for_create(self, offer: Offer, capped: float, lease: Lease) -> Optional[float]:
+        """What `create` is told: the bid for a bid; for a spot rental, the most the pool pays for
+        the machine (its all-in ceiling less storage), which a provider that takes a maximum
+        price holds it to (D132); nothing for an on-demand rental, whose price is fixed."""
+        if not offer.interruptible:
+            return None
+        if offer.bidding:
+            return capped
+        ceiling, _which = all_in_ceiling(offer, self.rented.policy_in_force, lease.max_all_in_hourly)
+        return round(ceiling - offer.storage_hourly, 4)
+
+    async def _past_its_timerless_hours(self, host: RentedHost) -> bool:
+        """A host on a connection with no dead-man timer is ended once it has run as long as a
+        lease there may (spec §7) — however its lease came to be longer: restarted from a park,
+        extended, amended. Nothing on the machine could stop it billing (D129)."""
+        limit = self.lease_hours_on(host.connection_name) if host.connection_name in self.providers else None
+        if limit is None or host.state in ("draining", "parked") or host.hours_held < limit:
+            return False
+        self.events.record(
+            "timerless_limit",
+            f"{host.host_id} has run {host.hours_held:.2f}h on {host.connection_name}, which cannot arm a dead-man "
+            f"timer; hosts there run at most {limit:g}h, so it is released",
+            numbers={"hours": round(host.hours_held, 3), "limit": limit},
+            host_id=host.host_id, lease_id=host.lease_id,
+        )
+        await self.drain(host, f"{host.connection_name} cannot arm a dead-man timer, and its {limit:g}h are up")
+        return True
+
+    async def _spot_moved(self, host: RentedHost, status: Any) -> bool:
+        """A spot host whose price moved, or that the provider is about to take back (D132). Its
+        spend is settled at the old price and carries on at the new; past the all-in ceiling it is
+        drained and released, as no bid can bring it back under; warned of an interruption, it is
+        drained at once, so what it has finishes or is sent elsewhere. True when it was drained."""
+        if status.interrupting and host.state not in ("draining", "parked"):
+            self.events.record(
+                "interruption_warned",
+                f"{host.host_id}: the provider is taking it back; draining it now",
+                numbers={"machine": host.offer.machine_id},
+                host_id=host.host_id, lease_id=host.lease_id,
+            )
+            await self.drain(host, "the provider is taking it back")
+            return True
+        if not host.interruptible or host.offer.bidding or status.bid_hourly is None:
+            return False
+        price = float(status.bid_hourly)
+        if abs(price - host.bid_hourly) < 1e-9:
+            return False
+        was = host.bid_hourly
+        host.settle()
+        host.bid_hourly = price
+        lease = self.leases.get(host.lease_id)
+        ceiling, which = all_in_ceiling(host.offer, self.rented.policy_in_force,
+                                        lease.max_all_in_hourly if lease is not None else None)
+        over = price + host.offer.storage_hourly > ceiling
+        self.events.record(
+            "spot_price_moved",
+            f"{host.host_id}'s spot price moved from ${was:.3f}/h to ${price:.3f}/h"
+            + (f", past {which} (${ceiling:.3f}/h all-in); releasing it" if over else ""),
+            numbers={"machine": host.offer.machine_id, "was": was, "now": price, "ceiling": ceiling},
+            host_id=host.host_id, lease_id=host.lease_id,
+        )
+        if over and host.state not in ("draining", "parked"):
+            await self.drain(host, f"its spot price passed {which}")
+            return True
+        refused = self._refuse_rebid(host, price, lease) if lease is not None else None
+        if refused is not None and host.state not in ("draining", "parked"):
+            # The same test a re-bid passes (D45): the burn cap and what the lease has left.
+            self.events.record("spot_price_refused", f"{host.host_id}: at its new spot price, {refused}; releasing it",
+                               numbers={"machine": host.offer.machine_id, "now": price},
+                               host_id=host.host_id, lease_id=host.lease_id)
+            await self.drain(host, f"at its new spot price, {refused}")
+            return True
+        return False
 
     def _cap_bid(self, bid: float, lease: Lease, offer: Offer) -> Optional[float]:
         """The supervisor's own clamp, applied after the strategy returns — a faulty or
@@ -3796,7 +4171,7 @@ class Fleet:
                 if reaped_for_overflow >= 1:
                     continue  # one host at a time (spec §9)
                 reaped_for_overflow += 1
-            if action.action == "park" and self.provider.capabilities.parkable:
+            if action.action == "park" and self.provider_for(host).capabilities.parkable:
                 if idle:
                     host.idle_since = now - idle_seconds.get(host.host_id, 0.0)
                 await self.park(host, "; ".join(action.reasons))
@@ -3820,7 +4195,7 @@ class Fleet:
 
     async def park(self, host: RentedHost, reason: str) -> None:
         try:
-            await self.provider.stop(host.instance)
+            await self.provider_for(host).stop(host.instance)
         except ProviderError as exc:
             log.warning("park of %s failed: %s", host.host_id, exc)
             return
@@ -3845,7 +4220,7 @@ class Fleet:
     async def destroy(self, host: RentedHost, reason: str) -> None:
         if host.copy_task is not None and not host.copy_task.done():
             host.copy_task.cancel()  # a copy to a host that is going is work for nobody
-        ok = await self._destroy_instance(host.instance, reason)
+        ok = await self._destroy_instance(host.instance, reason, host.connection_name)
         if ok:
             host.released = True
             host.state = "released"
@@ -3887,10 +4262,11 @@ class Fleet:
             lease_id=host.lease_id,
         )
 
-    async def _destroy_instance(self, instance: Instance, reason: str) -> bool:
+    async def _destroy_instance(self, instance: Instance, reason: str, connection: Optional[str] = None) -> bool:
         """A release counts only once the provider's listing no longer shows it."""
         try:
-            await self.provider.destroy(instance)
+            provider = self.provider_for(connection or self.legacy_connection)
+            await provider.destroy(instance)
         except ProviderError as exc:
             log.warning("destroy of %s failed (%s); will retry next pass", instance.instance_id, exc)
             self.events.record(
@@ -3900,7 +4276,7 @@ class Fleet:
             )
             return False
         try:
-            remaining = await self.provider.list_instances(self.label_prefix)
+            remaining = await provider.list_instances(self.label_prefix)
         except ProviderError:
             return False
         if any(i.instance_id == instance.instance_id for i in remaining):
@@ -3942,21 +4318,22 @@ class Fleet:
 
     # --- the provider's daily search quota (D121) ---
 
-    async def _counted(self, search: Any) -> Any:
+    async def _counted(self, search: Any, connection: Optional[str] = None) -> Any:
         """Run a search, then add what it returned to the day's count — refused or not."""
         try:
             return await search
         finally:
-            self.note_search_usage()
+            self.note_search_usage(connection)
 
     @staticmethod
     def _utc_day(now: float) -> str:
         return time.strftime("%Y-%m-%d", time.gmtime(now))
 
-    def note_search_usage(self) -> None:
+    def note_search_usage(self, connection: Optional[str] = None) -> None:
         """Take the rows the provider counted since last asked, and its last refusal, into the
         day's row. A provider without a search quota has nothing to take."""
-        take = getattr(self.provider, "take_search_usage", None)
+        connection = connection or self.connection
+        take = getattr(self.providers.get(connection), "take_search_usage", None)
         if take is None:
             return
         usage = take()
@@ -3966,7 +4343,7 @@ class Fleet:
         now = time.time()
         day = self._utc_day(now)
         db = self.events.db
-        key = (self.connection, day)
+        key = (connection, day)
         db.execute("INSERT INTO provider_search_usage (connection, day, rows, updated_at) VALUES (?, ?, 0, ?) "
                    "ON CONFLICT(connection, day) DO NOTHING", (*key, now))
         db.execute("UPDATE provider_search_usage SET rows = rows + ?, quota = ?, updated_at = ? "
@@ -3980,16 +4357,17 @@ class Fleet:
                 (spent, int(refusal["limit"]), refusal["at"], refusal["at"] + float(refusal.get("retry_after_s") or 0), *key),
             )
 
-    def search_quota(self) -> Optional[dict]:
+    def search_quota(self, connection: Optional[str] = None) -> Optional[dict]:
         """Today's use of the provider's search quota, for the console: what the pool's own
         searches returned (other tools on the same key are not seen until the provider refuses),
         the quota, and when it resets. None for a provider without one."""
-        limit = getattr(self.provider, "daily_search_rows", None)
+        connection = connection or self.connection
+        limit = getattr(self.providers.get(connection), "daily_search_rows", None)
         if limit is None:
             return None
         now = time.time()
         rows = self.events.db.query("SELECT * FROM provider_search_usage WHERE connection = ? AND day = ?",
-                                    (self.connection, self._utc_day(now)))
+                                    (connection, self._utc_day(now)))
         row = rows[0] if rows else None
         quota = int((row["quota"] if row and row["quota"] else None) or limit)
         used = int(row["rows"]) if row else 0
@@ -4004,55 +4382,71 @@ class Fleet:
             "source": "provider" if exhausted else "counted",
         }
 
-    async def _offers(self, policy: Optional[OfferPolicy] = None, kinds: Optional[str] = None) -> list[Offer]:
-        """Ask the market, then filter here.
+    async def _offers(self, policy: Optional[OfferPolicy] = None, kinds: Optional[str] = None,
+                      connections: Optional[Sequence[str]] = None) -> list[Offer]:
+        """Ask the market — every enabled connection at once, or the ones named — then filter here.
 
-        With a `policy`, the filters it implies are also asked of the provider (D123): every
+        With a `policy`, the filters it implies are also asked of each provider (D123): every
         offer a search returns counts against the provider's daily quota, so what the pool would
         only throw away is better never returned. The pool still applies every filter itself,
         and what it says was rejected, and why, is what came back. Without a policy — finding the
         very machine a host is on, to re-bid or restart it — the market is asked broadly, as a
-        machine already held need not pass today's search."""
+        machine already held need not pass today's search.
+
+        Each connection has its own back-off, quota and errors (D129): one that refuses or fails
+        leaves the others' offers standing, and says why in `searching`."""
+        names = [n for n in (connections if connections is not None else self.searchable()) if n in self.providers]
+        # The pool's mode decides what it rents *by itself*. One request — a preview, or an
+        # operator preparing a particular host — may name its own (D55).
+        bids, fixed = self._KINDS[kinds or self.rented.mode]
+        query = self.query_for(policy, bids, fixed)
+        self.last_query_filters = describe_query(query)
+        found = await asyncio.gather(*(self._search_one(name, query) for name in names))
+        failed = [n for n in names if self.searching[n].error]
+        if names and len(failed) == len(names):
+            # Nobody answered: an empty list here is indistinguishable from a market with
+            # nothing in it, and "0 offers seen" is a very different thing to tell an operator
+            # than "the provider would not answer" (D44).
+            self.last_offer_error = (self.searching[names[0]].error if len(names) == 1
+                                     else "; ".join(f"{n}: {self.searching[n].error}" for n in failed))
+        else:
+            self.last_offer_error = None
+        # Priced for the disk the host would be rented with, so the all-in the filters and
+        # the bid compare is what it would be billed (D108).
+        disk_gb = (policy or self.rented.policy_in_force).min_disk_gb
+        return [dataclasses.replace(offer.priced_for(disk_gb), connection=name)
+                for name, offers in zip(names, found, strict=True) for offer in offers]
+
+    async def _search_one(self, name: str, query: OfferQuery) -> list[Offer]:
+        state = self.searching.setdefault(name, SearchState())
         now = time.monotonic()
-        if now < self._offer_retry_at:
+        if now < state.retry_at:
             # The reason is the provider's, said once; only the remaining wait moves. Nesting
             # this produced "… — not asking again for 60s — not asking again for 44s" live.
-            self.last_offer_error = (
-                f"{self._offer_refusal or 'the provider refused'} — not asking again for "
-                f"{self._offer_retry_at - now:.0f}s"
-            )
+            state.error = f"{state.refusal or 'the provider refused'} — not asking again for {state.retry_at - now:.0f}s"
             return []
         try:
-            # The pool's mode decides what it rents *by itself*. One request — a preview, or an
-            # operator preparing a particular host — may name its own (D55).
-            bids, fixed = self._KINDS[kinds or self.rented.mode]
-            query = self.query_for(policy, bids, fixed)
-            self.last_query_filters = describe_query(query)
-            offers = await self._counted(self.provider.search_offers(query))
+            offers = await self._counted(self.providers[name].search_offers(query), name)
         except ProviderRateLimited as exc:
             # Asking again on the next pass is what earned the refusal: wait a minute instead, and
             # again after every refusal (D44, D119 — a flat minute, the owner's choice: no longer
             # doubling to fifteen).
-            self._offer_backoff_s = OFFER_RATE_LIMIT_WAIT_S
-            self._offer_retry_at = now + self._offer_backoff_s
-            log.warning("offer search rate limited; not asking again for %.0fs", self._offer_backoff_s)
-            self._offer_refusal = str(exc)
-            self.last_offer_error = f"{exc} — not asking again for {self._offer_backoff_s:.0f}s"
+            state.backoff_s = OFFER_RATE_LIMIT_WAIT_S
+            state.retry_at = now + state.backoff_s
+            log.warning("%s's offer search rate limited; not asking again for %.0fs", name, state.backoff_s)
+            state.refusal = str(exc)
+            state.error = f"{exc} — not asking again for {state.backoff_s:.0f}s"
             return []
         except ProviderError as exc:
-            # Remembered, not just logged: an empty list here is indistinguishable from a
-            # market with nothing in it, and "0 offers seen" is a very different thing to tell
-            # an operator than "the provider would not answer" (D44).
-            log.warning("offer search failed: %s", exc)
-            self.last_offer_error = str(exc)
+            log.warning("%s's offer search failed: %s", name, exc)
+            state.error = str(exc)
             return []
-        self._offer_backoff_s = 0.0
-        self._offer_retry_at = 0.0
-        self.last_offer_error = None
-        # Priced for the disk the host would be rented with, so the all-in the filters and
-        # the bid compare is what it would be billed (D108).
-        disk_gb = (policy or self.rented.policy_in_force).min_disk_gb
-        return [dataclasses.replace(offer.priced_for(disk_gb), connection=self.connection) for offer in offers]
+        except Exception as exc:  # noqa: BLE001 - a plug-in's bug must not take the other providers' offers with it
+            log.exception("%s's offer search raised", name)
+            state.error = f"the provider plug-in failed: {type(exc).__name__}: {exc}"
+            return []
+        state.backoff_s, state.retry_at, state.error = 0.0, 0.0, None
+        return offers
 
     def _lease_view(self, lease: Optional[Lease]) -> Optional[LeaseView]:
         if lease is None:

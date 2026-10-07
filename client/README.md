@@ -125,13 +125,14 @@ with WorkloadProvisioner() as provisioner:            # reads GPM_URL and GPM_PR
 - `latency_s`: the 95th-percentile answer time each request should meet.
 - `parallel`: how many requests you will send at once. The pool sizes hosts for it.
 - `hours`: the most it runs. `max_spend`: the most it spends, in dollars. Both are hard limits.
-- `machines`: `"roi"` (the default) lets the pool choose bid or fixed-price machines by expected
-  cost. `"on_demand"` and `"interruptible"` fix the choice.
+- `machines`: `"roi"` (the default) lets the pool choose by expected cost among interruptible
+  machines (a bid or a provider's spot price — cheaper, and can be taken away) and on-demand ones
+  (a fixed price). `"on_demand"` and `"interruptible"` fix the choice.
 - `idle_end_minutes`: once serving, the workload ends after this many minutes with no request.
   It defaults to the grant's (usually 15).
 
-A plan searches the provider's market, which has a daily limit on searches, so plan once rather
-than in a loop.
+A plan searches every provider the pool rents from, and providers limit searches by a daily
+quota, so plan once rather than in a loop.
 
 **Several models in one workload.** Each model gets its own target. Send requests for any of
 them through the same `w.client`:

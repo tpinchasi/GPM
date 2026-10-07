@@ -33,8 +33,11 @@ class Change:
     detail: str
     #: The value an operator must type again to confirm. Set only for loosening.
     requires_retype: Optional[str] = None
-    #: True when the change cannot take effect without restarting the router.
+    #: True when the change cannot take effect without restarting a process — `restarts` says which.
     needs_restart: bool = False
+    restarts: str = "router"
+    #: Set when the change is not allowed at all, with the reason: nothing is applied.
+    refused: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -43,6 +46,8 @@ class Change:
             "requires_retype": self.requires_retype is not None,
             "value": self.requires_retype,
             "needs_restart": self.needs_restart,
+            "restarts": self.restarts,
+            "refused": self.refused,
         }
 
 
@@ -64,6 +69,8 @@ class RentedNow:
     bid_hourly: float
     #: The storage it is billed beside its bid, so its all-in can be set against a ceiling.
     storage_hourly: float = 0.0
+    #: The provider it is held at (D129, D133): a change that drops that provider is refused.
+    provider: str = ""
 
 
 def plan_changes(
@@ -73,6 +80,9 @@ def plan_changes(
     machines: Optional[Mapping[str, MachineNow]] = None,
 ) -> list[Change]:
     changes: list[Change] = []
+    # Everything the pool holds stops a provider's removal; only hosts count as hosts and burn.
+    held = list(rented)
+    rented = [r for r in held if not r.host_id.startswith("volume:")]
     changes.extend(_machine_changes(candidate, machines or {}))
 
     # --- hosts ---
@@ -145,15 +155,32 @@ def plan_changes(
             needs_restart=True,
         ))
 
-    # --- provider connections (D129) ---
+    # --- provider connections (D129, D133) ---
     were = current.rented.providers if current.rented else {}
     become = candidate.rented.providers if candidate.rented else {}
     if were != become:
+        kept = {conn.type for conn in become.values()}
+        stranded = sorted({r.provider for r in held if r.provider and r.provider not in kept})
+        held_there = [r.host_id for r in held if r.provider in stranded]
+        turned_on = sorted(name for name, conn in become.items()
+                           if conn.enabled and not (name in were and were[name].enabled))
+        said = []
+        if turned_on:
+            said.append(f"{', '.join(turned_on)} will be searched and rented from")
+        turned_off = sorted(name for name, conn in were.items() if conn.enabled and not (name in become and become[name].enabled))
+        if turned_off:
+            said.append(f"{', '.join(turned_off)} will not be rented from again (its hosts stay until released)")
         changes.append(Change(
             "providers",
-            "the provider connections change; the supervisor rents through the connection it was started "
-            "with until it is restarted — renaming the connection also starts a new count of today's searches",
+            "the provider accounts change" + (f": {'; '.join(said)}" if said else "")
+            + ". This takes effect when the supervisor restarts; until then it keeps the accounts it started with",
             needs_restart=True,
+            restarts="supervisor",
+            # Renting somewhere new is a loosening: typed again, like any (D129).
+            requires_retype=turned_on[0] if turned_on else None,
+            refused=(f"the pool still holds {len(held_there)} host(s) or volume(s) at {', '.join(stranded)} "
+                     f"({', '.join(held_there)}): release them first, or keep that provider in the file — removed, "
+                     "nothing could stop them billing" if held_there else None),
         ))
 
     # --- capacity profiles ---

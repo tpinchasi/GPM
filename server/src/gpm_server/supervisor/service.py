@@ -155,7 +155,11 @@ class Supervisor:
             self.fleet = Fleet(
                 config,
                 config.rented,
-                provider or get_provider(config.rented.connection.type, config.rented.connection.settings),
+                # One provider per configured connection, enabled or not: a disabled one's hosts are
+                # still watched and swept (D129). Given one — a test's — it is the first connection's.
+                provider if provider is not None else {
+                    name: get_provider(conn.type, conn.settings) for name, conn in config.rented.providers.items()
+                },
                 self.leases,
                 self.events,
                 self.spend,
@@ -316,22 +320,29 @@ class Supervisor:
         different case: the supervisor starts, and adoption waits."""
         if self.fleet is None:
             return
-        try:
-            await self.fleet.provider.account()
-        except ProviderAuthError as exc:
-            raise ProviderCredentialMissing(
-                f"rented capacity is configured but the provider's credential is not usable: {exc}. "
-                "Set it in this process's environment, or remove the `rented` section. Nothing "
-                "was changed: every rented host's record is as it was."
-            ) from exc
-        except ProviderError:
-            return
+        for name, provider in self.fleet.providers.items():
+            if name not in self.config.rented.enabled_connections:
+                continue  # a disabled connection's hosts are still watched, as far as it answers
+            try:
+                await provider.account()
+            except ProviderAuthError as exc:
+                raise ProviderCredentialMissing(
+                    f"rented capacity is configured but provider connection {name!r}'s credential is not "
+                    f"usable: {exc}. Set it in this process's environment, disable the connection, or remove "
+                    "the `rented` section. Nothing was changed: every rented host's record is as it was."
+                ) from exc
+            except ProviderError:
+                continue
 
     async def adopt_rented(self) -> None:
         """Before the first pass — and so before the first sweep — take back the rented hosts
         the last supervisor published, and drop the rows of hosts the provider no longer has."""
         rows = [row for row in self.table.all() if row.kind in RENTED_KINDS]
+        if self.fleet is not None:
+            rows = [row for row in rows if row.host_id not in self.fleet.hosts]  # taken back already
         if not rows:
+            if self.fleet is not None:
+                self.fleet.pending_adoption = {}
             return
         if self.fleet is None:
             for row in rows:
@@ -353,8 +364,9 @@ class Supervisor:
             return
         self._adoption_pending = False
         adopted = set(answer)
+        pending = {r.host_id for held in self.fleet.pending_adoption.values() for r in held}
         for row in rows:
-            if row.host_id not in adopted:
+            if row.host_id not in adopted and row.host_id not in pending:
                 self.table.remove(row.host_id)
         if adopted:
             log.info("adopted %d rented host(s) from the previous supervisor: %s", len(adopted), sorted(adopted))
@@ -419,7 +431,7 @@ class Supervisor:
     async def _pass(self) -> None:
         self._follow_config_file()
         self.ensure_forwarder()
-        if self._adoption_pending:
+        if self._adoption_pending or (self.fleet is not None and self.fleet.adoption_retry_due):
             await self.adopt_rented()
         await asyncio.gather(*(self._ask_agent(host) for host in self.hosts.values()))
         await asyncio.gather(*(self._probe(host) for host in self.hosts.values()))
@@ -1041,8 +1053,11 @@ class Supervisor:
                     workload=host.workload,
                 )
             )
+        # A row held back at a restart is a host the pool may still hold: kept until its
+        # connection can be asked, or the next supervisor would sweep it as a stray (D61, D129).
+        held_back = {r.host_id for rows in self.fleet.pending_adoption.values() for r in rows}
         for row in self.table.all():
-            if row.kind in RENTED_KINDS and row.host_id not in live:
+            if row.kind in RENTED_KINDS and row.host_id not in live and row.host_id not in held_back:
                 self.table.remove(row.host_id)
 
     def _rented_variants_of(self, host: Any, variants: dict) -> dict:
