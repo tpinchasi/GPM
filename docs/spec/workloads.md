@@ -182,7 +182,8 @@ it took, so the history shows what each saved:
    exists and counted when a budget is checked, and it is deleted when the workload ends (the sweep
    deletes any volume under the pool's label whose workload is gone).
    - **The engine never runs from it.** Every host keeps its models on its own disk. The first host
-     fills the volume after its own fetch, by copying its verified files up into a fresh directory
+     is ready as soon as its own fetch ends, and fills the volume behind that, while it serves; the
+     volume is ready once its agent says the fill is done. It fills by copying its verified files up into a fresh directory
      that is renamed into place, named by its *build* — a digest of the hub's file list with each
      file's hash, so a repository changed upstream is a new build beside the old; only one host
      fills at a time, and another is named only once the provider shows the first gone. Every later
@@ -190,6 +191,8 @@ it took, so the history shows what each saved:
      publishes**, and fetches from the hub whatever is missing or does not match (host-agent.md
      §2.1). The volume is a cache never trusted: a host that wrote junk into it harms no other host.
      A build is never changed in place: a new one is filled into its own directory beside it.
+     Hosts that start together never wait for it: while one fills it, the others are created without
+     it and fetch from the hub at once — only a host created once it is ready copies from it.
    - **The ranking** prefers an offer that lands in the volume's data center by no more than the
      download it saves, priced at the offer's hourly rate — from the pool's own times for the two
      ways, an estimate until it has them. A data center with nothing that fits is passed over, and

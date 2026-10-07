@@ -76,6 +76,7 @@ def fetch(hub, models, **kwargs):
         async with hub.client() as client:
             async for _ in modelhub.fetch(REPO, models, client=client, report=report, **kwargs):
                 pass
+        await model_volume.fills_finished()  # a fill runs behind the host
 
     asyncio.run(run())
     return report
@@ -138,6 +139,34 @@ def test_the_first_host_fills_the_volume_with_one_whole_build(tmp_path):
     assert {p: (build / p).read_bytes() for p in FILES} == FILES
     marker = json.loads((build / model_volume.BUILD_MARKER).read_text())
     assert marker["build"] == build.name and set(marker["files"]) == set(FILES)
+
+
+def test_the_host_has_its_model_before_the_fill_ends_and_fills_while_it_serves(tmp_path, monkeypatch):
+    # The fill runs after the fetch, not inside it: a host is ready once its models are on its
+    # own disk, and does not stand paid and idle while it copies them up (the owner, D139).
+    volume = tmp_path / "volume"
+    volume.mkdir()
+    release = asyncio.Event()
+    real = model_volume.fill
+
+    async def slow_fill(*args):
+        await release.wait()
+        await real(*args)
+
+    monkeypatch.setattr(model_volume, "fill", slow_fill)
+    report = model_volume.Report()
+
+    async def run():
+        async with Hub().client() as client:
+            async for _ in modelhub.fetch(REPO, tmp_path / "first", client=client, report=report, volume_fill=volume):
+                pass
+        assert modelhub.is_complete(tmp_path / "first" / "acme__tiny-model"), "ready before the fill"
+        assert report.fill == "filling"
+        release.set()
+        await model_volume.fills_finished()
+
+    asyncio.run(run())
+    assert report.fill == "filled" and build_dir(volume).is_dir()
 
 
 def test_a_build_already_on_the_volume_is_left_as_it_is(tmp_path):
@@ -310,9 +339,10 @@ def pull_on(tmp_path, monkeypatch, host, *, read=None, fill=None):
         async with engine.client() as client:
             async for _ in facts.pull(client, "gemma4:26b"):
                 pass
+        await model_volume.fills_finished()
 
     asyncio.run(run())
-    return engine, facts.sources.get("gemma4:26b")
+    return engine, engines._sources_fact(facts.sources).get("gemma4:26b")
 
 
 def test_an_ollama_host_fills_the_volume_and_the_next_copies_from_it(tmp_path, monkeypatch):

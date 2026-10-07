@@ -19,6 +19,11 @@ from . import modelhub, vllm_state
 from . import volume as model_volume
 
 
+def _sources_fact(sources: dict[str, tuple[Any, float]]) -> dict[str, dict[str, Any]]:
+    """What each model's fetch took from where, read now — a fill behind the host still moves."""
+    return {tag: {**report.as_fact(), "seconds": seconds} for tag, (report, seconds) in sources.items()}
+
+
 class OllamaFacts:
     name = "ollama"
     #: This engine fetches through its own API, so there is nothing to fetch with until it runs.
@@ -33,7 +38,7 @@ class OllamaFacts:
         #: Accepted so that every engine in the registry is built the same way.
         self.settings = settings
         #: Where each tag's blobs came from on this host, by tag (D139), as for vLLM.
-        self.sources: dict[str, dict[str, Any]] = {}
+        self.sources: dict[str, tuple[model_volume.Report, float]] = {}
 
     async def describe(self, client: httpx.AsyncClient) -> dict[str, Any]:
         """Version, models on disk with sizes, models loaded. An engine that does not answer
@@ -53,7 +58,7 @@ class OllamaFacts:
                 key=lambda m: m["tag"],
             ),
             "models_loaded": sorted(m.get("name") for m in loaded if m.get("name")),
-            **({"model_sources": self.sources} if self.sources else {}),
+            **({"model_sources": _sources_fact(self.sources)} if self.sources else {}),
         }
 
     def launch_environment(
@@ -108,9 +113,9 @@ class OllamaFacts:
             async for progress in self._pull(client, tag):
                 yield progress
             if blobs is not None and filling:
-                await model_volume.fill_blobs(model_volume.FILL_PATH, blobs, report)
+                model_volume.in_background(model_volume.fill_blobs(model_volume.FILL_PATH, blobs, report), report)
         finally:
-            self.sources[tag] = {**report.as_fact(), "seconds": round(time.monotonic() - started, 1)}
+            self.sources[tag] = (report, round(time.monotonic() - started, 1))
 
     async def _pull(self, client: httpx.AsyncClient, tag: str) -> AsyncIterator[tuple[int, int]]:
         layers: dict[str, tuple[int, int]] = {}
@@ -245,8 +250,8 @@ class VllmFacts:
         self.settings = settings
         #: Where each model's files came from on this host — the model volume, the hub — and how
         #: long it took, by tag (D139). Reported in the facts so the pool's history can say
-        #: whether a volume pays.
-        self.sources: dict[str, dict[str, Any]] = {}
+        #: whether a volume pays; a fill still running behind the host says so as it goes.
+        self.sources: dict[str, tuple[model_volume.Report, float]] = {}
 
     @property
     def _models_dir(self) -> str:
@@ -283,7 +288,7 @@ class VllmFacts:
             # A process the launcher started that has since exited without serving its model
             # is a failure, not a model still loading — with the reason from its own log.
             "models_failed": self._failed(loaded),
-            **({"model_sources": self.sources} if self.sources else {}),
+            **({"model_sources": _sources_fact(self.sources)} if self.sources else {}),
         }
 
     def _failed(self, loaded: list[str]) -> dict[str, str]:
@@ -322,7 +327,7 @@ class VllmFacts:
             raise EngineRefused(str(no)) from no
         finally:
             if model_volume.READ_PATH.is_dir() or model_volume.FILL_PATH.is_dir():
-                self.sources[tag] = {**report.as_fact(), "seconds": round(time.monotonic() - started, 1)}
+                self.sources[tag] = (report, round(time.monotonic() - started, 1))
 
     async def hold(self, client: httpx.AsyncClient, tag: str, *, pinned: bool) -> None:
         """Serving a model here is a property of how the engine was started, not something that

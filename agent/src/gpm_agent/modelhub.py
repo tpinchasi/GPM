@@ -188,8 +188,9 @@ async def fetch(
 
     With a model volume (D139): before the hub, every file the volume holds of this build is
     copied from it and checked against the hub's hash (`volume_read`); after a whole fetch, the
-    build is copied up into the volume (`volume_fill`). Both are the agent's own mount paths, and
-    `report` says what came from where.
+    build is copied up into the volume (`volume_fill`) in the background, so the fetch ends as soon
+    as the model is on this host's disk. Both are the agent's own mount paths, and `report` says
+    what came from where — its `fill` reads `filling` until the copy ends.
     """
     into = directory_for(models_dir, repo)
     files = wanted(await listing(repo, client=client))
@@ -235,7 +236,9 @@ async def fetch(
             yield done, total
         (into / COMPLETE_MARKER).write_text(f"{total}\n")
         if volume_fill is not None:
-            await model_volume.fill(volume_fill, into.name, files, into, report)
+            # After the fetch, not inside it: the host is ready once its models are on its own
+            # disk, and fills the volume while it serves (D139).
+            model_volume.in_background(model_volume.fill(volume_fill, into.name, files, into, report), report)
     except httpx.HTTPError as exc:
         raise HubRefused(f"fetching {repo} stopped: {exc or type(exc).__name__}") from exc
     finally:

@@ -114,7 +114,8 @@ engine never runs from it:
   mismatched or with no published hash comes from the hub. Hashing runs off the event loop. For
   Ollama, blobs are copied into the engine's store only when they hash to the digest they are
   named by, and the engine's own pull then fetches the manifest and whatever is missing.
-- **Filling.** After its own fetch, the host copies its verified files up into a fresh directory on
+- **Filling.** After its own fetch — in the background, so the host is ready once its models are on
+  its own disk, and its facts say `filling` until the copy ends — the host copies its verified files up into a fresh directory on
   the volume (created exclusively, no link followed), each checked against the hub's hash as it is
   copied, and renames it into place under its build's name — a digest of the hub's file list with
   each file's hash, which every host computes alike from the hub's listing. A filler that stops

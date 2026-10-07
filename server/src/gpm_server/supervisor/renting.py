@@ -3969,10 +3969,12 @@ class Fleet:
         volume = next((v for v in self.workload_store.volumes(host.workload) if v.volume_id == host.volume_id), None)
         if volume is None or volume.location is None:
             return
+        fills = [str(r.get("fill") or "") for r in reports]
+        if volume.filler == host.host_id and any(f in ("", "filling") for f in fills):
+            return  # it serves while it fills the volume behind it: ready only once it says so
         host.volume_reported = True
         where = {"volume": volume.volume_id, "location": volume.location, "workload": host.workload}
         if volume.filler == host.host_id:
-            fills = [str(r.get("fill") or "") for r in reports]
             if all(f == "already there" or f.startswith("filled") for f in fills):
                 self.workload_store.volume_state(volume.volume_id, "ready")
                 self.events.record(

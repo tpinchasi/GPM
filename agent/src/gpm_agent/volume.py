@@ -333,8 +333,28 @@ async def fill(volume: Path, repo_dir: str, files: Sequence[Expected], into: Pat
     model either way, and the reason is in its facts."""
     try:
         report.fill = await asyncio.to_thread(_fill, volume, repo_dir, files, into)
-    except (OSError, VolumeRefused) as exc:
-        report.fill = f"not filled: {exc}"
+    except Exception as exc:  # noqa: BLE001 — whatever stops it, the host keeps serving
+        report.fill = f"not filled: {exc or type(exc).__name__}"
+
+
+#: Fills running behind a host that already serves, held so they are not collected mid-copy.
+_BACKGROUND: set[asyncio.Task] = set()
+
+
+def in_background(fill_coroutine, report: Report) -> None:
+    """Run a fill after the fetch, while the host serves (D139): a host that has its models on its
+    own disk is ready then, not a copy later. Until it ends, its facts say `filling`, and the pool
+    marks the volume ready only once they say it is filled."""
+    report.fill = "filling"
+    task = asyncio.get_running_loop().create_task(fill_coroutine)
+    _BACKGROUND.add(task)
+    task.add_done_callback(_BACKGROUND.discard)
+
+
+async def fills_finished() -> None:
+    """Wait for every fill running behind a host — for a clean shutdown, and for tests."""
+    while _BACKGROUND:
+        await asyncio.gather(*list(_BACKGROUND), return_exceptions=True)
 
 
 # --- Ollama: content-addressed blobs (D139) ---
@@ -414,5 +434,5 @@ async def fill_blobs(volume: Path, blobs: Sequence[Expected], report: Report) ->
     """Copy a tag's blobs from the engine's store up into the volume. Never fails the pull."""
     try:
         report.fill = await asyncio.to_thread(_fill_blobs, volume, blobs, ollama_blobs_dir())
-    except (OSError, VolumeRefused) as exc:
-        report.fill = f"not filled: {exc}"
+    except Exception as exc:  # noqa: BLE001 — whatever stops it, the host keeps serving
+        report.fill = f"not filled: {exc or type(exc).__name__}"

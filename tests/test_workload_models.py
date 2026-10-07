@@ -92,6 +92,8 @@ async def test_the_first_host_makes_the_volume_in_its_data_center_and_fills_it(d
 
 async def test_once_its_agent_says_it_filled_it_the_volume_is_ready(db):
     _, fleet, _, _, host = await first_host(db)
+    agent_says(fleet, host, fill="filling")  # serving, and filling behind
+    assert volume_of(fleet).state == "filling" and not host.volume_reported, "not ready while it fills"
     agent_says(fleet, host, fill="filled")
     assert volume_of(fleet).state == "ready" and volume_of(fleet).filler is None
     assert "volume_filled" in kinds(fleet)
