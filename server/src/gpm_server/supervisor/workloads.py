@@ -448,13 +448,15 @@ class Workloads:
                     "hourly": round(first_cost.hourly, 4), "expected_per_worker_hour": first_cost.per_worker_hour,
                     "reasons": first_cost.reasons,
                 },
-                "hourly_total": round(hosts * first_cost.hourly, 4),
+                "hourly_total": round(hosts * first_cost.hourly + (volume["hourly"] if volume else 0.0), 4),
                 "expected": first_cost.expected * hosts + (volume["over_hours"] if volume else 0.0),
                 "minutes_to_serve": round(ready_h * 60, 1),
             })
         return {
             "refused": None, "groups": groups, "hosts": sum(g["hosts_at_start"] for g in groups),
-            "hourly": sum(g["hosts_at_start"] * g["first_host"]["hourly"] for g in groups),
+            # The hosts and their model volumes (D139): a volume bills whether or not a host has it.
+            "hourly": sum(g["hosts_at_start"] * g["first_host"]["hourly"]
+                          + (g["model_volume"]["hourly"] if g.get("model_volume") else 0.0) for g in groups),
             "expected": round(sum(g["expected"] for g in groups), 4),
             "offers_passed": min(g["offers_passed"] for g in groups),
         }

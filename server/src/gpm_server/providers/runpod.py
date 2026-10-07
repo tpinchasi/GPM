@@ -134,6 +134,9 @@ class RunPodProvider:
     #: Where the credential is sent. A stored credential is bound to them: changed, it is cleared.
     endpoint_settings: ClassVar[tuple[str, ...]] = ("base_url", "graphql_url")
     offered: ClassVar[bool] = True
+    #: Keeping models between hosts (D139), as the console shows it beside the checkbox.
+    volume_price_per_gb_month: ClassVar[float] = _NETWORK_VOLUME_PER_GB_MONTH
+    volume_note: ClassVar[str] = "Only Secure Cloud hosts use it: RunPod mounts a network volume on Secure Cloud pods only."
 
     capabilities = ProviderCapabilities(
         #: Spot ("interruptible") pods are no longer offered: every pod is on demand.

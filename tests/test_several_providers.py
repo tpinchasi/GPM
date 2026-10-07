@@ -455,7 +455,12 @@ async def test_the_market_says_what_each_provider_returned_and_which_offer_the_p
     assert lines["fixed"]["seen"] == 1 and lines["fixed"]["rejected_by_reason"] == {}
     assert not lines["off"]["asked"] and lines["off"]["why_not"] == "turned off"
     (picked,) = [row for row in preview["best"] if row["would_rent"]]
-    assert picked == preview["best"][0], "one row, the first in the order the pool rents in"
+    # The first, in the order the pool rents in, of the kinds its mode lets it rent by itself — this
+    # pool bids only, so not the cheaper fixed price the market also lists (the UX review's finding).
+    allowed = [row for row in preview["best"] if row["kind"] == "interruptible"]
+    assert fleet.rented.mode == "interruptible" and picked == allowed[0]
+    narrowed = await fleet.market_preview(search=True, kinds="both", connections=["bids"])
+    assert not any(row["would_rent"] for row in narrowed["best"]), "a narrowed search is not the pool's pick"
 
 
 async def test_a_search_can_be_narrowed_to_some_providers(db):

@@ -865,10 +865,10 @@ function holdingLine(p) {
   const parts = [];
   if (p.rented) parts.push(`${p.rented} rented`);
   if (p.parked) parts.push(`${p.parked} parked`);
-  if (p.volumes) parts.push(`${p.volumes} volume${p.volumes === 1 ? "" : "s"}`);
+  if (p.volumes) parts.push(`${p.volumes} model volume${p.volumes === 1 ? "" : "s"}`);
   if (p.held_back) parts.push(`${p.held_back} waiting for the account to answer after a restart`);
   return el("div", {}, parts.length ? parts.join(" · ") : el("span", { class: "muted" }, "nothing"),
-    p.hourly ? el("span", { class: "muted" }, ` · ${rate(p.hourly)}`) : null);
+    p.hourly ? el("span", { class: "muted" }, ` · ${rate(p.hourly)}${p.volumes ? " with storage" : ""}`) : null);
 }
 
 function testResults(steps) {
@@ -910,7 +910,7 @@ function providerCard(p, data) {
       el("div", { class: "k" }, "credential"), credentialLine(p),
       el("div", { class: "k" }, "search quota"), quotaMeter(p.search_quota),
       el("div", { class: "k" }, "holding"), holdingLine(p),
-      p.configured ? el("div", { class: "k" }, "models") : null,
+      p.configured ? el("div", { class: "k" }, "model storage") : null,
       p.configured ? keepModelsControl(p) : null,
       p.search_error ? el("div", { class: "k" }, "last search") : null,
       p.search_error ? el("div", { class: "error" }, p.search_error) : null,
@@ -941,11 +941,13 @@ async function providersTab() {
   const burn = data.connections.reduce((n, p) => n + (p.hourly || 0), 0);
   const offered = data.plugins.filter((p) => p.offered && !data.connections.some((c) => c.type === p.type));
   const add = el("button", { class: "primary", disabled: !offered.length || undefined, onclick: () => addProviderDialog(data) }, "Add provider");
-  const focusAfter = providersView.focus;
+  const focusAfter = providersView.focus, focusOn = providersView.focusSelector;
   providersView.focus = null;
+  providersView.focusSelector = null;
   if (focusAfter) {
-    // Back to the card that was acted on, rather than the top of the page.
-    setTimeout(() => document.querySelector(`.provider-card[data-connection="${CSS.escape(focusAfter)}"] button`)?.focus(), 0);
+    // Back to the control that was used, or the card that was acted on, rather than the top.
+    setTimeout(() => (focusOn && document.querySelector(focusOn))?.focus()
+      || document.querySelector(`.provider-card[data-connection="${CSS.escape(focusAfter)}"] button`)?.focus(), 0);
   }
   return [
     el("div", { class: "providers-summary panel" },
@@ -992,39 +994,57 @@ async function withRetype(send, title) {
 }
 
 // Keep models between hosts (D139): offered only where the provider's storage reaches a data
-// center; anywhere else the box is greyed and says why, in the provider's own terms.
+// center; anywhere else the box is greyed and says why, in the provider's own terms. One short
+// line shows; the whole reason is the tooltip.
 const KEEP_MODELS_WHY = {
-  data_center: "Each workload renting here gets a model volume in its first host's data center. Later hosts there copy their models from it, each file checked, instead of downloading. Billed to the workload's lease; deleted when the workload ends.",
-  machine: "This provider keeps a volume on one machine only. It would help only when that same machine is free again, which is rare, and it is billed the whole time.",
-  none: "This provider keeps no storage between hosts.",
+  data_center: "Each workload renting here keeps its models on a volume in its first host's data center. Later hosts there copy them from it, each file checked, instead of downloading. Billed to the workload's lease, whether or not a host has it; deleted when the workload ends. Hosts that start together never wait for it.",
+  machine: "keeps a volume on one machine only. It would help only when that same machine is free again, which is rare, and it is billed the whole time.",
+  none: "keeps no storage between hosts.",
 };
 
 function keepModelsControl(p) {
   const reach = p.volume_reach || "none";
   const can = reach === "data_center";
-  const why = KEEP_MODELS_WHY[reach] || KEEP_MODELS_WHY.none;
+  const name = p.display_name || p.connection;
+  const price = p.volume_price_per_gb_month;
+  const short = can
+    ? `Later hosts in the same data center copy their models instead of downloading${price != null ? ` · $${Number(price).toFixed(2)} per GB a month` : ""}.`
+    : reach === "machine" ? `Not offered for ${name}: its storage stays on one machine.` : `Not offered for ${name}: it keeps no storage between hosts.`;
+  const why = can ? KEEP_MODELS_WHY.data_center + (p.volume_note ? ` ${p.volume_note}` : "") : `${name} ${KEEP_MODELS_WHY[reach] || KEEP_MODELS_WHY.none}`;
   const hint = `keep-models-${p.connection}`;
-  const box = el("input", { type: "checkbox", checked: (can && p.keep_models) || undefined, disabled: !can || undefined,
-    "aria-describedby": hint, onchange: (e) => setKeepModels(e.target, p) });
-  return el("label", { class: `remember keep-models${can ? "" : " is-disabled"}`, title: why }, box,
-    el("span", {}, "Keep models between hosts",
-      p.model_volumes ? el("span", { class: "muted" }, ` · ${p.model_volumes} model volume${p.model_volumes === 1 ? "" : "s"} now`) : null),
-    el("span", { class: "hint muted", id: hint }, can ? why : `Not available: ${why}`));
+  const box = el("input", { type: "checkbox", id: `keep-models-box-${p.connection}`, checked: (can && p.keep_models) || undefined,
+    disabled: !can || undefined, "aria-describedby": hint, title: why, onchange: (e) => setKeepModels(e.target, p) });
+  return el("div", { class: `keep-models${can ? "" : " is-disabled"}`, title: why },
+    el("label", { class: "keep-models-label" }, box, " Keep models between hosts"),
+    el("div", { class: "muted small-text", id: hint }, short, can && p.volume_note ? el("div", {}, p.volume_note) : null));
 }
 
 async function setKeepModels(box, p) {
   const on = box.checked;
+  const name = providerLabel(p);
+  const price = p.volume_price_per_gb_month;
+  const example = price != null
+    ? ` For example, a workload whose models take 40 GB keeps a volume of about 45 GB: $${(45 * price / 720).toFixed(4)}/h, about $${(45 * price).toFixed(2)} a month while it runs.`
+    : "";
   providersView.focus = p.connection;
+  providersView.focusSelector = `#keep-models-box-${CSS.escape(p.connection)}`;
   await run(box, async () => {
     const ok = await confirmAction({
-      title: on ? `Keep models between hosts at ${providerLabel(p)}?` : `Stop keeping models at ${providerLabel(p)}?`,
+      title: on ? `Keep models between hosts at ${name}?` : `Stop keeping models at ${name}?`,
       okLabel: on ? "Keep models" : "Stop keeping them",
       body: on
-        ? "Each workload renting here gets a model volume in its first host's data center, sized to its models. It is billed to the workload's lease, whether or not a host has it, and deleted when the workload ends. Later hosts there copy their models from it instead of downloading; the data center is preferred only while that saves more than it costs."
+        ? "Each workload renting here gets a model volume in its first host's data center, sized to its models. It is billed to the workload's lease, whether or not a host has it, and deleted when the workload ends."
+          + example + " Later hosts there copy their models from it instead of downloading; that data center is preferred only while it saves more than it costs."
+          + (p.volume_note ? ` ${p.volume_note}` : "")
         : "No new model volume is made here. Each one already made is deleted once no host has it, and later hosts download their models.",
     });
     if (!ok) { box.checked = !on; return; }
-    await api.changeProvider(p.connection, { keep_models: on });
+    try {
+      await api.changeProvider(p.connection, { keep_models: on });
+    } catch (error) {
+      box.checked = !on;  // refused: the box shows what the file says, not what was asked
+      throw error;
+    }
   });
 }
 
@@ -2404,6 +2424,8 @@ function searchSection(market) {
             if (fresh.search_quota) marketView.quota.replaceChildren(searchQuotaText(fresh.search_quota));
             marketView.at = Date.now();
             marketView.last = fresh;
+            marketView.searchedAs = marketAsks();
+            document.querySelector(".chips")?.replaceWith(marketChips(fresh));
             stampMarket();
             search.message = fresh.problem
               ? ` the market could not be asked: ${fresh.problem}`
@@ -2569,48 +2591,71 @@ async function saveSearch(event, note, mode) {
 // The last search this page made, kept so moving between tabs shows it again without asking
 // the provider. There is no timer: a search spends the provider's daily quota (D120).
 const marketView = { box: null, stamp: null, button: null, quota: null, busy: false, at: 0, last: null,
-  // What the next search asks: every provider (null) or the ones chosen, and which kinds.
-  connections: null, kinds: "both" };
+  // What the next search asks: every provider (null) or the ones chosen, and which kinds; and
+  // what the search shown below asked, so the chips can say when they differ.
+  connections: null, kinds: "both", searchedAs: null };
 
-// The chips that narrow a search (providers.md §7.2): a provider each, and the two kinds. A
-// search still happens only when a button is pressed (D120).
+// The chips that narrow the *next* search (providers.md §7.2): a provider each, and the two kinds.
+// Moving one never searches — a search spends the provider's quota (D120) — and the row says
+// when the next search will differ from what is shown below.
+const providerName = (market, name) => ((market.by_connection || {})[name] || {}).display_name || name;
+const marketAsks = () => `${marketView.kinds}|${marketView.connections ? [...marketView.connections].sort().join(",") : "all"}`;
+
 function marketChips(shown) {
   const lines = shown.by_connection || {};
-  const choosable = Object.entries(lines).filter(([, line]) => line.asked || line.why_not === "not chosen for this search"
-    || line.why_not === "no search yet");
-  const chip = (label, on, toggle, title) => el("button", { type: "button", class: `chip${on ? " on" : ""}`,
-    "aria-pressed": on ? "true" : "false", title, onclick: (e) => { toggle(); e.target.closest(".chips").replaceWith(marketChips(marketView.last || shown)); } }, label);
+  const choosable = Object.entries(lines).filter(([, line]) => line.searchable);
+  const chip = (key, label, on, toggle, title) => el("button", { type: "button", class: `chip${on ? " on" : ""}`, "data-chip": key,
+    "aria-pressed": on ? "true" : "false", title, onclick: (e) => {
+      toggle();
+      e.target.closest(".chips").replaceWith(marketChips(marketView.last || shown));
+      document.querySelector(`.chips [data-chip="${CSS.escape(key)}"]`)?.focus();  // keyboard stays put
+    } }, label);
   const chosen = (name) => !marketView.connections || marketView.connections.has(name);
-  const providers = choosable.length > 1 ? choosable.map(([name]) => chip(name, chosen(name), () => {
+  const providers = choosable.length > 1 ? choosable.map(([name, line]) => chip(`p:${name}`, line.display_name || name, chosen(name), () => {
     const next = new Set(marketView.connections || choosable.map(([n]) => n));
     if (next.has(name)) { if (next.size > 1) next.delete(name); } else next.add(name);
     marketView.connections = next.size === choosable.length ? null : next;
-  }, `search ${name}`)) : [];
+  }, `ask ${line.display_name || name} in the next search`)) : [];
   const kinds = { both: ["interruptible", "on_demand"], interruptible: ["interruptible"], on_demand: ["on_demand"] };
   const has = (k) => (kinds[marketView.kinds] || kinds.both).includes(k);
-  const kindChip = (k, label) => chip(label, has(k), () => {
+  const kindChip = (k, label) => chip(`k:${k}`, label, has(k), () => {
     const now = new Set(kinds[marketView.kinds] || kinds.both);
     if (now.has(k)) { if (now.size > 1) now.delete(k); } else now.add(k);
     marketView.kinds = now.size === 2 ? "both" : [...now][0];
-  }, label);
+  }, `${label} offers in the next search`);
+  const changed = marketView.searchedAs && marketView.searchedAs !== marketAsks();
   return el("div", { class: "row chips", role: "group", "aria-label": "What the next search asks" },
-    el("span", { class: "muted" }, "Search"), ...providers,
+    el("span", { class: "muted" }, "Next search asks"), ...providers,
     providers.length ? el("span", { class: "muted" }, "·") : null,
-    kindChip("interruptible", "interruptible"), kindChip("on_demand", "on demand"));
+    kindChip("interruptible", "interruptible"), kindChip("on_demand", "on demand"),
+    changed ? el("span", { class: "warn-text small-text" }, "changed — press Search the market") : null);
 }
 
-// A line per provider: asked or why not, what it returned, what passed, its quota.
+// A line per provider: what it returned and what passed, its quota, or why it was not asked.
 function marketLines(market) {
   const lines = Object.entries(market.by_connection || {});
   if (lines.length < 2) return null;
   return el("table", { class: "market-lines" },
-    el("thead", {}, el("tr", {}, ...["Provider", "Seen", "Pass", "Search quota", ""].map((h) => el("th", {}, h)))),
+    el("thead", {}, el("tr", {}, ...["Provider", "Offers returned", "Pass your policy", "Search quota", ""].map((h) => el("th", {}, h)))),
     el("tbody", {}, lines.map(([name, line]) => el("tr", {},
-      el("td", {}, name),
-      el("td", { class: "num" }, line.asked ? line.seen : "—"),
-      el("td", { class: "num" }, line.asked ? line.passed : "—"),
-      el("td", { class: "muted small-text" }, line.search_quota ? searchQuotaText(line.search_quota) : "none"),
-      el("td", { class: line.error ? "error" : "muted" }, line.error || line.why_not || "")))));
+      el("td", {}, line.display_name || name),
+      el("td", { class: "num" }, line.asked && !line.error ? line.seen : "—"),
+      el("td", { class: "num" }, line.asked && !line.error ? line.passed : "—"),
+      el("td", { class: "muted small-text" }, line.search_quota ? searchQuotaText(line.search_quota) : "no daily limit"),
+      el("td", { class: line.error ? "error" : "muted" }, line.error ? `could not be asked: ${line.error}` : line.why_not || "")))));
+}
+
+// What a provider does not report, said in words under the offers (providers.md §6).
+function assumedLegend(market) {
+  const words = { download_mbps: "download speed", reliability: "reliability", verified: "verified", download_per_gb: "download price" };
+  const by = {};
+  for (const offer of market.best || []) {
+    for (const field of offer.assumed || []) (by[offer.connection] ||= new Set()).add(words[field] || field);
+  }
+  const lines = Object.entries(by);
+  return lines.length ? el("p", { class: "muted small-text" }, "≈ not reported by the provider — the pool uses a stated default: ",
+    lines.map(([name, fields]) => `${providerName(market, name)}: ${[...fields].join(", ")}`).join("; "),
+    " (the account's assumed_… settings).") : null;
 }
 
 function marketSection(settings) {
@@ -2648,8 +2693,10 @@ async function refreshMarket() {
   try {
     const fresh = await api.market(1).catch((error) => ({ error: error.message }));
     marketView.last = fresh.error ? marketView.last : fresh;
+    if (!fresh.error) marketView.searchedAs = marketAsks();
     if (marketOnScreen()) {  // the operator may have moved on while it was asked
       marketView.box.replaceChildren(marketPanel(fresh));
+      if (!fresh.error) document.querySelector(".chips")?.replaceWith(marketChips(fresh));
       if (fresh.search_quota) marketView.quota.replaceChildren(searchQuotaText(fresh.search_quota));
     }
   } finally {
@@ -2719,10 +2766,11 @@ const marketPanel = (market) => {
       el("p", { class: "muted" }, "Nothing can be rented until a provider answers. A provider may limit searches by a daily quota of offers returned — once it is spent, every search is refused until it resets."));
   }
   const unasked = Object.entries(market.provider_errors || {});
-  const unaskedNote = unasked.length ? el("p", { class: "warn-text" },
+  const linesShown = Object.keys(market.by_connection || {}).length > 1;  // the table says it there
+  const unaskedNote = unasked.length && !linesShown ? el("p", { class: "warn-text" },
     `${unasked.map(([name, why]) => `${name} could not be asked (${why})`).join("; ")} — the offers below are the other providers' only.`) : null;
   // Rejections with a column per provider, where more than one was asked.
-  const askedNames = Object.entries(market.by_connection || {}).filter(([, l]) => l.asked).map(([n]) => n);
+  const askedNames = Object.entries(market.by_connection || {}).filter(([, l]) => l.asked && !l.error).map(([n]) => n);
   const perProvider = askedNames.length > 1;
   return el("div", {}, unaskedNote, avoidedNote, marketLines(market), el("div", { class: "grid" },
     el("div", { class: "panel" },
@@ -2743,10 +2791,11 @@ const marketPanel = (market) => {
       el("h2", {}, "Rejected, by reason"),
       el("table", {},
         perProvider ? el("thead", {}, el("tr", {}, el("th", {}, "Reason"),
-          ...askedNames.map((n) => el("th", { class: "num" }, n)))) : null,
+          ...askedNames.map((n) => el("th", { class: "num" }, providerName(market, n))), el("th", { class: "num" }, "All"))) : null,
         el("tbody", {}, Object.entries(market.rejected_by_reason || {}).map(([reason, count]) => perProvider
           ? el("tr", {}, el("td", { class: "muted" }, reason),
-            ...askedNames.map((n) => el("td", { class: "num" }, (market.by_connection[n].rejected_by_reason || {})[reason] || 0)))
+            ...askedNames.map((n) => el("td", { class: "num" }, (market.by_connection[n].rejected_by_reason || {})[reason] || 0)),
+            el("td", { class: "num" }, count))
           : el("tr", {}, el("td", { class: "num" }, count), el("td", { class: "muted" }, reason)))))),
     el("div", { class: "panel wide" }, el("h2", {}, "Best offers"),
       el("table", {},
@@ -2759,14 +2808,14 @@ const marketPanel = (market) => {
           el("th", {}, ""))),
         el("tbody", {}, (market.best || []).map((offer, index) => el("tr", {},
           el("td", {}, offer.would_rent ?? index === 0 ? el("strong", {}, offer.hardware) : offer.hardware,
-            offer.would_rent ? el("span", { title: "the offer the pool's own rule picks, across every provider asked" }, " ", pill("would rent", "ok")) : null,
+            offer.would_rent ? el("span", { title: "what the pool would rent by itself now: the cheapest per worker-hour of the kinds its mode allows, across every provider" }, " ", pill("would rent", "ok")) : null,
             el("div", { class: "muted mono" }, `${offer.machine} · ${offer.gpu_memory_gb}GB · `,
               // A value the provider does not report is marked as assumed, never shown as measured (§6).
               (offer.assumed || []).includes("download_mbps")
                 ? el("span", { title: "assumed: this provider does not report download speed" }, `≈${offer.download_mbps}Mbps`)
                 : `${offer.download_mbps}Mbps`)),
           // A bid or a spot price can be taken away; a fixed price cannot. Same machine, different deal.
-          el("td", {}, pricedPill(offer), offer.connection ? el("div", { class: "muted" }, offer.connection) : null),
+          el("td", {}, pricedPill(offer), offer.connection ? el("div", { class: "muted" }, providerName(market, offer.connection)) : null),
           el("td", { class: "num" }, pricedOf(offer) === "bid" ? rate(offer.floor) : "—"),
           el("td", { class: "num" }, el("strong", {}, rate(offer.would_bid))),
           el("td", { class: "num" }, rate(offer.on_demand)),
@@ -2779,7 +2828,8 @@ const marketPanel = (market) => {
             offer.per_worker_hour == null ? "—" : `$${Number(offer.per_worker_hour).toFixed(4)}`),
           el("td", {}, offer.offer_id
             ? el("button", { class: "small", onclick: (e) => rentThis(e, offer) }, "Rent")
-            : null))))))));
+            : null))))),
+      assumedLegend(market))));
 };
 
 // Renting one particular offer, the way it is listed: this machine, as a bid or at its fixed
@@ -2814,6 +2864,8 @@ async function rentThis(event, offer) {
           ? `At the spot price, ${rate(offer.would_bid)}, set by the provider. It can change while the host runs, and the host can be taken back at any time.`
           : `A bid of ${rate(offer.would_bid)} (floor ${rate(offer.floor)}). Cheaper, and it can be outbid at any moment.`),
       el("p", {}, `Worst case: ${money(spend)} over ${hours}h, this one host. Machine ${offer.machine} · ${offer.gpu_memory_gb} GB · ${offer.workers} workers.`),
+      (offer.assumed || []).length ? el("p", { class: "muted" },
+        `Not reported by the provider, and assumed: ${offer.assumed.map((f) => ({ download_mbps: "download speed", reliability: "reliability", verified: "verified", download_per_gb: "download price" })[f] || f).join(", ")}.`) : null,
       el("p", { class: "muted" }, "Cap and time limit come from the Prepare a host panel above. If this offer has gone, nothing else is rented in its place.")),
   });
   if (!ok) return;
@@ -3159,6 +3211,7 @@ function workloadPlanView(plan) {
   }
   const first = plan.first_host;
   const hosts = plan.hosts_at_start;
+  const volumes = (plan.groups || []).map((g) => g.model_volume).filter(Boolean);
   const perHour = plan.hourly_total ?? hosts * first.hourly;
   const bid = first.kind !== "on_demand";
   const createButton = el("button", { class: "primary", disabled: Boolean(plan.refused),
@@ -3221,6 +3274,11 @@ function workloadPlanView(plan) {
       el("div", { class: "k" }, "cost per hour"),
       el("div", {}, !several && Math.abs(hosts * first.hourly - perHour) < 0.005
         ? `${hosts} host${hosts === 1 ? "" : "s"} × ${rate(first.hourly)} = ${rate(perHour)}` : rate(perHour)),
+      // Where the provider keeps models between hosts (D139): said before anything is spent.
+      ...(volumes.length ? [el("div", { class: "k" }, "model volume"),
+        el("div", {}, ...volumes.map((v) => el("div", {},
+          `${v.size_gb} GB at ${v.connection}, in the first host's data center — ${money(v.hourly)}/h, `
+          + `${dollars(v.over_hours)} over ${plan.hours} h, in the budget; deleted when the workload ends`)))] : []),
       el("div", { class: "k" }, "budget"),
       el("div", {}, el("strong", {}, dollars(plan.max_spend)),
         plan.budget_derived ? ` — ${rate(perHour)} × ${plan.hours} h, plus 25%` : " — as typed"),
@@ -3436,17 +3494,18 @@ function workloadActions(w) {
 
 // A workload's model volume, in one line (D139): where, how big, what it holds, what it costs.
 const VOLUME_STATES = {
-  filling: (v) => `being filled by ${v.filler}`,
+  filling: (v) => el("span", {}, "being filled by ", v.filler ? hostLink(v.filler) : "a host"),
   ready: (v) => `ready (${v.models.join(", ")})`,
-  empty: () => "empty — the next host there fills it",
-  stale: () => "holds an older build — the next host there fills the new one",
+  empty: () => "empty — the next host in that data center fills it",
+  stale: () => "holds an older build — the next host in that data center fills the new one",
 };
 
 function volumeLine(v) {
   const state = (VOLUME_STATES[v.state] || (() => v.state || "?"))(v);
+  // A month, not an hour: a few GB costs fractions of a cent an hour, which would read as $0.
   return el("div", {}, `${v.connection} · ${v.location} · ${v.size_gb} GB · `,
     el("span", { class: v.state === "ready" ? "ok-text" : v.state === "filling" ? "" : "warn-text" }, state),
-    el("span", { class: "muted" }, ` · ${rate(v.hourly)}, ${dollars(v.spent)} so far`));
+    el("span", { class: "muted" }, ` · $${(v.hourly * 720).toFixed(2)} a month, ${money(v.spent)} so far`));
 }
 
 function workloadDetail(w) {
@@ -3484,7 +3543,8 @@ function workloadDetail(w) {
       el("div", {}, `${answers.count || 0} served, ${answers.borrowed || 0} on shared hosts while starting, ${answers.refused || 0} refused`),
       el("div", { class: "k" }, "made by"), el("div", {}, w.provisioner ? `a program, with provisioning key ${w.provisioner}` : "an operator"),
       el("div", { class: "k" }, "lease"), el("div", { class: "mono" }, w.lease.lease_id),
-      ...((w.volumes || []).length ? [el("div", { class: "k" }, "model volume"), el("div", {}, w.volumes.map(volumeLine))] : []),
+      ...((w.volumes || []).length ? [el("div", { class: "k" }, w.volumes.length === 1 ? "model volume" : "model volumes"),
+        el("div", {}, w.volumes.map(volumeLine))] : []),
       el("div", { class: "k" }, "keys"),
       el("div", {}, (w.keys || []).map((k) => el("div", {}, el("span", { class: "mono" }, k.key_id),
         el("span", { class: "muted" }, ` made ${until(k.created_at)}${keyState(k)}`))))),
@@ -3495,7 +3555,7 @@ function workloadDetail(w) {
             el("td", {}, hostLink(h.host_id)), el("td", {}, pill(h.state)),
             el("td", {}, el("span", { class: "mono" }, (h.models || []).join(", ")),
               h.models_source && h.models_source !== "hub"
-                ? el("div", { class: "muted" }, h.models_source === "volume" ? "copied from its model volume" : "copied from a sibling") : null),
+                ? el("div", { class: "muted" }, h.models_source === "volume" ? "copied from its model volume" : "copied from another of its hosts") : null),
             el("td", {}, h.hardware),
             el("td", {}, pricedPill(h), h.connection ? el("div", { class: "muted" }, h.connection) : null),
             el("td", { class: "num" }, h.workers),

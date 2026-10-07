@@ -1902,8 +1902,16 @@ class Fleet:
             key = filter_name(reasons[0])
             by_reason[key] = by_reason.get(key, 0) + 1
 
+        # The row the pool would rent by itself: the first of the kinds its mode allows, and only
+        # when every provider it searches was asked — a narrowed search shows the cheapest of what
+        # was asked, not the pool's pick.
+        bids_ok, fixed_ok = self._KINDS[self.rented.mode]
+        pick = None
+        if connections is None or set(chosen) == set(searchable):
+            pick = next(((o.connection, o.offer_id, o.interruptible) for o, _ in ranked
+                         if (bids_ok if o.interruptible else fixed_ok)), None)
         accepted = []
-        for index, (offer, offer_score) in enumerate(ranked[:10]):
+        for offer, offer_score in ranked[:10]:
             bid = price_bid(offer, bid_config, policy)
             workers, workers_why = self.workers_for(offer)
             accepted.append(
@@ -1935,7 +1943,7 @@ class Fleet:
                     "assumed": list(offer.assumed),
                     "score": round(offer_score, 3),
                     # The row the pool's own rule picks, across every provider asked (D131).
-                    "would_rent": index == 0,
+                    "would_rent": (offer.connection, offer.offer_id, offer.interruptible) == pick,
                 }
             )
         # A line per provider (providers.md §7.2): asked or not and why, what it returned, what
@@ -1950,12 +1958,17 @@ class Fleet:
                     stopped[filter_name(reasons[0])] = stopped.get(filter_name(reasons[0]), 0) + 1
             asked = search and name in chosen
             state = self.searching.get(name)
+            provider = self.providers.get(name)
             by_connection[name] = {
                 "asked": asked,
+                "display_name": str(getattr(provider, "display_name", "") or name),
+                # Searchable now, whether or not this search asked it: what the console offers as
+                # a chip for the next search.
+                "searchable": name in searchable,
                 "why_not": None if asked else (
-                    "no search yet" if not search else "turned off" if not settings.enabled
+                    "turned off" if not settings.enabled
                     else "not running — it needs a credential, or waits for a restart" if name not in self.providers
-                    else "not chosen for this search"),
+                    else "no search yet" if not search else "not chosen for this search"),
                 "error": state.error if asked and state is not None and state.error else None,
                 "seen": len(mine),
                 "passed": sum(1 for o, _ in ranked if o.connection == name),

@@ -480,7 +480,19 @@ def presentation(plugin: Any, type_name: str) -> dict[str, Any]:
         "endpoint_settings": list(getattr(plugin, "endpoint_settings", ()) or ()),
         "offered": bool(getattr(plugin, "offered", True)),
         "capabilities": dataclasses.asdict(capabilities) if dataclasses.is_dataclass(capabilities) else {},
+        # Keeping models between hosts (D139): what a volume costs, and the one thing to know about
+        # where it works — said by the plug-in, so the core names no provider.
+        "volume_price_per_gb_month": _number_or_none(getattr(plugin, "volume_price_per_gb_month", None)),
+        "volume_note": _short_text_or_none(getattr(plugin, "volume_note", None)),
     }
+
+
+def _number_or_none(value: Any) -> Optional[float]:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _short_text_or_none(value: Any) -> Optional[str]:
+    return value if isinstance(value, str) and 0 < len(value) <= 200 else None
 
 
 #: The group third-party providers register under. The ones shipped here use it too: there is

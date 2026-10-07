@@ -196,6 +196,8 @@ ol.stepper li.done span { background: var(--tag); color: var(--ok); }
 .remember input { margin: 3px 0 0; width: 16px; height: 16px; accent-color: var(--accent); }
 .remember .hint { grid-column: 2; font-size: 12.5px; }
 .keep-models { margin: 0; }
+.keep-models-label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.keep-models-label input { width: 16px; height: 16px; accent-color: var(--accent); margin: 0; }
 .chips { gap: 6px; margin: 6px 0 10px; flex-wrap: wrap; }
 .chip { padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--muted); font-size: 12.5px; cursor: pointer; }
 .chip.on { border-color: var(--accent); color: var(--ink); background: color-mix(in srgb, var(--accent) 12%, transparent); }
