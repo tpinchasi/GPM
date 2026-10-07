@@ -21,7 +21,7 @@
   </nav>
   <div class="right">
     <span id="link-state" class="pill muted">disconnected</span>
-    <button id="sign-out" class="small" title="Forget the admin key in this browser">Sign out</button>
+    <button id="sign-out" class="small" title="Forget the admin key in this browser" hidden>Sign out</button>
     <button id="panic" class="danger" title="Destroy every rented host now, verified. Leases are closed.">Release all rented</button>
   </div>
 </header>
@@ -31,10 +31,13 @@
     <h2>Admin key</h2>
     <p class="muted">Sent as a header on every call. Kept for this tab — a reload keeps it, closing the tab forgets it.</p>
     <input id="key-input" type="password" autocomplete="off" placeholder="gpmx_…" required>
-    <label class="pick option"><input id="key-remember" type="checkbox"> Keep me signed in on this browser</label>
-    <p class="muted small-text">Until you sign out. Anyone who can use this browser profile can then open the console.</p>
+    <label class="remember" for="key-remember">
+      <input id="key-remember" type="checkbox" aria-describedby="key-remember-hint">
+      <span>Keep me signed in on this browser</span>
+      <span id="key-remember-hint" class="hint muted">Until you sign out. Anyone who can use this browser profile can then open the console.</span>
+    </label>
     <p id="key-error" class="error" hidden></p>
-    <button type="submit">Open the console</button>
+    <button type="submit" class="primary">Open the console</button>
   </form>
 </dialog>
 

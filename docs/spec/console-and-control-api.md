@@ -151,4 +151,5 @@ as a header on each call, and kept in the tab's `sessionStorage` — a reload ke
 tab forgets it — or, when the operator ticks **Keep me signed in on this browser**, in
 `localStorage` until **Sign out** (D137). The page is served with a Content-Security-Policy that
 lets no script run on it but its own. A screen drawn again — every status update, every action —
-keeps the operator's scroll position and shows no “Loading…” in between.
+keeps the operator's scroll position — the page's, and that of any box that scrolls on its own, like
+the live feed — and shows no “Loading…” in between.

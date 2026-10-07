@@ -3792,10 +3792,18 @@ async function render() {
   const where = `${name}/${state.sub || ""}`;
   const again = state.drawn === where;
   state.drawn = where;
+  // Boxes that scroll on their own — the live feed, a wide table's panel — keep theirs too: the
+  // overview redraws on every decision, and the feed went back to its top each time (the owner).
+  const SCROLLERS = ".feed, .panel, pre, textarea";
   const draw = (...children) => {
     const y = window.scrollY;
+    const inner = again ? [...main.querySelectorAll(SCROLLERS)].map((box) => [box.scrollTop, box.scrollLeft]) : [];
     main.replaceChildren(...children);
-    if (again) window.scrollTo(0, y);
+    if (!again) return;
+    [...main.querySelectorAll(SCROLLERS)].forEach((box, i) => {
+      if (inner[i] && (inner[i][0] || inner[i][1])) { box.scrollTop = inner[i][0]; box.scrollLeft = inner[i][1]; }
+    });
+    window.scrollTo(0, y);
   };
   try {
     const pending = (screens[name] || screens.overview)(state.status);
@@ -3899,6 +3907,7 @@ function handleFrame(chunk) {
 }
 
 async function start() {
+  document.getElementById("sign-out").hidden = false;
   const { events } = await api.events(50);
   state.events = events;
   state.lastEventId = events.length ? Math.max(...events.map((e) => e.id)) : 0;
