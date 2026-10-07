@@ -115,8 +115,8 @@ def test_a_record_from_before_connections_is_the_connection_the_pool_first_had(d
     assert db.query("SELECT COUNT(*) AS n FROM provider_search_usage")[0]["n"] == 1, "carried over once"
 
 
-def test_a_change_to_the_connections_is_planned_restarted_retyped_and_never_strands_a_host():
-    """The supervisor rents through the accounts it started with; the plan says so, asks for an
+def test_a_change_to_the_connections_is_planned_retyped_and_never_strands_a_host():
+    """A change to the accounts takes effect at once (D135); the plan says what it does, asks for an
     account turned on to be typed again, and refuses dropping a provider the pool still holds
     hosts at — nothing could stop them billing (D129, D133)."""
     from gpm_server.configplan import RentedNow, plan_changes
@@ -126,8 +126,8 @@ def test_a_change_to_the_connections_is_planned_restarted_retyped_and_never_stra
                 if c.kind == "providers"], "the same connection in the new shape is no change"
     added = pool_config(providers={"fake": {"type": "fake"}, "other": {"type": "other"}})
     (change,) = [c for c in plan_changes(old_shape, added) if c.kind == "providers"]
-    assert change.needs_restart and change.restarts == "supervisor"
-    assert "when the supervisor restarts" in change.detail and "other will be searched" in change.detail
+    assert not change.needs_restart, "a connection change takes effect at once (D135)"
+    assert "other added" in change.detail and "other will be searched" in change.detail
     assert change.requires_retype == "other", "renting somewhere new is typed again"
     assert change.refused is None
     holding = [RentedNow("rented-a", 0.4, provider="fake")]

@@ -78,6 +78,7 @@ def plan_changes(
     candidate: PoolConfig,
     rented: Sequence[RentedNow] = (),
     machines: Optional[Mapping[str, MachineNow]] = None,
+    connection_types: Optional[Mapping[str, str]] = None,
 ) -> list[Change]:
     changes: list[Change] = []
     # Everything the pool holds stops a provider's removal; only hosts count as hosts and burn.
@@ -170,17 +171,55 @@ def plan_changes(
         turned_off = sorted(name for name, conn in were.items() if conn.enabled and not (name in become and become[name].enabled))
         if turned_off:
             said.append(f"{', '.join(turned_off)} will not be rented from again (its hosts stay until released)")
+        # A provider in both, under another name, is a rename — neither an addition nor a removal.
+        types_were = {conn.type for conn in were.values()}
+        types_become = {conn.type for conn in become.values()}
+        added = sorted(name for name, conn in become.items() if name not in were and conn.type not in types_were)
+        if added:
+            said.insert(0, f"{', '.join(added)} added")
+        removed = sorted(name for name, conn in were.items() if name not in become and conn.type not in types_become)
+        if removed:
+            said.append(f"{', '.join(removed)} removed")
+        # One connection per provider (D133), so a provider's entry before and after is the same
+        # connection, renamed or not. Pointed elsewhere, or at another credential, it could be
+        # another account: its hosts would read as gone while they bill (D136).
+        before_of = {conn.type: (name, conn) for name, conn in were.items()}
+        moved = [name for name, conn in become.items()
+                 if conn.type in before_of
+                 and (before_of[conn.type][1].settings != conn.settings
+                      or before_of[conn.type][1].credential_env != conn.credential_env)
+                 and any(r.provider == conn.type for r in held)]
+        # A running connection is never rebuilt while the supervisor runs: these wait for a restart.
+        waits = sorted(name for name, conn in become.items()
+                       if conn.type in before_of and (
+                           before_of[conn.type][0] != name
+                           or before_of[conn.type][1].settings != conn.settings
+                           or before_of[conn.type][1].credential_env != conn.credential_env))
+        if waits:
+            said.append(f"{', '.join(waits)}: renamed, or new settings or credential source — takes effect when "
+                        "the supervisor restarts")
+        # A name once one provider's names that provider's records (D133).
+        reused = [f"{name!r} names {connection_types[name]!r}'s records; give {conn.type!r} another name"
+                  for name, conn in become.items()
+                  if connection_types and connection_types.get(name, conn.type) != conn.type]
+        fresh = current.rented is None
+        refusal = (f"the pool still holds {len(held_there)} host(s) or volume(s) at {', '.join(stranded)} "
+                   f"({', '.join(held_there)}): release them first, or keep that provider in the file — removed, "
+                   "nothing could stop them billing") if held_there else (
+            f"{', '.join(moved)} holds hosts or volumes, and changing where its requests go or which credential it uses "
+            "could make it another account, where they would read as gone while they bill: release them first") if moved else (
+            "; ".join(reused) or None)
         changes.append(Change(
             "providers",
             "the provider accounts change" + (f": {'; '.join(said)}" if said else "")
-            + ". This takes effect when the supervisor restarts; until then it keeps the accounts it started with",
-            needs_restart=True,
+            + (". Renting is new to this pool: it starts when the supervisor restarts" if fresh
+               else "" if waits and not (added or removed or turned_on or turned_off) else ". The rest takes effect at once (D135)"
+               if waits else ". It takes effect at once (D135)"),
+            needs_restart=fresh or bool(waits),
             restarts="supervisor",
             # Renting somewhere new is a loosening: typed again, like any (D129).
             requires_retype=turned_on[0] if turned_on else None,
-            refused=(f"the pool still holds {len(held_there)} host(s) or volume(s) at {', '.join(stranded)} "
-                     f"({', '.join(held_there)}): release them first, or keep that provider in the file — removed, "
-                     "nothing could stop them billing" if held_there else None),
+            refused=refusal,
         ))
 
     # --- capacity profiles ---
@@ -593,10 +632,14 @@ def set_values(text: str, path: Sequence[str], values: Mapping[str, Any]) -> str
         return text
     lines = text.splitlines()
     start, end, indent = 0, len(lines), 0
-    for step in path:
+    for index, step in enumerate(path):
         at, first, last = _block_of(lines, step, start, end, indent)
         inline = lines[at].split(":", 1)[1].strip()
         if inline.startswith("{"):
+            if index != len(path) - 1:
+                # The values belong further in: written into this line they would land a level
+                # too high, and the file would no longer load as the same thing.
+                raise CannotEdit(f"{'.'.join(path[:index + 1])} is written on one line; change it on the Configuration screen")
             lines[at] = _set_in_flow(lines[at], values, step)
             return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
         start, end = first, last
@@ -807,3 +850,57 @@ def _set_in_flow(line: str, values: Mapping[str, Any], name: str) -> str:
             else:
                 items = [f" {key}: {_as_yaml(value)} "]
     return f"{head}{{{','.join(items)}}}{tail}"
+
+
+def remove_key(text: str, path: Sequence[str], key: str) -> str:
+    """Delete `key` and everything under it from the block mapping at `path` — a connection
+    under `rented.providers` — leaving every other line as it was. Comments around it stay."""
+    lines = text.splitlines()
+    start, end, indent = 0, len(lines), 0
+    for step in path:
+        at, first, last = _block_of(lines, step, start, end, indent)
+        if lines[at].split(":", 1)[1].split(" #", 1)[0].strip().startswith("{"):
+            raise CannotEdit(f"{'.'.join(path)} is written on one line; change it on the Configuration screen")
+        start, end, indent = first, last, None
+    at, _first, last = _block_of(lines, key, start, end, None)
+    while last > at + 1 and (not lines[last - 1].strip() or lines[last - 1].strip().startswith("#")):
+        last -= 1
+    del lines[at:last]
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+
+
+def with_connections(text: str, config: PoolConfig) -> str:
+    """The file in the connections shape (D129): `rented.provider` and `provider_settings`
+    become one `providers:` entry, written where `provider:` was. The first save from the
+    Providers screen does this once; a file already in the shape is returned as it is."""
+    lines = text.splitlines()
+    _, first, last = _block_of(lines, "rented", 0, len(lines), 0)
+    child = re.compile(r"^(\s*)(provider|provider_settings|providers)\s*:")
+    found = {m.group(2): (n, len(m.group(1))) for n in range(first, last) if (m := child.match(lines[n]))}
+    if "providers" in found or "provider" not in found or config.rented is None:
+        return text
+    indent = found["provider"][1]
+    drop: list[tuple[int, int]] = []
+    for key in ("provider", "provider_settings"):
+        if key not in found:
+            continue
+        at = found[key][0]
+        stop = at + 1
+        while stop < last and (not lines[stop].strip() or lines[stop].strip().startswith("#")
+                               or len(lines[stop]) - len(lines[stop].lstrip()) > indent):
+            stop += 1
+        while stop > at + 1 and (not lines[stop - 1].strip() or lines[stop - 1].strip().startswith("#")):
+            stop -= 1
+        drop.append((at, stop))
+    (name, conn), = config.rented.providers.items()
+    entry: dict[str, Any] = {"type": conn.type}
+    if conn.settings:
+        entry["settings"] = dict(conn.settings)
+    block = [f"{' ' * indent}providers:", f"{' ' * (indent + 2)}{name}: {_as_yaml(entry)}"]
+    at = found["provider"][0]
+    # Where `provider:` is once the lines before it are gone: `provider_settings:` may come first.
+    at -= sum(stop - begin for begin, stop in drop if stop <= at)
+    for begin, stop in sorted(drop, reverse=True):
+        del lines[begin:stop]
+    lines[at:at] = block
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else "")

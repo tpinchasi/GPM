@@ -151,19 +151,23 @@ class Supervisor:
 
         #: Absent `rented` means the pool has no way to spend at all.
         self.fleet: Optional[Fleet] = None
+        #: Each connection's credential, and connections changing while it runs (D130, D135).
+        from .connections import ProviderAccounts
+
+        self.accounts = ProviderAccounts(self)
         if config.rented is not None:
-            self.fleet = Fleet(
-                config,
-                config.rented,
-                # One provider per configured connection, enabled or not: a disabled one's hosts are
-                # still watched and swept (D129). Given one — a test's — it is the first connection's.
-                provider if provider is not None else {
-                    name: get_provider(conn.type, conn.settings) for name, conn in config.rented.providers.items()
-                },
-                self.leases,
-                self.events,
-                self.spend,
-            )
+            # One provider per configured connection, enabled or not: a disabled one's hosts are
+            # still watched and swept (D129). Given one — a test's — it is the first connection's.
+            given = provider if isinstance(provider, dict) else (
+                {config.rented.connection_name: provider} if provider is not None else None)
+            providers = given if given is not None else {
+                name: get_provider(conn.type, conn.settings) for name, conn in config.rented.providers.items()
+            }
+            # Each is handed its credential (D134): a plug-in reads none itself.
+            for name, built in providers.items():
+                if name in config.rented.providers:
+                    self.accounts.install(name, config.rented.providers[name], built)
+            self.fleet = Fleet(config, config.rented, providers, self.leases, self.events, self.spend)
             self.fleet.make_tunnel = self.make_tunnel
         #: Workloads inside the pool (D115): created from the control API, moved along each pass.
         from .provisioning import Provisioning
@@ -281,6 +285,7 @@ class Supervisor:
             forward = self._sync_agent_tunnel(host)
             if forward is not None:
                 await forward.start()
+        self.accounts.store.check()  # owner-only, like the pool's key files (T19)
         await self._refuse_without_a_credential()
         if self.config.provisioning.enabled:
             _ = self.provisioning.ca  # a bad client CA stops the start, not a program's first create
@@ -317,7 +322,10 @@ class Supervisor:
         """A pool configured to rent must be able to ask its provider what exists. One that
         cannot — no credential, or a refused one — can neither adopt its hosts nor verify a
         destroy, so it does not start (D61). A provider that is merely unreachable is a
-        different case: the supervisor starts, and adoption waits."""
+        different case: the supervisor starts, and adoption waits.
+
+        A connection holding nothing has nothing to adopt or verify: the pool starts, says so,
+        and that connection waits for a credential — typed into the console, say (D130)."""
         if self.fleet is None:
             return
         for name, provider in self.fleet.providers.items():
@@ -326,13 +334,34 @@ class Supervisor:
             try:
                 await provider.account()
             except ProviderAuthError as exc:
+                if not self._records_at(name):
+                    self.events.record(
+                        "credential_missing",
+                        f"provider connection {name!r} has no usable credential ({exc}); it holds nothing, so the "
+                        "pool starts, and nothing is searched or rented there until one is set",
+                        numbers={"connection": name})
+                    log.warning("provider connection %s has no usable credential; it holds nothing, so it waits for one", name)
+                    continue
                 raise ProviderCredentialMissing(
                     f"rented capacity is configured but provider connection {name!r}'s credential is not "
-                    f"usable: {exc}. Set it in this process's environment, disable the connection, or remove "
-                    "the `rented` section. Nothing was changed: every rented host's record is as it was."
+                    f"usable: {exc}, and the pool holds hosts or volumes there. Set it in this process's environment, "
+                    "or remove the `rented` section. Nothing was changed: every rented host's record is as it was."
                 ) from exc
             except ProviderError:
                 continue
+
+    def _records_at(self, name: str) -> bool:
+        """Does the database say the pool holds anything at this connection — a published rented
+        host, or a kept volume? Asked before adoption, so from the records alone."""
+        fleet = self.fleet
+        for row in self.table.all():
+            if row.kind not in RENTED_KINDS:
+                continue
+            ref = row.provider_ref or {}
+            named = ref.get("connection") or (ref.get("offer") or {}).get("connection") or fleet.legacy_connection
+            if fleet.resolve(named) == name or named == name:
+                return True
+        return any(fleet.resolve(v.connection or fleet.legacy_connection) == name for v in fleet.workload_store.volumes())
 
     async def adopt_rented(self) -> None:
         """Before the first pass — and so before the first sweep — take back the rented hosts
@@ -430,6 +459,10 @@ class Supervisor:
 
     async def _pass(self) -> None:
         self._follow_config_file()
+        if self.fleet is not None and self.config.rented is not None:
+            # Under the pass's lock, before anything uses them: a connection gone from the file
+            # that holds nothing now is dropped here, never in the middle of a pass (D135).
+            self.accounts.sync(self.config, self.config, drop=True)
         self.ensure_forwarder()
         if self._adoption_pending or (self.fleet is not None and self.fleet.adoption_retry_due):
             await self.adopt_rented()
@@ -491,6 +524,11 @@ class Supervisor:
             self._config_mtime = self.config_path.stat().st_mtime
         except OSError:
             pass
+        refused = self.accounts.refuse_moves(new)
+        if refused is not None:
+            self.events.record("config_refused", f"the configuration file was not applied: {refused}")
+            log.error("configuration not applied; keeping the running one: %s", refused)
+            return
         self.apply_config(new)
 
     def apply_config(self, new: PoolConfig) -> None:
@@ -534,6 +572,8 @@ class Supervisor:
         if self.fleet is not None and new.rented is not None:
             self.fleet.config = new
             self.fleet.rented = new.rented
+            # Connections added, changed or removed take effect now (D135).
+            self.accounts.sync(old, new)
         self.events.record(
             "config_applied",
             f"configuration reloaded: {len(after)} configured host(s)",
@@ -1188,6 +1228,9 @@ async def run(config: PoolConfig, database: Database, config_path: Optional[str]
                     port=config.control.port,
                     ssl_certfile=config.control.tls_certfile,
                     ssl_keyfile=config.control.tls_keyfile,
+                    # Its own scheme and client, never a proxy's say-so: a plain-HTTP proxy on this
+                    # machine could otherwise claim HTTPS for a credential sent in clear (T26).
+                    proxy_headers=False,
                     log_level="warning",
                 )
             )

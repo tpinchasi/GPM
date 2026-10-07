@@ -714,7 +714,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                             "hourly": round(sum(h.bid_hourly for h in fleet.hosts.values()
                                                 if not h.released and h.connection_name == name), 4),
                         }
-                        for name, p in fleet.providers.items()
+                        for name, p in list(fleet.providers.items())
                     ]
                     if fleet is not None
                     else None
@@ -869,6 +869,10 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
     def store() -> Optional[ConfigStore]:
         return supervisor.store
 
+    def known_connections() -> dict[str, str]:
+        """Every name a connection has had, with its provider (D133)."""
+        return dict(supervisor.fleet.connection_types) if supervisor.fleet is not None else {}
+
     def rented_now() -> list[RentedNow]:
         if supervisor.fleet is None:
             return []
@@ -911,7 +915,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         if errors:
             return JSONResponse({"errors": errors, "changes": []})
         candidate = store().parse(text)
-        changes = plan_changes(supervisor.config, candidate, rented_now(), machines_now())
+        changes = plan_changes(supervisor.config, candidate, rented_now(), machines_now(), known_connections())
         return JSONResponse({"errors": [], "changes": [change.as_dict() for change in changes]})
 
     @app.put("/pool/config")
@@ -919,13 +923,17 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         if store() is None:
             return _error(400, "no_config_file", "this pool was not started from a file")
         body = await request.json()
+        refused = _moves_holding(body.get("text", ""))
+        if refused is not None:
+            return _error(409, "change_refused", refused)
         try:
             version = store().apply(body.get("text", ""), body.get("version"))
         except StaleVersion as exc:
             return _error(409, "stale_version", str(exc))
         except ConfigError as exc:
             return _error(400, "invalid_config", str(exc))
-        supervisor.reload_config()
+        async with supervisor.pass_lock:  # a provider change never lands mid-pass (D135)
+            supervisor.reload_config()
         return JSONResponse({"version": version})
 
     @app.patch("/pool/config/rented")
@@ -1433,7 +1441,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         if errors:
             return _error(400, "invalid_config", "; ".join(errors))
         if str(body.get("confirm")) != host_id:
-            changes = plan_changes(supervisor.config, store().parse(text), rented_now(), machines_now())
+            changes = plan_changes(supervisor.config, store().parse(text), rented_now(), machines_now(), known_connections())
             listed = [c.as_dict() for c in changes]
             for change in listed:
                 if change["kind"] == "host_removed":
@@ -1452,7 +1460,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         if errors:
             return _error(400, "invalid_config", "; ".join(errors))
         candidate = store().parse(text)
-        changes = plan_changes(supervisor.config, candidate, rented_now(), machines_now())
+        changes = plan_changes(supervisor.config, candidate, rented_now(), machines_now(), known_connections())
         refused = [c for c in changes if c.refused]
         if refused:
             return _error(409, "change_refused", "; ".join(c.refused for c in refused))
@@ -1473,11 +1481,27 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         supervisor.reload_config()
         return JSONResponse({"version": new_version, "changes": [c.as_dict() for c in changes]})
 
+    # --- provider accounts (D130, D134-D136) ---
+    from .providers_api import register as register_providers
+
+    register_providers(
+        app, supervisor, error=_error, validate_plan_apply=_validate_plan_apply,
+        plan_of=lambda text: plan_changes(supervisor.config, store().parse(text), rented_now(), machines_now(),
+                                          known_connections()),
+    )
+
     def _has_section(text: str, name: str) -> bool:
         """Is this block already in the file? A missing one is written whole, once."""
         import re as _re
 
         return bool(_re.search(rf"^\s+{_re.escape(name)}\s*:", text, _re.M))
+
+    def _moves_holding(text: str) -> Optional[str]:
+        """The one check a raw save or a rollback cannot skip: a holding connection pointed
+        elsewhere (D136). Anything else the file gets wrong, its own load refuses."""
+        if store().validate(text):
+            return None
+        return supervisor.accounts.refuse_moves(store().parse(text))
 
     @app.get("/pool/config/history")
     async def config_history() -> JSONResponse:
@@ -1489,11 +1513,16 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
     async def rollback_config(request: Request) -> JSONResponse:
         if store() is None:
             return _error(400, "no_config_file", "this pool was not started from a file")
+        wanted = (await request.json()).get("version", "")
+        refused = _moves_holding(store().text_of(wanted) or "")
+        if refused is not None:
+            return _error(409, "change_refused", refused)
         try:
-            version = store().rollback((await request.json()).get("version", ""))
+            version = store().rollback(wanted)
         except ConfigError as exc:
             return _error(400, "invalid_config", str(exc))
-        supervisor.reload_config()
+        async with supervisor.pass_lock:  # a provider change never lands mid-pass (D135)
+            supervisor.reload_config()
         return JSONResponse({"version": version})
 
     @app.post("/pool/hosts/test")

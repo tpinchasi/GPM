@@ -397,6 +397,60 @@ class ProviderNotFound(Exception):
     """Configuration named a provider that is not installed."""
 
 
+# --- interface version 2: the credential handed in, and how the plug-in presents itself (D134) ---
+#
+# Optional members, read with `getattr`, so a version-1 plug-in still loads and runs: it reads
+# its own credential, the console says so and offers no field for one, and it is drawn with a
+# lettermark.
+#
+#   display_name: ClassVar[str]           — "Vast.ai"; the entry-point name where absent.
+#   icon: ClassVar[Optional[str]]         — a small SVG document, drawn as an image, never as markup.
+#   icon_url: ClassVar[Optional[str]]     — or an https address of the provider's own logo, which the
+#                                           console's page loads with no referrer (the owner's choice).
+#   endpoint_settings: ClassVar[tuple]    — the settings that decide where the credential is sent
+#                                           (a `base_url`). A change to any clears a stored credential.
+#   credential_env: str                   — the environment variable read when nothing else is
+#                                           given (`VAST_API_KEY`); may be an instance attribute.
+#   offered: ClassVar[bool]               — False keeps it off the console's Add provider (a test double).
+#   set_credential(credential)            — hand the plug-in its credential, or None for none.
+#                                           Replaces the one it holds at once, for the next call.
+
+#: The most an icon may be: a lettermark is drawn instead of a larger one.
+MAX_ICON_BYTES = 16_384
+
+
+def _https_or_none(url: Any) -> Optional[str]:
+    """An icon address the console may load: https, and short — never anything a page could
+    be pointed at otherwise."""
+    if isinstance(url, str) and url.startswith("https://") and len(url) <= 300 and not any(c in url for c in "\"'<> "):
+        return url
+    return None
+
+
+def takes_credential(provider: Any) -> bool:
+    """A version-2 plug-in is handed its credential; a version-1 one reads its own."""
+    return callable(getattr(provider, "set_credential", None))
+
+
+def presentation(plugin: Any, type_name: str) -> dict[str, Any]:
+    """How the console draws a plug-in: its name, its icon where it has a usable one, and what it
+    can do. Never anything the plug-in holds — only what its class declares."""
+    icon = getattr(plugin, "icon", None)
+    usable = isinstance(icon, str) and icon.lstrip().startswith("<svg") and len(icon.encode()) <= MAX_ICON_BYTES
+    capabilities = getattr(plugin, "capabilities", None)
+    return {
+        "type": type_name,
+        "display_name": str(getattr(plugin, "display_name", "") or type_name),
+        "icon": icon if usable else None,
+        "icon_url": _https_or_none(getattr(plugin, "icon_url", None)),
+        "interface_version": str(getattr(plugin, "interface_version", "1")),
+        "takes_credential": callable(getattr(plugin, "set_credential", None)),
+        "endpoint_settings": list(getattr(plugin, "endpoint_settings", ()) or ()),
+        "offered": bool(getattr(plugin, "offered", True)),
+        "capabilities": dataclasses.asdict(capabilities) if dataclasses.is_dataclass(capabilities) else {},
+    }
+
+
 #: The group third-party providers register under. The ones shipped here use it too: there is
 #: no privileged path for first-party plug-ins.
 ENTRY_POINT_GROUP = "gpm.providers"
@@ -406,6 +460,41 @@ def available_providers() -> dict[str, Any]:
     from importlib.metadata import entry_points
 
     return {point.name: point for point in entry_points(group=ENTRY_POINT_GROUP)}
+
+
+#: The distribution whose plug-ins are the framework's own, loaded like any of its modules.
+FRAMEWORK = "gpm-server"
+
+
+def installed_plugins() -> dict[str, dict[str, Any]]:
+    """Every installed provider plug-in, by name, for the console to offer — **without loading
+    another package's code** (T14): a plug-in runs only once configuration names it or an
+    operator chooses it. The framework's own are loaded, for their names and icons; another
+    package's are listed from its metadata, with `loaded` false."""
+    found: dict[str, dict[str, Any]] = {}
+    for name, point in sorted(available_providers().items()):
+        dist = getattr(point, "dist", None)
+        package = getattr(dist, "name", None) or "?"
+        entry: dict[str, Any] = {"package": package, "version": getattr(dist, "version", None), "loaded": False}
+        if package == FRAMEWORK:
+            try:
+                entry.update(presentation(point.load(), name), loaded=True)
+            except Exception:  # a broken plug-in is left as metadata, never fatal to the console
+                pass
+        found[name] = entry
+    return found
+
+
+def plugin_presentation(name: str) -> dict[str, Any]:
+    """Load one plug-in an operator chose, and say how it presents itself. Raises
+    ProviderNotFound for one that is not installed."""
+    found = available_providers()
+    if name not in found:
+        raise ProviderNotFound(f"unknown provider {name!r}")
+    point = found[name]
+    dist = getattr(point, "dist", None)
+    return {"package": getattr(dist, "name", None) or "?", "version": getattr(dist, "version", None),
+            "loaded": True, **presentation(point.load(), name)}
 
 
 def get_provider(name: str, settings: dict[str, Any]) -> Provider:
