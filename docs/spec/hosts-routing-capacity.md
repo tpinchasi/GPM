@@ -213,7 +213,7 @@ adoption after a supervisor restart restores what the engine was actually starte
 operator's act and never the supervisor's own pass: a relaunch stops a host serving, and
 evidence-based resizing stays post-v1 (§2.2).
 
-### 2.4 Automatic adjustment (D67, D68) — decided, not built
+### 2.4 Automatic adjustment (D67, D68, D75)
 
 Opt-in: `rented.workers_auto`. A host **starts** at its capacity profile's number — **six where no
 profile matches** — and finds its own from there, in both directions.
@@ -223,11 +223,30 @@ The engine is launched at the most the machine can really hold: the memory ceili
 workers stay real — they never exceed what the engine runs — and every adjustment is a change of
 router slots: instant, graceful, no restart.
 
-A host that is far worse value than the rest is **given up rather than shrunk** (D75): where its
-cost per unit of work — hourly all-in over tokens a second — stays worse than `replace_above_factor`
-of the pool's median for `replace_after_s`, it is drained, destroyed and its machine avoided, and
-the ordinary allocation path rents the replacement. One at a time, never the last ready host, and
-never without a lease whose budget covers the download.
+A host that is far worse value than the rest is **given up rather than shrunk** (D75). Its cost per
+unit of work is its hourly price all-in over the tokens a second it serves *while serving* — the
+tokens of the model it served most in the window, over the time it had one of those answers in
+hand, counting only answers that generated tokens and did not fail — so a host the router simply
+sent less work, or one ready only late in the window, is not taken for a slow one. It is compared
+with the **median of the other ready hosts serving the same model for the same demand**: a larger
+model is slower everywhere, a workload sending long prompts for short answers serves fewer tokens
+on any machine, and a dear market has no bad host, only dear ones. A host is judged only once its
+worker count has stood unchanged, and it has been ready, for `replace_after_s`: one still being
+raised runs fewer answers at once and serves fewer tokens a second for that alone — until then it
+is a yardstick for the others, not a candidate. A host holding several models is not judged.
+
+Where a host stays worse than `replace_above_factor` (3×) of that median for `replace_after_s`
+(600 s), judged on `replace_min_requests` (20) answers or more, it is drained and its machine
+avoided for the rest of its lease's hours — remembered across a restart, from the event log; not
+where the provider's id names a class of machine rather than one, which would bar the good hosts
+of that class too. The ordinary allocation path rents a replacement *when the demand needs one*:
+if the hosts left carry the load, none is rented. Bounds: one at a time — none while another is
+draining or a host of its demand is coming up, and none on a lease until a host on it has become
+ready since the last; at most two on one lease; never the last ready host of its demand; never
+without a lease open for renting whose budget left (after the cap's margin) and hours cover the
+replacement's download and the time it takes to become ready. On while `workers_auto` is
+(`workers_auto.replace_bad_value`, default on); each host given up is said in the event feed as
+`replaced_for_value`, with its ratio.
 
 A host steps **up** by one when it is saturated, requests are waiting, and its last step up raised
 throughput by `min_gain`. It steps **down** by one when throughput stayed flat after its last step

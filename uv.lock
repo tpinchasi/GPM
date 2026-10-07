@@ -283,7 +283,7 @@ provides-extras = ["certs"]
 
 [[package]]
 name = "gpm-server"
-version = "0.32.1"
+version = "0.33.0"
 source = { editable = "server" }
 dependencies = [
     { name = "cryptography" },

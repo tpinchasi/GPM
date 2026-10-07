@@ -698,6 +698,16 @@ class WorkersAutoConfig(BaseModel):
     #: The most any rented host's engine is launched to run at once. Six is where a host
     #: *starts* (D68); this is the ceiling it may climb to, bounded by what memory allows.
     max: int = Field(default=16, ge=1, le=64)
+    #: Give up a host that is far worse value than the rest (D75): its cost per unit of work —
+    #: hourly all-in over tokens a second — this many times the median of the other hosts serving
+    #: the same model, for `replace_after_s`, on at least `replace_min_requests` answers. It is
+    #: drained, destroyed and its machine avoided for its lease; the ordinary allocation rents
+    #: the replacement. One at a time, never the last ready host, never without a lease whose
+    #: budget covers a download.
+    replace_bad_value: bool = True
+    replace_above_factor: float = Field(default=3.0, gt=1)
+    replace_after_s: float = Field(default=600.0, gt=0)
+    replace_min_requests: int = Field(default=20, ge=1)
 
 
 class CapacityProfile(BaseModel):
