@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
 import httpx
 
 from . import modelhub, vllm_state
+from . import volume as model_volume
 
 
 class OllamaFacts:
@@ -30,6 +32,8 @@ class OllamaFacts:
         #: Unused here — this engine answers every question about itself over its own API.
         #: Accepted so that every engine in the registry is built the same way.
         self.settings = settings
+        #: Where each tag's blobs came from on this host, by tag (D139), as for vLLM.
+        self.sources: dict[str, dict[str, Any]] = {}
 
     async def describe(self, client: httpx.AsyncClient) -> dict[str, Any]:
         """Version, models on disk with sizes, models loaded. An engine that does not answer
@@ -49,6 +53,7 @@ class OllamaFacts:
                 key=lambda m: m["tag"],
             ),
             "models_loaded": sorted(m.get("name") for m in loaded if m.get("name")),
+            **({"model_sources": self.sources} if self.sources else {}),
         }
 
     def launch_environment(
@@ -82,7 +87,32 @@ class OllamaFacts:
 
     async def pull(self, client: httpx.AsyncClient, tag: str) -> AsyncIterator[tuple[int, int]]:
         """Fetch one tag, yielding (bytes completed, bytes total) as layers arrive. Raises
-        `EngineRefused` with the engine's own words if it will not."""
+        `EngineRefused` with the engine's own words if it will not.
+
+        With a model volume mounted at one of the agent's own paths (D139): before the engine's
+        pull, the tag's blobs — by the registry's manifest — are copied from the volume into the
+        engine's store, each kept only if it hashes to its name; after it, they are copied up."""
+        reading, filling = model_volume.READ_PATH.is_dir(), model_volume.FILL_PATH.is_dir()
+        if not (reading or filling):
+            async for progress in self._pull(client, tag):
+                yield progress
+            return
+        report, started = model_volume.Report(), time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as registry:
+                blobs = await model_volume.ollama_blobs(tag, registry)
+            if blobs is None:
+                report.fill = "not used: the registry did not list this tag's blobs"
+            elif reading:
+                await model_volume.read_blobs(model_volume.READ_PATH, blobs, model_volume.ollama_blobs_dir(), report)
+            async for progress in self._pull(client, tag):
+                yield progress
+            if blobs is not None and filling:
+                await model_volume.fill_blobs(model_volume.FILL_PATH, blobs, report)
+        finally:
+            self.sources[tag] = {**report.as_fact(), "seconds": round(time.monotonic() - started, 1)}
+
+    async def _pull(self, client: httpx.AsyncClient, tag: str) -> AsyncIterator[tuple[int, int]]:
         layers: dict[str, tuple[int, int]] = {}
         async with client.stream("POST", "/api/pull", json={"model": tag, "stream": True}, timeout=None) as response:
             if response.status_code != 200:
@@ -213,6 +243,10 @@ class VllmFacts:
 
     def __init__(self, settings: Any = None) -> None:
         self.settings = settings
+        #: Where each model's files came from on this host — the model volume, the hub — and how
+        #: long it took, by tag (D139). Reported in the facts so the pool's history can say
+        #: whether a volume pays.
+        self.sources: dict[str, dict[str, Any]] = {}
 
     @property
     def _models_dir(self) -> str:
@@ -249,6 +283,7 @@ class VllmFacts:
             # A process the launcher started that has since exited without serving its model
             # is a failure, not a model still loading — with the reason from its own log.
             "models_failed": self._failed(loaded),
+            **({"model_sources": self.sources} if self.sources else {}),
         }
 
     def _failed(self, loaded: list[str]) -> dict[str, str]:
@@ -271,12 +306,23 @@ class VllmFacts:
         return found
 
     async def pull(self, client: httpx.AsyncClient, tag: str) -> AsyncIterator[tuple[int, int]]:
-        """Fetch from the model hub, not from the engine — so the engine's client is unused."""
+        """Fetch from the model hub, not from the engine — so the engine's client is unused.
+        With a model volume mounted at one of the agent's own paths, from the volume first, or
+        into it after (D139)."""
+        report = model_volume.Report()
+        started = time.monotonic()
         try:
-            async for completed, total in modelhub.fetch(tag, self._models_dir):
+            async for completed, total in modelhub.fetch(
+                tag, self._models_dir, report=report,
+                volume_read=model_volume.READ_PATH if model_volume.READ_PATH.is_dir() else None,
+                volume_fill=model_volume.FILL_PATH if model_volume.FILL_PATH.is_dir() else None,
+            ):
                 yield completed, total
         except modelhub.HubRefused as no:
             raise EngineRefused(str(no)) from no
+        finally:
+            if model_volume.READ_PATH.is_dir() or model_volume.FILL_PATH.is_dir():
+                self.sources[tag] = {**report.as_fact(), "seconds": round(time.monotonic() - started, 1)}
 
     async def hold(self, client: httpx.AsyncClient, tag: str, *, pinned: bool) -> None:
         """Serving a model here is a property of how the engine was started, not something that

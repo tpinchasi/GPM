@@ -16,13 +16,15 @@ this module decides what that means and where it lands.
 
 from __future__ import annotations
 
-import dataclasses
 import os
 import re
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
 import httpx
+
+from . import volume as model_volume
+from .volume import Expected
 
 #: The hub this fetches from. Settable for a mirror or an air-gapped copy, by the machine's
 #: owner in the machine's own environment — never by the pool.
@@ -72,10 +74,30 @@ class HubRefused(Exception):
     """The hub said no, or the request was not one this module will make."""
 
 
-@dataclasses.dataclass(frozen=True)
-class RemoteFile:
-    path: str
-    size: int
+#: A file as the hub lists it: path, size, and the hash the hub publishes for it, which a copy
+#: from a model volume is checked against (D139).
+RemoteFile = Expected
+
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_SHA1 = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _remote_file(entry: dict) -> RemoteFile:
+    """One listing entry. A large-file-storage file's own `oid` is its pointer's, so its content
+    hash is the one under `lfs`; any other file's `oid` is the git blob sha1 of its content."""
+    path = entry["path"]
+    try:
+        model_volume.plain_parts(path)
+    except model_volume.VolumeRefused as exc:
+        raise HubRefused(f"the hub listed a path this agent will not write: {exc}") from exc
+    lfs = entry.get("lfs") if isinstance(entry.get("lfs"), dict) else None
+    sha256 = str((lfs or {}).get("oid") or (lfs or {}).get("sha256") or "").lower() or None
+    git_sha1 = None if lfs else (str(entry.get("oid") or "").lower() or None)
+    return RemoteFile(
+        path=path, size=int(entry.get("size") or 0),
+        sha256=sha256 if sha256 and _SHA256.match(sha256) else None,
+        git_sha1=git_sha1 if git_sha1 and _SHA1.match(git_sha1) else None,
+    )
 
 
 def directory_for(models_dir: str | Path, repo: str) -> Path:
@@ -146,14 +168,16 @@ async def listing(repo: str, *, client: Optional[httpx.AsyncClient] = None) -> l
     if not isinstance(entries, list):
         raise HubRefused(f"the hub answered for {repo} in a shape this agent does not understand")
     return [
-        RemoteFile(path=e["path"], size=int(e.get("size") or 0))
+        _remote_file(e)
         for e in entries
         if isinstance(e, dict) and e.get("type") == "file" and isinstance(e.get("path"), str)
     ]
 
 
 async def fetch(
-    repo: str, models_dir: str | Path, *, client: Optional[httpx.AsyncClient] = None
+    repo: str, models_dir: str | Path, *, client: Optional[httpx.AsyncClient] = None,
+    volume_read: Optional[Path] = None, volume_fill: Optional[Path] = None,
+    report: Optional[model_volume.Report] = None,
 ) -> AsyncIterator[tuple[int, int]]:
     """Fetch a repository into `models_dir`, yielding (bytes done, bytes total) as it moves.
 
@@ -161,6 +185,11 @@ async def fetch(
     continued with a range request. A 19 GB download cut at 18 GB costs a minute on the next
     attempt, not an hour — which matters because the pool retries a cut download (D57) and a
     rented host is paying for every second of it.
+
+    With a model volume (D139): before the hub, every file the volume holds of this build is
+    copied from it and checked against the hub's hash (`volume_read`); after a whole fetch, the
+    build is copied up into the volume (`volume_fill`). Both are the agent's own mount paths, and
+    `report` says what came from where.
     """
     into = directory_for(models_dir, repo)
     files = wanted(await listing(repo, client=client))
@@ -170,6 +199,9 @@ async def fetch(
     into.mkdir(parents=True, exist_ok=True)
     # Not complete until this fetch says so, whatever an earlier one left behind.
     (into / COMPLETE_MARKER).unlink(missing_ok=True)
+    report = report if report is not None else model_volume.Report()
+    if volume_read is not None:
+        await model_volume.read(volume_read, into.name, files, into, report)
 
     own = client is None
     client = client or httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=300.0), follow_redirects=True)
@@ -202,6 +234,8 @@ async def fetch(
             done += entry.size or landed
             yield done, total
         (into / COMPLETE_MARKER).write_text(f"{total}\n")
+        if volume_fill is not None:
+            await model_volume.fill(volume_fill, into.name, files, into, report)
     except httpx.HTTPError as exc:
         raise HubRefused(f"fetching {repo} stopped: {exc or type(exc).__name__}") from exc
     finally:

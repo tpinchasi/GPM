@@ -115,9 +115,11 @@ engine never runs from it:
   Ollama, blobs are copied into the engine's store only when they hash to the digest they are
   named by, and the engine's own pull then fetches the manifest and whatever is missing.
 - **Filling.** After its own fetch, the host copies its verified files up into a fresh directory on
-  the volume (created exclusively, no link followed), renames it into place, and writes a marker
-  last naming the hub revision and each file's hash. A filler that stops leaves a directory no one
-  reads.
+  the volume (created exclusively, no link followed), each checked against the hub's hash as it is
+  copied, and renames it into place under its build's name — a digest of the hub's file list with
+  each file's hash, which every host computes alike from the hub's listing. A filler that stops
+  leaves a directory no one reads; a build already there is left as it is. For Ollama the blobs are
+  copied up under their own names.
 - **The engine's own state** — process ids, start record, logs — is never kept in the models
   directory, so nothing of one host's engine reaches another through a volume.
 - What it did, and how long it took, is in the agent's facts: files from the volume, files from the
