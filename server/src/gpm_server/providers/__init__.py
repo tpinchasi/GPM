@@ -18,6 +18,10 @@ from .base import (
     ProviderRateLimited,
     ProviderUnavailable,
     get_provider,
+    installed_plugins,
+    plugin_presentation,
+    presentation,
+    takes_credential,
 )
 from .fake import FakeProvider, default_offer
 from .vast import VastProvider
@@ -45,4 +49,8 @@ __all__ = [
     "VastProvider",
     "default_offer",
     "get_provider",
+    "installed_plugins",
+    "plugin_presentation",
+    "presentation",
+    "takes_credential",
 ]

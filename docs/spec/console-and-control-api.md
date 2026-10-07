@@ -26,11 +26,13 @@
 - **The admin key is required on every control-API request**, sent as a header, never a cookie,
   with `Host` / `Origin` checked — on loopback too, because any web page open in the same
   browser can send requests to `127.0.0.1`. The app key is refused here.
-- **Several providers** rent side by side (D129–D133); their accounts, credentials and the market
-  across them are in [providers.md](providers.md). Until its screens are built, the console shows
-  the first account in the Provider panel and every account's line beneath it, marks each host
-  and offer with its account and with how it is paid for — **bid**, **spot** or **on demand** —
-  and says when a provider could not be asked while the others answered.
+- **Several providers** rent side by side (D129–D136). **Rented capacity → Providers** is where
+  their accounts are managed: a card each, with its icon, credential state, quota, holdings and
+  capabilities, and Add provider — choose, name, credential, test, save — with no restart
+  ([providers.md](providers.md) §7.1). A provider credential is the one secret typed into the
+  console: sent once, never sent back (D130). Each host and offer is marked with its account and
+  how it is paid for — **bid**, **spot** or **on demand** — and the market says when a provider
+  could not be asked while the others answered.
 - **Secrets never reach the browser.** The console shows only "set ✓ / missing ✗" against the
   environment variable or file a secret is read from.
 

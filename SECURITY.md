@@ -20,7 +20,8 @@ Anything that lets someone other than the operator:
 - **spend the operator's money** — rent hardware, raise a bid, bypass a lease, defeat a dollar
   cap or the cap safety margin;
 - **obtain the provider account credential**, in any form: a log line, an event, an API
-  response, a rented host, a browser;
+  response, a rented host, or a browser after it was typed in (it passes through one once, and is
+  never sent back);
 - **reach the control API without the admin key**, or use an app key to do anything the control
   API permits;
 - **serve inference without the app key**, on loopback included;
@@ -39,7 +40,8 @@ oversights:
   adversaries.
 - **Plug-ins are not sandboxed.** A provider or engine plug-in runs inside the supervisor with
   its full authority, including the account credential. Installing one is a trust decision equal
-  to installing GPM itself. Only plug-ins named in configuration are ever loaded.
+  to installing GPM itself. Only plug-ins named in configuration, or chosen by an operator on the
+  console's Add provider, are ever loaded.
 - **There is no isolation between apps sharing one pool's key.** Separate workloads use separate
   pools.
 

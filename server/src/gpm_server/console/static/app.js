@@ -78,6 +78,15 @@ const api = {
   provisioners: () => call("GET", "/pool/provisioners"),
   createProvisioner: (body) => call("POST", "/pool/provisioners", body),
   revokeProvisioner: (name, end) => call("DELETE", `/pool/provisioners/${encodeURIComponent(name)}?end_workloads=${end ? "true" : "false"}`),
+  // Provider accounts (D130, D134-D136). A credential goes out once, in a body, and never comes back.
+  providers: (fresh = false) => call("GET", `/pool/providers${fresh ? "?fresh=true" : ""}`),
+  plugin: (type) => call("GET", `/pool/providers/plugins/${encodeURIComponent(type)}`),
+  testProvider: (body) => call("POST", "/pool/providers/test", body),
+  addProvider: (body) => call("POST", "/pool/providers", body),
+  changeProvider: (name, body) => call("PATCH", `/pool/providers/${encodeURIComponent(name)}`, body),
+  removeProvider: (name, confirm) => call("DELETE", `/pool/providers/${encodeURIComponent(name)}`, confirm === undefined ? {} : { confirm }),
+  setCredential: (name, credential) => call("PUT", `/pool/providers/${encodeURIComponent(name)}/credential`, { credential }),
+  removeCredential: (name) => call("DELETE", `/pool/providers/${encodeURIComponent(name)}/credential`),
 };
 
 // --- small helpers ---
@@ -648,6 +657,7 @@ function hostTestForm() {
 // what. Each tab answers one question an operator comes here with, and has its own address so
 // Back works and a tab can be linked to.
 const RENTED_TABS = [
+  { id: "providers", label: "Providers", about: "The provider accounts this pool rents from: each one's credential, what it can do, what it holds, and adding another." },
   { id: "hosts", label: "Hosts", about: "What this pool is renting now, what it costs, and renting one more by hand." },
   { id: "engine", label: "Profiles", about: "What each machine this pool rents holds — its models, each with the variant it fetches — and the engine, image and start they run with." },
   { id: "finding", label: "Finding machines", about: "What the pool looks for on the market, and the live market those settings let through — try values here before saving them." },
@@ -667,9 +677,11 @@ function rentedTabs(current) {
 
 screens.rented = async (status) => {
   if (!status.provider) return [el("h1", {}, "Rented capacity"), el("p", { class: "muted" }, "This pool has no rented capacity configured, so it cannot spend.")];
-  const tab = RENTED_TABS.find((t) => t.id === state.sub) || RENTED_TABS[0];
+  // With no tab named it opens on Hosts — what is being paid for now.
+  const tab = RENTED_TABS.find((t) => t.id === (state.sub || "hosts")) || RENTED_TABS[1];
   const market = RENTED_TABS_WITH_MARKET.has(tab.id) ? await api.market(1, null, false).catch((e) => ({ error: e.message })) : null;
   const head = [el("h1", {}, "Rented capacity"), rentedTabs(tab.id), el("p", { class: "muted tab-about" }, tab.about)];
+  if (tab.id === "providers") return [...head, ...await providersTab()];
   if (tab.id === "engine") return [...head, ...engineSection(status)];
   if (tab.id === "finding") return [...head, ...searchSection(market), ...marketSection(market)];
   if (tab.id === "scaling") return [...head, limitsPanel(status), ...allocationSection(market)];
@@ -704,15 +716,614 @@ function providerPanel(status, account) {
       ] : []),
       el("div", { class: "k" }, "cap margin"), el("div", {}, `${(status.provider.cap_safety_margin * 100).toFixed(0)}%`,
         el("span", { class: "muted" }, status.provider.capabilities.reports_charges ? " — narrows once a charge is reported" : " — wider: this provider reports no charges"))),
-    (status.providers || []).length > 1 ? el("div", {},
-      el("h3", {}, "Provider accounts"),
-      el("p", { class: "muted" }, "The credential and credit above are the first account's. Each account's own:"),
-      el("table", {}, el("tbody", {}, status.providers.map((p) => el("tr", {},
-        el("td", {}, el("strong", {}, p.connection), el("div", { class: "muted" }, p.type)),
-        el("td", {}, p.enabled ? pill("searched", "ok") : pill("off")),
-        el("td", { class: "num" }, `${p.rented} rented · ${rate(p.hourly)}`),
-        el("td", {}, p.search_quota ? searchQuotaText(p.search_quota) : el("span", { class: "muted" }, "no search quota")),
-        el("td", {}, p.search_error ? el("span", { class: "error" }, p.search_error) : null)))))) : null);
+    el("p", { class: "muted" }, (status.providers || []).length > 1
+      ? `The first of ${status.providers.length} provider accounts. `
+      : "", el("a", { href: "#rented/providers" }, "Provider accounts →")));
+}
+
+// --- Provider accounts (D130, D134-D136; providers.md §7.1) ---
+//
+// A card per account, every card laid out alike so two read side by side: who it is, whether it
+// is working, its credential, what it holds, what it can and cannot do, and what can be done to
+// it. A credential is typed into a dialog, sent once, and dropped from the page as the dialog
+// closes.
+
+const providersView = { tests: {}, data: null, secrets: [], focus: null, opened: 0 };
+
+// Hues far enough apart that two providers' lettermarks never read as one.
+const LETTERMARK_HUES = [215, 160, 275, 25, 340, 190, 45, 120];
+
+// A plug-in's own icon is drawn as an image — never as markup, so it can run nothing. Without
+// one, a lettermark in a colour fixed by the provider's name.
+function providerIcon(p, size = 40) {
+  const name = p.display_name || p.type || "?";
+  if (p.icon) {
+    return el("img", { class: "provider-icon", width: size, height: size, alt: "",
+      src: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(p.icon)}` });
+  }
+  if (p.icon_url && p.icon_url.startsWith("https://")) {
+    // The provider's own logo, from its site: no referrer sent, and the lettermark if it fails.
+    const img = el("img", { class: "provider-icon", width: size, height: size, alt: "", src: p.icon_url,
+      referrerpolicy: "no-referrer", loading: "lazy", decoding: "async" });
+    img.addEventListener("error", () => img.replaceWith(providerIcon({ ...p, icon_url: null }, size)), { once: true });
+    return img;
+  }
+  // "Lambda Cloud" → LC, "RunPod" → RP, "Vast.ai" → V.
+  const words = name.split(/\s+/).filter(Boolean);
+  const capitals = name.replace(/[^A-Z]/g, "");
+  const letters = words.length > 1 ? words[0][0] + words[1][0] : capitals.length > 1 ? capitals.slice(0, 2) : name[0];
+  let turn = 0;
+  for (const c of String(p.type || name)) turn = (turn * 31 + c.charCodeAt(0)) % 997;
+  const hue = LETTERMARK_HUES[turn % LETTERMARK_HUES.length];
+  return el("div", { class: "provider-icon lettermark", "aria-hidden": "true",
+    style: `--hue:${hue};width:${size}px;height:${size}px;font-size:${Math.round(size * (letters.length > 1 ? 0.38 : 0.48))}px` },
+  letters.toUpperCase());
+}
+
+const providerLabel = (p) => (p.display_name && p.display_name !== p.connection ? `${p.display_name} (${p.connection})` : p.connection);
+
+// Small line icons for what a provider can do; drawn here, never fetched.
+const CAP_ICON = {
+  interruptible: '<path d="M4 12h4l2-6 4 12 2-6h4"/>',
+  parkable: '<rect x="7" y="6" width="3" height="12" rx="1"/><rect x="14" y="6" width="3" height="12" rx="1"/>',
+  self_terminate: '<circle cx="12" cy="13" r="7"/><path d="M12 13V9M10 3h4"/>',
+  interruption_notice: '<path d="M12 4l9 16H3z"/><path d="M12 10v4M12 17v.5"/>',
+  reports_charges: '<path d="M6 3h12v18l-3-2-3 2-3-2-3 2z"/><path d="M9 8h6M9 12h6"/>',
+  volumes: '<ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v12c0 1.7 3.1 3 7 3s7-1.3 7-3V6"/>',
+  copies: '<rect x="8" y="8" width="11" height="11" rx="2"/><path d="M5 15V5h10"/>',
+  reports_instance_logs: '<path d="M5 5h14M5 10h14M5 15h9M5 20h6"/>',
+  warning: '<path d="M12 4l9 16H3z"/><path d="M12 10v4M12 17v.5"/>',
+};
+const capIcon = (name) => el("span", { class: "cap-icon", "aria-hidden": "true",
+  html: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${CAP_ICON[name] || ""}</svg>` });
+
+// What a provider can do, in the order an operator weighs it: how it rents, then what keeps
+// spending safe, then what makes a host ready sooner. Every provider rents on demand.
+const CAPABILITIES = [
+  ["interruptible", "Interruptible", "Offers that can be taken away — bid for, or at the provider's spot price. Cheaper."],
+  ["parkable", "Park", "A host can be stopped with its disk kept, and started again without downloading."],
+  ["interruption_notice", "Interruption warning", "The provider warns before it takes a host back; the pool drains it at once."],
+  ["self_terminate", "Dead-man timer", "A host ends itself if the pool goes quiet. Without it, leases here are kept short."],
+  ["reports_charges", "Reports charges", "The provider says what each host cost, and spend is reconciled against it."],
+  ["volumes", "Volumes", "Models kept on a volume beside a machine, for the next host there."],
+  ["copies", "Copies between hosts", "A new host takes its models from a sibling instead of the hub."],
+  ["reports_instance_logs", "Boot logs", "A host that never answered says why."],
+];
+
+// Two rows, said in words: what it can do, and what it cannot — never told apart by style alone.
+function capabilityRows(capabilities, { compact = false } = {}) {
+  const has = CAPABILITIES.filter(([key]) => (capabilities || {})[key]);
+  const lacks = CAPABILITIES.filter(([key]) => !(capabilities || {})[key]);
+  const chip = ([key, label, about], on) => {
+    const warn = !on && key === "self_terminate";
+    return el("li", { class: `cap-chip${on ? "" : " off"}${warn ? " warn" : ""}`, title: about },
+      capIcon(warn ? "warning" : key), warn ? "No dead-man timer" : label);
+  };
+  const row = (title, list, on) => el("div", { class: "cap-row" },
+    el("span", { class: "cap-row-title" }, title),
+    list.length ? el("ul", { class: "cap-chips", "aria-label": title }, list.map((c) => chip(c, on)))
+      : el("span", { class: "muted small-text" }, on ? "none declared" : "nothing missing"));
+  return el("div", { class: "cap-rows" }, row("Can", has, true), compact ? null : row("Cannot", lacks, false));
+}
+
+// The one thing to know first about an account: a state, with what it means for what it holds.
+function providerHealth(p) {
+  const holds = p.holds > 0 ? ` — ${p.holds} host${p.holds === 1 ? "" : "s"} held there` : "";
+  const account = p.account || {};
+  const credential = p.credential || {};
+  if (!p.configured) return { key: "removed", tone: "parked", label: `Removed — still releasing${holds}` };
+  if (credential.source === "missing") return { key: "credential", tone: "bad", label: `Needs a credential${holds}` };
+  if (credential.source === "withheld") return { key: "credential", tone: "warn", label: `Credential waits for a restart${holds}` };
+  if (account.state === "refused") return { key: "credential", tone: "bad", label: `Credential refused${holds}` };
+  if (account.state === "unreachable") return { key: "unreachable", tone: "warn", label: "Cannot be reached" };
+  if (!p.enabled) return { key: "off", tone: "disabled", label: `Off${holds}` };
+  if (p.pending) return { key: "pending", tone: "warn", label: "Not renting — a change waits for a restart" };
+  if (!account.state || account.state === "unknown") return { key: "unchecked", tone: "warn", label: "Not checked yet" };
+  if (p.search_quota && p.search_quota.exhausted) return { key: "quota", tone: "warn", label: "Search quota used up" };
+  if (p.search_error) return { key: "failing", tone: "warn", label: "Searches failing" };
+  return { key: "searching", tone: "ok", label: "Searching" };
+}
+
+function credentialLine(p) {
+  const c = p.credential || {};
+  const account = p.account || {};
+  const when = (ts) => new Date(ts * 1000).toLocaleDateString([], { month: "short", day: "numeric" });
+  const where = c.source === "stored" ? `saved ${when(c.set_at)}`
+    : c.source === "environment" ? `from ${c.variable} in the supervisor's environment`
+    : c.source === "plugin" ? "read by the plug-in itself"
+    : c.source === "withheld" ? `${c.variable || "the environment's"} is not sent here until the supervisor restarts — or type one in`
+    : c.variable ? `none — type one in, or set ${c.variable}` : "none — type one in";
+  const verdict = c.source === "missing" || c.source === "withheld" ? null
+    : account.state === "valid" ? pill("valid", "ok")
+    : account.state === "refused" ? pill("refused", "bad")
+    : account.state === "unreachable" ? pill("unreachable", "warn") : null;
+  return el("div", {},
+    verdict, verdict ? " " : null, el("span", {}, where),
+    account.state === "valid" && account.credit != null ? el("span", { class: "muted" }, ` · ${dollars(account.credit)} credit`) : null,
+    c.cleared_at ? el("div", { class: "warn-text" }, "The credential saved earlier was deleted: the account's endpoint changed after it was saved.") : null,
+    c.source !== "missing" && account.state !== "valid" && account.detail ? el("div", { class: "muted" }, account.detail) : null);
+}
+
+function quotaMeter(quota) {
+  if (!quota) return el("span", { class: "muted" }, "no daily search quota");
+  const share = quota.limit ? Math.min(1, quota.used / quota.limit) : 0;
+  return el("div", {},
+    el("div", { class: `burn${quota.exhausted ? " bad" : share >= 0.8 ? " warn" : ""}`, role: "img",
+      "aria-label": `${Math.round(share * 100)}% of today's search quota used` }, el("div", { style: `width:${Math.round(share * 100)}%` })),
+    el("div", { class: "muted small-text" }, searchQuotaText(quota)));
+}
+
+function holdingLine(p) {
+  const parts = [];
+  if (p.rented) parts.push(`${p.rented} rented`);
+  if (p.parked) parts.push(`${p.parked} parked`);
+  if (p.volumes) parts.push(`${p.volumes} volume${p.volumes === 1 ? "" : "s"}`);
+  if (p.held_back) parts.push(`${p.held_back} waiting for the account to answer after a restart`);
+  return el("div", {}, parts.length ? parts.join(" · ") : el("span", { class: "muted" }, "nothing"),
+    p.hourly ? el("span", { class: "muted" }, ` · ${rate(p.hourly)}`) : null);
+}
+
+function testResults(steps) {
+  const mark = { passed: "✓", failed: "✗", warning: "!", skipped: "–" };
+  const tone = { passed: "ok", failed: "bad", warning: "warn", skipped: "disabled" };
+  const label = { credential: "Credential", search: "A search", instances: "This pool's hosts there", capabilities: "Capabilities" };
+  return el("ol", { class: "steps" }, steps.map((s) => el("li", { class: `step ${s.status}` },
+    el("span", { class: `pill ${tone[s.status] || ""}`, role: "img", "aria-label": s.status }, mark[s.status] || "?"),
+    el("div", {}, el("strong", {}, label[s.step] || s.step), el("div", { class: "muted" }, s.detail)))));
+}
+
+function providerCard(p, data) {
+  const health = providerHealth(p);
+  const c = p.credential || {};
+  const tested = providersView.tests[p.connection];
+  const actions = [], aside = [], reasons = [];
+  if (p.configured) {
+    actions.push(el("button", { class: "small", onclick: (e) => testSaved(e.target, p) }, "Test connection"));
+    if (c.can_type) {
+      actions.push(el("button", { class: `small${c.source === "missing" ? " primary" : ""}`, disabled: !data.secure_transport || undefined,
+        onclick: () => credentialDialog(p, data) }, c.source === "stored" ? "Replace credential" : "Type in a credential"));
+      const orSet = c.variable ? "; or set " + c.variable + " in the supervisor's environment" : "";
+      if (!data.secure_transport) reasons.push(`A credential can be typed in only over HTTPS or on the pool's own machine${orSet}.`);
+    }
+    actions.push(el("button", { class: "small", onclick: (e) => toggleProvider(e.target, p) }, p.enabled ? "Turn off" : "Turn on"));
+    aside.push(el("button", { class: "small", onclick: () => editProviderDialog(p) }, "Settings"));
+    aside.push(el("button", { class: "small danger", disabled: p.holds > 0 || undefined,
+      onclick: (e) => removeProvider(e.target, p) }, "Remove"));
+    if (p.holds > 0) reasons.push(`It holds ${p.holds} host${p.holds === 1 ? "" : "s"} or volume${p.holds === 1 ? "" : "s"}: release them before removing it.`);
+  }
+  return el("article", { class: `panel provider-card${p.enabled ? "" : " is-off"}`, "data-connection": p.connection,
+    "aria-labelledby": `provider-${p.connection}` },
+    el("header", { class: "provider-head" }, providerIcon(p),
+      el("div", { class: "provider-title" },
+        el("h2", { id: `provider-${p.connection}` }, p.display_name || p.type),
+        el("div", { class: "muted mono" }, p.connection === p.type ? p.type : `${p.connection} · ${p.type}`)),
+      el("span", { class: `pill status ${health.tone}`, role: "status" }, health.label)),
+    el("div", { class: "kv provider-facts" },
+      el("div", { class: "k" }, "credential"), credentialLine(p),
+      el("div", { class: "k" }, "search quota"), quotaMeter(p.search_quota),
+      el("div", { class: "k" }, "holding"), holdingLine(p),
+      p.search_error ? el("div", { class: "k" }, "last search") : null,
+      p.search_error ? el("div", { class: "error" }, p.search_error) : null,
+      p.pending ? el("div", { class: "k" }, "waiting") : null,
+      p.pending ? el("div", { class: "warn-text" }, `The file's change ${p.pending}.`) : null),
+    capabilityRows(p.capabilities),
+    el("div", { class: "provider-actions" }, el("div", { class: "row" }, actions), el("div", { class: "row" }, aside)),
+    reasons.length ? el("div", { class: "muted small-text" }, reasons.map((r) => el("div", {}, r))) : null,
+    tested ? el("details", { class: "provider-test", open: tested.open || undefined,
+      ontoggle: (e) => { tested.open = e.target.open; } },
+      el("summary", {}, `Test at ${clock(tested.at)}: `, tested.steps.some((s) => s.status === "failed")
+        ? el("span", { class: "error" }, "failed") : tested.steps.some((s) => s.status === "warning")
+          ? el("span", { class: "warn-text" }, "passed with a warning") : el("span", { class: "ok-text" }, "passed")),
+      testResults(tested.steps)) : null);
+}
+
+async function providersTab() {
+  let data;
+  try {
+    data = await api.providers();
+  } catch (error) {
+    return [el("p", { class: "error" }, error.message), el("button", { onclick: () => render() }, "Try again")];
+  }
+  providersView.data = data;
+  const live = data.connections.filter((p) => p.configured);
+  const searching = live.filter((p) => providerHealth(p).key === "searching").length;
+  const hosts = data.connections.reduce((n, p) => n + p.rented + p.parked, 0);
+  const burn = data.connections.reduce((n, p) => n + (p.hourly || 0), 0);
+  const offered = data.plugins.filter((p) => p.offered && !data.connections.some((c) => c.type === p.type));
+  const add = el("button", { class: "primary", disabled: !offered.length || undefined, onclick: () => addProviderDialog(data) }, "Add provider");
+  const focusAfter = providersView.focus;
+  providersView.focus = null;
+  if (focusAfter) {
+    // Back to the card that was acted on, rather than the top of the page.
+    setTimeout(() => document.querySelector(`.provider-card[data-connection="${CSS.escape(focusAfter)}"] button`)?.focus(), 0);
+  }
+  return [
+    el("div", { class: "providers-summary panel" },
+      el("div", { class: "summary-stats" },
+        el("div", {}, el("div", { class: "stat" }, live.length), el("div", { class: "muted" }, `account${live.length === 1 ? "" : "s"}`)),
+        el("div", {}, el("div", { class: "stat" }, searching), el("div", { class: "muted" }, "searching")),
+        el("div", {}, el("div", { class: "stat" }, hosts), el("div", { class: "muted" }, "hosts held")),
+        el("div", {}, el("div", { class: "stat" }, rate(burn)), el("div", { class: "muted" }, "burning"))),
+      el("div", { class: "summary-actions" },
+        el("div", { class: "row" },
+          el("button", { onclick: (e) => run(e.target, async () => { providersView.tests = {}; await api.providers(true); }) }, "Check every account"),
+          add),
+        offered.length ? null : el("div", { class: "muted small-text" }, "Every installed provider is connected: a pool has one account per provider."))),
+    data.secure_transport ? null : el("p", { class: "warn-text" },
+      "This page is not on HTTPS or the pool's own machine, so a credential cannot be typed in here. Open the console over HTTPS, or from the pool's machine."),
+    live.length || data.connections.length ? el("div", { class: "provider-grid" }, data.connections.map((p) => providerCard(p, data)))
+      : el("div", { class: "panel" }, el("p", {}, "No provider account yet."), add.cloneNode(true)),
+    el("p", { class: "muted" }, "A pool has one account per provider. Limits — hosts, hourly burn, leases — are the pool's, across every account. "
+      + "Every search asks each account that is on, and every rental takes what is expected to cost least per worker-hour across them."),
+  ];
+}
+
+async function testSaved(button, p) {
+  providersView.focus = p.connection;
+  await run(button, async () => {
+    const answer = await api.testProvider({ connection: p.connection });
+    providersView.tests[p.connection] = { at: Date.now() / 1000, steps: answer.steps, open: true };
+    await api.providers(true);
+  });
+}
+
+// A change the plan says must be typed again: asked, then sent again with the typed value.
+async function withRetype(send, title) {
+  try {
+    return await send(undefined);
+  } catch (error) {
+    const loosening = (error.changes || []).find((c) => c.requires_retype);
+    if (!loosening) throw error;
+    const ok = await confirmAction({ title, retype: loosening.value, retypeLabel: `Type ${loosening.value} to confirm`,
+      body: el("ul", {}, error.changes.map((c) => el("li", {}, c.detail))) });
+    if (!ok) return null;
+    return await send(loosening.value);
+  }
+}
+
+async function toggleProvider(button, p) {
+  providersView.focus = p.connection;
+  delete providersView.tests[p.connection];
+  await run(button, async () => {
+    if (p.enabled) {
+      const ok = await confirmAction({ title: `Turn off ${providerLabel(p)}?`, okLabel: "Turn off",
+        body: "Nothing more is searched or rented there. Its hosts stay until they are released, and are still watched and charged." });
+      if (!ok) return;
+      await api.changeProvider(p.connection, { enabled: false });
+    } else {
+      await withRetype((confirm) => api.changeProvider(p.connection, { enabled: true, ...(confirm ? { confirm } : {}) }),
+        `Turn on ${providerLabel(p)}?`);
+    }
+  });
+}
+
+async function removeProvider(button, p) {
+  await run(button, async () => {
+    try {
+      await api.removeProvider(p.connection);
+    } catch (error) {
+      if (!error.changes) throw error;
+      const ok = await confirmAction({ title: `Remove ${providerLabel(p)}?`, retype: p.connection, okLabel: "Remove",
+        retypeLabel: `Type ${p.connection} to remove it`,
+        body: el("div", {}, el("p", {}, "It leaves the pool's file, and its saved credential is deleted. The file keeps its own history."),
+          el("ul", {}, error.changes.map((c) => el("li", {}, c.detail)))) });
+      if (ok) {
+        await api.removeProvider(p.connection, p.connection);
+        delete providersView.tests[p.connection];
+      }
+    }
+  });
+}
+
+// --- the dialog the add, credential and settings flows share ---
+
+function providerDialog() {
+  let dialog = document.getElementById("provider-dialog");
+  if (!dialog) {
+    dialog = el("dialog", { id: "provider-dialog", class: "provider-dialog", "aria-labelledby": "provider-dialog-title" });
+    document.body.append(dialog);
+    // Whatever was typed is dropped as the dialog closes, however it closes — the fields of
+    // steps no longer on screen included.
+    dialog.addEventListener("close", () => {
+      for (const input of providersView.secrets) input.value = "";
+      providersView.secrets = [];
+      providersView.opened += 1;  // anything still in flight for this opening draws nothing
+      dialog.replaceChildren();
+    });
+  }
+  // Whatever an earlier opening still has in flight must not draw into this one.
+  providersView.opened += 1;
+  return { dialog, opening: providersView.opened };
+}
+
+const dialogTitle = (text) => el("h2", { id: "provider-dialog-title" }, text);
+
+let secretCount = 0;
+function secretField(label, hint) {
+  const id = `secret-${++secretCount}`;
+  const input = el("input", { id, type: "password", autocomplete: "off", spellcheck: "false", "data-secret": "",
+    placeholder: "paste it here", "aria-describedby": `${id}-hint` });
+  providersView.secrets.push(input);
+  const toggle = el("button", { type: "button", class: "small", "aria-pressed": "false", "aria-label": "Show credential", onclick: () => {
+    const shown = input.type === "password";
+    input.type = shown ? "text" : "password";
+    toggle.textContent = shown ? "Hide" : "Show";
+    toggle.setAttribute("aria-pressed", String(shown));
+  } }, "Show");
+  return { input, node: el("div", { class: "field" }, el("label", { for: id }, label),
+    el("div", { class: "row tight" }, input, toggle), el("small", { id: `${id}-hint`, class: "muted" }, hint)) };
+}
+
+const SECRET_HINT = "Sent once to this pool and kept by its supervisor in an owner-only file. It is never shown again — not here, not in a log.";
+
+function credentialDialog(p, data) {
+  const { dialog } = providerDialog();
+  const secret = secretField(`${p.display_name || p.type} credential`, SECRET_HINT);
+  const result = el("div", { role: "alert" });
+  const save = el("button", { class: "primary", type: "submit", disabled: true }, "Test and save");
+  secret.input.addEventListener("input", () => { save.disabled = !secret.input.value.trim(); });
+  const form = el("form", { method: "dialog" });
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    const value = secret.input.value.trim();
+    if (!value) return;
+    save.disabled = true;
+    save.textContent = "testing…";
+    try {
+      await api.setCredential(p.connection, value);
+      delete providersView.tests[p.connection];
+      providersView.focus = p.connection;
+      dialog.close();
+      await refresh();
+    } catch (error) {
+      result.replaceChildren(el("p", { class: "error" }, error.message));
+      save.disabled = false;
+    } finally {
+      save.textContent = "Test and save";
+    }
+  };
+  const stored = (p.credential || {}).source === "stored";
+  const deleteSaved = async () => {
+    const ok = await confirmAction({ title: `Delete the saved credential for ${providerLabel(p)}?`, okLabel: "Delete",
+      body: (p.credential || {}).variable
+        ? `The account then takes ${p.credential.variable} from the supervisor's environment, if it is set.`
+        : "The account then has no credential." });
+    if (!ok) return;
+    try {
+      await api.removeCredential(p.connection);
+      delete providersView.tests[p.connection];
+      dialog.close();
+      await refresh();
+    } catch (error) { result.replaceChildren(el("p", { class: "error" }, error.message)); }
+  };
+  form.append(
+    el("header", { class: "provider-head" }, providerIcon(p, 32), dialogTitle(`${stored ? "Replace" : "Type in"} the credential for ${providerLabel(p)}`)),
+    p.holds ? el("p", { class: "muted" }, `The pool holds ${p.holds} host(s) or volume(s) here, so the new credential must see them — a key to another account is refused.`) : null,
+    secret.node,
+    result,
+    stored && p.holds ? el("p", { class: "muted small-text" }, "The saved credential cannot be deleted while the account holds hosts: nothing could then watch or release them. Replace it instead.") : null,
+    el("div", { class: "row" },
+      el("button", { type: "button", onclick: () => dialog.close() }, "Cancel"),
+      stored && !p.holds ? el("button", { type: "button", class: "danger", onclick: deleteSaved }, "Delete saved credential") : null,
+      save));
+  dialog.replaceChildren(form);
+  dialog.showModal();
+  secret.input.focus();
+}
+
+function editProviderDialog(p) {
+  const { dialog } = providerDialog();
+  const prior = el("input", { id: "provider-prior", type: "number", min: "0", step: "0.01", value: p.interruption_prior_per_hour ?? "",
+    placeholder: "the pool's default", "aria-describedby": "provider-prior-hint" });
+  const settings = el("textarea", { id: "provider-settings", class: "mono", rows: "5", spellcheck: "false", "aria-describedby": "provider-settings-hint" },
+    JSON.stringify(p.settings || {}, null, 2));
+  const note = el("div", { role: "alert" });
+  const endpointKeys = p.endpoint_settings || [];
+  const form = el("form", { method: "dialog" });
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    let parsed;
+    try { parsed = JSON.parse(settings.value || "{}"); } catch { parsed = undefined; }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      note.replaceChildren(el("p", { class: "error" }, "Settings are a JSON object, like {} or {\"name\": \"value\"}."));
+      return;
+    }
+    const moved = endpointKeys.filter((k) => JSON.stringify(parsed[k] ?? null) !== JSON.stringify((p.settings || {})[k] ?? null));
+    if (moved.length && (p.credential || {}).source === "stored") {
+      const ok = await confirmAction({ title: "Delete the saved credential?", okLabel: "Change and delete",
+        body: `Changing ${moved.join(", ")} sends requests somewhere else, so when it takes effect — at the supervisor's next restart — the saved credential is deleted rather than sent there. Type it in again then.` });
+      if (!ok) return;
+    }
+    const body = { settings: parsed, interruption_prior_per_hour: prior.value === "" ? null : Number(prior.value) };
+    try {
+      await api.changeProvider(p.connection, body);
+      providersView.focus = p.connection;
+      dialog.close();
+      await refresh();
+    } catch (error) {
+      note.replaceChildren(el("p", { class: "error" }, error.message));
+    }
+  };
+  form.append(
+    el("header", { class: "provider-head" }, providerIcon(p, 32), dialogTitle(`Settings for ${providerLabel(p)}`)),
+    el("div", { class: "field" }, el("label", { for: "provider-prior" }, "Interruptions expected per hour"), prior,
+      el("small", { id: "provider-prior-hint", class: "muted" }, "For a machine with no history here, how often an interruptible host is taken away. Empty uses the pool's default.")),
+    el("div", { class: "field" }, el("label", { for: "provider-settings" }, "Plug-in settings"), settings,
+      el("small", { id: "provider-settings-hint", class: "muted" }, endpointKeys.length
+        ? `${endpointKeys.join(", ")} decide where requests go: changing them deletes a saved credential. Never put a credential here. Takes effect when the supervisor restarts.`
+        : "The plug-in's own settings. Never put a credential here. Takes effect when the supervisor restarts.")),
+    note,
+    el("div", { class: "row" }, el("button", { type: "button", onclick: () => dialog.close() }, "Cancel"),
+      el("button", { class: "primary", type: "submit" }, "Save")));
+  dialog.replaceChildren(form);
+  dialog.showModal();
+}
+
+// Add provider: choose → name and credential → test → save, one step on screen at a time.
+function addProviderDialog(data) {
+  const { dialog, opening } = providerDialog();
+  const current = () => providersView.opened === opening && dialog.open;
+  const draft = { step: 1, plugin: null, name: "", nameEdited: false, enabled: true, tested: null, problem: null, plan: null, busy: false };
+  const secret = secretField("Credential", SECRET_HINT);
+  const STEPS = ["Provider", "Account", "Test", "Save"];
+
+  const stepper = () => el("ol", { class: "stepper", "aria-label": "Steps" }, STEPS.map((label, i) =>
+    el("li", { class: i + 1 === draft.step ? "current" : i + 1 < draft.step ? "done" : "",
+      "aria-current": i + 1 === draft.step ? "step" : undefined }, el("span", { "aria-hidden": "true" }, i + 1), label)));
+  const nav = (...buttons) => el("div", { class: "row wizard-nav" },
+    el("button", { type: "button", onclick: () => dialog.close() }, "Cancel"),
+    draft.step > 1 ? el("button", { type: "button", onclick: () => { draft.step -= 1; draft.problem = null; draw(); } }, "Back") : null,
+    ...buttons);
+  const problem = () => (draft.problem ? el("p", { class: "error", role: "alert" }, draft.problem) : null);
+
+  function choose() {
+    const connected = new Set(data.connections.map((c) => c.type));
+    const offered = data.plugins.filter((p) => p.offered);
+    const tile = (p) => {
+      const pick = async () => {
+        if (draft.busy) return;
+        let chosen = p;
+        if (!p.loaded) {
+          draft.busy = p.type; draw();
+          try { chosen = await api.plugin(p.type); } catch (error) { draft.problem = error.message; }
+          draft.busy = false;
+          if (!current()) return;
+          if (draft.problem) { draw(); return; }
+        }
+        if (!draft.plugin || draft.plugin.type !== chosen.type) {
+          // Another provider: nothing typed for the last one goes to this one.
+          secret.input.value = "";
+          if (!draft.nameEdited) draft.name = chosen.type;
+          draft.tested = null; draft.plan = null;
+        }
+        draft.plugin = chosen; draft.problem = null; draft.step = 2; draw();
+      };
+      return el("button", { type: "button", class: `plugin-tile${draft.plugin && draft.plugin.type === p.type ? " chosen" : ""}`,
+        disabled: draft.busy || undefined, onclick: pick },
+        providerIcon(p, 36),
+        el("div", {}, el("strong", {}, p.display_name),
+          el("div", { class: "muted small-text" }, draft.busy === p.type ? "Loading…"
+            : p.loaded ? p.type : `Separate package ${p.package}${p.version ? ` ${p.version}` : ""}. Choosing it loads its code into the pool.`),
+          p.loaded ? capabilityRows(p.capabilities, { compact: true }) : null));
+    };
+    const free = offered.filter((p) => !connected.has(p.type));
+    const taken = offered.filter((p) => connected.has(p.type));
+    return [el("p", { class: "muted" }, "The installed provider plug-ins. A pool has one account per provider."),
+      el("div", { class: "plugin-tiles" }, free.length ? free.map(tile) : el("p", { class: "muted" }, "No other provider plug-in is installed.")),
+      taken.length ? el("p", { class: "muted small-text" }, `Already connected: ${taken.map((p) => p.display_name).join(", ")}.`) : null,
+      problem(), nav()];
+  }
+
+  function account() {
+    const p = draft.plugin;
+    const name = el("input", { id: "provider-name", value: draft.name, autocomplete: "off", spellcheck: "false",
+      pattern: "[a-z][a-z0-9_\\-]{0,31}", "aria-describedby": "provider-name-hint" });
+    name.oninput = () => { draft.name = name.value.trim(); draft.nameEdited = true; };
+    const form = el("form", { method: "dialog" });
+    form.onsubmit = (event) => {
+      event.preventDefault();
+      if (!/^[a-z][a-z0-9_-]{0,31}$/.test(draft.name)) { draft.problem = "A lower-case name: letters, digits, - and _, starting with a letter."; draw(); return; }
+      if (p.takes_credential && data.secure_transport && !secret.input.value.trim()) { draft.problem = "Paste the account's credential."; draw(); return; }
+      draft.problem = null; draft.step = 3; draft.tested = null; draw(); test();
+    };
+    form.append(
+      el("header", { class: "provider-head" }, providerIcon(p, 32), el("div", {}, el("strong", {}, p.display_name), capabilityRows(p.capabilities, { compact: true }))),
+      el("div", { class: "field" }, el("label", { for: "provider-name" }, "Name in this pool"), name,
+        el("small", { id: "provider-name-hint", class: "muted" }, "How hosts, spend and decisions name this account. It cannot be reused for another provider later.")),
+      p.takes_credential
+        ? (data.secure_transport ? secret.node : el("p", { class: "error" }, "Not on HTTPS or the pool's own machine: a credential cannot be sent from here. It can be set in the supervisor's environment instead."))
+        : el("p", { class: "muted" }, "This plug-in reads its own credential from its settings or environment."),
+      problem(), nav(el("button", { type: "submit", class: "primary" }, "Test it")));
+    return [form];
+  }
+
+  async function test() {
+    let answer;
+    try {
+      const value = secret.input.value.trim();
+      answer = await api.testProvider({ type: draft.plugin.type, ...(value ? { credential: value } : {}) });
+    } catch (error) {
+      answer = { ok: false, steps: [{ step: "credential", status: "failed", detail: error.message }] };
+    }
+    if (!current() || draft.step !== 3) return;  // closed, or moved on, meanwhile
+    draft.tested = answer;
+    draw();
+  }
+
+  function testing() {
+    if (!draft.tested) return [el("p", { class: "muted", role: "status" }, "Asking the provider…"), nav()];
+    const warnings = draft.tested.steps.filter((s) => s.status === "warning");
+    const understood = el("input", { id: "provider-understood", type: "checkbox" });
+    const next = el("button", { type: "button", class: "primary", disabled: !draft.tested.ok || warnings.length > 0 || undefined,
+      onclick: () => { if (warnings.length && !understood.checked) return; draft.step = 4; draft.plan = null; draw(); savePlan(); } }, "Continue");
+    understood.onchange = () => { next.disabled = !understood.checked; };
+    return [testResults(draft.tested.steps),
+      draft.tested.ok && warnings.length ? el("label", { class: "pick option", for: "provider-understood" }, understood,
+        `Add it anyway: ${warnings.map((w) => w.detail).join(" ")}`) : null,
+      draft.tested.ok ? null : el("p", { class: "error", role: "alert" }, "Fix what failed, then go back and test again."),
+      nav(el("button", { type: "button", onclick: () => { draft.tested = null; draw(); test(); } }, "Test again"), next)];
+  }
+
+  async function savePlan() {
+    let plan;
+    try {
+      plan = (await api.addProvider({ name: draft.name, type: draft.plugin.type, enabled: draft.enabled, plan_only: true })).changes;
+    } catch (error) {
+      plan = [{ detail: error.message, refused: error.message }];
+    }
+    if (!current() || draft.step !== 4) return;
+    draft.plan = plan;
+    draw();
+  }
+
+  function saving() {
+    const on = el("input", { id: "provider-on", type: "checkbox", checked: draft.enabled || undefined });
+    on.onchange = () => { draft.enabled = on.checked; draft.plan = null; draw(); savePlan(); };
+    const save = el("button", { type: "button", class: "primary", disabled: !draft.plan || draft.plan.some((c) => c.refused) || undefined }, "Add provider");
+    save.onclick = async () => {
+      save.disabled = true;
+      const value = secret.input.value.trim();
+      const body = { name: draft.name, type: draft.plugin.type, enabled: draft.enabled, ...(value ? { credential: value } : {}) };
+      try {
+        const done = await withRetype((confirm) => api.addProvider({ ...body, ...(confirm ? { confirm } : {}) }),
+          `Add ${draft.plugin.display_name} (${draft.name}) and rent from it?`);
+        if (done) {
+          providersView.tests[draft.name] = { at: Date.now() / 1000, steps: draft.tested.steps };
+          providersView.focus = draft.name;
+          dialog.close();
+          if (location.hash !== "#rented/providers") location.hash = "#rented/providers";
+          else await refresh();
+          return;
+        }
+      } catch (error) {
+        draft.problem = error.message;
+        draw();
+        return;
+      }
+      save.disabled = false;
+    };
+    const credential = !draft.plugin.takes_credential ? "read by the plug-in itself"
+      : secret.input.value.trim() ? "typed in — kept by the supervisor, never shown again" : "from the supervisor's environment";
+    return [
+      el("div", { class: "kv" },
+        el("div", { class: "k" }, "provider"), el("div", {}, draft.plugin.display_name),
+        el("div", { class: "k" }, "name"), el("div", { class: "mono" }, draft.name),
+        el("div", { class: "k" }, "credential"), el("div", {}, credential)),
+      el("label", { class: "pick option", for: "provider-on" }, on, "Search and rent from it now"),
+      el("div", { class: "plan" }, el("strong", {}, "Saving it will:"),
+        draft.plan ? el("ul", {}, draft.plan.map((c) => el("li", { class: c.refused ? "error" : "" }, c.refused || c.detail)))
+          : el("p", { class: "muted", role: "status" }, "Working out what it changes…")),
+      problem(), nav(save)];
+  }
+
+  function draw() {
+    if (!current() && draft.step !== 1) return;
+    const body = draft.step === 1 ? choose() : draft.step === 2 ? account() : draft.step === 3 ? testing() : saving();
+    dialog.replaceChildren(dialogTitle("Add a provider account"), stepper(), ...body.filter(Boolean));
+    if (draft.step === 2) (dialog.querySelector("input[data-secret]") || dialog.querySelector("#provider-name"))?.focus();
+  }
+  dialog.showModal();
+  draw();
 }
 
 function limitsPanel(status) {
@@ -3270,6 +3881,7 @@ function handleFrame(chunk) {
     checkRelease(payload);
     document.getElementById("pool-name").textContent = payload.pool;
     if (["overview", "hosts", "models"].includes(state.screen)) render();
+    else if (state.screen === "rented" && state.sub === "providers" && !operatorIsBusy()) render();
   }
 }
 

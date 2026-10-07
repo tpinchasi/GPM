@@ -67,8 +67,14 @@ class FakeProvider:
     reads as a sequence of events rather than a sleep.
     """
 
-    interface_version: ClassVar[str] = "1"
+    interface_version: ClassVar[str] = "2"
     name: ClassVar[str] = "fake"
+    display_name: ClassVar[str] = "Fake market"
+    #: Installed with the framework for tests; never offered on the console's Add provider.
+    offered: ClassVar[bool] = False
+    icon: ClassVar[Optional[str]] = None
+    endpoint_settings: ClassVar[tuple[str, ...]] = ("endpoint",)
+    credential_env: ClassVar[str] = "GPM_FAKE_PROVIDER_KEY"
 
     def __init__(
         self,
@@ -111,6 +117,13 @@ class FakeProvider:
         self.unavailable = False
         #: Scripted: the account credential is missing or refused.
         self.credential_refused = False
+        #: Scripted accounts (D134): None takes any credential, or none — as every test before
+        #: credentials were handed in. Otherwise the credentials it accepts, each to its account;
+        #: only `home_account`'s credential sees the instances.
+        self.accepted_credentials: Optional[dict[str, str]] = None
+        self.home_account = "home"
+        self.credential: Optional[str] = None
+        self.credentials_handed: list[Optional[str]] = []
         #: Scripted: the next instance comes up without the start-up material it was given.
         self.drop_startup_material = False
         #: Hand the same engines out again rather than running out of them, for a long run.
@@ -188,9 +201,28 @@ class FakeProvider:
             return url
         return self.engine_urls.pop(0)
 
+    def set_credential(self, credential: Optional[str]) -> None:
+        self.credential = credential or None
+        self.credentials_handed.append(self.credential)
+
+    def twin(self) -> "FakeProvider":
+        """Another client of the same market — its offers, instances and accounts — holding its
+        own credential: what a fresh plug-in built for a test call is (D134)."""
+        other = FakeProvider.__new__(FakeProvider)
+        other.__dict__.update(self.__dict__)
+        other.calls = []
+        other.credential = None
+        other.credentials_handed = []
+        return other
+
+    def _account(self) -> Optional[str]:
+        if self.accepted_credentials is None:
+            return self.home_account
+        return self.accepted_credentials.get(self.credential or "")
+
     def _guard(self, call: str) -> None:
         self.calls.append(call)
-        if self.credential_refused:
+        if self.credential_refused or self._account() is None:
             raise ProviderAuthError("fake provider is scripted to refuse the credential")
         if self.unavailable:
             raise ProviderUnavailable("fake provider is scripted unavailable")
@@ -205,7 +237,7 @@ class FakeProvider:
                 raw={"state": i.state},
             )
             for i in self.instances.values()
-            if i.label.startswith(label_prefix)
+            if i.label.startswith(label_prefix) and self._account() == self.home_account
         ]
 
     async def search_offers(self, query: OfferQuery) -> list[Offer]:
@@ -371,7 +403,7 @@ class FakeProvider:
 
     async def account(self) -> AccountStatus:
         self._guard("account")
-        return AccountStatus(credential_valid=True, credit_remaining=100.0)
+        return AccountStatus(credential_valid=True, credit_remaining=100.0, detail=f"account {self._account()}")
 
     def self_terminate_request(self, action: str = "destroy") -> SelfTerminateRequest:
         # Instance-scoped credential only, exactly as a real provider's would be.

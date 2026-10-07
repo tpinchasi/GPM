@@ -787,6 +787,10 @@ class ProviderConnection(BaseModel):
     #: machine has no history of its own (D131). Unset: `workloads.eviction_prior_per_hour`.
     #: Providers differ — a bid market's hosts are outbid, a spot market's reclaimed.
     interruption_prior_per_hour: Optional[float] = Field(default=None, ge=0)
+    #: Take the credential from this variable of the supervisor's environment, always (D130) —
+    #: for an operator who keeps secrets out of the pool's machine state. Unset: one typed into
+    #: the console, else the plug-in's own variable (`VAST_API_KEY`).
+    credential_env: Optional[str] = Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 
 
 class RentedConfig(BaseModel):
@@ -1019,6 +1023,9 @@ class RentedConfig(BaseModel):
     workers: int = Field(default=1, ge=1)
     capabilities: list[str] = Field(default_factory=list)
     label_prefix: Optional[str] = None
+    #: Where credentials typed into the console are kept (D130): an owner-only directory, one
+    #: file per provider. Unset: `provider-credentials` beside the pool's database.
+    credentials_dir: Optional[str] = None
     ssh_key: Optional[str] = None
     ssh_user: str = "root"
     known_hosts: str = "~/.config/gpm/known_hosts"
@@ -1390,6 +1397,13 @@ class PoolConfig(BaseModel):
         if self.rented is not None and self.rented.engine:
             return self.rented.engine
         return self.engine
+
+    def credentials_dir(self) -> Path:
+        """Where typed-in provider credentials are kept (D130): beside the database unless named."""
+        named = self.rented.credentials_dir if self.rented is not None else None
+        if named:
+            return Path(named).expanduser()
+        return Path(self.request_log).expanduser().resolve().parent / "provider-credentials"
 
     def engines_in_use(self) -> list[str]:
         """Every engine this pool runs, the pool's default first.

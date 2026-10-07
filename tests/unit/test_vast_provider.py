@@ -409,8 +409,31 @@ async def test_rate_limiting_is_typed():
 
 async def test_the_account_credential_is_never_read_from_configuration(monkeypatch):
     monkeypatch.delenv("VAST_API_KEY", raising=False)
-    with pytest.raises(ProviderAuthError, match="never from configuration"):
-        _ = VastProvider().client
+    with pytest.raises(ProviderAuthError, match="no credential is set"):
+        _ = VastProvider(api_key="in-the-settings").client
+
+
+async def test_a_handed_credential_is_the_one_sent_and_a_new_one_is_used_at_once(monkeypatch):
+    """D134: the supervisor hands the plug-in its credential; the environment is not read."""
+    monkeypatch.setenv("VAST_API_KEY", "from-the-environment")
+    seen = []
+
+    def answer(request):
+        seen.append(request.headers["authorization"])
+        return httpx.Response(200, json={"credit": 5.0})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr("gpm_server.providers.vast.httpx.AsyncClient",
+                        lambda **kw: real(transport=httpx.MockTransport(answer), **kw))
+    provider = VastProvider()
+    provider.set_credential("handed-first")
+    await provider.account()
+    provider.set_credential("handed-second")
+    await provider.account()
+    assert seen == ["Bearer handed-first", "Bearer handed-second"]
+    provider.set_credential(None)
+    with pytest.raises(ProviderAuthError):
+        await provider.account()
 
 
 # --- what goes on the host ---

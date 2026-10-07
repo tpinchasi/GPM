@@ -21,7 +21,7 @@ have an engine like any other host.
 
 ---
 
-## 1. Provider interface (v1)
+## 1. Provider interface (v2)
 
 A provider is an **HTTP API client** with typed errors, timeouts and retries — never a wrapper
 around a command-line tool. Output formats of CLIs change between versions, interactive prompts
@@ -90,6 +90,29 @@ A provider states what it can do; the pool adapts rather than assumes.
 | `reports_charges` | Spend is estimate-only; the cap safety margin is widened and the console says why |
 | `price_history` | Volatility-aware bidding relies on the pool's own samples only |
 | `direct_port_mapping` — a public port can be mapped to the engine | `http` / `https` transports to rented hosts are unavailable; `tunnel` only |
+
+### Version 2: the credential handed in, and how it presents itself (D134)
+
+Every member is optional, read where present, so a version-1 plug-in still loads and runs — it
+reads its own credential, and the console says so and offers no field for one.
+
+```python
+    interface_version: ClassVar[str] = "2"
+    display_name: ClassVar[str]               # "Vast.ai"; the entry-point name where absent
+    icon: ClassVar[str | None]                # a small SVG (≤16 KB), drawn as an image, never markup
+    icon_url: ClassVar[str | None]            # or an https address of the provider's own logo
+    endpoint_settings: ClassVar[tuple[str, ...]]  # the settings that decide where the credential goes
+    offered: ClassVar[bool] = True            # False keeps a test double off Add provider
+    credential_env: str                       # the variable read when nothing else is given
+
+    def set_credential(self, credential: str | None) -> None: ...
+```
+
+- **The supervisor hands the plug-in its credential** and the plug-in reads no environment itself
+  (providers.md §5). A new credential takes effect from the next call; a client built with the
+  old one is closed once its calls have finished.
+- **A stored credential is bound to `endpoint_settings`**: a connection whose values for them
+  change no longer gets it.
 
 ### The fake provider
 
@@ -300,7 +323,9 @@ Rules every strategy obeys:
 - Each interface has an integer major version. Adding an optional operation or capability is
   backwards-compatible; changing a guarantee is a new major version.
 - Plug-ins are ordinary Python packages discovered by entry point; the pool's configuration
-  names the ones in use. Nothing is loaded that configuration does not name.
+  names the ones in use. Nothing is loaded that configuration does not name, or that an
+  operator did not choose on the console's Add provider: another package's plug-in is listed
+  there from its package metadata alone (D134).
 - A plug-in runs **inside the supervisor process with its full authority**, including the
   provider credential. Installing one is a trust decision equivalent to installing the
   framework itself — see [../threat-model.md](../threat-model.md).

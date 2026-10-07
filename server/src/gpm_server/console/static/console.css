@@ -130,3 +130,63 @@ fieldset.field > legend { font-weight: 600; font-size: 12.5px; padding: 0; margi
 .field input[type="checkbox"] { padding: 0; }
 .field > small { font-size: 12px; }
 .programs-table .row { gap: 6px; flex-wrap: wrap; }
+
+/* Provider accounts (D130, D134) */
+.providers-summary { display: flex; align-items: center; gap: 24px; flex-wrap: wrap; margin-bottom: 14px; }
+.summary-stats { display: flex; gap: 28px; flex-wrap: wrap; }
+.summary-stats .stat { line-height: 1.1; }
+.summary-actions { margin: 0 0 0 auto; }
+.provider-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr)); gap: 14px; align-items: start; }
+.provider-card { display: flex; flex-direction: column; gap: 12px; padding: 14px 16px; }
+.provider-card.is-off { opacity: .85; }
+.provider-head { display: flex; align-items: center; gap: 12px; }
+.provider-head h2 { margin: 0; font-size: 16px; }
+.provider-title { min-width: 0; flex: 1; }
+.provider-head .pill.status { margin-left: auto; white-space: nowrap; font-weight: 600; }
+.provider-icon { flex: none; border-radius: 10px; object-fit: contain; background: var(--tag); }
+.provider-icon.lettermark { display: grid; place-items: center; color: #fff; font-weight: 700; letter-spacing: .02em;
+  background: hsl(var(--hue) 60% 40%); }
+.provider-facts { gap: 8px 16px; padding: 10px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.provider-facts .burn { max-width: 260px; margin: 4px 0 3px; }
+.cap-chips { display: flex; flex-wrap: wrap; gap: 6px; list-style: none; padding: 0; margin: 0; }
+.cap-rows { display: flex; flex-direction: column; gap: 8px; }
+.cap-row { display: grid; grid-template-columns: 4.5rem 1fr; gap: 8px; align-items: start; }
+.cap-row-title { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; padding-top: 3px; }
+.ok-text { color: var(--ok); }
+dialog.provider-dialog .field input { margin-left: 0; }
+.provider-test summary { margin-top: 0; }
+.cap-chip { display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px 2px 7px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--tag); font-size: 12px; }
+.cap-chip.off { background: transparent; color: var(--muted); border-style: dashed; }
+.cap-chip.off.warn { color: var(--warn); border-color: var(--warn); border-style: solid; opacity: 1; }
+.cap-icon { display: inline-flex; }
+.provider-actions { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.provider-actions .row { margin-top: 0; gap: 6px; }
+.provider-test { border-top: 1px dashed var(--line); padding-top: 8px; }
+.small-text { font-size: 12px; }
+ol.steps { list-style: none; padding: 0; margin: 6px 0; display: flex; flex-direction: column; gap: 8px; }
+ol.steps li { display: flex; gap: 10px; align-items: flex-start; }
+ol.steps li .pill { min-width: 1.9em; text-align: center; font-weight: 700; }
+dialog.provider-dialog { max-width: 640px; width: calc(100% - 32px); }
+dialog.provider-dialog .field { margin: 12px 0; }
+dialog.provider-dialog .field input:not([type=checkbox]), dialog.provider-dialog textarea { width: 100%; }
+dialog.provider-dialog .row.tight { margin-top: 0; flex-wrap: nowrap; }
+dialog.provider-dialog .row.tight input { flex: 1; }
+ol.stepper { display: flex; gap: 6px; list-style: none; padding: 0; margin: 4px 0 14px; flex-wrap: wrap; }
+ol.stepper li { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+ol.stepper li + li::before { content: ""; width: 18px; height: 1px; background: var(--line); }
+ol.stepper li span { display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 50%;
+  border: 1px solid var(--line); font-size: 12px; }
+ol.stepper li.current { color: var(--ink); font-weight: 600; }
+ol.stepper li.current span { background: var(--accent); border-color: var(--accent); color: #fff; }
+ol.stepper li.done span { background: var(--tag); color: var(--ok); }
+.plugin-tiles { display: grid; gap: 10px; }
+.plugin-tile { display: flex; gap: 12px; align-items: flex-start; text-align: left; padding: 10px 12px; }
+.plugin-tile.chosen { border-color: var(--accent); }
+.plugin-tile .cap-chips { margin-top: 6px; }
+.wizard-nav { justify-content: flex-end; margin-top: 16px; }
+
+/* Dark text on the light accent: white on it is too faint to read. */
+@media (prefers-color-scheme: dark) {
+  button.primary, ol.stepper li.current span { color: #0b1220; }
+}

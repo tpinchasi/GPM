@@ -170,17 +170,20 @@ rented:
 Vast is the provider the framework ships with; another is a plug-in (see
 [writing-a-plugin.md](writing-a-plugin.md)).
 
-- **Each provider reads its own credential**, from the supervisor's environment, as the first one
-  does.
+- **A credential can be typed into the console** — Rented capacity → Providers → Add provider, or
+  *Type in a credential* on an account's card. It is tested, kept by the supervisor in an
+  owner-only file, and never shown again. The supervisor's environment still works
+  (`VAST_API_KEY`, or a connection's own `credential_env`), and a `credential_env` always wins.
 - **Every search asks every enabled provider**, and every rental takes what is expected to cost
   least per worker-hour across all of them — a bid, a **spot** price (a provider's own
   interruptible price, paid as listed and never bid on), or on demand — counting what being
   taken away would cost.
 - **A provider without a dead-man timer** serves only short leases
   (`teardown.max_hours_without_deadman`): a longer lease rents elsewhere.
-- **A change to the providers takes effect when the supervisor restarts.** The configuration plan
-  says so, asks you to type the name of a provider you turn on, and refuses to remove one the
-  pool still holds hosts at — release them first.
+- **Adding, turning on or off, and removing a provider take effect at once** — no restart; a change
+  to an existing one's settings, or a rename, at the supervisor's next restart. The configuration plan asks
+  you to type the name of a provider you turn on, and refuses to remove one the pool still holds
+  hosts at — release them first.
 - `enabled: false` stops searching and renting there; its hosts stay until released, and are
   still watched and charged.
 

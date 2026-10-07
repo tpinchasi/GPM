@@ -1,10 +1,9 @@
 # Specification — Several Providers
 
-> Status: **designed; steps 1 and 2 built** (D129–D133; 2026-10-07) — the connections'
+> Status: **designed; steps 1–3 built** (D129–D136; 2026-10-07) — the connections'
 > configuration, every record naming its connection, the supervisor renting through several at
-> once, and spot prices (§9). The console (steps 3–4) and the second real provider (step 5) are
-> not built: until they are, connections are managed in the configuration file, and the
-> console's screens show the first enabled connection. Reasons are in
+> once, spot prices, credentials typed in once and the Providers screen (§9). The market across
+> providers (step 4) and the second real provider (step 5) are not built. Reasons are in
 > [../decisions.md](../decisions.md). The second real
 > provider is **RunPod** (its v2 API), chosen by the owner on 2026-10-07 from a comparison of
 > candidates' APIs against [plugin-interfaces.md](plugin-interfaces.md) §1.
@@ -37,6 +36,12 @@ rented:
   file edited while the supervisor was stopped — is kept, never dropped, and nothing is done to it
   until the provider is configured again.
 - **Turning a connection on** is a loosening, typed again like any (`requires_retype`).
+- **Adding, turning on or off, and removing take effect at once** (D135), from the console or the
+  file: a connection added is searched from the next pass, one turned off is not. A connection
+  removed while the pool holds anything there is kept — watched, charged and released as usual,
+  never searched — until it holds nothing. **A running connection is never rebuilt**: a change to
+  its settings or credential source, or a rename, waits for the supervisor's restart, and its card
+  says so.
 - **Limits are the pool's** (D129). Leases, the most rented hosts and the hourly burn cap hold
   across every connection together. A connection has no limits of its own in this version.
 
@@ -111,8 +116,10 @@ use counted before is carried into the per-connection counter once, under that n
   that long, however its lease came to be longer (extended, amended). Bidding applies only to
   bid offers (§2).
 - **One plug-in's failure stays its own**: a search that raises anything leaves the other
-  connections' offers standing, and says why beside them.
-- **Changing the connections takes a supervisor restart**, and the configuration plan says so.
+  connections' offers standing, and says why beside them; on the Providers screen a plug-in that
+  fails in its own way shows as a failed step or an unreachable account, never as a broken page.
+- **Adding, turning on or off, and removing connections take effect at once**; settings, credential
+  source and renames at a restart (D135, §1). The configuration plan says which.
 - **Spend** is reconciled per connection, against each one's reported charges where it has them.
   A lease's caps hold on the sum.
 
@@ -134,11 +141,45 @@ use counted before is carried into the per-connection counter once, under that n
 - **A new credential takes effect without a restart**, on the supervisor's next pass, after a
   test against the provider's account call.
 
-When this is built, the threat model's asset table and T16 change: the credential *may pass
-through the browser once, typed in*, and is never sent back. Found by the architecture review,
-and required of step 3:
-- **The credential is bound to where it is sent.** A change to a connection's settings that names
-  another endpoint (a `base_url`, an `api_key_env`) clears it; **Test connection** sends a stored
+How it is built (D130, D134, D136):
+- **Resolved in one order**: the connection's `credential_env`, when it names one, always; else one
+  typed into the console, if it was saved for the endpoint the connection now uses; else the
+  plug-in's own variable (`VAST_API_KEY`). The plug-in is handed it (`set_credential`) and reads
+  nothing itself. A version-1 plug-in still reads its own, and the console says so.
+- **Kept per provider**, in `rented.credentials_dir` (default: `provider-credentials` beside the
+  database), one file each: with one connection per provider (D133), a rename keeps it.
+- **Tested before it is kept**: the provider's account call must accept it. A **replacement**,
+  while the pool holds anything at that connection, must also see every instance and volume it
+  holds there, or it is another account's and refused (D136); removing a typed-in credential is
+  refused there outright.
+- **A credential from the environment goes only to the plug-in's own default endpoint.** A
+  connection whose settings name an endpoint takes a credential typed in, bound to that endpoint,
+  or none — live, at a restart, and after any edit of the file alike: the file is the admin key's
+  to write, so an endpoint it names could be anyone's, and the admin key must never steer one of
+  the supervisor's secrets there. Test connection of an unsaved account uses only a credential
+  typed in, or the plug-in's own variable with no settings. *Accepted:* a `credential_env` can
+  name another variable, which is then sent to the provider's own endpoint — a third party the
+  admin does not control.
+- **A connection whose change waits for a restart is not rented through** meanwhile: its hosts
+  would otherwise land on an account the restart may replace.
+- **A connection holding hosts or volumes is not pointed elsewhere**: a change to its settings or
+  credential source is refused however it arrives — the plan, a raw save, a rollback — and a file
+  edit the supervisor follows is not applied (the running configuration is kept) — another endpoint or
+  credential could be another account, where its hosts would read as gone while they bill.
+- **Renaming a connection** takes effect at a restart, its records then found by their provider
+  (D133); until then the old name's plug-in goes on watching its hosts — never two plug-ins on one
+  account.
+- **A pool holding nothing** at an enabled connection with no usable credential starts, says so,
+  and waits for one; holding something, it does not start (D61).
+- **Test connection** reports four steps — the credential (and credit), one search of a single
+  row, the instances already under the pool's label (a **warning** for a connection not yet
+  saved: they would be swept as strays), the declared capabilities. A saved connection is tested
+  with its own settings and credential; a new one with the credential typed, or the environment.
+
+The threat model's asset table, T16 and T26–T29 follow: the credential *passes through the
+browser once, typed in*, and is never sent back. Found by the architecture review, and built:
+- **The credential is bound to where it is sent.** A change to a connection's endpoint settings
+  (a `base_url`) clears a typed-in one; **Test connection** sends a stored
   credential only to the endpoint it was saved with, and fetches no URL it is given.
 - **Replacing a credential cannot switch accounts** while the connection holds hosts or volumes,
   where the provider can say which account a key is.
@@ -177,9 +218,15 @@ worker-hour.
 
 ## 7. Console
 
-### 7.1 Providers (Rented capacity → Providers, the first tab)
+### 7.1 Providers (Rented capacity → Providers, the first tab) — built
 
-A card per connection:
+A summary across accounts (how many, how many searching, hosts held, burn) with **Add provider**
+and **Check every account**, then a card per connection, every card laid out alike so two read
+side by side — the provider's **icon** (its plug-in's own SVG, or the provider's logo loaded from its own site
+with no referrer sent — the provider then sees the console's address; else, or if it fails to
+load, a lettermark in a colour fixed by its name), its name and connection, and one status badge, the most pressing
+first (*needs a credential*, *credential refused*, *cannot be reached*, *off*, *search quota
+used up*, *searches failing*, *searching*):
 - its type, and what it can do: on demand; interruptible, by bid or spot price; park; dead-man
   timer; interruption notice; reports charges;
 - its credential's state and the credit left;
@@ -199,8 +246,12 @@ A card per connection:
 5. **Save.** The usual validate → plan → apply, with the plan saying what changes ("searches
    will now also ask runpod; no host affected").
 
-One connection's page shows its status history, its hosts and spend, and its slice of the
-decision log.
+Another package's plug-in is listed by its name and package, and loaded only once chosen
+(D134, T14). A credential is typed only into a dialog; every field it was typed into is emptied as
+the dialog closes, however it closes.
+
+Not built yet: one connection's own page — its status history, its hosts and spend, and its slice
+of the decision log.
 
 ### 7.2 The market, across providers (Rented capacity → Finding machines)
 
@@ -231,7 +282,8 @@ decision log.
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /pool/providers` | Every connection: type, enabled, capabilities, credential state (never its value), credit, quota use, hosts and burn |
+| `GET /pool/providers` | Every connection: type, enabled, capabilities, icon, credential state (never its value), credit, quota use, hosts and burn; and the installed plug-ins (`fresh=true` asks each account now) |
+| `GET /pool/providers/plugins/{type}` | Load the plug-in an operator chose on Add provider, and how it presents itself |
 | `POST /pool/providers/test` | Test an unsaved connection, credential included; saves nothing |
 | `POST /pool/providers`, `PATCH /pool/providers/{name}` | Add or change a connection through validate → plan → apply; enabling is retyped like any loosening |
 | `PUT /pool/providers/{name}/credential`, `DELETE …/credential` | Set or replace, or remove, the credential; answers with its state only |
@@ -245,7 +297,7 @@ Each step ships on its own and keeps a single-provider pool working as it does t
 2. Interruptible offers priced by bid or spot (§2), and a supervisor with several connections, tested against
    **fake providers** with different capabilities: one that takes bids; one that offers spot at a
    price it changes, with an interruption notice; and one fixed-price only that cannot park.
-3. Credentials typed in once (§5), and the Providers screen.
+3. Credentials typed in once (§5), and the Providers screen. **Built** (0.31.0).
 4. The market across providers, then the connection columns everywhere else.
 5. The second real provider plug-in, **RunPod** (on demand, with park), built on its v2 API and
    checked live on the smallest case with the owner's go-ahead. Two facts are verified first (see

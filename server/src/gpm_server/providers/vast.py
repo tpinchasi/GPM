@@ -73,8 +73,15 @@ def _gb(megabytes: Optional[float]) -> float:
 
 
 class VastProvider:
-    interface_version: ClassVar[str] = "1"
+    interface_version: ClassVar[str] = "2"
     name: ClassVar[str] = "vast"
+    display_name: ClassVar[str] = "Vast.ai"
+    icon: ClassVar[Optional[str]] = None
+    #: The provider's own logo, as its site declares it (`<link rel="icon">`, checked 2026-10-07):
+    #: loaded by the console's page, which falls back to a lettermark if it does not load (D134).
+    icon_url: ClassVar[Optional[str]] = "https://vast.ai/icon.png"
+    #: Where the credential is sent. A stored credential is bound to it: changed, it is cleared.
+    endpoint_settings: ClassVar[tuple[str, ...]] = ("base_url",)
 
     capabilities = ProviderCapabilities(
         interruptible=True,
@@ -105,6 +112,10 @@ class VastProvider:
     ):
         self.api_key_env = api_key_env
         self.base_url = base_url
+        #: The credential the supervisor handed in (D134); until it does, the environment's, as
+        #: before — a provider built by hand, outside a pool, still works.
+        self._credential: Optional[str] = None
+        self._handed = False
         self._client = client
         self._timeout = timeout
         #: The offer search is limited by a daily quota of offer rows returned, not by request
@@ -129,14 +140,37 @@ class VastProvider:
 
     # --- plumbing ---
 
+    def _quiet(self, text: str) -> str:
+        """The provider's own words, with the credential taken out should an answer echo it."""
+        key = self._credential if self._handed else os.environ.get(self.api_key_env)
+        return text.replace(key, "[credential]") if key and len(key) >= 4 else text
+
+    @property
+    def credential_env(self) -> str:
+        return self.api_key_env
+
+    def set_credential(self, credential: Optional[str]) -> None:
+        """Use this credential from the next call on (D134). A client built with the old one is
+        dropped — closed once whatever is using it has finished, never mid-call."""
+        if self._handed and (credential or None) == self._credential:
+            return
+        self._credential = credential or None
+        self._handed = True
+        old, self._client = self._client, None
+        if old is not None:
+            try:
+                asyncio.get_running_loop().call_later(60, lambda: asyncio.ensure_future(old.aclose()))
+            except RuntimeError:
+                pass
+
     @property
     def client(self) -> httpx.AsyncClient:
         if self._client is None:
-            key = os.environ.get(self.api_key_env)
+            key = self._credential if self._handed else os.environ.get(self.api_key_env)
             if not key:
                 raise ProviderAuthError(
-                    f"{self.api_key_env} is not set; the account credential is read from the "
-                    "environment and never from configuration"
+                    "no credential is set for this provider: type one in on the Providers screen, or set "
+                    f"{self.api_key_env} in the supervisor's environment"
                 )
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
@@ -189,10 +223,10 @@ class VastProvider:
             if "/asks/" in path:
                 raise OfferGone(f"{method} {path}: no longer available")
             raise ProviderUnavailable(
-                f"{method} {path}: the provider says this endpoint is gone ({response.text[:120]})"
+                f"{method} {path}: the provider says this endpoint is gone ({self._quiet(response.text[:120])})"
             )
         if response.status_code >= 400:
-            raise ProviderUnavailable(f"{method} {path}: {response.status_code} {response.text[:200]}")
+            raise ProviderUnavailable(f"{method} {path}: {response.status_code} {self._quiet(response.text[:200])}")
         if not response.content:
             return {}
         try:

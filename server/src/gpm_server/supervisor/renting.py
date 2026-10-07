@@ -443,6 +443,8 @@ class Fleet:
         #: Each connection's searching: its back-off after "too many requests", the provider's own
         #: words for it, and why its last search came back empty (D119, D129).
         self.searching: dict[str, SearchState] = {name: SearchState() for name in self.providers}
+        #: Connections not rented through while a change to them waits for a restart (D135).
+        self.paused: set[str] = set()
 
     # --- connections (D129) ---
 
@@ -455,8 +457,10 @@ class Fleet:
         self.providers[self.connection] = value
 
     def searchable(self) -> list[str]:
-        """The connections a search asks: the enabled ones the pool has a provider for."""
-        return [name for name in self.rented.enabled_connections if name in self.providers]
+        """The connections a search asks: the enabled ones the pool has a provider for, but for
+        one whose change waits for a restart — renting there now would put hosts on an account
+        the restart may replace (D136)."""
+        return [name for name in self.rented.enabled_connections if name in self.providers and name not in self.paused]
 
     def provider_for(self, what: Any) -> Provider:
         """The provider a host, an offer or a connection's name belongs to. A record whose
@@ -1728,7 +1732,7 @@ class Fleet:
         open_leases = self.leases.open_leases()
 
         instances = []
-        for name, provider in self.providers.items():
+        for name, provider in list(self.providers.items()):
             try:
                 instances += [(name, i) for i in await provider.list_instances(self.label_prefix)]
             except ProviderError as exc:
@@ -2543,7 +2547,7 @@ class Fleet:
         answered = 0
         # Every configured connection is asked, rows or not: "nobody could be asked" must mean
         # exactly that, or a retry holding only one account's rows reads as the whole pool down.
-        for name, provider in self.providers.items():
+        for name, provider in list(self.providers.items()):
             try:
                 existing.update({(name, i.instance_id): i for i in await provider.list_instances(self.label_prefix)})
                 answered += 1
@@ -2714,7 +2718,7 @@ class Fleet:
         intended. Anything carrying this pool's label that we did not intend is swept."""
         known = {(self.resolve(host.connection_name), host.instance.instance_id)
                  for host in self.hosts.values() if not host.released}
-        for name, provider in self.providers.items():
+        for name, provider in list(self.providers.items()):
             if name in self.pending_adoption:
                 continue  # its hosts are not taken back yet: what it lists may be ours
             try:
@@ -2740,7 +2744,7 @@ class Fleet:
         "could not list" is never "none there" (D61)."""
         live = {(self.resolve(v.connection or self.legacy_connection) or v.connection, v.volume_id): v
                 for v in self.workload_store.volumes()}
-        for name, provider in self.providers.items():
+        for name, provider in list(self.providers.items()):
             if not provider.capabilities.volumes:
                 continue
             try:
@@ -3241,6 +3245,41 @@ class Fleet:
             "INSERT OR IGNORE INTO provider_search_usage (connection, day, rows, quota, exhausted_at, resets_at, "
             "updated_at) SELECT ?, day, rows, quota, exhausted_at, resets_at, updated_at FROM search_usage",
             (self.legacy_connection,))
+
+    def add_connection(self, name: str, type_name: str, provider: Provider) -> None:
+        """A connection added or rebuilt while the supervisor runs (D135): searched from the next
+        pass. A name once another provider's is refused, as at a start (D133)."""
+        was = self.connection_types.get(name)
+        if was is not None and was != type_name:
+            raise ConnectionNameReused(
+                f"provider connection {name!r} names {was!r}'s records; give {type_name!r} another name (D133)")
+        self.providers[name] = provider
+        self.searching.setdefault(name, SearchState())
+        self.connection_types[name] = type_name
+        self.leases.db.execute("INSERT OR REPLACE INTO pool_meta (key, value) VALUES (?, ?)",
+                               (f"connection_type:{name}", type_name))
+
+    def held_at(self, name: str) -> list[tuple[str, str]]:
+        """What the pool holds at a connection, as (record, provider's instance or volume id):
+        live hosts, kept volumes and hosts held back at a restart. While any is held, the
+        connection's provider is kept and its credential cannot be taken away."""
+        # By provider, never by the file: one connection per provider (D133), so whatever name a
+        # record carries — an old name, a rename's — it is held at that provider's connection,
+        # and the answer does not change with a file the supervisor has only half applied.
+        kind = self.connection_types.get(name)
+        if kind is None:
+            return []
+
+        def here(named: Optional[str]) -> bool:
+            return self.connection_types.get(named or self.legacy_connection) == kind
+
+        held = [(h.host_id, h.instance.instance_id) for h in self.hosts.values()
+                if not h.released and here(h.connection_name)]
+        held += [(f"volume:{v.volume_id}", v.volume_id) for v in self.workload_store.volumes() if here(v.connection)]
+        for pending_name, rows in self.pending_adoption.items():
+            if here(pending_name):
+                held += [(row.host_id, str((row.provider_ref or {}).get("instance_id") or "")) for row in rows]
+        return held
 
     def widen_while_short(self, workload: str, chosen: Any) -> None:
         """A group of several models with fewer ready hosts than it planned runs more of each card
