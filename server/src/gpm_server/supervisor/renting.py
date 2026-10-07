@@ -739,6 +739,7 @@ class Fleet:
         if workloads is not None:
             self.workloads = {w.name: w for w in workloads if w.active}
         await self.finish_draining(busy or {})
+        await self.connect_late()
         await self.beat_deadman_timers()
         await self.sweep_orphans()
         await self.expire_parked()
@@ -1459,6 +1460,29 @@ class Fleet:
                 continue
             if code != 0:
                 log.warning("heartbeat to %s failed: %s", host.host_id, output.strip())
+
+    async def connect_late(self) -> None:
+        """A host its provider gave no address yet is asked again every pass, and its forward
+        opened as soon as there is one. Found live on RunPod: a pod's SSH address appears a little
+        after the pod is created, and a host asked only at its creation never had a forward — it
+        could not be reached, beaten or prepared, and billed until it was given up."""
+        for host in list(self.hosts.values()):
+            if host.released or host.dial_url or host.state == "parked":
+                continue
+            try:
+                connection = await self.provider_for(host).connection(host.instance)
+            except ProviderError as exc:
+                log.warning("could not ask where %s is: %s", host.host_id, exc)
+                continue
+            if not (connection.public_url or connection.ssh_host):
+                continue
+            host.connection = connection
+            host.dial_url = connection.public_url or await self._open_tunnel(host.host_id, connection, host.engine_port)
+            if host.dial_url:
+                self.events.record(
+                    "host_reachable",
+                    f"{host.host_id} can be reached now: its provider gave its address only after creating it",
+                    host_id=host.host_id, lease_id=host.lease_id)
 
     async def _open_tunnel(self, host_id: str, connection: ConnectionInfo,
                            port: Optional[int] = None) -> Optional[str]:

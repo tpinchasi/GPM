@@ -414,3 +414,25 @@ async def test_what_the_agent_reports_reaches_the_pool_under_the_tags_it_pulled(
     host.agent_facts = {"engine": {"model_sources": engines._sources_fact(facts.sources)}}
     fleet._volume_news(host)
     assert volume_of(fleet).state == "ready"
+
+
+async def test_a_host_whose_address_comes_after_its_creation_is_reached_when_it_does(db):
+    # Found live on RunPod: a pod's SSH address appears a little after it is created.
+    from gpm_server.providers.base import ConnectionInfo
+
+    provider = FakeProvider(offers=market())
+    fleet = make_fleet(db, provider)
+    real = provider.connection
+    placed = {"yet": False}
+
+    async def later(instance):
+        return await real(instance) if placed["yet"] else ConnectionInfo()
+
+    provider.connection = later
+    workload, _ = open_workload(fleet, hosts_at_start=1)
+    await run(fleet, [workload])
+    (host,) = fleet.hosts_of("research")
+    assert host.dial_url is None, "no address yet"
+    placed["yet"] = True
+    await run(fleet, [workload])
+    assert host.dial_url is not None and "host_reachable" in kinds(fleet)

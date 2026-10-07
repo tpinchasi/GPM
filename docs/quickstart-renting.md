@@ -175,7 +175,10 @@ Vast and RunPod ship with the framework; another provider is a plug-in (see
   reliability, so its offers carry stated defaults (`assumed_download_mbps`,
   `assumed_reliability`), marked *assumed* wherever they are shown. Its hosts get the dead-man
   timer: a pod's own key, which RunPod puts in every pod, ends that pod and cannot list, create or
-  read anything else of the account.
+  read anything else of the account. RunPod runs the pool's start-up script in place of the image's
+  own entrypoint, so an image that starts its engine itself needs `rented.engine_start` — for
+  Ollama, `nohup ollama serve > /var/log/ollama.log 2>&1 &` — and the image must carry python3
+  for the host agent (`vastai/ollama` does). Its SSH daemon is started for you.
 - **Keep models between hosts** (`keep_models: true`, or the checkbox on the account's card) is
   offered only where the provider's storage reaches a data center — RunPod's network volumes, on
   Secure Cloud. Each workload then keeps its models on a volume in its first host's data center,
