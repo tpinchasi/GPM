@@ -146,5 +146,9 @@ host test | host prepare | host drain | host release | host park | down --all | 
 ## 5. How it is built
 
 A static page (HTML and JavaScript, no build step) served by the supervisor process at `/ui`,
-with live updates over server-sent events. It has no server-side session: the admin key is held
-in the page's memory for the tab's lifetime and sent as a header on each call.
+with live updates over server-sent events. It has no server-side session: the admin key is sent
+as a header on each call, and kept in the tab's `sessionStorage` — a reload keeps it, closing the
+tab forgets it — or, when the operator ticks **Keep me signed in on this browser**, in
+`localStorage` until **Sign out** (D137). The page is served with a Content-Security-Policy that
+lets no script run on it but its own. A screen drawn again — every status update, every action —
+keeps the operator's scroll position and shows no “Loading…” in between.

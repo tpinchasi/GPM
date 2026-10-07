@@ -5,8 +5,10 @@
  * make. No framework and no build step — the whole page is this file, index.html and
  * console.css, served by the supervisor.
  *
- * The admin key lives in this closure for the tab's lifetime. It is never written to storage
- * and never put in a URL; it goes out as an Authorization header on each call.
+ * The admin key goes out as an Authorization header on each call, never in a URL or a cookie.
+ * It is kept for this tab (sessionStorage: a reload keeps it, closing the tab forgets it), or —
+ * when the operator ticks "Keep me signed in" — for this browser until Sign out (localStorage).
+ * The page's Content-Security-Policy lets no script run here but this file (D137).
  */
 
 let ADMIN_KEY = null;
@@ -3784,19 +3786,30 @@ async function render() {
     link.classList.toggle("active", link.getAttribute("href") === `#${name}`);
   }
   const main = document.getElementById("screen");
+  // The same screen drawn again — a status update every few seconds, or after an action — keeps
+  // the operator's place: no "Loading…" in between and the scroll where it was. Found by the
+  // owner: the page jumped back to the top every few seconds while scrolled down.
+  const where = `${name}/${state.sub || ""}`;
+  const again = state.drawn === where;
+  state.drawn = where;
+  const draw = (...children) => {
+    const y = window.scrollY;
+    main.replaceChildren(...children);
+    if (again) window.scrollTo(0, y);
+  };
   try {
     const pending = (screens[name] || screens.overview)(state.status);
-    if (pending instanceof Promise) {
+    if (pending instanceof Promise && !again) {
       // A screen that has to ask the provider takes seconds. Say so, rather than leaving the
       // previous screen on the page where it reads as this one's answer.
       main.replaceChildren(el("p", { class: "muted" }, "Loading…"));
     }
     const parts = await pending;
-    if (state.screen !== name) return;  // the operator moved on while we were waiting
-    main.replaceChildren(...[parts].flat().filter(Boolean));
+    if (state.screen !== name || state.drawn !== where) return;  // the operator moved on while we were waiting
+    draw(...[parts].flat().filter(Boolean));
   } catch (error) {
     if (state.screen !== name) return;
-    main.replaceChildren(el("p", { class: "error" }, error.message));
+    draw(el("p", { class: "error" }, error.message));
   }
 }
 
@@ -3902,6 +3915,23 @@ document.getElementById("panic").onclick = async (e) => {
   if (ok) run(e.target, () => api.down());
 };
 
+// Where the admin key is kept between reloads (D137): this tab, or this browser until Sign out.
+const KEY_SLOT = "gpm.admin-key";
+const keptKey = {
+  read() {
+    try { return localStorage.getItem(KEY_SLOT) || sessionStorage.getItem(KEY_SLOT); } catch { return null; }
+  },
+  write(key, browser) {
+    try {
+      this.forget();
+      (browser ? localStorage : sessionStorage).setItem(KEY_SLOT, key);
+    } catch { /* storage refused: the key lives in this page only */ }
+  },
+  forget() {
+    try { localStorage.removeItem(KEY_SLOT); sessionStorage.removeItem(KEY_SLOT); } catch { /* nothing kept */ }
+  },
+};
+
 const keyDialog = document.getElementById("key-dialog");
 document.getElementById("key-form").onsubmit = async (event) => {
   event.preventDefault();
@@ -3909,6 +3939,8 @@ document.getElementById("key-form").onsubmit = async (event) => {
   const error = document.getElementById("key-error");
   try {
     await api.status();
+    keptKey.write(ADMIN_KEY, document.getElementById("key-remember").checked);
+    document.getElementById("key-input").value = "";
     keyDialog.close();
     await start();
   } catch (problem) {
@@ -3917,4 +3949,26 @@ document.getElementById("key-form").onsubmit = async (event) => {
     error.hidden = false;
   }
 };
-keyDialog.showModal();
+document.getElementById("sign-out").onclick = () => {
+  keptKey.forget();
+  ADMIN_KEY = null;
+  location.reload();
+};
+
+// A key kept from before opens the console straight away; one the pool no longer takes is
+// forgotten, and the key is asked for again.
+(async () => {
+  const kept = keptKey.read();
+  if (kept) {
+    ADMIN_KEY = kept;
+    try {
+      await api.status();
+      await start();
+      return;
+    } catch {
+      ADMIN_KEY = null;
+      keptKey.forget();
+    }
+  }
+  keyDialog.showModal();
+})();

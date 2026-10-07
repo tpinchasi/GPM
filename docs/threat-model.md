@@ -11,7 +11,7 @@
 |---|---|---|
 | **The provider account credential** | It can rent hardware without limit. The most damaging thing to lose | Supervisor's environment, or an owner-only file the supervisor keeps when it was typed into the console (D130). **Never on a rented host, never in pool configuration; it passes through the browser once, as it is typed in, and is never sent back** |
 | **Money** | The pool spends unattended | Bounded by leases, caps and the dead-man timer |
-| **The admin key** | Opens leases, raises ceilings, releases hosts | Operator's machine; held in console page memory for a tab's lifetime |
+| **The admin key** | Opens leases, raises ceilings, releases hosts | Operator's machine; in the console, kept for the tab (`sessionStorage`), or in the browser's profile until Sign out when the operator asks (D137) — the page runs no script but its own |
 | **The app key** | Admits a client to the pool's compute | Each app's environment |
 | **Prompts and completions** | May be sensitive to an adopter | In transit through the router; in memory on every host that serves them; **never written to the pool's request log** |
 | **Availability** | Apps depend on the router | Router process |
@@ -45,7 +45,7 @@ The rented host is **outside** the trust boundary even though the pool created i
 
 | # | Threat | Mitigation in the design | Residual risk |
 |---|---|---|---|
-| **T1** | A web page drives the control API on loopback (CSRF, DNS rebinding) and spends money or destroys hosts | Admin key required on **every** control request, as a header, never a cookie; `Host` and `Origin` checked; no ambient authority | A page that can read the key from the console's memory — i.e. a browser or extension compromise |
+| **T1** | A web page drives the control API on loopback (CSRF, DNS rebinding) and spends money or destroys hosts | Admin key required on **every** control request, as a header, never a cookie; `Host` and `Origin` checked; no ambient authority | A page that can read the key from the console — a browser or extension compromise; and, where the operator ticked *Keep me signed in*, anyone using that browser profile (D137) |
 | **T2** | A web page or local process uses the router on loopback for free compute, or to exhaust workers | App key required on every request, loopback included | Anyone who can read the app's environment has the key |
 | **T3** | The app key is used to reach the control API | App and admin keys are separate and never interchangeable; the control API refuses the app key | — |
 | **T4** | Keys captured on the network | Off loopback, the listener requires TLS; a bearer key over plain HTTP is refused at configuration load | Misconfigured TLS termination in front of the pool |

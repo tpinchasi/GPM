@@ -413,6 +413,15 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             # is still running the old console and nothing tells them. `no-cache` means "ask
             # every time"; the ETag makes the answer a cheap 304 when nothing changed.
             response.headers["cache-control"] = "no-cache"
+            # The page may keep the admin key in the browser (D137), so nothing but its own script
+            # ever runs on it: no inline script, no other origin's, no framing. Images may come
+            # from a provider's own site (its logo, D134) — an image runs nothing.
+            response.headers["content-security-policy"] = (
+                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+                "img-src 'self' data: https:; connect-src 'self'; object-src 'none'; base-uri 'none'; "
+                "frame-ancestors 'none'; form-action 'self'"
+            )
+            response.headers["referrer-policy"] = "no-referrer"
             return response
         refusal = authorised(request)
         if refusal is not None:

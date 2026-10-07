@@ -167,7 +167,8 @@ def test_a_page_from_an_older_release_reloads_itself_unless_the_operator_is_busy
         assert page.js("window.__same_page === true"), "not reloaded under the operator"
         assert "now runs 99.0.0" in page.js("document.getElementById('release-banner').textContent")
 
-        # Not busy: it reloads, and asks for the key again (the key is never stored).
+        # Not busy: it reloads, and opens again on the key kept for this tab (D137) — no asking.
         page.js("document.getElementById('__typing').remove(); document.activeElement.blur(); true")
         page.until("window.__same_page === undefined", within=15, what="the reload")
-        page.until("(document.getElementById('key-dialog') || {}).open === true", within=30, what="the key asked again")
+        page.until("(document.getElementById('key-dialog') || {}).open === false && !!document.querySelector('#screen h1')",
+                   within=30, what="the console again, without the key asked for")

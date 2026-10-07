@@ -639,3 +639,56 @@ def test_a_logo_address_is_offered_only_over_https():
     for bad in ("http://vast.ai/icon.png", "javascript:alert(1)", 'https://x/" onerror="x', None, 3):
         plugin = type("P", (FakeProvider,), {"icon_url": bad})
         assert presentation(plugin, "p")["icon_url"] is None, bad
+
+
+@pytest.mark.skipif(a_browser() is None, reason="no browser here")
+@pytest.mark.timeout(180)
+def test_the_page_stays_where_the_operator_scrolled_while_it_updates(pool):
+    """Found by the owner: scrolled down, the page jumped back to the top every few seconds — each
+    status update redrew the screen through a "Loading…" that collapsed it."""
+    supervisor, market, base, path, database = pool
+    with open_page(f"{base}/ui/#rented/providers") as page:
+        page.call("Emulation.setDeviceMetricsOverride", width=900, height=400, deviceScaleFactor=1, mobile=False)
+        page.until("(document.getElementById('key-dialog') || {}).open === true", within=60, what="the page")
+        page.js(f"document.getElementById('key-input').value = {json.dumps(ADMIN_KEY)};"
+                "document.getElementById('key-form').requestSubmit(); true")
+        page.until("!!document.querySelector('.provider-card')", within=30, what="the card")
+        page.js("window.scrollTo(0, document.body.scrollHeight); window.__y = window.scrollY; true")
+        assert page.js("window.__y") > 100, "the page is taller than the window"
+        page.js("window.__redraws = 0; new MutationObserver(() => window.__redraws++)"
+                ".observe(document.getElementById('screen'), {childList: true}); true")
+        page.until("window.__redraws >= 2", within=20, what="two status updates redrawing the screen")
+        assert abs(page.js("window.scrollY") - page.js("window.__y")) < 5
+
+
+@pytest.mark.skipif(a_browser() is None, reason="no browser here")
+@pytest.mark.timeout(180)
+def test_signing_in_is_kept_for_the_tab_or_the_browser_and_sign_out_forgets_it(pool):
+    """The owner: "every refresh, I need to log in again" (D137)."""
+    supervisor, market, base, path, database = pool
+    with open_page(f"{base}/ui/#overview") as page:
+        page.until("(document.getElementById('key-dialog') || {}).open === true", within=60, what="the page")
+        page.js(f"document.getElementById('key-input').value = {json.dumps(ADMIN_KEY)};"
+                "document.getElementById('key-form').requestSubmit(); true")
+        page.until("document.getElementById('key-dialog').open === false", within=30, what="signed in")
+        assert page.js("sessionStorage.getItem('gpm.admin-key') !== null && localStorage.getItem('gpm.admin-key') === null")
+        assert page.js("document.getElementById('key-input').value") == "", "not left in the field"
+        page.js("location.reload(); true")
+        page.until("document.readyState === 'complete' && !!document.querySelector('#screen h1')", within=30,
+                   what="the console after a reload, without asking")
+        assert page.js("document.getElementById('key-dialog').open") is False
+
+        page.js("document.getElementById('sign-out').click(); true")
+        page.until("(document.getElementById('key-dialog') || {}).open === true", within=30, what="asked again")
+        assert page.js("sessionStorage.getItem('gpm.admin-key') === null && localStorage.getItem('gpm.admin-key') === null")
+
+        page.js(f"document.getElementById('key-input').value = {json.dumps(ADMIN_KEY)};"
+                "document.getElementById('key-remember').checked = true;"
+                "document.getElementById('key-form').requestSubmit(); true")
+        page.until("document.getElementById('key-dialog').open === false", within=30, what="signed in, kept")
+        assert page.js("localStorage.getItem('gpm.admin-key') !== null && sessionStorage.getItem('gpm.admin-key') === null")
+
+        # A kept key the pool no longer takes is forgotten, and the key asked for.
+        page.js("localStorage.setItem('gpm.admin-key', 'gpmx_not_a_key_any_more'); location.reload(); true")
+        page.until("(document.getElementById('key-dialog') || {}).open === true", within=30, what="asked again")
+        assert page.js("localStorage.getItem('gpm.admin-key') === null")

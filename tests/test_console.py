@@ -212,12 +212,16 @@ def test_the_page_is_served_and_holds_no_key_of_its_own(console):
         assert "gpm" in page.text.lower()
         script = anonymous.get("/ui/app.js").text
 
-    # The key is entered into the page and kept in memory; it is never persisted.
-    assert "localStorage" not in script
-    assert "sessionStorage" not in script
+    # The key is kept for the tab, or for the browser only when the operator ticks "Keep me
+    # signed in" (D137) — one place reads and writes it, never a cookie or a URL.
+    assert script.count("localStorage.setItem") == 0 and "(browser ? localStorage : sessionStorage).setItem" in script
+    assert 'id="key-remember"' in page.text and 'id="sign-out"' in page.text
     assert "document.cookie" not in script
     # ...and every call it makes carries it as a header.
     assert "Authorization: `Bearer ${ADMIN_KEY}`" in script
+    # Since the page may keep a key, no script but its own may ever run on it.
+    policy = page.headers["content-security-policy"]
+    assert "script-src 'self'" in policy and "frame-ancestors 'none'" in policy and "unsafe-eval" not in policy
 
 
 def test_the_console_is_never_served_from_a_stale_cache(console):
