@@ -316,6 +316,7 @@ Each step ships on its own and keeps a single-provider pool working as it does t
 5. The second real provider plug-in, **RunPod** (on demand, with park), built on its v2 API and
    checked live on the smallest case with the owner's go-ahead. **Plug-in built (D138)**; checked live
    2026-10-07 on one pod: it offers no spot; its pod-scoped key ends its own pod, so its hosts get the
-   dead-man timer; and the plug-in's start-up brings up the SSH daemon RunPod does not. Not yet: the
-   console and a host prepared end to end through the supervisor. **Verda**
+   dead-man timer; and the plug-in's start-up brings up the SSH daemon RunPod does not. Then end to end
+   through a scratch pool: two hosts rented, prepared, served and released, a model volume filled and
+   copied from (D139). **Verda**
    is the likely third, as the first provider whose interruptible offers have a spot price.

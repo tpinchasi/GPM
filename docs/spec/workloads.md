@@ -4,7 +4,7 @@
 > built** (D118, §12; 2026-09-30), against the fake provider. The first
 > provider (Vast) does not yet offer volumes or copies to the pool (§6): both stay off there until
 > checked live. **Keeping models between hosts on a model volume** (D139, §6) is built against the fake provider
-> and RunPod's API, and not yet checked live.
+> and RunPod's API, and checked live on RunPod end to end (2026-10-07: filled, copied, served, deleted).
 
 A **workload** is a named unit inside one pool that owns one to four models (§12), a lease, its own rented
 hosts, its own key, and its own sizing and machine choice. Several workloads run side by side in
