@@ -2421,7 +2421,7 @@ function searchSection(market) {
           try {
             const fresh = await api.market(1, searchValues());
             marketView.box.replaceChildren(marketPanel(fresh));
-            if (fresh.search_quota) marketView.quota.replaceChildren(searchQuotaText(fresh.search_quota));
+            marketView.quota.replaceChildren(...marketQuota(fresh));
             marketView.at = Date.now();
             marketView.last = fresh;
             marketView.searchedAs = marketAsks();
@@ -2631,6 +2631,17 @@ function marketChips(shown) {
     changed ? el("span", { class: "warn-text small-text" }, "changed — press Search the market") : null);
 }
 
+// Each provider's search quota above the search, named — or that it has none. With one provider,
+// its quota alone, as before: the top-level `search_quota` is only the first provider's.
+function marketQuota(market) {
+  const lines = Object.entries(market.by_connection || {});
+  if (lines.length < 2) return [searchQuotaText(market.search_quota)];
+  return lines.map(([name, line]) => el("div", { class: "small-text" },
+    el("span", {}, `${line.display_name || name}: `),
+    line.search_quota ? searchQuotaText(line.search_quota)
+      : el("span", { class: "muted" }, line.why_not && !line.searchable ? `not searched — ${line.why_not}` : "no daily search limit")));
+}
+
 // A line per provider: what it returned and what passed, its quota, or why it was not asked.
 function marketLines(market) {
   const lines = Object.entries(market.by_connection || {});
@@ -2664,7 +2675,7 @@ function marketSection(settings) {
   marketView.box = el("div", {}, marketPanel(shown));
   marketView.stamp = el("span", { class: "muted" });
   marketView.button = el("button", { class: "small", onclick: () => refreshMarket() }, "Search the market");
-  marketView.quota = el("div", {}, searchQuotaText(shown.search_quota));
+  marketView.quota = el("div", {}, ...marketQuota(shown));
   if (!marketView.last) marketView.at = 0;
   stampMarket();
   return [
@@ -2698,7 +2709,7 @@ async function refreshMarket() {
     if (marketOnScreen()) {  // the operator may have moved on while it was asked
       marketView.box.replaceChildren(marketPanel(fresh));
       if (!fresh.error) document.querySelector(".chips")?.replaceWith(marketChips(fresh));
-      if (fresh.search_quota) marketView.quota.replaceChildren(searchQuotaText(fresh.search_quota));
+      if (!fresh.error) marketView.quota.replaceChildren(...marketQuota(fresh));
     }
   } finally {
     marketView.at = Date.now();
