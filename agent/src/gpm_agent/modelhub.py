@@ -202,7 +202,7 @@ async def fetch(
     (into / COMPLETE_MARKER).unlink(missing_ok=True)
     report = report if report is not None else model_volume.Report()
     if volume_read is not None:
-        await model_volume.read(volume_read, into.name, files, into, report)
+        await model_volume.read_safely(volume_read, into.name, files, into, report)
 
     own = client is None
     client = client or httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=300.0), follow_redirects=True)

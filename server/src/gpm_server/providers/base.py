@@ -111,6 +111,10 @@ class ProviderCapabilities:
     #: The provider copies a directory from one of its instances to another (D116). Without it,
     #: a new host never takes its models from a sibling.
     copies: bool = False
+    #: An offer's `machine_id` names one machine, so an offer listing a machine the pool already
+    #: rents is that very machine. False where it names a class — a GPU type in a cloud — that
+    #: many instances share: then a live host never keeps another of its class from being rented.
+    machine_ids_are_machines: bool = True
     #: The provider warns before it takes an instance away, and `status` says so (`interrupting`).
     #: With it, the pool drains the host at once (D132).
     interruption_notice: bool = False

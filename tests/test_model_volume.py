@@ -372,3 +372,51 @@ def test_a_blob_that_does_not_hash_to_its_name_is_left_for_the_engine(tmp_path, 
 def test_an_ollama_host_without_a_volume_pulls_as_before(tmp_path, monkeypatch):
     engine, sources = pull_on(tmp_path, monkeypatch, "only")
     assert len(engine.downloaded) == 2 and sources is None, "nothing to report without a volume"
+
+
+# --- what a hostile or broken volume cannot do (the security and code reviews) ---
+
+
+def test_a_pipe_planted_where_a_file_belongs_never_stops_a_reader(tmp_path):
+    volume = filled(tmp_path)
+    weights = build_dir(volume) / "model.safetensors"
+    weights.unlink()
+    os.mkfifo(weights)  # opening it to read would block for ever
+    hub = Hub()
+    report = fetch(hub, tmp_path / "second", volume_read=volume)
+    assert report.files_missing == 1 and hub.downloads == ["model.safetensors"]
+    assert on_disk(tmp_path / "second") == FILES
+
+
+def test_a_directory_or_an_unreadable_file_in_the_volume_is_left_for_the_hub(tmp_path):
+    volume = filled(tmp_path)
+    build = build_dir(volume)
+    (build / "config.json").unlink()
+    (build / "config.json").mkdir()
+    (build / "tokenizer" / "tokenizer.json").chmod(0)
+    hub = Hub()
+    report = fetch(hub, tmp_path / "second", volume_read=volume)
+    assert sorted(hub.downloads) == ["config.json", "tokenizer/tokenizer.json"] and report.files_from_volume == 1
+    assert on_disk(tmp_path / "second") == FILES
+
+
+def test_an_empty_directory_under_the_builds_name_is_not_taken_for_the_build(tmp_path):
+    volume = filled(tmp_path)
+    build = build_dir(volume)
+    name = build.name
+    for path in sorted(build.rglob("*"), reverse=True):
+        path.rmdir() if path.is_dir() else path.unlink()
+    build.rmdir()
+    (volume / "acme__tiny-model" / name).mkdir()  # junk any host could make
+    report = fetch(Hub(), tmp_path / "second", volume_fill=volume)
+    assert report.fill == "filled" and {p: (build / p).read_bytes() for p in FILES} == FILES
+
+
+def test_a_fill_clears_an_older_build_and_a_stopped_fills_draft(tmp_path):
+    volume = filled(tmp_path)
+    old = build_dir(volume)
+    (volume / "acme__tiny-model" / ".fill-deadbeef0000").mkdir()  # a fill that was stopped
+    report = fetch(Hub({**FILES, "model.safetensors": b"v2" * 150_000}), tmp_path / "second", volume_fill=volume)
+    assert report.fill == "filled"
+    (current,) = (volume / "acme__tiny-model").iterdir()
+    assert current.name != old.name, "only the hub's current build is kept: the volume holds one"

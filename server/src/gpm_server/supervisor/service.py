@@ -468,7 +468,12 @@ class Supervisor:
             await self.adopt_rented()
         await asyncio.gather(*(self._ask_agent(host) for host in self.hosts.values()))
         await asyncio.gather(*(self._probe(host) for host in self.hosts.values()))
-        await self._probe_rented()
+        try:
+            await self._probe_rented()
+        except Exception:  # noqa: BLE001
+            # A rented host is not trusted: nothing it says may stop this pass before the leases
+            # are enforced and hosts are torn down below (the security review's finding).
+            log.exception("probing rented hosts failed; the pass goes on")
         self._publish_all()
 
         if self.fleet is not None and not self._adoption_pending:

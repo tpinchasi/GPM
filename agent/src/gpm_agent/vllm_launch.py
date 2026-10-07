@@ -357,13 +357,40 @@ def option_flags(options: Sequence[str], family: Optional[str]) -> tuple[list[st
     return flags, missing
 
 
+def _cmdline(pid: int) -> Optional[bytes]:
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+
+
+def _ours(pid: int, cmdline: Callable[[int], Optional[bytes]]) -> bool:
+    """Is this process one an older launcher on this machine started — an engine or the router? A
+    number from a file is only a number: it may be another machine's, brought with its models."""
+    said = cmdline(pid) or b""
+    return b"vllm" in said or (b"proxy" in said and b"--upstreams" in said)
+
+
 def stop_previous(models_dir: Path, *, kill: Callable[[int, int], None] = os.kill,
-                  alive: Optional[Callable[[int], bool]] = None, grace_s: float = 30.0) -> list[int]:
-    """Stop what the last call started. A process already gone is not an error."""
+                  alive: Optional[Callable[[int], bool]] = None, grace_s: float = 30.0,
+                  cmdline: Callable[[int], Optional[bytes]] = _cmdline) -> list[int]:
+    """Stop what the last call started. A process already gone is not an error.
+
+    What an older launcher started is listed in the models directory, where it kept its state
+    then: on a host upgraded in place those engines still hold the cards and ports. They are
+    stopped too — but only processes that are an engine or the router by their own command line,
+    since that file may equally have come from another machine with the models (D139)."""
     pids_file = state_dir_for(models_dir) / PIDS_FILE
     try:
         pids = [int(p) for p in json.loads(pids_file.read_text())]
     except (OSError, ValueError, TypeError):
+        pids = []
+    try:
+        older = [int(p) for p in json.loads((Path(models_dir) / PIDS_FILE).read_text())]
+    except (OSError, ValueError, TypeError):
+        older = []
+    pids += [p for p in older if p not in pids and _ours(p, cmdline)]
+    if not pids:
         return []
 
     def is_alive(pid: int) -> bool:
@@ -414,6 +441,7 @@ def launch(
     probe_card: Callable[[], Optional[int]] = card_memory_bytes,
     devices: Optional[Sequence[str]] = None,
     probe_devices: Callable[[Mapping[str, str]], list[str]] = card_devices,
+    cmdline: Callable[[int], Optional[bytes]] = _cmdline,
 ) -> Started:
     """Stop what ran before, then start vLLM for every complete model on disk.
 
@@ -423,10 +451,10 @@ def launch(
     models_dir = Path(models_dir).expanduser()
     state = state_dir_for(models_dir)
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    env = dict(os.environ if env is None else env)
+    stop_previous(models_dir, kill=kill, alive=alive, cmdline=cmdline)
     for name in LEGACY_STATE:
         (models_dir / name).unlink(missing_ok=True)
-    env = dict(os.environ if env is None else env)
-    stop_previous(models_dir, kill=kill, alive=alive)
     (state / STARTED_FILE).unlink(missing_ok=True)
 
     started = Started()

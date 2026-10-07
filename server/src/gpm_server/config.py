@@ -467,7 +467,12 @@ class WorkloadsConfig(BaseModel):
 
     @model_validator(mode="after")
     def _hub_is_last_resort(self) -> "WorkloadsConfig":
-        self.model_sources = ["volume" if s == "warm" else s for s in self.model_sources]
+        # `warm` is read as `volume`; a file naming both means it once. A source really named
+        # twice is still refused below.
+        named = list(self.model_sources)
+        self.model_sources = ["volume" if s == "warm" else s for s in named]
+        if len(set(named)) == len(named):
+            self.model_sources = list(dict.fromkeys(self.model_sources))
         if "hub" not in self.model_sources:
             raise ValueError("workloads.model_sources must keep 'hub': it is the source every other falls back to")
         if len(set(self.model_sources)) != len(self.model_sources):

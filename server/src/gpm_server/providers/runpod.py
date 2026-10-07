@@ -90,7 +90,9 @@ _SSH_DAEMON = (
     "( if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then "
     "{ apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server; } "
     "|| apk add --no-cache openssh-server; fi; "
-    "mkdir -p /run/sshd && ssh-keygen -A && "
+    # Host keys made here, never the image's: a public image's baked-in keys are known to anyone
+    # who pulls it, which would defeat the pool's trust in the first key it sees.
+    "mkdir -p /run/sshd && rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub && ssh-keygen -A && "
     "/usr/sbin/sshd -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no "
     "-o PermitRootLogin=prohibit-password ) >/var/log/gpm-sshd.log 2>&1 &"
 )
@@ -158,6 +160,9 @@ class RunPodProvider:
         #: Network volumes (D139): one data center's, mounted at creation by any Secure Cloud pod
         #: there — several at once. Never on a Community Cloud pod.
         volumes=True,
+        #: An offer is a GPU type in a cloud: no machine is shown before renting (D138), and two
+        #: pods of one type are two machines under one id.
+        machine_ids_are_machines=False,
         volume_reach="data_center",
         copies=False,
         interruption_notice=False,

@@ -354,6 +354,45 @@ def describe_query(query: OfferQuery) -> list[str]:
 _ASSUMED_WORDS = {"download_mbps": "download speed", "reliability": "reliability", "verified": "verified",
                   "download_per_gb": "download price"}
 
+#: How long after a volume is made the pool waits before taking its absence from the provider's
+#: listing as its deletion (D139).
+VOLUME_LISTING_GRACE_S = 600.0
+
+#: Offer fields a host's record keeps beside its offer, not in it: a release from before them
+#: builds the offer from that dict and refuses a field it does not know (D129).
+_OFFER_FIELDS_BESIDE = ("assumed", "locations", "volume_per_gb_hourly")
+
+
+def _offer_beside(saved: Any) -> dict:
+    """The fields kept beside a host's offer, as the offer takes them."""
+    if not isinstance(saved, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key in ("assumed", "locations"):
+        if isinstance(saved.get(key), (list, tuple)):
+            out[key] = tuple(str(v) for v in saved[key])
+    if isinstance(saved.get("volume_per_gb_hourly"), (int, float)):
+        out["volume_per_gb_hourly"] = float(saved["volume_per_gb_hourly"])
+    return out
+
+
+#: How long a host filling a model volume has, once it is ready, to say it has filled it (D139).
+#: Its fill runs in the background and is lost if its agent is put back — at a restart's
+#: adoption — and a volume left "filling" for ever would never be used. At least half an hour,
+#: and as long as 50 MB/s would need for the volume.
+def _fill_deadline_s(size_gb: float) -> float:
+    return max(1800.0, size_gb * 1e9 / 50e6)
+
+
+def _count(value: Any, whole: bool = True) -> float:
+    """A number a host reported, as a finite, non-negative and bounded one — or 0. Hosts are not
+    trusted, and a value that is not a number is not a reason to stop (D139)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return 0
+    value = min(max(value, 0), 10**15)
+    return int(value) if whole else float(value)
+
+
 #: How fast a host copies its models from a model volume to its own disk, for estimating what a
 #: volume saves until the pool has its own times (D139): a network volume reads at about 200–400
 #: MB/s by its provider's own figure, and a parallel copy reached ~1.2 GiB/s in a third-party
@@ -1732,7 +1771,11 @@ class Fleet:
         if view.reachable:
             host.agent_facts = view.facts
             host.agent_detail = None
-            self._volume_news(host)
+            try:
+                self._volume_news(host)
+            except Exception:  # noqa: BLE001 — what a host says must never stop a pass
+                log.exception("%s's facts about its model volume could not be read", host.host_id)
+                host.volume_reported = True
         else:
             host.agent_facts = None
             host.agent_detail = view.detail
@@ -1873,6 +1916,8 @@ class Fleet:
             raise ValueError(f"kinds must be one of {sorted(self._KINDS)}")
         searchable = self.searchable()
         if connections is not None:
+            if not connections:
+                raise ValueError("name at least one provider to search")
             unknown = [n for n in connections if n not in searchable]
             if unknown:
                 raise ValueError(f"not a provider this pool searches now: {', '.join(unknown)}")
@@ -2130,7 +2175,9 @@ class Fleet:
         # GPU is "available" to anyone who outbids the tenant, and the tenant is us. Bidding on
         # it either fails or evicts our own host at a higher price (seen live: both).
         for host in self.hosts.values():
-            if not host.released:
+            if not host.released and self._capability(host, "machine_ids_are_machines", True):
+                # Not where an id names a class of machine (a GPU type in a cloud): there, another
+                # host of the same class is another machine (the code review's finding).
                 skipped.setdefault(host.offer.machine_id, f"already rented by this pool as {host.host_id}")
         return skipped
 
@@ -2588,8 +2635,16 @@ class Fleet:
             # Beside the offer, not in it: a release from before connections builds the offer from
             # this dict and refuses a field it does not know — rolling back must still adopt (D129).
             "offer": {k: v for k, v in dataclasses.asdict(dataclasses.replace(host.offer, raw={})).items()
-                      if k != "connection"},
+                      if k not in ("connection", *_OFFER_FIELDS_BESIDE)},
+            # Beside the offer for the same reason: fields 0.32 added (D138, D139).
+            "offer_beside": {k: (list(v) if isinstance(v, tuple) else v)
+                             for k, v in ((k, getattr(host.offer, k)) for k in _OFFER_FIELDS_BESIDE)},
             "connection": host.connection_name,
+            # Its model volume, and what its agent has said of it (D139): lost, a restarted pool
+            # would park a host with nothing to keep, and never learn its volume was filled.
+            "volume_id": host.volume_id,
+            "models_source": host.models_source,
+            "volume_reported": host.volume_reported,
         }
 
     async def adopt(self, rows: list) -> Optional[list[str]]:
@@ -2673,7 +2728,11 @@ class Fleet:
                 host_id=row.host_id,
                 instance=instance,
                 offer=Offer(**{**{k: v for k, v in ref["offer"].items() if k != "connection"},
+                               **_offer_beside(ref.get("offer_beside")),
                                "connection": row_connection}),
+                volume_id=ref.get("volume_id"),
+                models_source=str(ref.get("models_source") or "hub"),
+                volume_reported=bool(ref.get("volume_reported")),
                 bid_hourly=float(ref.get("bid_hourly") or row.hourly_rate or 0.0),
                 lease_id=row.lease_id or "",
                 created_at=float(ref.get("created_at") or time.time()),
@@ -2821,6 +2880,20 @@ class Fleet:
                 continue
             settings = self.rented.providers.get(name)
             attached = {h.volume_id for h in self.hosts.values() if h.volume_id}
+            # A volume the pool holds a record of that the provider no longer lists is gone — deleted
+            # by hand, or by the provider for an empty account — and its record goes with it, or it
+            # would be handed to new hosts and counted as spend for ever (the code review's finding).
+            # A few minutes' grace for one just made, which a listing may not show yet.
+            listed = {v.volume_id for v in found}
+            for (connection, volume_id), record in live.items():
+                if (connection == name and record.location is not None and volume_id not in listed
+                        and time.time() - record.created_at > VOLUME_LISTING_GRACE_S):
+                    self.workload_store.volume_deleted(volume_id)
+                    self.events.record(
+                        "volume_gone",
+                        f"model volume {volume_id} at {record.location} is gone at {name}; new hosts download "
+                        "their models, and the next one there makes a new volume",
+                        numbers={"volume": volume_id, "location": record.location, "workload": record.workload})
             for volume in found:
                 record = live.get((name, volume.volume_id))
                 if record is not None and record.workload in self.workloads:
@@ -3495,14 +3568,15 @@ class Fleet:
                     f"${(burning + hourly) * hours:.2f} over the {hours:.2f}h left, more than the ${left:.2f} its budget has left")
         return None
 
-    def _refuse_bid_for_burn(self, bid: float) -> Optional[str]:
+    def _refuse_bid_for_burn(self, bid: float, also_hourly: float = 0.0) -> Optional[str]:
         """The cap applies to the burn this bid *would* create, not only to today's. With no
         overall cap set there is nothing to refuse here: the bid is already clamped to the
-        per-host ceiling, and the host count to the pool's limit (D46)."""
+        per-host ceiling, and the host count to the pool's limit (D46). A model volume this host
+        would make burns too (D139)."""
         if self.config.limits.max_hourly_burn is None:
             return None
         burn = (sum(h.bid_hourly for h in self.hosts.values() if not h.released) + self.volume_burn()
-                + self.held_back_burn() + bid)
+                + self.held_back_burn() + bid + also_hourly)
         if burn > self.config.limits.max_hourly_burn:
             return (
                 f"bidding ${bid:.3f}/h would take the burn to ${burn:.3f}/h, above the "
@@ -3687,7 +3761,8 @@ class Fleet:
             if capped is None:
                 continue
 
-            refusal = self._refuse_bid_for_burn(capped)
+            refusal = self._refuse_bid_for_burn(
+                capped, also_hourly=self._new_volume_hourly(spec, offer, here, for_this_host, builds))
             if refusal is not None:
                 self.last_refusal = refusal
                 self.events.record(
@@ -3869,12 +3944,21 @@ class Fleet:
         for volume in self._group_volumes(spec, builds):
             if volume.location is None:
                 continue  # bound to a machine (D116): kept until its workload ends, never used
-            if volume.state == "filling" and volume.filler and volume.filler not in self.hosts:
+            filler = self.hosts.get(volume.filler) if volume.filler else None
+            held_back = bool(volume.filler) and any(r.host_id == volume.filler for r in self.held_back_rows())
+            gone = bool(volume.filler) and filler is None and not held_back
+            late = (filler is not None and filler.ready_at is not None
+                    and time.time() - filler.ready_at > _fill_deadline_s(volume.size_gb))
+            if volume.state == "filling" and (gone or late):
+                # Another filler is named only once the first is gone — a host held back at a
+                # restart may still be writing — or has had its time (the code review's finding).
                 self.workload_store.volume_state(volume.volume_id, "empty")
                 self.events.record(
                     "volume_not_filled",
-                    f"model volume {volume.volume_id} at {volume.location}: {volume.filler} went before filling it; "
-                    "the next host there fills it",
+                    f"model volume {volume.volume_id} at {volume.location}: {volume.filler} "
+                    + ("went before filling it" if gone else
+                       f"did not say it filled it within {_fill_deadline_s(volume.size_gb) / 60:.0f} minutes of being ready")
+                    + "; the next host there fills it",
                     numbers={"volume": volume.volume_id, "workload": spec.name},
                 )
                 volume = dataclasses.replace(volume, state="empty", filler=None)
@@ -3887,6 +3971,10 @@ class Fleet:
         ("read"), fill it ("fill"), make it ("new") — or nothing: models not kept here, the offer
         cannot land in the volume's data center, or another host is filling it."""
         if not offer.locations or not self.keeps_models(offer.connection):
+            return None
+        if offer.volume_per_gb_hourly is None:
+            # A volume whose price the plug-in does not state would be free to every budget, burn
+            # and spend check: none is made (the security review's finding).
             return None
         named = offer.connection or self.legacy_connection
         volume = here.get(self.resolve(named) or named)
@@ -4000,7 +4088,14 @@ class Fleet:
 
     def _models_kept(self, host: RentedHost) -> bool:
         """Are this host's models kept on its workload's data-center volume (D139)?"""
-        return bool(host.volume_id and self.provider_for(host).capabilities.reach == "data_center")
+        return bool(host.volume_id and self._capability(host, "reach", None) == "data_center")
+
+    def _capability(self, host: RentedHost, name: str, otherwise: Any) -> Any:
+        """A capability of a host's provider — or `otherwise` where its provider is no longer configured."""
+        try:
+            return getattr(self.provider_for(host).capabilities, name)
+        except ProviderError:
+            return otherwise
 
     def _volume_news(self, host: RentedHost) -> None:
         """What a host's agent says it did with its volume, taken in once every model is fetched
@@ -4009,7 +4104,10 @@ class Fleet:
         the hub's current build is marked stale, for the next host there to fill."""
         if host.volume_id is None or host.volume_reported or not host.agent_facts or not host.workload:
             return
-        sources = (host.agent_facts.get("engine") or {}).get("model_sources") or {}
+        engine = host.agent_facts.get("engine")
+        sources = engine.get("model_sources") if isinstance(engine, dict) else None
+        if not isinstance(sources, dict):
+            return
         tags = [(host.builds or {}).get(model) or model for model in host.models]
         reports = [sources.get(tag) for tag in tags]
         if not reports or any(not isinstance(r, dict) for r in reports):
@@ -4017,7 +4115,8 @@ class Fleet:
         volume = next((v for v in self.workload_store.volumes(host.workload) if v.volume_id == host.volume_id), None)
         if volume is None or volume.location is None:
             return
-        fills = [str(r.get("fill") or "") for r in reports]
+        # Only short text from a host reaches the log (the security review's finding).
+        fills = [str(r.get("fill") or "")[:200] for r in reports]
         if volume.filler == host.host_id and any(f in ("", "filling") for f in fills):
             return  # it serves while it fills the volume behind it: ready only once it says so
         host.volume_reported = True
@@ -4037,11 +4136,11 @@ class Fleet:
                     + "; ".join(f for f in fills if not (f == "already there" or f.startswith("filled")))
                     + "; the next host there fills it", numbers=where, host_id=host.host_id, lease_id=host.lease_id)
             return
-        copied = sum(int(r.get("bytes_from_volume") or 0) for r in reports)
-        files = sum(int(r.get("files_from_volume") or 0) for r in reports)
-        mismatched = sum(int(r.get("files_mismatched") or 0) for r in reports)
-        missing = sum(int(r.get("files_missing") or 0) for r in reports)
-        seconds = sum(float(r.get("seconds_from_volume") or 0.0) for r in reports)
+        copied = sum(_count(r.get("bytes_from_volume")) for r in reports)
+        files = sum(_count(r.get("files_from_volume")) for r in reports)
+        mismatched = sum(_count(r.get("files_mismatched")) for r in reports)
+        missing = sum(_count(r.get("files_missing")) for r in reports)
+        seconds = sum(_count(r.get("seconds_from_volume"), whole=False) for r in reports)
         self.events.record(
             "models_from_volume",
             f"{host.host_id} copied {files} file(s), {copied / 1e9:.1f} GB of {', '.join(host.models)}, from the model "
@@ -4057,7 +4156,10 @@ class Fleet:
                 f"{host.host_id}: {mismatched} file(s) in the model volume at {volume.location} did not match the "
                 "hub; it downloaded them instead", numbers={**where, "mismatched": mismatched},
                 host_id=host.host_id, lease_id=host.lease_id)
-        if files == 0 and missing and volume.state == "ready":
+        # A file that did not match, or a volume holding none of the build, is not to be steered to
+        # again: the next host there fills it afresh (the reviews' finding — a poisoned volume
+        # must not keep drawing hosts to its data center).
+        if (mismatched or (files == 0 and missing)) and volume.state == "ready":
             self.workload_store.volume_state(volume.volume_id, "stale")
             self.events.record(
                 "volume_stale",

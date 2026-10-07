@@ -329,3 +329,88 @@ def test_a_copy_timeout_must_leave_time_to_fetch():
                        "teardown": {"max_preparing_minutes": 30}},
             "workloads": {"copy_timeout_s": 1200},
         })
+
+
+# --- the reviews' findings ---
+
+
+async def test_whatever_a_host_says_of_its_volume_never_stops_a_pass(db):
+    _, fleet, _, _, host = await first_host(db)
+    for junk in ({"engine": "x"}, {"engine": {"model_sources": []}},
+                 {"engine": {"model_sources": {"big:q4": {"fill": "filled" * 100, "bytes_from_volume": "x"}}}},
+                 {"engine": {"model_sources": {"big:q4": {"files_from_volume": float("inf"), "fill": None}}}}):
+        host.agent_facts, host.volume_reported = junk, False
+        fleet._volume_news(host)  # raises nothing
+    assert all(len(e["summary"]) < 1000 for e in fleet.events.recent(50)), "a host's text is cut short"
+
+
+async def test_a_mismatch_marks_the_volume_stale_so_it_draws_no_more_hosts(db):
+    _, fleet, workload, _, first = await first_host(db)
+    agent_says(fleet, first, fill="filled")
+    await fleet.destroy(first, "done")
+    await run(fleet, [workload])
+    (second,) = fleet.hosts_of("research")
+    agent_says(fleet, second, files_from_volume=2, files_mismatched=1, files_missing=0)
+    assert volume_of(fleet).state == "stale"
+
+
+async def test_a_filler_that_never_says_it_filled_frees_the_volume_after_its_time(db):
+    _, fleet, workload, _, first = await first_host(db)
+    first.ready_at = time.time() - 4 * 3600  # its fill was lost, say, when its agent was put back
+    assert fleet._volumes_here(workload)["fake"].state == "empty"
+    assert "did not say it filled it" in str(fleet.events.recent(10))
+
+
+async def test_a_filler_held_back_at_a_restart_is_not_taken_for_gone(db):
+    _, fleet, workload, _, first = await first_host(db)
+    del fleet.hosts[first.host_id]
+    fleet.pending_adoption = {"fake": [type("Row", (), {"host_id": first.host_id, "workload": "research"})()]}
+    assert fleet._volumes_here(workload)["fake"].state == "filling", "it may still be writing"
+    fleet.pending_adoption = {}
+    assert fleet._volumes_here(workload)["fake"].state == "empty"
+
+
+async def test_a_hosts_volume_survives_a_restart_and_old_releases_can_still_adopt_it(db):
+    _, fleet, _, _, host = await first_host(db)
+    ref = fleet.published_ref(host)
+    assert ref["volume_id"] == host.volume_id and ref["models_source"] == host.models_source
+    assert "locations" not in ref["offer"] and "assumed" not in ref["offer"], "a release before 0.32 refuses them"
+    assert ref["offer_beside"]["locations"] == ["EU-1"]
+
+
+async def test_a_volume_deleted_at_the_provider_has_its_record_retired(db):
+    provider, fleet, workload, _, _ = await first_host(db)
+    volume = volume_of(fleet)
+    provider.volumes.clear()  # deleted by hand in the provider's own console
+    await fleet.sweep_volumes()
+    assert fleet.workload_store.volumes("research"), "too new to be sure: a listing may not show it yet"
+    db.execute("UPDATE workload_volumes SET created_at = ? WHERE volume_id = ?", (time.time() - 3600, volume.volume_id))
+    await fleet.sweep_volumes()
+    assert fleet.workload_store.volumes("research") == [] and "volume_gone" in kinds(fleet)
+
+
+async def test_a_volume_whose_price_the_provider_does_not_state_is_never_made(db):
+    offers = [dataclasses.replace(o, volume_per_gb_hourly=None) for o in dc_market()]
+    provider, fleet, _, _, host = await first_host(db, offers=offers)
+    assert host.volume_id is None and provider.volumes == {}
+
+
+async def test_two_hosts_of_one_gpu_class_are_rented_where_an_id_names_a_class(db):
+    # RunPod: an offer is a GPU type in a cloud, not a machine (the code review's finding).
+    classes = dataclasses.replace(KEEPS, machine_ids_are_machines=False)
+    provider, fleet = keeping(db, offers=[dc_market()[0]], capabilities=classes, keep=False)
+    workload, _ = open_workload(fleet, hosts_at_start=2)
+    await run(fleet, [workload])
+    assert [h.offer.machine_id for h in fleet.hosts_of("research")] == ["m-0", "m-0"]
+
+
+async def test_what_the_agent_reports_reaches_the_pool_under_the_tags_it_pulled(db):
+    # End to end in shape: the agent's own report, as its facts carry it, keyed as the pool reads it.
+    from gpm_agent import engines
+
+    _, fleet, _, _, host = await first_host(db)
+    facts = engines.VllmFacts()
+    facts.sources = {tag: (model_volume.Report(fill="filled"), 12.0) for tag in host.builds.values()}
+    host.agent_facts = {"engine": {"model_sources": engines._sources_fact(facts.sources)}}
+    fleet._volume_news(host)
+    assert volume_of(fleet).state == "ready"

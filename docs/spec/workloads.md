@@ -185,12 +185,13 @@ it took, so the history shows what each saved:
      is ready as soon as its own fetch ends, and fills the volume behind that, while it serves; the
      volume is ready once its agent says the fill is done. It fills by copying its verified files up into a fresh directory
      that is renamed into place, named by its *build* — a digest of the hub's file list with each
-     file's hash, so a repository changed upstream is a new build beside the old; only one host
+     file's hash, so a repository changed upstream is a new build that replaces the old; only one host
      fills at a time, and another is named only once the provider shows the first gone. Every later
      host copies from the volume **by the hub's file list, each file checked against the hash the hub
      publishes**, and fetches from the hub whatever is missing or does not match (host-agent.md
      §2.1). The volume is a cache never trusted: a host that wrote junk into it harms no other host.
-     A build is never changed in place: a new one is filled into its own directory beside it.
+     A build is never changed in place: a new one is filled into a directory of its own, and the
+     filler clears the older one first — a host still copying it takes those files from the hub.
      Hosts that start together never wait for it: while one fills it, the others are created without
      it and fetch from the hub at once — only a host created once it is ready copies from it.
    - **The ranking** prefers an offer that lands in the volume's data center by no more than the
@@ -198,7 +199,7 @@ it took, so the history shows what each saved:
      ways, an estimate until it has them. A data center with nothing that fits is passed over, and
      those hosts fetch from the hub; nothing waits for it. A volume that no longer holds the hub's
      current build — its hosts report every file missing — is marked stale: not preferred, and the
-     next host there fills the new build beside the old.
+     next host there fills the new build. A file that did not match marks it stale the same way.
    - **With a volume, a host is released, not parked**: the models outlive it anyway.
    - **The workload's plan says it before anything is spent**, in the workload's own hours and
      budget, not per month: *“keeps a 40 GB model volume at runpod, in the first host's data center —

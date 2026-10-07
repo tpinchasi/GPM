@@ -38,6 +38,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import time
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
@@ -59,6 +60,12 @@ PARALLEL = 4
 
 _CHUNK = 8 << 20
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def _copy_deadline(size: int) -> float:
+    """How long one file's copy from the volume may take before it is left for the hub: at least
+    a minute, and as long as 20 MB/s would need — far below what a network volume does."""
+    return max(60.0, size / 20e6)
 
 
 class VolumeRefused(Exception):
@@ -94,6 +101,8 @@ class Report:
     seconds_from_volume: float = 0.0
     #: "filled", "already there", or why not.
     fill: Optional[str] = None
+    #: Why reading the volume stopped, where it did; the hub supplied the rest.
+    read_error: Optional[str] = None
 
     def as_fact(self) -> dict[str, object]:
         return dataclasses.asdict(self)
@@ -179,25 +188,49 @@ def _copy_checked(source_fd: int, sink: Path, expected: Expected) -> bool:
         raise
 
 
+def _open_regular(directory: int, name: str) -> int:
+    """A regular file in the volume, opened for reading — never a link, and never a pipe or device:
+    opening a pipe blocks until something writes to it, so a host that planted one where a weight
+    file belongs would stop every later reader (the reviews' finding). Opened without blocking,
+    checked, then set to block as an ordinary read."""
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise VolumeRefused(f"{name!r} in the volume is not a regular file")
+        os.set_blocking(fd, True)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def _read_one(volume: Path, repo_dir: str, build: str, expected: Expected, into: Path) -> str:
-    """One file from the volume to local disk: "copied", "mismatched" or "missing"."""
+    """One file from the volume to local disk: "copied", "mismatched" or "missing". Anything the
+    volume does wrong — an error reading it, a file of the wrong kind — makes the file "missing",
+    for the hub: the volume can slow a host down, never stop it."""
     if not expected.checkable:
         return "missing"
     parts = plain_parts(expected.path)
     try:
         directory = _open_dir(volume, [repo_dir, build, *parts[:-1]])
-    except (FileNotFoundError, NotADirectoryError, VolumeRefused):
+    except (OSError, VolumeRefused):
         return "missing"
     try:
-        try:
-            source = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
-        except OSError:
-            return "missing"
+        source = _open_regular(directory, parts[-1])
+    except (OSError, VolumeRefused):
+        return "missing"
     finally:
         os.close(directory)
     target = into.joinpath(*parts)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    return "copied" if _copy_checked(source, target, expected) else "mismatched"
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except BaseException:
+        os.close(source)
+        raise
+    try:
+        return "copied" if _copy_checked(source, target, expected) else "mismatched"
+    except OSError:
+        return "missing"
 
 
 async def read(volume: Path, repo_dir: str, files: Sequence[Expected], into: Path,
@@ -212,6 +245,17 @@ async def read(volume: Path, repo_dir: str, files: Sequence[Expected], into: Pat
     return await _copy_in(volume, repo_dir, build, files, into, report)
 
 
+async def read_safely(volume: Path, repo_dir: str, files: Sequence[Expected], into: Path,
+                      report: Report) -> None:
+    """`read`, never failing the fetch around it: whatever goes wrong, the hub has every file."""
+    try:
+        await read(volume, repo_dir, files, into, report)
+    except Exception as exc:  # noqa: BLE001
+        report.fill = report.fill or None
+        report.files_missing = max(report.files_missing, len(files) - report.files_from_volume)
+        report.read_error = f"{exc or type(exc).__name__}"[:200]
+
+
 async def _copy_in(volume: Path, first: str, second: str, files: Sequence[Expected], into: Path,
                    report: Report) -> list[Expected]:
     started = time.monotonic()
@@ -223,7 +267,14 @@ async def _copy_in(volume: Path, first: str, second: str, files: Sequence[Expect
         if target.is_file() and target.stat().st_size == expected.size:
             return
         async with gate:
-            outcome = await asyncio.to_thread(_read_one, volume, first, second, expected, into)
+            try:
+                outcome = await asyncio.wait_for(
+                    asyncio.to_thread(_read_one, volume, first, second, expected, into),
+                    timeout=_copy_deadline(expected.size))
+            except (OSError, asyncio.TimeoutError):
+                # Stuck or broken: left for the hub. A copy still running in its thread writes
+                # only to its own draft, which the hub's fetch of the same file replaces.
+                outcome = "missing"
         if outcome == "copied":
             report.files_from_volume += 1
             report.bytes_from_volume += expected.size
@@ -258,7 +309,7 @@ def _write_into(directory: int, parts: Sequence[str], local: Path, expected: Exp
         os.close(directory)
     hasher = _hasher(expected)()
     moved = 0
-    with open(local, "rb") as source, os.fdopen(out, "wb") as sink:
+    with os.fdopen(out, "wb") as sink, open(local, "rb") as source:
         while chunk := source.read(_CHUNK):
             moved += len(chunk)
             hasher.update(chunk)
@@ -290,30 +341,61 @@ def _remove_tree(parent: int, name: str) -> None:
         pass
 
 
+def _holds(parent: int, build: str, files: Sequence[Expected]) -> bool:
+    """Is this build already whole on the volume, by its marker? A directory under the build's
+    name with no marker, or the wrong one, is junk — an empty directory any host could make."""
+    try:
+        directory = os.open(build, _DIR_FLAGS, dir_fd=parent)
+    except OSError:
+        return False
+    try:
+        marker = _open_regular(directory, BUILD_MARKER)
+    except (OSError, VolumeRefused):
+        return False
+    finally:
+        os.close(directory)
+    try:
+        with os.fdopen(marker, "r") as source:
+            said = json.loads(source.read(1 << 20))
+    except (OSError, ValueError):
+        return False
+    return isinstance(said, dict) and said.get("build") == build and said.get("files") == {f.path: f.size for f in files}
+
+
 def _fill(volume: Path, repo_dir: str, files: Sequence[Expected], into: Path) -> str:
     build = build_id(files)
     if build is None:
         return "not filled: the hub publishes no hash for every file"
     parent = _open_dir(volume, [repo_dir], create=True)
     try:
-        try:
-            os.close(os.open(build, _DIR_FLAGS, dir_fd=parent))
+        if _holds(parent, build, files):
             return "already there"
-        except FileNotFoundError:
-            pass
+        # Only one host fills at a time (the pool names it), so whatever else is here — an older
+        # build, a draft a stopped fill left, junk under this build's name — is cleared first: a
+        # volume sized for one build would otherwise fill up for good (the reviews' finding). A
+        # host still copying an older build finds its files gone and takes them from the hub.
+        for entry in os.listdir(parent):
+            _remove_tree(parent, entry)
+            try:
+                os.unlink(entry, dir_fd=parent)
+            except OSError:
+                pass
         draft = f".fill-{secrets.token_hex(6)}"
         os.mkdir(draft, 0o755, dir_fd=parent)
         try:
-            for expected in files:
-                parts = plain_parts(expected.path)
-                local = into.joinpath(*parts)
-                directory = os.open(draft, _DIR_FLAGS, dir_fd=parent)
-                if not _write_into(directory, parts, local, expected):
-                    raise VolumeRefused(f"{expected.path} on this host does not match the hub")
-            marker = os.open(f"{draft}/{BUILD_MARKER}", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                             0o644, dir_fd=parent)
-            with os.fdopen(marker, "w") as out:
-                json.dump({"build": build, "files": {f.path: f.size for f in files}}, out)
+            # Held open once: every write goes through this descriptor, so a draft swapped for a
+            # link by another host meanwhile leads nowhere.
+            here = os.open(draft, _DIR_FLAGS, dir_fd=parent)
+            try:
+                for expected in files:
+                    parts = plain_parts(expected.path)
+                    if not _write_into(os.dup(here), parts, into.joinpath(*parts), expected):
+                        raise VolumeRefused(f"{expected.path} on this host does not match the hub")
+                marker = os.open(BUILD_MARKER, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=here)
+                with os.fdopen(marker, "w") as out:
+                    json.dump({"build": build, "files": {f.path: f.size for f in files}}, out)
+            finally:
+                os.close(here)
             try:
                 os.rename(draft, build, src_dir_fd=parent, dst_dir_fd=parent)
             except OSError:
@@ -404,9 +486,13 @@ async def ollama_blobs(tag: str, client: httpx.AsyncClient) -> Optional[list[Exp
 
 
 async def read_blobs(volume: Path, blobs: Sequence[Expected], into: Path, report: Report) -> None:
-    """Copy the blobs the volume holds into the engine's own store, each checked against its name."""
-    into.mkdir(parents=True, exist_ok=True)
-    await _copy_in(volume, "ollama", "blobs", blobs, into, report)
+    """Copy the blobs the volume holds into the engine's own store, each checked against its name.
+    Never fails the pull: the engine fetches whatever is not there."""
+    try:
+        into.mkdir(parents=True, exist_ok=True)
+        await _copy_in(volume, "ollama", "blobs", blobs, into, report)
+    except Exception as exc:  # noqa: BLE001
+        report.read_error = f"{exc or type(exc).__name__}"[:200]
 
 
 def _fill_blobs(volume: Path, blobs: Sequence[Expected], local: Path) -> str:
@@ -420,10 +506,16 @@ def _fill_blobs(volume: Path, blobs: Sequence[Expected], local: Path) -> str:
             except FileNotFoundError:
                 pass
             draft = f".fill-{secrets.token_hex(6)}-{blob.path}"
-            if not _write_into(os.dup(directory), [draft], local / blob.path, blob):
-                os.unlink(draft, dir_fd=directory)
-                raise VolumeRefused(f"{blob.path} on this host does not match its name")
-            os.rename(draft, blob.path, src_dir_fd=directory, dst_dir_fd=directory)
+            try:
+                if not _write_into(os.dup(directory), [draft], local / blob.path, blob):
+                    raise VolumeRefused(f"{blob.path} on this host does not match its name")
+                os.rename(draft, blob.path, src_dir_fd=directory, dst_dir_fd=directory)
+            except BaseException:
+                try:
+                    os.unlink(draft, dir_fd=directory)
+                except OSError:
+                    pass
+                raise
             added += 1
     finally:
         os.close(directory)

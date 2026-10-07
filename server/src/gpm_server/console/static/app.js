@@ -2636,7 +2636,8 @@ function marketLines(market) {
   const lines = Object.entries(market.by_connection || {});
   if (lines.length < 2) return null;
   return el("table", { class: "market-lines" },
-    el("thead", {}, el("tr", {}, ...["Provider", "Offers returned", "Pass your policy", "Search quota", ""].map((h) => el("th", {}, h)))),
+    el("thead", {}, el("tr", {}, el("th", {}, "Provider"), el("th", { class: "num" }, "Offers returned"),
+      el("th", { class: "num" }, "Pass your policy"), el("th", {}, "Search quota"), el("th", {}, ""))),
     el("tbody", {}, lines.map(([name, line]) => el("tr", {},
       el("td", {}, line.display_name || name),
       el("td", { class: "num" }, line.asked && !line.error ? line.seen : "—"),

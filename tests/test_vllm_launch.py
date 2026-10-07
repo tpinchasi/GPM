@@ -644,3 +644,17 @@ def test_a_marker_that_cannot_be_read_vouches_for_nothing(tmp_path):
     for unreadable in ("", "not a size"):
         (into / modelhub.COMPLETE_MARKER).write_text(unreadable)
         assert not modelhub.is_complete(into)
+
+
+def test_an_upgraded_host_stops_its_older_launchers_engines_and_nothing_else(tmp_path):
+    # On a host upgraded in place, the older launcher's engines still hold the cards; its list is
+    # in the models directory. Only processes that are an engine by their own command line are
+    # stopped — the list may as well be another machine's (the code review's finding).
+    downloaded(tmp_path, BIG, 1000)
+    processes = Processes()
+    processes.alive.update({4242, 4343})
+    (tmp_path / vllm_launch.PIDS_FILE).write_text("[4242, 4343]")
+    lines = {4242: b"python3\x00-m\x00vllm\x00serve", 4343: b"/usr/sbin/sshd"}
+    processes.launch(tmp_path, cmdline=lines.get)
+    assert (4242, signal.SIGTERM) in processes.killed and not any(pid == 4343 for pid, _ in processes.killed)
+    assert not (tmp_path / vllm_launch.PIDS_FILE).exists()

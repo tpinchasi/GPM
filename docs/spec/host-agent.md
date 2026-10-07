@@ -119,7 +119,9 @@ engine never runs from it:
   the volume (created exclusively, no link followed), each checked against the hub's hash as it is
   copied, and renames it into place under its build's name — a digest of the hub's file list with
   each file's hash, which every host computes alike from the hub's listing. A filler that stops
-  leaves a directory no one reads; a build already there is left as it is. For Ollama the blobs are
+  leaves a directory no one reads. A build already there, by its marker, is left as it is; anything
+  else in the repository's directory — an older build, a stopped fill's draft, junk under the
+  build's name — is cleared first, so a volume sized for one build never fills up for good. For Ollama the blobs are
   copied up under their own names.
 - **The engine's own state** — process ids, start record, logs — is never kept in the models
   directory, so nothing of one host's engine reaches another through a volume.
