@@ -26,6 +26,8 @@
 - **The admin key is required on every control-API request**, sent as a header, never a cookie,
   with `Host` / `Origin` checked — on loopback too, because any web page open in the same
   browser can send requests to `127.0.0.1`. The app key is refused here.
+- **Several providers** are designed, not built: their connections, credentials and the market
+  across them are in [providers.md](providers.md) (D129–D132).
 - **Secrets never reach the browser.** The console shows only "set ✓ / missing ✗" against the
   environment variable or file a secret is read from.
 
