@@ -478,7 +478,7 @@ hosts:
 rented:
   marketplace:
     kind: rented-interruptible
-    provider: <provider plug-in name>
+    providers: { <connection name>: { type: <provider plug-in name> } }   # D129
     transport: { type: tunnel }
     image: <pinned engine image>               # never a floating tag
     offer_policy: { min_vram_gb: 64, min_disk_gb: 60,          # the disk each host is rented with

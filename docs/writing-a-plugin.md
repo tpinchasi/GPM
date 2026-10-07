@@ -155,12 +155,13 @@ places no bid at all rather than an unwinnable one.
 ## Loading it
 
 Plug-ins are ordinary Python packages discovered by entry point, and configuration names the
-one in use:
+one in use. A provider is used through a **connection** — a name, the plug-in, and its
+settings (D129):
 
 ```yaml
 rented:
-  provider: your-marketplace
-  provider_settings: { region: eu-west }
+  providers:
+    my-account: { type: your-marketplace, settings: { region: eu-west } }
 ```
 
 Each interface carries a major version. Adding an optional operation or capability is

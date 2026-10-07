@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Optional
 from urllib.parse import urlparse
@@ -756,6 +757,34 @@ class EngineImage(BaseModel):
     note: Optional[str] = None
 
 
+#: A provider connection's name: what every record of it carries (D129).
+CONNECTION_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+
+
+def _connection_name_for(plugin: str) -> str:
+    """The connection an old single-provider configuration becomes: named after its plug-in, made
+    a valid name where the plug-in's is not (`My.Cloud` → `my-cloud`), so a file that loaded
+    before still loads (D129)."""
+    name = re.sub(r"[^a-z0-9_-]+", "-", plugin.lower()).strip("-_")
+    if not name or not name[0].isalpha():
+        name = f"p-{name}".rstrip("-")
+    return name[:32]
+
+
+class ProviderConnection(BaseModel):
+    """One account at one provider (D129): its plug-in, whether the pool may search and rent
+    through it, and the plug-in's own settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: The installed `gpm.providers` plug-in.
+    type: str
+    #: Disabled: no new search and no new rental. Its hosts stay until released, and are still
+    #: watched, charged and swept.
+    enabled: bool = True
+    settings: dict[str, Any] = Field(default_factory=dict)
+
+
 class RentedConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -856,6 +885,16 @@ class RentedConfig(BaseModel):
         for key, where in cls._MERGED.items():
             if key in data:
                 raise ValueError(f"rented.{key} is gone (D108): {where}")
+        if "provider" in data or "provider_settings" in data:
+            if "providers" in data:
+                raise ValueError("rented names both `provider` and `providers`: keep `providers`, the "
+                                 "connections by name (D129)")
+            data = dict(data)
+            kind = data.pop("provider", None)
+            settings = data.pop("provider_settings", None) or {}
+            if not kind:
+                raise ValueError("rented.provider_settings without rented.provider")
+            data["providers"] = {_connection_name_for(str(kind)): {"type": kind, "settings": settings}}
         bidding = data.get("bidding")
         if isinstance(bidding, dict) and "bid_ceiling" in bidding:
             raise ValueError(
@@ -864,6 +903,31 @@ class RentedConfig(BaseModel):
                 "in each search profile)"
             )
         return data
+
+    @model_validator(mode="after")
+    def _one_connection(self) -> "RentedConfig":
+        """Named, and — until the supervisor rents from several (providers.md §9, step 2) —
+        exactly one enabled."""
+        if not self.providers:
+            raise ValueError("rented needs a provider: `providers: {name: {type: ...}}` (D129)")
+        for name in self.providers:
+            if not CONNECTION_NAME.match(name):
+                raise ValueError(f"provider connection {name!r}: a lower-case name of letters, digits, '-' "
+                                 "and '_', starting with a letter, at most 32 characters")
+        enabled = [name for name, conn in self.providers.items() if conn.enabled]
+        if len(enabled) != 1:
+            raise ValueError(f"exactly one provider connection must be enabled for now ({len(enabled)} are): "
+                             "renting from several at once is not built yet (D129)")
+        return self
+
+    @property
+    def connection_name(self) -> str:
+        """The connection the pool rents through (D129): the one enabled."""
+        return next(name for name, conn in self.providers.items() if conn.enabled)
+
+    @property
+    def connection(self) -> ProviderConnection:
+        return self.providers[self.connection_name]
 
     @model_validator(mode="after")
     def _every_search_says_what_it_rents(self) -> "RentedConfig":
@@ -915,8 +979,9 @@ class RentedConfig(BaseModel):
         assert ceiling is not None, "refused at load"
         return ceiling
 
-    provider: str
-    provider_settings: dict[str, Any] = Field(default_factory=dict)
+    #: The provider connections, by name (D129). The single-provider shape — `provider` and
+    #: `provider_settings` — still loads, as one connection named after its type.
+    providers: dict[str, ProviderConnection] = Field(default_factory=dict)
     #: How hosts are rented (D52). `interruptible`: bid, cheaper, can be outbid at any moment.
     #: `on_demand`: pay the listed price, and nobody can take the host away. `cheaper`: look at
     #: both and let ranking decide, which weighs the price against the download it would waste.

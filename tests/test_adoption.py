@@ -7,6 +7,8 @@ have destroyed a perfectly good host that was still billing.
 """
 
 
+import json
+
 import pytest
 from fakes.fake_ollama import FakeOllama
 from fakes.harness import BackgroundLoop, ServerHandle, stub_ssh_command
@@ -393,5 +395,31 @@ def test_a_draining_host_is_left_to_its_drain_by_the_supervisors_probe(tmp_path,
         released = next(e for e in supervisor.events.recent() if e["kind"] == "released")
         assert "its work had finished" in released["summary"]
         loop.run(supervisor.aclose())
+    finally:
+        database.close()
+
+
+def test_a_host_recorded_before_connections_is_adopted_as_the_pools_first_connection(tmp_path, market):
+    """D129: a host written by a version without connections names none; read back, it is the
+    connection the pool's configuration became the first time a version with them ran."""
+    loop, provider, _ = market
+    database = Database(tmp_path / "gpm.sqlite3")
+    try:
+        first = Supervisor(config(), database, provider=provider)
+        first.fleet.run_on_host = silent
+        loop.run(first.start())
+        host = rent_one(loop, first)
+        loop.run(first.aclose())
+        (row,) = database.query("SELECT provider_ref FROM hosts WHERE host_id = ?", (host.host_id,))
+        ref = json.loads(row["provider_ref"])
+        assert ref["connection"] == "fake"
+        del ref["connection"]  # as an older version wrote it
+        database.execute("UPDATE hosts SET provider_ref = ? WHERE host_id = ?", (json.dumps(ref), host.host_id))
+
+        second = Supervisor(config(), database, provider=provider)
+        second.fleet.run_on_host = silent
+        loop.run(second.start())
+        assert second.fleet.hosts[host.host_id].connection_name == "fake"
+        loop.run(second.aclose())
     finally:
         database.close()

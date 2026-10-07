@@ -148,6 +148,12 @@ class RentedHost:
     engine: str = ""
     engine_port: int = 0
     agent_detail: Optional[str] = None
+
+    @property
+    def connection_name(self) -> str:
+        """The provider connection it was rented through (D129) — not `connection`, which is how
+        the pool reaches the machine."""
+        return self.offer.connection
     #: How many times the pool has tried to put an agent here, so it stops trying.
     agent_attempts: int = 0
     #: When the agent was last tried on a host whose engine cannot answer yet (D97): such an
@@ -262,6 +268,34 @@ class Unit:
     budget_bound: Optional[tuple] = None
 
 
+class ConnectionEvents:
+    """The decision log, as the fleet writes it: an event that names a machine also names the
+    connection it is on (D129), since a machine identifier is unique only within one. The
+    machine history is built from these."""
+
+    def __init__(self, events: EventLog, connection: str):
+        self._events = events
+        self._connection = connection
+
+    def record(self, kind: str, summary: str, *, numbers: Optional[dict] = None, **where: Any) -> Any:
+        if numbers and numbers.get("machine") and not numbers.get("connection"):
+            numbers = {**numbers, "connection": self._connection}
+        return self._events.record(kind, summary, numbers=numbers, **where)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._events, name)
+
+
+def legacy_connection(db: Any, current: str) -> str:
+    """The connection a record that names none belongs to (D129): fixed the first time a pool
+    with connections ran, as the one it was configured with then."""
+    rows = db.query("SELECT value FROM pool_meta WHERE key = 'legacy_connection'")
+    if rows:
+        return str(rows[0]["value"])
+    db.execute("INSERT OR IGNORE INTO pool_meta (key, value) VALUES ('legacy_connection', ?)", (current,))
+    return str(db.query("SELECT value FROM pool_meta WHERE key = 'legacy_connection'")[0]["value"])
+
+
 #: How long the market is not asked again after the provider says it is asked too often (D119).
 OFFER_RATE_LIMIT_WAIT_S = 60.0
 
@@ -307,8 +341,15 @@ class Fleet:
         self.config = config
         self.rented = rented
         self.provider = provider
+        #: The connection this provider was configured as (D129).
+        self.connection = rented.connection_name
+        #: What a record from before connections existed belongs to: the connection the pool's
+        #: configuration became the first time this version ran, remembered so a later rename or
+        #: a second connection does not reassign those records.
+        #: Settled by `claim_records`, under the pool lock; until then, this connection's.
+        self.legacy_connection = self.connection
         self.leases = leases
-        self.events = events
+        self.events = ConnectionEvents(events, self.connection)
         self.spend = spend
         self.hosts: dict[str, RentedHost] = {}
         self.label_prefix = rented.label_prefix or f"gpm/{config.pool.name}/"
@@ -466,6 +507,7 @@ class Fleet:
                 self.spend.record(
                     lease_id=volume.lease_id, host_id=f"volume:{volume.volume_id}", source="estimate",
                     amount=round(volume.hourly * max(0.0, now - volume.created_at) / 3600, 6),
+                    connection=volume.connection or self.legacy_connection,
                 )
 
     async def record_spend(self, lease: Lease) -> None:
@@ -478,6 +520,7 @@ class Fleet:
                 host_id=host.host_id,
                 source="estimate",
                 amount=host.estimated_spend,
+                connection=host.connection_name,
             )
             try:
                 charges = await self.provider.reported_charges(host.instance)
@@ -492,6 +535,7 @@ class Fleet:
                     host_id=host.host_id,
                     source="reported",
                     amount=host.reported_spend,
+                    connection=host.connection_name,
                 )
                 drift = host.reported_spend - host.estimated_spend
                 if host.estimated_spend > 0 and drift / host.estimated_spend > self.rented.spend.drift_alert:
@@ -2305,7 +2349,11 @@ class Fleet:
             "cards_per_copy": host.cards_per_copy,
             "workload": host.workload,
             "disk_gb": host.disk_gb,
-            "offer": dataclasses.asdict(dataclasses.replace(host.offer, raw={})),
+            # Beside the offer, not in it: a release from before connections builds the offer from
+            # this dict and refuses a field it does not know — rolling back must still adopt (D129).
+            "offer": {k: v for k, v in dataclasses.asdict(dataclasses.replace(host.offer, raw={})).items()
+                      if k != "connection"},
+            "connection": host.connection_name,
         }
 
     async def adopt(self, rows: list) -> Optional[list[str]]:
@@ -2346,7 +2394,8 @@ class Fleet:
             host = RentedHost(
                 host_id=row.host_id,
                 instance=instance,
-                offer=Offer(**ref["offer"]),
+                offer=Offer(**{**{k: v for k, v in ref["offer"].items() if k != "connection"},
+                               "connection": ref.get("connection") or self.legacy_connection}),
                 bid_hourly=float(ref.get("bid_hourly") or row.hourly_rate or 0.0),
                 lease_id=row.lease_id or "",
                 created_at=float(ref.get("created_at") or time.time()),
@@ -2688,7 +2737,9 @@ class Fleet:
         except ProviderError as exc:
             log.warning("the price of %s could not be read: %s", host.offer.machine_id, exc)
             return None
-        return offer.priced_for(host.disk_gb or self.rented.disk_gb) if offer is not None else None
+        if offer is None:
+            return None
+        return dataclasses.replace(offer.priced_for(host.disk_gb or self.rented.disk_gb), connection=host.connection_name)
 
     # --- acquire what is missing ---
 
@@ -2936,6 +2987,17 @@ class Fleet:
             if ramp:
                 unit.ramp_round = asked
             unit.ramp_landed_at = 0.0
+
+    def claim_records(self) -> None:
+        """Fix what a record from before connections belongs to, and carry the search use counted
+        before into this connection's counter (D129, D121). Called under the pool lock: a second
+        supervisor started on the same database, which then exits on the lock, must not decide it."""
+        db = self.leases.db
+        self.legacy_connection = legacy_connection(db, self.connection)
+        db.execute(
+            "INSERT OR IGNORE INTO provider_search_usage (connection, day, rows, quota, exhausted_at, resets_at, "
+            "updated_at) SELECT ?, day, rows, quota, exhausted_at, resets_at, updated_at FROM search_usage",
+            (self.legacy_connection,))
 
     def widen_while_short(self, workload: str, chosen: Any) -> None:
         """A group of several models with fewer ready hosts than it planned runs more of each card
@@ -3433,6 +3495,7 @@ class Fleet:
         self.workload_store.add_volume(Volume(
             volume_id=volume_id, workload=host.workload or "", machine_id=offer.machine_id, size_gb=size,
             hourly=hourly, lease_id=lease.lease_id, created_at=time.time(), builds=dict(builds),
+            connection=offer.connection or self.connection,
         ))
         self.events.record(
             "volume_created",
@@ -3903,16 +3966,18 @@ class Fleet:
         now = time.time()
         day = self._utc_day(now)
         db = self.events.db
-        db.execute("INSERT INTO search_usage (day, rows, updated_at) VALUES (?, 0, ?) ON CONFLICT(day) DO NOTHING",
-                   (day, now))
-        db.execute("UPDATE search_usage SET rows = rows + ?, quota = ?, updated_at = ? WHERE day = ?",
-                   (int(usage.get("rows") or 0), usage.get("limit"), now, day))
+        key = (self.connection, day)
+        db.execute("INSERT INTO provider_search_usage (connection, day, rows, updated_at) VALUES (?, ?, 0, ?) "
+                   "ON CONFLICT(connection, day) DO NOTHING", (*key, now))
+        db.execute("UPDATE provider_search_usage SET rows = rows + ?, quota = ?, updated_at = ? "
+                   "WHERE connection = ? AND day = ?", (int(usage.get("rows") or 0), usage.get("limit"), now, *key))
         if refusal is not None:
             # The provider's own count beats ours: other tools on the same key spend it too.
             spent = int(refusal["limit"]) - int(refusal.get("remaining") or 0)
             db.execute(
-                "UPDATE search_usage SET rows = MAX(rows, ?), quota = ?, exhausted_at = ?, resets_at = ? WHERE day = ?",
-                (spent, int(refusal["limit"]), refusal["at"], refusal["at"] + float(refusal.get("retry_after_s") or 0), day),
+                "UPDATE provider_search_usage SET rows = MAX(rows, ?), quota = ?, exhausted_at = ?, resets_at = ? "
+                "WHERE connection = ? AND day = ?",
+                (spent, int(refusal["limit"]), refusal["at"], refusal["at"] + float(refusal.get("retry_after_s") or 0), *key),
             )
 
     def search_quota(self) -> Optional[dict]:
@@ -3923,7 +3988,8 @@ class Fleet:
         if limit is None:
             return None
         now = time.time()
-        rows = self.events.db.query("SELECT * FROM search_usage WHERE day = ?", (self._utc_day(now),))
+        rows = self.events.db.query("SELECT * FROM provider_search_usage WHERE connection = ? AND day = ?",
+                                    (self.connection, self._utc_day(now)))
         row = rows[0] if rows else None
         quota = int((row["quota"] if row and row["quota"] else None) or limit)
         used = int(row["rows"]) if row else 0
@@ -3986,7 +4052,7 @@ class Fleet:
         # Priced for the disk the host would be rented with, so the all-in the filters and
         # the bid compare is what it would be billed (D108).
         disk_gb = (policy or self.rented.policy_in_force).min_disk_gb
-        return [offer.priced_for(disk_gb) for offer in offers]
+        return [dataclasses.replace(offer.priced_for(disk_gb), connection=self.connection) for offer in offers]
 
     def _lease_view(self, lease: Optional[Lease]) -> Optional[LeaseView]:
         if lease is None:

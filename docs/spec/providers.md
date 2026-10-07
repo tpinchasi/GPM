@@ -1,6 +1,7 @@
 # Specification — Several Providers
 
-> Status: **designed, not built** (D129–D132; 2026-10-07). Reasons are in
+> Status: **designed; step 1 built** (D129–D132; 2026-10-07) — the connections' configuration
+> shape and every record naming its connection (§9). The rest is not built. Reasons are in
 > [../decisions.md](../decisions.md). Until it is built, a pool has exactly one provider
 > (`rented.provider`), and the other specification files describe that. The second real
 > provider is **RunPod** (its v2 API), chosen by the owner on 2026-10-07 from a comparison of
@@ -23,7 +24,8 @@ rented:
   `enabled`, and the plug-in's own `settings`. Several connections may share a type, for example
   two accounts at one provider.
 - **The old shape still loads.** `rented.provider: vast` with `provider_settings` is read as one
-  connection named after its type. The console writes the new shape the first time it saves.
+  connection named after its type; naming both shapes is refused. Until step 2, exactly one
+  connection may be enabled. The console writes the new shape the first time it saves.
 - **Disabled** means no new search and no new rental on that connection. Its hosts stay until
   they are released, and are still monitored, charged, swept and bound by the dead-man timer.
 - **Removing** a connection is refused while it has a host, a parked disk or a kept volume,
@@ -65,6 +67,11 @@ The rest follows from that:
 Each offer, host, instance, spend row, decision-log event, machine-history row and search-usage
 counter carries the connection's name. A machine identifier is unique only within a connection.
 The avoid list, machine history and warm volumes are therefore kept per connection.
+
+A record written before connections names none. It belongs to the **legacy connection**: the
+one the pool's configuration became the first time a version with connections ran, kept in
+`pool_meta` so a later rename or a second connection does not reassign it. The day's search
+use counted before is carried into the per-connection counter once, under that name.
 
 ## 4. The supervisor with several connections
 

@@ -179,7 +179,7 @@ def test_load_config_reads_the_shipped_example():
     worse than none."""
     parsed = load_config(EXAMPLE_CONFIG)
     assert parsed.pool.model_set
-    assert parsed.rented.provider == "vast"
+    assert parsed.rented.connection_name == "vast" and parsed.rented.connection.type == "vast"
     assert parsed.rented.max_all_in_hourly == 0.60
     assert parsed.rented.disk_gb == 60
     assert parsed.limits.max_rented_hosts == 1

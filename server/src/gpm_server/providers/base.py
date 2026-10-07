@@ -133,6 +133,10 @@ class Offer:
     #: Whether this offer is bid for and can be outbid. False is an on-demand rental: it costs
     #: `all_in_hourly`, there is nothing to bid, and nobody can take it away (D52).
     interruptible: bool = True
+    #: The provider connection it was found through (D129) — stamped by the pool, never by a
+    #: plug-in, which does not know the name it was configured under. A machine identifier is
+    #: unique only within its connection.
+    connection: str = ""
     raw: dict[str, Any] = dataclasses.field(default_factory=dict, repr=False)
 
     def priced_for(self, disk_gb: float) -> "Offer":

@@ -97,7 +97,28 @@ CREATE TABLE IF NOT EXISTS leases (
     closed_reason   TEXT
 );
 
--- Every decision, with the numbers that produced it (supervisor.md §3).
+-- Facts about the pool's own state, one row each: what a record from before provider
+-- connections (D129) belongs to.
+CREATE TABLE IF NOT EXISTS pool_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- Each provider connection's daily search quota (D121, D129): offer rows the pool's own
+-- searches returned, per UTC day, and what the provider said when it refused.
+CREATE TABLE IF NOT EXISTS provider_search_usage (
+    connection   TEXT NOT NULL,
+    day          TEXT NOT NULL,
+    rows         INTEGER NOT NULL DEFAULT 0,
+    quota        INTEGER,
+    exhausted_at REAL,
+    resets_at    REAL,
+    updated_at   REAL NOT NULL,
+    PRIMARY KEY (connection, day)
+);
+
+-- Before connections (D129), one provider's search use: read once into provider_search_usage,
+-- under the legacy connection, and not written since.
 -- The provider's daily search quota (D121): offer rows the pool's own searches returned, per UTC
 -- day, and what the provider said when it refused. Kept here so a restart does not forget it.
 CREATE TABLE IF NOT EXISTS search_usage (
@@ -109,6 +130,7 @@ CREATE TABLE IF NOT EXISTS search_usage (
     updated_at   REAL NOT NULL
 );
 
+-- Every decision, with the numbers that produced it (supervisor.md §3).
 CREATE TABLE IF NOT EXISTS events (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     ts       REAL NOT NULL,
@@ -333,6 +355,12 @@ _ADDED_COLUMNS = {
     "workload_volumes": [
         # The group's builds the volume holds (D118); NULL for one made before: the workload's.
         ("builds", "TEXT"),
+        # The provider connection it is on (D129); NULL for one made before: the legacy connection.
+        ("connection", "TEXT"),
+    ],
+    "spend": [
+        # The provider connection the money went to (D129); NULL before: the legacy connection.
+        ("connection", "TEXT"),
     ],
     "host_counters": [
         # Of `busy`, how many serve a workload's request on a lent host (D115): load the shared

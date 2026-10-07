@@ -195,7 +195,12 @@ class PoolHarness:
             rentable_urls.append(server.base_url)
 
         rented_section = dict(rented) if rented else None
-        if rented_section is not None:
+        if rented_section is not None and "providers" in rented_section:
+            connections = {name: dict(conn) for name, conn in rented_section["providers"].items()}
+            for conn in connections.values():
+                conn["settings"] = {"engine_urls": rentable_urls, **(conn.get("settings") or {})}
+            rented_section["providers"] = connections
+        elif rented_section is not None:
             settings = dict(rented_section.get("provider_settings") or {})
             settings.setdefault("engine_urls", rentable_urls)
             rented_section["provider_settings"] = settings
