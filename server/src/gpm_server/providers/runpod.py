@@ -69,6 +69,19 @@ _DISK_PER_GB_MONTH = 0.10
 _HOURS_PER_MONTH = 720.0
 #: The provider's own floor on a persistent volume (`PersistentMount.size`).
 _MIN_VOLUME_GB = 10
+#: RunPod runs the image as it is: unlike a provider that boots its own SSH daemon into every
+#: instance, it starts one only where the image does, and the pool reaches its hosts over SSH.
+#: So the start-up script first makes sure one runs — installed from the image's own package
+#: manager when missing, key login only (the pool's key is put in place by the script itself) —
+#: in the background, so a slow install never holds up the engine. Unverified on a live pod.
+_SSH_DAEMON = (
+    "( if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then "
+    "{ apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server; } "
+    "|| apk add --no-cache openssh-server; fi; "
+    "mkdir -p /run/sshd && ssh-keygen -A && "
+    "/usr/sbin/sshd -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no "
+    "-o PermitRootLogin=prohibit-password ) >/var/log/gpm-sshd.log 2>&1 &"
+)
 #: A 400 on create means either "this request breaks a rule" or "no capacity", told apart only by
 #: its human-readable `detail` (the create operation's own documentation). These are the words a
 #: capacity refusal is read from; anything else is a rule the request broke, which no other
@@ -415,7 +428,7 @@ class RunPodProvider:
             # alive: a pod whose command returns is `EXITED`, and the script's work (the timer,
             # the engine) runs in the background.
             body["entrypoint"] = ["/bin/sh", "-c"]
-            body["cmd"] = [f"{spec.onstart}\nwhile :; do sleep 3600; done"]
+            body["cmd"] = [f"{_SSH_DAEMON}\n{spec.onstart}\nwhile :; do sleep 3600; done"]
 
         path = "/pods"
         try:

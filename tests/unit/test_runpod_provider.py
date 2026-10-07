@@ -7,6 +7,7 @@ document.
 
 import json
 import pathlib
+import subprocess
 
 import httpx
 import pytest
@@ -228,7 +229,13 @@ async def test_creating_asks_for_the_pod_the_offer_and_the_spec_describe():
     assert body["ports"] == ["11434/tcp", "22/tcp"]
     assert body["env"] == {"OLLAMA_NUM_PARALLEL": "2"}
     assert body["entrypoint"] == ["/bin/sh", "-c"]
-    assert body["cmd"][0].startswith("arm-the-timer\n") and "while :; do sleep 3600; done" in body["cmd"][0]
+    script = body["cmd"][0].splitlines()
+    assert script[1:] == ["arm-the-timer", "while :; do sleep 3600; done"]
+    # RunPod starts no SSH daemon of its own: the script starts one first, in the background,
+    # key login only — and it is a script `sh` can read.
+    assert script[0].endswith("&") and "/usr/sbin/sshd" in script[0]
+    assert "PasswordAuthentication=no" in script[0] and "PermitRootLogin=prohibit-password" in script[0]
+    assert subprocess.run(["sh", "-n", "-c", body["cmd"][0]]).returncode == 0
     assert "price" not in json.dumps(body) and "bid" not in body
 
 
