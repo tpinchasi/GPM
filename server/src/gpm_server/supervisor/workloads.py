@@ -802,8 +802,17 @@ class Workloads:
                  "kind": "interruptible" if h.interruptible else "on_demand", "hourly": round(h.bid_hourly, 4),
                  "priced": ("bid" if h.offer.bidding else "spot") if h.interruptible else "on_demand",
                  "connection": h.connection_name,
-                 "models": list(h.models)}
+                 "models": list(h.models),
+                 # Where its models came from: its workload's model volume, a sibling, the hub (D139).
+                 "models_source": h.models_source}
                 for h in hosts
+            ],
+            # Its model volumes, where models are kept between hosts (D139).
+            "volumes": [
+                {"volume_id": v.volume_id, "connection": v.connection, "location": v.location, "size_gb": v.size_gb,
+                 "hourly": v.hourly, "state": v.state, "filler": v.filler, "models": sorted((v.builds or {}).keys()),
+                 "spent": round(v.hourly * max(0.0, time.time() - v.created_at) / 3600, 4)}
+                for v in self.store.volumes(workload.name) if v.location is not None
             ],
             "lease": {
                 "lease_id": workload.lease_id,

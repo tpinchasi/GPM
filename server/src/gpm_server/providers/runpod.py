@@ -19,6 +19,10 @@ is said where it is decided:
   the pool asks for is split between the two, so the storage billed is the storage priced.
 - **The balance is not in v2.** It is read from the provider's GraphQL API (`myself {
   clientBalance }`), only there, and a failure to read it never marks the credential invalid.
+- **A model volume is a network volume** (D139): it belongs to one data center, mounts only on a
+  Secure Cloud pod and only when the pod is created, and any number of pods there can mount it.
+  A pod is asked for in the volume's data center, but the API calls that only a preference
+  (`dataCenterIds`), so where the pod landed is read back, and a pod elsewhere is given up.
 """
 
 from __future__ import annotations
@@ -53,6 +57,7 @@ from .base import (
     ProviderRateLimited,
     ProviderUnavailable,
     SelfTerminateRequest,
+    VolumeInfo,
     redacted,
 )
 
@@ -67,8 +72,15 @@ _DISK_PER_GB_MONTH = 0.10
 #: The provider bills storage per second at a monthly rate and does not say how many hours its
 #: month has. 720 is the shorter month, so the hourly figure is never below what is billed.
 _HOURS_PER_MONTH = 720.0
-#: The provider's own floor on a persistent volume (`PersistentMount.size`).
+#: The provider's own floor on a persistent volume (`PersistentMount.size`), and a network
+#: volume's (`CreateNetworkVolumeRequest.size`).
 _MIN_VOLUME_GB = 10
+#: The most a network volume may be (`CreateNetworkVolumeRequest.size`).
+_MAX_NETWORK_VOLUME_GB = 4096
+#: A network volume, per GB per month, billed whether or not anything has it mounted (pricing
+#: page, 2026-10-07): $0.07 up to 1 TB, $0.05 beyond. The higher rate is used throughout, so
+#: the figure is never below what is billed.
+_NETWORK_VOLUME_PER_GB_MONTH = 0.07
 #: RunPod runs the image as it is: unlike a provider that boots its own SSH daemon into every
 #: instance, it starts one only where the image does, and the pool reaches its hosts over SSH.
 #: So the start-up script first makes sure one runs — installed from the image's own package
@@ -140,7 +152,10 @@ class RunPodProvider:
         direct_port_mapping=True,
         #: `GET /v2/pods/{id}/logs`: the container's and the system's output, as server-sent events.
         reports_instance_logs=True,
-        volumes=False,
+        #: Network volumes (D139): one data center's, mounted at creation by any Secure Cloud pod
+        #: there — several at once. Never on a Community Cloud pod.
+        volumes=True,
+        volume_reach="data_center",
         copies=False,
         interruption_notice=False,
     )
@@ -195,6 +210,15 @@ class RunPodProvider:
         self._quiet_until = 0.0
         #: How long a log read listens: the stream stays open after its backfill.
         self.logs_window_s = 5.0
+        #: The data centers that take a network volume, read at most once an hour: they change
+        #: when the provider builds one, not between passes. A failed read is tried again sooner,
+        #: since until it succeeds no offer says where a volume can follow it.
+        self._volume_dcs: Optional[tuple[float, Optional[frozenset[str]]]] = None
+        self.datacenters_cache_s = 3600.0
+        self.datacenters_retry_s = 300.0
+        #: After a create that made a volume and then failed, how long the provider's Retry-After
+        #: may hold up deleting it: waited out, rather than leave a volume billing behind.
+        self.cleanup_wait_s = 30.0
 
     # --- plumbing ---
 
@@ -304,6 +328,30 @@ class RunPodProvider:
         except ValueError as exc:
             raise ProviderUnavailable(f"{method} {path}: response was not JSON") from exc
 
+    async def _all_pages(self, path: str, field: str, params: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
+        """Every entry of a listing, over all its pages. A listing that does not end, or a page
+        that is not a list, is refused rather than half believed: "could not list" is never
+        "none" (D61). An answer without `pagination` is one page."""
+        entries: list[dict[str, Any]] = []
+        params = dict(params or {})
+        for _ in range(self.max_instance_pages):
+            payload = await self._call("GET", path, params=params or None)
+            rows = payload.get(field) if isinstance(payload, dict) else None
+            if not isinstance(rows, list):
+                raise ProviderUnavailable(f"GET {path}: the answer carries no `{field}` list; refusing to read it as none")
+            entries.extend(r for r in rows if isinstance(r, dict))
+            page = payload.get("pagination") or {}
+            if not page.get("hasNextPage"):
+                return entries
+            cursor = page.get("nextCursor")
+            if not cursor:
+                raise ProviderUnavailable(f"GET {path}: more pages are said to follow, with no cursor to them")
+            params = {**params, "cursor": cursor}
+        raise ProviderUnavailable(
+            f"GET {path}: the listing did not end after {self.max_instance_pages} pages; "
+            "refusing to act on a partial list"
+        )
+
     # --- offers ---
 
     async def search_offers(self, query: OfferQuery) -> list[Offer]:
@@ -315,7 +363,7 @@ class RunPodProvider:
         if not query.on_demand:
             return []  # nothing here can be bid for
         gpus = max(1, int(query.min_gpus))
-        found: list[Offer] = []
+        answers: list[tuple[str, list[Any]]] = []
         for cloud in self.clouds:
             if query.verified_only and cloud != "SECURE":
                 continue
@@ -326,14 +374,59 @@ class RunPodProvider:
             rows = payload.get("gpus") if isinstance(payload, dict) else None
             if not isinstance(rows, list):
                 raise ProviderUnavailable("GET /catalog/gpus: the answer carries no `gpus` list")
+            answers.append((cloud, rows))
+        # Read after the catalog, so that its failure — even a rate limit — costs this search its
+        # locations and never the search itself.
+        volume_dcs = await self._volume_data_centers() if any(c == "SECURE" for c, _ in answers) else frozenset()
+        found: list[Offer] = []
+        for cloud, rows in answers:
             for row in rows:
-                offer = self._to_offer(row, cloud, gpus, query)
+                offer = self._to_offer(row, cloud, gpus, query, volume_dcs)
                 if offer is not None:
                     found.append(offer)
         found.sort(key=lambda o: (o.all_in_hourly, o.offer_id))
         return found[: max(0, int(query.limit))]
 
-    def _to_offer(self, row: dict[str, Any], cloud: str, gpus: int, query: OfferQuery) -> Optional[Offer]:
+    async def _volume_data_centers(self) -> frozenset[str]:
+        """The data centers that take a network volume (`networkVolumeTypes` not empty), or none
+        when they cannot be read — a search goes on without them, its offers saying nowhere."""
+        now = time.monotonic()
+        cached = self._volume_dcs
+        if cached is not None:
+            fresh_for = self.datacenters_cache_s if cached[1] is not None else self.datacenters_retry_s
+            if now - cached[0] < fresh_for:
+                return cached[1] or frozenset()
+        try:
+            payload = await self._call("GET", "/catalog/datacenters")
+            rows = payload.get("dataCenters") if isinstance(payload, dict) else None
+            if not isinstance(rows, list):
+                raise ProviderUnavailable("GET /catalog/datacenters: the answer carries no `dataCenters` list")
+        except ProviderError as exc:
+            log.warning("the data centers that take a network volume were not read (%s): "
+                        "no offer says where a volume can follow it until they are", exc)
+            self._volume_dcs = (now, None)
+            return frozenset()
+        found = frozenset(str(r["id"]) for r in rows
+                          if isinstance(r, dict) and r.get("id") and r.get("networkVolumeTypes"))
+        self._volume_dcs = (now, found)
+        return found
+
+    @staticmethod
+    def _locations(row: dict[str, Any], volume_dcs: frozenset[str]) -> tuple[str, ...]:
+        """Where this GPU type is in stock — the catalog's `dataCenters`, computed for the cloud
+        and card count asked — and a network volume can be made, sorted."""
+        found = set()
+        for entry in row.get("dataCenters") or []:
+            if not isinstance(entry, dict) or not entry.get("id"):
+                continue
+            if str(entry.get("availability") or "NONE").upper() == "NONE":
+                continue  # listed, but none free there now
+            if str(entry["id"]) in volume_dcs:
+                found.add(str(entry["id"]))
+        return tuple(sorted(found))
+
+    def _to_offer(self, row: dict[str, Any], cloud: str, gpus: int, query: OfferQuery,
+                  volume_dcs: frozenset[str] = frozenset()) -> Optional[Offer]:
         side = cloud.lower()
         gpu_id = str(row.get("id") or "")
         name = str(row.get("name") or gpu_id)
@@ -358,6 +451,8 @@ class RunPodProvider:
         all_in = price * gpus + storage
         if query.max_all_in_hourly is not None and all_in > query.max_all_in_hourly:
             return None
+        # A network volume mounts only on a Secure Cloud pod: a Community offer can take none.
+        secure = cloud == "SECURE"
         return Offer(
             offer_id=machine,
             machine_id=machine,
@@ -379,11 +474,13 @@ class RunPodProvider:
             reliability=self.assumed_reliability,
             # Secure cloud is the provider's own data-centre hardware; community is hosted by
             # others. Read as "verified" — an interpretation, so it is said to be assumed.
-            verified=cloud == "SECURE",
+            verified=secure,
             throughput_proxy=float(gpus),
             interruptible=False,
             bidding=False,
             assumed=("download_mbps", "reliability", "verified"),
+            locations=self._locations(row, volume_dcs) if secure else (),
+            volume_per_gb_hourly=_NETWORK_VOLUME_PER_GB_MONTH / _HOURS_PER_MONTH if secure else None,
             raw=row,
         )
 
@@ -400,14 +497,93 @@ class RunPodProvider:
     async def create(self, offer: Offer, spec: InstanceSpec, bid: Optional[float]) -> Instance:
         if bid is not None:
             raise ProviderError("RunPod rents on demand only: a pod is created at its listed price, never with a bid")
-        if spec.volume is not None:
-            raise ProviderError("RunPod volumes are not supported by this provider")
         cloud, _, rest = offer.offer_id.partition(":")
         gpu_id, _, count = rest.rpartition(":")
         if cloud not in _CLOUDS or not gpu_id or not count.isdigit():
             raise ProviderError(f"not an offer from this provider: {offer.offer_id!r}")
+        if spec.volume is None:
+            pod = await self._create_pod(offer, spec, cloud, gpu_id, int(count))
+            return Instance(instance_id=str(pod["id"]), label=spec.label, machine_id=offer.machine_id, raw=pod,
+                            location=str(pod.get("dataCenterId") or "") or None)
+        return await self._create_with_volume(offer, spec, cloud, gpu_id, int(count))
 
-        container_gb, volume_gb = self._split_disk(spec.disk_gb)
+    async def _create_with_volume(self, offer: Offer, spec: InstanceSpec, cloud: str, gpu_id: str,
+                                  count: int) -> Instance:
+        """A pod with a network volume mounted (D139): the one named, or a new one made for it in
+        a data center the offer can land in. Either the pod is in the volume's data center, or
+        nothing this call made is left — never a pod elsewhere without its volume."""
+        volume = spec.volume
+        assert volume is not None
+        if cloud != "SECURE":
+            raise ProviderError(
+                f"{offer.hardware} in {cloud} cloud cannot take a volume: RunPod mounts a network volume "
+                "only on a Secure Cloud pod"
+            )
+        made = False
+        if volume.volume_id:
+            volume_id = volume.volume_id
+            where = volume.location or await self._volume_location(volume_id)
+            if offer.locations and where not in offer.locations:
+                # The catalog says this GPU is not free there now: a pod asked for would be
+                # refused, or placed elsewhere and given up — a rental for nothing.
+                raise OfferGone(f"{offer.hardware} is not in stock in {where}, where volume {volume_id} is "
+                                f"(in stock with a volume in: {', '.join(offer.locations)})")
+        else:
+            if volume.location and volume.location in offer.locations:
+                where = volume.location
+            elif offer.locations:
+                where = offer.locations[0]
+            else:
+                raise OfferGone(f"{offer.hardware} is in stock in no data center that takes a network volume")
+            size = max(_MIN_VOLUME_GB, math.ceil(volume.size_gb))
+            if size > _MAX_NETWORK_VOLUME_GB:
+                raise ProviderError(f"a network volume is at most {_MAX_NETWORK_VOLUME_GB} GB; {size} GB was asked for")
+            volume_id = await self._create_volume(volume.label, size, where)
+            made = True
+
+        try:
+            pod = await self._create_pod(offer, spec, cloud, gpu_id, count, network=(volume_id, volume.mount, where))
+            pod_id = str(pod["id"])
+            landed = str(pod.get("dataCenterId") or "") or None
+            if landed is None:
+                # Created with its volume mounted, which the API places only in the volume's data
+                # center; nothing contradicts that, but the answer did not confirm it either.
+                log.warning("pod %s was created with volume %s and the answer does not say which data center "
+                            "it is in; taken to be %s, where the volume is", pod_id, volume_id, where)
+            elif landed != where:
+                try:
+                    await self.destroy(Instance(pod_id, label=spec.label))
+                except ProviderError as exc:
+                    raise ProviderUnavailable(
+                        f"pod {pod_id} landed in {landed}, not in {where} where volume {volume_id} is, "
+                        f"and could not be destroyed: {exc}"
+                    ) from exc
+                raise OfferGone(f"{offer.hardware} landed in {landed}, not in {where} where volume {volume_id} is: "
+                                f"pod {pod_id} has been destroyed")
+        except (Exception, asyncio.CancelledError) as exc:
+            if made:
+                left = await self._delete_new_volume(volume_id)
+                if left is not None:
+                    log.error("volume %s, made for a pod that was not created, could not be deleted: %s",
+                              volume_id, left)
+                    if not isinstance(exc, asyncio.CancelledError):
+                        raise ProviderUnavailable(
+                            f"{exc}; and volume {volume_id}, made for it in {where}, could not be deleted: {left}"
+                        ) from exc
+            raise
+        return Instance(instance_id=pod_id, label=spec.label, machine_id=offer.machine_id, raw=pod,
+                        volume_id=volume_id, location=landed or where)
+
+    async def _create_pod(self, offer: Offer, spec: InstanceSpec, cloud: str, gpu_id: str, count: int,
+                          network: Optional[tuple[str, str, str]] = None) -> dict[str, Any]:
+        """The pod itself, created and starting, or an error with nothing left behind. `network`
+        is (volume, mount path, data center) for a pod that mounts a network volume."""
+        if network is not None:
+            # The volume holds what is kept; the pod has no persistent volume of its own (the two
+            # are exclusive), so all of the disk asked for is container disk.
+            container_gb, volume_gb = max(1, math.ceil(spec.disk_gb)), None
+        else:
+            container_gb, volume_gb = self._split_disk(spec.disk_gb)
         ports = [f"{int(p)}/tcp" for p in spec.ports]
         if "22/tcp" not in ports:
             ports.append("22/tcp")  # the pool reaches the host over SSH
@@ -415,11 +591,15 @@ class RunPodProvider:
             "name": spec.label,
             "image": spec.image,
             "cloud": cloud,
-            "gpu": {"id": gpu_id, "count": int(count)},
+            "gpu": {"id": gpu_id, "count": count},
             "disk": container_gb,
             "ports": ports,
         }
-        if volume_gb is not None:
+        if network is not None:
+            volume_id, mount, where = network
+            body["mounts"] = {"network": [{"volumeId": volume_id, "path": mount}]}
+            body["dataCenterIds"] = [where]
+        elif volume_gb is not None:
             body["mounts"] = {"persistent": {"size": volume_gb, "path": self.volume_path}}
         if spec.env:
             body["env"] = {str(k): str(v) for k, v in spec.env.items()}
@@ -429,6 +609,7 @@ class RunPodProvider:
             # the engine) runs in the background.
             body["entrypoint"] = ["/bin/sh", "-c"]
             body["cmd"] = [f"{_SSH_DAEMON}\n{spec.onstart}\nwhile :; do sleep 3600; done"]
+        place = f"{offer.hardware} in {cloud} cloud" + (f", {network[2]}" if network is not None else "")
 
         path = "/pods"
         try:
@@ -440,7 +621,7 @@ class RunPodProvider:
         if response.status_code == 400:
             words = self._quiet(_problem(response))
             if _NO_CAPACITY.search(words):
-                raise OfferGone(f"{offer.hardware} in {cloud} cloud: no capacity now ({words})")
+                raise OfferGone(f"{place}: no capacity now ({words})")
             raise ProviderError(f"POST {path}: the provider refused the request ({words})")
         if response.status_code == 402:
             raise ProviderError(
@@ -450,7 +631,7 @@ class RunPodProvider:
             # The create operation's own documentation: this account cannot use that GPU pool —
             # skip it and keep going. A credential without write access answers the same way.
             raise OfferGone(
-                f"{offer.hardware} in {cloud} cloud: this account may not create it "
+                f"{place}: this account may not create it "
                 f"({self._quiet(_problem(response))}; a read-only credential is also refused this way)"
             )
         if response.status_code >= 500:
@@ -476,7 +657,7 @@ class RunPodProvider:
                 ) from exc
             raise ProviderError(f"pod {pod_id} was created {status.lower()}, and has been destroyed")
         self._remember(pod)
-        return Instance(instance_id=pod_id, label=spec.label, machine_id=offer.machine_id, raw=pod)
+        return pod
 
     async def _after_unclear(self, label: str, cause: ProviderError) -> ProviderError:
         """After a create whose outcome is not known: end whatever the label names, then report
@@ -528,35 +709,15 @@ class RunPodProvider:
         does not end, or a page that is not a list of pods, is refused rather than half believed.
         A `TERMINATED` pod is gone and is not listed: the pool verifies a destroy by listing again.
         """
-        entries: list[dict[str, Any]] = []
-        params: dict[str, Any] = {"limit": 1000}
-        for _ in range(self.max_instance_pages):
-            payload = await self._call("GET", "/pods", params=params)
-            pods = payload.get("pods") if isinstance(payload, dict) else None
-            if not isinstance(pods, list):
-                raise ProviderUnavailable("GET /pods: the answer carries no `pods` list; refusing to read it as none")
-            entries.extend(p for p in pods if isinstance(p, dict))
-            page = payload.get("pagination") or {}
-            if not page.get("hasNextPage"):
-                break
-            cursor = page.get("nextCursor")
-            if not cursor:
-                raise ProviderUnavailable("GET /pods: more pages are said to follow, with no cursor to them")
-            params = {**params, "cursor": cursor}
-        else:
-            raise ProviderUnavailable(
-                f"the pod listing did not end after {self.max_instance_pages} pages; "
-                "refusing to act on a partial list of what is running"
-            )
-
         found = []
-        for entry in entries:
+        for entry in await self._all_pages("/pods", "pods", {"limit": 1000}):
             label = str(entry.get("name") or "")
             if not label.startswith(label_prefix) or str(entry.get("status") or "").upper() == "TERMINATED":
                 continue
             self._remember(entry)
             found.append(Instance(instance_id=str(entry.get("id")), label=label,
-                                  machine_id=self._machine_of(entry), raw=entry))
+                                  machine_id=self._machine_of(entry), raw=entry,
+                                  location=str(entry.get("dataCenterId") or "") or None))
         return found
 
     async def status(self, instance: Instance) -> InstanceStatus:
@@ -680,6 +841,112 @@ class RunPodProvider:
         if not ok or not lines:
             return None
         return self._quiet("\n".join(lines[-tail:]))
+
+    # --- volumes (D139) ---
+
+    async def _network_volumes(self) -> list[dict[str, Any]]:
+        return await self._all_pages("/network-volumes", "networkVolumes")
+
+    async def list_volumes(self, label_prefix: str) -> list[VolumeInfo]:
+        """Every network volume whose name carries this prefix. A network volume is in one data
+        center and on no machine, so its `machine_id` is that data center too."""
+        found = []
+        for entry in await self._network_volumes():
+            name = str(entry.get("name") or "")
+            if not entry.get("id") or not name.startswith(label_prefix):
+                continue
+            size = float(entry.get("size") or 0)
+            where = str(entry.get("dataCenter") or "") or None
+            found.append(VolumeInfo(
+                volume_id=str(entry["id"]), machine_id=where or "", label=name, size_gb=size,
+                hourly=size * _NETWORK_VOLUME_PER_GB_MONTH / _HOURS_PER_MONTH, location=where,
+            ))
+        return found
+
+    async def delete_volume(self, volume_id: str) -> None:
+        """Idempotent: a volume the provider no longer knows is already gone."""
+        path = f"/network-volumes/{volume_id}"
+        response = await self._send("DELETE", path)
+        if response.status_code == 404:
+            return
+        if response.status_code >= 400:
+            raise self._fail("DELETE", path, response)
+
+    async def _volume_location(self, volume_id: str) -> str:
+        """The data center of a volume the pool names without saying where it is."""
+        entry = await self._call("GET", f"/network-volumes/{volume_id}", missing_ok=True)
+        if not isinstance(entry, dict) or not entry.get("id"):
+            raise ProviderError(f"volume {volume_id} does not exist")
+        if not entry.get("dataCenter"):
+            raise ProviderUnavailable(f"GET /network-volumes/{volume_id}: the answer says no data center")
+        return str(entry["dataCenter"])
+
+    async def _create_volume(self, name: str, size_gb: int, where: str) -> str:
+        """A new network volume, or an error with nothing left behind.
+
+        Names need not be unique, so after a create whose outcome is not known, a volume is
+        ended only if it was not there before: what is there before is read first."""
+        before = {str(v.get("id")) for v in await self._network_volumes()}
+        path = "/network-volumes"
+        try:
+            response = await self._send("POST", path, json={"name": name, "size": size_gb, "dataCenter": where})
+        except ProviderUnavailable as exc:
+            raise await self._after_unclear_volume(name, where, before, exc) from exc
+        if response.status_code in (400, 422):
+            words = self._quiet(_problem(response))
+            if _NO_CAPACITY.search(words):
+                raise OfferGone(f"no network volume can be made in {where} now ({words})")
+            raise ProviderError(f"POST {path}: the provider refused the volume ({words})")
+        if response.status_code == 402:
+            raise ProviderError(
+                f"insufficient balance: the provider will not create a volume ({self._quiet(_problem(response))})"
+            )
+        if response.status_code >= 500:
+            raise await self._after_unclear_volume(name, where, before, self._fail("POST", path, response))
+        if response.status_code >= 400:
+            raise self._fail("POST", path, response)
+        try:
+            entry = response.json()
+        except ValueError:
+            entry = None
+        if not isinstance(entry, dict) or not entry.get("id"):
+            raise await self._after_unclear_volume(
+                name, where, before, ProviderUnavailable(f"POST {path}: the answer names no volume"))
+        return str(entry["id"])
+
+    async def _after_unclear_volume(self, name: str, where: str, before: set[str],
+                                    cause: ProviderError) -> ProviderError:
+        """After a volume create whose outcome is not known: delete any volume of that name in
+        that data center that was not there before, then report the cause."""
+        try:
+            ended = []
+            for entry in await self._network_volumes():
+                volume_id = str(entry.get("id") or "")
+                if (volume_id and volume_id not in before and str(entry.get("name") or "") == name
+                        and str(entry.get("dataCenter") or "") == where):
+                    await self.delete_volume(volume_id)
+                    ended.append(volume_id)
+        except ProviderError as exc:
+            return ProviderUnavailable(f"{cause}; and whether a volume was left behind could not be checked: {exc}")
+        if ended:
+            return type(cause)(f"{cause} — but created volume {', '.join(ended)}, which has been deleted")
+        return cause
+
+    async def _delete_new_volume(self, volume_id: str) -> Optional[str]:
+        """Delete a volume this create made, and check it is gone. None when it is; otherwise
+        why not, for the error to say."""
+        wait = self._quiet_until - time.monotonic()
+        if 0 < wait <= self.cleanup_wait_s:
+            # The pod create was rate limited: the delete would be refused the same way.
+            await asyncio.sleep(wait)
+        try:
+            await self.delete_volume(volume_id)
+            still = await self._call("GET", f"/network-volumes/{volume_id}", missing_ok=True)
+        except ProviderError as exc:
+            return str(exc)
+        if isinstance(still, dict) and still.get("id"):
+            return "the provider still lists it after its delete"
+        return None
 
     # --- money ---
 

@@ -93,9 +93,21 @@ class ProviderCapabilities:
     #: The provider will hand back an instance's own boot output. Without it, a host that
     #: never answers is given up knowing only that it never answered (D78).
     reports_instance_logs: bool = False
-    #: A volume can be made beside an instance, on its machine, and attached to a later instance
-    #: on the same machine (D116). Without it, a workload's next host always fetches.
+    #: A volume can be made with an instance and attached to a later one (D116, D139). Without
+    #: it, a workload's next host always fetches.
     volumes: bool = False
+    #: How far a volume reaches (D139): `"machine"` — only a later instance on the machine it was
+    #: made on — or `"data_center"` — any later instance in its data center, several at once.
+    #: Unset with `volumes`: `"machine"`. Only a data-center volume is offered to the operator
+    #: ("Keep models between hosts"); a machine-bound one helps only when that machine is free
+    #: again, while it bills the whole time. A plug-in may state it without `volumes`, for storage
+    #: the provider sells but the plug-in does not use, so the console can say why it is not offered.
+    volume_reach: Optional[str] = None
+
+    @property
+    def reach(self) -> Optional[str]:
+        """How far this provider's volumes reach, or None without volumes."""
+        return (self.volume_reach or "machine") if self.volumes else None
     #: The provider copies a directory from one of its instances to another (D116). Without it,
     #: a new host never takes its models from a sibling.
     copies: bool = False
@@ -150,6 +162,13 @@ class Offer:
     #: name — `download_mbps`, `reliability`, `verified`, `download_per_gb`. The value is used
     #: like any other, and every place that shows or decides by it says it was assumed.
     assumed: tuple[str, ...] = ()
+    #: Where this offer can land now that a data-center volume can follow it (D139): the
+    #: provider's own names for its data centers, those with this offer in stock *and* taking a
+    #: volume. Empty where the provider has no such volumes or does not say. A search never
+    #: narrows to one: an offer elsewhere stays an offer (D123).
+    locations: tuple[str, ...] = ()
+    #: A data-center volume's price, per GB per hour, where this offer lands (D139).
+    volume_per_gb_hourly: Optional[float] = None
     raw: dict[str, Any] = dataclasses.field(default_factory=dict, repr=False)
 
     def priced_for(self, disk_gb: float) -> "Offer":
@@ -184,6 +203,11 @@ class VolumeSpec:
     label: str
     size_gb: float = 0.0
     volume_id: Optional[str] = None
+    #: For a data-center volume (D139): the data center it is in — an existing one's, which the
+    #: instance must land in, or where a new one is made (one of the offer's `locations`; unset,
+    #: the plug-in chooses among them). A create that cannot put the instance there fails as
+    #: `OfferGone`, leaving nothing behind — never an instance elsewhere without its volume.
+    location: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -194,6 +218,8 @@ class VolumeInfo:
     size_gb: float
     #: What it costs per hour, where the provider says.
     hourly: float = 0.0
+    #: A data-center volume's data center (D139).
+    location: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -218,6 +244,8 @@ class Instance:
     raw: dict[str, Any] = dataclasses.field(default_factory=dict, repr=False)
     #: The volume it was created with, where one was asked for (D116).
     volume_id: Optional[str] = None
+    #: The data center it landed in, where the provider says (D139).
+    location: Optional[str] = None
 
 
 class InstanceState(str):

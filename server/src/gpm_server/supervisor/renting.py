@@ -21,6 +21,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
+from gpm_agent import volume as model_volume
+
 from .. import agentpkg, history
 from .. import workloads as workload_math
 from ..config import BiddingConfig, OfferPolicy, PoolConfig, RentedConfig, TransportConfig
@@ -99,10 +101,13 @@ class RentedHost:
     cards_per_copy: int = 1
     #: The workload it was bought for (D115); None is the shared workload.
     workload: Optional[str] = None
-    #: The volume it was created with, and where its models came from: "warm" (a volume that
-    #: already held them), "sibling" (copied from a ready host of its workload), or "hub" (D116).
+    #: The volume it was created with, and where its models came from: "volume" (copied from its
+    #: workload's model volume, D139), "sibling" (copied from a ready host of its workload), or
+    #: "hub" (D116).
     volume_id: Optional[str] = None
     models_source: str = "hub"
+    #: Whether what its agent said about its volume has been taken in (D139): once per host.
+    volume_reported: bool = False
     copy_state: Optional[str] = None
     copy_task: Optional[asyncio.Task] = dataclasses.field(default=None, repr=False, compare=False)
     copy_started_at: Optional[float] = None
@@ -348,6 +353,12 @@ def describe_query(query: OfferQuery) -> list[str]:
 #: How an assumed field is said (providers.md §6).
 _ASSUMED_WORDS = {"download_mbps": "download speed", "reliability": "reliability", "verified": "verified",
                   "download_per_gb": "download price"}
+
+#: How fast a host copies its models from a model volume to its own disk, for estimating what a
+#: volume saves until the pool has its own times (D139): a network volume reads at about 200–400
+#: MB/s by its provider's own figure, and a parallel copy reached ~1.2 GiB/s in a third-party
+#: benchmark (decisions.md, Verified facts). The lower figure, so the saving is never overstated.
+VOLUME_COPY_MB_PER_S = 300.0
 
 
 class Fleet:
@@ -1721,6 +1732,7 @@ class Fleet:
         if view.reachable:
             host.agent_facts = view.facts
             host.agent_detail = None
+            self._volume_news(host)
         else:
             host.agent_facts = None
             host.agent_detail = view.detail
@@ -2759,9 +2771,17 @@ class Fleet:
             except ProviderError as exc:
                 log.warning("could not list %s's volumes: %s", name, exc)
                 continue
+            settings = self.rented.providers.get(name)
+            attached = {h.volume_id for h in self.hosts.values() if h.volume_id}
             for volume in found:
                 record = live.get((name, volume.volume_id))
                 if record is not None and record.workload in self.workloads:
+                    if (record.location is None or volume.volume_id in attached or settings is None
+                            or settings.keep_models):
+                        continue
+                    # Keeping models was turned off for this account: each of its model volumes
+                    # goes once no host has it (D139).
+                    await self._delete_volume(volume.volume_id, f"keeping models between hosts is off for {name}", name)
                     continue
                 await self._delete_volume(volume.volume_id, "its workload is over" if record else "never recorded by this pool",
                                           name)
@@ -3409,12 +3429,14 @@ class Fleet:
         total = self.config.limits.max_hourly_burn
         return bound if total is None else min(bound, total)
 
-    def _refuse_for_workload_budget(self, offer: Offer, bid: float, lease: Lease, workload: Optional[str]) -> Optional[str]:
+    def _refuse_for_workload_budget(self, offer: Offer, bid: float, lease: Lease, workload: Optional[str],
+                                    also_hourly: float = 0.0) -> Optional[str]:
         """A workload's host it cannot pay for to the end of its hours (D124): what the
         workload's hosts already burn, with this one at its price, over the hours the lease has
         left, beyond what the budget has left. Seen live: a $5, 1.75-hour workload fell back to a
-        $7.17/h on-demand host, which would have spent the budget in forty minutes."""
-        hourly = (bid + offer.storage_hourly) if offer.interruptible else offer.all_in_hourly
+        $7.17/h on-demand host, which would have spent the budget in forty minutes. A model volume
+        this host would make bills too, to the end, and is counted with it (D139)."""
+        hourly = ((bid + offer.storage_hourly) if offer.interruptible else offer.all_in_hourly) + also_hourly
         burning = sum(h.bid_hourly for h in self.hosts_of(workload) if h.state != "draining")
         hours = lease.hours_left()
         # The dollars left, not the margin-reduced figure the cap is enforced on: the margin
@@ -3603,12 +3625,12 @@ class Fleet:
                 fixed_workers=(chosen_group.workers_per_host
                                if chosen_group is not None and len(chosen_group.models) > 1 else None))
             reasons = [*reasons, *kind_reasons[:1]]
-        warm = self._warm_volumes(spec, builds) if spec is not None else {}
-        if warm and offer_id is None and any(self._at(o) in warm for o, _ in ranked):
-            # A machine that already holds the models downloads nothing: first, whatever else
-            # the ranking said (D116).
-            ranked = sorted(ranked, key=lambda pair: 0 if self._at(pair[0]) in warm else 1)
-            reasons = [*reasons, f"a machine holding its models is offered again: {ranked[0][0].machine_id}"]
+        here = self._volumes_here(spec, builds) if spec is not None else {}
+        if here and offer_id is None:
+            # An offer whose host would copy its models from the workload's volume is preferred
+            # by no more than the download it saves (D139).
+            ranked, kept_why = self._prefer_kept_models(ranked, here, lease, for_this_host, builds)
+            reasons = [*reasons, *kept_why]
 
         unaffordable_offers, created = 0, False
         for offer, offer_score in ranked[: self.rented.bidding.attempts]:
@@ -3625,7 +3647,8 @@ class Fleet:
                 )
                 continue
             if spec is not None:
-                unaffordable = self._refuse_for_workload_budget(offer, capped, lease, workload)
+                unaffordable = self._refuse_for_workload_budget(
+                    offer, capped, lease, workload, also_hourly=self._new_volume_hourly(spec, offer, here, for_this_host, builds))
                 if unaffordable is not None:
                     unaffordable_offers += 1
                     self.last_refusal = unaffordable
@@ -3665,7 +3688,7 @@ class Fleet:
                 env=self.instance_env(launch_workers, for_this_host),
                 # Armed before anything else runs, and carrying no account credential.
                 onstart=self.deadman_onstart(for_this_host, offer.connection),
-                volume=self._volume_for(spec, offer, warm, for_this_host, builds) if spec is not None else None,
+                volume=self._volume_for(spec, offer, here, for_this_host, builds) if spec is not None else None,
             )
             try:
                 # No price on an on-demand rental: the provider's listed rate is what is paid. A spot
@@ -3731,8 +3754,8 @@ class Fleet:
                 engine=self.config.rented_engine(),
                 engine_port=self.engine_port,
             )
-            if instance.volume_id is not None and spec is not None:
-                self._record_volume(host, instance.volume_id, warm, offer, lease, for_this_host, builds)
+            if instance.volume_id is not None and spec is not None and instance_spec.volume is not None:
+                self._record_volume(host, instance, instance_spec.volume, offer, lease, for_this_host, builds)
             connection = await self.provider_for(offer).connection(instance)
             host.connection = connection
             host.dial_url = connection.public_url or await self._open_tunnel(host_id, connection, host.engine_port)
@@ -3778,59 +3801,219 @@ class Fleet:
         return [v for v in self.workload_store.volumes(spec.name)
                 if (v.builds == builds) or (v.builds is None and len(spec.groups) == 1)]
 
-    def _warm_volumes(self, spec: Any, builds: Optional[dict[str, str]] = None) -> dict[tuple[str, str], Volume]:
-        """The machines holding one of this group's volumes, where warm machines are on."""
-        if (spec is None or "warm" not in self._sources() or not self.config.workloads.keep_models_on_machine
-                or not any(p.capabilities.volumes for p in self.providers.values()) or not self._models_dir()):
+    def keeps_models(self, connection: str) -> bool:
+        """Is "Keep models between hosts" on for this provider account, and can it be (D139)?
+        Only where its volumes reach a data center; set on any other, it does nothing."""
+        named = connection or self.legacy_connection
+        name = self.resolve(named) or named
+        settings, provider = self.rented.providers.get(name), self.providers.get(name)
+        return bool(settings is not None and settings.keep_models and provider is not None
+                    and provider.capabilities.reach == "data_center" and "volume" in self._sources())
+
+    def _volumes_here(self, spec: Any, builds: Optional[dict[str, str]] = None) -> dict[str, Volume]:
+        """This group's model volumes, by the connection each is on (D139). A volume whose filler
+        has gone without filling it is left empty, for the next host there to fill — named only
+        now, once the pool holds that host no more."""
+        if spec is None:
             return {}
         builds = builds if builds is not None else dict(spec.groups[0].builds)
-        return {(self.resolve(v.connection or self.legacy_connection) or v.connection, v.machine_id): v
-                for v in self._group_volumes(spec, builds)}
+        found: dict[str, Volume] = {}
+        for volume in self._group_volumes(spec, builds):
+            if volume.location is None:
+                continue  # bound to a machine (D116): kept until its workload ends, never used
+            if volume.state == "filling" and volume.filler and volume.filler not in self.hosts:
+                self.workload_store.volume_state(volume.volume_id, "empty")
+                self.events.record(
+                    "volume_not_filled",
+                    f"model volume {volume.volume_id} at {volume.location}: {volume.filler} went before filling it; "
+                    "the next host there fills it",
+                    numbers={"volume": volume.volume_id, "workload": spec.name},
+                )
+                volume = dataclasses.replace(volume, state="empty", filler=None)
+            named = volume.connection or self.legacy_connection
+            found[self.resolve(named) or named] = volume
+        return found
 
-    def _volume_for(self, spec: Any, offer: Offer, warm: dict[tuple[str, str], Volume],
+    def _volume_role(self, offer: Offer, here: dict[str, Volume]) -> Optional[tuple[str, Optional[Volume]]]:
+        """What a new host from this offer does with its group's volume (D139): copy from it
+        ("read"), fill it ("fill"), make it ("new") — or nothing: models not kept here, the offer
+        cannot land in the volume's data center, or another host is filling it."""
+        if not offer.locations or not self.keeps_models(offer.connection):
+            return None
+        named = offer.connection or self.legacy_connection
+        volume = here.get(self.resolve(named) or named)
+        if volume is None:
+            return ("new", None)
+        if volume.location not in offer.locations:
+            return None
+        if volume.state == "ready":
+            return ("read", volume)
+        if volume.state in ("empty", "stale"):
+            return ("fill", volume)
+        return None
+
+    def _volume_size(self, models: Sequence[str], builds: dict[str, str]) -> int:
+        return max(10, math.ceil(self.model_set_gb(models, builds) * 1.1) + 1)
+
+    def _new_volume_hourly(self, spec: Any, offer: Offer, here: dict[str, Volume],
+                           models: Sequence[str], builds: dict[str, str]) -> float:
+        """What a volume this host would make costs per hour, for the budget check (D139)."""
+        role = self._volume_role(offer, here) if spec is not None else None
+        if role is None or role[0] != "new":
+            return 0.0
+        return self._volume_size(models, builds) * (offer.volume_per_gb_hourly or 0.0)
+
+    def _prefer_kept_models(self, ranked: list, here: dict[str, Volume], lease: Lease,
+                            models: Sequence[str], builds: dict[str, str]) -> tuple[list, list[str]]:
+        """Put first an offer whose host would copy its models from the volume — but only while
+        what it costs more over the lease's hours is no more than the download it saves, priced at
+        its own hourly rate (D139). Estimated until the pool has its own times for both ways."""
+        reaching = [pair for pair in ranked if (self._volume_role(pair[0], here) or ("",))[0] == "read"]
+        if not reaching:
+            return ranked, []
+        top, best = ranked[0][0], reaching[0][0]
+        volume = self._volume_role(best, here)[1]
+        gigabytes = self.model_set_gb(models, builds)
+        download_s = gigabytes * 8000 / max(top.download_mbps or 0.0, 100.0)
+        copy_s = gigabytes * 1000 / VOLUME_COPY_MB_PER_S
+        saved_h = max(0.0, download_s - copy_s) / 3600
+        worth = saved_h * best.all_in_hourly
+        extra = max(0.0, best.all_in_hourly - top.all_in_hourly) * lease.hours_left()
+        if reaching[0] is ranked[0]:
+            return ranked, [f"its models are kept at {volume.location}: this host copies ~{gigabytes:.0f} GB "
+                            f"instead of downloading (≈{saved_h * 60:.0f} min saved, estimate)"]
+        if extra <= worth:
+            return ([reaching[0], *[p for p in ranked if p is not reaching[0]]],
+                    [f"its models are kept at {volume.location}: a host there copies ~{gigabytes:.0f} GB instead "
+                     f"of downloading — ≈{saved_h * 60:.0f} min, worth ${worth:.2f}, for ${extra:.2f} more over the "
+                     "lease (estimate)"])
+        return ranked, [f"a host at {volume.location} would copy its models (≈{saved_h * 60:.0f} min, ${worth:.2f}) "
+                        f"but costs ${extra:.2f} more over the lease: not preferred"]
+
+    def _volume_for(self, spec: Any, offer: Offer, here: dict[str, Volume],
                     models: Sequence[str], builds: dict[str, str]) -> Optional[VolumeSpec]:
-        """The volume a workload's new host is created with: the one already on this machine, or
-        — for its first — a new one to keep its models on, so the next host there fetches nothing."""
-        if spec is None or "warm" not in self._sources() or not self.config.workloads.keep_models_on_machine:
+        """The volume a workload's new host is created with (D139): its group's, mounted for the
+        agent to copy from, or to fill; or — for its first host where models are kept — a new one
+        to fill. Mounted at the agent's own paths, which the pool never sends to the agent."""
+        role = self._volume_role(offer, here) if spec is not None else None
+        if role is None:
             return None
-        if not self.provider_for(offer).capabilities.volumes or not self._models_dir():
-            return None
+        kind, volume = role
         index = next((i for i, g in enumerate(spec.groups) if g.builds == builds), 0)
         label = f"{self.label_prefix}{spec.name}/models" + (f"-{index}" if len(spec.groups) > 1 else "")
-        if self._at(offer) in warm:
-            return VolumeSpec(mount=self._models_dir(), label=label, volume_id=warm[self._at(offer)].volume_id)
-        if self._group_volumes(spec, builds):
-            return None  # one volume per group: the first machine keeps its models
-        size = math.ceil(self.model_set_gb(models, builds) * 1.1) + 1
-        return VolumeSpec(mount=self._models_dir(), label=label, size_gb=float(size))
+        if kind == "read":
+            return VolumeSpec(mount=str(model_volume.READ_PATH), label=label,
+                              volume_id=volume.volume_id, location=volume.location)
+        if kind == "fill":
+            return VolumeSpec(mount=str(model_volume.FILL_PATH), label=label,
+                              volume_id=volume.volume_id, location=volume.location)
+        return VolumeSpec(mount=str(model_volume.FILL_PATH), label=label,
+                          size_gb=float(self._volume_size(models, builds)))
 
-    def _record_volume(self, host: RentedHost, volume_id: str, warm: dict[str, Volume], offer: Offer,
+    def _record_volume(self, host: RentedHost, instance: Instance, asked: VolumeSpec, offer: Offer,
                        lease: Lease, models: Sequence[str], builds: dict[str, str]) -> None:
-        host.volume_id = volume_id
-        if self._at(offer) in warm and warm[self._at(offer)].volume_id == volume_id:
-            host.models_source = "warm"
+        host.volume_id = instance.volume_id
+        location = instance.location or asked.location or ""
+        if asked.volume_id is None:
+            size = asked.size_gb
+            hourly = round(size * (offer.volume_per_gb_hourly or 0.0), 6)
+            self.workload_store.add_volume(Volume(
+                volume_id=instance.volume_id, workload=host.workload or "", machine_id=location, size_gb=size,
+                hourly=hourly, lease_id=lease.lease_id, created_at=time.time(), builds=dict(builds),
+                connection=offer.connection or self.connection, location=location, state="filling",
+                filler=host.host_id,
+            ))
             self.events.record(
-                "models_from_volume",
-                f"{host.host_id} on {offer.machine_id} is created with volume {volume_id}, which holds "
-                f"{', '.join(models)}: nothing is downloaded",
-                numbers={"volume": volume_id, "machine": offer.machine_id, "workload": host.workload},
+                "volume_created",
+                f"model volume {instance.volume_id} ({size:g} GB) made at {location} for workload {host.workload}'s "
+                f"models, at ${hourly:.4f}/h while it exists; {host.host_id} fills it, and later hosts there copy "
+                "from it",
+                numbers={"volume": instance.volume_id, "location": location, "size_gb": size, "hourly": hourly,
+                         "workload": host.workload},
                 host_id=host.host_id, lease_id=lease.lease_id,
             )
+        elif asked.mount == str(model_volume.READ_PATH):
+            host.models_source = "volume"
+            self.events.record(
+                "volume_attached",
+                f"{host.host_id} at {location} copies {', '.join(models)} from model volume {instance.volume_id}, "
+                "each file checked against the hub",
+                numbers={"volume": instance.volume_id, "location": location, "workload": host.workload},
+                host_id=host.host_id, lease_id=lease.lease_id,
+            )
+        else:
+            self.workload_store.volume_state(instance.volume_id, "filling", host.host_id)
+            self.events.record(
+                "volume_filling",
+                f"{host.host_id} at {location} fills model volume {instance.volume_id} with {', '.join(models)}",
+                numbers={"volume": instance.volume_id, "location": location, "workload": host.workload},
+                host_id=host.host_id, lease_id=lease.lease_id,
+            )
+
+    def _models_kept(self, host: RentedHost) -> bool:
+        """Are this host's models kept on its workload's data-center volume (D139)?"""
+        return bool(host.volume_id and self.provider_for(host).capabilities.reach == "data_center")
+
+    def _volume_news(self, host: RentedHost) -> None:
+        """What a host's agent says it did with its volume, taken in once every model is fetched
+        (D139): a filler's volume is ready, or empty again; a reader's copy is put on record —
+        how much, how long, and any file that did not match — and a volume that holds nothing of
+        the hub's current build is marked stale, for the next host there to fill."""
+        if host.volume_id is None or host.volume_reported or not host.agent_facts or not host.workload:
             return
-        size = math.ceil(self.model_set_gb(models, builds) * 1.1) + 1
-        hourly = round(size * (offer.storage_per_gb_hourly or 0.0), 6)
-        self.workload_store.add_volume(Volume(
-            volume_id=volume_id, workload=host.workload or "", machine_id=offer.machine_id, size_gb=size,
-            hourly=hourly, lease_id=lease.lease_id, created_at=time.time(), builds=dict(builds),
-            connection=offer.connection or self.connection,
-        ))
+        sources = (host.agent_facts.get("engine") or {}).get("model_sources") or {}
+        tags = [(host.builds or {}).get(model) or model for model in host.models]
+        reports = [sources.get(tag) for tag in tags]
+        if not reports or any(not isinstance(r, dict) for r in reports):
+            return
+        volume = next((v for v in self.workload_store.volumes(host.workload) if v.volume_id == host.volume_id), None)
+        if volume is None or volume.location is None:
+            return
+        host.volume_reported = True
+        where = {"volume": volume.volume_id, "location": volume.location, "workload": host.workload}
+        if volume.filler == host.host_id:
+            fills = [str(r.get("fill") or "") for r in reports]
+            if all(f == "already there" or f.startswith("filled") for f in fills):
+                self.workload_store.volume_state(volume.volume_id, "ready")
+                self.events.record(
+                    "volume_filled",
+                    f"model volume {volume.volume_id} at {volume.location} holds {', '.join(host.models)}: later hosts "
+                    "there copy from it", numbers=where, host_id=host.host_id, lease_id=host.lease_id)
+            else:
+                self.workload_store.volume_state(volume.volume_id, "empty")
+                self.events.record(
+                    "volume_not_filled",
+                    f"{host.host_id} did not fill model volume {volume.volume_id}: "
+                    + "; ".join(f for f in fills if not (f == "already there" or f.startswith("filled")))
+                    + "; the next host there fills it", numbers=where, host_id=host.host_id, lease_id=host.lease_id)
+            return
+        copied = sum(int(r.get("bytes_from_volume") or 0) for r in reports)
+        files = sum(int(r.get("files_from_volume") or 0) for r in reports)
+        mismatched = sum(int(r.get("files_mismatched") or 0) for r in reports)
+        missing = sum(int(r.get("files_missing") or 0) for r in reports)
+        seconds = sum(float(r.get("seconds_from_volume") or 0.0) for r in reports)
         self.events.record(
-            "volume_created",
-            f"volume {volume_id} ({size} GB) made on {offer.machine_id} for workload {host.workload}'s models, "
-            f"at ${hourly:.4f}/h while it exists; the next host on this machine fetches nothing",
-            numbers={"volume": volume_id, "machine": offer.machine_id, "size_gb": size, "hourly": hourly},
-            host_id=host.host_id, lease_id=lease.lease_id,
+            "models_from_volume",
+            f"{host.host_id} copied {files} file(s), {copied / 1e9:.1f} GB of {', '.join(host.models)}, from the model "
+            f"volume at {volume.location} in {seconds:.0f} s"
+            + (f"; {missing} file(s) were not there and came from the hub" if missing else ""),
+            numbers={**where, "files": files, "bytes": copied, "seconds": round(seconds, 1),
+                     "missing": missing, "mismatched": mismatched},
+            host_id=host.host_id, lease_id=host.lease_id,
         )
+        if mismatched:
+            self.events.record(
+                "volume_mismatch",
+                f"{host.host_id}: {mismatched} file(s) in the model volume at {volume.location} did not match the "
+                "hub; it downloaded them instead", numbers={**where, "mismatched": mismatched},
+                host_id=host.host_id, lease_id=host.lease_id)
+        if files == 0 and missing and volume.state == "ready":
+            self.workload_store.volume_state(volume.volume_id, "stale")
+            self.events.record(
+                "volume_stale",
+                f"model volume {volume.volume_id} at {volume.location} holds nothing of the hub's current build of "
+                f"{', '.join(host.models)}; the next host there fills it", numbers=where,
+                host_id=host.host_id, lease_id=host.lease_id)
 
     async def models_from_sibling_pending(self, host: RentedHost) -> bool:
         """Is a copy of this host's models from a ready sibling still running? (D116)
@@ -3839,7 +4022,7 @@ class Fleet:
         builds; the host's own fetch waits for it, then finds the files already there. A copy
         that fails or takes too long falls through to the hub, said in the log. False when there
         is nothing to wait for."""
-        if host.workload is None or host.models_source == "warm" or host.copy_state in ("done", "failed", "none"):
+        if host.workload is None or host.models_source == "volume" or host.copy_state in ("done", "failed", "none"):
             return False
         if ("sibling" not in self._sources() or not self.provider_for(host).capabilities.copies
                 or not self._models_dir()):
@@ -4243,6 +4426,11 @@ class Fleet:
         return released
 
     async def park(self, host: RentedHost, reason: str) -> None:
+        if self._models_kept(host):
+            # Its models are on its workload's volume, so a stopped host would keep nothing the
+            # next host lacks, and would bill for it (D139).
+            await self.destroy(host, f"{reason}; released rather than parked: its models are kept on its model volume")
+            return
         try:
             await self.provider_for(host).stop(host.instance)
         except ProviderError as exc:

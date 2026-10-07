@@ -171,6 +171,15 @@ def plan_changes(
         turned_off = sorted(name for name, conn in were.items() if conn.enabled and not (name in become and become[name].enabled))
         if turned_off:
             said.append(f"{', '.join(turned_off)} will not be rented from again (its hosts stay until released)")
+        # Keeping models between hosts (D139): for hosts not yet created, at once.
+        keeps = sorted(name for name, conn in become.items() if conn.keep_models and not (name in were and were[name].keep_models))
+        if keeps:
+            said.append(f"{', '.join(keeps)} will keep models between hosts: each workload renting there gets a model "
+                        "volume in its first host's data center, billed to its lease, and deleted when it ends")
+        stops = sorted(name for name, conn in were.items() if conn.keep_models and name in become and not become[name].keep_models)
+        if stops:
+            said.append(f"{', '.join(stops)} will stop keeping models: no new model volume, and each one there is "
+                        "deleted once no host has it")
         # A provider in both, under another name, is a rename — neither an addition nor a removal.
         types_were = {conn.type for conn in were.values()}
         types_become = {conn.type for conn in become.values()}

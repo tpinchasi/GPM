@@ -5,7 +5,10 @@ nothing of any account's). Everything else is shaped after the provider's publis
 document.
 """
 
+import dataclasses
 import json
+import logging
+import math
 import pathlib
 import subprocess
 
@@ -23,6 +26,7 @@ from gpm_server.providers import (
     ProviderUnavailable,
     RunPodProvider,
 )
+from gpm_server.providers.base import VolumeSpec
 
 CATALOG = json.loads((pathlib.Path(__file__).parent.parent / "fixtures" / "runpod_catalog.json").read_text())
 BASE = "https://api.runpod.io/v2"
@@ -40,10 +44,32 @@ def row(gpu_id="NVIDIA Test 1", name="Test 1", memory=24, availability="LOW", se
             "maxCount": {"secure": max_count[0], "community": max_count[1]}}
 
 
-def catalog(*rows, seen=None):
-    """A handler answering the catalog — the real one unless rows are given."""
+def data_center(dc_id, volumes=True):
+    return {"id": dc_id, "name": dc_id, "region": "NORTH_AMERICA", "globalNetwork": False, "compliance": [],
+            "networkVolumeTypes": ["STANDARD"] if volumes else []}
+
+
+#: Shaped after `ListDataCentersResponse`, by hand. Which of these take a network volume is made up
+#: for the tests, not read from the provider: of the RTX 4090's two data centers in the catalog
+#: fixture, one does; of the H100's eight, two do.
+DATA_CENTERS = {"dataCenters": [
+    data_center("EU-RO-1"), data_center("EUR-NO-1", volumes=False),
+    data_center("CA-MTL-1"), data_center("US-CA-2"), data_center("AP-JP-1", volumes=False),
+    data_center("US-KS-2"), data_center("US-TX-3"),
+]}
+
+
+def catalog(*rows, seen=None, data_centers=None, dc_seen=None):
+    """A handler answering the catalog — the real one unless rows are given — and the data
+    centers. `seen` records the catalog's requests, `dc_seen` the data centers'."""
 
     def handler(request):
+        if request.url.path == "/v2/catalog/datacenters":
+            if dc_seen is not None:
+                dc_seen.append(request)
+            if isinstance(data_centers, httpx.Response):
+                return data_centers
+            return httpx.Response(200, json=data_centers if data_centers is not None else DATA_CENTERS)
         if seen is not None:
             seen.append(request)
         assert request.url.path == "/v2/catalog/gpus", request.url.path
@@ -189,6 +215,71 @@ async def test_only_the_clouds_configured_are_asked():
 async def test_a_catalog_without_its_list_is_refused_not_read_as_empty():
     with pytest.raises(ProviderUnavailable, match="no `gpus` list"):
         await provider(lambda r: httpx.Response(200, json={})).search_offers(ON_DEMAND)
+
+
+async def test_a_secure_offer_says_where_a_volume_can_follow_it():
+    """D139: the data centers with the GPU in stock *and* taking a network volume, sorted."""
+    offers = {o.offer_id: o for o in await provider(catalog()).search_offers(ON_DEMAND)}
+
+    # In stock in EU-RO-1 and EUR-NO-1; only EU-RO-1 takes a volume.
+    assert offers["SECURE:NVIDIA GeForce RTX 4090:1"].locations == ("EU-RO-1",)
+    # Two of its eight take one; sorted, whatever order the catalog lists them in.
+    assert offers["SECURE:NVIDIA H100 80GB HBM3:1"].locations == ("CA-MTL-1", "US-CA-2")
+    # In stock only in EU-SE-1, which takes no volume here: an offer still, going nowhere a volume
+    # can follow.
+    nowhere = offers["SECURE:NVIDIA RTX A6000:1"]
+    assert nowhere.locations == ()
+    assert nowhere.volume_per_gb_hourly == pytest.approx(0.07 / 720)
+    # A network volume mounts only on Secure Cloud: a Community offer takes none, nor is priced for one.
+    community = offers["COMMUNITY:NVIDIA GeForce RTX 4090:1"]
+    assert community.locations == () and community.volume_per_gb_hourly is None
+
+
+async def test_a_data_center_listed_with_none_in_stock_is_not_a_location():
+    stocked = row(community=False)
+    stocked["dataCenters"] = [{"id": "US-TX-3", "name": "x", "availability": "NONE"},
+                              {"id": "US-KS-2", "name": "y", "availability": "HIGH"},
+                              {"id": "EU-RO-1", "name": "z"}]
+    (offer,) = await provider(catalog(stocked)).search_offers(ON_DEMAND)
+    assert offer.locations == ("US-KS-2",)
+
+
+async def test_the_data_centers_are_read_at_most_once_an_hour():
+    seen, dc_seen = [], []
+    api = provider(catalog(seen=seen, dc_seen=dc_seen))
+    await api.search_offers(ON_DEMAND)
+    await api.search_offers(ON_DEMAND)
+    assert len(seen) == 4 and len(dc_seen) == 1, "the catalog every search, the data centers once"
+    assert dc_seen[0].url.path == "/v2/catalog/datacenters"
+
+    read_at, held = api._volume_dcs
+    api._volume_dcs = (read_at - 3601, held)
+    await api.search_offers(ON_DEMAND)
+    assert len(dc_seen) == 2, "an hour on, read again"
+
+
+async def test_a_community_only_search_never_asks_for_the_data_centers():
+    dc_seen = []
+    offers = await provider(catalog(dc_seen=dc_seen), clouds=["community"]).search_offers(ON_DEMAND)
+    assert offers and dc_seen == []
+
+
+@pytest.mark.parametrize("failed", [
+    problem(500, "down"),
+    problem(429, "slow down", **{"Retry-After": "0"}),
+    httpx.Response(200, json={"message": "moved"}),
+])
+async def test_data_centers_that_cannot_be_read_cost_the_offers_their_locations_not_the_search(failed):
+    dc_seen = []
+    api = provider(catalog(data_centers=failed, dc_seen=dc_seen))
+    offers = await api.search_offers(ON_DEMAND)
+    assert offers and all(o.locations == () for o in offers)
+    await api.search_offers(ON_DEMAND)
+    assert len(dc_seen) == 1, "a failed read is not retried every search"
+    read_at, _ = api._volume_dcs
+    api._volume_dcs = (read_at - 301, None)
+    await api.search_offers(ON_DEMAND)
+    assert len(dc_seen) == 2, "but sooner than an hour"
 
 
 # --- creating ---
@@ -367,6 +458,248 @@ async def test_the_credential_never_appears_in_an_error():
     assert KEY not in str(failed.value)
 
 
+# --- creating with a model volume (D139) ---
+
+
+def volume(volume_id="vol1", name="gpm/p/w/models", size=50, dc="US-KS-2"):
+    return {"id": volume_id, "name": name, "size": size, "dataCenter": dc, "type": "STANDARD"}
+
+
+class Api:
+    """Answers by (method, path); records every request as (method, path, body)."""
+
+    def __init__(self, **answers):
+        self.answers = {"GET /v2/network-volumes": httpx.Response(200, json={"networkVolumes": []}),
+                        "POST /v2/network-volumes": httpx.Response(201, json=volume()),
+                        "POST /v2/pods": httpx.Response(201, json=pod(status="PROVISIONING")),
+                        "DELETE /v2/pods/pod1": httpx.Response(204),
+                        "DELETE /v2/network-volumes/vol1": httpx.Response(204),
+                        "GET /v2/network-volumes/vol1": problem(404, "not found")}
+        self.answers.update({k.replace("_", " ", 1): v for k, v in answers.items()})
+        self.seen = []
+
+    def __call__(self, request):
+        body = json.loads(request.read()) if request.content else None
+        self.seen.append((request.method, request.url.path, body))
+        answer = self.answers[f"{request.method} {request.url.path}"]
+        return answer(request) if callable(answer) else answer
+
+    def calls(self):
+        return [(m, p) for m, p, _ in self.seen]
+
+    def body(self, method, path):
+        return next(b for m, p, b in self.seen if (m, p) == (method, path))
+
+
+async def a_secure_offer(locations=("US-KS-2", "US-TX-3")):
+    return dataclasses.replace(await an_offer(), locations=locations)
+
+
+def with_volume(**volume_spec):
+    return dataclasses.replace(SPEC, volume=VolumeSpec(mount="/opt/gpm/volume", label="gpm/p/w/models",
+                                                      **volume_spec))
+
+
+async def test_a_new_volume_is_made_in_a_data_center_the_offer_can_land_in_and_mounted():
+    api = Api()
+    instance = await provider(api).create(await a_secure_offer(), with_volume(size_gb=40.5), None)
+
+    # What is there first (to tell its own volume from another after an unclear create), then the
+    # volume, then the pod.
+    assert api.calls() == [("GET", "/v2/network-volumes"), ("POST", "/v2/network-volumes"), ("POST", "/v2/pods")]
+    assert api.body("POST", "/v2/network-volumes") == {"name": "gpm/p/w/models", "size": 41, "dataCenter": "US-KS-2"}
+    body = api.body("POST", "/v2/pods")
+    assert body["mounts"] == {"network": [{"volumeId": "vol1", "path": "/opt/gpm/volume"}]}
+    assert body["dataCenterIds"] == ["US-KS-2"]
+    assert body["disk"] == 150, "no persistent volume beside a network one: the whole disk is the container's"
+    assert body["cloud"] == "SECURE"
+    assert instance.instance_id == "pod1" and instance.volume_id == "vol1" and instance.location == "US-KS-2"
+
+
+async def test_a_new_volume_goes_where_asked_if_the_offer_lands_there_and_is_never_below_the_floor():
+    api = Api(**{"POST_/v2/network-volumes": httpx.Response(201, json=volume(dc="US-TX-3")),
+                 "POST_/v2/pods": httpx.Response(201, json=pod(dataCenterId="US-TX-3"))})
+    instance = await provider(api).create(await a_secure_offer(), with_volume(size_gb=3, location="US-TX-3"), None)
+    assert api.body("POST", "/v2/network-volumes") == {"name": "gpm/p/w/models", "size": 10, "dataCenter": "US-TX-3"}
+    assert instance.location == "US-TX-3"
+
+    elsewhere = Api()
+    await provider(elsewhere).create(await a_secure_offer(), with_volume(size_gb=20, location="EU-RO-1"), None)
+    assert elsewhere.body("POST", "/v2/network-volumes")["dataCenter"] == "US-KS-2", "not one it lands in: the first"
+
+
+async def test_an_existing_volume_is_mounted_where_it_is():
+    api = Api(**{"POST_/v2/pods": httpx.Response(201, json=pod(dataCenterId="US-TX-3"))})
+    instance = await provider(api).create(
+        await a_secure_offer(), with_volume(volume_id="vol7", location="US-TX-3"), None)
+    assert api.calls() == [("POST", "/v2/pods")]
+    body = api.body("POST", "/v2/pods")
+    assert body["mounts"] == {"network": [{"volumeId": "vol7", "path": "/opt/gpm/volume"}]}
+    assert body["dataCenterIds"] == ["US-TX-3"] and body["disk"] == 150
+    assert instance.volume_id == "vol7" and instance.location == "US-TX-3"
+
+
+async def test_an_existing_volume_named_without_its_data_center_is_looked_up():
+    api = Api(**{"GET_/v2/network-volumes/vol7": httpx.Response(200, json=volume("vol7", dc="US-KS-2"))})
+    await provider(api).create(await a_secure_offer(), with_volume(volume_id="vol7"), None)
+    assert api.calls() == [("GET", "/v2/network-volumes/vol7"), ("POST", "/v2/pods")]
+    assert api.body("POST", "/v2/pods")["dataCenterIds"] == ["US-KS-2"]
+
+
+async def test_an_existing_volume_where_the_gpu_is_not_in_stock_is_a_gone_offer_asking_nothing():
+    api = Api()
+    with pytest.raises(OfferGone, match="not in stock in EU-RO-1"):
+        await provider(api).create(await a_secure_offer(), with_volume(volume_id="vol7", location="EU-RO-1"), None)
+    assert api.seen == []
+
+
+async def test_a_pod_that_is_not_created_takes_its_new_volume_with_it():
+    api = Api(**{"POST_/v2/pods": problem(400, "minCudaVersion and allowedCudaVersions are mutually exclusive")})
+    with pytest.raises(ProviderError, match="refused the request") as refused:
+        await provider(api).create(await a_secure_offer(), with_volume(size_gb=40), None)
+    assert not isinstance(refused.value, (OfferGone, ProviderUnavailable)), "the pod's own error, re-raised"
+    # Deleted, and checked to be gone.
+    assert api.calls()[-2:] == [("DELETE", "/v2/network-volumes/vol1"), ("GET", "/v2/network-volumes/vol1")]
+
+
+async def test_no_capacity_for_the_pod_is_still_a_gone_offer_once_the_volume_is_deleted():
+    api = Api(**{"POST_/v2/pods": problem(400, "There are no longer any instances available")})
+    with pytest.raises(OfferGone, match="US-KS-2: no capacity"):
+        await provider(api).create(await a_secure_offer(), with_volume(size_gb=40), None)
+    assert ("DELETE", "/v2/network-volumes/vol1") in api.calls()
+
+
+async def test_a_new_volume_that_cannot_be_deleted_is_said():
+    api = Api(**{"POST_/v2/pods": problem(400, "no longer available"),
+                 "DELETE_/v2/network-volumes/vol1": problem(500, "storage backend down")})
+    with pytest.raises(ProviderUnavailable, match="volume vol1, made for it in US-KS-2, could not be deleted"):
+        await provider(api).create(await a_secure_offer(), with_volume(size_gb=40), None)
+
+    lingering = Api(**{"POST_/v2/pods": problem(400, "no longer available"),
+                       "GET_/v2/network-volumes/vol1": httpx.Response(200, json=volume())})
+    with pytest.raises(ProviderUnavailable, match="still lists it"):
+        await provider(lingering).create(await a_secure_offer(), with_volume(size_gb=40), None)
+
+
+async def test_a_rate_limited_pod_create_still_deletes_its_volume_once_allowed():
+    api = Api(**{"POST_/v2/pods": problem(429, "slow down", **{"Retry-After": "0.05"})})
+    with pytest.raises(ProviderRateLimited):
+        await provider(api).create(await a_secure_offer(), with_volume(size_gb=40), None)
+    assert ("DELETE", "/v2/network-volumes/vol1") in api.calls()
+
+
+async def test_a_pod_that_lands_away_from_its_volume_is_given_up_and_the_volume_with_it():
+    api = Api(**{"POST_/v2/pods": httpx.Response(201, json=pod(dataCenterId="EU-RO-1"))})
+    with pytest.raises(OfferGone, match="landed in EU-RO-1, not in US-KS-2"):
+        await provider(api).create(await a_secure_offer(), with_volume(size_gb=40), None)
+    calls = api.calls()
+    assert calls.index(("DELETE", "/v2/pods/pod1")) < calls.index(("DELETE", "/v2/network-volumes/vol1"))
+
+
+async def test_a_pod_landing_away_from_an_existing_volume_leaves_the_volume():
+    api = Api(**{"POST_/v2/pods": httpx.Response(201, json=pod(dataCenterId="EU-RO-1"))})
+    with pytest.raises(OfferGone, match="landed in EU-RO-1"):
+        await provider(api).create(await a_secure_offer(), with_volume(volume_id="vol1", location="US-KS-2"), None)
+    assert ("DELETE", "/v2/pods/pod1") in api.calls()
+    assert not any(p.startswith("/v2/network-volumes") for _, p in api.calls()), "not this create's to delete"
+
+
+async def test_an_answer_that_does_not_say_where_is_taken_as_landed_and_said(caplog):
+    api = Api(**{"POST_/v2/pods": httpx.Response(201, json=pod(dataCenterId=None))})
+    with caplog.at_level(logging.WARNING, logger="gpm.runpod"):
+        instance = await provider(api).create(await a_secure_offer(), with_volume(size_gb=40), None)
+    assert instance.location == "US-KS-2" and instance.volume_id == "vol1"
+    assert "does not say which data center" in caplog.text
+
+
+async def test_a_community_offer_with_a_volume_is_refused_before_anything_is_asked():
+    api = Api()
+    community = dataclasses.replace(await a_secure_offer(), offer_id="COMMUNITY:NVIDIA Test 1:1",
+                                    machine_id="COMMUNITY:NVIDIA Test 1:1")
+    with pytest.raises(ProviderError, match="only on a Secure Cloud pod"):
+        await provider(api).create(community, with_volume(size_gb=40), None)
+    assert api.seen == []
+
+
+async def test_an_offer_with_nowhere_a_volume_can_follow_is_a_gone_offer_asking_nothing():
+    api = Api()
+    with pytest.raises(OfferGone, match="no data center that takes a network volume"):
+        await provider(api).create(await a_secure_offer(locations=()), with_volume(size_gb=40), None)
+    assert api.seen == []
+
+
+async def test_a_volume_above_the_providers_ceiling_is_refused_before_anything_is_asked():
+    api = Api()
+    with pytest.raises(ProviderError, match="at most 4096 GB"):
+        await provider(api).create(await a_secure_offer(), with_volume(size_gb=5000), None)
+    assert api.seen == []
+
+
+async def test_a_volume_refused_for_a_rule_is_not_a_gone_offer():
+    api = Api(**{"POST_/v2/network-volumes": problem(400, "name too long")})
+    with pytest.raises(ProviderError, match="refused the volume") as refused:
+        await provider(api).create(await a_secure_offer(), with_volume(size_gb=40), None)
+    assert not isinstance(refused.value, OfferGone)
+    assert ("POST", "/v2/pods") not in api.calls()
+
+
+async def test_an_unanswered_volume_create_deletes_only_the_volume_it_made():
+    """Names need not be unique: one of the same name that was there before is not touched."""
+    listings = iter([
+        [volume("old", dc="US-KS-2")],
+        [volume("old", dc="US-KS-2"), volume("new", dc="US-KS-2"), volume("other", dc="US-TX-3")],
+    ])
+    api = Api(**{"GET_/v2/network-volumes": lambda r: httpx.Response(200, json={"networkVolumes": next(listings)}),
+                 "POST_/v2/network-volumes": problem(502, "upstream failure"),
+                 "DELETE_/v2/network-volumes/new": httpx.Response(204)})
+    with pytest.raises(ProviderUnavailable, match="created volume new, which has been deleted"):
+        await provider(api).create(await a_secure_offer(), with_volume(size_gb=40), None)
+    deleted = [p for m, p in api.calls() if m == "DELETE"]
+    assert deleted == ["/v2/network-volumes/new"]
+    assert ("POST", "/v2/pods") not in api.calls()
+
+
+# --- the volumes ---
+
+
+async def test_volumes_are_listed_by_label_with_their_data_center_and_price():
+    listing = {"networkVolumes": [volume("v1", "gpm/p/w/models", 40, "US-KS-2"),
+                                  volume("v2", "someone-else", 100, "EU-RO-1")]}
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        return httpx.Response(200, json=listing)
+
+    (found,) = await provider(handler).list_volumes("gpm/p/")
+    assert seen == ["/v2/network-volumes"]
+    assert (found.volume_id, found.label, found.size_gb) == ("v1", "gpm/p/w/models", 40)
+    assert found.location == found.machine_id == "US-KS-2"
+    assert found.hourly == pytest.approx(40 * 0.07 / 720)
+    assert math.isclose(found.hourly * 720, 2.8)
+
+
+async def test_a_volume_listing_that_cannot_be_read_is_refused_not_read_as_empty():
+    with pytest.raises(ProviderUnavailable, match="no `networkVolumes` list"):
+        await provider(lambda r: httpx.Response(200, json={})).list_volumes("gpm/")
+    with pytest.raises(ProviderUnavailable):
+        await provider(lambda r: problem(503, "down")).list_volumes("gpm/")
+
+
+async def test_deleting_a_volume_is_idempotent():
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path))
+        return httpx.Response(204) if request.url.path.endswith("/v1") else problem(404, "not found")
+
+    await provider(handler).delete_volume("v1")
+    await provider(handler).delete_volume("v2")
+    assert seen == [("DELETE", "/v2/network-volumes/v1"), ("DELETE", "/v2/network-volumes/v2")]
+    with pytest.raises(ProviderError):
+        await provider(lambda r: problem(409, "still mounted")).delete_volume("v1")
+
+
 # --- the listing ---
 
 
@@ -388,6 +721,7 @@ async def test_every_page_is_read_and_only_this_pools_label_kept():
     assert [i.instance_id for i in found] == ["1", "3"], "stopped kept; terminated is gone"
     assert cursors == [None, "c2"]
     assert found[0].machine_id == "SECURE:NVIDIA GeForce RTX 4090:1" and found[0].label == "p/a"
+    assert found[0].location == "US-KS-2", "where it runs, as the pod says"
 
 
 async def test_a_listing_that_never_ends_is_refused_rather_than_half_believed():
@@ -715,6 +1049,9 @@ def test_how_it_presents_itself():
     caps = shown["capabilities"]
     assert caps["interruptible"] is False and caps["parkable"] is True and caps["self_terminate"] is True
     assert caps["reports_charges"] and caps["direct_port_mapping"] and caps["reports_instance_logs"]
+    # D139: network volumes, one data center's, for any pod there.
+    assert caps["volumes"] is True and caps["volume_reach"] == "data_center"
+    assert RunPodProvider.capabilities.reach == "data_center"
 
 
 def test_it_is_installed_under_its_name():

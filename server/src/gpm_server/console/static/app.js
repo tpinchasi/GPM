@@ -787,7 +787,7 @@ const CAPABILITIES = [
   ["interruption_notice", "Interruption warning", "The provider warns before it takes a host back; the pool drains it at once."],
   ["self_terminate", "Dead-man timer", "A host ends itself if the pool goes quiet. Without it, leases here are kept short."],
   ["reports_charges", "Reports charges", "The provider says what each host cost, and spend is reconciled against it."],
-  ["volumes", "Volumes", "Models kept on a volume beside a machine, for the next host there."],
+  ["volumes", "Keeps models", "Storage that outlives a host, so a later host can take its models from it instead of downloading them."],
   ["copies", "Copies between hosts", "A new host takes its models from a sibling instead of the hub."],
   ["reports_instance_logs", "Boot logs", "A host that never answered says why."],
 ];
@@ -798,8 +798,10 @@ function capabilityRows(capabilities, { compact = false } = {}) {
   const lacks = CAPABILITIES.filter(([key]) => !(capabilities || {})[key]);
   const chip = ([key, label, about], on) => {
     const warn = !on && key === "self_terminate";
+    // How far kept storage reaches is what decides whether it helps (D139).
+    const reach = key === "volumes" && on ? (capabilities.volume_reach === "data_center" ? " — in a data center" : " — on one machine") : "";
     return el("li", { class: `cap-chip${on ? "" : " off"}${warn ? " warn" : ""}`, title: about },
-      capIcon(warn ? "warning" : key), warn ? "No dead-man timer" : label);
+      capIcon(warn ? "warning" : key), warn ? "No dead-man timer" : label + reach);
   };
   const row = (title, list, on) => el("div", { class: "cap-row" },
     el("span", { class: "cap-row-title" }, title),
@@ -904,6 +906,8 @@ function providerCard(p, data) {
       el("div", { class: "k" }, "credential"), credentialLine(p),
       el("div", { class: "k" }, "search quota"), quotaMeter(p.search_quota),
       el("div", { class: "k" }, "holding"), holdingLine(p),
+      p.configured ? el("div", { class: "k" }, "models") : null,
+      p.configured ? keepModelsControl(p) : null,
       p.search_error ? el("div", { class: "k" }, "last search") : null,
       p.search_error ? el("div", { class: "error" }, p.search_error) : null,
       p.pending ? el("div", { class: "k" }, "waiting") : null,
@@ -981,6 +985,43 @@ async function withRetype(send, title) {
     if (!ok) return null;
     return await send(loosening.value);
   }
+}
+
+// Keep models between hosts (D139): offered only where the provider's storage reaches a data
+// center; anywhere else the box is greyed and says why, in the provider's own terms.
+const KEEP_MODELS_WHY = {
+  data_center: "Each workload renting here gets a model volume in its first host's data center. Later hosts there copy their models from it, each file checked, instead of downloading. Billed to the workload's lease; deleted when the workload ends.",
+  machine: "This provider keeps a volume on one machine only. It would help only when that same machine is free again, which is rare, and it is billed the whole time.",
+  none: "This provider keeps no storage between hosts.",
+};
+
+function keepModelsControl(p) {
+  const reach = p.volume_reach || "none";
+  const can = reach === "data_center";
+  const why = KEEP_MODELS_WHY[reach] || KEEP_MODELS_WHY.none;
+  const hint = `keep-models-${p.connection}`;
+  const box = el("input", { type: "checkbox", checked: (can && p.keep_models) || undefined, disabled: !can || undefined,
+    "aria-describedby": hint, onchange: (e) => setKeepModels(e.target, p) });
+  return el("label", { class: `remember keep-models${can ? "" : " is-disabled"}`, title: why }, box,
+    el("span", {}, "Keep models between hosts",
+      p.model_volumes ? el("span", { class: "muted" }, ` · ${p.model_volumes} model volume${p.model_volumes === 1 ? "" : "s"} now`) : null),
+    el("span", { class: "hint muted", id: hint }, can ? why : `Not available: ${why}`));
+}
+
+async function setKeepModels(box, p) {
+  const on = box.checked;
+  providersView.focus = p.connection;
+  await run(box, async () => {
+    const ok = await confirmAction({
+      title: on ? `Keep models between hosts at ${providerLabel(p)}?` : `Stop keeping models at ${providerLabel(p)}?`,
+      okLabel: on ? "Keep models" : "Stop keeping them",
+      body: on
+        ? "Each workload renting here gets a model volume in its first host's data center, sized to its models. It is billed to the workload's lease, whether or not a host has it, and deleted when the workload ends. Later hosts there copy their models from it instead of downloading; the data center is preferred only while that saves more than it costs."
+        : "No new model volume is made here. Each one already made is deleted once no host has it, and later hosts download their models.",
+    });
+    if (!ok) { box.checked = !on; return; }
+    await api.changeProvider(p.connection, { keep_models: on });
+  });
 }
 
 async function toggleProvider(button, p) {
@@ -3336,6 +3377,21 @@ function workloadActions(w) {
     el("button", { class: "small danger", onclick: (e) => endWorkload(e.target, w) }, "End…"));
 }
 
+// A workload's model volume, in one line (D139): where, how big, what it holds, what it costs.
+const VOLUME_STATES = {
+  filling: (v) => `being filled by ${v.filler}`,
+  ready: (v) => `ready (${v.models.join(", ")})`,
+  empty: () => "empty — the next host there fills it",
+  stale: () => "holds an older build — the next host there fills the new one",
+};
+
+function volumeLine(v) {
+  const state = (VOLUME_STATES[v.state] || (() => v.state || "?"))(v);
+  return el("div", {}, `${v.connection} · ${v.location} · ${v.size_gb} GB · `,
+    el("span", { class: v.state === "ready" ? "ok-text" : v.state === "filling" ? "" : "warn-text" }, state),
+    el("span", { class: "muted" }, ` · ${rate(v.hourly)}, ${dollars(v.spent)} so far`));
+}
+
 function workloadDetail(w) {
   const answers = w.answers || {};
   const keyState = (k) => {
@@ -3371,6 +3427,7 @@ function workloadDetail(w) {
       el("div", {}, `${answers.count || 0} served, ${answers.borrowed || 0} on shared hosts while starting, ${answers.refused || 0} refused`),
       el("div", { class: "k" }, "made by"), el("div", {}, w.provisioner ? `a program, with provisioning key ${w.provisioner}` : "an operator"),
       el("div", { class: "k" }, "lease"), el("div", { class: "mono" }, w.lease.lease_id),
+      ...((w.volumes || []).length ? [el("div", { class: "k" }, "model volume"), el("div", {}, w.volumes.map(volumeLine))] : []),
       el("div", { class: "k" }, "keys"),
       el("div", {}, (w.keys || []).map((k) => el("div", {}, el("span", { class: "mono" }, k.key_id),
         el("span", { class: "muted" }, ` made ${until(k.created_at)}${keyState(k)}`))))),
@@ -3379,7 +3436,10 @@ function workloadDetail(w) {
       ? el("table", {}, el("thead", {}, el("tr", {}, ...["Host", "State", "Models", "Machine", "Kind", "Answers at once", "Price"].map((h) => el("th", {}, h)))),
           el("tbody", {}, w.hosts.map((h) => el("tr", {},
             el("td", {}, hostLink(h.host_id)), el("td", {}, pill(h.state)),
-            el("td", { class: "mono" }, (h.models || []).join(", ")), el("td", {}, h.hardware),
+            el("td", {}, el("span", { class: "mono" }, (h.models || []).join(", ")),
+              h.models_source && h.models_source !== "hub"
+                ? el("div", { class: "muted" }, h.models_source === "volume" ? "copied from its model volume" : "copied from a sibling") : null),
+            el("td", {}, h.hardware),
             el("td", {}, pricedPill(h), h.connection ? el("div", { class: "muted" }, h.connection) : null),
             el("td", { class: "num" }, h.workers),
             el("td", { class: "num" }, rate(h.hourly))))))

@@ -194,6 +194,13 @@ class Volume:
     builds: Optional[dict[str, str]] = None
     #: The provider connection it is on (D129); empty for one made before connections.
     connection: str = ""
+    #: A data-center volume's data center (D139); None for one bound to a machine.
+    location: Optional[str] = None
+    #: Whether it holds its builds (D139): `filling` (by `filler`), `ready`, `empty` (its filler
+    #: went without filling it) or `stale` (the hub's build changed). None for a machine's.
+    state: Optional[str] = None
+    #: The one host filling it, while one is.
+    filler: Optional[str] = None
 
 
 class WorkloadStore:
@@ -345,11 +352,16 @@ class WorkloadStore:
     def add_volume(self, volume: Volume) -> None:
         self.db.execute(
             "INSERT INTO workload_volumes (volume_id, workload, machine_id, size_gb, hourly, lease_id, created_at, builds, "
-            "connection) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "connection, location, state, filler) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (volume.volume_id, volume.workload, volume.machine_id, volume.size_gb, volume.hourly,
              volume.lease_id, volume.created_at, json.dumps(volume.builds) if volume.builds is not None else None,
-             volume.connection or None),
+             volume.connection or None, volume.location, volume.state, volume.filler),
         )
+
+    def volume_state(self, volume_id: str, state: str, filler: Optional[str] = None) -> None:
+        """Whether a data-center volume holds its builds, and who is filling it (D139)."""
+        self.db.execute("UPDATE workload_volumes SET state = ?, filler = ? WHERE volume_id = ?",
+                        (state, filler, volume_id))
 
     def volumes(self, workload: Optional[str] = None, live_only: bool = True) -> list[Volume]:
         sql = "SELECT * FROM workload_volumes WHERE 1=1"
@@ -362,7 +374,7 @@ class WorkloadStore:
         return [
             Volume(r["volume_id"], r["workload"], r["machine_id"], r["size_gb"], r["hourly"], r["lease_id"],
                    r["created_at"], r["deleted_at"], json.loads(r["builds"]) if r["builds"] else None,
-                   r["connection"] or "")
+                   r["connection"] or "", r["location"], r["state"], r["filler"])
             for r in self.db.query(sql + " ORDER BY created_at", params)
         ]
 

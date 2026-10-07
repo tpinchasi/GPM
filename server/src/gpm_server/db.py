@@ -357,6 +357,11 @@ _ADDED_COLUMNS = {
         ("builds", "TEXT"),
         # The provider connection it is on (D129); NULL for one made before: the legacy connection.
         ("connection", "TEXT"),
+        # A data-center volume (D139): its data center; whether it holds its builds (`filling`,
+        # `ready`, `empty`, `stale`); and the one host filling it, while one is.
+        ("location", "TEXT"),
+        ("state", "TEXT"),
+        ("filler", "TEXT"),
     ],
     "spend": [
         # The provider connection the money went to (D129); NULL before: the legacy connection.

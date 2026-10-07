@@ -84,6 +84,9 @@ class VastProvider:
     endpoint_settings: ClassVar[tuple[str, ...]] = ("base_url",)
 
     capabilities = ProviderCapabilities(
+        #: Vast sells volumes bound to one machine (D139, verified 2026-10-07): not used, and
+        #: said, so keeping models between hosts is shown greyed here with that reason.
+        volume_reach="machine",
         interruptible=True,
         parkable=True,
         same_machine_rebid=True,

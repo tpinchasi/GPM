@@ -451,11 +451,14 @@ class WorkloadsConfig(BaseModel):
     eviction_prior_per_hour: float = Field(default=0.10, ge=0.0)
     #: How long an engine takes to load a model once it is on disk, for the time to ready.
     engine_load_s: float = Field(default=180.0, ge=0.0)
-    #: Keep a workload's models on a volume on its machine, for its next host there (D116).
-    keep_models_on_machine: bool = True
-    #: Where a new host of a workload gets its models, tried in order (D116).
-    model_sources: list[Literal["warm", "sibling", "hub"]] = Field(
-        default_factory=lambda: ["warm", "sibling", "hub"]
+    #: Retired (D139): models are kept between hosts by a provider account's `keep_models`, and
+    #: only where its volumes reach a data center. Still read, so a file that sets it loads; it
+    #: does nothing.
+    keep_models_on_machine: Optional[bool] = None
+    #: Where a new host of a workload gets its models, tried in order (D116, D139): its model
+    #: volume, a ready sibling's copy, the hub. `warm` is read as `volume`.
+    model_sources: list[Literal["volume", "warm", "sibling", "hub"]] = Field(
+        default_factory=lambda: ["volume", "sibling", "hub"]
     )
     #: How long a copy from a sibling may take. Past it the host is given up and another rented:
     #: a copy the provider may still be running is never raced by a fetch into the same place.
@@ -464,6 +467,7 @@ class WorkloadsConfig(BaseModel):
 
     @model_validator(mode="after")
     def _hub_is_last_resort(self) -> "WorkloadsConfig":
+        self.model_sources = ["volume" if s == "warm" else s for s in self.model_sources]
         if "hub" not in self.model_sources:
             raise ValueError("workloads.model_sources must keep 'hub': it is the source every other falls back to")
         if len(set(self.model_sources)) != len(self.model_sources):
@@ -791,6 +795,11 @@ class ProviderConnection(BaseModel):
     #: for an operator who keeps secrets out of the pool's machine state. Unset: one typed into
     #: the console, else the plug-in's own variable (`VAST_API_KEY`).
     credential_env: Optional[str] = Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+    #: Keep models between hosts (D139): each workload renting here gets a model volume in its
+    #: first host's data center, which its later hosts copy their models from. Only where the
+    #: plug-in's volumes reach a data center; on any other provider it is refused when saved, and
+    #: does nothing if set in the file.
+    keep_models: bool = False
 
 
 class RentedConfig(BaseModel):

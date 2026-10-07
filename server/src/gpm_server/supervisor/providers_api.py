@@ -102,6 +102,12 @@ def register(
             "enabled": bool(conn is not None and conn.enabled),
             "settings": redacted(dict(conn.settings)) if conn is not None else {},
             "interruption_prior_per_hour": conn.interruption_prior_per_hour if conn is not None else None,
+            # Keep models between hosts (D139): on or off, and whether this provider can at all —
+            # only where its volumes reach a data center.
+            "keep_models": bool(conn is not None and conn.keep_models),
+            "volume_reach": (provider.capabilities.reach or provider.capabilities.volume_reach) if provider is not None else None,
+            "model_volumes": sum(1 for v in fleet.workload_store.volumes()
+                                 if v.location is not None and fleet.resolve(v.connection or fleet.legacy_connection) == name),
             "credential_env": conn.credential_env if conn is not None else None,
             "credential": accounts.describe(name, provider) if provider is not None and name in accounts.built else None,
             "pending": accounts.pending.get(name),
@@ -292,6 +298,17 @@ def register(
         for key in ("interruption_prior_per_hour", "credential_env"):
             if key in body:
                 wanted[key] = body[key]
+        if "keep_models" in body:
+            if not isinstance(body["keep_models"], bool):
+                return error(400, "bad_request", "`keep_models` is true or false")
+            provider = supervisor.fleet.providers.get(name)
+            reach = (provider.capabilities.reach or provider.capabilities.volume_reach) if provider is not None else None
+            if body["keep_models"] and reach != "data_center":
+                return error(409, "cannot_keep_models", (
+                    f"{name} keeps a volume on one machine only: it would help only when that same machine is "
+                    "free again, which is rare, and it is billed the whole time" if reach == "machine"
+                    else f"{name} keeps no storage between hosts"))
+            wanted["keep_models"] = body["keep_models"]
         if not wanted:
             return error(400, "bad_request", "nothing to change")
         text, version = supervisor.store.read()

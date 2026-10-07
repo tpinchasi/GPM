@@ -692,3 +692,27 @@ def test_signing_in_is_kept_for_the_tab_or_the_browser_and_sign_out_forgets_it(p
         page.js("localStorage.setItem('gpm.admin-key', 'gpmx_not_a_key_any_more'); location.reload(); true")
         page.until("(document.getElementById('key-dialog') || {}).open === true", within=30, what="asked again")
         assert page.js("localStorage.getItem('gpm.admin-key') === null")
+
+
+def test_keeping_models_is_turned_on_only_where_storage_reaches_a_data_center(pool):
+    """D139: the checkbox on each provider account. Where storage is bound to one machine, or
+    there is none, it is refused with the reason the console shows on the greyed box."""
+    import dataclasses
+
+    supervisor, market, base, path, database = pool
+    machine_only = dataclasses.replace(market.capabilities, volumes=True, volume_reach="machine")
+    market.capabilities = machine_only
+    refused = httpx.patch(f"{base}/pool/providers/fake", headers=AUTH, json={"keep_models": True})
+    assert refused.status_code == 409 and "one machine only" in refused.json()["detail"]
+    market.capabilities = dataclasses.replace(machine_only, volumes=False, volume_reach=None)
+    assert "keeps no storage" in httpx.patch(f"{base}/pool/providers/fake", headers=AUTH,
+                                             json={"keep_models": True}).json()["detail"]
+
+    market.capabilities = dataclasses.replace(machine_only, volume_reach="data_center")
+    turned_on = httpx.patch(f"{base}/pool/providers/fake", headers=AUTH, json={"keep_models": True})
+    assert turned_on.status_code == 200, turned_on.text
+    assert "keep_models: true" in path.read_text()
+    view = next(c for c in httpx.get(f"{base}/pool/providers", headers=AUTH).json()["connections"]
+                if c["connection"] == "fake")
+    assert view["keep_models"] is True and view["volume_reach"] == "data_center"
+    assert supervisor.fleet.keeps_models("fake"), "for hosts not yet created, at once"

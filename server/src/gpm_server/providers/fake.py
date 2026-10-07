@@ -279,8 +279,30 @@ class FakeProvider:
             raise BidLost(f"bid {bid} did not win machine {offer.machine_id}",
                           response={"success": False, "msg": "outbid", "offer": offer.offer_id})
 
-        volume_id = None
-        if spec.volume is not None:
+        volume_id, location = None, None
+        if spec.volume is not None and self.capabilities.reach == "data_center":
+            # A data-center volume (D139): the instance lands in the volume's data center, or the
+            # create fails and leaves nothing behind.
+            if spec.volume.volume_id is not None:
+                held = self.volumes.get(spec.volume.volume_id)
+                if held is None:
+                    raise ProviderError(f"volume {spec.volume.volume_id} does not exist")
+                location = held.location
+            else:
+                location = spec.volume.location or (offer.locations[0] if offer.locations else None)
+            if location is None or location not in offer.locations:
+                raise OfferGone(f"offer {offer.offer_id} cannot land in data center {location}")
+            if spec.volume.volume_id is not None:
+                volume_id = spec.volume.volume_id
+            else:
+                volume_id = f"v-{next(self._volume_ids)}"
+                self.volumes[volume_id] = VolumeInfo(
+                    volume_id=volume_id, machine_id=location, label=spec.volume.label,
+                    size_gb=spec.volume.size_gb,
+                    hourly=round(spec.volume.size_gb * (offer.volume_per_gb_hourly or 0.0001), 6),
+                    location=location,
+                )
+        elif spec.volume is not None:
             if not self.capabilities.volumes:
                 raise ProviderError("this provider has no volumes")
             if spec.volume.volume_id is not None:
@@ -312,7 +334,8 @@ class FakeProvider:
             # engines and start creating hosts that can never answer.
             engine_url=self._next_engine_url(),
         )
-        return Instance(instance_id=instance_id, label=spec.label, machine_id=offer.machine_id, volume_id=volume_id)
+        return Instance(instance_id=instance_id, label=spec.label, machine_id=offer.machine_id, volume_id=volume_id,
+                        location=location)
 
     async def list_volumes(self, label_prefix: str) -> list[VolumeInfo]:
         self._guard("list_volumes")
