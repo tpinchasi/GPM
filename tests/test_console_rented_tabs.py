@@ -149,6 +149,46 @@ def test_the_days_search_quota_is_shown_beside_the_market_and_the_provider(tmp_p
 
 
 @pytest.mark.timeout(180)
+def test_each_providers_search_quota_is_named_above_the_market(tmp_path):
+    """With several providers, the line above the search names each one's quota, or says it has
+    none — it showed only the first provider's, unnamed, as if it were the pool's."""
+    from gpm_server.config import ProviderConnection
+    from gpm_server.providers import FakeProvider
+
+    config_path = tmp_path / "pool.yaml"
+    config_path.write_text(POOL_YAML + f"\nrequest_log: {tmp_path / 'gpm.sqlite3'}\n")
+    loop = BackgroundLoop()
+    database = Database(tmp_path / "gpm.sqlite3")
+    supervisor = Supervisor(load_config(config_path), database, config_path=str(config_path))
+    fleet = supervisor.fleet
+    fleet.provider.daily_search_rows = 20_000
+    fleet.provider.display_name = "Quota Cloud"
+    second = FakeProvider()
+    second.display_name = "Open Cloud"
+    supervisor.config.rented.providers["open"] = ProviderConnection(type="fake")
+    fleet.providers["open"] = second
+    fleet.connection_types["open"] = "fake"
+    server = ServerHandle(create_control_app(supervisor, supervisor.config), loop)
+    try:
+        with open_page(f"{server.base_url}/ui/#rented/finding") as page:
+            page.until("(document.getElementById('key-dialog') || {}).open === true", within=60, what="the page")
+            page.js(HELPERS)
+            page.js(f"document.getElementById('key-input').value = {json.dumps(ADMIN_KEY)};"
+                    "document.getElementById('key-form').requestSubmit(); true")
+            page.until("__headings().includes('Live market — the real offer pipeline, read-only')", within=30, what="Finding")
+            text = page.js("document.getElementById('screen').textContent")
+            assert "Quota Cloud: search quota: 0 of 20,000 offers used today" in text
+            assert "Open Cloud: no daily search limit" in text
+            page.js("[...document.querySelectorAll('button')].find(b => b.textContent === 'Search the market').click(); true")
+            page.until("document.getElementById('screen').textContent.includes('searched at')", within=30, what="the search")
+            assert "Open Cloud: no daily search limit" in page.js("document.getElementById('screen').textContent")
+    finally:
+        server.stop()
+        loop.stop()
+        database.close()
+
+
+@pytest.mark.timeout(180)
 def test_a_page_from_an_older_release_reloads_itself_unless_the_operator_is_busy(served, monkeypatch):
     """D122: a forgotten tab must not keep running an older release's code after a deploy."""
     from gpm_server.supervisor import control
