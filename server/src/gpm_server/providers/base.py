@@ -146,6 +146,10 @@ class Offer:
     #: plug-in, which does not know the name it was configured under. A machine identifier is
     #: unique only within its connection.
     connection: str = ""
+    #: Fields the provider does not report, filled with a stated default (providers.md §6): by
+    #: name — `download_mbps`, `reliability`, `verified`, `download_per_gb`. The value is used
+    #: like any other, and every place that shows or decides by it says it was assumed.
+    assumed: tuple[str, ...] = ()
     raw: dict[str, Any] = dataclasses.field(default_factory=dict, repr=False)
 
     def priced_for(self, disk_gb: float) -> "Offer":

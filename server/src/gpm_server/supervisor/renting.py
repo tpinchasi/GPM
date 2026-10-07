@@ -345,6 +345,11 @@ def describe_query(query: OfferQuery) -> list[str]:
     return said
 
 
+#: How an assumed field is said (providers.md §6).
+_ASSUMED_WORDS = {"download_mbps": "download speed", "reliability": "reliability", "verified": "verified",
+                  "download_per_gb": "download price"}
+
+
 class Fleet:
     """The rented half of the pool: what exists, what it costs, and what to do next."""
 
@@ -1906,6 +1911,8 @@ class Fleet:
                     "download_mbps": offer.download_mbps,
                     "storage_hourly": round(offer.storage_hourly, 5),
                     "reliability": offer.reliability,
+                    # What the provider does not report, filled with a stated default (§6).
+                    "assumed": list(offer.assumed),
                     "score": round(offer_score, 3),
                 }
             )
@@ -3734,9 +3741,12 @@ class Fleet:
             self.events.record(
                 "rented",
                 (f"bid ${capped:.3f}/h" if offer.interruptible else f"on demand at ${capped:.3f}/h, not outbiddable")
-                + f" on {offer.machine_id} ({offer.hardware}), {workers} workers: {workers_why}",
+                + f" on {offer.machine_id} ({offer.hardware}), {workers} workers: {workers_why}"
+                + (f"; assumed, as the provider does not report them: {', '.join(_ASSUMED_WORDS.get(a, a) for a in offer.assumed)}"
+                   if offer.assumed else ""),
                 numbers={
                     "workers": workers,
+                    "assumed": list(offer.assumed),
                     # Named here as data, not only in the sentence: the machine history is a
                     # view over this log, and a view should not have to parse prose (D69).
                     "machine": offer.machine_id,

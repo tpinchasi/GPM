@@ -2662,7 +2662,11 @@ const marketPanel = (market) => {
           el("th", {}, ""))),
         el("tbody", {}, (market.best || []).map((offer, index) => el("tr", {},
           el("td", {}, index === 0 ? el("strong", {}, offer.hardware) : offer.hardware,
-            el("div", { class: "muted mono" }, `${offer.machine} · ${offer.gpu_memory_gb}GB · ${offer.download_mbps}Mbps`)),
+            el("div", { class: "muted mono" }, `${offer.machine} · ${offer.gpu_memory_gb}GB · `,
+              // A value the provider does not report is marked as assumed, never shown as measured (§6).
+              (offer.assumed || []).includes("download_mbps")
+                ? el("span", { title: "assumed: this provider does not report download speed" }, `≈${offer.download_mbps}Mbps`)
+                : `${offer.download_mbps}Mbps`)),
           // A bid or a spot price can be taken away; a fixed price cannot. Same machine, different deal.
           el("td", {}, pricedPill(offer), offer.connection ? el("div", { class: "muted" }, offer.connection) : null),
           el("td", { class: "num" }, pricedOf(offer) === "bid" ? rate(offer.floor) : "—"),

@@ -18,6 +18,7 @@ gpm = "gpm_server.cli:main"
 # First-party plug-ins load through the same entry-point mechanism a third party's would.
 [project.entry-points."gpm.providers"]
 fake = "gpm_server.providers.fake:FakeProvider"
+runpod = "gpm_server.providers.runpod:RunPodProvider"
 vast = "gpm_server.providers.vast:VastProvider"
 
 [project.entry-points."gpm.engines"]
