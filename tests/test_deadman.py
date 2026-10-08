@@ -280,7 +280,10 @@ async def test_the_supervisor_beats_every_live_host_each_pass(tmp_path):
 async def test_a_provider_that_cannot_self_terminate_gets_no_timer_and_only_short_leases(tmp_path):
     database, fleet = fleet_for(tmp_path, interruptible=True, self_terminate=False)
     try:
-        assert fleet.deadman_onstart() is None
+        script = fleet.deadman_onstart()
+        # No timer — but the pool's way in and the engine's start are still there: without them the
+        # host could never be reached or serve.
+        assert script is not None and "deadman.sh" not in script
         assert fleet.max_lease_hours() == 1.0
     finally:
         database.close()
@@ -400,3 +403,11 @@ def test_the_loop_repairs_ownership_every_time_not_just_the_first():
 
     assert loop.count("chown -R root /root/.ssh") >= 1, "the loop re-adds the key but not its owner"
     assert "sleep 10" in loop and "UNTIL" in loop
+
+
+def test_without_a_timer_the_script_still_carries_the_key_and_the_engine():
+    from gpm_server.deadman import onstart_script
+
+    script = onstart_script(None, window_s=600, public_key="ssh-ed25519 AAAAtest pool", extra="run-the-engine")
+    assert "deadman.sh" not in script
+    assert "ssh-ed25519 AAAAtest pool" in script and "run-the-engine" in script

@@ -100,7 +100,7 @@ def register(
             # Not running yet: what its class says of itself, for the card's price and note.
             try:
                 known = plugin_presentation(type_name)
-                view.update({k: known.get(k) for k in ("volume_price_per_gb_month", "volume_note")})
+                view.update({k: known.get(k) for k in ("volume_price_per_gb_month", "volume_note", "credential_format")})
             except Exception:  # noqa: BLE001 — an unknown plug-in: nothing more to say
                 pass
         view.update({

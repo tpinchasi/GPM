@@ -86,7 +86,7 @@ A provider states what it can do; the pool adapts rather than assumes.
 | `interruption_notice` — the provider warns before taking an instance away, and `status` says `interrupting` | The pool learns of an interruption only when the instance stops |
 | `parkable` — an instance can be stopped with its disk kept | "Park" is unavailable; tear-down is always destroy |
 | `same_machine_rebid` — a stopped instance can be restarted by raising its bid | Eviction choice is "replace" only |
-| `self_terminate` — an **instance-scoped** credential lets an instance end itself | No dead-man timer; the pool refuses leases longer than a short maximum on this provider |
+| `self_terminate` — an **instance-scoped** credential lets an instance end itself | No dead-man timer; the pool refuses leases longer than a short maximum on this provider. The start-up script still carries the pool's key and the engine's start, without the timer (D140) |
 | `reports_charges` | Spend is estimate-only; the cap safety margin is widened and the console says why |
 | `price_history` | Volatility-aware bidding relies on the pool's own samples only |
 | `direct_port_mapping` — a public port can be mapped to the engine | `http` / `https` transports to rented hosts are unavailable; `tunnel` only |
@@ -105,6 +105,7 @@ reads its own credential, and the console says so and offers no field for one.
     endpoint_settings: ClassVar[tuple[str, ...]]  # the settings that decide where the credential goes
     offered: ClassVar[bool] = True            # False keeps a test double off Add provider
     credential_env: str                       # the variable read when nothing else is given
+    credential_format: ClassVar[str | None]   # what the credential is, where more than one key (≤200 chars)
 
     def set_credential(self, credential: str | None) -> None: ...
 ```
@@ -114,6 +115,8 @@ reads its own credential, and the console says so and offers no field for one.
   old one is closed once its calls have finished.
 - **A stored credential is bound to `endpoint_settings`**: a connection whose values for them
   change no longer gets it.
+- **`credential_format`** is shown under the credential field: a provider whose credential is a
+  client id and a secret (Verda) says how the two are written as one value.
 
 ### The fake provider
 

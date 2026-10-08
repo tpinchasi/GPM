@@ -165,9 +165,10 @@ rented:
   providers:
     vast:   { type: vast }
     runpod: { type: runpod, keep_models: true }   # RUNPOD_API_KEY, or a credential typed in
+    verda:  { type: verda }                       # VERDA_CREDENTIAL=CLIENT_ID:CLIENT_SECRET, or typed in
 ```
 
-Vast and RunPod ship with the framework; another provider is a plug-in (see
+Vast, RunPod and Verda ship with the framework; another provider is a plug-in (see
 [writing-a-plugin.md](writing-a-plugin.md)).
 
 - **RunPod** rents on demand only (it offers no spot), from its Secure and Community clouds
@@ -179,6 +180,15 @@ Vast and RunPod ship with the framework; another provider is a plug-in (see
   own entrypoint, so an image that starts its engine itself needs `rented.engine_start` — for
   Ollama, `nohup ollama serve > /var/log/ollama.log 2>&1 &` — and the image must carry python3
   for the host agent (`vastai/ollama` does). Its SSH daemon is started for you.
+- **Verda** rents GPU virtual machines, on demand or **spot** — at its own price, which the pool pays
+  as listed and never bids on; a spot machine can be taken back at any moment, without notice, and is
+  replaced. Its credential is a Cloud API client's id and secret, written as `CLIENT_ID:CLIENT_SECRET`.
+  The account needs any one SSH key of its own (the provider creates no machine without one; the pool
+  reaches its hosts with its own key). Each machine runs the engine image as one container, with only
+  that container's SSH daemon published (port 2222): every port of a Verda machine is open to the
+  internet, so the engine's is never published. **It has no dead-man timer** — no credential narrower
+  than the whole account — so it serves only short leases; and a machine is never parked, since a
+  shut-down one keeps billing in full. Download speed and reliability are *assumed*, as on RunPod.
 - **Keep models between hosts** (`keep_models: true`, or the checkbox on the account's card) is
   offered only where the provider's storage reaches a data center — RunPod's network volumes, on
   Secure Cloud. Each workload then keeps its models on a volume in its first host's data center,

@@ -1,6 +1,6 @@
 [project]
 name = "gpm-server"
-version = "0.33.1"
+version = "0.34.0"
 description = "GPM router: serves GPU inference from a pool of hosts behind one URL, without an app knowing where the GPU runs."
 requires-python = ">=3.11"
 dependencies = [
@@ -19,6 +19,7 @@ gpm = "gpm_server.cli:main"
 [project.entry-points."gpm.providers"]
 fake = "gpm_server.providers.fake:FakeProvider"
 runpod = "gpm_server.providers.runpod:RunPodProvider"
+verda = "gpm_server.providers.verda:VerdaProvider"
 vast = "gpm_server.providers.vast:VastProvider"
 
 [project.entry-points."gpm.engines"]

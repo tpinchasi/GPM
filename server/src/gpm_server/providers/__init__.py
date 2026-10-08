@@ -26,6 +26,7 @@ from .base import (
 from .fake import FakeProvider, default_offer
 from .runpod import RunPodProvider
 from .vast import VastProvider
+from .verda import VerdaProvider
 
 __all__ = [
     "AccountStatus",
@@ -49,6 +50,7 @@ __all__ = [
     "ProviderUnavailable",
     "RunPodProvider",
     "VastProvider",
+    "VerdaProvider",
     "default_offer",
     "get_provider",
     "installed_plugins",

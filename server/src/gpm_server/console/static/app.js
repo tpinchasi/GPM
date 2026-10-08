@@ -1117,8 +1117,11 @@ function secretField(label, hint) {
     toggle.textContent = shown ? "Hide" : "Show";
     toggle.setAttribute("aria-pressed", String(shown));
   } }, "Show");
-  return { input, node: el("div", { class: "field" }, el("label", { for: id }, label),
-    el("div", { class: "row tight" }, input, toggle), el("small", { id: `${id}-hint`, class: "muted" }, hint)) };
+  const said = el("small", { id: `${id}-hint`, class: "muted" }, hint);
+  // What the credential is, where the plug-in says (an id and a secret, say), before the hint.
+  const format = (text) => said.replaceChildren(...(text ? [el("strong", {}, text), " "] : []), hint);
+  return { input, format, node: el("div", { class: "field" }, el("label", { for: id }, label),
+    el("div", { class: "row tight" }, input, toggle), said) };
 }
 
 const SECRET_HINT = "Sent once to this pool and kept by its supervisor in an owner-only file. It is never shown again — not here, not in a log.";
@@ -1126,6 +1129,7 @@ const SECRET_HINT = "Sent once to this pool and kept by its supervisor in an own
 function credentialDialog(p, data) {
   const { dialog } = providerDialog();
   const secret = secretField(`${p.display_name || p.type} credential`, SECRET_HINT);
+  secret.format(p.credential_format);
   const result = el("div", { role: "alert" });
   const save = el("button", { class: "primary", type: "submit", disabled: true }, "Test and save");
   secret.input.addEventListener("input", () => { save.disabled = !secret.input.value.trim(); });
@@ -1263,7 +1267,7 @@ function addProviderDialog(data) {
           if (!draft.nameEdited) draft.name = chosen.type;
           draft.tested = null; draft.plan = null;
         }
-        draft.plugin = chosen; draft.problem = null; draft.step = 2; draw();
+        draft.plugin = chosen; draft.problem = null; draft.step = 2; secret.format(chosen.credential_format); draw();
       };
       return el("button", { type: "button", class: `plugin-tile${draft.plugin && draft.plugin.type === p.type ? " chosen" : ""}`,
         disabled: draft.busy || undefined, onclick: pick },
