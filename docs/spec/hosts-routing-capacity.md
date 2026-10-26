@@ -367,9 +367,13 @@ On the others the policy is verified by test-connection and every probe.
   the request that finds a model cold pays its load time, and `X-GPM-Wait-S` does not include
   it — that is generation from the pool's point of view.
 
-**In the console's Profiles tab**, each build shows what it serves and what it accepts, filled from
-the hub's task where known. A build whose kind the profile's engine cannot serve — Whisper on a
-profile of Ollama hosts — is listed greyed, with the reason, and cannot be added (D147).
+**In the console's Profiles tab**, each build shows what it does — chat, chat that sees pictures,
+chat on text only, speech to text, ranking, embeddings only — and the operator can change it; a
+build found on the hub starts from the hub's task (`automatic-speech-recognition` is speech to
+text, `text-ranking` ranking, `image-text-to-text` pictures; `text-classification` says nothing).
+A build whose kind the rented engine cannot serve — Whisper on Ollama hosts — says so beside it,
+and saving is refused by the configuration's own check (D147). Each vLLM image has a *decodes
+audio* box (`audio-decoding`), and a profile holding speech with no image ticked says so.
 
 ## 4. Model resolution
 

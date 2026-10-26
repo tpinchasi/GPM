@@ -434,3 +434,83 @@ def test_a_variants_exact_size_is_read_once_and_kept(pool, monkeypatch):
     # A test-sized file rounds to nothing in GB; what matters here is one read, then the cache.
     assert first == second == {"repo": BIG_FP8, "size_gb": first["size_gb"]}
     assert sum(1 for r in hub.requests if r.startswith("list")) == 1, hub.requests
+
+
+# --- what a build does (D142, D143) ---
+
+
+def test_the_hubs_speech_and_ranking_tasks_are_named_for_what_the_build_serves():
+    original = next(e for e in RECORDED_SEARCH if e["id"] == "google/gemma-4-26B-A4B-it")
+    speech = {**original, "id": "owner/speech-test", "pipeline_tag": "automatic-speech-recognition"}
+    ranker = {**original, "id": "owner/ranker-test", "pipeline_tag": "text-ranking"}
+    either = {**original, "id": "owner/classifier-test", "pipeline_tag": "text-classification"}
+    groups = {g.model: g for g in hubbuilds.group_search([speech, ranker, either])}
+    assert groups["owner/speech-test"].task == "speech to text"
+    assert groups["owner/ranker-test"].task == "ranking"
+    assert groups["owner/classifier-test"].task is None, "rankers and every other classifier alike"
+
+
+def test_a_build_added_from_the_hub_says_what_it_serves(pool):
+    supervisor, url, path = pool
+    answer = put(url, {
+        "profiles": {"rank": {"ranker": "owner/ranker-test"}, "chat": {BIG: BIG_FP4}},
+        "rent": ["rank", "chat"],
+        "add": [{"name": "ranker", "builds": [
+            {"tag": "owner/ranker-test", "engine": "vllm", "size_gb": 1.1, "serves": ["rerank"], "inputs": None},
+        ]}],
+    })
+    assert answer.status_code == 200, answer.text
+    written = yaml.safe_load(path.read_text())
+    assert written["catalog"]["ranker"]["variants"] == [
+        {"tag": "owner/ranker-test", "engine": "vllm", "size_gb": 1.1, "serves": ["rerank"]},
+    ]
+
+
+def test_what_an_existing_build_takes_is_corrected_in_place_and_unsaid_again(pool):
+    supervisor, url, path = pool
+    profiles = {"profiles": {"chat": {BIG: BIG_FP4}}, "rent": ["chat"]}
+    answer = put(url, {**profiles, "describe": [{"model": BIG, "tag": BIG_FP4, "inputs": ["image"]}]})
+    assert answer.status_code == 200, answer.text
+    variants = yaml.safe_load(path.read_text())["catalog"][BIG]["variants"]
+    assert variants[1] == {"tag": BIG_FP4, "engine": "vllm", "size_gb": 17.0, "inputs": ["image"]}
+    assert variants[0]["tag"] == BIG and "inputs" not in variants[0], "only the build named"
+
+    supervisor.reload_config()
+    answer = put(url, {**profiles, "describe": [{"model": BIG, "tag": BIG_FP4, "inputs": None}]})
+    assert answer.status_code == 200, answer.text
+    assert "inputs" not in yaml.safe_load(path.read_text())["catalog"][BIG]["variants"][1]
+
+
+@pytest.mark.parametrize("change, said", [
+    ({"describe": [{"model": BIG, "tag": "someone/Else", "serves": ["chat"]}]}, "no build"),
+    ({"describe": [{"model": BIG, "tag": BIG_FP4, "serves": ["speak"]}]}, "serves"),
+    ({"describe": [{"model": BIG, "tag": BIG_FP4, "serves": []}]}, "at least one"),
+    ({"describe": [{"model": BIG, "tag": BIG_FP4, "inputs": ["video"]}]}, "inputs"),
+])
+def test_what_a_build_does_is_said_in_known_words_only(pool, change, said):
+    supervisor, url, path = pool
+    before = path.read_text()
+    answer = put(url, {"profiles": {"chat": {BIG: BIG_FP4}}, "rent": ["chat"], **change})
+    assert answer.status_code == 400 and said in answer.text
+    assert path.read_text() == before
+
+
+def test_speech_rented_from_an_image_not_said_to_decode_audio_is_refused_before_anything_is_written(pool):
+    supervisor, url, path = pool
+    before = path.read_text()
+    answer = put(url, {
+        "profiles": {"speech": {"speech": "owner/speech-test"}}, "rent": ["speech"],
+        "add": [{"name": "speech", "builds": [{"tag": "owner/speech-test", "engine": "vllm", "serves": ["transcribe"]}]}],
+    })
+    assert answer.status_code == 400 and "audio-decoding" in answer.text
+    assert path.read_text() == before
+
+
+def test_the_status_says_what_each_build_does_and_each_engine_can(pool):
+    supervisor, url, path = pool
+    with httpx.Client(base_url=url, headers={"Authorization": f"Bearer {ADMIN_KEY}"}, timeout=30) as http:
+        engine = http.get("/pool/status").json()["engine"]
+    fp4 = next(v for v in engine["pool_variants"] if v["tag"] == BIG_FP4)
+    assert fp4["serves"] is None and fp4["inputs"] is None
+    assert engine["offers"]["ollama"]["kinds"] == ["chat", "embed"]
+    assert set(engine["offers"]["vllm"]["kinds"]) == {"chat", "embed", "transcribe", "rerank"}

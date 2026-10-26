@@ -340,6 +340,10 @@ _TASKS = {
     "any-to-any": "vision",
     "feature-extraction": "embedding",
     "sentence-similarity": "embedding",
+    # Models beyond chat (D142). `text-classification` is left out: it holds rankers and every
+    # other kind of classifier alike, so it says nothing about what a build serves.
+    "automatic-speech-recognition": "speech to text",
+    "text-ranking": "ranking",
 }
 
 

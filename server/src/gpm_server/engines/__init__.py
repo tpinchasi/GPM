@@ -1,6 +1,7 @@
 from .base import (
     CHAT,
     EMBED,
+    INPUTS,
     KINDS,
     RERANK,
     TRANSCRIBE,
@@ -26,6 +27,7 @@ from .vllm import VllmEngine
 __all__ = [
     "CHAT",
     "EMBED",
+    "INPUTS",
     "KINDS",
     "RERANK",
     "TRANSCRIBE",

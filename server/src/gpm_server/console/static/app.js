@@ -1651,6 +1651,8 @@ function engineDraft(status) {
     migrated: made.migrated,
     // Models and variants found by searching, new to the pool's file: {model: [{tag, engine, size_gb}]}.
     adds: {},
+    // What builds already in the file serve and take, as changed here: {"model|tag": {serves, inputs}}.
+    describe: {},
     // Which profile's finder is open, by index; one at a time.
     finding: null,
     images: images.length ? images.map((i) => ({ ...i })) : null,
@@ -1748,6 +1750,59 @@ function variantsFor(status, d) {
   return found;
 }
 
+// What a build does, as the catalog says it (D142, D143) — the choices a profile row offers.
+// `serves` null means chat and embeddings; `inputs` null means nobody has said what it takes.
+const DOES = [
+  { key: "chat", label: "chat", serves: null, inputs: null },
+  { key: "pictures", label: "chat, sees pictures", serves: null, inputs: ["image"] },
+  { key: "text", label: "chat, text only", serves: null, inputs: [] },
+  { key: "transcribe", label: "speech to text", serves: ["transcribe"], inputs: null },
+  { key: "rerank", label: "ranking", serves: ["rerank"], inputs: null },
+  { key: "embed", label: "embeddings only", serves: ["embed"], inputs: null },
+];
+const KIND_WORDS = { chat: "chat", embed: "embeddings", transcribe: "speech to text", rerank: "ranking" };
+// The hub's task for a model, as what a build of it found there does.
+const TASK_DOES = { "speech to text": "transcribe", ranking: "rerank", vision: "pictures" };
+const sameList = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+
+function traitsOf(status, d, model, tag) {
+  const key = `${model}|${tag}`;
+  if (key in d.describe) return d.describe[key];
+  const added = (d.adds[model] || []).find((b) => b.tag === tag);
+  if (added) return { serves: added.serves ?? null, inputs: added.inputs ?? null };
+  const known = (status.engine.pool_variants || []).find((v) => v.model === model && v.tag === tag) || {};
+  return { serves: known.serves ?? null, inputs: known.inputs ?? null };
+}
+
+function setTraits(d, model, tag, traits) {
+  const added = (d.adds[model] || []).find((b) => b.tag === tag);
+  if (added) Object.assign(added, traits);
+  else d.describe[`${model}|${tag}`] = traits;
+}
+
+function traitWords(t) {
+  const serves = (t.serves || ["chat", "embed"]).map((k) => KIND_WORDS[k] || k).join(", ");
+  return t.inputs ? `${serves}; takes ${t.inputs.length ? t.inputs.join(", ") : "text only"}` : serves;
+}
+
+// What the build does, chosen here, and whether the engine rented hosts run can do it at all —
+// said before saving, as the file's own check would refuse it after.
+function doesCell(status, d, m, draw) {
+  if (!m.build) return el("td", {}, "—");
+  const t = traitsOf(status, d, m.model, m.build);
+  const current = DOES.find((o) => sameList(o.serves, t.serves) && sameList(o.inputs, t.inputs));
+  const select = el("select", { "aria-label": "what this build does", onchange: (ev) => {
+    const o = DOES.find((x) => x.key === ev.target.value);
+    if (o) { setTraits(d, m.model, m.build, { serves: o.serves, inputs: o.inputs }); draw(); }
+  } },
+  ...(current ? [] : [el("option", { value: "", selected: true }, `as written: ${traitWords(t)}`)]),
+  ...DOES.map((o) => el("option", { value: o.key, ...(current && current.key === o.key ? { selected: true } : {}) }, o.label)));
+  const can = ((status.engine.offers || {})[d.rented] || {}).kinds;
+  const cannot = can ? (t.serves || ["chat", "embed"]).filter((k) => !can.includes(k)) : [];
+  return el("td", {}, select, cannot.length ? el("div", { class: "error" },
+    `${d.rented} cannot serve ${cannot.map((k) => KIND_WORDS[k] || k).join(", ")}${d.rented === "ollama" ? " — rent vLLM for it" : ""}`) : null);
+}
+
 function profileCard(status, d, profile, i, draw) {
   const finding = d.finding === i;
   const shape = (several, label) => el("label", { class: "pick" },
@@ -1761,6 +1816,7 @@ function profileCard(status, d, profile, i, draw) {
   const rows = profile.models.map((m, at) => el("tr", {},
     el("td", { class: "mono" }, m.model),
     el("td", { class: "mono" }, m.build || el("span", { class: "error" }, `no ${d.rented} variant — choose one`)),
+    doesCell(status, d, m, draw),
     el("td", {}, m.precision || "—"),
     el("td", { class: "num" }, m.size_gb ? `${m.size_gb} GB` : m.build ? el("span", { class: "muted" }, "not measured") : "—"),
     el("td", {}, el("button", { class: "small", title: "remove from this profile",
@@ -1781,7 +1837,7 @@ function profileCard(status, d, profile, i, draw) {
         draw();
       } }, "Remove profile")),
     profile.models.length ? el("table", { class: "builds held" },
-      el("thead", {}, el("tr", {}, ...["Model", "Variant", "Precision", "Size", ""].map((h) => el("th", {}, h)))),
+      el("thead", {}, el("tr", {}, ...["Model", "Variant", "Does", "Precision", "Size", ""].map((h) => el("th", {}, h)))),
       el("tbody", {}, ...rows)) : el("p", { class: "muted" }, "Holds nothing yet — add a model below."),
     splitsAcross(status, d, profile, draw),
     el("div", { class: "row" }, needsLine(profile.models, profile.cards || 1),
@@ -1950,7 +2006,7 @@ function finderView(status, d, profile, draw) {
       el("span", { class: "muted" }, "size ≤"), number("maxSize", "GB"),
       el("span", { class: "muted" }, "fits a card of"), number("fitsCard", "GB"),
       hubEngine ? select("precision", [["", "any precision"], ...["BF16", "FP16", "FP8", "NVFP4", "MXFP4", "INT4", "INT8"].map((p) => [p, p])]) : null,
-      select("kind", [["", "any kind"], ["chat", "chat"], ["vision", "vision"], ["embedding", "embedding"], ["tools", "tools"], ["thinking", "thinking"]]),
+      select("kind", [["", "any kind"], ["chat", "chat"], ["vision", "vision"], ["embedding", "embedding"], ["speech to text", "speech to text"], ["ranking", "ranking"], ["tools", "tools"], ["thinking", "thinking"]]),
       hubEngine ? el("label", { class: "pick" }, el("input", { type: "checkbox", ...(f.hideGated ? { checked: true } : {}),
         onchange: (ev) => { f.hideGated = ev.target.checked; redraw(); } }), el("span", {}, "hide gated")) : null),
     v.error ? el("p", { class: "error" }, v.error) : null,
@@ -2023,7 +2079,7 @@ function hubResults(status, d, profile, draw, action, held, redraw) {
         el("td", { class: "muted" }, x.full_speed_on ? `full speed on ${x.full_speed_on}` : (x.runs_on ? `runs on ${x.runs_on}` : "—")),
         el("td", { class: x.why_not ? "error" : "muted" }, x.why_not || (x.options || []).join(", ")),
       ], x.why_not ? () => {} : () => {
-        hold(d, profile, name, x.repo, size || null, x.precision, !pool.some((p) => p.tag === x.repo), x.repo);
+        hold(d, profile, name, x.repo, size || null, x.precision, !pool.some((p) => p.tag === x.repo), x.repo, TASK_DOES[group.task]);
         draw();
       }, x.why_not ? "—" : action));
     }
@@ -2092,7 +2148,7 @@ function libraryResults(status, d, profile, draw, action, held) {
 
 // Put a model and its variant in a profile: one model per machine replaces, several adds. A
 // variant new to the pool is remembered to be written into the catalog on save.
-function hold(d, profile, model, tag, size, precision, isNew, repo) {
+function hold(d, profile, model, tag, size, precision, isNew, repo, does) {
   if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(model || "")) {
     finder.error = `"${model}" cannot be a model's name: letters, digits, '.', '_', ':', '-' and '/'`;
     return;
@@ -2106,7 +2162,9 @@ function hold(d, profile, model, tag, size, precision, isNew, repo) {
   }
   if (isNew) {
     const list = d.adds[model] || (d.adds[model] = []);
-    if (!list.some((b) => b.tag === tag)) list.push({ tag, engine: d.rented, size_gb: size, precision });
+    // What the hub says the model is for becomes what the build serves; the row can change it.
+    const o = DOES.find((x) => x.key === does);
+    if (!list.some((b) => b.tag === tag)) list.push({ tag, engine: d.rented, size_gb: size, precision, ...(o ? { serves: o.serves, inputs: o.inputs } : {}) });
   }
   // A size the search could not tell is read now, and fills in when it arrives.
   if (!size && repo) {
@@ -2131,10 +2189,22 @@ function machineSetup(status, d, draw) {
       el("span", { class: "muted" }, "driver ≥"),
       el("input", { type: "text", style: "width:5rem", value: img.min_driver,
         oninput: (ev) => { d.images[i].min_driver = ev.target.value; } }),
+      el("label", { class: "pick", title: "the image carries vLLM's audio extra (audio-decoding); speech to text is placed only on such an image" },
+        el("input", { type: "checkbox", ...((img.capabilities || []).includes("audio-decoding") ? { checked: true } : {}),
+          onchange: (ev) => {
+            const caps = new Set(d.images[i].capabilities || []);
+            if (ev.target.checked) caps.add("audio-decoding"); else caps.delete("audio-decoding");
+            d.images[i].capabilities = [...caps];
+            draw();
+          } }), el("span", {}, "decodes audio")),
       el("button", { class: "small", onclick: () => { d.images.splice(i, 1); draw(); } }, "Remove"))),
       el("button", { class: "small", onclick: () => { d.images.push({ image: "", min_driver: "" }); draw(); } }, "Add an image"));
+    const speech = d.profiles.some((p) => p.rented && p.models.some((m) => m.build
+      && (traitsOf(status, d, m.model, m.build).serves || []).includes("transcribe")));
+    const decodes = (d.images || []).some((img) => (img.capabilities || []).includes("audio-decoding"));
     rows.push(stackedRow("images", "images, newest first", { control: list },
-      "a machine gets the first its driver can run; one that can run none is never bid on"));
+      speech && !decodes ? el("span", { class: "error" }, "a profile holds speech to text: tick “decodes audio” on an image that carries vLLM's audio extra — vLLM's own image does not")
+        : "a machine gets the first its driver can run; one that can run none is never bid on"));
   } else {
     rows.push(stackedRow("image", "image", { control: el("input", { type: "text", style: "width:18rem", value: d.image,
       oninput: (ev) => { d.image = ev.target.value; } }) }, "pinned, never a floating tag"));
@@ -2211,6 +2281,11 @@ async function saveEngine(event, note) {
     // Only builds a profile still uses: one found and then dropped is not written to the file.
     add: Object.entries(d.adds).map(([name, builds]) => ({ name, builds: builds.filter((b) => used.has(`${name}|${b.tag}`)) }))
       .filter((item) => item.builds.length),
+    // What builds already in the file serve and take, where changed here (D143).
+    describe: Object.entries(d.describe).filter(([key]) => used.has(key)).map(([key, t]) => {
+      const at = key.indexOf("|");
+      return { model: key.slice(0, at), tag: key.slice(at + 1), serves: t.serves, inputs: t.inputs };
+    }),
   };
   if (d.rented === "vllm") body.images = (d.images || []).filter((i) => (i.image || "").trim());
   else { body.images = []; if ((d.image || "").trim()) body.image = d.image.trim(); }

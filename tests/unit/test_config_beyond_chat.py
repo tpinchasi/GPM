@@ -132,3 +132,13 @@ def test_speech_on_rented_vllm_needs_an_image_said_to_decode_audio():
     pool = config(catalog=catalog, rented=renting(images=plain + AUDIO_IMAGES))
     assert pool.image_needs(["owner/whisper"]) == frozenset({"audio-decoding"})
     assert pool.image_needs(["chat:7b"]) == frozenset()
+
+
+def test_rented_hosts_cannot_run_whisper_cpp():
+    with pytest.raises(ValueError, match="rented hosts cannot run whisper-cpp"):
+        config(catalog=WHISPER_CATALOG, rented=renting(engine="whisper-cpp"))
+
+
+def test_a_request_limit_above_what_a_machine_accepts_is_refused():
+    with pytest.raises(ValueError, match="64"):
+        config(model_set=["chat"], hosts=[local()], pool={"max_request_mb": 100})

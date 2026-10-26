@@ -25,8 +25,9 @@ class WhisperCppEngine:
     default_port: ClassVar[int] = 8178
     models_dir: ClassVar[str] = ""
     image_words: ClassVar[tuple[str, ...]] = ("whisper",)
-    #: A new build is served by starting the server again with it — the agent does that.
-    loads_by_restart: ClassVar[bool] = True
+    #: The agent starts the server with each new build itself, when it is asked to hold it; the
+    #: pool never asks for a restart (D148).
+    loads_by_restart: ClassVar[bool] = False
     splits_across_cards: ClassVar[bool] = False
     options: ClassVar[dict[str, EngineOption]] = {}
     #: Its builds are files in model-hub repositories (`owner/repo/file.bin`).

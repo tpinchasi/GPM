@@ -407,7 +407,8 @@ class PoolSettings(BaseModel):
     #: The most one request body may be, in megabytes (D144): over it is `413
     #: request_too_large`, refused before the body is read. Under the 25 MB the engines take
     #: for an upload, so nothing is queued only for an engine to refuse it.
-    max_request_mb: float = Field(default=24.0, gt=0)
+    #: At most 64: the router in front of several engines on one machine refuses more (D144).
+    max_request_mb: float = Field(default=24.0, gt=0, le=64)
     #: The most request bytes the router holds at once — queued, in flight and kept for a
     #: resend (D144). Full is `503 uploads_full`, waited out like any 503.
     max_held_request_mb: float = Field(default=512.0, gt=0)
@@ -1197,6 +1198,7 @@ class PoolConfig(BaseModel):
                 f"{both} are in the pool's model set and marked workloads_only: a model is either the "
                 "shared hosts' or workloads' only — remove it from one"
             )
+        self._rented_engine_is_one_a_rented_host_can_run()
         self._engine_can_hold_what_the_pool_asks()
         self._rented_hosts_have_a_build_of_what_they_rent_for()
         self._images_are_built_for_this_engine()
@@ -1754,6 +1756,23 @@ class PoolConfig(BaseModel):
                         f"{sorted(beyond)} — it serves {sorted(kinds)}. Speech to text runs on vLLM or "
                         "whisper-cpp, ranking on vLLM."
                     )
+
+    def _rented_engine_is_one_a_rented_host_can_run(self) -> None:
+        """An engine whose server the host's agent starts on a machine its owner set up —
+        whisper.cpp (D148) — has no image a rented host could start from."""
+        if self.rented is None:
+            return
+        from .engines import EngineNotFound, get_engine
+
+        try:
+            engine = get_engine(self.rented_engine())
+        except EngineNotFound:
+            return
+        if getattr(engine, "residency_from_agent", False):
+            raise ValueError(
+                f"rented hosts cannot run {engine.name}: its server is started by the agent of a machine "
+                "its owner set up (D148). Rent vLLM for speech to text, and run whisper.cpp on a host of your own"
+            )
 
     def _rented_images_carry_what_builds_need(self) -> None:
         """A model rented hosts hold whose build needs something of the image — speech on vLLM

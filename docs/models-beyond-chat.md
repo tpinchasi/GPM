@@ -182,7 +182,7 @@ embeddings — not speech or ranking.
 
 | Setting | Default | What it bounds |
 |---|---|---|
-| `pool.max_request_mb` | 24 | One request body — about 12 minutes of 16 kHz WAV, 20 or more of MP3 |
+| `pool.max_request_mb` | 24 | One request body — about 12 minutes of 16 kHz WAV, 20 or more of MP3. At most 64, which the router in front of several engines on one machine accepts |
 | `pool.max_held_request_mb` | 512 | Request bytes the router holds at once — queued, in flight, kept for a resend |
 
 - A transcription holds a worker for as long as it runs; there is no separate queue for short
