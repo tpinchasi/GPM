@@ -53,7 +53,10 @@ def _init(args: argparse.Namespace) -> int:
         # would keep the port and every install would be refused.
         print(f"\nThis agent installs {settings.engine} and runs it on {settings.engine_url}. If you run")
         print(f"{settings.engine} yourself, quit it and remove it from login items first.")
-    if settings.engine == "whisper-cpp" and not settings.engine_binary and shutil.which(whisper_cpp.PROGRAM) is None:
+    if (
+        settings.engine == "whisper-cpp" and not settings.install_engines and not settings.engine_binary
+        and shutil.which(whisper_cpp.PROGRAM) is None
+    ):
         # Not a refusal: the owner may install it next. Said now rather than on the first pass.
         print(f"\nNote: {whisper_cpp.PROGRAM} is not on this PATH. Install whisper.cpp, or set")
         print(f"engine_binary in {path} to its program, before the pool asks this machine to serve.")
@@ -123,7 +126,8 @@ def main(argv: list[str] | None = None) -> int:
     init.add_argument("--restart-command", default=None, help="how the engine is restarted here (a program to run)")
     init.add_argument("--engine-env-file", default=None, help="where the engine's start-up environment is written")
     init.add_argument("--engine-binary", default=None,
-                      help="the engine's program, for an engine this agent starts (whisper-cpp); PATH if unset")
+                      help="the engine's program, for an engine this agent starts (whisper-cpp) and does not "
+                           "install; PATH if unset")
     init.add_argument("--install-engines", action="store_true",
                       help="let this agent install the engine, run it, and switch its version when the "
                            "pool asks (only the machine's owner can allow this)")

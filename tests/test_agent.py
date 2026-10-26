@@ -93,8 +93,9 @@ def test_the_agent_never_runs_a_shell_or_a_command_it_was_given():
                     # lists — and is a command-line entry for the machine's restart script,
                     # reachable from nothing on the agent's protocol (checked below). platform.py
                     # starts the programs the agent runs itself — whisper.cpp's server (D148) and
-                    # an engine it installed (D150) — and runs its own literal commands to recognise
-                    # and stop them and to check signatures (D152, D154): checked below.
+                    # an engine it installed (D150) — runs its own literal commands to recognise
+                    # and stop them and to check signatures (D152, D154), and runs a caller's fixed
+                    # argument list and waits for it — whisper.cpp's build (D152): checked below.
                     # startup.py runs the owner's own `init` and `startup` commands (D154), from
                     # the command line only: checked in test_agent_startup.py.
                     assert path.name in (
@@ -112,7 +113,7 @@ def test_the_agent_never_runs_a_shell_or_a_command_it_was_given():
     # command line imports it, and the machine's restart script is what runs that.
     for name in (
         "app.py", "models.py", "engine_control.py", "engines.py", "proxy.py",
-        "installs.py", "ollama_server.py", "whisper_cpp.py", "platform.py",
+        "installs.py", "ollama_server.py", "whisper_cpp.py", "whisper_build.py", "platform.py",
     ):
         text = (root / name).read_text()
         assert "vllm_launch" not in text, f"{name} reaches the launcher, which can start processes"
@@ -135,8 +136,17 @@ def test_the_agent_never_runs_a_shell_or_a_command_it_was_given():
         node for node in ast.walk(platform_tree)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "launch"
     ]
-    assert len(launches) == 1 and launches[0] in list(ast.walk(functions["start"]))
-    assert isinstance(launches[0].args[0], ast.Name) and launches[0].args[0].id == "argv"
+    # Two places start a program: `start`, for a server the agent runs; `run_command`, for a
+    # command it waits for. Each on its caller's `argv` — which `run_command` may only put behind
+    # POSIX's `nice`, to lower its priority.
+    run_command = next(node for node in ast.walk(platform_tree)
+                       if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_command")
+    assert len(launches) == 2
+    assert launches[0] in list(ast.walk(functions["start"])) and launches[1] in list(ast.walk(run_command))
+    assert all(isinstance(call.args[0], ast.Name) and call.args[0].id == "argv" for call in launches)
+    rebound = [node for node in ast.walk(run_command) if isinstance(node, ast.Assign)
+               and any(getattr(target, "id", None) == "argv" for target in node.targets)]
+    assert [ast.unparse(node.value) for node in rebound] == ["[nice, '-n', str(LOW_PRIORITY), *argv]"]
 
     def runs_a_command(call):
         func = call.func
@@ -184,8 +194,38 @@ def test_the_agent_never_runs_a_shell_or_a_command_it_was_given():
             if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "argv" for t in node.targets)
         ]
         assert len(assigned) == 1 and isinstance(assigned[0], ast.Call) and assigned[0].func.id == builder, name
-    for name in ("app.py", "models.py", "engines.py", "installs.py", "proxy.py", "engine_control.py"):
+    for name in ("app.py", "models.py", "engines.py", "installs.py", "proxy.py", "engine_control.py", "whisper_build.py"):
         assert "host_platform.start(" not in (root / name).read_text(), f"{name} starts a program"
+
+    # What runs through `run_command`, and from where: whisper.cpp's build and checks (D152). Each
+    # command is a literal list — a fixed program, or a path the agent found, then constants — or
+    # comes from one of the builders that write the build's argument lists; nothing else.
+    builders = {"configure_argv", "build_argv", "venv_argv", "pip_argv", "help_argv"}
+    for name in sorted(path.name for path in root.glob("*.py")):
+        text = (root / name).read_text()
+        if "host_platform.run_command" not in text and "platform import run_command" not in text:
+            continue  # startup.py has a `run_command` of its own, for the owner's commands
+        assert name in ("whisper_build.py", "whisper_cpp.py"), f"{name} runs commands"
+        tree = ast.parse(text)
+        runs = [
+            node for node in ast.walk(tree) if isinstance(node, ast.Call) and (
+                (isinstance(node.func, ast.Name) and node.func.id == "run")
+                or (isinstance(node.func, ast.Attribute) and node.func.attr == "run"
+                    and isinstance(node.func.value, ast.Name) and node.func.value.id == "self")
+            )
+        ]
+        assert runs, name
+        for call in runs:
+            command = call.args[0]
+            if isinstance(command, ast.Call):
+                assert isinstance(command.func, ast.Name) and command.func.id in builders, ast.unparse(command)
+            else:
+                assert isinstance(command, ast.List), ast.unparse(command)
+                first, *rest = command.elts
+                assert isinstance(first, ast.Constant) or (
+                    isinstance(first, ast.Call) and getattr(first.func, "id", None) == "str"
+                ), ast.unparse(command)
+                assert all(isinstance(part, ast.Constant) for part in rest), ast.unparse(command)
 
 
 # --- the agent's own settings ---

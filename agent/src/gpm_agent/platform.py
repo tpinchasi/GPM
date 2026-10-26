@@ -14,10 +14,14 @@ system it is on:
   process number from a file is only a number, and may since belong to something else.
 - **Checking a program's signature** where the system has one: `codesign` on macOS,
   Authenticode on Windows, each with the publisher pinned by the caller (D152).
+- **Running a command and waiting for it** (`run_command`) — a build, or a check of a program the
+  agent installed — at low priority if asked, and ended, with everything it started, when the
+  wait is given up.
 
 Every command run here is a literal argument list written in this module — `ps`, `taskkill`,
-`codesign`, and PowerShell with a fixed script — and none takes text from the pool. The system is
-read from `sys.platform` and can be named instead, so each branch is tested on any machine.
+`codesign`, and PowerShell with a fixed script — and none takes text from the pool; `start` and
+`run_command` run their caller's own fixed argument list. The system is read from `sys.platform`
+and can be named instead, so each branch is tested on any machine.
 """
 
 from __future__ import annotations
@@ -26,9 +30,11 @@ import asyncio
 import os
 import platform as _stdlib_platform
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
@@ -46,6 +52,15 @@ Process = subprocess.Popen
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 CREATE_NO_WINDOW = 0x08000000
 WINDOWS_START_FLAGS = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+#: Windows' "below normal" priority, a process-creation flag there.
+BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
+
+#: How far a command run at low priority is lowered, on POSIX's scale of 0 to 19: below
+#: anything the machine's owner runs at the default, so a build on their laptop yields to them.
+LOW_PRIORITY = 10
+
+#: How much of a command's output `run_command` hands back: its last words, not its whole log.
+_OUTPUT_TAIL_BYTES = 16384
 
 #: How long a program is given to stop when asked, before it is made to.
 STOP_GRACE_S = 10.0
@@ -298,6 +313,105 @@ async def stop(
     except (ProcessLookupError, PermissionError):
         pass
     await _until(gone, grace_s, poll_s)
+
+
+# --- running a command and waiting for it ---
+
+
+def _end_now(process: Process, os_name: str) -> None:
+    """End a command `run_command` started, and everything it started: its session on POSIX —
+    a build's compilers are its children — its process tree on Windows."""
+    if process.poll() is not None:
+        return
+    if os_name == WINDOWS:
+        _run(["taskkill", "/PID", str(int(process.pid)), "/T", "/F"])
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+    process.wait()
+
+
+def _tail(handle: Any, offset: int) -> str:
+    """What a command wrote after `offset`, its last `_OUTPUT_TAIL_BYTES` at most."""
+    handle.flush()
+    handle.seek(0, os.SEEK_END)
+    handle.seek(max(offset, handle.tell() - _OUTPUT_TAIL_BYTES))
+    return handle.read().decode(errors="replace")
+
+
+async def run_command(
+    argv: list[str],
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    timeout_s: float = COMMAND_TIMEOUT_S,
+    low_priority: bool = False,
+    log: Optional[Path] = None,
+    os_name: Optional[str] = None,
+    poll_s: float = POLL_S,
+    popen: Optional[Callable[..., Any]] = None,
+) -> Ran:
+    """Run `argv` — the caller's fixed argument list, never a shell line — and wait for it,
+    without holding up the event loop. Answers what `_run` answers: the exit code (None when it
+    could not start or did not finish) and its output — the tail of what it wrote, which goes to
+    `log` when one is named (appended, after a line saying what ran) and is otherwise kept only
+    until it is read here.
+
+    `low_priority` lowers it below the machine owner's own programs: started through POSIX's
+    `nice`, which every process it starts inherits, or as below-normal on Windows. It runs in its
+    own session (or process group), so that when the wait is given up — the time is up, or the
+    agent is stopping and cancels it — the command and everything it started end with it, and a
+    half-finished build is not left running.
+    """
+    os_name = os_name or system()
+    launch = popen or subprocess.Popen
+    placement: dict[str, Any]
+    if os_name == WINDOWS:
+        placement = {"creationflags": WINDOWS_START_FLAGS | (BELOW_NORMAL_PRIORITY_CLASS if low_priority else 0)}
+    else:
+        placement = {"start_new_session": True}
+        nice = shutil.which("nice") if low_priority else None
+        if nice:
+            # `nice` runs the command in its own place, so its process number is the command's.
+            argv = [nice, "-n", str(LOW_PRIORITY), *argv]
+    if log is not None:
+        log.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        sink: Any = open(log, "a+b")  # noqa: SIM115 - closed below, after the command ends
+        sink.write(f"--- gpm-agent: {' '.join(argv)} at {time.ctime()}\n".encode())
+    else:
+        sink = tempfile.TemporaryFile()  # noqa: SIM115 - closed below, after the command ends
+    with sink:
+        sink.flush()
+        offset = sink.tell()
+        try:
+            process = launch(
+                argv, stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.STDOUT,
+                env=None if env is None else dict(env), **placement,
+            )
+        except OSError as exc:
+            return Ran(None, str(exc) or type(exc).__name__)
+        if low_priority and os_name != WINDOWS and not nice:
+            # No `nice` program here: lowered from outside, as early as can be.
+            try:
+                os.setpriority(os.PRIO_PROCESS, process.pid, LOW_PRIORITY)
+            except OSError:
+                pass
+        deadline = time.monotonic() + timeout_s
+        try:
+            while process.poll() is None:
+                if time.monotonic() >= deadline:
+                    _end_now(process, os_name)
+                    return Ran(None, f"{_tail(sink, offset)}\nit did not finish within {timeout_s:.0f}s and was stopped")
+                await asyncio.sleep(poll_s)
+        except BaseException:
+            _end_now(process, os_name)  # given up on — by the agent stopping, most likely
+            raise
+        return Ran(process.returncode, _tail(sink, offset))
 
 
 # --- signatures (D152) ---

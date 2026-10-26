@@ -59,8 +59,8 @@ def is_loopback(host: str) -> bool:
 AGENT_STARTED_ENGINES = frozenset({"whisper-cpp"})
 
 #: Engines this agent can install and run itself, where the machine's owner allows it (D150) —
-#: those the installer's table names (`installs.RELEASES`). whisper.cpp joins when its build does.
-INSTALLABLE_ENGINES = frozenset({"ollama"})
+#: those the installer's table names (`installs.RELEASES`).
+INSTALLABLE_ENGINES = frozenset({"ollama", "whisper-cpp"})
 
 #: The addresses such a server is started on: 127.0.0.1, as the agent passes it, or a name for it.
 _SERVER_HOSTS = ("127.0.0.1", "localhost")
@@ -119,7 +119,8 @@ class Settings:
     heartbeat_file: Optional[str] = None
     #: The engine's program, for an engine this agent starts itself — whisper.cpp's
     #: `whisper-server` (D148). The owner's choice, an absolute path; unset means the one on this
-    #: agent's PATH. The pool never names a program.
+    #: agent's PATH. Not with `install_engines`, where the program is the one the agent installed.
+    #: The pool never names a program.
     engine_binary: Optional[str] = None
     #: Whether this agent may install the engine, run it, and switch its version when the pool
     #: asks (D150, D151). The machine owner's word, written by `gpm-agent init --install-engines`;
@@ -167,6 +168,11 @@ class Settings:
                     "install_engines: the agent runs the engine itself, and restarts it with the "
                     "pool's numbers; remove restart_command and engine_env_file, which are for an "
                     "engine the machine's owner runs (D150)"
+                )
+            if self.engine_binary is not None:
+                raise SettingsError(
+                    "install_engines: the agent runs the version of the engine it installed, and "
+                    "never another program; remove engine_binary, which names the owner's own (D150)"
                 )
             problem = loopback_engine_url_problem(self.engine_url)
             if problem:

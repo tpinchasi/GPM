@@ -13,6 +13,9 @@ What keeps that inside the agent's bounds:
   publishes one; a file with no published digest is refused. Where the platform signs programs
   and the table pins the publisher, every program unpacked must carry that signature (Ollama on
   macOS: Developer ID team `3MU9H2V9Y9`); elsewhere the facts say the signature was not checked.
+  A source archive, for which no release publishes a digest, is fetched by the commit its tag
+  names — read from the repository — and must say it is that commit; the tools a build needs and
+  the machine lacks come pinned to their own published digests (`whisper_build`).
 - **Archives unpack only into their own directory.** No absolute path, no `..`, no link that
   leads out, no device file; anything else refuses the whole version. Nothing in an archive is
   ever run but the engine's own program, and no install script runs at all.
@@ -26,8 +29,10 @@ The work runs in the background, one job at a time; the verb answers at once wit
 stand (`Installer.state`), and the pool reads how it went on its next passes.
 
 A **source** is what one engine's releases are made into a version directory by (`Source`).
-Ollama's are archives (`ArchiveSource`, with the table's `OLLAMA` row); whisper.cpp's, built from
-source on macOS and Linux, plug in through the same four operations.
+Ollama's are archives (`ArchiveSource`, with the table's `OLLAMA` row); whisper.cpp's are built
+from the release's source on macOS and Linux and taken from its own archives on Windows
+(`whisper_build.WhisperCppSource`, with the table's `WHISPER_CPP` row), through the same four
+operations.
 """
 
 from __future__ import annotations
@@ -68,7 +73,8 @@ LATEST = "latest"
 LATEST_EVERY_S = 6 * 3600.0
 
 #: How long a switched-to server is given to answer before the switch is called a failure. Ollama
-#: answers in about a second; loading nothing, it has no reason to take longer than this.
+#: answers in about a second, loading nothing; whisper.cpp's server answers once it has loaded the
+#: file it serves, which takes seconds — two minutes means something is wrong with either.
 SWITCH_TIMEOUT_S = 120.0
 
 #: How long a version that could not be fetched or staged is left alone before another attempt —
@@ -86,6 +92,9 @@ STATE_FILE = "state.json"
 #: Where downloads wait, by their digest, so a cut transfer resumes on the next attempt.
 DOWNLOADS = "downloads"
 PARTIAL = ".partial"
+#: Beside the engines' own directories: tools the agent fetched to build an engine with (`cmake`
+#: from PyPI, where the machine has none), kept for the next build.
+TOOLS = ".tools"
 
 _CHUNK = 1 << 20
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -245,8 +254,13 @@ class GitHubReleases:
             raise InstallRefused(f"{self.repo}'s release {tag!r} is not named v<version>; it is not installed")
         if body.get("draft"):
             raise InstallRefused(f"{self.repo} {tag} is a draft, not a release")
+        return Release(version=tag[1:], tag=tag, assets=self.assets_of(body))
+
+    @staticmethod
+    def assets_of(body: Any) -> tuple[Asset, ...]:
+        """A release's files as GitHub lists them, each with the digest it publishes, if any."""
         assets = []
-        for entry in body.get("assets") or []:
+        for entry in (body.get("assets") if isinstance(body, dict) else None) or []:
             if not isinstance(entry, dict):
                 continue
             name, number, size, digest = entry.get("name"), entry.get("id"), entry.get("size"), entry.get("digest")
@@ -256,7 +270,7 @@ class GitHubReleases:
             if isinstance(digest, str) and digest.startswith("sha256:") and _HEX64.fullmatch(digest[7:].lower()):
                 sha256 = digest[7:].lower()
             assets.append(Asset(name, number, size, sha256))
-        return Release(version=tag[1:], tag=tag, assets=tuple(assets))
+        return tuple(assets)
 
     async def latest(self, http: httpx.AsyncClient) -> Release:
         """The newest release that is not a pre-release, as the repository marks it."""
@@ -594,7 +608,43 @@ OLLAMA = ArchiveRelease(
     },
 )
 
-RELEASES: dict[str, ArchiveRelease] = {"ollama": OLLAMA}
+@dataclasses.dataclass(frozen=True)
+class BuiltRelease:
+    """An engine whose version tags carry its source and no program for some systems: built on
+    the machine there (macOS, Linux), and taken on Windows from the archives its project
+    publishes — on the version's own release, or on a build tag of the same commit."""
+
+    engine: str
+    repo: str
+    #: The one program a version needs, as the build names its target.
+    program: str
+    #: Windows: what the machine has → the archive for it, by every name the project has given
+    #: it, newest first.
+    windows: Mapping[str, tuple[str, ...]]
+    #: The NVIDIA driver each CUDA archive needs at least, (major, minor), as `nvidia-smi` says it.
+    driver_floors: Mapping[str, tuple[int, int]]
+
+
+#: whisper.cpp (verified against v1.9.5 and its build tag b5454, and v1.9.4 and b5130,
+#: 2026-10-26). Its version tags carry no files since 1.9.3; Windows archives come with a build
+#: tag of the same commit, and were renamed between b5130 (`whisper-cublas-12.4.0-bin-x64.zip`)
+#: and b5454 (`whisper-bin-win-cuda-12.4.0-x64.zip`). None is signed. CUDA 12.4 runs on NVIDIA's
+#: 550 drivers and later; 11.8, by CUDA 11's compatibility across minor versions, on 452.39 and
+#: later. Without such a card: the CPU build with OpenBLAS on x64, the plain CPU build on arm64.
+WHISPER_CPP = BuiltRelease(
+    engine="whisper-cpp",
+    repo="ggml-org/whisper.cpp",
+    program="whisper-server",
+    windows={
+        "cuda-12.4": ("whisper-bin-win-cuda-12.4.0-x64.zip", "whisper-cublas-12.4.0-bin-x64.zip"),
+        "cuda-11.8": ("whisper-bin-win-cuda-11.8.0-x64.zip", "whisper-cublas-11.8.0-bin-x64.zip"),
+        "blas": ("whisper-blas-bin-x64.zip",),
+        "cpu-arm64": ("whisper-bin-win-cpu-arm64.zip",),
+    },
+    driver_floors={"cuda-12.4": (550, 0), "cuda-11.8": (452, 39)},
+)
+
+RELEASES: dict[str, ArchiveRelease | BuiltRelease] = {"ollama": OLLAMA, "whisper-cpp": WHISPER_CPP}
 
 
 class ArchiveSource(GitHubReleases):
@@ -695,10 +745,20 @@ def _keep_only(downloads: Path, digests: set[str]) -> None:
                 path.unlink()
 
 
-def source_for(engine: str, target: Target, *, run: Optional[host_platform.Runner] = None) -> Optional[Source]:
-    """The source for `engine` on `target`, from the table; None for an engine it does not name."""
+def source_for(
+    engine: str, target: Target, *, run: Optional[host_platform.Runner] = None, tools_dir: Optional[Path] = None,
+) -> Optional[Source]:
+    """The source for `engine` on `target`, from the table; None for an engine it does not name.
+    `tools_dir` is where a source that builds keeps the tools it fetched (`TOOLS`)."""
     table = RELEASES.get(engine)
-    return ArchiveSource(table, target, run=run) if table is not None else None
+    if isinstance(table, ArchiveRelease):
+        return ArchiveSource(table, target, run=run)
+    if isinstance(table, BuiltRelease):
+        # Imported here: the build's module uses this one's releases, downloads and unpacking.
+        from .whisper_build import WhisperCppSource
+
+        return WhisperCppSource(table, target, tools_dir=tools_dir)
+    return None
 
 
 # --- the record of what is installed ---
@@ -780,7 +840,8 @@ def validated(body: Any) -> tuple[str, bool]:
 
 
 class Server(Protocol):
-    """The engine's server as the installer drives it (`ollama_server.OllamaServer`)."""
+    """The engine's server as the installer drives it (`ollama_server.OllamaServer`,
+    `whisper_cpp.InstalledServer`)."""
 
     foreign_reason: str
 
@@ -849,6 +910,12 @@ class Installer:
     @property
     def busy(self) -> bool:
         return self._job is not None and not self._job.done()
+
+    @property
+    def starting(self) -> bool:
+        """Whether the server is being stopped or started by this installer right now — a switch,
+        a restart, or bringing it back — so that nothing else starts it meanwhile."""
+        return self._lock.locked()
 
     def program(self, version: str) -> Path:
         return self.source.program(self.engine_dir / version)

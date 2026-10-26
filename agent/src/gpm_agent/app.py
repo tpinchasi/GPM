@@ -30,6 +30,7 @@ from .facts import Probes, disk, gather
 from .models import ModelWork, Refused
 from .ollama_server import OllamaServer
 from .settings import FOREIGN_PREFIXES, INSTALLABLE_ENGINES, Settings
+from .whisper_cpp import InstalledServer, WhisperCppFacts
 
 log = logging.getLogger("gpm_agent")
 
@@ -42,15 +43,24 @@ def _error(status: int, error: str, detail: str) -> JSONResponse:
     return JSONResponse({"error": error, "detail": detail}, status_code=status)
 
 
-def default_installer(settings: Settings, engine_client: httpx.AsyncClient) -> Optional[installs.Installer]:
-    """The installer for this machine's engine, where its owner allows installs (D150) — else None."""
+def default_installer(
+    settings: Settings, engine_client: httpx.AsyncClient, engine: Any = None
+) -> Optional[installs.Installer]:
+    """The installer for this machine's engine, where its owner allows installs (D150) — else None.
+    For whisper.cpp it drives `engine`'s own server, which then takes its program from it."""
     if not settings.install_engines or settings.engine not in INSTALLABLE_ENGINES:
         return None
-    source = installs.source_for(settings.engine, installs.this_machine())
+    engines = Path(settings.engines_path).expanduser() if settings.engines_path else host_platform.engines_dir()
+    source = installs.source_for(settings.engine, installs.this_machine(), tools_dir=engines / installs.TOOLS)
     if source is None:
         return None
-    engines = Path(settings.engines_path).expanduser() if settings.engines_path else host_platform.engines_dir()
     engine_dir = engines / settings.engine
+    if settings.engine == "whisper-cpp":
+        if not isinstance(engine, WhisperCppFacts):
+            return None  # nothing to drive: its server is the engine's own
+        installer = installs.Installer(source, engine_dir, InstalledServer(engine, engine_client))
+        engine.use_installer(installer)
+        return installer
     server = OllamaServer(
         engine_dir, engine_url=settings.engine_url, models_path=settings.models_path, client=engine_client,
     )
@@ -69,11 +79,15 @@ def create_app(
     it at a fake repository and fake programs."""
     probes = probes or Probes()
     engine = engine_facts(settings.engine, settings)
+    if installer is not None and getattr(installer.server, "engine", None) is not None:
+        # A server the installer drives through the engine itself (whisper.cpp's): the same
+        # object, so the model work and the installer see one record of what runs.
+        engine = installer.server.engine
 
     # Made here rather than at start-up so the app answers the same however it is served.
     engine_client = httpx.AsyncClient(base_url=settings.engine_url, timeout=10, transport=engine_transport)
     if engine is not None and installer is None:
-        installer = default_installer(settings, engine_client)
+        installer = default_installer(settings, engine_client, engine)
 
     work = (
         ModelWork(
