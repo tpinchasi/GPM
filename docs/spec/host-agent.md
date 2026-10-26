@@ -254,10 +254,23 @@ that does not answer is stopped and the previous started again, at once.
 previous versions, the latest seen and when, what is being fetched or built with its progress,
 and the last error.
 
-**Running across reboots** (D154): `gpm-agent init` makes the agent start with the machine — a
-launchd agent in `~/Library/LaunchAgents`, a systemd user unit with lingering enabled, or a
-scheduled task at logon — and installs once, interactively, what needs administrator rights where
-the platform needs them. The agent never asks for elevation itself, and does not update itself.
+**Running across reboots** (D154): `gpm-agent init --start-at-login` — or `gpm-agent startup
+add|remove|status` for an agent already set up — makes the agent start with the machine, running
+`<its interpreter> -I -m gpm_agent.cli --config <settings> serve` with only the owner's `PATH`:
+
+| | Where | How |
+|---|---|---|
+| macOS | `~/Library/LaunchAgents/<name>.plist` | `launchctl bootstrap gui/<uid>`; `RunAtLoad`, kept alive after a failure, `ProcessType=Interactive` |
+| Linux | `~/.config/systemd/user/<name>.service` | `systemctl --user enable` and `restart`; `Restart=on-failure`, `KillMode=process` (engines outlive an agent restart); lingering checked, and enabled with `sudo` only under `--admin` at a terminal |
+| Windows | a task definition beside the settings | `schtasks /Create /XML` at logon for this user: no time limit, runs on battery, restarted after a failure |
+
+`<name>` follows the settings file, so two agents on one machine get two entries. macOS and Windows
+start it at login, so an unattended machine logs its owner in automatically. A start from `uvx`'s
+cache is refused: install it with `uv tool install gpm-agent`. `init --prerequisites` (or
+`gpm-agent prerequisites`) installs what the engine needs and is missing — ffmpeg, and a compiler
+for whisper.cpp's build — with administrator rights only under `--admin` at a terminal, and
+otherwise prints the exact commands. The agent never asks for elevation itself, and does not
+update itself.
 
 ## 3. What it reports — facts
 
