@@ -1,4 +1,5 @@
 from .base import (
+    AmbiguousField,
     Engine,
     EngineNotFound,
     EngineOption,
@@ -12,6 +13,7 @@ from .ollama import OllamaEngine
 from .vllm import VllmEngine
 
 __all__ = [
+    "AmbiguousField",
     "Engine",
     "EngineNotFound",
     "EngineOption",

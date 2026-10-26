@@ -106,19 +106,12 @@ class VllmEngine:
         return set(openai_api.INFERENCE_PATHS)
 
     def requested_model(self, path: str, body: bytes) -> Optional[str]:
-        model = openai_api.decode(body).get("model")
-        return model if isinstance(model, str) else None
+        return openai_api.requested_model(body)
 
     def with_model(self, path: str, body: bytes, tag: str) -> bytes:
-        """Splice the new name into the raw bytes, leaving every other byte untouched — the
-        same rule and the same regular expression as every other adapter, because passthrough
-        fidelity is a property of the pool, not of an engine."""
-        import json
-
-        from .ollama import _MODEL_FIELD  # one expression, deliberately not copied
-
-        rewritten, count = _MODEL_FIELD.subn(rb"\g<1>" + json.dumps(tag).encode(), body, count=1)
-        return rewritten if count else body
+        """The same rule as every other adapter, because passthrough fidelity is a property of
+        the pool, not of an engine."""
+        return openai_api.with_model(body, tag)
 
     def wants_schema(self, path: str, body: bytes) -> bool:
         return openai_api.wants_schema(path, body)

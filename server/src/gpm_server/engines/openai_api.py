@@ -11,7 +11,10 @@ Everything in this module is on the router's request path: cheap, synchronous, n
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Optional
+
+from .base import AmbiguousField
 
 #: Paths that take a worker. `/v1/models` is excluded on purpose: listing models is metadata,
 #: costs an engine nothing, and must not consume capacity the pool is counting.
@@ -26,12 +29,88 @@ INFERENCE_PATHS = frozenset({
 STREAMING_PATHS = frozenset({"/v1/chat/completions", "/v1/completions", "/v1/responses"})
 
 
-def decode(body: bytes) -> dict[str, Any]:
+#: The fields the pool itself reads from a JSON body. Each may appear once at the top level,
+#: spelled exactly. An engine whose decoder matches keys ignoring case — Go's, so Ollama's —
+#: reads `"MODEL"` where the pool reads `"model"`, and with both present the pool would check
+#: one value and the engine serve another (D141).
+POOL_FIELDS = frozenset({"model", "stream", "response_format", "format"})
+
+_WHITESPACE = re.compile(r"[ \t\n\r]*")
+_DECODER = json.JSONDecoder()
+
+
+def members(body: bytes) -> Optional[list[tuple[str, Any, int, int]]]:
+    """The top-level object's members in order, duplicates included: each key, its value, and
+    where the value starts and ends in the decoded text. None when the body is not one JSON
+    object in UTF-8 — including nesting too deep to parse, which is a refusal, not a crash."""
     try:
-        parsed = json.loads(body)
-    except (ValueError, UnicodeDecodeError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+        text = body.decode("utf-8")
+        at = _WHITESPACE.match(text).end()
+        if text[at:at + 1] != "{":
+            return None
+        at = _WHITESPACE.match(text, at + 1).end()
+        found: list[tuple[str, Any, int, int]] = []
+        if text[at:at + 1] == "}":
+            at += 1
+        else:
+            while True:
+                if text[at:at + 1] != '"':
+                    return None
+                key, at = _DECODER.raw_decode(text, at)
+                at = _WHITESPACE.match(text, at).end()
+                if text[at:at + 1] != ":":
+                    return None
+                start = _WHITESPACE.match(text, at + 1).end()
+                value, at = _DECODER.raw_decode(text, start)
+                found.append((key, value, start, at))
+                at = _WHITESPACE.match(text, at).end()
+                if text[at:at + 1] == ",":
+                    at = _WHITESPACE.match(text, at + 1).end()
+                    continue
+                if text[at:at + 1] != "}":
+                    return None
+                at += 1
+                break
+        if _WHITESPACE.match(text, at).end() != len(text):
+            return None
+        return found
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return None
+
+
+def decode(body: bytes) -> dict[str, Any]:
+    found = members(body)
+    return {key: value for key, value, _, _ in found} if found is not None else {}
+
+
+def requested_model(body: bytes) -> Optional[str]:
+    """The top-level `model`, after refusing a body in which a field the pool reads is named
+    twice or in another letter case (`AmbiguousField`)."""
+    found = members(body)
+    if found is None:
+        return None
+    seen: set[str] = set()
+    for key, _, _, _ in found:
+        folded = key.casefold()
+        if folded in POOL_FIELDS:
+            if key != folded or folded in seen:
+                raise AmbiguousField(folded)
+            seen.add(folded)
+    model = next((value for key, value, _, _ in found if key == "model"), None)
+    return model if isinstance(model, str) else None
+
+
+def with_model(body: bytes, tag: str) -> bytes:
+    """The body with the top-level `model` value replaced — the one `requested_model` read —
+    and every other byte untouched. Re-serialising would reorder keys and renormalise numbers
+    and whitespace, the passthrough drift the contract forbids; a pattern over the raw bytes
+    would rewrite whichever `"model"` came first, nested or not."""
+    found = members(body)
+    for key, _, start, end in found or ():
+        if key == "model":
+            text = body.decode("utf-8")
+            return (text[:start] + json.dumps(tag) + text[end:]).encode("utf-8")
+    return body
 
 
 def is_streaming(path: str, body: bytes) -> bool:

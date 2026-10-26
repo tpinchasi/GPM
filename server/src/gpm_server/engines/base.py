@@ -130,7 +130,11 @@ class Engine(Protocol):
         """Paths that take a worker."""
 
     def requested_model(self, path: str, body: bytes) -> Optional[str]:
-        """The model the request names, or None if the body does not name one."""
+        """The model the request names, or None if the body does not name one.
+
+        Raises `AmbiguousField` when the body names a field the pool reads in a way this
+        engine could read differently — twice, or in another letter case (D141).
+        """
 
     def with_model(self, path: str, body: bytes, tag: str) -> bytes:
         """Return the body with the model field changed and nothing else.
@@ -222,6 +226,15 @@ class Engine(Protocol):
 
 class EngineNotFound(Exception):
     """The configuration named an engine that is not installed."""
+
+
+class AmbiguousField(ValueError):
+    """A request body names a field the pool reads twice, or in another letter case, so the
+    pool and the engine could read different values from it (D141). Refused, never guessed."""
+
+    def __init__(self, field: str):
+        super().__init__(field)
+        self.field = field
 
 
 #: The group third-party engines register under — the same one the shipped adapter uses.

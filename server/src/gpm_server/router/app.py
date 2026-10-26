@@ -27,6 +27,7 @@ from ..config import ConfigError, PoolConfig, load_config
 from ..contract import CONTRACT_VERSION
 from ..db import Database, RequestRecord
 from ..directory import read_directory
+from ..engines import AmbiguousField
 from ..keys import match, verify
 from ..models import HostState
 from ..provisioning_store import HashTaken
@@ -681,7 +682,11 @@ def create_app(
             )
 
         body = await request.body()
-        requested = engine.requested_model(path, body)
+        ambiguous: Optional[str] = None
+        try:
+            requested = engine.requested_model(path, body)
+        except AmbiguousField as refused:
+            requested, ambiguous = None, refused.field
 
         async def record(outcome: str, **fields: object) -> None:
             await state.log.record(
@@ -693,6 +698,13 @@ def create_app(
                     workload=who.workload,
                     **fields,  # type: ignore[arg-type]
                 )
+            )
+
+        if ambiguous is not None:
+            await record("rejected", status_code=400, reason="ambiguous_field")
+            return _error(
+                400, "bad_request", "ambiguous_field",
+                f"the body names `{ambiguous}` more than once or in another letter case; name it once, in lower case",
             )
 
         if requested is None:
