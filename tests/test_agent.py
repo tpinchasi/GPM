@@ -562,6 +562,41 @@ def test_plan_uses_the_platform_the_agent_found_when_none_is_typed_and_reports_a
     assert "apple-silicon" in wrong["capability_conflict"] and "as written" in wrong["capability_conflict"]
 
 
+DECLARED_YAML = """
+pool: {name: p, model_set: [m1, m2], models_per_host: declared}
+auth: {app_keys: ["gpma_x"], admin_keys: ["gpmx_x"]}
+catalog:
+  m1:
+    variants:
+      - {tag: m1-vllm, engine: vllm}
+      - {tag: m1, engine: ollama}
+hosts:
+  - id: box
+    kind: local
+    engine: vllm
+    models: [m1]
+    transport: {type: http, base_url: "http://127.0.0.1:1"}
+    agent: {url: "http://127.0.0.1:8095", bearer_env: K}
+  - id: other
+    kind: local
+    models: [m2]
+    transport: {type: http, base_url: "http://127.0.0.1:2"}
+"""
+
+
+def test_plan_downloads_only_the_hosts_own_share_in_its_own_engines_build(tmp_path):
+    path = tmp_path / "pool.yaml"
+    path.write_text(DECLARED_YAML)
+    config = load_config(path)
+
+    def plan(on_disk):
+        machine = MachineNow(frozenset(), frozenset(on_disk), None)
+        return {c.kind: c.detail for c in plan_changes(config, config, machines={"box": machine})}
+
+    assert "['m1-vllm']" in plan(set())["agent_download"]
+    assert "agent_download" not in plan({"m1-vllm"})   # m2 is another host's, and m1 is the engine's build
+
+
 # --- the console's delete button, and its CLI twin ---
 
 
