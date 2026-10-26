@@ -1,8 +1,9 @@
 """The agent's own configuration — owned by whoever owns this machine, never by the pool.
 
 docs/spec/host-agent.md §4–5. One JSON file, owner-readable only. It holds the *hash* of the
-agent key, never the key; and the two things the pool can ask for but never define: whether
-models may be deleted here, and the command that restarts the engine.
+agent key, never the key; and the things the pool can ask for but never define: whether models
+may be deleted here, the command that restarts the engine, and whether the agent may install and
+run the engine itself (§2.3).
 """
 
 from __future__ import annotations
@@ -56,6 +57,10 @@ def is_loopback(host: str) -> bool:
 
 #: Engines whose server this agent starts itself (D148), and so binds where it says.
 AGENT_STARTED_ENGINES = frozenset({"whisper-cpp"})
+
+#: Engines this agent can install and run itself, where the machine's owner allows it (D150) —
+#: those the installer's table names (`installs.RELEASES`). whisper.cpp joins when its build does.
+INSTALLABLE_ENGINES = frozenset({"ollama"})
 
 #: The addresses such a server is started on: 127.0.0.1, as the agent passes it, or a name for it.
 _SERVER_HOSTS = ("127.0.0.1", "localhost")
@@ -116,6 +121,13 @@ class Settings:
     #: `whisper-server` (D148). The owner's choice, an absolute path; unset means the one on this
     #: agent's PATH. The pool never names a program.
     engine_binary: Optional[str] = None
+    #: Whether this agent may install the engine, run it, and switch its version when the pool
+    #: asks (D150, D151). The machine owner's word, written by `gpm-agent init --install-engines`;
+    #: the pool can never change it. Off unless said.
+    install_engines: bool = False
+    #: Where installed engines live, an absolute path. Unset: the system's per-user place for an
+    #: application's data (`platform.engines_dir`).
+    engines_path: Optional[str] = None
 
     def check(self) -> None:
         if not is_loopback(self.host) and not (self.tls_certfile and self.tls_keyfile):
@@ -138,6 +150,32 @@ class Settings:
                 "engine_binary must be the program's absolute path; leave it unset to use the one "
                 "on this agent's PATH"
             )
+        if not isinstance(self.install_engines, bool):
+            raise SettingsError("install_engines must be true or false")
+        if self.engines_path is not None and (
+            not isinstance(self.engines_path, str) or not Path(self.engines_path).expanduser().is_absolute()
+        ):
+            raise SettingsError("engines_path must be an absolute path; leave it unset for the system's own place")
+        if self.install_engines:
+            if self.engine not in INSTALLABLE_ENGINES:
+                raise SettingsError(
+                    f"install_engines: this agent cannot install {self.engine}; it installs "
+                    f"{', '.join(sorted(INSTALLABLE_ENGINES))}"
+                )
+            if self.restart_command is not None or self.engine_env_file is not None:
+                raise SettingsError(
+                    "install_engines: the agent runs the engine itself, and restarts it with the "
+                    "pool's numbers; remove restart_command and engine_env_file, which are for an "
+                    "engine the machine's owner runs (D150)"
+                )
+            problem = loopback_engine_url_problem(self.engine_url)
+            if problem:
+                raise SettingsError(
+                    f"engine_url {self.engine_url!r} {problem}. With install_engines this agent "
+                    f"starts {self.engine} itself, on 127.0.0.1, and that server has no "
+                    "authentication of its own, so it is never put on a network (D150). "
+                    "Use http://127.0.0.1:<port>."
+                )
         if self.engine in AGENT_STARTED_ENGINES:
             problem = loopback_engine_url_problem(self.engine_url)
             if problem:

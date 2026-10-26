@@ -77,8 +77,8 @@ def test_no_accelerator_and_could_not_tell_are_different_answers():
 
 
 def test_the_agent_never_runs_a_shell_or_a_command_it_was_given():
-    """Structural: every command is a literal argument list in facts.py, run without a shell,
-    and nothing else in the package can start a process."""
+    """Structural: every command is a literal argument list, run without a shell, and only a few
+    modules can start a process at all — each checked below for what it starts."""
     root = pathlib.Path(gpm_agent.__file__).parent
     for path in root.glob("*.py"):
         tree = ast.parse(path.read_text())
@@ -91,12 +91,14 @@ def test_the_agent_never_runs_a_shell_or_a_command_it_was_given():
                     # facts.py runs literal argument lists to learn what the machine is. The vLLM
                     # launcher (D97) starts `vllm` and the agent's own router, as fixed argument
                     # lists — and is a command-line entry for the machine's restart script,
-                    # reachable from nothing on the agent's protocol (checked below). whisper.cpp's
-                    # server is started by the agent itself (D148): checked below for what it runs.
+                    # reachable from nothing on the agent's protocol (checked below). platform.py
+                    # starts the programs the agent runs itself — whisper.cpp's server (D148) and
+                    # an engine it installed (D150) — and runs its own literal commands to recognise
+                    # and stop them and to check signatures (D152, D154): checked below.
                     # startup.py runs the owner's own `init` and `startup` commands (D154), from
                     # the command line only: checked in test_agent_startup.py.
                     assert path.name in (
-                        "facts.py", "vllm_launch.py", "whisper_cpp.py", "startup.py",
+                        "facts.py", "vllm_launch.py", "platform.py", "startup.py",
                     ), f"{path.name} can start a process"
         text = path.read_text()
         assert "os.system" not in text and "os.popen" not in text and "create_subprocess_shell" not in text
@@ -108,35 +110,82 @@ def test_the_agent_never_runs_a_shell_or_a_command_it_was_given():
 
     # The launcher can start processes, so nothing that answers the pool may reach it: only the
     # command line imports it, and the machine's restart script is what runs that.
-    for name in ("app.py", "models.py", "engine_control.py", "engines.py", "proxy.py"):
+    for name in (
+        "app.py", "models.py", "engine_control.py", "engines.py", "proxy.py",
+        "installs.py", "ollama_server.py", "whisper_cpp.py", "platform.py",
+    ):
         text = (root / name).read_text()
         assert "vllm_launch" not in text, f"{name} reaches the launcher, which can start processes"
     launcher = (root / "vllm_launch.py").read_text()
     assert "shell=" not in launcher and "os.system" not in launcher
 
-    # The one process the agent starts on the pool's behalf (D148): the program — the owner's
-    # `engine_binary`, or `whisper-server` on the agent's PATH — with the argument list built in
-    # `server_argv` from the agent's own constants, a file under its models directory and its
-    # port. The only other command is `ps`, a literal, to read a process's command line.
-    whisper = ast.parse((root / "whisper_cpp.py").read_text())
-    calls = [
-        node for node in ast.walk(whisper)
+    # platform.py: a program starts in `start`, on the caller's `argv`, and nowhere else; its own
+    # commands run in `_run`, each a literal list naming one of four programs.
+    platform_tree = ast.parse((root / "platform.py").read_text())
+    functions = {node.name: node for node in ast.walk(platform_tree) if isinstance(node, ast.FunctionDef)}
+    subprocess_calls = [
+        node for node in ast.walk(platform_tree)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
         and isinstance(node.func.value, ast.Name) and node.func.value.id == "subprocess"
     ]
-    assert sorted(call.func.attr for call in calls) == ["Popen", "run"]
-    for call in calls:
-        command = call.args[0]
-        if call.func.attr == "Popen":
-            assert isinstance(command, ast.Name) and command.id == "argv"
-        else:
-            assert isinstance(command, ast.List) and isinstance(command.elts[0], ast.Constant)
-            assert command.elts[0].value == "ps"
-    assigned = [
-        node.value for node in ast.walk(whisper)
-        if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "argv" for t in node.targets)
+    assert [call.func.attr for call in subprocess_calls] == ["run"]
+    assert subprocess_calls[0] in list(ast.walk(functions["_run"]))
+    assert isinstance(subprocess_calls[0].args[0], ast.Name) and subprocess_calls[0].args[0].id == "argv"
+    launches = [
+        node for node in ast.walk(platform_tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "launch"
     ]
-    assert len(assigned) == 1 and isinstance(assigned[0], ast.Call) and assigned[0].func.id == "server_argv"
+    assert len(launches) == 1 and launches[0] in list(ast.walk(functions["start"]))
+    assert isinstance(launches[0].args[0], ast.Name) and launches[0].args[0].id == "argv"
+
+    def runs_a_command(call):
+        func = call.func
+        names = [func] if isinstance(func, ast.Name) else list(func.values) if isinstance(func, ast.BoolOp) else []
+        return bool(names) and all(isinstance(n, ast.Name) and n.id in ("run", "_run") for n in names)
+
+    # `_run_briefly` only passes its caller's command on, with a shorter time limit.
+    passed_on = list(ast.walk(functions["_run_briefly"]))
+    commands = [
+        node for node in ast.walk(platform_tree)
+        if isinstance(node, ast.Call) and runs_a_command(node) and node not in passed_on
+    ]
+    # A part is a literal, a number or a path made text here, or one of the module's own string
+    # constants — PowerShell's fixed script — never anything a caller passes as text.
+    constants = {
+        target.id for node in platform_tree.body if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+        for target in node.targets if isinstance(target, ast.Name)
+    }
+    assert commands, "the platform's own commands are found"
+    for call in commands:
+        command = call.args[0]
+        assert isinstance(command, ast.List) and isinstance(command.elts[0], ast.Constant)
+        assert command.elts[0].value in ("ps", "powershell", "taskkill", "codesign")
+        for part in command.elts:
+            assert isinstance(part, (ast.Constant, ast.Call, ast.JoinedStr)) or (
+                isinstance(part, ast.Name) and part.id in constants
+            ), ast.dump(part)
+
+    # What the agent starts through it: whisper.cpp's server (D148) — the owner's program with
+    # the argument list built in `server_argv` from the agent's own constants, a file under its
+    # models directory and its port; and an installed Ollama (D150) — the program in a version
+    # directory the agent unpacked, and `serve`, built in `serve_argv`.
+    for name, builder in (("whisper_cpp.py", "server_argv"), ("ollama_server.py", "serve_argv")):
+        tree = ast.parse((root / name).read_text())
+        starts = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "start"
+            and isinstance(node.func.value, ast.Name) and node.func.value.id == "host_platform"
+        ]
+        assert len(starts) == 1, name
+        assert isinstance(starts[0].args[0], ast.Name) and starts[0].args[0].id == "argv"
+        assigned = [
+            node.value for node in ast.walk(tree)
+            if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "argv" for t in node.targets)
+        ]
+        assert len(assigned) == 1 and isinstance(assigned[0], ast.Call) and assigned[0].func.id == builder, name
+    for name in ("app.py", "models.py", "engines.py", "installs.py", "proxy.py", "engine_control.py"):
+        assert "host_platform.start(" not in (root / name).read_text(), f"{name} starts a program"
 
 
 # --- the agent's own settings ---
@@ -212,6 +261,7 @@ def test_the_verbs_are_a_closed_list():
         ("/agent/v1/models", ("DELETE",)),  # stage 2: delete this tag (D40's three bounds)
         ("/agent/v1/engine", ("POST",)),    # stage 3: restart, with the owner's command (D41)
         ("/agent/v1/heartbeat", ("POST",)),  # stage 5a: postpone the timer on a rented host (D63)
+        ("/agent/v1/engine/version", ("PUT",)),  # S9: set the engine's version, from the agent's table (D151)
     }
 
 

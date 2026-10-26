@@ -1,8 +1,9 @@
 """whisper.cpp's `whisper-server`, run by this agent (D148).
 
 The third engine differs from the other two in the one way that matters most here: **nobody else
-starts it.** Ollama is the machine owner's service, and vLLM is started by the machine's restart
-script; whisper.cpp's server is a plain program that serves the one file it was started with,
+starts it.** Ollama is the machine owner's service (unless the owner lets the agent install and
+run it, D150), and vLLM is started by the machine's restart script; whisper.cpp's server is a
+plain program that serves the one file it was started with,
 cannot say which file that is, and has no authentication of its own. So this agent fetches the
 build, starts the server on loopback with it, and reports what it is serving — the pool asks for
 a model set and never learns there is a process to start.
@@ -34,17 +35,16 @@ import json
 import os
 import re
 import shutil
-import signal
-import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Optional
+from typing import Any, AsyncIterator, Optional
 from urllib.parse import urlsplit
 
 import httpx
 
 from . import modelhub
+from . import platform as host_platform
 from .settings import loopback_engine_url_problem
 from .vllm_state import state_dir_for
 
@@ -196,40 +196,11 @@ def installed_version(binary: str) -> Optional[str]:
     return None
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # there, and not this user's — which the command-line check then says
-    except OSError:
-        return False
-    return True
-
-
-def _command_line(pid: int) -> Optional[bytes]:
-    """A process's command line: from /proc where there is one, else from `ps`, run as a literal
-    argument list. Asked only before signalling a process, and once when the agent restarts."""
-    try:
-        return Path(f"/proc/{pid}/cmdline").read_bytes()
-    except OSError:
-        pass
-    try:
-        done = subprocess.run(
-            ["ps", "-ww", "-o", "command=", "-p", str(pid)],
-            capture_output=True, timeout=5, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return done.stdout if done.returncode == 0 else None
-
-
 def _is_our_server(pid: int, record: dict[str, Any]) -> bool:
     """Is this process the server the record describes? A number from a file is only a number:
     the process may have ended and its number gone to another. Ours was started with the
     recorded file and the transcription path, and an unrelated process is not."""
-    said = _command_line(pid) or b""
+    said = host_platform.command_line(pid) or b""
     return str(record.get("file", "")).encode() in said and INFERENCE_PATH.encode() in said
 
 
@@ -271,7 +242,7 @@ class WhisperCppFacts:
         self.hub_transport = hub_transport
         #: The server this agent process started, while it lives. After the agent's own restart
         #: there is none, and the record on disk says what was started before.
-        self._process: Optional[subprocess.Popen[bytes]] = None
+        self._process: Optional[host_platform.Process] = None
         self._record: Optional[dict[str, Any]] = None
         self._record_read = False
         #: Whether a process recorded before this agent started is the server, checked once.
@@ -352,7 +323,7 @@ class WhisperCppFacts:
         (self._state_dir / RECORD_FILE).unlink(missing_ok=True)
         self._record, self._record_read, self._process = None, True, None
 
-    def _own_process(self, record: dict[str, Any]) -> Optional[subprocess.Popen[bytes]]:
+    def _own_process(self, record: dict[str, Any]) -> Optional[host_platform.Process]:
         if self._process is not None and self._process.pid == record.get("pid"):
             return self._process
         return None
@@ -364,7 +335,7 @@ class WhisperCppFacts:
         if own is not None:
             return own.poll() is None
         pid = record["pid"]
-        if not _pid_alive(pid):
+        if not host_platform.alive(pid):
             return False
         if pid not in self._ours:
             self._ours[pid] = _is_our_server(pid, record)
@@ -521,19 +492,15 @@ class WhisperCppFacts:
         log_path = logs / LOG_FILE
         argv = server_argv(binary, model_file, port)
         environment = {name: value for name, value in os.environ.items() if name not in _HUB_CREDENTIALS}
-        with open(log_path, "ab") as out:
-            out.write(f"--- gpm-agent: starting {PROGRAM} with {build.tag} at {time.ctime()}\n".encode())
-            out.flush()
-            offset = out.tell()
-            try:
-                # Its own session, so it outlives an agent restart and keeps serving; its working
-                # directory is the agent's state directory, where it writes the audio it converts.
-                process = subprocess.Popen(
-                    argv, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
-                    cwd=state, env=environment, start_new_session=True,
-                )
-            except OSError as exc:
-                raise _refused(f"could not start {binary}: {exc}") from exc
+        try:
+            # Its own session, so it outlives an agent restart and keeps serving; its working
+            # directory is the agent's state directory, where it writes the audio it converts.
+            process, offset = host_platform.start(
+                argv, env=environment, log=log_path, cwd=state,
+                note=f"starting {PROGRAM} with {build.tag}",
+            )
+        except OSError as exc:
+            raise _refused(f"could not start {binary}: {exc}") from exc
         self._process = process
         record = {
             "pid": process.pid, "tag": build.tag, "file": str(model_file), "argv": argv,
@@ -550,31 +517,12 @@ class WhisperCppFacts:
             return
         own = self._own_process(record)
         if own is not None:
-            if own.poll() is None:
-                own.terminate()
-                if not await self._gone(lambda: own.poll() is not None):
-                    own.kill()
-                    await self._gone(lambda: own.poll() is not None)
+            await host_platform.stop(own.pid, process=own, grace_s=STOP_GRACE_S, poll_s=POLL_S / 2)
         else:
             pid = record["pid"]
-            if _pid_alive(pid) and _is_our_server(pid, record):
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                    if not await self._gone(lambda: not _pid_alive(pid)):
-                        os.kill(pid, signal.SIGKILL)
-                        await self._gone(lambda: not _pid_alive(pid))
-                except ProcessLookupError:
-                    pass
+            if host_platform.alive(pid) and _is_our_server(pid, record):
+                await host_platform.stop(pid, grace_s=STOP_GRACE_S, poll_s=POLL_S / 2)
         self._forget()
-
-    @staticmethod
-    async def _gone(gone: Callable[[], bool]) -> bool:
-        deadline = time.monotonic() + STOP_GRACE_S
-        while not gone():
-            if time.monotonic() >= deadline:
-                return False
-            await asyncio.sleep(POLL_S / 2)
-        return True
 
     async def delete(self, client: httpx.AsyncClient, tag: str) -> None:
         """Remove a build from disk — stopping the server first if it is serving it."""

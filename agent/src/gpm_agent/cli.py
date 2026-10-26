@@ -41,12 +41,18 @@ def _init(args: argparse.Namespace) -> int:
             restart_command=([args.restart_command] if args.restart_command else None),
             engine_env_file=args.engine_env_file,
             engine_binary=args.engine_binary,
+            install_engines=args.install_engines,
         )
     settings.check()
     save(settings, path)
     print(f"Agent key (shown once; only its hash is stored in {path}):\n\n  {key}\n")
     print("Give it to the pool as an environment variable on the pool's machine, and name that")
     print("variable in the host's `agent.bearer_env`." + ("" if args.start_at_login else " Then: gpm-agent serve"))
+    if settings.install_engines:
+        # Said now: the agent never stops a program it did not start, so the owner's own copy
+        # would keep the port and every install would be refused.
+        print(f"\nThis agent installs {settings.engine} and runs it on {settings.engine_url}. If you run")
+        print(f"{settings.engine} yourself, quit it and remove it from login items first.")
     if settings.engine == "whisper-cpp" and not settings.engine_binary and shutil.which(whisper_cpp.PROGRAM) is None:
         # Not a refusal: the owner may install it next. Said now rather than on the first pass.
         print(f"\nNote: {whisper_cpp.PROGRAM} is not on this PATH. Install whisper.cpp, or set")
@@ -118,6 +124,9 @@ def main(argv: list[str] | None = None) -> int:
     init.add_argument("--engine-env-file", default=None, help="where the engine's start-up environment is written")
     init.add_argument("--engine-binary", default=None,
                       help="the engine's program, for an engine this agent starts (whisper-cpp); PATH if unset")
+    init.add_argument("--install-engines", action="store_true",
+                      help="let this agent install the engine, run it, and switch its version when the "
+                           "pool asks (only the machine's owner can allow this)")
     init.add_argument("--rotate", action="store_true", help="mint a new key, keep everything else")
     # D154: set up once, by the machine's owner, at a terminal.
     init.add_argument("--start-at-login", action="store_true",

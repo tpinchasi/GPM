@@ -9,6 +9,11 @@ ever written to disk or put in a process's environment.
 
 And it only happens when an operator asks. A restart drops whatever the engine is doing, so
 it is never something the pool's control loop does on its own.
+
+**An engine the agent runs itself** (D150, `install_engines`) needs no owner's command: the
+numbers are stored in the agent's own directory for that engine, and the agent stops its own
+server and starts it again with them. The pool's part is the same either way — numbers, and the
+request to restart.
 """
 
 from __future__ import annotations
@@ -79,20 +84,34 @@ def _write(path: str, environment: dict[str, str]) -> None:
 
 
 class EngineControl:
-    def __init__(self, settings: Settings, engine: OllamaFacts, client: httpx.AsyncClient):
+    def __init__(
+        self, settings: Settings, engine: OllamaFacts, client: httpx.AsyncClient, installer: Any = None
+    ):
         self.settings, self.engine, self.client = settings, engine, client
+        #: The installer, where this agent runs the engine itself (D150); None where the owner does.
+        self.installer = installer
         self._lock = asyncio.Lock()
 
     @property
     def can_restart(self) -> bool:
-        return bool(self.settings.restart_command)
+        return self.installer is not None or bool(self.settings.restart_command)
 
     @property
     def can_apply_settings(self) -> bool:
+        if self.installer is not None:
+            return True
         return self.can_restart and bool(self.settings.engine_env_file)
+
+    def applied(self) -> Optional[dict[str, str]]:
+        """The environment the engine was last started with, as the pool's numbers set it."""
+        if self.installer is not None:
+            return self.installer.server.pool_environment()
+        return read_applied(self.settings.engine_env_file)
 
     async def act(self, body: Any) -> dict[str, Any]:
         wanted = validated(body)
+        if self.installer is not None:
+            return await self._restart_own(wanted)
         if not self.can_restart:
             raise Refused(409, "owner_has_not_enabled_restart",
                           "this machine's owner has set no restart_command in the agent's settings; the pool cannot supply one")
@@ -119,6 +138,32 @@ class EngineControl:
             "restart_exit_code": code,
             "restart_output": output[-_OUTPUT_TAIL:],
             "engine_answers": answers,
+        }
+
+    async def _restart_own(self, wanted: Optional[dict[str, int]]) -> dict[str, Any]:
+        """The engine this agent runs: the numbers stored where its server is started from, and
+        the server started again with them. Answered in the owner's command's terms, so the pool
+        reads both alike: the exit code is 0 once the agent's own restart succeeded."""
+        if wanted is not None and wanted.get("cards_per_copy", 1) > 1 and not getattr(self.engine, "splits_across_cards", False):
+            raise Refused(409, "engine_cannot_split",
+                          f"{self.engine.name} does not split a model across cards on request")
+        if self._lock.locked():
+            raise Refused(409, "restart_in_progress", "the engine is already being restarted")
+        async with self._lock:
+            await self.installer.restartable()
+            changed = False
+            if wanted is not None:
+                changed = self.installer.server.set_pool_environment(self.engine.launch_environment(**wanted))
+            problem = await self.installer.restart()
+        running = self.installer.record.running
+        return {
+            "settings_written": changed,
+            "applied": self.applied(),
+            "restart_exit_code": 0 if problem is None else None,
+            "restart_output": (
+                f"the agent started {self.engine.name} {running} again" if problem is None else problem
+            ),
+            "engine_answers": problem is None,
         }
 
     async def _restart(self) -> tuple[Optional[int], str]:
