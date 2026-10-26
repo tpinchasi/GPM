@@ -344,7 +344,11 @@ def _machine_changes(candidate: PoolConfig, machines: Mapping[str, MachineNow]) 
         if not host.agent.manage_models:
             continue
         capabilities = frozenset(host.capabilities) | (found or frozenset() if not stated else frozenset())
-        variants = variants_for_host(candidate.pool.model_set, candidate.catalog, capabilities, candidate.engine)
+        # What the supervisor will ask this agent to hold: the host's share of the set (D89),
+        # in its own engine's builds (D93) — not the whole set in the pool's engine.
+        variants = variants_for_host(
+            candidate.models_held_by(host), candidate.catalog, capabilities, candidate.engine_of(host),
+        )
         missing = sorted({group[0].tag for group in variants.values() if group} - machine.on_disk)
         if not missing:
             continue
