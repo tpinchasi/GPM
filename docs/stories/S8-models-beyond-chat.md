@@ -86,8 +86,8 @@ a `data:` URL, and any other part type (`audio_url`, `video_url`, `file`, `input
 the table does not know) is refused `400 media_not_inline`. An engine given a URL fetches it from
 the host it runs on — the operator's own network for a local or fixed host, the provider's for a
 rented one — and engine errors come back to the app verbatim; one engine also accepts a local
-file path. Refusing is the pool's guarantee; where vLLM can be launched with remote media off,
-it is, as a second line.
+file path. Refusing is the pool's guarantee — and the only one: vLLM v0.29.0 has no setting that
+turns remote fetching off (checked in its source, stage 3).
 
 ### 3. What a build can do: declared, and observed where the engine can say
 
@@ -327,7 +327,6 @@ ambiguous and maps to nothing.
 |---|---|
 | vLLM v0.29.0 starts Whisper with `--max-model-len` capped at 448, and runs a sequence-classification reranker with no extra flag | Stage 3: one cheap rented host, minutes, capped, asked first |
 | The Gemma 4 NVFP4 builds the catalog serves on vLLM keep the vision tower | Stage 3, same host |
-| vLLM v0.29.0 has a launch option that turns remote media off | Stage 3: read the release, then the host |
 | whisper.cpp's server queues a second request rather than refusing it | Stage 3: on the laptop |
 
 **Checked, 2026-10-26.**
@@ -377,19 +376,21 @@ and its `-ggml` and `-ct2` builds, Apache-2.0).
 0. **Checks before code** — done (§8 and *Checked*).
 1. **Decisions and specification** — done 2026-10-26: D142–D149, written into the contract, the
    plug-in interface, the catalog, the agent, the threat model and `decisions.md`.
-2. **Router and catalog**: the facts object, the size limit and held-bytes budget, upload
+2. **Router and catalog** — done 2026-10-26: the facts object, the size limit and held-bytes budget, upload
    rebuilding, kinds and inputs, media inline, the two guards and their answers, `504`, the
    request log's columns and the measures' filters — against fakes: vLLM transcription (with a
    *missing audio extra* mode and a length check), a rerank endpoint, Ollama's `/api/show` with
    per-instance capabilities and its transcription, and whisper.cpp's server; uploads chunked,
    with a quoted boundary, with `model` after the file, and the refusal cases.
-3. **Engines, agent and the laptop**: vLLM's paths, the length cap, image capabilities and the
+3. **Engines, agent and the laptop** — built and tested against fakes 2026-10-26; the laptop's
+   whisper.cpp host and the live rented check remain: vLLM's paths, the length cap, image capabilities and the
    agent's check, the proxy's header routing and allow-list, Ollama's observed capabilities, the
    whisper.cpp engine and the agent's management of it (fetching one file, running and restarting
    the server, its facts), the host check. The laptop's whisper.cpp host. One live
    check on a rented host — ivrit.ai's Whisper turbo and a small reranker, minutes, capped, asked
    first.
-4. **SDK and console**: the two methods; the Profiles tab's fields; the hub's task mapping.
+4. **SDK and console** — done 2026-10-26: the two methods; the Profiles tab's fields; the hub's
+   task mapping.
 
 **Written ahead of the code, on this branch** (2026-10-26), and to be checked against it before
 merging: how apps use it — `client/README.md` (*Beyond chat*) and the app contract §2 and §4 —

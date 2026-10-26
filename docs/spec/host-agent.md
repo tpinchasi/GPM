@@ -143,21 +143,48 @@ Three rules the hub fetch keeps:
 ### whisper.cpp (D148)
 
 An agent whose settings name `engine: whisper-cpp` manages a **`whisper-server`** — the program
-installed on the machine, found on the agent's `PATH` or at `engine_binary` in its settings; the
-pool never sends a path or a command. *Put models* names one build: a file in a hub repository
-(`owner/repo/file.bin`), which the agent checks against the repository's listing and fetches into
-its models directory, refusing a name that leaves it (D40). The agent then starts the server on
-its engine port, on loopback, with that file, OpenAI's transcription path and `--convert`; it
-restarts it when the build changes or the server stops. Its facts add the program's version,
-whether `ffmpeg` is present, the file on disk and whether `GET /` answers. One machine running
-Ollama and whisper.cpp runs two agents, each with its own port and key.
+installed on the machine, found on the agent's `PATH` or at `engine_binary` in its settings (an
+absolute path); the pool never sends a path or a command. Its engine URL is
+`http://127.0.0.1:<port>` or `http://localhost:<port>` (8178 by default), and its models live in
+`~/gpm-whisper-models` unless set.
 
-### vLLM's audio extra (D146)
+- **Fetching.** *Put models* names one build: a file at the root of a hub repository
+  (`owner/repo/file.bin`), which the agent checks against the repository's listing and fetches,
+  alone, into its own directory `owner__repo__file.bin/` under the models directory — resumably,
+  as every fetch is — refusing a name that leaves it (D40).
+- **Holding.** Only under `pinned` residency, which the pool requires of such a host. The agent
+  starts the server with exactly
+  `whisper-server -m <file> --host 127.0.0.1 --port <port> --inference-path /v1/audio/transcriptions --convert -l auto`
+  (`-l auto` because its default language is English), in its own session, with the hub's
+  credential withheld from its environment; its record, its log and its working directory —
+  where it writes converted audio — are the agent's state directory beside the models directory,
+  never inside it. A port another program already answers on is refused. A server that stopped,
+  or a build that changed, is started again on the pool's next pass, and a failed start is tried
+  again only after a pause. The server outlives an agent restart and is recognised by its command
+  line when the agent comes back.
+- **Facts.** The program's version as its installation names it (1.9.2 has no version flag),
+  where it was found, whether `ffmpeg` is present (`--convert` needs it: without it the server
+  exits at start), the file on disk, whether `GET /` answers, the build loaded only when the
+  agent's own server is running it and answers, and the last line of its log when it stopped.
 
-On a vLLM host the agent checks, before the engine starts, that the interpreter behind the `vllm`
-command imports vLLM's audio extra — run isolated, as a fixed argument list — and reports
-`audio-decoding` in its facts. A host whose image was declared to carry it and does not is failed
-with that reason before it serves.
+This is the one program the agent itself starts, and it starts it only with these fixed
+arguments. One machine running Ollama and whisper.cpp runs two agents, each with its own port and
+key.
+
+### vLLM's audio extra and each model's length (D146)
+
+On a vLLM host the agent checks, once per agent process and in the background — never delaying an
+answer — that the interpreter named on the `vllm` command's `#!` line imports vLLM's audio extra
+(`av`, `scipy.signal`, `soundfile`, `soxr`), run isolated (`-I`), as a fixed argument list. Its
+facts say `engine.carries: ["audio-decoding"]` when it does, `carries: []` with `carries_detail`
+(the import's last error line) when it does not, and neither while the answer is unknown. The pool
+gives up a host whose image was chosen for carrying it and does not, with that reason.
+
+The launcher starts each model with `--max-model-len` at the smaller of the pool's number and the
+maximum vLLM derives from that model's own files — its configuration's text section, rotary
+scaling, and for an absolute-position encoder its tokenizer's length — so Whisper starts at 448
+beside a chat model at 8192. A model capped is in the facts: `engine.max_model_len_capped`,
+`{model: {asked, applied}}`.
 
 ## 2.2 The router in front of several engines (D96)
 
@@ -172,14 +199,18 @@ archive is already on every host the pool creates.
 
 | | |
 |---|---|
-| Routes by | The `model` field of the request, against a file the machine's start-up wrote mapping model to its upstream, or to one per copy — re-read as it changes |
+| Routes by | The `X-GPM-Model` header the pool's router sets to the build it chose (D144), so an upload is routed without its form being parsed; without it (an older router), the JSON body's `model` field. Against a file the machine's start-up wrote mapping model to its upstream, or to one per copy — re-read as it changes |
+| Forwards | `POST` on these paths only, each by its exact name: `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/audio/transcriptions`, `/v1/audio/translations`, `/v1/rerank` (D142). Any other path is `404 path_not_served` and reaches no engine — including the engines' routes that load or unload models and adapters |
 | Between copies | The one with the fewest requests in flight from the router; a copy that refuses the connection is passed over for the next, since it never saw the request (D107) |
-| Translates | **Nothing.** The request leaves as it arrived, byte for byte, with only the upstream chosen |
+| Translates | **Nothing.** The request leaves as it arrived, byte for byte, with only the upstream chosen; the pool's `X-GPM-*` headers end here |
+| Streams | A JSON request as its `stream` field says; an upload's answer always, with the engine's status and type, since whether it streams is a field of the form |
+| Bounds | A body over 64 MB — above the most `pool.max_request_mb` may be — is `413 request_too_large`: refused on its declared length before it is read, and counted while it is read |
+| Errors | `{"error": {"message", "type"}}` in fixed words — never the model, header or path a caller sent, nor an exception's text, which go to its log: `path_not_served` and `model_not_found` (404), `request_too_large` (413), `upstream_unavailable` (502) |
 | `/health` | 200 only when **every** engine behind it answers — every copy of every model. A machine serving two models of three is not one the pool can call ready, nor one serving a model on one card of two |
 | `/v1/models` | The union, so the pool sees one host holding a set; a model with copies once every copy answers |
 | `/metrics` | Every engine's, labelled and concatenated — not summed, because a sum of cache fractions means nothing. The pool sums running and waiting across them and takes the fullest cache |
 
-The pool names a model. It never names a port, a path or a command.
+The pool names a model, in a header. It never names a port, a path or a command.
 
 ## 3. What it reports — facts
 
