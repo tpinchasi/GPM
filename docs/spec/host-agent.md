@@ -142,9 +142,11 @@ Three rules the hub fetch keeps:
 
 ### whisper.cpp (D148)
 
-An agent whose settings name `engine: whisper-cpp` manages a **`whisper-server`** — the program
-installed on the machine, found on the agent's `PATH` or at `engine_binary` in its settings (an
-absolute path); the pool never sends a path or a command. Its engine URL is
+An agent whose settings name `engine: whisper-cpp` manages a **`whisper-server`** — the version the
+agent built or installed itself where its owner allows installs (§2.3,
+`<engines>/whisper-cpp/<version>/bin/whisper-server`), or otherwise the program on the machine,
+found on the agent's `PATH` or at `engine_binary` in its settings (an absolute path; refused
+together with `install_engines`); the pool never sends a path or a command. Its engine URL is
 `http://127.0.0.1:<port>` or `http://localhost:<port>` (8178 by default), and its models live in
 `~/gpm-whisper-models` unless set.
 
@@ -249,6 +251,15 @@ wanted; the agent resolves `latest` from the repository at most every six hours,
 version in the background while the engine keeps serving, and switches only when asked to.
 Switching stops the running server, starts the staged one and waits for it to answer; a server
 that does not answer is stopped and the previous started again, at once.
+
+**whisper.cpp's build** (macOS, Linux) runs `cmake` configure and `cmake --build … --target
+whisper-server -j <half the cores>` at low priority (`nice -n 10`), logging to
+`<engines>/whisper-cpp/logs/build.log`, in a work directory removed afterwards; the program must
+then answer `--help`. `cmake` is the machine's, or 4.4.4 from PyPI in a private environment under
+`<engines>/.tools/`, installed with `--require-hashes`. A compiler is required — Xcode's
+command-line tools, or `c++` and `make` — and its absence refuses the version, naming `gpm-agent
+prerequisites`, before anything is fetched. Switching whisper.cpp keeps the model file it was
+serving and starts the new program with it; with no file held yet, the check is `--help`.
 
 The **first** version is started as soon as it is staged — nothing runs to drain. A version that
 fails to start is switched away from at once and not staged again by `latest` until a newer one is

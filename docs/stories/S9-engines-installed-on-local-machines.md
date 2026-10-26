@@ -1,6 +1,6 @@
 # S9 — Engines installed and kept current on the machines the pool manages
 
-> Status: **decided** (2026-10-26) — D150–D154; building. Part of the [feature list](README.md).
+> Status: **built** (2026-10-26) — D150–D154; stages 1–3 done, the laptop (stage 4) next, asked first. Part of the [feature list](README.md).
 > Follows S8, which needs Ollama and whisper.cpp on local machines and, until this story, leaves
 > installing them to the owner.
 
@@ -55,12 +55,13 @@ Decided in D150–D154 and specified in [host-agent.md](../spec/host-agent.md) �
 
 1. **Decisions and specification** — done 2026-10-26: D150–D154, the agent's §2.3 and verb, the
    supervisor's upgrade pass, configuration, console, threat model T35.
-2. **The agent**: the platform layer (paths, processes, starting with the machine) for all three;
+2. **The agent** — built and tested against fakes 2026-10-26 (whisper.cpp's build also run for real
+   on the first adopter's laptop, into a scratch directory): the platform layer (paths, processes, starting with the machine) for all three;
    the installer (the release table, resolving `latest`, download with resume, digests, macOS
    signatures, safe unpacking, versions side by side, switching and going back); Ollama run by
    the agent; whisper.cpp built from source and from Windows archives; ffmpeg at `init`; the verb
    and facts — against a fake repository and fake programs.
-3. **The pool**: `engine_version`, the idle wait, the drain, the switch, the check and the
+3. **The pool** — built and tested 2026-10-26: `engine_version`, the idle wait, the drain, the switch, the check and the
    rollback; plan and events; the console's versions with *Upgrade now* and *Roll back*.
 4. **On the first adopter's laptop**, asked first: the app quit, the headless Ollama installed and
    switched to, the laptop's whisper.cpp built and run by its own agent.
