@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import re
@@ -604,6 +605,16 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     "wanted_engine_settings": agents.wanted_engine_settings(host.config.workers, len(host.required_tags)),
                     "models": view.models if view and view.reachable else None,
                     "capability_conflict": agents.capability_conflict(host.config.capabilities, view),
+                    # Where the engine versions its agent installs stand (S9, D153).
+                    "engine_install": host.install,
+                    "engine_version": host.config.engine_version,
+                    "upgrade": (
+                        dataclasses.asdict(supervisor.upgrades.active[host.host_id])
+                        | {"held_before": sorted(supervisor.upgrades.active[host.host_id].held_before)}
+                        if host.host_id in supervisor.upgrades.active else None
+                    ),
+                    "versions_not_taken": sorted(supervisor.upgrades.refused.get(host.host_id, ())),
+                    "upgrade_asked": supervisor.upgrades.asked.get(host.host_id),
                 }
             hosts.append(entry)
 
@@ -2086,6 +2097,37 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 numbers={**(settings or {}), "exit_code": answer.get("restart_exit_code"), "settings_written": answer.get("settings_written")},
             )
         return JSONResponse(status_code=status_code, content=answer)
+
+    @app.post("/pool/hosts/{host_id}/engine/{what}")
+    async def switch_host_engine(host_id: str, what: str, request: Request) -> JSONResponse:
+        """Upgrade now, or roll back, an engine the host's agent installed (D153). Either goes
+        through the same drain and check as an upgrade at a quiet moment, on the next pass."""
+        if what not in ("upgrade", "rollback"):
+            return _error(404, "not_found", "engine actions are upgrade and rollback")
+        host = supervisor.hosts.get(host_id)
+        if host is None or host.config.agent is None:
+            return _error(404, "no_agent", f"no configured host {host_id!r} with an agent")
+        install = host.install or {}
+        if not install.get("allowed"):
+            return _error(409, "installs_not_allowed",
+                          f"{host_id}'s agent does not install its engine: its owner sets install_engines there")
+        try:
+            body = await request.json()
+        except ValueError:
+            return _error(400, "bad_request", "the body must be JSON")
+        if not isinstance(body, dict) or body.get("confirm") != host_id:
+            return _error(400, "not_confirmed", "type the host id again as `confirm`: the host stops taking requests while it switches")
+        if what == "rollback" and not install.get("previous"):
+            return _error(409, "nothing_to_roll_back_to", f"{host_id} keeps no previous version")
+        if what == "upgrade" and (not install.get("staged") or install.get("staged") == install.get("running")):
+            return _error(409, "nothing_staged", f"{host_id} has no newer version staged yet")
+        supervisor.upgrades.ask(host_id, what)
+        supervisor.events.record(
+            f"engine_{what}_asked", f"host {host_id}: an operator asked to "
+            + (f"upgrade to {install.get('staged')}" if what == "upgrade" else f"roll back to {install.get('previous')}"),
+            host_id=host_id,
+        )
+        return JSONResponse({"asked": what, "install": install})
 
     @app.post("/pool/hosts/{host_id}/models/delete")
     async def delete_host_model(host_id: str, request: Request) -> JSONResponse:

@@ -136,9 +136,11 @@ agent stages a newer version while the host serves. When one is staged, the pass
 host to have served nothing for `pool.engine_upgrade_idle_s` (600 s) — or for an operator's
 *Upgrade now* — then takes it out of routing (`preparing`: *upgrading Ollama 0.40.11 → 0.40.12*),
 waits for its requests in flight to end, up to `pool.engine_upgrade_drain_s` (300 s; after that
-it puts the host back and tries at the next idle moment), and asks the agent to switch. Within
-the host's preparing window the engine must answer and the host hold what it held before the
-switch — its resident set when pinned, the models on its disk when on demand. Otherwise the pass
+it puts the host back and tries at the next idle moment), and asks the agent to switch — a switch the agent carries out in the background, so the pass
+never waits on it. Within `pool.engine_upgrade_check_s` (600 s) the engine must answer and the
+host hold what it held before the switch — its resident set when pinned, the models on its disk
+when on demand. A host that has served nothing since the supervisor started counts as quiet from
+the start, so an upgrade never follows a start-up at once. Otherwise the pass
 asks the agent for the previous version, and records the failed version as one this host does
 not take again; a newer release is tried as usual. One host upgrades at a time. Every step is an
 event: staged, draining, switched, held, rolled back.

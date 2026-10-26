@@ -74,6 +74,7 @@ const api = {
   removeHost: (id, confirm) => call("DELETE", `/pool/config/hosts/${encodeURIComponent(id)}`, confirm === undefined ? {} : { confirm }),
   restartEngine: (hostId, applySettings) =>
     call("POST", `/pool/hosts/${hostId}/engine/restart`, { confirm: hostId, apply_settings: applySettings }),
+  switchEngine: (hostId, what) => call("POST", `/pool/hosts/${hostId}/engine/${what}`, { confirm: hostId }),
   deleteModel: (hostId, tag) => call("POST", `/pool/hosts/${hostId}/models/delete`, { tag, confirm: tag }),
   workloads: () => call("GET", "/pool/workloads"),
   planWorkload: (body) => call("POST", "/pool/workloads/plan", body),
@@ -526,8 +527,51 @@ function agentPanel(host) {
       el("div", { class: "k" }, "owner allows"), el("div", { class: "muted" },
         `delete models: ${facts.allows.delete ? "yes" : "no"} · restart engine: ${facts.allows.restart ? "yes" : "no command set"}`),
       el("div", { class: "k" }, "agent"), el("div", { class: "muted" }, `v${facts.agent.version} · last answered ${clock(agent.asked_at)}`)),
+    engineVersions(host, agent),
     engineControl(host, agent, facts),
     agentModels(host, agent, facts));
+}
+
+// The engine versions an agent installs and runs, where its machine's owner let it (S9, D153):
+// a newer one is staged while the host serves, and switched to when it is quiet and drained —
+// or now, from here. Rolling back goes through the same drain.
+function engineVersions(host, agent) {
+  const v = agent.engine_install;
+  if (!v) return null;
+  if (!v.allowed) return el("p", { class: "muted" },
+    "The machine's owner has not let this agent install its engine (install_engines in its settings), so its version is the owner's to keep.");
+  const working = v.working ? `${v.working.step} ${v.working.version}`
+    + (v.working.total ? ` — ${gigabytes(v.working.done)} of ${gigabytes(v.working.total)}` : "") : null;
+  const upgrade = agent.upgrade;
+  const act = (what, label) => async (e) => {
+    const ok = await confirmAction({
+      title: what === "upgrade" ? `Upgrade ${v.engine} on ${host.host_id} to ${v.staged} now?` : `Roll ${v.engine} on ${host.host_id} back to ${v.previous}?`,
+      body: `The host stops taking new requests, finishes the ones it has, switches, and must then answer and hold what it held before — or it goes back by itself.`,
+      retype: host.host_id,
+    });
+    if (!ok) return;
+    const button = e.target; button.disabled = true;
+    try { await api.switchEngine(host.host_id, what); await refresh(); } catch (error) { alert(error.message); } finally { button.disabled = false; button.textContent = label; }
+  };
+  const newer = v.staged && v.staged !== v.running;
+  return el("div", {},
+    el("h2", {}, `${v.engine} versions`, el("span", { class: "muted" }, ` · following ${agent.engine_version === "latest" ? "the latest release" : agent.engine_version}`)),
+    el("div", { class: "kv" },
+      el("div", { class: "k" }, "running"), el("div", { class: "mono" }, v.running || "nothing yet"),
+      el("div", { class: "k" }, "staged"), el("div", { class: "mono" }, v.staged || "—", working ? el("span", { class: "muted" }, ` · ${working}`) : null),
+      el("div", { class: "k" }, "previous"), el("div", { class: "mono" }, v.previous || "—"),
+      el("div", { class: "k" }, "latest seen"), el("div", { class: "mono" }, v.latest || "—",
+        v.latest_checked_at ? el("span", { class: "muted" }, ` · checked ${clock(v.latest_checked_at)}`) : null),
+      upgrade ? el("div", { class: "k" }, "now") : null,
+      upgrade ? el("div", {}, pill(upgrade.phase, "warn"), ` ${upgrade.rollback ? "back" : ""} to ${upgrade.to}`) : null,
+      (agent.versions_not_taken || []).length ? el("div", { class: "k" }, "not taken here") : null,
+      (agent.versions_not_taken || []).length ? el("div", { class: "mono" }, agent.versions_not_taken.join(", ")) : null,
+      v.error ? el("div", { class: "k" }, "last error") : null,
+      v.error ? el("div", { class: "error" }, v.error) : null),
+    upgrade ? null : el("div", { class: "row" },
+      newer ? el("button", { class: "primary", onclick: act("upgrade", "Upgrade now") }, `Upgrade now to ${v.staged}`) : null,
+      v.previous && v.previous !== v.running ? el("button", { onclick: act("rollback", "Roll back") }, `Roll back to ${v.previous}`) : null,
+      newer ? el("span", { class: "muted" }, "otherwise it switches by itself once the host has been quiet for a while") : null));
 }
 
 // The engine has to run as many requests at once as the host has workers, and hold the whole

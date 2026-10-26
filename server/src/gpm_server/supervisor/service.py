@@ -44,6 +44,7 @@ from ..providers.base import ProviderAuthError, ProviderError, get_provider
 from ..transports import SshTunnel, build_client, tunnel_maker
 from . import agents
 from .renting import Fleet
+from .upgrades import EngineUpgrades
 
 log = logging.getLogger("gpm.supervisor")
 #: Programs' requests answered per look of the watcher, and per pass (D117).
@@ -77,6 +78,10 @@ class SupervisedHost:
     agent_tunnel: Optional[SshTunnel] = None
     last_error: Optional[str] = None
     last_probe_at: Optional[float] = None
+    #: Where the engine versions its agent installs stand (S9, D153): `engine.install`.
+    install: Optional[dict[str, Any]] = None
+    #: Whether the engine answered at the last probe — what an upgrade's check reads.
+    engine_answers: bool = False
 
     @property
     def host_id(self) -> str:
@@ -125,6 +130,11 @@ class Supervisor:
         self.engine: Engine = self.engines[config.engine]
         self.table = HostTable(database)
         self.counters = HostCounters(database)
+        #: Engine upgrades on hosts whose agent installs the engine (S9, D153).
+        self.upgrades = EngineUpgrades()
+        #: A host that has served nothing since the supervisor started is quiet from then, not
+        #: for ever: an upgrade never follows a start-up at once.
+        self._started_at = time.time()
         self.lock = SupervisorLock(
             database,
             pool=config.pool.name,
@@ -472,6 +482,10 @@ class Supervisor:
             await self.adopt_rented()
         await asyncio.gather(*(self._ask_agent(host) for host in self.hosts.values()))
         await asyncio.gather(*(self._probe(host) for host in self.hosts.values()))
+        try:
+            await self._upgrade_engines()
+        except Exception:  # noqa: BLE001 - an upgrade must never stop the pass that enforces leases
+            log.exception("advancing engine upgrades failed; the pass goes on")
         try:
             await self._probe_rented()
         except Exception:  # noqa: BLE001
@@ -914,6 +928,66 @@ class Supervisor:
                 self.events.record(kind, f"host {host.host_id}: {summary}", host_id=host.host_id, numbers=numbers)
         elif host.agent.reachable is False and models_before is not None:
             host.agent = dataclasses.replace(host.agent, models=None)
+        await self._say_engine_version(host)
+
+    async def _say_engine_version(self, host: SupervisedHost) -> None:
+        """Tell an agent that installs its engine which version this host should run (D151) —
+        it stages a newer one in the background — and keep where its versions stand. Never a
+        switch: that is `_upgrade_engines`, after a drain."""
+        engine = ((host.agent.facts or {}).get("engine") or {}) if host.agent and host.agent.reachable else {}
+        install = engine.get("install") if isinstance(engine, dict) else None
+        if not isinstance(install, dict):
+            host.install = None
+            return
+        if not install.get("allowed"):
+            host.install = install
+            return
+        status, answer = await agents.set_engine_version(
+            host.agent_endpoint, host.config.engine_version, transport=self._agent_transport
+        )
+        host.install = answer if status == 200 and answer is not None else install
+
+    async def _upgrade_engines(self) -> None:
+        """Advance each host's engine upgrade by one step (docs/spec/supervisor.md §3.1)."""
+        counters = self.counters.all()
+        now = time.time()
+        pool = self.config.pool
+        for host in self.hosts.values():
+            if host.config.agent is None or host.config.disabled:
+                continue
+            counter = counters.get(host.host_id)
+            last = counter.last_request_at if counter is not None else None
+            step = self.upgrades.next_step(
+                host.host_id, host.install,
+                busy=counter.busy if counter is not None else 0,
+                idle_s=max(0.0, now - (last if last is not None else self._started_at)),
+                held=host.resident if host.config.residency == "pinned" else host.available,
+                engine_answers=host.engine_answers,
+                idle_needed_s=pool.engine_upgrade_idle_s,
+                drain_s=pool.engine_upgrade_drain_s,
+                check_s=pool.engine_upgrade_check_s,
+                another_upgrading=any(other != host.host_id for other in self.upgrades.active),
+                now=now,
+            )
+            if step.event:
+                self.events.record(step.event, f"host {host.host_id}: {step.summary}", host_id=host.host_id,
+                                   numbers={"version": step.version} if step.version else None)
+            if step.action in ("switch", "rollback") and step.version:
+                status, answer = await agents.set_engine_version(
+                    host.agent_endpoint, step.version, switch=True, transport=self._agent_transport
+                )
+                if answer is not None:
+                    host.install = answer
+                if status != 200 and step.action == "switch":
+                    self.upgrades.active.pop(host.host_id, None)
+                    detail = (answer or {}).get("detail") or (answer or {}).get("error") or f"the agent answered {status}"
+                    self.events.record("engine_upgrade_failed", f"host {host.host_id}: the switch to {step.version} "
+                                       f"was refused: {detail}", host_id=host.host_id)
+            upgrade = self.upgrades.active.get(host.host_id)
+            if upgrade is not None:
+                # Out of routing for the whole of it: draining, switching and checking.
+                host.state = HostState.PREPARING
+                host.last_error = upgrade.reason(str((host.install or {}).get("engine") or "the engine"))
 
     async def _probe_rented(self) -> None:
         """A rented host is verified exactly like any other: only `ready` hosts are routed to,
@@ -1254,6 +1328,12 @@ class Supervisor:
                     host.last_error = None
                 await self._observe_inputs(host)
 
+        host.engine_answers = health.ok
+        upgrade = self.upgrades.active.get(host.host_id)
+        if upgrade is not None:
+            # An upgrade owns the host until it is done: the router must not send it work.
+            host.state = HostState.PREPARING
+            host.last_error = upgrade.reason(str((host.install or {}).get("engine") or "the engine"))
         host.last_probe_at = time.monotonic()
         if host.state is not previous:
             log.info(
