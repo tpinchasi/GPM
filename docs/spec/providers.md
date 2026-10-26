@@ -318,5 +318,9 @@ Each step ships on its own and keeps a single-provider pool working as it does t
    2026-10-07 on one pod: it offers no spot; its pod-scoped key ends its own pod, so its hosts get the
    dead-man timer; and the plug-in's start-up brings up the SSH daemon RunPod does not. Then end to end
    through a scratch pool: two hosts rented, prepared, served and released, a model volume filled and
-   copied from (D139). **Verda**
-   is the likely third, as the first provider whose interruptible offers have a spot price.
+   copied from (D139).
+6. More providers, in the owner's order (D140): **Verda**, then **Shadeform**, then **Lambda Cloud**.
+   **Verda's plug-in built** (D140), not yet checked live: spot at the provider's price and on demand,
+   GPU virtual machines whose start-up script runs the engine image as the one container that is the
+   host, with only its SSH daemon published; no dead-man timer, so short leases only; never parked;
+   no model volumes yet.

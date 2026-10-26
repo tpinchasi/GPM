@@ -60,6 +60,7 @@ from .base import (
     VolumeInfo,
     redacted,
 )
+from .hostscript import SSH_DAEMON
 
 log = logging.getLogger("gpm.runpod")
 
@@ -81,21 +82,8 @@ _MAX_NETWORK_VOLUME_GB = 4096
 #: page, 2026-10-07): $0.07 up to 1 TB, $0.05 beyond. The higher rate is used throughout, so
 #: the figure is never below what is billed.
 _NETWORK_VOLUME_PER_GB_MONTH = 0.07
-#: RunPod runs the image as it is: unlike a provider that boots its own SSH daemon into every
-#: instance, it starts one only where the image does, and the pool reaches its hosts over SSH.
-#: So the start-up script first makes sure one runs — installed from the image's own package
-#: manager when missing, key login only (the pool's key is put in place by the script itself) —
-#: in the background, so a slow install never holds up the engine. Unverified on a live pod.
-_SSH_DAEMON = (
-    "( if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then "
-    "{ apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server; } "
-    "|| apk add --no-cache openssh-server; fi; "
-    # Host keys made here, never the image's: a public image's baked-in keys are known to anyone
-    # who pulls it, which would defeat the pool's trust in the first key it sees.
-    "mkdir -p /run/sshd && rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub && ssh-keygen -A && "
-    "/usr/sbin/sshd -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no "
-    "-o PermitRootLogin=prohibit-password ) >/var/log/gpm-sshd.log 2>&1 &"
-)
+#: RunPod runs the image as it is, and starts no SSH daemon of its own: the start-up script does.
+_SSH_DAEMON = SSH_DAEMON
 #: A 400 on create means either "this request breaks a rule" or "no capacity", told apart only by
 #: its human-readable `detail` (the create operation's own documentation). These are the words a
 #: capacity refusal is read from; anything else is a rule the request broke, which no other

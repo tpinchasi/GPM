@@ -980,18 +980,18 @@ class Fleet:
     # --- the dead-man timer ---
 
     def deadman_onstart(self, models: Optional[Sequence[str]] = None, connection: Optional[str] = None) -> Optional[str]:
-        """The start-up script that arms the timer, or None where the provider has no
-        instance-scoped credential.
+        """The start-up script: the timer armed first, the pool's key, then the engine.
 
-        Without one the pool would have to choose between putting the account credential on a
-        machine it does not trust and having no timer at all. It does neither: it refuses long
-        leases on that provider instead (spec §7).
+        Where the provider has no instance-scoped credential there is no timer: the pool would
+        otherwise have to choose between putting the account credential on a machine it does not
+        trust and having none. It does neither — it refuses long leases on that provider instead
+        (spec §7) — and the script still carries the pool's way in and the engine's start.
         """
         provider = self.provider_for(connection or self.connection)
-        if not provider.capabilities.self_terminate:
-            return None
+        timer = (provider.self_terminate_request(self.rented.teardown.deadman_action)
+                 if provider.capabilities.self_terminate else None)
         return onstart_script(
-            provider.self_terminate_request(self.rented.teardown.deadman_action),
+            timer,
             window_s=int(self.rented.teardown.deadman_minutes * 60),
             engine_port=self.engine_port,
             public_key=self.pool_public_key(),
@@ -3062,19 +3062,16 @@ class Fleet:
                 self._end_prepare_lease(host, "no longer exists at the provider")
                 continue
 
-            if (
-                status.startup_material is False
-                and host.state != "ready"
-                and self.deadman_onstart(connection=host.connection_name) is not None
-            ):
-                # Created with a start-up script and reported back without one (seen live): no
-                # dead-man timer, no key for the pool, so it can never join and nothing on it
-                # would stop it billing. There is no way in to repair it. End it now (D65).
+            if status.startup_material is False and host.state != "ready":
+                # Created with a start-up script — every host is (D140) — and reported back without
+                # one (seen live): no key for the pool, nor a dead-man timer where it would have had
+                # one, so it can never join and nothing on it would stop it billing. There is no way
+                # in to repair it. End it now (D65).
                 self.avoid(host.offer.machine_id, "came up without its start-up material")
                 self.events.record(
                     "host_without_startup",
                     f"{host.host_id} came up without the start-up material it was created with: "
-                    "no dead-man timer and no way in for the pool; ending it",
+                    "no way in for the pool, nor its dead-man timer; ending it",
                     numbers={"machine": host.offer.machine_id},
                     host_id=host.host_id,
                     lease_id=host.lease_id,

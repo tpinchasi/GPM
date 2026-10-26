@@ -277,7 +277,7 @@ def install_public_key_command(
 
 
 def onstart_script(
-    request: "SelfTerminateRequest",
+    request: Optional["SelfTerminateRequest"],
     *,
     window_s: int,
     engine_port: int = 11434,
@@ -292,18 +292,23 @@ def onstart_script(
     Armed first on purpose — a host that fails later in its start-up must still be able to end
     itself rather than bill until somebody notices. The pool's public key goes in next, so the
     supervisor can reach the host to heartbeat the timer and forward the engine.
+
+    With no `request` — a provider whose instances hold no credential to end themselves — there
+    is no timer, and the rest is the same: the pool still needs its way in and its engine. Such a
+    provider is rented from only for short leases (spec §7).
     """
-    script = build_script(
-        request, window_s=window_s, poll_s=poll_s, engine_port=engine_port, state_dir=state_dir
-    )
-    lines = [
-        "mkdir -p " + state_dir,
-        f"cat > {state_dir}/deadman.sh <<'GPM_DEADMAN_EOF'",
-        script,
-        "GPM_DEADMAN_EOF",
-        f"chmod +x {state_dir}/deadman.sh",
-        f"nohup {state_dir}/deadman.sh >{state_dir}/deadman.log 2>&1 &",
-    ]
+    lines = ["mkdir -p " + state_dir]
+    if request is not None:
+        script = build_script(
+            request, window_s=window_s, poll_s=poll_s, engine_port=engine_port, state_dir=state_dir
+        )
+        lines += [
+            f"cat > {state_dir}/deadman.sh <<'GPM_DEADMAN_EOF'",
+            script,
+            "GPM_DEADMAN_EOF",
+            f"chmod +x {state_dir}/deadman.sh",
+            f"nohup {state_dir}/deadman.sh >{state_dir}/deadman.log 2>&1 &",
+        ]
     if public_key:
         lines.append(install_public_key_command(public_key, ssh_user))
     if extra:

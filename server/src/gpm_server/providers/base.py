@@ -488,6 +488,8 @@ def presentation(plugin: Any, type_name: str) -> dict[str, Any]:
         # where it works — said by the plug-in, so the core names no provider.
         "volume_price_per_gb_month": _number_or_none(getattr(plugin, "volume_price_per_gb_month", None)),
         "volume_note": _short_text_or_none(getattr(plugin, "volume_note", None)),
+        # What the credential is, where it is more than one key — shown under the field.
+        "credential_format": _short_text_or_none(getattr(plugin, "credential_format", None)),
     }
 
 
