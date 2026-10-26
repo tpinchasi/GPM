@@ -17,6 +17,7 @@ import secrets
 import stat
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 DEFAULT_PATH = "~/.config/gpm-agent/agent.json"
 KEY_PREFIX = "gpmg"
@@ -44,6 +45,34 @@ def is_loopback(host: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+#: Engines whose server this agent starts itself (D148), and so binds where it says.
+AGENT_STARTED_ENGINES = frozenset({"whisper-cpp"})
+
+#: The addresses such a server is started on: 127.0.0.1, as the agent passes it, or a name for it.
+_SERVER_HOSTS = ("127.0.0.1", "localhost")
+
+
+def loopback_engine_url_problem(url: str) -> Optional[str]:
+    """What is wrong with `url` as the address of a server this agent starts, or None.
+
+    Plain http, on 127.0.0.1, with its port written out — the port is the one the server is
+    started on, so it cannot be left to a scheme's default."""
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return "is not a URL"
+    if parts.scheme != "http":
+        return "must be plain http: the server it names speaks nothing else"
+    if parts.hostname not in _SERVER_HOSTS:
+        return "is not this machine's loopback address"
+    if port is None:
+        return "names no port"
+    if parts.path not in ("", "/") or parts.query or parts.fragment:
+        return "must be the server's address and nothing more"
+    return None
 
 
 @dataclasses.dataclass
@@ -76,6 +105,10 @@ class Settings:
     #: the heartbeat verb is refused. Touching it can only ever *postpone* a shutdown the pool
     #: could equally cause by going silent, which is why it needs no other bound.
     heartbeat_file: Optional[str] = None
+    #: The engine's program, for an engine this agent starts itself — whisper.cpp's
+    #: `whisper-server` (D148). The owner's choice, an absolute path; unset means the one on this
+    #: agent's PATH. The pool never names a program.
+    engine_binary: Optional[str] = None
 
     def check(self) -> None:
         if not is_loopback(self.host) and not (self.tls_certfile and self.tls_keyfile):
@@ -90,6 +123,23 @@ class Settings:
             or not all(isinstance(part, str) for part in self.restart_command)
         ):
             raise SettingsError("restart_command must be a list of strings: an argument list, never a shell line")
+        if self.engine_binary is not None and (
+            not isinstance(self.engine_binary, str)
+            or not Path(self.engine_binary).expanduser().is_absolute()
+        ):
+            raise SettingsError(
+                "engine_binary must be the program's absolute path; leave it unset to use the one "
+                "on this agent's PATH"
+            )
+        if self.engine in AGENT_STARTED_ENGINES:
+            problem = loopback_engine_url_problem(self.engine_url)
+            if problem:
+                raise SettingsError(
+                    f"engine_url {self.engine_url!r} {problem}. This agent starts {self.engine}'s "
+                    "server itself, on 127.0.0.1, and that server has no authentication of its "
+                    "own, so it is never put on a network: the pool reaches it on this machine or "
+                    "through a tunnel (D148). Use http://127.0.0.1:<port>."
+                )
 
     def accepts(self, key: str) -> bool:
         return hmac.compare_digest(fingerprint(key), self.key_hash)

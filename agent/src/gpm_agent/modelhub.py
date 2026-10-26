@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Collection, Optional
 
 import httpx
 
@@ -174,10 +174,27 @@ async def listing(repo: str, *, client: Optional[httpx.AsyncClient] = None) -> l
     ]
 
 
+#: A directory name under the models directory: one plain segment, so a caller choosing where a
+#: fetch lands still cannot choose a place outside it.
+_DIRECTORY_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def chosen(listed: list[RemoteFile], repo: str, only: Collection[str]) -> list[RemoteFile]:
+    """The files named in `only`, exactly as the hub lists them — or a refusal naming the first
+    one the listing does not have. Names are matched whole, so a file of the same name in a
+    subdirectory is not the file asked for."""
+    by_path = {f.path: f for f in listed}
+    for path in sorted(set(only)):
+        if path not in by_path:
+            raise HubRefused(f"the hub's listing of {repo} has no {path}")
+    return [by_path[path] for path in sorted(set(only))]
+
+
 async def fetch(
     repo: str, models_dir: str | Path, *, client: Optional[httpx.AsyncClient] = None,
     volume_read: Optional[Path] = None, volume_fill: Optional[Path] = None,
     report: Optional[model_volume.Report] = None,
+    only: Optional[Collection[str]] = None, into: Optional[str] = None,
 ) -> AsyncIterator[tuple[int, int]]:
     """Fetch a repository into `models_dir`, yielding (bytes done, bytes total) as it moves.
 
@@ -191,25 +208,37 @@ async def fetch(
     build is copied up into the volume (`volume_fill`) in the background, so the fetch ends as soon
     as the model is on this host's disk. Both are the agent's own mount paths, and `report` says
     what came from where — its `fill` reads `filling` until the copy ends.
+
+    **Part of a repository** (D148): some repositories hold one model in several sizes side by
+    side, each a single file, and a build is one of them. `only` names the files wanted, exactly
+    as the hub lists them, in place of the usual choice of weights; one the listing lacks is
+    refused. `into` names the directory under `models_dir` they land in, in place of the
+    repository's own — one plain segment, so nothing a caller passes lands outside it.
     """
-    into = directory_for(models_dir, repo)
-    files = wanted(await listing(repo, client=client))
+    if into is None:
+        into_dir = directory_for(models_dir, repo)
+    elif _DIRECTORY_NAME.match(into) and ".." not in into:
+        into_dir = Path(models_dir).expanduser() / into
+    else:
+        raise HubRefused(f"{into!r} is not a directory name under the models directory")
+    listed = await listing(repo, client=client)
+    files = wanted(listed) if only is None else chosen(listed, repo, only)
     if not files:
         raise HubRefused(f"{repo} holds no files this agent would fetch")
     total = sum(f.size for f in files)
-    into.mkdir(parents=True, exist_ok=True)
+    into_dir.mkdir(parents=True, exist_ok=True)
     # Not complete until this fetch says so, whatever an earlier one left behind.
-    (into / COMPLETE_MARKER).unlink(missing_ok=True)
+    (into_dir / COMPLETE_MARKER).unlink(missing_ok=True)
     report = report if report is not None else model_volume.Report()
     if volume_read is not None:
-        await model_volume.read_safely(volume_read, into.name, files, into, report)
+        await model_volume.read_safely(volume_read, into_dir.name, files, into_dir, report)
 
     own = client is None
     client = client or httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=300.0), follow_redirects=True)
     done = 0
     try:
         for entry in files:
-            target = into / entry.path
+            target = into_dir / entry.path
             target.parent.mkdir(parents=True, exist_ok=True)
             already = target.stat().st_size if target.exists() else 0
             if entry.size and already == entry.size:
@@ -234,11 +263,11 @@ async def fetch(
                 )
             done += entry.size or landed
             yield done, total
-        (into / COMPLETE_MARKER).write_text(f"{total}\n")
+        (into_dir / COMPLETE_MARKER).write_text(f"{total}\n")
         if volume_fill is not None:
             # After the fetch, not inside it: the host is ready once its models are on its own
             # disk, and fills the volume while it serves (D139).
-            model_volume.in_background(model_volume.fill(volume_fill, into.name, files, into, report), report)
+            model_volume.in_background(model_volume.fill(volume_fill, into_dir.name, files, into_dir, report), report)
     except httpx.HTTPError as exc:
         raise HubRefused(f"fetching {repo} stopped: {exc or type(exc).__name__}") from exc
     finally:

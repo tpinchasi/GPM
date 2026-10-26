@@ -17,6 +17,7 @@ import httpx
 
 from . import modelhub, vllm_state
 from . import volume as model_volume
+from .whisper_cpp import WhisperCppFacts
 
 
 def _sources_fact(sources: dict[str, tuple[Any, float]]) -> dict[str, dict[str, Any]]:
@@ -420,7 +421,7 @@ class VllmFacts:
         return applied
 
 
-_ENGINES = {"ollama": OllamaFacts, "vllm": VllmFacts}
+_ENGINES = {"ollama": OllamaFacts, "vllm": VllmFacts, "whisper-cpp": WhisperCppFacts}
 
 
 def engine_facts(name: str, settings: Any = None) -> Optional[Any]:
