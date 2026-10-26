@@ -8,7 +8,16 @@ from typing import Any, ClassVar, Optional
 import httpx
 
 from . import openai_api
-from .base import EngineOption, Health, Occupancy, PullResult
+from .base import (
+    CHAT,
+    EMBED,
+    EngineOption,
+    Health,
+    MediaNotInline,
+    Occupancy,
+    PullResult,
+    RequestFacts,
+)
 
 _STREAMING_PATHS = frozenset({"/api/chat", "/api/generate"})
 
@@ -19,12 +28,17 @@ def _decode(body: bytes) -> dict[str, Any]:
 
 
 class OllamaEngine:
-    interface_version: ClassVar[str] = "1"
+    interface_version: ClassVar[str] = "2"
     name: ClassVar[str] = "ollama"
+    #: Chat and embeddings. Ollama's transcription hands the audio to a chat model, which the
+    #: pool does not offer (D142); it has no ranking.
+    kinds: ClassVar[frozenset[str]] = frozenset({CHAT, EMBED})
     default_port: ClassVar[int] = 11434
     #: Ollama's own store for the root user, where its images keep it (unverified on every image).
     models_dir: ClassVar[str] = "/root/.ollama/models"
     image_words: ClassVar[tuple[str, ...]] = ("ollama",)
+    #: The image a rented host starts from when the configuration names none. Pinned (T10).
+    default_image: ClassVar[str] = "ollama/ollama:0.34.2"
     loads_by_restart: ClassVar[bool] = False
     #: Ollama's start takes no named options, and its builds are its own library's names.
     options: ClassVar[dict[str, EngineOption]] = {}
@@ -49,6 +63,44 @@ class OllamaEngine:
         return {"/api/chat", "/api/generate", "/api/embed", "/api/embeddings"} | set(
             openai_api.INFERENCE_PATHS
         )
+
+    def kind_of(self, path: str) -> Optional[str]:
+        if path in _STREAMING_PATHS:
+            return CHAT
+        if path in ("/api/embed", "/api/embeddings"):
+            return EMBED
+        return openai_api.kind_of(path) if path in openai_api.INFERENCE_PATHS else None
+
+    def request_facts(self, path: str, content_type: str, body: bytes) -> RequestFacts:
+        if path in openai_api.INFERENCE_PATHS:
+            return openai_api.json_facts(path, body)
+        # Its own API: the same top-level fields, a picture as base64 in `images` — beside a
+        # message's text in chat, beside the prompt in generate — and streaming on by default.
+        kind = self.kind_of(path) or CHAT
+        found = openai_api.members(body)
+        if found is None:
+            return RequestFacts(model=None, kind=kind)
+        model = openai_api.requested_model(body)
+        fields = {key: value for key, value, _, _ in found}
+        inputs: set[str] = set()
+        if kind == CHAT:
+            carriers = [fields] + [m for m in fields.get("messages") or [] if isinstance(m, dict)]
+            for carrier in carriers:
+                images = carrier.get("images")
+                if images:
+                    if not isinstance(images, list) or not all(isinstance(i, str) and ":" not in i for i in images):
+                        raise MediaNotInline("a picture given by link or path rather than as base64")
+                    inputs.add("image")
+        return RequestFacts(
+            model=model,
+            kind=kind,
+            inputs=frozenset(inputs),
+            stream=path in _STREAMING_PATHS and bool(fields.get("stream", True)),
+            wants_schema=isinstance(fields.get("format"), dict),
+        )
+
+    def rewrite_model(self, path: str, content_type: str, body: bytes, tag: str) -> tuple[str, bytes]:
+        return content_type, openai_api.with_model(body, tag)
 
     def requested_model(self, path: str, body: bytes) -> Optional[str]:
         # Ollama decodes JSON with Go's matching, which ignores letter case: `requested_model`
@@ -235,6 +287,21 @@ class OllamaEngine:
         response.raise_for_status()
         return _tags_in(response.json().get("models", []))
 
+    async def observed_inputs(self, client: httpx.AsyncClient, tags: set[str]) -> dict[str, frozenset[str]]:
+        """What each build takes besides text, as this Ollama says (D143). It depends on the
+        version running it — the same files take pictures under one and not another — so the
+        pool asks rather than trusting a library page. A tag it cannot show is left out."""
+        found: dict[str, frozenset[str]] = {}
+        for tag in sorted(tags):
+            try:
+                shown = await client.post("/api/show", json={"model": tag})
+                shown.raise_for_status()
+                capabilities = shown.json().get("capabilities") or []
+            except (httpx.HTTPError, ValueError):
+                continue
+            found[tag] = frozenset(_INPUT_OF.get(c, "") for c in capabilities) - {""}
+        return found
+
 
 #: Error text that means the pull cannot succeed however often it is tried.
 _PERMANENT_PULL_ERRORS = ("not found", "does not exist", "manifest unknown", "invalid model", "no space left")
@@ -243,6 +310,10 @@ _PERMANENT_PULL_ERRORS = ("not found", "does not exist", "manifest unknown", "in
 def _permanent(error: str) -> bool:
     lowered = error.lower()
     return any(marker in lowered for marker in _PERMANENT_PULL_ERRORS)
+
+
+#: Ollama's capability names for what a model takes, in the pool's words.
+_INPUT_OF = {"vision": "image", "audio": "audio"}
 
 
 def _tags_in(entries: list[dict]) -> frozenset[str]:

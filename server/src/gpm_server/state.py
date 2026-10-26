@@ -10,7 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from .config import PoolConfig
+from .config import PoolConfig, Variant
 from .db import Database, HostCounters, HostTable, RequestLog
 from .engines import Engine, get_engine
 from .models import Host
@@ -38,6 +38,50 @@ class RouterState:
             config, HostTable(database), HostCounters(database), self.dispatcher
         )
         self.log = RequestLog(database)
+        #: Request bytes held right now — queued, in flight, kept for a resend (D144).
+        self.held_bytes = 0
+        self._learn_builds(config)
+
+    def _learn_builds(self, config: PoolConfig) -> None:
+        """What each build does and takes, and which builds of each name some host could hold —
+        read from configuration, once per configuration, never from the published host rows."""
+        traits = config.build_traits()
+        self.dispatcher.traits = lambda tag: traits.get(tag, (frozenset({"chat", "embed"}), None))
+        self._reachable: dict[str, list[Variant]] = {}
+
+    def refusal_for(self, model: str, kind: str, inputs: frozenset[str]) -> Optional[tuple[str, str]]:
+        """Why no host this pool has or rents could ever serve this, or None (D143). Waiting cannot
+        help such a request, so it is refused at once rather than queued into a `503`."""
+        builds = self._reachable.get(model)
+        if builds is None:
+            by_tag = {
+                variant.tag: variant
+                for name in self.config.catalog
+                for variant in self.config.builds_reachable(name)
+            }
+            builds = [by_tag[model]] if model in by_tag else self.config.builds_reachable(model)
+            self._reachable[model] = builds
+        doing = [build for build in builds if kind in build.kinds()]
+        if not doing:
+            return "kind_not_served", (
+                f"no build of {model!r} that this pool's hosts could hold serves {kind}; ask the operator "
+                "for a model that does"
+            )
+        if inputs and not any(build.accepts() is None or inputs <= build.accepts() for build in doing):
+            return "input_not_accepted", (
+                f"no build of {model!r} that this pool's hosts could hold accepts {sorted(inputs)}"
+            )
+        return None
+
+    def take_request_bytes(self, size: int) -> bool:
+        """Hold a request's bytes, unless that would pass `pool.max_held_request_mb` (D144)."""
+        if self.held_bytes + size > self.config.pool.max_held_request_mb * 1_000_000:
+            return False
+        self.held_bytes += size
+        return True
+
+    def give_back_request_bytes(self, size: int) -> None:
+        self.held_bytes = max(0, self.held_bytes - size)
 
     def apply(self, config: PoolConfig) -> None:
         """Serve under a configuration applied while the router runs: the model set, the
@@ -49,6 +93,7 @@ class RouterState:
         self.engine = self.engines[config.engine]
         self.app_hashes = config.auth.app_hashes()
         self.registry.apply_config(config)
+        self._learn_builds(config)
 
     @property
     def hosts(self) -> list[Host]:

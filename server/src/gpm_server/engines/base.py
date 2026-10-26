@@ -228,6 +228,64 @@ class EngineNotFound(Exception):
     """The configuration named an engine that is not installed."""
 
 
+#: What a request asks a model to do — read from the path it arrived on (D142).
+CHAT, EMBED, TRANSCRIBE, RERANK = "chat", "embed", "transcribe", "rerank"
+KINDS = frozenset({CHAT, EMBED, TRANSCRIBE, RERANK})
+#: What a request may carry besides text (D143).
+INPUTS = frozenset({"image", "audio"})
+#: What an engine that does not say serves: what every engine served before kinds existed.
+VERSION_ONE_KINDS = frozenset({CHAT, EMBED})
+
+
+@dataclasses.dataclass(frozen=True)
+class RequestFacts:
+    """Everything the router needs from a request body, read once (D144)."""
+
+    model: Optional[str]
+    kind: str = CHAT
+    inputs: frozenset[str] = frozenset()
+    stream: bool = False
+    wants_schema: bool = False
+
+
+class MediaNotInline(ValueError):
+    """A picture or sound given by link, or a part the pool does not know (D143). The engine host
+    would fetch a link from its own network; the pool refuses it before choosing a host."""
+
+    def __init__(self, what: str):
+        super().__init__(what)
+        self.what = what
+
+
+def kinds_of(engine: Any) -> frozenset[str]:
+    """The kinds an engine serves. Version 2 declares them; version 1 served chat and embeddings."""
+    return frozenset(getattr(engine, "kinds", VERSION_ONE_KINDS))
+
+
+def facts_of(engine: Any, path: str, content_type: str, body: bytes) -> RequestFacts:
+    """A request's facts, through the engine's version-2 reader where it has one.
+
+    A version-1 plug-in is read the way it always was — three calls — and as chat: it declared
+    no other kind. May raise `AmbiguousField`, `MediaNotInline` or `multipart.BadUpload`.
+    """
+    reader = getattr(engine, "request_facts", None)
+    if reader is not None:
+        return reader(path, content_type, body)
+    return RequestFacts(
+        model=engine.requested_model(path, body),
+        stream=engine.is_streaming(path, body),
+        wants_schema=engine.wants_schema(path, body),
+    )
+
+
+def rewrite_of(engine: Any, path: str, content_type: str, body: bytes, tag: str) -> tuple[str, bytes]:
+    """The body with the model set to `tag`, and the content type to send it with."""
+    writer = getattr(engine, "rewrite_model", None)
+    if writer is not None:
+        return writer(path, content_type, body, tag)
+    return content_type, engine.with_model(path, body, tag)
+
+
 class AmbiguousField(ValueError):
     """A request body names a field the pool reads twice, or in another letter case, so the
     pool and the engine could read different values from it (D141). Refused, never guessed."""

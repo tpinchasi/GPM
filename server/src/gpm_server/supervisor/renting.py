@@ -1052,7 +1052,7 @@ class Fleet:
                 dict(row)
                 for row in self.events.db.query(
                     "SELECT host_id, outcome, latency_ms, tokens_out, generate_ms FROM request_log "
-                    "WHERE host_id IS NOT NULL ORDER BY id DESC LIMIT 20000"
+                    "WHERE host_id IS NOT NULL AND (kind IS NULL OR kind = 'chat') ORDER BY id DESC LIMIT 20000"
                 )
             ]
         except Exception as exc:  # noqa: BLE001 - a view is never worth failing a bid for
@@ -1463,7 +1463,7 @@ class Fleet:
         """
         images = self.rented.images
         if not images:
-            return self.rented.image, "the pool's only image"
+            return self.config.rented_image(), "the pool's only image"
         chosen = image_for(offer, images)
         if chosen is None:
             wanted = ", ".join(f"{i.image} needs {i.min_driver}" for i in images)

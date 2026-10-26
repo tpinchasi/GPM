@@ -18,7 +18,7 @@ import math
 import time
 from typing import Callable, Optional
 
-from ..catalog import ResolvedVariant, select_variant
+from ..catalog import ResolvedVariant, Traits, select_variant
 from ..models import Host, HostState, Worker, WorkerState
 
 
@@ -42,6 +42,9 @@ class Need:
     #: holds several of its models (D118) — a fixed share of the card, so no model starves
     #: another and each stays within its target. None: no such limit (one model, or shared).
     cap: Optional[int] = None
+    #: What the request asks for, and what it carries besides text (D142, D143).
+    kind: str = "chat"
+    inputs: frozenset[str] = frozenset()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -80,6 +83,9 @@ class Dispatcher:
         #: its request **leaves** `acquire`, never merely when it is woken: a woken waiter has not
         #: yet re-taken the lock, and a request arriving meanwhile must still see it queued.
         self._waiting: dict[str, tuple[Need, frozenset[str]]] = {}
+        #: What each build does and takes, from the router's own configuration (D143); set by
+        #: the router's state on every configuration it loads. None: everything is chat.
+        self.traits: Optional[Traits] = None
 
     def variant_for(self, host: Host, need: Need) -> Optional[ResolvedVariant]:
         variants = host.variants.get(need.model)
@@ -93,6 +99,10 @@ class Dispatcher:
             host.servable,
             wants_schema=need.wants_schema,
             runtime_class_pin=need.runtime_class_pin,
+            kind=need.kind,
+            inputs=need.inputs,
+            traits=self.traits,
+            observed=host.observed_inputs,
         )
 
     def eligible(self, need: Need, exclude: frozenset[str] = frozenset()) -> list[tuple[Host, ResolvedVariant]]:

@@ -165,7 +165,7 @@ def test_a_host_declaring_no_models_at_all_is_refused():
 
 
 def test_a_host_asked_for_a_build_its_platform_cannot_run_is_refused():
-    with pytest.raises(ValueError, match="meet no variant's requirements"):
+    with pytest.raises(ValueError, match="no build of them is one it can serve"):
         config(
             pool={"models_per_host": "declared"},
             catalog={BIG: {"variants": [{"tag": "gemma4:26b-mlx", "requires": ["apple-silicon"]}]}},

@@ -145,7 +145,7 @@ own, which an older router ignores.
 - **Long work is not a failure.** A timeout after the whole body was sent is `504
   generation_timeout`: no re-run elsewhere, no failure counted against the host, not retried by
   the SDK. Today it reads as a host that never answered — counted, re-run on a second host, and
-  retried by the SDK for up to half an hour. Each kind has its own read timeout.
+  retried by the SDK for up to half an hour.
 - **Measured by kind.** The request log gains `kind` and `request_bytes`; the token-based
   measures and the latency curves (worker readings, D75, workload latency, the concurrency curve,
   machine history) filter by kind explicitly.

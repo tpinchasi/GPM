@@ -67,6 +67,10 @@ class SupervisedHost:
     state: HostState = HostState.UNREACHABLE
     resident: frozenset[str] = frozenset()
     available: frozenset[str] = frozenset()
+    #: What each build accepts, as the engine reported it (D143), and for which builds, when.
+    observed: dict[str, frozenset[str]] = dataclasses.field(default_factory=dict)
+    observed_for: frozenset[str] = frozenset()
+    observed_at: float = 0.0
     #: The last answer from this host's agent, if it has one (docs/spec/host-agent.md).
     agent: Optional[agents.AgentView] = None
     #: The forward to an agent that sits on the far side of this host's SSH tunnel.
@@ -622,8 +626,10 @@ class Supervisor:
         now = time.time()
         counters = self.counters.all()
         rows = self.db.query(
+            # Chat only (D145): a transcription's latency grows with the recording, and says
+            # nothing of how many requests the host can take at once.
             "SELECT host_id, model_served, tokens_out, generate_ms, latency_ms, ts "
-            "FROM request_log WHERE outcome = 'ok' AND ts > ?",
+            "FROM request_log WHERE outcome = 'ok' AND ts > ? AND (kind IS NULL OR kind = 'chat')",
             (now - window * 2,),
         )
         waiting = len(
@@ -722,7 +728,7 @@ class Supervisor:
         rows = self.db.query(
             "SELECT host_id, model_served, tokens_out, latency_ms, ts FROM request_log "
             "WHERE outcome = 'ok' AND ts > ? AND latency_ms IS NOT NULL AND tokens_out > 0 "
-            "AND (status_code IS NULL OR status_code < 400)",
+            "AND (status_code IS NULL OR status_code < 400) AND (kind IS NULL OR kind = 'chat')",
             (now - cfg.window_s,),
         )
         readings = []
@@ -1227,6 +1233,7 @@ class Supervisor:
                 else:
                     host.state = HostState.READY
                     host.last_error = None
+                await self._observe_inputs(host)
 
         host.last_probe_at = time.monotonic()
         if host.state is not previous:
@@ -1237,6 +1244,22 @@ class Supervisor:
                 host.state.value,
                 host.last_error or "ok",
             )
+
+    async def _observe_inputs(self, host: SupervisedHost) -> None:
+        """Ask the engine what each of this host's builds takes, where it can say (D143) — when
+        the builds change, and every ten minutes, which is how an engine upgraded in place is
+        noticed. Never on the request path: the router reads what is published here."""
+        ask = getattr(self.engine_for(host), "observed_inputs", None)
+        if ask is None:
+            return
+        tags = frozenset(v.tag for variants in host.variants.values() for v in variants) & (host.available | host.resident)
+        if tags == host.observed_for and time.monotonic() - host.observed_at < 600:
+            return
+        try:
+            host.observed = await ask(host.client, set(tags))
+        except httpx.HTTPError:
+            return
+        host.observed_for, host.observed_at = tags, time.monotonic()
 
     def _publish_all(self) -> None:
         for host in self.hosts.values():
@@ -1258,6 +1281,7 @@ class Supervisor:
                     },
                     resident=host.resident,
                     available=host.available,
+                    observed={tag: tuple(sorted(found)) for tag, found in host.observed.items()},
                     residency=host.config.residency,
                     engine=self.config.engine_of(host.config),
                     last_error=host.last_error,

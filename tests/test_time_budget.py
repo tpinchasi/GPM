@@ -7,6 +7,7 @@ the router holds to it: it always answers a queued request before an SDK client 
 import concurrent.futures
 import time
 
+from fakes.fake_ollama import inference_seen
 from fakes.harness import EngineSpec, pool_harness
 
 MODEL = "m1"
@@ -54,7 +55,7 @@ def test_a_deadline_that_has_already_passed_is_not_started():
             )
         assert response.status_code == 504
         assert response.json()["reason"] == "deadline_exceeded"
-        assert pool.engines["local-1"].fake.received == []
+        assert inference_seen(pool.engines["local-1"].fake) == []
 
 
 def test_a_deadline_shorter_than_the_queue_limit_ends_the_wait_early():

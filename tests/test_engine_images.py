@@ -33,6 +33,7 @@ def config(images=(), image=None):
     # A vLLM pool, because that is the engine published once per accelerator generation. It
     # serves one model per process, so its set is spread across hosts (D89).
     engine = "vllm" if (images or (image and "vllm" in image)) else "ollama"
+    rented["engine"] = engine
     pool = {"name": "test", "model_set": [MODEL]}
     if engine == "vllm":
         pool["models_per_host"] = "declared"
@@ -167,7 +168,7 @@ def test_a_build_must_say_which_driver_it_needs():
             "hosts": [{"id": "h", "kind": "local", "workers": 1, "models": [MODEL],
                        "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}}],
             "engine": "vllm",
-            "rented": {"provider": "fake", "workers": 1, "capabilities": ["cuda"],
+            "rented": {"provider": "fake", "engine": "ollama", "workers": 1, "capabilities": ["cuda"],
                        "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 1.0}, "bidding": {"premium": 0.0},
                        "images": [{"image": "vastai/vllm:v0.29.0-cuda-13.0"}]},
         })

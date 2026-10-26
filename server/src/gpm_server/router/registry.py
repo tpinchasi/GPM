@@ -140,6 +140,7 @@ class HostRegistry:
             workers=[Worker(worker_id=f"{row.host_id}/w{i}") for i in range(row.workers)],
             variants=variants,
             literal_variants=_literal_variants(variants),
+            observed_inputs={tag: frozenset(found) for tag, found in row.observed.items()},
             state=HostState(row.state),
             resident=row.resident,
             available=row.available,
@@ -187,6 +188,7 @@ class HostRegistry:
         variants = _variants(row)
         host.variants = variants
         host.literal_variants = _literal_variants(variants)
+        host.observed_inputs = {tag: frozenset(found) for tag, found in row.observed.items()}
 
         if str(host.client.base_url).rstrip("/") != row.dial_url.rstrip("/"):
             self._retired.append(host.client)

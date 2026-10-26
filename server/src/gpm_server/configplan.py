@@ -454,8 +454,8 @@ def _limit_changes(current: PoolConfig, candidate: PoolConfig, rented: Sequence[
                 "considered; hosts already running keep theirs",
             ))
 
-        if new_rented.image != old_rented.image:
-            changes.append(Change("image", f"the engine image changes to {new_rented.image}; it applies to hosts rented from now on"))
+        if candidate.rented_image() != current.rented_image():
+            changes.append(Change("image", f"the engine image changes to {candidate.rented_image()}; it applies to hosts rented from now on"))
         if new_rented.teardown.idle_minutes != old_rented.teardown.idle_minutes:
             changes.append(Change("idle_minutes", f"idle release changes from {old_rented.teardown.idle_minutes} to {new_rented.teardown.idle_minutes} minutes"))
         if new_rented.teardown.deadman_minutes != old_rented.teardown.deadman_minutes:

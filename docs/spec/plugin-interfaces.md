@@ -204,7 +204,7 @@ embeddings:
     kinds: ClassVar[frozenset[str]]          # what it can serve: chat, embed, transcribe, rerank
     def kind_of(self, path: str) -> str | None: ...                       # its own paths only
     def request_facts(self, path: str, content_type: str, body: bytes) -> RequestFacts: ...
-    def with_model(self, path: str, content_type: str, body: bytes, tag: str) -> tuple[str, bytes]: ...
+    def rewrite_model(self, path: str, content_type: str, body: bytes, tag: str) -> tuple[str, bytes]: ...
     async def observed_inputs(self, conn: Connection, tags: set[str]) -> dict[str, set[str]] | None: ...
 ```
 
@@ -212,7 +212,7 @@ embeddings:
 |---|---|
 | `kinds`, `kind_of` | Declared, never inferred, and never inherited from a shared list: an engine that cannot run a kind does not claim it. Configuration load refuses a build whose `serves` its engine does not declare (D147) |
 | `request_facts` | Model, stream, schema, kind and the inputs carried (`image`, `audio`), read **once** from a body the router has already bounded (D144). Raises `AmbiguousField` (D141), `MediaNotInline` for a link or an unknown part type (D143), `BadUpload` for a form it would have to guess about (D144) |
-| `with_model` | For JSON, as version 1. For an upload, returns a **rebuilt** form — its own boundary, canonical part headers, the `model` part rewritten — and the new content type; every file's bytes untouched |
+| `rewrite_model` | For JSON, `with_model`'s rule. For an upload, returns a **rebuilt** form — its own boundary, canonical part headers, the `model` part rewritten — and the new content type; every file's bytes untouched |
 | `observed_inputs` | What each tag accepts on this host, where the engine can say (Ollama's capabilities); `None` where it cannot, and the catalog's declaration stands (D143) |
 
 The shipped engines: **Ollama** (chat, embeddings), **vLLM** (chat, embeddings, transcription,
@@ -304,6 +304,10 @@ rented:
     - { image: "vastai/vllm:v0.29.0-cuda-13.0", min_driver: "580", capabilities: [audio-decoding] }
     - { image: "vastai/vllm:v0.29.0-cuda-12.9", min_driver: "550", capabilities: [audio-decoding] }
 ```
+
+With neither `images` nor `image` named, rented hosts start from the rented engine's own pinned
+default (`default_image`: `ollama/ollama:0.34.2`, `vllm/vllm-openai:v0.29.0`), so changing engine never
+leaves the other engine's image behind (D147).
 
 An image's `capabilities` say what it carries beyond the engine — `audio-decoding` for vLLM's
 audio extra, which a transcription build `require`s. The pool chooses an image that carries what

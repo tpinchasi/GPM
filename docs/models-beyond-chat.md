@@ -187,7 +187,7 @@ embeddings — not speech or ranking.
 
 - A transcription holds a worker for as long as it runs; there is no separate queue for short
   calls.
-- Long recordings should be split by the app. One that outlasts its kind's read time is `504
+- Long recordings should be split by the app. One that outlasts the pool's read time (`pool.upstream_read_timeout_s`, 300 s) is `504
   generation_timeout` and is not re-run.
 - **Privacy:** pictures and recordings go wherever text goes. A pool that includes marketplace
   hosts must not carry media its owner would not show those hosts' operators

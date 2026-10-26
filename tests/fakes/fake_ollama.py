@@ -19,6 +19,12 @@ from starlette.routing import Route
 _CREATED_AT = "2026-01-01T00:00:00.000000Z"
 
 
+def inference_seen(fake) -> list:
+    """What reached an engine besides the pool asking what its builds take (`/api/show`, D143) —
+    metadata, which a probe sends to every host whatever requests arrive."""
+    return [entry for entry in fake.received if entry[0] != "/api/show"]
+
+
 class FakeOllama:
     def __init__(
         self,
@@ -39,6 +45,9 @@ class FakeOllama:
         self.healthy = healthy
         #: Scripted: a host that cannot fetch the model set must not join the pool.
         self.refuse_pull = False
+        #: Extra capabilities a tag reports from `/api/show` — `vision`, `audio` — as this
+        #: version of the engine would (D143). Set by a test; empty means text only.
+        self.capabilities: dict[str, list[str]] = {}
         #: Scripted: what a pull reports as its size, and a pause between its progress frames.
         self.pull_bytes = 1_000_000_000
         self.pull_delay_s = 0.0
@@ -311,7 +320,8 @@ class FakeOllama:
         model = parsed.get("model", "")
         if model not in self.available:
             return JSONResponse({"error": f"model '{model}' not found"}, status_code=404)
-        return JSONResponse({"capabilities": ["embedding"] if _is_embedding(model) else ["completion"]})
+        base = ["embedding"] if _is_embedding(model) else ["completion"]
+        return JSONResponse({"capabilities": base + self.capabilities.get(model, [])})
 
     async def _pull(self, request: Request) -> Response:
         _, parsed = await self._record(request)

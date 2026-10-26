@@ -42,6 +42,7 @@ BASE_YAML = textwrap.dedent(
     limits: {{max_rented_hosts: 1, max_hourly_burn: 1.00}}
     rented:
       provider: fake
+      engine: ollama
       offer_policy: {{ min_disk_gb: 10, max_all_in_hourly: 0.60 }}
       scale: {{scale_up_after_s: 0}}
     """
@@ -980,6 +981,7 @@ def test_a_setting_is_changed_in_place_leaving_the_rest_of_the_file_alone():
     before = (
         "rented:\n"
         "  provider: vast            # the account credential is read from the environment\n"
+        "  engine: ollama\n"
         "  offer_policy:\n"
         "    min_gpu_memory_gb: 80\n"
         "    max_download_per_gb: 0.015   # half a cent per GB\n"
@@ -1005,6 +1007,7 @@ def test_a_nested_one_line_mapping_is_edited_whole_not_cut_at_its_first_comma():
 
     before = (
         "rented:\n"
+        "  engine: ollama\n"
         '  search_profiles: { cheap tests: { min_disk_gb: 20, exclude_hardware: ["CMP", "P106"] }, other: {min_disk_gb: 5} }\n'
     )
     after = set_values(before, ("rented", "search_profiles"), {"cheap tests": {"min_disk_gb": 40}})

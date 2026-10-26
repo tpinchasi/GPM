@@ -322,9 +322,16 @@ _ADDED_COLUMNS = {
         # Of those, how many were of the same model (D118). Where the two are equal nothing else
         # ran on the host: the only answers a model's own latency curve is built from.
         ("model_concurrency", "INTEGER"),
+        # What the request asked for — chat, embeddings, transcription, ranking — and its body's
+        # size (D145): measures built on output tokens read only the kinds that produce them.
+        ("kind", "TEXT"),
+        ("request_bytes", "INTEGER"),
     ],
     "hosts": [
         ("available", "TEXT NOT NULL DEFAULT '[]'"),
+        # What each build accepts besides text, as this host's engine reports it — Ollama does,
+        # per version (D143). A column of its own, so a router from before it reads on unchanged.
+        ("observed", "TEXT NOT NULL DEFAULT '{}'"),
         ("residency", "TEXT NOT NULL DEFAULT 'pinned'"),
         # A pool may run more than one engine (D93). The default is the engine every pool ran
         # before this column existed, so a table written by an older version reads correctly.
@@ -439,6 +446,9 @@ class RequestRecord:
     concurrency: Optional[int] = None
     #: Of `concurrency`, the answers of the same model (D118).
     model_concurrency: Optional[int] = None
+    #: What it asked for, and the size of its body (D145).
+    kind: Optional[str] = None
+    request_bytes: Optional[int] = None
 
 
 class RequestLog:
@@ -451,8 +461,9 @@ class RequestLog:
             INSERT INTO request_log (
                 ts, request_id, session_id, host_id, worker_id, model_requested,
                 model_served, runtime_class, queue_wait_ms, latency_ms, status_code,
-                outcome, reason, tokens_out, generate_ms, workload, borrowed, concurrency, model_concurrency
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                outcome, reason, tokens_out, generate_ms, workload, borrowed, concurrency, model_concurrency,
+                kind, request_bytes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.ts,
@@ -474,6 +485,8 @@ class RequestLog:
                 int(record.borrowed),
                 record.concurrency,
                 record.model_concurrency,
+                record.kind,
+                record.request_bytes,
             ),
         )
 
@@ -502,6 +515,8 @@ class HostRow:
     variants: dict[str, tuple[tuple[str, str, Optional[bool]], ...]]
     resident: frozenset[str]
     available: frozenset[str] = frozenset()
+    #: tag -> what it accepts besides text, where this host's engine says (D143).
+    observed: dict[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)
     residency: str = "pinned"
     #: Which engine this machine runs (D93). Published so the router can refuse to send a
     #: request to a host whose engine does not serve the path it arrived on.
@@ -531,6 +546,7 @@ def _row_to_host(row: sqlite3.Row) -> HostRow:
         },
         resident=frozenset(json.loads(row["resident"])),
         available=frozenset(json.loads(row["available"])),
+        observed={tag: tuple(found) for tag, found in json.loads(row["observed"] or "{}").items()},
         residency=row["residency"],
         engine=row["engine"],
         lease_id=row["lease_id"],
@@ -552,8 +568,8 @@ class HostTable:
             INSERT INTO hosts (
                 host_id, kind, transport_type, priority, dial_url, state, workers,
                 capabilities, variants, resident, available, residency, engine, lease_id,
-                provider_ref, hourly_rate, last_error, updated_at, workload
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                provider_ref, hourly_rate, last_error, updated_at, workload, observed
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(host_id) DO UPDATE SET
                 kind=excluded.kind, transport_type=excluded.transport_type,
                 priority=excluded.priority, dial_url=excluded.dial_url,
@@ -564,7 +580,7 @@ class HostTable:
                 lease_id=excluded.lease_id,
                 provider_ref=excluded.provider_ref, hourly_rate=excluded.hourly_rate,
                 last_error=excluded.last_error, updated_at=excluded.updated_at,
-                workload=excluded.workload
+                workload=excluded.workload, observed=excluded.observed
             """,
             (
                 host.host_id,
@@ -586,6 +602,7 @@ class HostTable:
                 host.last_error,
                 time.time(),
                 host.workload,
+                json.dumps({tag: sorted(found) for tag, found in sorted(host.observed.items())}),
             ),
         )
 

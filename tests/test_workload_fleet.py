@@ -21,7 +21,7 @@ MODEL, BIG = "m1", "big"
 
 def make_fleet(database, provider, max_rented_hosts=6, **rented_overrides):
     rented = {
-        "provider": "fake", "workers": 4,
+        "provider": "fake", "engine": "ollama", "workers": 4,
         "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 2.0},
         "bidding": {"premium": 0.02}, "scale": {"scale_up_after_s": 0},
         "teardown": {"idle_minutes": 1},

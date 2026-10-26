@@ -391,7 +391,7 @@ async def test_anything_that_is_not_a_plain_model_tag_never_reaches_the_engine(t
     machine = Machine()
     refused = await machine.call("PUT", {"tags": [tag], "residency": "on_demand"})
     assert refused.status_code == 400 and refused.json()["error"] == "bad_tag"
-    assert machine.engine.received == []
+    assert inference_seen(machine.engine) == []
 
 
 async def test_registry_style_tags_are_plain_tags():
@@ -630,6 +630,8 @@ def test_deleting_from_the_console_needs_the_tag_twice_and_never_touches_a_catal
 # =====================================================================================
 
 import sys  # noqa: E402
+
+from fakes.fake_ollama import inference_seen  # noqa: E402
 
 
 def restartable(tmp_path, *, env_file=True, command=None, **more):

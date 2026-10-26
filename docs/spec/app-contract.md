@@ -122,7 +122,7 @@ It is served from a cached copy, never by asking a third party while the app wai
 | `503` | `host_lost` | The host serving this was taken away before any of the response reached you; nothing partial was sent (§5.1) | wait and retry |
 | `503` | `uploads_full` | The pool is holding as many request bytes as it allows (`pool.max_held_request_mb`) | wait and retry |
 | `504` | `deadline_exceeded` | The request's `X-GPM-Deadline` passed before it could be served | **fail fast** — the app already said the answer would be useless |
-| `504` | `generation_timeout` | The whole request was sent, and the engine did not answer within this kind's read time — a long recording, say. Not a host failure: it is not re-run on another host | **fail fast** — sending it again would take as long again |
+| `504` | `generation_timeout` | The whole request was sent, and the engine did not answer within the pool's read time (`pool.upstream_read_timeout_s`) — a long recording, say. Not a host failure: it is not re-run on another host | **fail fast** — sending it again would take as long again |
 
 ```json
 {"error": "no_capacity", "reason": "recovering", "retry_after_s": 30,

@@ -753,7 +753,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     "rented_capabilities": list(supervisor.config.rented.capabilities) if supervisor.config.rented else [],
                     "rent_profiles": list(supervisor.config.rented.rent_profiles) if supervisor.config.rented else [],
                     "engine_start": supervisor.config.rented.engine_start if supervisor.config.rented else None,
-                    "image": supervisor.config.rented.image if supervisor.config.rented else None,
+                    "image": supervisor.config.rented_image() if supervisor.config.rented else None,
                     "available": sorted(available_engines()),
                     # What each engine's own start can switch on, and whether its builds can be
                     # looked up on a model hub — what the editor offers as checkboxes (D100).
@@ -767,7 +767,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                             {"image": i.image, "min_driver": i.min_driver, "note": i.note}
                             for i in supervisor.config.rented.images
                         ]
-                        or [{"image": supervisor.config.rented.image, "min_driver": None, "note": None}]
+                        or [{"image": supervisor.config.rented_image(), "min_driver": None, "note": None}]
                     )
                     if supervisor.config.rented is not None
                     else [],

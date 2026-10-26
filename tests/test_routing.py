@@ -2,6 +2,7 @@
 
 import concurrent.futures
 
+from fakes.fake_ollama import inference_seen
 from fakes.harness import EngineSpec, pool_harness
 
 MODEL = "m1"
@@ -110,7 +111,7 @@ def test_a_model_outside_the_pools_set_is_refused_not_loaded():
         response = client.post("/api/chat", json={"model": "never-heard-of-it", "messages": []})
         assert response.status_code == 404
         assert response.json()["reason"] == "model_not_in_pool"
-        assert pool.engines["local-1"].fake.received == []
+        assert inference_seen(pool.engines["local-1"].fake) == []
 
 
 def test_a_field_the_pool_reads_named_twice_or_in_another_case_is_refused():
@@ -129,8 +130,8 @@ def test_a_field_the_pool_reads_named_twice_or_in_another_case_is_refused():
             assert response.status_code == 400, body
             assert response.json()["reason"] == "ambiguous_field", body
             assert "never-heard-of-it" not in response.text
-        assert pool.engines["local-1"].fake.received == []
-        assert pool.engines["remote-1"].fake.received == []
+        assert inference_seen(pool.engines["local-1"].fake) == []
+        assert inference_seen(pool.engines["remote-1"].fake) == []
 
 
 def test_a_body_too_deeply_nested_to_parse_is_refused_not_a_crash():
@@ -154,7 +155,7 @@ def test_a_path_the_engine_does_not_serve_is_not_forwarded():
         response = client.post("/api/pull", json={"model": MODEL})
         assert response.status_code == 404
         assert response.json()["reason"] == "unknown_path"
-        assert pool.engines["local-1"].fake.received == []
+        assert inference_seen(pool.engines["local-1"].fake) == []
 
 
 def test_the_app_key_never_reaches_the_engine():

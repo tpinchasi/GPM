@@ -27,7 +27,15 @@ from ..config import ConfigError, PoolConfig, load_config
 from ..contract import CONTRACT_VERSION
 from ..db import Database, RequestRecord
 from ..directory import read_directory
-from ..engines import AmbiguousField
+from ..engines import (
+    AmbiguousField,
+    BadUpload,
+    MediaNotInline,
+    RequestFacts,
+    facts_of,
+    openai_api,
+    rewrite_of,
+)
 from ..keys import match, verify
 from ..models import HostState
 from ..provisioning_store import HashTaken
@@ -81,7 +89,13 @@ _RETRY_AFTER_S = {
     "no_eligible_host": 30,
     # A workload whose own hosts are still coming up, and which may not borrow (D115).
     "workload_preparing": 30,
+    # The router is holding as many request bytes as it allows (D144): uploads finish quickly.
+    "uploads_full": 5,
 }
+
+#: A body larger than this is read in a worker thread, never on the event loop every stream in
+#: flight shares (D144).
+_READ_OFF_LOOP_BYTES = 1_000_000
 
 
 @dataclasses.dataclass(frozen=True)
@@ -640,6 +654,63 @@ def create_app(
 
     @app.post("/{full_path:path}")
     async def inference(request: Request, full_path: str) -> Response:
+        """Bound the body before anything reads it (D144): the caller's key first, so an
+        unknown caller never makes the router hold an upload; then its size, declared and
+        actual; then the router's budget for bytes held at once."""
+        if _identity(state, request) is None:
+            return _error(401, "unauthorized", detail="missing or invalid app key")
+        encoding = (request.headers.get("content-encoding") or "identity").strip().lower()
+        if encoding != "identity":
+            return _error(400, "bad_request", "content_encoding", "send the body uncompressed, with no Content-Encoding")
+        limit = int(state.config.pool.max_request_mb * 1_000_000)
+        too_large = f"the body is over this pool's {state.config.pool.max_request_mb:g} MB limit"
+        declared = (request.headers.get("content-length") or "").strip()
+        if declared.isdigit() and int(declared) > limit:
+            return _error(413, "request_too_large", "request_too_large", too_large)
+        received = bytearray()
+        async for chunk in request.stream():
+            received += chunk
+            if len(received) > limit:
+                return _error(413, "request_too_large", "request_too_large", too_large)
+        body = bytes(received)
+        if not state.take_request_bytes(len(body)):
+            return _no_capacity("uploads_full", "the pool is holding as many request bytes as it allows")
+        try:
+            response = await _inference(request, full_path, body)
+        except BaseException:
+            state.give_back_request_bytes(len(body))
+            raise
+        if isinstance(response, StreamingResponse):
+            response.body_iterator = _giving_back(response.body_iterator, len(body))
+        else:
+            state.give_back_request_bytes(len(body))
+        return response
+
+    def _inputs_are_why(need: Need) -> bool:
+        """Whether what the request carries is the only reason no host takes it, and waiting
+        cannot change that (D143): ready hosts would serve it without its picture, they report
+        their builds do not take one, and no host the pool could rent would either."""
+        if not state.dispatcher.eligible(dataclasses.replace(need, inputs=frozenset())):
+            return False
+        if state.config.rented is not None:
+            rented = state.config.rented_engine()
+            for build in state.config.builds_reachable(need.model):
+                accepts = build.accepts()
+                if (build.engine is None or build.engine == rented) and need.kind in build.kinds() and (
+                        accepts is None or need.inputs <= accepts):
+                    return False
+        return True
+
+    async def _giving_back(chunks: AsyncIterator[bytes], size: int) -> AsyncIterator[bytes]:
+        """A streamed answer holds its request's bytes until the stream ends — a resend may
+        still need them until then."""
+        try:
+            async for chunk in chunks:
+                yield chunk
+        finally:
+            state.give_back_request_bytes(size)
+
+    async def _inference(request: Request, full_path: str, body: bytes) -> Response:
         named, path = _workload_prefix("/" + full_path)
         # The **path** chooses how the request is read, not the host: it has to be understood
         # before the pool knows where it will go (D93). Engines that serve the same path read it
@@ -675,18 +746,38 @@ def create_app(
                     "Ask its operator for a new workload.",
                 )
         if path not in state.paths():
+            asked = openai_api.kind_of(path)
+            if asked is not None:
+                # A path some engine serves, but none this pool runs (D147): what it asks for
+                # cannot be had here, which says more than "no such path".
+                return _error(
+                    400, "bad_request", "kind_not_served",
+                    f"no engine this pool runs serves {asked} ({', '.join(sorted(state.engines))}); "
+                    "ask the operator for a pool that does",
+                )
             served = ", ".join(sorted(state.engines))
             return _error(
                 404, "not_found", "unknown_path",
                 f"{path} is not an inference path of any engine this pool runs ({served})",
             )
 
-        body = await request.body()
-        ambiguous: Optional[str] = None
+        # Read once (D144): the model, the kind, what it carries, how it wants its answer.
+        content_type = request.headers.get("content-type", "")
+        facts = RequestFacts(model=None)
+        refused: Optional[tuple[str, str]] = None
         try:
-            requested = engine.requested_model(path, body)
-        except AmbiguousField as refused:
-            requested, ambiguous = None, refused.field
+            if len(body) > _READ_OFF_LOOP_BYTES:
+                facts = await asyncio.to_thread(facts_of, engine, path, content_type, body)
+            else:
+                facts = facts_of(engine, path, content_type, body)
+        except AmbiguousField as ambiguous:
+            refused = ("ambiguous_field", f"the body names `{ambiguous.field}` more than once or in another letter case; "
+                                          "name it once, in lower case")
+        except MediaNotInline as media:
+            refused = ("media_not_inline", f"{media.what}: send pictures and sound inside the request")
+        except BadUpload as upload:
+            refused = ("bad_upload", f"the upload could not be read as one clean form: {upload.why}")
+        requested = facts.model
 
         async def record(outcome: str, **fields: object) -> None:
             await state.log.record(
@@ -696,16 +787,15 @@ def create_app(
                     session_id=session_id,
                     model_requested=requested,
                     workload=who.workload,
+                    kind=facts.kind,
+                    request_bytes=len(body),
                     **fields,  # type: ignore[arg-type]
                 )
             )
 
-        if ambiguous is not None:
-            await record("rejected", status_code=400, reason="ambiguous_field")
-            return _error(
-                400, "bad_request", "ambiguous_field",
-                f"the body names `{ambiguous}` more than once or in another letter case; name it once, in lower case",
-            )
+        if refused is not None:
+            await record("rejected", status_code=400, reason=refused[0])
+            return _error(400, "bad_request", refused[0], refused[1])
 
         if requested is None:
             await record("rejected", status_code=400, reason="model_missing")
@@ -732,9 +822,17 @@ def create_app(
                 f"{requested!r} is not in this pool's model set; it will not be loaded on demand",
             )
 
+        # Waiting cannot help a request no host this pool has or rents could ever serve (D143).
+        refusal = state.refusal_for(requested, facts.kind, facts.inputs)
+        if refusal is not None:
+            await record("rejected", status_code=400, reason=refusal[0])
+            return _error(400, "bad_request", refusal[0], refusal[1])
+
         need = Need(
             model=requested,
-            wants_schema=engine.wants_schema(path, body),
+            wants_schema=facts.wants_schema,
+            kind=facts.kind,
+            inputs=facts.inputs,
             runtime_class_pin=request.headers.get("x-gpm-runtime-class"),
             # Only hosts whose engine serves this path (D93): a request on one engine's own API
             # would be a 404 on a host running the other, after the pool had called it eligible.
@@ -791,6 +889,13 @@ def create_app(
                 await record("rejected", status_code=503, reason=reason)
                 return _no_capacity(reason, "no host is ready to serve this request")
             except NoEligibleHost:
+                if need.inputs and _inputs_are_why(need):
+                    await record("rejected", status_code=400, reason="input_not_accepted")
+                    return _error(
+                        400, "bad_request", "input_not_accepted",
+                        f"the hosts that hold {requested!r} report that its builds do not take {sorted(need.inputs)}, "
+                        "and none the pool could add would",
+                    )
                 await record("rejected", status_code=503, reason="no_eligible_host")
                 return _no_capacity(
                     "no_eligible_host",
@@ -812,10 +917,19 @@ def create_app(
             concurrency = assignment.concurrency
             model_concurrency = assignment.model_concurrency
             host_engine = state.engine_of(assignment.host)
-            forwarded = host_engine.with_model(path, body, assignment.variant.tag)
-            upstream_request = assignment.host.client.build_request(
-                "POST", path, content=forwarded, headers=_upstream_headers(request)
-            )
+            rewrite = (host_engine, path, content_type, body, assignment.variant.tag)
+            if len(body) > _READ_OFF_LOOP_BYTES:
+                forwarded_type, forwarded = await asyncio.to_thread(rewrite_of, *rewrite)
+            else:
+                forwarded_type, forwarded = rewrite_of(*rewrite)
+            headers = _upstream_headers(request)
+            if forwarded_type:
+                headers["content-type"] = forwarded_type
+            # The build chosen, named for the machine's router in front of several engine
+            # processes, so it routes an upload without reading it (D144). An app's own X-GPM-*
+            # headers never reach a host, so this one is always the pool's.
+            headers["x-gpm-model"] = assignment.variant.tag
+            upstream_request = assignment.host.client.build_request("POST", path, content=forwarded, headers=headers)
             # Latency runs from the moment the engine is asked. For a non-streaming call the
             # headers arrive only after the whole generation, so measuring from after `send`
             # would report a 46-second answer as under a millisecond (seen live).
@@ -831,6 +945,19 @@ def create_app(
                     await record("cancelled", reason="client_disconnected", host_id=assignment.host.host_id,
                                  queue_wait_ms=wait_s * 1000)
                 return Response(status_code=499)
+            except httpx.ReadTimeout:
+                # The whole request was sent and the engine was still working when the read time
+                # ran out — long work, not a dead host (D144). Running it again elsewhere would
+                # take as long again, so it is answered, not re-run, and not counted as a failure.
+                with anyio.CancelScope(shield=True):
+                    await state.dispatcher.release(assignment)
+                    await record("failed", status_code=504, reason="generation_timeout", host_id=assignment.host.host_id,
+                                 queue_wait_ms=wait_s * 1000, latency_ms=(time.monotonic() - dispatched_at) * 1000)
+                return _error(
+                    504, "generation_timeout", "generation_timeout",
+                    f"the engine did not answer within {state.config.pool.upstream_read_timeout_s:g} s; it was not "
+                    "run again — split long work into shorter requests",
+                )
             except httpx.HTTPError as exc:
                 # Failed before the first response byte: retry once, on the next eligible host
                 # in priority order. Never for "no capacity" (docs/spec/app-contract.md §5).

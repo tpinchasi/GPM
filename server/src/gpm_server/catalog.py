@@ -7,7 +7,7 @@ anything else is passed through exactly as requested, never guessed and never pu
 from __future__ import annotations
 
 import dataclasses
-from typing import Iterable, Mapping, Optional, Sequence
+from typing import Callable, Iterable, Mapping, Optional, Sequence
 
 from .config import CatalogEntry, Variant
 
@@ -96,12 +96,23 @@ def literal_variants_for_host(
     return literal
 
 
+#: What a build does and takes, as the router's configuration says: (kinds, accepts) by tag.
+Traits = Callable[[str], tuple[frozenset[str], Optional[frozenset[str]]]]
+
+#: A build the catalog does not list: chat and embeddings, accepting what nobody has stated.
+_UNLISTED = (frozenset({"chat", "embed"}), None)
+
+
 def select_variant(
     variants: Sequence[ResolvedVariant],
     resident: frozenset[str],
     *,
     wants_schema: bool,
     runtime_class_pin: Optional[str] = None,
+    kind: str = "chat",
+    inputs: frozenset[str] = frozenset(),
+    traits: Optional[Traits] = None,
+    observed: Optional[Mapping[str, frozenset[str]]] = None,
 ) -> Optional[ResolvedVariant]:
     """The build this host would serve for this request, or None if it cannot serve it.
 
@@ -109,6 +120,11 @@ def select_variant(
     said does not enforce one: silently routing it to a back-end that accepts the schema and
     ignores it turns guaranteed-valid output into best-effort output. A build nobody has made
     a statement about is still usable, but only after every build known to enforce.
+
+    The same rule holds for what a request carries (D143): a picture goes to a build that takes
+    pictures, then to one nobody has said about, never to one that leaves them out — the
+    catalog's word narrowed by what the host's engine reports. And a build serves only the kinds
+    it is for (D142).
     """
     usable = [
         variant
@@ -116,6 +132,20 @@ def select_variant(
         if variant.tag in resident
         and (runtime_class_pin is None or variant.runtime_class == runtime_class_pin)
     ]
+    if traits is not None:
+        usable = [variant for variant in usable if kind in traits(variant.tag)[0]]
+        if inputs:
+            takes, unstated = [], []
+            for variant in usable:
+                accepts = traits(variant.tag)[1]
+                seen = (observed or {}).get(variant.tag)
+                if seen is not None:
+                    accepts = seen if accepts is None else accepts & seen
+                if accepts is None:
+                    unstated.append(variant)
+                elif inputs <= accepts:
+                    takes.append(variant)
+            usable = takes + unstated
     if not wants_schema:
         return usable[0] if usable else None
     known = [v for v in usable if v.enforces_schema is True]

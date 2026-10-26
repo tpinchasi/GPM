@@ -50,6 +50,7 @@ def pool_file(per_host: str = "all") -> str:
 
         rented:
           provider: fake
+          engine: ollama
           {"models: [b]" if declared else ""}
           offer_policy: {{ min_disk_gb: 10, max_all_in_hourly: 0.60 }}
         """

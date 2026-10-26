@@ -71,6 +71,9 @@ class Host:
     variants: dict[str, tuple[ResolvedVariant, ...]]
     #: Every tag the pool knows by name, for requests that name a build explicitly.
     literal_variants: dict[str, ResolvedVariant]
+    #: tag -> what it accepts besides text, where this host's engine says so (D143). Narrows the
+    #: catalog's declaration: the same Ollama files take pictures under one version, not another.
+    observed_inputs: dict[str, frozenset[str]] = dataclasses.field(default_factory=dict)
     transport_type: str = "http"
     #: The engine on this machine (D93). A pool may run more than one — a laptop on one, rented
     #: hosts on another — and a request that arrived on a path this host's engine does not serve

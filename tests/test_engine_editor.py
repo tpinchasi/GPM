@@ -67,6 +67,7 @@ POOL_YAML = textwrap.dedent(
 
     rented:
       provider: fake
+      engine: ollama
       # The provider's own build of the same engine.
       image: vastai/ollama:0.34.2
       # Vast's ssh launch mode replaces the image's entrypoint, so the engine is started here.

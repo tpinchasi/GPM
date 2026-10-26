@@ -29,6 +29,7 @@ def config(model_set=(MODEL,)):
             "hosts": [],
             "rented": {
                 "provider": "fake",
+                "engine": "ollama",  # the market's machines here run the fake Ollama (D147)
                 "workers": 2,
                 "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 0.60},
                 "scale": {"scale_up_after_s": 0},
