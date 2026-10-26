@@ -498,6 +498,11 @@ rented engine could hold would take the request, the answer is `400 kind_not_ser
 input_not_accepted`, at once — computed when the configuration loads. When such a build exists but
 no ready host holds one, it is `503 no_eligible_host`, as for a schema requirement.
 
+A host whose agent installs its engine (S9) takes `engine_version`: `latest` (the default) or a
+pinned version, which the agent installs and the supervisor switches to when the host is idle
+and drained ([supervisor.md](supervisor.md) §3.1). Ignored, and said so in plan, for a host whose
+agent's owner has not allowed installs.
+
 A **whisper.cpp host** holds the one build it declares, has one worker, and is reached on loopback
 or through a tunnel; it must carry an agent that manages its models, which fetches the build and
 runs the server (D148), and its residency is `pinned` — the server cannot load a build on first

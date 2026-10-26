@@ -128,6 +128,21 @@ Every pass (default 15 s):
 
 `gpm plan` prints what the supervisor would do and spends nothing.
 
+### 3.1 Upgrading an engine the agent installed (S9, D153)
+
+For a configured host whose agent installs its engine (`engine.install.allowed` in its facts), the
+pass sends the host's `engine_version` — `latest` unless pinned — with each agent call, and the
+agent stages a newer version while the host serves. When one is staged, the pass waits for the
+host to have served nothing for `pool.engine_upgrade_idle_s` (600 s) — or for an operator's
+*Upgrade now* — then takes it out of routing (`preparing`: *upgrading Ollama 0.40.11 → 0.40.12*),
+waits for its requests in flight to end, up to `pool.engine_upgrade_drain_s` (300 s; after that
+it puts the host back and tries at the next idle moment), and asks the agent to switch. Within
+the host's preparing window the engine must answer and the host hold what it held before the
+switch — its resident set when pinned, the models on its disk when on demand. Otherwise the pass
+asks the agent for the previous version, and records the failed version as one this host does
+not take again; a newer release is tried as usual. One host upgrades at a time. Every step is an
+event: staged, draining, switched, held, rolled back.
+
 ## 4. Cost controls
 
 Ordered by value — idle time, not the hourly rate, dominates cost.

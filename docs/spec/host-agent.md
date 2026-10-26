@@ -212,6 +212,53 @@ archive is already on every host the pool creates.
 
 The pool names a model, in a header. It never names a port, a path or a command.
 
+## 2.3 Installing and running engines on the owner's machine (S9, D150–D154)
+
+On a machine its owner gives it — `install_engines: true` in the agent's own settings, which
+`gpm-agent init --install-engines` writes and the pool cannot change — the agent installs the
+engine it manages, runs it, and keeps it at the version the pool asks for. Hosts the pool rents
+are unchanged: their engine comes with the image.
+
+**It runs the engine itself**, as it runs whisper.cpp's server (D148): `ollama serve` on
+loopback at the engine URL's port, with the models directory and the pool's numbers (workers,
+models held, context) as its environment, built here from integers. A restart or new settings
+need no command from the owner. An engine on the port that the agent did not start is reported
+(`engine.foreign`) and left alone: the agent never stops a program it did not start, so a
+machine moving to an agent-run engine has its own copy quit first by its owner.
+
+**Where from** (D152) — only the engine's official repository, through a table inside the agent:
+
+| | macOS | Linux | Windows |
+|---|---|---|---|
+| Ollama | `ollama-darwin.tgz`, signed by team `3MU9H2V9Y9` | `ollama-linux-<arch>.tar.zst`, with `-rocm` on AMD | `ollama-windows-<arch>.zip`, with `-rocm` on AMD |
+| whisper.cpp | Built from the tag's source: static, Metal | Built from the tag's source: static, CUDA where `nvcc` is, else CPU | The release's archive: CUDA 12.4 or 11.8 by the driver, else BLAS |
+| ffmpeg | Homebrew, at `init` | apt or dnf, at `init` | winget, at `init` |
+
+Every file is checked against its release's published digest, and on macOS the programs'
+signature with the team pinned; archives unpack only into their own directory (no absolute
+paths, `..` or links out); no install script runs. A source build reads the tag's commit from the
+repository and fetches the archive of that commit, with `cmake` from PyPI's official wheels where
+the machine has none, at low priority.
+
+**Versions side by side** (D153). Each version lives in its own directory under the engines
+directory — `~/Library/Application Support/gpm/engines/<engine>/<version>` on macOS,
+`~/.local/share/gpm/engines/…` on Linux, `%LOCALAPPDATA%\gpm\engines\…` on Windows — beside the
+agent's record of which is running, which is staged and which came before. The running version
+and the previous one are kept; older ones are removed. *Set engine version* names the version
+wanted; the agent resolves `latest` from the repository at most every six hours, stages a newer
+version in the background while the engine keeps serving, and switches only when asked to.
+Switching stops the running server, starts the staged one and waits for it to answer; a server
+that does not answer is stopped and the previous started again, at once.
+
+**Facts** add, under `engine.install`: whether installs are allowed, the running, staged and
+previous versions, the latest seen and when, what is being fetched or built with its progress,
+and the last error.
+
+**Running across reboots** (D154): `gpm-agent init` makes the agent start with the machine — a
+launchd agent in `~/Library/LaunchAgents`, a systemd user unit with lingering enabled, or a
+scheduled task at logon — and installs once, interactively, what needs administrator rights where
+the platform needs them. The agent never asks for elevation itself, and does not update itself.
+
 ## 3. What it reports — facts
 
 Read-only, cheap, no privileges: operating system and architecture; accelerators (kind, name,
@@ -233,7 +280,8 @@ silent override in either direction.
 | **Load, pin, or unload a model** | To make `residency` true: `pinned` loads and pins the whole set; `on_demand` leaves loading to the engine |
 | **Report surplus models** | Models on disk that no pool configuration names are *listed*, with sizes |
 | **Delete a model** | Only as an **explicit operator action in the console** — never by the supervisor's own reconciliation, so no configuration change, bug or pass can delete anything. The tag is typed again to confirm; a tag this pool requires on that host is refused; and the agent refuses all deletion when its own configuration says `allow_delete: false`, which the machine's owner sets and the pool cannot change |
-| **Restart the engine, apply engine settings** (parallelism, keep-alive, models held at once) | Only through a command the **operator wrote into the agent's own configuration on that host**. The pool can ask for it to be run; it cannot say what it is |
+| **Restart the engine, apply engine settings** (parallelism, keep-alive, models held at once) | Only through a command the **operator wrote into the agent's own configuration on that host** — or, for an engine the agent runs itself (§2.3), by restarting its own process with the pool's numbers. The pool can ask for it to be run; it cannot say what it is |
+| **Install an engine, and switch its version** (§2.3) | Only where the machine's owner set `install_engines: true`. An engine name from the agent's own list and a version — never a URL, path or command; only from the engine's official repository, each file checked against its published digest and, where the platform has one, its pinned signature. Switched only when the pool asks, after draining the host; the previous version kept for going back |
 
 | May not, ever | |
 |---|---|
@@ -286,7 +334,7 @@ today. The console says the agent is unreachable; nothing is inferred from its s
 
 ## 7. The protocol
 
-Four verbs, all under `/agent/v1`, all behind the agent key. The list is closed, and a test
+Six verbs, all under `/agent/v1`, all behind the agent key. The list is closed, and a test
 fails until it is edited on purpose to admit another.
 
 | Verb | Body | Does |
@@ -295,6 +343,7 @@ fails until it is edited on purpose to admit another.
 | `PUT /models` | `{tags, residency}` — the **whole** desired state | Starts working toward it in the background, one pull at a time, and answers at once with where each tag stands (on disk, loaded, pulling with bytes, last error), free disk, the owner's floor, and the surplus. A tag that failed is left alone for a minute, not retried every pass |
 | `DELETE /models` | `{tag}` | §4's deletion, inside its bounds |
 | `POST /heartbeat` | — | Touches the dead-man timer's file on a host the pool created (D63). No body, and no other bound: it can only *postpone* a shutdown the pool could equally cause by going silent. A machine nobody rented carries no timer, and the verb says so |
+| `PUT /engine/version` | `{version, switch}` — `version` is `latest` or a version in the engine's own form; `switch` is a boolean (D151) | Works toward that version in the background — resolving, fetching or building, checking, staging — and answers at once with `engine.install` (§2.3). `switch: true` starts the staged version now, or the previous one when that is the version named — a rollback. Refused unless the owner set `install_engines: true` |
 | `POST /engine` | `{settings}` — `null`, or `{workers, models_held, context?, cards_per_copy?}` as bounded whole numbers; `cards_per_copy` is 1, 2, 4 or 8, and refused for an engine that cannot split a model (D114) | Writes the engine's start-up environment to the file the owner named, if it changed; runs the owner's restart command; waits for the engine to answer; reports the exit code, the tail of the output, and whether the engine came back |
 
 A tag travels in a body, never a path, and must be a plain model tag — a name, optionally
