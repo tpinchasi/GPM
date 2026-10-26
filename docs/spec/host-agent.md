@@ -167,8 +167,8 @@ absolute path); the pool never sends a path or a command. Its engine URL is
   exits at start), the file on disk, whether `GET /` answers, the build loaded only when the
   agent's own server is running it and answers, and the last line of its log when it stopped.
 
-This is the one program the agent itself starts, and it starts it only with these fixed
-arguments. One machine running Ollama and whisper.cpp runs two agents, each with its own port and
+The agent starts it only with these fixed arguments — as it starts an engine it installed
+(§2.3), and nothing else. One machine running Ollama and whisper.cpp runs two agents, each with its own port and
 key.
 
 ### vLLM's audio extra and each model's length (D146)
@@ -250,9 +250,19 @@ version in the background while the engine keeps serving, and switches only when
 Switching stops the running server, starts the staged one and waits for it to answer; a server
 that does not answer is stopped and the previous started again, at once.
 
-**Facts** add, under `engine.install`: whether installs are allowed, the running, staged and
-previous versions, the latest seen and when, what is being fetched or built with its progress,
-and the last error.
+The **first** version is started as soon as it is staged — nothing runs to drain. A version that
+fails to start is switched away from at once and not staged again by `latest` until a newer one is
+released; one named explicitly is refused. Files come through the repository's API (`GPM_GITHUB_API`
+names another for tests; a `GITHUB_TOKEN` in the machine's environment is sent only to it), and a
+cut download resumes. Linux's `.tar.zst` archives need Python 3.14 or the `zstandard` package.
+`install_engines` excludes `restart_command` and `engine_env_file` — the agent runs the engine — and
+needs a loopback engine URL with a port; `engines_path` moves the engines directory.
+
+**Facts** add, under `engine.install`: `allowed`, `engine`, `running`, `staged`, `previous`,
+`latest` and `latest_checked_at`, `wanted`, `working` (`{step, version, done, total}` while
+resolving, downloading, verifying, unpacking, building or switching), `error`, and `signature`
+(`checked` or `not checked`); and `engine.foreign` when an engine the agent did not start holds
+its port.
 
 **Running across reboots** (D154): `gpm-agent init --start-at-login` — or `gpm-agent startup
 add|remove|status` for an agent already set up — makes the agent start with the machine, running
@@ -356,8 +366,8 @@ fails until it is edited on purpose to admit another.
 | `PUT /models` | `{tags, residency}` — the **whole** desired state | Starts working toward it in the background, one pull at a time, and answers at once with where each tag stands (on disk, loaded, pulling with bytes, last error), free disk, the owner's floor, and the surplus. A tag that failed is left alone for a minute, not retried every pass |
 | `DELETE /models` | `{tag}` | §4's deletion, inside its bounds |
 | `POST /heartbeat` | — | Touches the dead-man timer's file on a host the pool created (D63). No body, and no other bound: it can only *postpone* a shutdown the pool could equally cause by going silent. A machine nobody rented carries no timer, and the verb says so |
-| `PUT /engine/version` | `{version, switch}` — `version` is `latest` or a version in the engine's own form; `switch` is a boolean (D151) | Works toward that version in the background — resolving, fetching or building, checking, staging — and answers at once with `engine.install` (§2.3). `switch: true` starts the staged version now, or the previous one when that is the version named — a rollback. Refused unless the owner set `install_engines: true` |
-| `POST /engine` | `{settings}` — `null`, or `{workers, models_held, context?, cards_per_copy?}` as bounded whole numbers; `cards_per_copy` is 1, 2, 4 or 8, and refused for an engine that cannot split a model (D114) | Writes the engine's start-up environment to the file the owner named, if it changed; runs the owner's restart command; waits for the engine to answer; reports the exit code, the tail of the output, and whether the engine came back |
+| `PUT /engine/version` | `{version, switch}` and nothing else — `version` is `latest` or a version in the engine's own form; `switch` is a boolean (D151) | Works toward that version in the background — resolving, fetching or building, checking, staging — and answers **at once**, even to a switch, with `engine.install` (§2.3). `switch: true` starts the staged version, or the previous one when that is the version named — a rollback — in the background. Refused: `403 installs_not_allowed` unless the owner set `install_engines: true`; `409 busy` (a switch running), `not_staged`, `foreign_engine` (an engine it did not start holds the port); `400` for anything else in the body |
+| `POST /engine` | `{settings}` — `null`, or `{workers, models_held, context?, cards_per_copy?}` as bounded whole numbers; `cards_per_copy` is 1, 2, 4 or 8, and refused for an engine that cannot split a model (D114) | Writes the engine's start-up environment to the file the owner named, if it changed; runs the owner's restart command; waits for the engine to answer; reports the exit code, the tail of the output, and whether the engine came back — or, for an engine the agent runs itself (§2.3), stores the numbers beside its versions and restarts its own server with them |
 
 A tag travels in a body, never a path, and must be a plain model tag — a name, optionally
 namespaced and versioned. Anything with a scheme, a space, `..` or a leading dash is refused

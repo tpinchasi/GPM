@@ -212,6 +212,8 @@
 | `ollama serve` from the headless macOS archive serves the MLX builds as the app does, and keeps `~/.ollama/models` | D150, D152 — on the first adopter's laptop, stage 4 |
 | Ollama's Windows programs are Authenticode-signed, by a publisher name the agent can pin | D152 — read from a release archive before Windows ships |
 | whisper.cpp builds statically with Metal from its release source using Xcode's command-line tools and `cmake` from PyPI, and the build tag published with a version tag is the same commit | D152 — on the laptop; the commit from the API |
+| The agent's AMD card check (`/dev/kfd` on Linux, `amdhip64*.dll` on Windows) finds the cards Ollama's ROCm archive serves, and the macOS archive serves Intel Macs | D152 — on such machines |
+| A process the agent starts from a Windows scheduled task outlives the task's job object | D154 — on a Windows machine |
 | A standard Windows user can register the agent's task with `schtasks /Create /XML` (UTF-16), `RestartOnFailure` restarts it after a crash, `pythonw.exe` exists in uv's tool environments, and winget's ffmpeg is on the task's `PATH` | D154 — on a Windows machine before Windows is called done |
 | An agent started at login has no `HF_TOKEN` from the owner's shell, so a gated model cannot be fetched by it | D154 — a token file in the agent's own directory, if needed |
 | A systemd user unit keeps running after logout once lingering is enabled, and `loginctl enable-linger` needs administrator rights on common distributions | D154 — on a Linux machine |

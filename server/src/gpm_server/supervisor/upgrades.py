@@ -122,22 +122,20 @@ class EngineUpgrades:
                                 + (", and there is no previous version" if rollback else ", and nothing newer is staged"),
                                 event="engine_upgrade_not_possible")
                 return Step("wait")
+            running = install.get("running")
+            if not running and not rollback:
+                # Nothing runs yet: the agent starts the first version it installs by itself,
+                # as there is nothing to drain and nothing held to keep (D153).
+                return Step("wait")
             if another_upgrading and not by_operator:
                 return Step("wait")
-            running = install.get("running")
             quiet = idle_s is None or idle_s >= idle_needed_s
             if running and not by_operator and not (busy == 0 and quiet):
                 return Step("wait")
             self.asked.pop(host_id, None)
-            upgrade = Upgrade(to=to, came_from=running, held_before=held if running else frozenset(),
+            upgrade = Upgrade(to=to, came_from=running, held_before=held,
                               by_operator=by_operator, rollback=rollback, until=now + drain_s)
             self.active[host_id] = upgrade
-            if not running:
-                # Nothing runs yet: nothing to drain, and nothing held to keep.
-                upgrade.phase = "switching"
-                upgrade.until = now + SWITCH_TIMEOUT_S
-                return Step("switch", f"installing {engine} {to}: nothing ran before", event="engine_upgrade_switching",
-                            version=to)
             return Step("start", f"{upgrade.reason(engine)}: "
                         + ("an operator asked" if by_operator else f"it has served nothing for {idle_needed_s:g}s")
                         + f"; no new requests, and up to {drain_s:g}s for the {busy} it has", event="engine_upgrade_draining")

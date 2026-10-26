@@ -122,11 +122,10 @@ def test_one_host_at_a_time_and_nothing_where_the_owner_did_not_allow_installs()
     assert step(upgrades, None, 0).action == "wait"
 
 
-def test_a_machine_with_nothing_running_yet_installs_at_once():
+def test_a_machine_with_nothing_running_yet_is_left_to_its_agent_which_starts_the_first_version_itself():
     upgrades = EngineUpgrades()
-    first = step(upgrades, install(running=None, staged="0.40.12"), 0, busy=0, idle_s=1)
-    assert (first.action, first.version) == ("switch", "0.40.12")
-    assert upgrades.active["mac"].held_before == frozenset()
+    assert step(upgrades, install(running=None, staged="0.40.12"), 0, busy=0, idle_s=1).action == "wait"
+    assert "mac" not in upgrades.active
 
 
 # --- through the pool ---
