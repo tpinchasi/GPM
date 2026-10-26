@@ -263,7 +263,7 @@ requires-dist = [
 
 [[package]]
 name = "gpm-client"
-version = "0.6.0"
+version = "0.7.0"
 source = { editable = "client" }
 dependencies = [
     { name = "httpx" },
