@@ -113,6 +113,33 @@ def test_a_model_outside_the_pools_set_is_refused_not_loaded():
         assert pool.engines["local-1"].fake.received == []
 
 
+def test_a_field_the_pool_reads_named_twice_or_in_another_case_is_refused():
+    # Ollama decodes JSON ignoring letter case, last key winning: with both present it would
+    # serve "MODEL" while the pool checked "model" (D141). Nothing reaches a host.
+    bodies = [
+        {"model": MODEL, "MODEL": "never-heard-of-it", "messages": []},
+        '{"model": "%s", "model": "never-heard-of-it", "messages": []}' % MODEL,
+        {"model": MODEL, "Stream": True, "messages": []},
+        {"model": MODEL, "\u017ftream": True, "messages": []},  # long s: Go folds it to "s"
+    ]
+    with two_tiers() as pool, pool.client() as client:
+        for body in bodies:
+            sent = {"content": body} if isinstance(body, str) else {"json": body}
+            response = client.post("/api/chat", headers={"Content-Type": "application/json"}, **sent)
+            assert response.status_code == 400, body
+            assert response.json()["reason"] == "ambiguous_field", body
+            assert "never-heard-of-it" not in response.text
+        assert pool.engines["local-1"].fake.received == []
+        assert pool.engines["remote-1"].fake.received == []
+
+
+def test_a_body_too_deeply_nested_to_parse_is_refused_not_a_crash():
+    with two_tiers() as pool, pool.client() as client:
+        response = client.post("/api/chat", content=b'{"model":"' + MODEL.encode() + b'","x":' + b"[" * 200_000 + b"]" * 200_000 + b"}")
+        assert response.status_code == 400
+        assert response.json()["reason"] == "model_missing"
+
+
 def test_the_app_key_is_required_even_on_loopback():
     with two_tiers() as pool:
         with pool.client(key=None) as client:

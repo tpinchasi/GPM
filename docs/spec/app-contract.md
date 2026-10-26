@@ -72,6 +72,8 @@ It is served from a cached copy, never by asking a third party while the app wai
 |---|---|---|---|
 | engine's own | — | Passed through | returned |
 | `401` | — | Missing or wrong app key | raise `PoolAuthError`, never retried |
+| `400` | `model_missing` | The body names no model, or is not one JSON object in UTF-8 | raise `PoolRequestError` |
+| `400` | `ambiguous_field` | The body names `model`, `stream`, `response_format` or `format` more than once, or in another letter case — an engine could read a different value than the pool checked (D141) | raise `PoolRequestError` |
 | `404` | `model_not_in_pool` | The model is not in this pool's declared set; it will not be loaded on demand | raise `PoolRequestError` |
 | `503` | `queue_timeout` | All workers busy for longer than the queue limit | wait and retry |
 | `503` | `preparing` | A host is up but still loading the pool's models | wait and retry |

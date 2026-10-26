@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Any, ClassVar, Optional
 
 import httpx
@@ -11,18 +10,12 @@ import httpx
 from . import openai_api
 from .base import EngineOption, Health, Occupancy, PullResult
 
-# Matches the first `"model": "<value>"` pair, including escaped characters in the value.
-_MODEL_FIELD = re.compile(rb'("model"\s*:\s*)"(?:[^"\\]|\\.)*"')
-
 _STREAMING_PATHS = frozenset({"/api/chat", "/api/generate"})
 
 
 def _decode(body: bytes) -> dict[str, Any]:
-    try:
-        parsed = json.loads(body)
-    except (ValueError, UnicodeDecodeError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+    # Ollama's own API is JSON with the same top-level fields, so it is read the same way.
+    return openai_api.decode(body)
 
 
 class OllamaEngine:
@@ -58,18 +51,12 @@ class OllamaEngine:
         )
 
     def requested_model(self, path: str, body: bytes) -> Optional[str]:
-        model = _decode(body).get("model")
-        return model if isinstance(model, str) else None
+        # Ollama decodes JSON with Go's matching, which ignores letter case: `requested_model`
+        # refuses the bodies where that would let it read another model than the pool checked.
+        return openai_api.requested_model(body)
 
     def with_model(self, path: str, body: bytes, tag: str) -> bytes:
-        """Splice the new tag into the raw bytes, leaving every other byte untouched.
-
-        Re-serialising the parsed body would reorder keys and renormalise numbers and
-        whitespace, which is exactly the passthrough drift the contract forbids.
-        """
-        replacement = rb"\g<1>" + json.dumps(tag).encode()
-        rewritten, count = _MODEL_FIELD.subn(replacement, body, count=1)
-        return rewritten if count else body
+        return openai_api.with_model(body, tag)
 
     def wants_schema(self, path: str, body: bytes) -> bool:
         if path in openai_api.INFERENCE_PATHS:

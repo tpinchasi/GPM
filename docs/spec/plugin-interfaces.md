@@ -184,7 +184,8 @@ class Engine(Protocol):
 
 | Operation | Guarantee |
 |---|---|
-| `with_model` | Changes the model field and **nothing else** — byte-for-byte otherwise. The router relies on this to keep passthrough exact |
+| `requested_model` | Reads the model the engine will read. Raises `AmbiguousField` for a body in which a field the pool reads appears twice or in another letter case, when this engine's decoder could pick a different value than the pool's (D141) |
+| `with_model` | Changes the top-level model field — the one `requested_model` read — and **nothing else**, byte-for-byte otherwise. The router relies on this to keep passthrough exact |
 | `models_resident` | Reports what is loaded *now*. The "whole model set on every host" rule and eviction detection rest on it |
 | `load_and_pin` | Loads all the tags and configures them to stay loaded; raises if they cannot all be resident together |
 | `launch_settings` | Environment or flags that make the engine run `workers` requests in parallel at `context`, holding `n_models` models — used only on hosts the pool creates |
