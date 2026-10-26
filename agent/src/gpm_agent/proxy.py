@@ -10,9 +10,19 @@ nothing else. They ship in the same archive because that archive is already on e
 pool creates, not because they are the same thing.
 
 **It routes, it does not translate.** A request arrives in the engine's own API and leaves in
-it, byte for byte, with only the upstream chosen from the `model` field. The same rule the pool
-itself obeys, for the same reason: translation is where tool-calling and structured-output
-fidelity get lost.
+it, byte for byte, with only the upstream chosen. The same rule the pool itself obeys, for the
+same reason: translation is where tool-calling and structured-output fidelity get lost. The
+pool's router names the build it chose in the `X-GPM-Model` header, so an upload — a form
+carrying a recording — is routed without being parsed (D144); the pool's headers end here and
+never reach an engine. A request without that header, from an older router, is routed by its
+JSON body's `model` field.
+
+**Only inference is forwarded.** A closed list of paths, each allowed by its exact name and never
+by prefix (D142): beside them, engines serve routes that load, unload or download models and
+adapters, and no request reaches those through here. Anything else is refused before an engine
+hears of it. An error answer is fixed text — never the model, header or path a caller sent, nor
+an exception's text, since an answer can travel back through the pool to an application; those
+go to this process's log.
 
 **A model may have several copies** — one per card on a machine with more than one (D107). Each
 request goes to the copy with the fewest requests in flight from this process, and a copy that
@@ -26,6 +36,7 @@ of model to upstream. The pool names a model; it never names a port, a path or a
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -46,6 +57,35 @@ HEALTH_TIMEOUT_S = 5.0
 
 #: Long enough for a whole generation at a large context; the upstream's own limits bound it.
 INFERENCE_TIMEOUT_S = 3600.0
+
+#: The paths an engine is asked inference on — the only ones forwarded, each by its exact name
+#: (D142). Never a prefix: beside these, engines serve routes that load and unload models and
+#: adapters (vLLM's `/v1/load_lora_adapter`, whisper.cpp's `/load`, which takes a file path), and
+#: a request must not reach them. Adding one is a decision, as adding a kind is.
+FORWARDED_PATHS = frozenset({
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/responses",
+    "/v1/embeddings",
+    "/v1/audio/transcriptions",
+    "/v1/audio/translations",
+    "/v1/rerank",
+})
+
+#: Where the pool's router names the build it chose (D144). Headers starting `X-GPM-` are the
+#: pool's own — the router drops an application's before forwarding — and none goes on to an
+#: engine.
+MODEL_HEADER = "x-gpm-model"
+POOL_HEADER_PREFIX = "x-gpm-"
+
+#: The largest body forwarded. Above the pool's own request limit (24 MB by default, D144), so it
+#: does not refuse what the pool let through; it is here so that nothing reaching this port can
+#: make it hold an unbounded body.
+MAX_BODY_BYTES = 64_000_000
+
+#: Above this, a JSON body is read on a worker thread, so one large picture does not stall every
+#: other stream this process carries — the rule the pool's router keeps for itself (D144).
+READ_OFF_LOOP_BYTES = 1_000_000
 
 
 class Upstreams:
@@ -95,26 +135,52 @@ class Upstreams:
         return self.by_model().get(model, []) if model else []
 
 
-def _model_of(body: bytes) -> Optional[str]:
+def _json_facts(body: bytes) -> tuple[Optional[str], bool]:
+    """The model a JSON body names and whether it asks to stream, in one parse. A body that is
+    not a JSON object names no model and does not stream."""
     try:
         parsed = json.loads(body)
-    except (ValueError, UnicodeDecodeError):
-        return None
+    except (ValueError, RecursionError):
+        return None, False
     if not isinstance(parsed, dict):
-        return None
+        return None, False
     model = parsed.get("model")
-    return model if isinstance(model, str) else None
+    return (model if isinstance(model, str) else None), bool(parsed.get("stream", False))
 
 
-def _wants_stream(body: bytes) -> bool:
-    try:
-        parsed = json.loads(body)
-    except (ValueError, UnicodeDecodeError):
-        return False
-    return bool(isinstance(parsed, dict) and parsed.get("stream", False))
+def _is_upload(content_type: Optional[str]) -> bool:
+    """Whether a body is a form — how a recording is sent (D142). A form is never parsed here: it
+    can be tens of megabytes, and the pool's router has already read and rebuilt it (D144)."""
+    return (content_type or "").split(";", 1)[0].strip().lower() == "multipart/form-data"
 
 
-def create_app(upstream_map: str | Path, *, client: Optional[httpx.AsyncClient] = None) -> Starlette:
+def _refusal(status_code: int, kind: str, message: str) -> JSONResponse:
+    """An error in the shape engines answer with. `message` is always fixed text: what a caller
+    sent and what went wrong upstream are logged, never answered."""
+    return JSONResponse({"error": {"message": message, "type": kind}}, status_code=status_code)
+
+
+async def _bounded_body(request: Request, limit: int) -> Optional[bytes]:
+    """The whole body, or None when it is over `limit`: refused on its declared length before
+    any of it is read, and counted as it is read, since a length need not be declared."""
+    declared = (request.headers.get("content-length") or "").strip()
+    if declared.isascii() and declared.isdigit() and int(declared) > limit:
+        return None
+    chunks, size = [], 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def create_app(
+    upstream_map: str | Path,
+    *,
+    client: Optional[httpx.AsyncClient] = None,
+    max_body_bytes: int = MAX_BODY_BYTES,
+) -> Starlette:
     upstreams = Upstreams(upstream_map)
     http = client or httpx.AsyncClient(timeout=INFERENCE_TIMEOUT_S, follow_redirects=False)
     #: Requests this process has open to each copy — how the least busy one is chosen.
@@ -188,37 +254,61 @@ def create_app(upstream_map: str | Path, *, client: Optional[httpx.AsyncClient] 
                     continue  # one engine that will not say must not hide the others
         return Response("\n".join(chunks), media_type="text/plain; version=0.0.4")
 
+    def did_not_answer(model: Optional[str], refused: Optional[httpx.HTTPError]) -> Response:
+        log.warning("no copy of %.200r answered: %s", model, refused)
+        return _refusal(502, "upstream_unavailable", "the engine for this model did not answer")
+
     async def forward(request: Request) -> Response:
-        body = await request.body()
-        model = _model_of(body)
+        # The path exactly as the server read it — not one re-parsed from a URL, which a `%3F`
+        # in it would cut short — and only a path on the list is sent on.
+        path = request.scope["path"]
+        if path not in FORWARDED_PATHS:
+            log.warning("refused a request on a path that is not forwarded: %.200r", path)
+            return _refusal(404, "path_not_served", "this machine forwards inference requests only")
+        body = await _bounded_body(request, max_body_bytes)
+        if body is None:
+            log.warning("refused a request on %s over %d bytes", path, max_body_bytes)
+            return _refusal(413, "request_too_large", "the request body is over this machine's limit")
+
+        # The pool's header, when there is one, is the model: the router chose the build and
+        # wrote the same tag into the body, and reading it from there would mean parsing a form.
+        named = request.headers.get(MODEL_HEADER)
+        if _is_upload(request.headers.get("content-type")):
+            # Never parsed. Whether its answer streams is a field of the form, so every upload's
+            # answer is relayed as it comes — which is also right for one that does not stream.
+            model, stream = named, True
+        else:
+            if len(body) > READ_OFF_LOOP_BYTES:
+                in_body, stream = await asyncio.to_thread(_json_facts, body)
+            else:
+                in_body, stream = _json_facts(body)
+            model = named if named is not None else in_body
         urls = upstreams.urls_for(model)
         if not urls:
-            known = ", ".join(sorted(upstreams.by_model())) or "none"
-            return JSONResponse(
-                {"error": {
-                    "message": f"this host serves no model named {model!r} (it serves: {known})",
-                    "type": "model_not_found",
-                }},
-                status_code=404,
-            )
+            log.warning("refused a request for a model this machine does not serve: %.200r (it serves: %s)",
+                        model, ", ".join(sorted(upstreams.by_model())) or "none")
+            return _refusal(404, "model_not_found",
+                            "the request names no model this machine serves; GET /v1/models lists those it does")
 
         # Hop-by-hop headers are the connection's, not the message's, and forwarding them
-        # breaks the connection this process owns.
+        # breaks the connection this process owns. The pool's own headers end here.
         headers = {
             name: value for name, value in request.headers.items()
             if name.lower() not in ("host", "content-length", "connection", "transfer-encoding")
+            and not name.lower().startswith(POOL_HEADER_PREFIX)
         }
         # Least busy first; a copy that refuses the connection never saw the request, so the
         # next is tried. Anything after the connection is the copy's answer and is passed on.
         candidates = least_busy_first(urls)
 
-        if not _wants_stream(body):
+        if not stream:
             refused: Optional[httpx.HTTPError] = None
             for url in candidates:
                 in_flight[url] = in_flight.get(url, 0) + 1
                 try:
-                    answer = await http.post(f"{url}{request.url.path}", content=body, headers=headers)
+                    answer = await http.post(f"{url}{path}", content=body, headers=headers)
                 except httpx.ConnectError as exc:
+                    log.warning("the copy of %.200r at %s refused the connection: %s", model, url, exc)
                     refused = exc
                     continue
                 except httpx.HTTPError as exc:
@@ -231,11 +321,7 @@ def create_app(upstream_map: str | Path, *, client: Optional[httpx.AsyncClient] 
                     status_code=answer.status_code,
                     media_type=answer.headers.get("content-type"),
                 )
-            return JSONResponse(
-                {"error": {"message": f"the engine for {model!r} did not answer: {refused}",
-                           "type": "upstream_unavailable"}},
-                status_code=502,
-            )
+            return did_not_answer(model, refused)
 
         # Streaming: the engine's answer is opened before this one is, so its status and type
         # are the ones the client gets — a refusal is not a 200 — and it is closed when the
@@ -248,11 +334,11 @@ def create_app(upstream_map: str | Path, *, client: Optional[httpx.AsyncClient] 
             in_flight[url] = in_flight.get(url, 0) + 1
             try:
                 upstream = await http.send(
-                    http.build_request("POST", f"{url}{request.url.path}", content=body, headers=headers), stream=True)
+                    http.build_request("POST", f"{url}{path}", content=body, headers=headers), stream=True)
                 chosen = url
                 break
             except httpx.ConnectError as exc:
-                log.warning("the copy of %s at %s refused the connection: %s", model, url, exc)
+                log.warning("the copy of %.200r at %s refused the connection: %s", model, url, exc)
                 refused = exc
             except httpx.HTTPError as exc:
                 refused = exc
@@ -260,11 +346,7 @@ def create_app(upstream_map: str | Path, *, client: Optional[httpx.AsyncClient] 
                 break
             in_flight[url] -= 1
         if upstream is None:
-            return JSONResponse(
-                {"error": {"message": f"the engine for {model!r} did not answer: {refused}",
-                           "type": "upstream_unavailable"}},
-                status_code=502,
-            )
+            return did_not_answer(model, refused)
 
         async def relay():
             try:
@@ -273,7 +355,7 @@ def create_app(upstream_map: str | Path, *, client: Optional[httpx.AsyncClient] 
             except httpx.HTTPError as exc:
                 # Raised, not swallowed: a clean end would pass a cut answer as a whole one, and
                 # the pool would deliver it rather than run it again (D62).
-                log.warning("stream from %s for %s broke: %s", chosen, model, exc)
+                log.warning("stream from %s for %.200r broke: %s", chosen, model, exc)
                 raise
             finally:
                 await upstream.aclose()
