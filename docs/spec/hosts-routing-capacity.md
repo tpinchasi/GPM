@@ -367,6 +367,10 @@ On the others the policy is verified by test-connection and every probe.
   the request that finds a model cold pays its load time, and `X-GPM-Wait-S` does not include
   it — that is generation from the pool's point of view.
 
+**In the console's Profiles tab**, each build shows what it serves and what it accepts, filled from
+the hub's task where known. A build whose kind the profile's engine cannot serve — Whisper on a
+profile of Ollama hosts — is listed greyed, with the reason, and cannot be added (D147).
+
 ## 4. Model resolution
 
 ### 4.1 Logical names and the catalog
@@ -464,6 +468,35 @@ class**, derived from the variant and the host's platform, never typed in by han
   Recording detects mixing; it cannot repair a mixed dataset. The remedy is to switch the option
   on and regenerate. *(The switch is post-v1; pinning is in v1.)*
 
+### 4.4 What a request asks for, and what a build accepts (D142, D143)
+
+A request's path is its **kind** — chat, embeddings, transcription, ranking — and a build serves
+the kinds its catalog variant lists in `serves` (unset: chat and embeddings). A request carrying a
+picture or sound goes to a build whose `inputs` list it, else to one that states nothing; a build
+whose list leaves it out is never used. That is the structured-output guard's three-valued rule
+(§4.1), for every input. On hosts whose engine can say what a build accepts — Ollama, per version —
+dispatch narrows the declaration by what the host reports.
+
+```yaml
+catalog:
+  my-speech-model:
+    variants:
+      - { tag: "owner/my-speech-model", engine: "vllm", serves: [transcribe] }
+      - { tag: "owner/my-speech-model-ggml/model-q5_0.bin", engine: "whisper-cpp", serves: [transcribe] }
+  my-vision-model:
+    variants:
+      - { tag: "owner/my-vision-model", engine: "vllm", inputs: [image] }
+      - { tag: "my-vision-model:7b" }        # Ollama: what it accepts is read from the host
+```
+
+**Refused or waited for.** When no build of the model that any configured host, rented profile or
+rented engine could hold would take the request, the answer is `400 kind_not_served` or `400
+input_not_accepted`, at once — computed when the configuration loads. When such a build exists but
+no ready host holds one, it is `503 no_eligible_host`, as for a schema requirement.
+
+A **whisper.cpp host** holds the one build it declares, has one worker, and is reached on loopback
+or through a tunnel; it must carry an agent, which fetches the build and runs the server (D148).
+
 ## 5. Routing
 
 **The request's workload comes first** ([workloads.md](workloads.md) §4, D115): a workload's
@@ -510,6 +543,7 @@ effect is visible.
 ## 6. Request log
 
 Every request is recorded: time, session id if sent, host, worker, model requested, model
-served, runtime class, queue wait, latency, token counts, outcome. It is the source for the
+served, runtime class, its kind and its body's size (D145), queue wait, latency, token counts,
+outcome. Measures built on output tokens read only the kinds that produce them. It is the source for the
 console, for idle detection, for corrupt-output counters, and for the offline join described in
 §4.3. It contains **no prompt or completion text**.

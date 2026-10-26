@@ -140,6 +140,25 @@ Three rules the hub fetch keeps:
 - **A hub credential is the machine's.** Read from the environment its owner started it in;
   never accepted from the pool, written to disk, or returned in any answer.
 
+### whisper.cpp (D148)
+
+An agent whose settings name `engine: whisper-cpp` manages a **`whisper-server`** — the program
+installed on the machine, found on the agent's `PATH` or at `engine_binary` in its settings; the
+pool never sends a path or a command. *Put models* names one build: a file in a hub repository
+(`owner/repo/file.bin`), which the agent checks against the repository's listing and fetches into
+its models directory, refusing a name that leaves it (D40). The agent then starts the server on
+its engine port, on loopback, with that file, OpenAI's transcription path and `--convert`; it
+restarts it when the build changes or the server stops. Its facts add the program's version,
+whether `ffmpeg` is present, the file on disk and whether `GET /` answers. One machine running
+Ollama and whisper.cpp runs two agents, each with its own port and key.
+
+### vLLM's audio extra (D146)
+
+On a vLLM host the agent checks, before the engine starts, that the interpreter behind the `vllm`
+command imports vLLM's audio extra — run isolated, as a fixed argument list — and reports
+`audio-decoding` in its facts. A host whose image was declared to carry it and does not is failed
+with that reason before it serves.
+
 ## 2.2 The router in front of several engines (D96)
 
 The agent's archive also carries a **router**: one endpoint on the machine in front of several

@@ -193,6 +193,101 @@ its idle cutoff.
 certificate, and the SDK uses it for every request (`pip install 'gpm-client[certs]'`). The
 private key never leaves your machine. Some grants require it.
 
+## Beyond chat: pictures, speech to text, ranking
+
+Ask the operator which models the pool has for each of these. A model name is the same kind of
+logical name as for chat: the pool picks the build that suits the host that gets the request.
+
+### Pictures in a chat message
+
+`chat()` takes any message parts. `image_part()` turns a file into a part that carries the
+picture inside the request, which is the only way the pool accepts one:
+
+```python
+from gpm_client import PoolClient, image_part
+
+with PoolClient() as pool:
+    reply = pool.chat("gemma4:26b", [{"role": "user", "content": [
+        {"type": "text", "text": "What is the total on this receipt?"},
+        image_part("receipt.jpg"),            # a path, bytes, or an open binary file
+    ]}])
+    print(reply.content)
+```
+
+- **Pictures go to builds that can see them.** If the model has a build that cannot, the pool
+  sends your picture to one that can, or waits for one. If none of its builds can, the answer is
+  `400 input_not_accepted`. A picture is never silently dropped.
+- **Inline only.** A picture given as a link (`https://…`) is refused `400 media_not_inline`:
+  the pool will not make a GPU host fetch addresses from its own network. `image_part()` reads
+  the file and inlines it.
+- With `PoolClient(api="ollama")`, the engine's own shape applies instead: base64 strings in the
+  message's `images` list.
+
+### Speech to text
+
+A recording is not a chat message. It is uploaded to OpenAI's transcription path, and
+`transcribe()` does that for you:
+
+```python
+with PoolClient() as pool:
+    t = pool.transcribe("whisper-large-v3-turbo", "voice-note.m4a", language="he")
+    print(t.text)
+    print(t.served_model, t.host, t.wait_s)
+```
+
+- **`language`** — name it when you know it. Whisper detects a language on its own, but naming
+  it is more accurate, and for a language-specific fine-tune it is what the model was trained on.
+- **`response_format="verbose_json"`** returns `t.segments`, each with its start and end, where
+  the build provides them. `"text"` returns plain text in `t.text` either way.
+- **`prompt`** — words the recording is likely to contain (names, jargon), to help spelling.
+- **One upload is at most 24 MB** unless the operator set otherwise — about 12 minutes of 16 kHz
+  WAV, or 20 or more of MP3 or M4A. Split longer recordings and send the parts. Over the limit
+  is `413 request_too_large`, refused before the file is read.
+- **A very long recording can run past the pool's read time** for its kind. That is `504
+  generation_timeout`, and it is not retried: re-sending it would take as long again.
+
+### Ranking documents against a query
+
+For retrieval: put the documents that best answer a query first.
+
+```python
+with PoolClient() as pool:
+    for r in pool.rerank("bge-reranker-v2-m3", "How do I reset my password?", documents, top_n=3):
+        print(f"{r.score:.3f}", documents[r.index][:80])
+```
+
+### With the OpenAI client instead
+
+The pool speaks OpenAI's `/v1` paths, so the official client works against it. Give it the
+pool's transport and it waits for capacity like `PoolClient` does:
+
+```python
+import httpx
+from openai import OpenAI
+from gpm_client import pool_transport
+
+client = OpenAI(base_url=f"{POOL_URL}/v1", api_key=APP_KEY,
+                http_client=httpx.Client(transport=pool_transport()))
+
+with open("voice-note.m4a", "rb") as audio:
+    print(client.audio.transcriptions.create(model="whisper-large-v3-turbo", file=audio, language="he").text)
+```
+
+### When the pool cannot do what you asked
+
+| Answer | Meaning |
+|---|---|
+| `400 kind_not_served` | No build of that model does this — a transcription asked of a chat model, say, or ranking on a pool that has no engine for it. Ask the operator for a model that does |
+| `400 input_not_accepted` | None of the model's builds accepts what you sent (a picture, sound) |
+| `400 media_not_inline` | A picture or sound was given as a link, or as a part type the pool does not accept |
+| `400 bad_upload` | The upload could not be read as one clean form, or named the model twice |
+| `413 request_too_large` | Over the pool's size limit |
+| `504 generation_timeout` | The work outlasted the pool's read time; not retried |
+
+Each is a `PoolRequestError` with `.reason` and `.detail`, raised at once. A `503` that only
+means "busy" — including `uploads_full`, when the pool is holding as many uploads as it allows —
+is waited out as usual.
+
 ## Configuration
 
 | Variable | Default | What it sets |
@@ -218,7 +313,8 @@ you are handed a key starting `gpmx_`, that is the wrong one — ask for a `gpma
 | Failure **mid-stream**, after output was delivered | **Stops.** Raises `PoolStreamInterrupted` |
 | `503 no_lease` | **Stops.** Raises `PoolUnavailable` |
 | `401` | Raises `PoolAuthError` |
-| Any other `4xx` — e.g. `404 model_not_in_pool` | Raises `PoolRequestError` |
+| Any other `4xx` — e.g. `404 model_not_in_pool`, `413 request_too_large` | Raises `PoolRequestError` |
+| `504 generation_timeout` or `deadline_exceeded` | Raises `PoolRequestError`; never retried |
 | Total wait exceeds `max_wait_s` | Raises `PoolUnavailable` |
 
 Three of those deserve their reasoning:
@@ -233,7 +329,8 @@ there until an operator opens one, pass `RetryPolicy(wait_without_lease=True)`.
 
 **Retrying is safe here** because a chat or generate call has no server-side effect to
 duplicate — the whole conversation travels with each request, and your tools run in your
-process, not the engine's.
+process, not the engine's. The same holds for a transcription or a ranking; an upload is kept in
+memory so a retry can send it again.
 
 ### Tuning it
 

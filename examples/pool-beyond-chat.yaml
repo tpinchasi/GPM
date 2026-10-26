@@ -1,0 +1,41 @@
+# For operators: the parts of pool.yaml the examples assume. Merge into your own configuration;
+# keys and other secrets stay out of this file. See docs/models-beyond-chat.md.
+
+pool:
+  model_set: ["gemma4:26b", "whisper-large-v3-turbo", "bge-reranker-v2-m3"]
+  max_request_mb: 24            # one request body; uploads over it are refused before being read
+
+catalog:
+  gemma4:26b:                   # chat, and pictures where the build can see them
+    variants:
+      - { tag: "gemma4:26b-mlx", requires: ["apple-silicon"], engine: "ollama" }
+      - { tag: "google/gemma-4-26B-A4B-it", engine: "vllm", inputs: [image] }
+  whisper-large-v3-turbo:       # speech to text
+    variants:
+      - { tag: "openai/whisper-large-v3-turbo", engine: "vllm", serves: [transcribe] }
+      - { tag: "ggerganov/whisper.cpp/ggml-large-v3-turbo-q5_0.bin", engine: "whisper-cpp", serves: [transcribe] }
+  bge-reranker-v2-m3:           # ranking
+    variants:
+      - { tag: "BAAI/bge-reranker-v2-m3", engine: "vllm", serves: [rerank] }
+
+hosts:
+  - id: mac                     # the Mac's Ollama: chat and pictures
+    kind: local
+    engine: ollama
+    workers: 3
+    residency: on_demand
+    capabilities: [apple-silicon]
+    transport: { type: http, base_url: "http://127.0.0.1:11434" }
+    models: ["gemma4:26b"]
+  - id: mac-whisper             # whisper.cpp beside it: its own agent fetches the model and runs the server
+    kind: local
+    engine: whisper-cpp
+    workers: 1                  # one recording at a time
+    transport: { type: http, base_url: "http://127.0.0.1:8178" }
+    agent: { url: "http://127.0.0.1:8096", bearer_env: WHISPER_AGENT_KEY }
+    models: ["whisper-large-v3-turbo"]
+
+rented:                         # overflow, and the models a Mac cannot run; vLLM is the default
+  models: ["gemma4:26b", "whisper-large-v3-turbo", "bge-reranker-v2-m3"]
+  images:
+    - { image: "vastai/vllm:v0.29.0-cuda-13.0", min_driver: "580", capabilities: [audio-decoding] }
