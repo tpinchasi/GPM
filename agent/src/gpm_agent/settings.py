@@ -29,6 +29,13 @@ class SettingsError(Exception):
     """The file is missing, unsafe or does not make sense. The message is for an operator."""
 
 
+#: Whether the file's permission bits mean anything here. Windows has none: Python reports every
+#: writable file there as readable and writable by all, so the check would refuse every file.
+#: There the file is kept private by where it lives — under the user's profile, which Windows
+#: gives to that user, the system and administrators only.
+CHECKS_FILE_MODE = os.name != "nt"
+
+
 def mint_key() -> str:
     # 32 random bytes: beyond any dictionary, so a plain digest is enough to store.
     return f"{KEY_PREFIX}_{secrets.token_hex(32)}"
@@ -150,7 +157,7 @@ def load(path: str | Path = DEFAULT_PATH) -> Settings:
     if not path.exists():
         raise SettingsError(f"{path} does not exist. Run `gpm-agent init` on this machine first.")
     mode = path.stat().st_mode
-    if mode & (stat.S_IRGRP | stat.S_IROTH | stat.S_IWGRP | stat.S_IWOTH):
+    if CHECKS_FILE_MODE and mode & (stat.S_IRGRP | stat.S_IROTH | stat.S_IWGRP | stat.S_IWOTH):
         raise SettingsError(f"{path} is readable or writable by others; `chmod 600` it.")
     try:
         body = json.loads(path.read_text())

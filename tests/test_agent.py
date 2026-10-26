@@ -93,7 +93,11 @@ def test_the_agent_never_runs_a_shell_or_a_command_it_was_given():
                     # lists — and is a command-line entry for the machine's restart script,
                     # reachable from nothing on the agent's protocol (checked below). whisper.cpp's
                     # server is started by the agent itself (D148): checked below for what it runs.
-                    assert path.name in ("facts.py", "vllm_launch.py", "whisper_cpp.py"), f"{path.name} can start a process"
+                    # startup.py runs the owner's own `init` and `startup` commands (D154), from
+                    # the command line only: checked in test_agent_startup.py.
+                    assert path.name in (
+                        "facts.py", "vllm_launch.py", "whisper_cpp.py", "startup.py",
+                    ), f"{path.name} can start a process"
         text = path.read_text()
         assert "os.system" not in text and "os.popen" not in text and "create_subprocess_shell" not in text
         if "create_subprocess_exec" in text:

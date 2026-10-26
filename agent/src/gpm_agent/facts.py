@@ -12,6 +12,7 @@ means "could not tell", and the pool does not derive a capability from silence.
 
 from __future__ import annotations
 
+import ctypes
 import dataclasses
 import os
 import platform
@@ -45,6 +46,43 @@ def _read(path: str) -> Optional[str]:
         return None
 
 
+class MemoryStatus(ctypes.Structure):
+    """Windows' `MEMORYSTATUSEX`, as `GlobalMemoryStatusEx` fills it: two 32-bit numbers, then
+    seven 64-bit ones, 64 bytes in all. Of the 64-bit ones only the first two are read: physical
+    memory in total, and available."""
+
+    _fields_ = [
+        ("dwLength", ctypes.c_uint32),
+        ("dwMemoryLoad", ctypes.c_uint32),
+        ("ullTotalPhys", ctypes.c_uint64),
+        ("ullAvailPhys", ctypes.c_uint64),
+        ("ullTotalPageFile", ctypes.c_uint64),
+        ("ullAvailPageFile", ctypes.c_uint64),
+        ("ullTotalVirtual", ctypes.c_uint64),
+        ("ullAvailVirtual", ctypes.c_uint64),
+        ("ullAvailExtendedVirtual", ctypes.c_uint64),
+    ]
+
+
+def _windows_memory(kernel32: Any = None) -> Optional[tuple[int, int]]:
+    """Total and available physical memory, in bytes, from Windows' own `GlobalMemoryStatusEx` —
+    or None anywhere else, or when the call fails. A library call, not a command: Windows has no
+    `/proc/meminfo`, and nothing it ships prints these numbers in a form meant to be read."""
+    if kernel32 is None:
+        windll = getattr(ctypes, "windll", None)  # only Windows' ctypes has it
+        if windll is None:
+            return None
+        kernel32 = windll.kernel32
+    status = MemoryStatus()
+    status.dwLength = ctypes.sizeof(MemoryStatus)
+    try:
+        if not kernel32.GlobalMemoryStatusEx(ctypes.pointer(status)):
+            return None
+    except OSError:
+        return None
+    return status.ullTotalPhys, status.ullAvailPhys
+
+
 @dataclasses.dataclass
 class Probes:
     """The outside world, injectable."""
@@ -54,6 +92,8 @@ class Probes:
     run: Callable[[Sequence[str]], Optional[str]] = _run
     read: Callable[[str], Optional[str]] = _read
     disk_usage: Callable[[str], Any] = shutil.disk_usage
+    #: Total and available memory on Windows, or None.
+    windows_memory: Callable[[], Optional[tuple[int, int]]] = _windows_memory
 
 
 def _int(text: Optional[str]) -> Optional[int]:
@@ -83,6 +123,12 @@ def memory(probes: Probes) -> dict[str, Optional[int]]:
             if all(v is not None for v in reclaimable):
                 available = sum(reclaimable) * page
         return {"total_bytes": total, "available_bytes": available}
+
+    if probes.system() == "Windows":
+        both = probes.windows_memory()
+        if both is None:
+            return {"total_bytes": None, "available_bytes": None}
+        return {"total_bytes": both[0], "available_bytes": both[1]}
 
     info = probes.read("/proc/meminfo")
     if not info:
@@ -123,7 +169,10 @@ def accelerators(probes: Probes) -> Optional[list[dict[str, Any]]]:
                     "memory_bytes": size * 1024 * 1024 if size is not None else None, "unified": False,
                 })
 
-    rocm = probes.run(["rocm-smi", "--showproductname", "--csv"])
+    # On Windows NVIDIA's cards are all this asks about — `nvidia-smi` ships with the driver there
+    # too — and nothing else is claimed: there a machine without NVIDIA's answer is one this could
+    # not tell about, since it may hold a card of another make, not one with none.
+    rocm = None if probes.system() == "Windows" else probes.run(["rocm-smi", "--showproductname", "--csv"])
     if rocm is not None:
         could_tell = True
         for line in rocm.splitlines()[1:]:
