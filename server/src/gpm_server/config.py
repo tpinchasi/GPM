@@ -11,7 +11,7 @@ import ipaddress
 import os
 import re
 from pathlib import Path
-from typing import Any, ClassVar, Literal, Optional
+from typing import Any, ClassVar, Iterable, Literal, Optional
 from urllib.parse import urlparse
 
 import yaml
@@ -1205,6 +1205,7 @@ class PoolConfig(BaseModel):
         self._copy_fits_the_preparing_window()
         self._builds_serve_what_their_engine_can()
         self._agent_managed_engines_are_well_placed()
+        self._rented_images_carry_what_builds_need()
         self._hosts_can_serve_what_they_are_asked_for()
         self._declared_models_are_in_the_set()
         self._every_model_is_held_by_somebody()
@@ -1235,6 +1236,22 @@ class PoolConfig(BaseModel):
             return list(host.models)
         servable = self._servable_by(host)
         return servable[:1]
+
+    def image_needs(self, tags: Iterable[str]) -> frozenset[str]:
+        """What the image a rented host starts from must carry to serve these builds (D146) —
+        vLLM decodes speech only with its audio extra, which an image has or lacks."""
+        if self.rented is None:
+            return frozenset()
+        from .engines import EngineNotFound, get_engine
+
+        try:
+            needs = getattr(get_engine(self.rented_engine()), "image_needs", None) or {}
+        except EngineNotFound:
+            return frozenset()
+        traits = self.build_traits()
+        return frozenset(
+            needs[kind] for tag in tags for kind in traits.get(tag, (frozenset(), None))[0] if kind in needs
+        )
 
     def rented_image(self) -> str:
         """The image rented hosts start from when `rented.images` names none: `rented.image`, or
@@ -1738,6 +1755,27 @@ class PoolConfig(BaseModel):
                         "whisper-cpp, ranking on vLLM."
                     )
 
+    def _rented_images_carry_what_builds_need(self) -> None:
+        """A model rented hosts hold whose build needs something of the image — speech on vLLM
+        needs its audio extra (D146) — needs an image listed as carrying it. Said now, before
+        anything is rented, not after a host was paid for and answered every recording 400."""
+        if self.rented is None:
+            return
+        engine = self.rented_engine()
+        carried = [frozenset(i.capabilities) for i in self.rented.images]  # `image:` alone carries nothing said
+        for name in dict.fromkeys(self._rented_models()):
+            entry = self.catalog.get(name)
+            tags = [v.tag for v in (entry.variants if entry else []) if v.engine is None or v.engine == engine]
+            needs = self.image_needs(tags)
+            if needs and not any(needs <= image for image in carried):
+                listed = ", ".join(i.image for i in self.rented.images) or self.rented_image()
+                raise ValueError(
+                    f"rented hosts hold {name!r}, which {engine} serves only from an image carrying "
+                    f"{sorted(needs)}, and none of theirs says it does ({listed}). List the image under "
+                    f"`rented.images` with `capabilities: {sorted(needs)}` — the host's agent checks the "
+                    f"claim before it serves (D146)"
+                )
+
     def _agent_managed_engines_are_well_placed(self) -> None:
         """An engine whose server the host's agent runs — whisper.cpp (D148) — needs that agent,
         must not be reached in clear text off the machine (its server has no authentication),
@@ -1755,6 +1793,16 @@ class PoolConfig(BaseModel):
                 raise ValueError(
                     f"host {host.id!r} runs {engine.name}, whose server its agent starts and reports on; "
                     "give the host an `agent` (D148)"
+                )
+            if not host.agent.manage_models:
+                raise ValueError(
+                    f"host {host.id!r} runs {engine.name}, whose model only its agent fetches and starts; "
+                    "remove `manage_models: false` from its agent (D148)"
+                )
+            if host.residency != "pinned":
+                raise ValueError(
+                    f"host {host.id!r} runs {engine.name}, which serves the one model it was started with "
+                    "and cannot load another on first use; remove `residency: on_demand` (D148)"
                 )
             transport = host.transport
             if transport.type != "tunnel" and not _is_loopback(transport.base_url or ""):

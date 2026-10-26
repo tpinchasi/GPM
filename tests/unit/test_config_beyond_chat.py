@@ -24,6 +24,10 @@ def local(host_id="mac", **overrides):
     return {"id": host_id, "kind": "local", "transport": {"type": "http", "base_url": "http://127.0.0.1:11434"}, **overrides}
 
 
+#: An image of vLLM said to carry its audio extra (D146).
+AUDIO_IMAGES = [{"image": "example/vllm-audio:v0.29.0", "min_driver": "550", "capabilities": ["audio-decoding"]}]
+
+
 def renting(**overrides):
     return {"provider": "fake", "workers": 2, "capabilities": ["cuda"],
             "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 0.60}, "bidding": {"premium": 0.02}, **overrides}
@@ -45,7 +49,7 @@ def test_a_host_running_ollama_asked_for_speech_is_told_why_and_what_to_do():
 
 def test_rented_hosts_run_vllm_unless_told_otherwise_and_a_pool_relying_on_ollama_hears_how_to_keep_it():
     vllm_catalog = {WHISPER: {"variants": [{"tag": "owner/whisper", "engine": "vllm", "serves": ["transcribe"]}]}}
-    assert config(catalog=vllm_catalog, rented=renting()).rented_engine() == "vllm"
+    assert config(catalog=vllm_catalog, rented=renting(images=AUDIO_IMAGES)).rented_engine() == "vllm"
 
     with pytest.raises(ValueError) as refused:
         config(model_set=["chat"], catalog={"chat": {"variants": [{"tag": "chat:7b", "engine": "ollama"}]}},
@@ -85,6 +89,9 @@ def test_a_whisper_cpp_host_with_its_agent_on_loopback_and_one_worker_loads():
     # Plain http off the machine is refused for every host; https still reaches a server with no key.
     ({"transport": {"type": "https", "base_url": "https://192.168.1.20:8178"}}, "no authentication"),
     ({"workers": 3}, "workers: 1"),
+    ({"agent": {"url": "http://127.0.0.1:8096", "bearer_env": "WHISPER_AGENT_KEY", "manage_models": False}},
+     "manage_models: false"),
+    ({"residency": "on_demand"}, "residency: on_demand"),
 ])
 def test_a_whisper_cpp_host_is_refused_without_its_agent_off_loopback_or_with_extra_workers(change, said):
     host = whisper_host()
@@ -105,7 +112,7 @@ def test_serves_and_inputs_are_three_valued_and_speech_hears():
             WHISPER: {"variants": [{"tag": "owner/whisper", "engine": "vllm", "serves": ["transcribe"]}]},
         },
         hosts=[local(models=["vision"])],
-        rented=renting(models=[WHISPER]),
+        rented=renting(models=[WHISPER], images=AUDIO_IMAGES),
         pool={"models_per_host": "declared"},
     )
     traits = pool.build_traits()
@@ -113,3 +120,15 @@ def test_serves_and_inputs_are_three_valued_and_speech_hears():
     assert traits["v:text"][1] == frozenset()
     assert traits["v:unsaid"][1] is None
     assert traits["owner/whisper"] == (frozenset({"transcribe"}), frozenset({"audio"}))
+
+
+def test_speech_on_rented_vllm_needs_an_image_said_to_decode_audio():
+    catalog = {WHISPER: {"variants": [{"tag": "owner/whisper", "engine": "vllm", "serves": ["transcribe"]}]}}
+    with pytest.raises(ValueError, match="capabilities: \\['audio-decoding'\\]"):
+        config(catalog=catalog, rented=renting())
+    plain = [{"image": "example/vllm:v0.29.0", "min_driver": "550"}]
+    with pytest.raises(ValueError, match="example/vllm:v0.29.0"):
+        config(catalog=catalog, rented=renting(images=plain))
+    pool = config(catalog=catalog, rented=renting(images=plain + AUDIO_IMAGES))
+    assert pool.image_needs(["owner/whisper"]) == frozenset({"audio-decoding"})
+    assert pool.image_needs(["chat:7b"]) == frozenset()

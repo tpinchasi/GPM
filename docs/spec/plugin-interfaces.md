@@ -206,6 +206,10 @@ embeddings:
     def request_facts(self, path: str, content_type: str, body: bytes) -> RequestFacts: ...
     def rewrite_model(self, path: str, content_type: str, body: bytes, tag: str) -> tuple[str, bytes]: ...
     async def observed_inputs(self, conn: Connection, tags: set[str]) -> dict[str, set[str]] | None: ...
+    default_image: ClassVar[str]             # the pinned image rented hosts start from (D147)
+    image_needs: ClassVar[dict[str, str]]    # kind -> what the image must carry for it (D146)
+    residency_from_agent: ClassVar[bool]     # what it holds is the host agent's to say (D148)
+    max_workers: ClassVar[int | None]        # requests it serves at once, where it is bounded
 ```
 
 | Member | Guarantee |
@@ -214,6 +218,9 @@ embeddings:
 | `request_facts` | Model, stream, schema, kind and the inputs carried (`image`, `audio`), read **once** from a body the router has already bounded (D144). Raises `AmbiguousField` (D141), `MediaNotInline` for a link or an unknown part type (D143), `BadUpload` for a form it would have to guess about (D144) |
 | `rewrite_model` | For JSON, `with_model`'s rule. For an upload, returns a **rebuilt** form — its own boundary, canonical part headers, the `model` part rewritten — and the new content type; every file's bytes untouched |
 | `observed_inputs` | What each tag accepts on this host, where the engine can say (Ollama's capabilities); `None` where it cannot, and the catalog's declaration stands (D143) |
+| `image_needs` | Per kind, an image capability a rented host holding such a build must start from (§"Choosing the build per machine") |
+| `residency_from_agent` | The server cannot say what it holds: the host must carry an agent that manages its models, and the host is resident in what that agent reports loaded. Refused at load without one |
+| `max_workers` | A host running it is refused at load with more workers than this |
 
 The shipped engines: **Ollama** (chat, embeddings), **vLLM** (chat, embeddings, transcription,
 ranking) and **whisper.cpp** (transcription; one model per server; its host must carry an agent,
@@ -310,9 +317,13 @@ default (`default_image`: `ollama/ollama:0.34.2`, `vllm/vllm-openai:v0.29.0`), s
 leaves the other engine's image behind (D147).
 
 An image's `capabilities` say what it carries beyond the engine — `audio-decoding` for vLLM's
-audio extra, which a transcription build `require`s. The pool chooses an image that carries what
-a host's builds require, as it applies the driver floor, and the host's agent verifies the claim
-before the host serves (D146).
+audio extra. An engine names what its image must carry per kind (`image_needs`; vLLM:
+`{transcribe: audio-decoding}`). The pool chooses, among the images carrying what a host's builds
+need, the first whose driver floor the machine meets — refusing the offer before the bid when none
+does — and refuses at load a configuration whose rented models need what no listed image carries
+(`image:` alone carries nothing said). The host's agent verifies the claim: its facts' `engine.carries`
+lists what the engine's installation was found to carry, and a host missing what its image was
+chosen for is given up with the reason (D146).
 
 A machine that can run none is refused **before it is bid on**. `image:` alone still means one
 build for every machine, and the driver floor in the offer policy is then what keeps an unusable

@@ -1546,9 +1546,16 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         """Test connection for an **unsaved** host definition. Saves nothing, spends nothing."""
         body = await request.json()
         try:
+            # The engine the definition names, not the pool's default: the check speaks to it on
+            # its own paths (D93, D142).
+            named = body.get("engine") if isinstance(body, dict) else None
+            engine = get_engine(named) if isinstance(named, str) and named else supervisor.engine
+        except EngineNotFound as exc:
+            return _error(400, "bad_host", str(exc))
+        try:
             result = await test_connection(
                 body,
-                engine=supervisor.engine,
+                engine=engine,
                 settings=supervisor.config.pool,
                 model_set=supervisor.config.pool.model_set,
                 catalog=supervisor.config.catalog,

@@ -1453,17 +1453,26 @@ class Fleet:
         before the pool assigned models."""
         return list(host.models) if host.models else self.rented_models
 
-    def image_for(self, offer) -> tuple[Optional[str], str]:
+    def image_for(self, offer, tags: Sequence[str] = ()) -> tuple[Optional[str], str]:
         """Which build of the engine this machine gets, and why (D92).
 
         With a single `image` the answer never varies, and the driver floor in the offer policy
         is what keeps an unusable machine out. With several, the pool takes the first whose
         driver floor this machine meets — so a newer, faster build is used where it can be, and
         an older machine still gets a build that runs rather than being refused outright.
+
+        Only images carrying what the host's builds need are candidates (D146): speech on vLLM
+        needs an image with its audio extra, known before the bid as the driver floor is.
         """
-        images = self.rented.images
-        if not images:
+        needs = self.config.image_needs(tags)
+        images = [i for i in self.rented.images if needs <= set(i.capabilities)]
+        if not self.rented.images and not needs:
             return self.config.rented_image(), "the pool's only image"
+        if not images:
+            return None, (
+                f"image: no image of the engine is listed as carrying {sorted(needs)}, which this "
+                f"host's builds need"
+            )
         chosen = image_for(offer, images)
         if chosen is None:
             wanted = ", ".join(f"{i.image} needs {i.min_driver}" for i in images)
@@ -1473,6 +1482,7 @@ class Fleet:
             )
         return chosen.image, (
             f"driver {offer.driver_version} meets {chosen.min_driver}"
+            + (f", carries {', '.join(sorted(needs))}" if needs else "")
             + (f" — {chosen.note}" if chosen.note else "")
         )
 
@@ -1879,6 +1889,25 @@ class Fleet:
         else:
             host.agent_facts = None
             host.agent_detail = view.detail
+
+    def image_falls_short(self, host: RentedHost) -> Optional[str]:
+        """Why this host's image cannot serve its builds, when its agent has checked and found
+        it lacks what the image was chosen for (D146) — or None, including when the agent has
+        not said: an agent that cannot tell is not one that found the image wanting."""
+        needs = self.config.image_needs(list(self.builds_of(self.models_of(host), host.builds).values()))
+        engine = (host.agent_facts or {}).get("engine")
+        carries = engine.get("carries") if isinstance(engine, dict) else None
+        if not needs or not isinstance(carries, list):
+            return None
+        missing = needs - set(carries)
+        if not missing:
+            return None
+        detail = engine.get("carries_detail")
+        return (
+            f"its image was listed as carrying {sorted(missing)} and does not"
+            + (f" ({str(detail)[:200]})" if detail else "")
+            + "; correct the image's `capabilities` in rented.images"
+        )
 
     # --- what would happen (spec §3) ---
 
@@ -3884,7 +3913,7 @@ class Fleet:
                                        numbers={"offer": offer.offer_id, "workload": workload}, lease_id=lease.lease_id)
                     continue
 
-            image, image_why = self.image_for(offer)
+            image, image_why = self.image_for(offer, list(self.builds_of(for_this_host, builds).values()))
             if image is None:
                 # Refused *before* the bid: renting a machine whose driver cannot run any build
                 # of the engine buys a host that can never answer, and pays for it until the

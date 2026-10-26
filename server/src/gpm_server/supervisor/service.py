@@ -952,6 +952,12 @@ class Supervisor:
                 self._rented_clients[host_id] = client
 
             await self.fleet.ask_agent(host)
+            short = self.fleet.image_falls_short(host)
+            if short is not None:
+                # Chosen because it claimed to carry what this host's builds need, and its agent
+                # found otherwise (D146): it would start and refuse every request of that kind.
+                await self.fleet.destroy(host, short)
+                continue
 
             health = await self.engine_for(host).health(client)
             if not health.ok:
@@ -1201,16 +1207,29 @@ class Supervisor:
             return
 
         previous = host.state
-        health = await self.engine_for(host).health(host.client)
+        engine = self.engine_for(host)
+        from_agent = bool(getattr(engine, "residency_from_agent", False))
+        health = await engine.health(host.client)
         if not health.ok:
-            host.state = HostState.UNREACHABLE
-            host.last_error = health.detail
             host.resident = frozenset()
             host.available = frozenset()
+            starting = self._agent_is_starting_it(host) if from_agent else None
+            if starting:
+                # Its agent fetches the model and starts the server with it (D148): a server not
+                # answering yet is one being brought up, not a host that went away.
+                host.state = HostState.PREPARING
+                host.last_error = starting
+            else:
+                host.state = HostState.UNREACHABLE
+                host.last_error = health.detail
         else:
             try:
-                resident = await self.engine_for(host).models_resident(host.client)
-                available = await self.engine_for(host).models_available(host.client)
+                if from_agent:
+                    # The server cannot say what it holds; the agent that started it does (D148).
+                    resident, available = self._agent_holds(host)
+                else:
+                    resident = await engine.models_resident(host.client)
+                    available = await engine.models_available(host.client)
             except httpx.HTTPError as exc:
                 host.state = HostState.UNREACHABLE
                 host.last_error = str(exc)
@@ -1244,6 +1263,37 @@ class Supervisor:
                 host.state.value,
                 host.last_error or "ok",
             )
+
+    @staticmethod
+    def _agent_models(host: SupervisedHost) -> list[dict[str, Any]]:
+        report = (host.agent.models if host.agent is not None and host.agent.reachable else None) or {}
+        return [m for m in report.get("models") or [] if isinstance(m, dict) and isinstance(m.get("tag"), str)]
+
+    def _agent_holds(self, host: SupervisedHost) -> tuple[frozenset[str], frozenset[str]]:
+        """What the agent says its engine serves, and what it has on disk — only for the model
+        set it was asked to hold, which is all it reports on."""
+        models = self._agent_models(host)
+        return (
+            frozenset(m["tag"] for m in models if m.get("loaded")),
+            frozenset(m["tag"] for m in models if m.get("on_disk")),
+        )
+
+    def _agent_is_starting_it(self, host: SupervisedHost) -> Optional[str]:
+        """Why the server is not answering, as its agent tells it — or None when the agent says
+        nothing that explains it, and the host is unreachable like any other."""
+        for model in self._agent_models(host):
+            if model.get("error"):
+                return f"{model['tag']}: {str(model['error'])[:300]}"
+            pulling = model.get("pulling")
+            if isinstance(pulling, dict):
+                done, total = pulling.get("completed_bytes"), pulling.get("total_bytes")
+                share = f" ({done * 100 // total}%)" if isinstance(done, int) and isinstance(total, int) and total else ""
+                return f"its agent is fetching {model['tag']}{share}"
+            if not model.get("on_disk"):
+                return f"its agent has yet to fetch {model['tag']}"
+            if not model.get("loaded"):
+                return f"its agent is starting the server with {model['tag']}"
+        return None
 
     async def _observe_inputs(self, host: SupervisedHost) -> None:
         """Ask the engine what each of this host's builds takes, where it can say (D143) — when

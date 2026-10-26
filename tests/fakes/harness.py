@@ -145,6 +145,11 @@ class PoolHarness:
 
                 fake = FakeVllm()
                 fake.start(spec.resident)  # a machine someone else started, serving its models
+            elif spec.engine == "whisper-cpp":
+                from .fake_whisper_cpp import FakeWhisperCpp
+
+                fake = FakeWhisperCpp()
+                fake.start(spec.resident)  # started by its agent, which the test stands in for
             else:
                 fake = FakeOllama(
                     resident=spec.resident, available=spec.available,

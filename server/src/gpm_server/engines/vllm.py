@@ -72,6 +72,10 @@ class VllmEngine:
     #: The image a rented host starts from when the configuration names none: the project's own
     #: build, pinned (T10). It leaves out the audio extra; images that carry it say so (D146).
     default_image: ClassVar[str] = "vllm/vllm-openai:v0.29.0"
+    #: What an image must carry for a kind (D146): speech needs vLLM's `audio` extra, which this
+    #: engine's own image leaves out. Rented hosts holding such a build start only from an image
+    #: whose `capabilities` name it.
+    image_needs: ClassVar[dict[str, str]] = {TRANSCRIBE: "audio-decoding"}
     #: It serves what it was started with; a downloaded model is picked up by starting it again.
     loads_by_restart: ClassVar[bool] = True
     #: The agent's launcher starts a model across a group of cards with `--tensor-parallel-size`.

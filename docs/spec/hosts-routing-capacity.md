@@ -495,7 +495,12 @@ input_not_accepted`, at once — computed when the configuration loads. When suc
 no ready host holds one, it is `503 no_eligible_host`, as for a schema requirement.
 
 A **whisper.cpp host** holds the one build it declares, has one worker, and is reached on loopback
-or through a tunnel; it must carry an agent, which fetches the build and runs the server (D148).
+or through a tunnel; it must carry an agent that manages its models, which fetches the build and
+runs the server (D148), and its residency is `pinned` — the server cannot load a build on first
+use. The server cannot say what it holds, so the host is ready when the server answers **and** its
+agent reports it started with the build; while the agent is fetching or starting it the host is
+`preparing`, with the agent's progress or error as the reason. Test connection, before the host is
+saved, does not expect the server to answer yet.
 
 ## 5. Routing
 

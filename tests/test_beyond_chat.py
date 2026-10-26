@@ -3,8 +3,10 @@ ranking — each read once, bounded, refused when it could never be served, and 
 build that can do it."""
 
 import base64
+import json
 import time
 
+import httpx
 from fakes.fake_ollama import inference_seen
 from fakes.fake_vllm import read_form
 from fakes.harness import EngineSpec, pool_harness
@@ -287,3 +289,87 @@ def test_the_standard_library_reads_the_rebuilt_form_as_the_pool_did():
         replace={"model": "tag"},
     )
     assert read_form(content_type, body) == {"model": "tag", "file": {"filename": "f.wav", "data": AUDIO}}
+
+
+# --- whisper.cpp, run by the host's agent (D148) ---
+
+WHISPER_FILE = "owner/whisper-ggml/model-q5_0.bin"
+
+
+class WhisperAgent:
+    """The host's agent as the pool hears it: what it was asked to hold, and where it stands."""
+
+    def __init__(self):
+        self.asked: list[dict] = []
+        self.models: list[dict] = []
+        self.transport = httpx.MockTransport(self._answer)
+
+    def _answer(self, request):
+        if request.url.path.endswith("/facts"):
+            return httpx.Response(200, json={
+                "agent": {"version": "test", "protocol": "1"}, "os": "Darwin", "arch": "arm64",
+                "capabilities": ["apple-silicon"], "engine": {"name": "whisper-cpp", "answers": True},
+            })
+        self.asked.append(json.loads(request.content))
+        return httpx.Response(200, json={"engine_answers": True, "models": self.models, "surplus": []})
+
+
+def whisper_cpp_pool(monkeypatch):
+    monkeypatch.setenv("WHISPER_AGENT_KEY", "test-agent-key")
+    return pool_harness(
+        [EngineSpec(id="mac-whisper", resident=set(), engine="whisper-cpp"),
+         EngineSpec(id="mac", resident={"chatter:7b"})],
+        model_set=[WHISPER, CHAT],
+        catalog={WHISPER: {"variants": [{"tag": WHISPER_FILE, "engine": "whisper-cpp", "serves": ["transcribe"]}]},
+                 CHAT: CATALOG[CHAT]},
+        pool_settings={"models_per_host": "declared"},
+        host_overrides={
+            "mac-whisper": {"models": [WHISPER],
+                            "agent": {"url": "http://127.0.0.1:8096", "bearer_env": "WHISPER_AGENT_KEY"}},
+            "mac": {"models": [CHAT]},
+        },
+    )
+
+
+def test_a_whisper_cpp_host_is_ready_when_its_agent_says_the_server_holds_its_build(monkeypatch):
+    with whisper_cpp_pool(monkeypatch) as pool:
+        host = pool.supervisor.hosts["mac-whisper"]
+        agent = WhisperAgent()
+        pool.supervisor._agent_transport = agent.transport
+
+        # Fetching: the server is not up, and that is a host being prepared, not one gone away.
+        agent.models = [{"tag": WHISPER_FILE, "on_disk": False, "loaded": False,
+                         "pulling": {"tag": WHISPER_FILE, "completed_bytes": 50, "total_bytes": 200}}]
+        pool.reprobe()
+        assert agent.asked[-1] == {"tags": [WHISPER_FILE], "residency": "pinned"}
+        assert host.state.value == "preparing" and "fetching" in host.last_error and "25%" in host.last_error
+
+        # Started with the file: the agent says so, and only then is the host ready.
+        pool.engines["mac-whisper"].fake.start({WHISPER_FILE})
+        agent.models = [{"tag": WHISPER_FILE, "on_disk": True, "loaded": False}]
+        pool.reprobe()
+        assert host.state.value == "preparing", "a server answering is not one holding the build"
+        agent.models = [{"tag": WHISPER_FILE, "on_disk": True, "loaded": True}]
+        pool.reprobe()
+        assert host.state.value == "ready", host.last_error
+
+        with pool.client() as client:
+            response = client.post("/v1/audio/transcriptions", data={"model": WHISPER},
+                                   files={"file": ("note.wav", AUDIO, "audio/wav")})
+        assert response.status_code == 200, response.text
+        assert response.json() == {"text": f"heard {len(AUDIO)} bytes"}
+        assert pool.engines["mac-whisper"].fake.received[-1][1]["model"] == WHISPER_FILE
+
+        # The server stops: its agent says it is starting it again, and nothing is routed there.
+        pool.engines["mac-whisper"].fake.running = False
+        agent.models = [{"tag": WHISPER_FILE, "on_disk": True, "loaded": False}]
+        pool.reprobe()
+        assert host.state.value == "preparing" and "starting the server" in host.last_error
+
+
+def test_a_whisper_cpp_host_whose_agent_is_silent_is_unreachable_like_any_other(monkeypatch):
+    with whisper_cpp_pool(monkeypatch) as pool:
+        pool.supervisor._agent_transport = httpx.MockTransport(lambda request: httpx.Response(503))
+        pool.reprobe()
+        host = pool.supervisor.hosts["mac-whisper"]
+        assert host.state.value == "unreachable"
