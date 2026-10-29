@@ -769,10 +769,31 @@ def test_a_refused_start_reports_no_lengths(tmp_path):
     # Lengths that are not numbers are not lengths.
     ({"config": {"max_position_embeddings": "long", "max_seq_len": True}}, None),
     # A reranker's encoder is held to its tokenizer's own limit: 514 positions, 512 tokens.
-    ({"config": {"position_embedding_type": "absolute", "max_position_embeddings": 514},
+    ({"config": {"architectures": ["XLMRobertaForSequenceClassification"],
+                 "position_embedding_type": "absolute", "max_position_embeddings": 514},
       "tokenizer_config": {"model_max_length": 512}}, 512),
-    # … but only an encoder with absolute positions, as vLLM does.
-    ({"config": {"max_position_embeddings": 514}, "tokenizer_config": {"model_max_length": 512}}, 514),
+    # … and so is an embedding encoder …
+    ({"config": {"architectures": ["BertModel"], "position_embedding_type": "absolute", "max_position_embeddings": 514},
+      "tokenizer_config": {"model_max_length": 512}}, 512),
+    # … and a sentence-transformers model, whatever its architecture …
+    ({"config": {"architectures": ["SomeForCausalLM"], "position_embedding_type": "absolute",
+                 "max_position_embeddings": 514},
+      "tokenizer_config": {"model_max_length": 512},
+      "modules": [{"idx": 0, "type": "sentence_transformers.models.Transformer", "path": ""},
+                  {"idx": 1, "type": "sentence_transformers.models.Pooling", "path": "1_Pooling"}]}, 512),
+    # … but only a model vLLM runs for pooling: one that generates is not held to it, absolute
+    # positions or not — `…LMHeadModel` included, though it ends in `Model` …
+    ({"config": {"architectures": ["SomeForCausalLM"], "position_embedding_type": "absolute",
+                 "max_position_embeddings": 514},
+      "tokenizer_config": {"model_max_length": 512}}, 514),
+    ({"config": {"architectures": ["SomeLMHeadModel"], "position_embedding_type": "absolute",
+                 "max_position_embeddings": 514},
+      "tokenizer_config": {"model_max_length": 512}}, 514),
+    ({"config": {"position_embedding_type": "absolute", "max_position_embeddings": 514},
+      "tokenizer_config": {"model_max_length": 512}}, 514),
+    # … and only an encoder with absolute positions, as vLLM does.
+    ({"config": {"architectures": ["XLMRobertaForSequenceClassification"], "max_position_embeddings": 514},
+      "tokenizer_config": {"model_max_length": 512}}, 514),
     # A sentence-transformers model's own `max_seq_length` replaces the rest outright.
     ({"config": {"max_position_embeddings": 512},
       "sentence_bert_config": {"max_seq_length": 256, "do_lower_case": False}}, 256),

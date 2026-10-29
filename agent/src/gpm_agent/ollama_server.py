@@ -10,9 +10,10 @@ agent installs Ollama itself (`installs`) and runs it, as it runs whisper.cpp's 
   (`~/.ollama/models` unless set, so nothing already downloaded is downloaded again), and the
   pool's numbers — workers, models held, context — as the environment Ollama reads them from,
   built from integers by the engine's adapter. The hub's and GitHub's credentials are withheld.
-- **Recognised as its own** by a record of what it started and the process's command line, so
-  that it is still known as the agent's own after the agent restarts, and a process number that
-  has since gone to another program is never signalled.
+- **Recognised as its own** by a record of what it started and the process's command line —
+  exactly the argument list it was started with (`platform.started_with`) — so that it is still
+  known as the agent's own after the agent restarts, and a process number that has since gone to
+  another program is never signalled.
 - **Never over something it did not start.** If anything else answers on the port — the Ollama
   app, or an `ollama serve` the owner started — the agent reports it and leaves it alone.
 
@@ -53,8 +54,20 @@ ANSWER_TIMEOUT_S = 3.0
 #: Between looks while the server starts.
 POLL_S = 0.25
 
+#: How long a process found running is taken to be the server on the strength of one look at its
+#: command line — well under one of the pool's passes, so a number that has gone to another
+#: process is not mistaken for the server for long.
+IDENTITY_TRUSTED_S = 2.0
+
 #: How far back the log is read for the line that says why a server stopped.
 _LOG_TAIL_BYTES = 16384
+
+#: What Ollama prints about each request it serves, and what it prints only when asked to debug —
+#: which can carry what a client sent. Never a reason, and never reported.
+_PER_REQUEST = ("[GIN]", "level=DEBUG", "level=TRACE")
+
+#: What a line of the log says when it is a reason.
+_ERROR_WORDS = ("error", "failed", "not found")
 
 
 def serve_argv(program: Path) -> list[str]:
@@ -62,7 +75,11 @@ def serve_argv(program: Path) -> list[str]:
     return [str(program), "serve"]
 
 
-def _last_line(log: Optional[str], offset: int) -> Optional[str]:
+def _last_error_line(log: Optional[str], offset: int) -> Optional[str]:
+    """The last line naming an error that the server wrote to its log since it was started — what
+    the operator would read, such as `Error: listen tcp 127.0.0.1:11434: bind: address already in
+    use`. Never a line about a request, nor one written for debugging, nor an indented one: the
+    reason travels to the pool, and those can carry what a client sent."""
     if not log:
         return None
     try:
@@ -73,7 +90,9 @@ def _last_line(log: Optional[str], offset: int) -> Optional[str]:
     except OSError:
         return None
     for line in reversed(lines):
-        if line.strip():
+        if not line.strip() or line[:1].isspace() or any(marker in line for marker in _PER_REQUEST):
+            continue
+        if any(word in line.lower() for word in _ERROR_WORDS):
             return line.strip()[:300]
     return None
 
@@ -101,8 +120,9 @@ class OllamaServer:
         self._process: Optional[host_platform.Process] = None
         self._record: Optional[dict[str, Any]] = None
         self._record_read = False
-        #: Whether a process recorded before this agent started is its server, checked once each.
-        self._identity: dict[int, bool] = {}
+        #: A process recorded before this agent started, found to be its server, and when —
+        #: looked at again once that is more than `IDENTITY_TRUSTED_S` ago.
+        self._confirmed: Optional[tuple[int, float]] = None
 
     # --- the pool's numbers ---
 
@@ -161,8 +181,8 @@ class OllamaServer:
         self._record, self._record_read = record, True
 
     def _forget(self) -> None:
+        self._record, self._record_read, self._process, self._confirmed = None, True, None, None
         (self.state_dir / RECORD_FILE).unlink(missing_ok=True)
-        self._record, self._record_read, self._process = None, True, None
 
     def _own_process(self, record: dict[str, Any]) -> Optional[host_platform.Process]:
         if self._process is not None and self._process.pid == record.get("pid"):
@@ -170,22 +190,30 @@ class OllamaServer:
         return None
 
     def _is_ours(self, pid: int, record: dict[str, Any]) -> bool:
-        """Is process `pid` the server the record describes? Started with the recorded program
-        and `serve`; a program that has since taken the number is not."""
-        said = host_platform.command_line(pid, os_name=self.os_name) or b""
-        return str(record["program"]).encode() in said and b"serve" in said
+        """Is process `pid` the server the record describes? Running exactly the argument list
+        recorded for it; a program that has since taken the number is not."""
+        recorded = record.get("argv")
+        if not isinstance(recorded, list) or not recorded or not all(isinstance(part, str) for part in recorded):
+            return False
+        return host_platform.started_with(pid, recorded, os_name=self.os_name)
 
     def _alive(self, record: dict[str, Any]) -> bool:
+        """Asked of the process itself when this agent started it; otherwise of the system, with
+        its identity looked at again whenever the last look is more than a moment old — a
+        positive answer is kept only that long, and a negative one not at all."""
         own = self._own_process(record)
         if own is not None:
             return own.poll() is None
         pid = record["pid"]
         if not host_platform.alive(pid, os_name=self.os_name):
-            self._identity.pop(pid, None)  # the number may go to another program next
             return False
-        if pid not in self._identity:
-            self._identity[pid] = self._is_ours(pid, record)
-        return self._identity[pid]
+        confirmed = self._confirmed
+        if confirmed is not None and confirmed[0] == pid and time.monotonic() - confirmed[1] < IDENTITY_TRUSTED_S:
+            return True
+        if self._is_ours(pid, record):
+            self._confirmed = (pid, time.monotonic())
+            return True
+        return False
 
     def ours(self) -> bool:
         """Is the server this agent started running now — started by this agent process, or by
@@ -198,17 +226,16 @@ class OllamaServer:
         return record.get("version") if record is not None and self._alive(record) else None
 
     def why_stopped(self) -> Optional[str]:
-        """The server's last words, when the one this agent started has stopped."""
+        """Why the server this agent started has stopped: its exit, and its last line naming an
+        error, if it wrote one."""
         record = self._current()
         if record is None or self._alive(record):
             return None
         own = self._own_process(record)
         code = own.returncode if own is not None else None
-        line = _last_line(record.get("log"), int(record.get("log_offset") or 0))
-        return (
-            f"ollama serve exited{f' with code {code}' if code is not None else ''}: "
-            f"{line or 'nothing in its log'}"
-        )
+        line = _last_error_line(record.get("log"), int(record.get("log_offset") or 0))
+        reason = f"ollama serve exited{f' with code {code}' if code is not None else ''}"
+        return f"{reason}: {line}" if line else reason
 
     # --- what answers on the port ---
 
@@ -241,7 +268,8 @@ class OllamaServer:
 
     async def start(self, program: Path, version: str, timeout_s: float) -> Optional[str]:
         """Start `program serve` and wait for it to answer as `version`. None once it does;
-        otherwise why not — and then whatever was started is left for the caller to stop."""
+        otherwise why not — and then whatever was started is left for the caller to stop. An error
+        from the system, such as a directory this user may not write, is a reason like any other."""
         if self.ours():
             return "this agent's server is already running"
         if await self.listening():
@@ -249,9 +277,12 @@ class OllamaServer:
         if not program.is_file():
             return f"{program} is not there"
         logs = self.state_dir / "logs"
-        logs.mkdir(mode=0o700, parents=True, exist_ok=True)
         log_path = logs / LOG_FILE
         argv = serve_argv(program)
+        try:
+            logs.mkdir(mode=0o700, parents=True, exist_ok=True)
+        except OSError as exc:
+            return f"could not prepare its log in {logs}: {exc}"
         try:
             process, offset = host_platform.start(
                 argv, env=self.environment(), log=log_path, cwd=self.state_dir,
@@ -264,7 +295,13 @@ class OllamaServer:
             "pid": process.pid, "version": version, "program": str(program), "argv": argv,
             "log": str(log_path), "log_offset": offset, "started_at": time.time(),
         }
-        self._remember(record)
+        try:
+            self._remember(record)
+        except OSError as exc:
+            # A server nothing records is one nothing would stop once this agent restarts.
+            host_platform.end_now(process, os_name=self.os_name)
+            self._process = None
+            return f"could not record the server it started in {self.state_dir}: {exc}"
         deadline = time.monotonic() + timeout_s
         while self._alive(record):
             said = await self.answers()
@@ -279,8 +316,9 @@ class OllamaServer:
         return self.why_stopped() or "it exited as it started"
 
     async def stop(self) -> None:
-        """Stop the server this agent started, if it runs, and forget it. A process known only
-        from the record is signalled only once its command line says it is that server."""
+        """Stop the server this agent started, if it runs — with whatever it started — and forget
+        it. A process known only from the record is signalled only once its command line, read
+        now, says it is that server."""
         record = self._current()
         if record is None:
             return

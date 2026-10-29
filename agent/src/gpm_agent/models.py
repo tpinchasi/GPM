@@ -110,6 +110,13 @@ class ModelWork:
             raise Refused(400, "bad_tag", "every tag must be a plain model tag: no URL, no path, no scheme")
         if residency not in ("pinned", "on_demand"):
             raise Refused(400, "bad_residency", "residency must be pinned or on_demand")
+        if getattr(self.engine, "serves_one_model", False) and len(set(tags)) > 1:
+            # Holding each in turn would restart its server on every pass, serving none for long.
+            raise Refused(
+                400, "one_model_only",
+                f"{self.engine.name} serves one model at a time, and the desired set names "
+                f"{len(set(tags))}: {', '.join(sorted(set(tags)))}",
+            )
         self.desired = Desired(tuple(sorted(set(tags))), residency)
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._work(), name="gpm-agent:models")
@@ -235,6 +242,13 @@ class ModelWork:
         for tag in self.desired.tags:
             if wants_loading(tag) and tag not in self.pinned_by_agent:
                 await self._hold(tag, pinned=True)
+        # What is loaded now, not at the start of the pass: the loads above changed it, and the
+        # set may have changed while they waited — a tag pinned meanwhile and already gone from
+        # the set must be released below, not dropped as stale.
+        state = await self.engine.describe(self.client)
+        if not state.get("answers") and not fetches_alone:
+            return  # an engine gone quiet says nothing about what it holds: left for the next pass
+        loaded = set(state.get("models_loaded", []))
         # A pin does not outlive the engine: a remembered tag that is no longer loaded was
         # unpinned by an engine restart, and is not this agent's to release any more.
         stale = {tag for tag in self.pinned_by_agent if tag not in loaded and tag not in self.desired.tags}
@@ -249,6 +263,15 @@ class ModelWork:
                     await self._hold(tag, pinned=False)
                 self.pinned_by_agent.discard(tag)
                 self._remember()
+        # An engine whose server this agent starts (D148) is held to the set by what it runs,
+        # not by the pins above: a server still starting, or left running silent, is pinned by
+        # no one, and would otherwise keep running once its model left the set.
+        keep_only = getattr(self.engine, "keep_only", None)
+        if keep_only is not None:
+            try:
+                await keep_only(self.client, self.desired.tags if self.desired.residency == "pinned" else ())
+            except (EngineRefused, httpx.HTTPError, OSError):
+                pass  # still running, and listed as surplus and loaded; tried again next pass
 
     def _may_retry(self, tag: str) -> bool:
         failed = self.errors.get(tag)
@@ -284,7 +307,9 @@ class ModelWork:
     async def _hold(self, tag: str, *, pinned: bool) -> None:
         try:
             await self.engine.hold(self.client, tag, pinned=pinned)
-        except (EngineRefused, httpx.HTTPError) as exc:
+        except (EngineRefused, httpx.HTTPError, OSError) as exc:
+            # An error from the system — a directory it may not write, a process it may not
+            # signal — is a refusal like any other: reported, and not tried again at once.
             self._fail(tag, str(exc) or type(exc).__name__)
             return
         self.errors.pop(tag, None)

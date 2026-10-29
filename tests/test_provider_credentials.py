@@ -49,6 +49,7 @@ def pool_file() -> str:
             transport: {{ type: http, base_url: "http://127.0.0.1:1" }}
 
         rented:
+          engine: ollama
           provider: fake   # the old shape: the console's first save rewrites it
           offer_policy: {{ min_disk_gb: 10, max_all_in_hourly: 0.60 }}
         """
@@ -542,6 +543,7 @@ def test_the_old_shape_with_its_settings_first_and_a_one_line_providers_are_edit
         pool: { name: p, model_set: [a] }
         auth: { app_keys: [k] }
         rented:
+          engine: ollama
           provider_settings:
             endpoint: "http://a"
           provider: fake

@@ -40,14 +40,16 @@ from gpm_agent.settings import Settings, SettingsError, fingerprint, load
 AGENT_KEY = "gpmg_" + "a" * 64
 V1, V2, V3 = "0.40.10", "0.40.11", "0.41.0"
 
-#: The fake program. Packed into each release's archive behind a small shell wrapper, which passes
-#: the version it was packed as and the program's own path — so the process's command line names
-#: the program, as the real one's does. Told how to behave by a file beside the test, per version.
+#: The fake program. Packed into each release's archive behind a small shell wrapper, which names
+#: the version it was packed as in its environment and runs the fake as `python fake.py <program>
+#: <arguments>`, the way the system runs a script — so the process's command line ends in exactly
+#: the argument list the agent started it with, as the real one's is. Told how to behave by a file
+#: beside the test, per version.
 FAKE_OLLAMA = '''
 import http.server, json, os, sys, time
 
-version, control_path, starts_path, program = sys.argv[1:5]
-args = sys.argv[5:]
+version, control_path, starts_path = (os.environ[name] for name in ("FAKE_VERSION", "FAKE_CONTROL", "FAKE_STARTS"))
+program, args = sys.argv[1], sys.argv[2:]
 try:
     control = json.load(open(control_path)).get(version, {})
 except OSError:
@@ -254,8 +256,9 @@ class Rig:
 
     def program(self, version: str) -> bytes:
         return (
-            f'#!/bin/sh\nexec "{sys.executable}" "{self.root / "fake_ollama.py"}" "{version}" '
-            f'"{self.control}" "{self.starts_file}" "$0" "$@"\n'
+            f'#!/bin/sh\nFAKE_VERSION="{version}" FAKE_CONTROL="{self.control}" FAKE_STARTS="{self.starts_file}"\n'
+            "export FAKE_VERSION FAKE_CONTROL FAKE_STARTS\n"
+            f'exec "{sys.executable}" "{self.root / "fake_ollama.py"}" "$0" "$@"\n'
         ).encode()
 
     def release(self, version: str, *, latest: bool = True, extra: Optional[list] = None) -> None:
@@ -395,6 +398,91 @@ async def test_on_windows_a_process_is_read_and_stopped_by_fixed_commands():
          '(Get-CimInstance Win32_Process -Filter "ProcessId=1234").CommandLine'],
         ["taskkill", "/PID", "1234", "/T", "/F"],
     ]
+
+
+SERVER_ARGV = ["/e/whisper-server", "-m", "/m/o__r__f.bin", "--port", "8178", "-l", "auto"]
+
+
+@pytest.mark.parametrize("listed, ours", [
+    (SERVER_ARGV, True),
+    (["/bin/sh", *SERVER_ARGV], True),                                  # a script, run by its `#!`
+    (["/usr/bin/python3", "-I", *SERVER_ARGV], True),                   # … with its one argument
+    (["/usr/bin/env", "python3", "-I", *SERVER_ARGV], False),           # more than a `#!` adds
+    ([*SERVER_ARGV, "--more"], False),
+    (["/usr/bin/python3", "-c", "pass", *SERVER_ARGV[1:]], False),      # its words, not its program
+])
+def test_a_process_is_its_own_by_exactly_its_argument_list_where_they_are_listed(monkeypatch, listed, ours):
+    monkeypatch.setattr(host_platform, "arguments", lambda pid, os_name=None: listed)
+    assert host_platform.started_with(4242, SERVER_ARGV, os_name="linux") is ours
+
+
+@pytest.mark.parametrize("line, ours", [
+    (" ".join(SERVER_ARGV), True),
+    ("/usr/bin/python3 /t/fake.py " + " ".join(SERVER_ARGV), True),
+    ("/usr/bin/env python3 -I " + " ".join(SERVER_ARGV), False),
+    ("sleep 60 " + " ".join(SERVER_ARGV[1:]), False),
+    (" ".join(SERVER_ARGV) + " --more", False),
+])
+def test_where_only_a_joined_command_line_is_read_it_is_compared_whole(monkeypatch, line, ours):
+    monkeypatch.setattr(host_platform, "arguments", lambda pid, os_name=None: None)
+    said = host_platform.started_with(
+        4242, SERVER_ARGV, os_name="macos", run=lambda argv, env=None: host_platform.Ran(0, line + "\n"),
+    )
+    assert said is ours
+
+
+def test_on_windows_a_command_line_is_compared_as_windows_quotes_it():
+    argv = [r"C:\Users\me\AppData\Local\gpm\engines\whisper-cpp\1.9.5\Release\whisper-server.exe",
+            "-m", r"C:\Users\me\gpm whisper models\o__r__f.bin", "--port", "8178"]
+    quoted = (r'C:\Users\me\AppData\Local\gpm\engines\whisper-cpp\1.9.5\Release\whisper-server.exe '
+              r'-m "C:\Users\me\gpm whisper models\o__r__f.bin" --port 8178')
+
+    def says(line):
+        return lambda argv, env=None: host_platform.Ran(0, line + "\r\n")
+
+    assert host_platform.started_with(7, argv, os_name="windows", run=says(quoted))
+    assert not host_platform.started_with(7, argv, os_name="windows", run=says(quoted + " --more"))
+    assert not host_platform.started_with(7, argv, os_name="windows", run=says(quoted.replace('"', "")))
+    assert not host_platform.started_with(7, argv, os_name="windows", run=lambda argv, env=None: host_platform.Ran(1, ""))
+
+
+def test_why_the_server_stopped_is_an_error_line_never_a_request(tmp_path):
+    """The reason travels to the pool: Ollama's lines about requests, and what it prints when
+    asked to debug — which can carry a client's prompt — are never it."""
+    from gpm_agent.ollama_server import _last_error_line
+
+    log = tmp_path / "ollama.log"
+    log.write_text(
+        "--- gpm-agent: starting ollama 0.40.11\n"
+        'time=2026-10-29T12:00:00 level=INFO source=routes.go:1 msg="Listening on 127.0.0.1:11434"\n'
+        "Error: could not load the runner\n"
+        '[GIN] 2026/10/29 - 12:00:01 | 500 | 1.2s | 127.0.0.1 | POST "/api/chat"\n'
+        'time=2026-10-29T12:00:01 level=DEBUG msg="chat request" prompt="the error in my report"\n'
+        "    error: an indented line, describing something else\n"
+    )
+    assert _last_error_line(str(log), 0) == "Error: could not load the runner"
+    log.write_text('[GIN] 2026/10/29 - 12:00:01 | 200 | 1.2s | 127.0.0.1 | POST "/api/chat"\n')
+    assert _last_error_line(str(log), 0) is None
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes where the test forbids")
+async def test_a_state_directory_it_may_not_write_is_a_reason_not_an_exception(tmp_path):
+    """An error from the system is said as the start's reason, for the installer to record —
+    not an exception that ends its work unsaid."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    program = tmp_path / "ollama"
+    program.write_text("#!/bin/sh\nexit 1\n")
+    program.chmod(0o755)
+    async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{free_port()}", timeout=3) as client:
+        server = OllamaServer(locked / "ollama", engine_url=str(client.base_url), models_path="~/.ollama/models",
+                              client=client)
+        locked.chmod(0o500)
+        try:
+            said = await server.start(program, V1, 5)
+        finally:
+            locked.chmod(0o755)
+    assert said is not None and "ermission denied" in said and server._process is None
 
 
 def test_on_windows_liveness_is_asked_of_windows_and_never_with_a_signal(tmp_path, monkeypatch):

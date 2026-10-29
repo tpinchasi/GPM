@@ -243,8 +243,16 @@ with PoolClient() as pool:
 - **One upload is at most 24 MB** unless the operator set otherwise — about 12 minutes of 16 kHz
   WAV, or 20 or more of MP3 or M4A. Split longer recordings and send the parts. Over the limit
   is `413 request_too_large`, refused before the file is read.
-- **A very long recording can run past the pool's read time** for its kind. That is `504
-  generation_timeout`, and it is not retried: re-sending it would take as long again.
+- **A very long recording can run past the pool's read time** — `pool.upstream_read_timeout_s`,
+  300 s unless the operator set otherwise. That is `504 generation_timeout`, and it is not
+  retried: re-sending it would take as long again.
+- **`transcribe()` waits 900 s for the text** once the recording is sent, or the client's own
+  read timeout where that is longer. Its clock also runs while the request queues in the pool,
+  so it is kept well above the pool's read time: a recording too long for the pool gets the
+  pool's `504`, rather than the SDK giving up first. For a pool whose operator raised its read
+  time, raise this with it: `transcribe(..., read_timeout_s=1800)`. If it does run out, that is
+  `PoolRequestError` with reason `read_timeout`, and the recording is not sent again — the pool
+  may still be working on it.
 
 ### Ranking documents against a query
 
@@ -252,26 +260,38 @@ For retrieval: put the documents that best answer a query first.
 
 ```python
 with PoolClient() as pool:
-    for r in pool.rerank("bge-reranker-v2-m3", "How do I reset my password?", documents, top_n=3):
+    ranked = pool.rerank("bge-reranker-v2-m3", "How do I reset my password?", documents, top_n=3)
+    for r in ranked:
         print(f"{r.score:.3f}", documents[r.index][:80])
+    print(ranked.served_model, ranked.host, ranked.wait_s)
 ```
+
+`rerank()` returns a `Ranking`: a list of `Ranked`, best first, that also carries the facts of
+the call as a `Reply` does.
 
 ### With the OpenAI client instead
 
 The pool speaks OpenAI's `/v1` paths, so the official client works against it. Give it the
-pool's transport and it waits for capacity like `PoolClient` does:
+pool's transport and it waits for capacity like `PoolClient` does, and turn the OpenAI client's
+own retries off, since the transport already waits and retries where that is safe:
 
 ```python
 import httpx
 from openai import OpenAI
 from gpm_client import pool_transport
 
-client = OpenAI(base_url=f"{POOL_URL}/v1", api_key=APP_KEY,
-                http_client=httpx.Client(transport=pool_transport()))
+client = OpenAI(base_url=f"{POOL_URL}/v1", api_key=APP_KEY, max_retries=0,
+                http_client=httpx.Client(transport=pool_transport(),
+                                         timeout=httpx.Timeout(900, connect=5)))
 
 with open("voice-note.m4a", "rb") as audio:
     print(client.audio.transcriptions.create(model="whisper-large-v3-turbo", file=audio, language="he").text)
 ```
+
+Left on, the 1.x and 2.x releases of the OpenAI client send a refused request twice more. With
+those releases a refusal reaches you as the client's `APIConnectionError`, whose `__cause__` is
+the `PoolRequestError` with the pool's reason; later releases raise the `PoolRequestError`
+itself. The 900 s read timeout is there for transcriptions, as `transcribe()` uses (above).
 
 ### When the pool cannot do what you asked
 
@@ -281,8 +301,11 @@ with open("voice-note.m4a", "rb") as audio:
 | `400 input_not_accepted` | None of the model's builds accepts what you sent (a picture, sound) |
 | `400 media_not_inline` | A picture or sound was given as a link, or as a part type the pool does not accept |
 | `400 bad_upload` | The upload could not be read as one clean form, or named the model twice |
+| `400 content_encoding` | The body was sent compressed (a `Content-Encoding` other than identity). Send it uncompressed |
+| `404 unknown_path` | The path is not one any engine this pool runs answers — a typing error, or an engine's own path the pool does not forward |
 | `413 request_too_large` | Over the pool's size limit |
 | `504 generation_timeout` | The work outlasted the pool's read time; not retried |
+| `504 read_timeout` | The SDK's own: no answer within its read timeout after the request was sent. Not sent again — the pool may still be working on it |
 
 Each is a `PoolRequestError` with `.reason` and `.detail`, raised at once. A `503` that only
 means "busy" — including `uploads_full`, when the pool is holding as many uploads as it allows —
@@ -309,7 +332,8 @@ you are handed a key starting `gpmx_`, that is the wrong one — ask for a `gpma
 |---|---|
 | `503` with a `Retry-After` | Waits exactly that long, then retries |
 | `503` without one | Exponential back-off, 2 s → 60 s, with jitter |
-| Transport error **before** any byte arrived | Retries on the same back-off |
+| Transport error **before** any byte arrived — a refused or dropped connection | Retries on the same back-off |
+| **Read timeout**: the request was sent and no answer came within the read timeout | **Stops.** Raises `PoolRequestError` (504, `read_timeout`); never sent again |
 | Failure **mid-stream**, after output was delivered | **Stops.** Raises `PoolStreamInterrupted` |
 | `503 no_lease` | **Stops.** Raises `PoolUnavailable` |
 | `401` | Raises `PoolAuthError` |
@@ -317,10 +341,14 @@ you are handed a key starting `gpmx_`, that is the wrong one — ask for a `gpma
 | `504 generation_timeout` or `deadline_exceeded` | Raises `PoolRequestError`; never retried |
 | Total wait exceeds `max_wait_s` | Raises `PoolUnavailable` |
 
-Three of those deserve their reasoning:
+Four of those deserve their reasoning:
 
 **Mid-stream failure is never retried.** Your code has already consumed half an answer. Only
 you know whether re-running the call is correct, so the SDK refuses to guess.
+
+**A read timeout is never retried.** The request reached the pool, which may still be running
+it: sending it again would run it twice, and work that took too long once takes as long again.
+Allow longer, or send shorter work.
 
 **`no_lease` fails immediately**, unlike every other `503`. A lease is the operator's spending
 authority; without one, the pool is not permitted to rent capacity, so waiting cannot possibly
@@ -360,7 +388,7 @@ wait is silent, which is the wrong default for anything running unattended.
 from gpm_client import (
     PoolError,               # base class: catch this to catch everything
     PoolAuthError,           # 401 — wrong or missing app key
-    PoolRequestError,        # other 4xx; carries .status_code, .reason, .detail
+    PoolRequestError,        # other 4xx, a 504, or a read timeout; carries .status_code, .reason, .detail
     PoolUnavailable,         # no capacity within the time you allowed; carries .reason
     PoolStreamInterrupted,   # died after partial output
 )
@@ -426,6 +454,12 @@ own queue timeout is always configured below the SDK's read timeout, so a queued
 real answer — a worker or a `503` — before your client would give up on it. Override with
 `PoolClient(timeout=httpx.Timeout(...))` if you must, but lowering the read timeout below the
 pool's queue timeout re-introduces exactly the abandoned-work problem the contract prevents.
+
+`transcribe()` reads for longer, **900 s** (or the client's own read timeout where that is
+longer; `read_timeout_s=` per call): a recording queues, then runs for up to the pool's read
+time, `pool.upstream_read_timeout_s` (300 s by default), and the SDK must still be listening when
+the pool answers `504 generation_timeout`. Keep it well above the pool's read time plus its
+queue timeout.
 
 ## What this package deliberately does not have
 

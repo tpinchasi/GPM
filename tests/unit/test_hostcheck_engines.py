@@ -5,6 +5,7 @@ agent starts once the host is saved — is not failed for not answering before t
 import asyncio
 
 import httpx
+import pytest
 from gpm_server import hostcheck
 from gpm_server.config import CatalogEntry, PoolSettings
 from gpm_server.engines import get_engine
@@ -42,3 +43,18 @@ def test_a_whisper_cpp_server_not_started_yet_is_expected_before_the_host_is_sav
     assert result["ok"], result
     steps = {step["name"]: step for step in result["steps"]}
     assert "agent starts it" in steps["reach"]["detail"]
+
+
+@pytest.mark.parametrize("definition, said", [
+    ({"transport": {"type": "https", "base_url": "https://192.168.1.20:8178"}, "workers": 1}, "no authentication"),
+    ({"base_url": "http://127.0.0.1:8178", "workers": 4}, "workers: 1"),
+])
+def test_a_whisper_cpp_host_that_saving_would_refuse_fails_its_test(monkeypatch, definition, said):
+    not_yet = httpx.MockTransport(lambda request: httpx.Response(503))
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: real_client(*a, **{**k, "transport": not_yet}))
+    result = asyncio.run(hostcheck.test_connection(
+        definition, engine=get_engine("whisper-cpp"), settings=PoolSettings(name="t", model_set=["speech"]),
+        model_set=["speech"], catalog={},
+    ))
+    assert not result["ok"] and said in result["steps"][-1]["detail"]

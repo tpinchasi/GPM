@@ -514,3 +514,9 @@ def test_the_status_says_what_each_build_does_and_each_engine_can(pool):
     assert fp4["serves"] is None and fp4["inputs"] is None
     assert engine["offers"]["ollama"]["kinds"] == ["chat", "embed"]
     assert set(engine["offers"]["vllm"]["kinds"]) == {"chat", "embed", "transcribe", "rerank"}
+
+
+def test_a_describe_that_is_not_a_list_of_objects_is_a_400_not_a_crash(pool):
+    supervisor, url, path = pool
+    answer = put(url, {"profiles": {"chat": {BIG: BIG_FP4}}, "rent": ["chat"], "describe": ["x"]})
+    assert answer.status_code == 400 and "describe" in answer.text

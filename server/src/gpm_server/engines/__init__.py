@@ -17,6 +17,7 @@ from .base import (
     available_engines,
     facts_of,
     get_engine,
+    kind_of_path,
     kinds_of,
     rewrite_of,
 )
@@ -46,6 +47,7 @@ __all__ = [
     "available_engines",
     "facts_of",
     "get_engine",
+    "kind_of_path",
     "kinds_of",
     "rewrite_of",
 ]

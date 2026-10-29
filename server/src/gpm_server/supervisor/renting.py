@@ -96,6 +96,8 @@ class RentedHost:
     #: (D111). Empty for a host bought without profiles: its builds are the catalog's first.
     profile: Optional[str] = None
     builds: dict[str, str] = dataclasses.field(default_factory=dict)
+    #: The image it was started from, where this pool started it (not known for one adopted).
+    image: Optional[str] = None
     #: How many cards each copy of its models spans (D114), fixed when it was bought: the
     #: machine was searched for that many, and every relaunch must ask for the same.
     cards_per_copy: int = 1
@@ -503,6 +505,9 @@ class Fleet:
         #: The last attempt rented nothing because the workload's budget carried none of its
         #: offers, and nothing else was tried (D126).
         self.last_budget_bound = False
+        #: Images a host's agent found not to carry what they were listed as carrying, by image
+        #: (D146): not rented again for those needs while this supervisor runs.
+        self.images_lacking: dict[str, set[str]] = {}
         #: The machine history, rebuilt from the logs every few seconds (D69).
         self._history: Optional[dict] = None
         self._history_at = 0.0
@@ -1465,10 +1470,18 @@ class Fleet:
         needs an image with its audio extra, known before the bid as the driver floor is.
         """
         needs = self.config.image_needs(tags)
-        images = [i for i in self.rented.images if needs <= set(i.capabilities)]
+        listed = [i for i in self.rented.images if needs <= set(i.capabilities)]
+        # An image a host's agent found not to carry what it claimed is not rented again for
+        # that need: every round would pay for a machine to learn the same thing (D146).
+        images = [i for i in listed if not needs & self.images_lacking.get(i.image, set())]
         if not self.rented.images and not needs:
             return self.config.rented_image(), "the pool's only image"
         if not images:
+            if listed:
+                return None, (
+                    f"image: {', '.join(i.image for i in listed)} — listed as carrying {sorted(needs)} — "
+                    "was found by a host's agent not to; correct `rented.images` and the pool rents again"
+                )
             return None, (
                 f"image: no image of the engine is listed as carrying {sorted(needs)}, which this "
                 f"host's builds need"
@@ -1902,6 +1915,8 @@ class Fleet:
         missing = needs - set(carries)
         if not missing:
             return None
+        if host.image:
+            self.images_lacking.setdefault(host.image, set()).update(missing)
         detail = engine.get("carries_detail")
         return (
             f"its image was listed as carrying {sorted(missing)} and does not"
@@ -4010,6 +4025,7 @@ class Fleet:
                 disk_gb=policy.min_disk_gb,
                 engine=self.config.rented_engine(),
                 engine_port=self.engine_port,
+                image=image,
             )
             if instance.volume_id is not None and spec is not None and instance_spec.volume is not None:
                 self._record_volume(host, instance, instance_spec.volume, offer, lease, for_this_host, builds)

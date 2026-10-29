@@ -451,6 +451,13 @@ class PoolSettings(BaseModel):
                 f"queue_timeout_s ({self.queue_timeout_s}) must be below "
                 f"client_time_to_first_byte_s ({self.client_time_to_first_byte_s})"
             )
+        if self.max_held_request_mb < self.max_request_mb:
+            # Below one request's limit, a body between the two would wait for room that can
+            # never come: `503 uploads_full` on an idle pool, until the caller gives up (D144).
+            raise ValueError(
+                f"pool.max_held_request_mb ({self.max_held_request_mb:g}) must be at least "
+                f"pool.max_request_mb ({self.max_request_mb:g})"
+            )
         return self
 
 
@@ -1220,6 +1227,7 @@ class PoolConfig(BaseModel):
                 f"{both} are in the pool's model set and marked workloads_only: a model is either the "
                 "shared hosts' or workloads' only — remove it from one"
             )
+        self._rented_engine_is_said_where_the_default_moved()
         self._rented_engine_is_one_a_rented_host_can_run()
         self._engine_can_hold_what_the_pool_asks()
         self._rented_hosts_have_a_build_of_what_they_rent_for()
@@ -1470,7 +1478,7 @@ class PoolConfig(BaseModel):
         if self.rented.rent_profiles:
             return
         missing = []
-        for name in self._rented_models():
+        for name in self._models_rented_hosts_may_hold():
             entry = self.catalog.get(name)
             if entry is None:
                 continue  # served under its own name, by any engine
@@ -1486,11 +1494,14 @@ class PoolConfig(BaseModel):
                 "renting Ollama hosts, set `rented.engine: ollama`."
                 if self.rented.engine is None else ""
             )
+            hint = self._kind_hint(missing, engine)
+            if hint:
+                # What they do is the reason: adding a build for this engine could not help.
+                raise ValueError(f"rented hosts run {engine!r}, and cannot serve {missing}.{hint}{default}")
             raise ValueError(
                 f"rented hosts run {engine!r}, and the catalog has no build of {missing} for it "
                 f"(with capabilities {sorted(caps)}). Add a variant with `engine: {engine}` — for "
-                f"vLLM, the model's repository on the hub — or stop renting for those models."
-                f"{self._kind_hint(missing, engine)}{default}"
+                f"vLLM, the model's repository on the hub — or stop renting for those models.{default}"
             )
 
     def _rented_models(self) -> list[str]:
@@ -1732,12 +1743,15 @@ class PoolConfig(BaseModel):
                 if name in servable_here:
                     servable.append(name)
                 elif whole_set:
+                    hint = self._kind_hint([name], self.engine_of(host))
+                    if hint:
+                        raise ValueError(f"host {host.id!r} cannot serve {name!r}: it runs "
+                                         f"{self.engine_of(host)!r}.{hint}")
                     raise ValueError(
                         f"host {host.id!r} has no usable variant of {name!r}: it runs "
                         f"{self.engine_of(host)!r} with capabilities {sorted(caps)}, and no "
                         f"variant matches both. Give it the capability, add a variant for that "
                         f"engine, add a fallback with no requirements, or remove the host."
-                        f"{self._kind_hint([name], self.engine_of(host))}"
                     )
             if not servable:
                 raise ValueError(
@@ -1779,6 +1793,33 @@ class PoolConfig(BaseModel):
                         "whisper-cpp, ranking on vLLM."
                     )
 
+    def _models_rented_hosts_may_hold(self) -> list[str]:
+        """Every model a rented host may be asked to hold: what the pool rents for, and what a
+        workload may rent for — the models only workloads hold (D115) included."""
+        workloads_only = [name for name, entry in self.catalog.items() if entry.workloads_only]
+        return list(dict.fromkeys([*self._rented_models(), *workloads_only]))
+
+    def _rented_engine_is_said_where_the_default_moved(self) -> None:
+        """Rented hosts run vLLM unless `rented.engine` says otherwise (D147); before, they ran
+        the pool's own engine — Ollama unless named. A pool written then, renting Ollama hosts
+        without saying so, would now rent vLLM machines that fetch its Ollama tags from the hub,
+        fail, and be replaced until the lease's cap. So where the default moved and nothing
+        names a vLLM build, the configuration is refused, saying how to keep what it meant."""
+        if self.rented is None or self.rented.engine is not None or self.engine == "vllm":
+            return
+        def marked_for_vllm(name: str) -> bool:
+            entry = self.catalog.get(name)
+            return entry is not None and any(v.engine == "vllm" for v in entry.variants)
+
+        unmarked = [name for name in self._models_rented_hosts_may_hold() if not marked_for_vllm(name)]
+        if unmarked:
+            raise ValueError(
+                f"rented hosts run vLLM unless `rented.engine` says otherwise (D147), and {unmarked} "
+                f"{'has' if len(unmarked) == 1 else 'have'} no build marked `engine: vllm`. To keep renting "
+                f"Ollama hosts, add `rented.engine: ollama`; to rent vLLM, give each a build with "
+                f"`engine: vllm` (the model's hub repository) and say `rented.engine: vllm`"
+            )
+
     def _rented_engine_is_one_a_rented_host_can_run(self) -> None:
         """An engine whose server the host's agent starts on a machine its owner set up —
         whisper.cpp (D148) — has no image a rented host could start from."""
@@ -1804,7 +1845,7 @@ class PoolConfig(BaseModel):
             return
         engine = self.rented_engine()
         carried = [frozenset(i.capabilities) for i in self.rented.images]  # `image:` alone carries nothing said
-        for name in dict.fromkeys(self._rented_models()):
+        for name in self._models_rented_hosts_may_hold():
             entry = self.catalog.get(name)
             tags = [v.tag for v in (entry.variants if entry else []) if v.engine is None or v.engine == engine]
             needs = self.image_needs(tags)
@@ -1856,6 +1897,30 @@ class PoolConfig(BaseModel):
                 raise ValueError(
                     f"host {host.id!r} runs {engine.name}, which serves {limit} request at a time; set `workers: {limit}`"
                 )
+            # Its builds are its own: a file named for this engine, never a build written for
+            # any engine — an engine-less Whisper for vLLM is a repository, not a file.
+            for name in self.models_held_by(host):
+                entry = self.catalog.get(name)
+                variants = entry.variants if entry else [Variant(tag=name)]
+                own = [v for v in variants if v.engine == engine.name and set(v.requires) <= set(host.capabilities)]
+                if not own:
+                    raise ValueError(
+                        f"host {host.id!r} runs {engine.name} and holds {name!r}, which has no build marked "
+                        f"`engine: {engine.name}`: give it one, a file in a hub repository (`owner/repo/file.bin`) (D148)"
+                    )
+        for name, entry in self.catalog.items():
+            for variant in entry.variants:
+                if variant.engine is None:
+                    continue
+                try:
+                    pattern = getattr(get_engine(variant.engine), "build_tag", None)
+                except EngineNotFound:
+                    continue
+                if pattern is not None and not pattern.match(variant.tag):
+                    raise ValueError(
+                        f"{name!r}'s build {variant.tag!r} is not one {variant.engine} can fetch: expected "
+                        "`owner/repo/file.bin` — a hub repository and one `.bin` file at its root (D148)"
+                    )
 
 
 def rented_profile_models(rented: "RentedConfig") -> list[str]:

@@ -206,7 +206,10 @@ class VerdaProvider:
         #: older than `tidy_after_s`, so nothing of a create still in flight is touched.
         self.tidy_interval_s = 600.0
         self.tidy_after_s = 1800.0
-        self._tidied = 0.0
+        #: When the last tidy ran, on the monotonic clock — None until the first. Not 0.0: the
+        #: clock counts from the machine's boot, so a pool on a machine up for less than
+        #: `tidy_interval_s` would skip its first tidy (found on a freshly started CI runner).
+        self._tidied: Optional[float] = None
         #: Raised by every new credential: a token asked for under an older one is not kept.
         self._generation = 0
         #: The catalog changes when the provider changes its prices, not between passes.
@@ -662,7 +665,7 @@ class VerdaProvider:
         bills. Only this pool's, only what no live instance uses, only what is old enough that no
         create in flight can own it. Best effort, never failing the listing it rides on."""
         now = time.monotonic()
-        if now - self._tidied < self.tidy_interval_s:
+        if self._tidied is not None and now - self._tidied < self.tidy_interval_s:
             return
         self._tidied = now
         cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=self.tidy_after_s)

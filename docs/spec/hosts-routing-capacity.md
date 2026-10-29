@@ -495,8 +495,14 @@ catalog:
 
 **Refused or waited for.** When no build of the model that any configured host, rented profile or
 rented engine could hold would take the request, the answer is `400 kind_not_served` or `400
-input_not_accepted`, at once — computed when the configuration loads. When such a build exists but
-no ready host holds one, it is `503 no_eligible_host`, as for a schema requirement.
+input_not_accepted`, at once — computed when the configuration loads. A name is read as dispatch
+reads it: a catalogued model first, then a build tag. When such a build exists but no ready host
+holds one, it is `503 no_eligible_host`, as for a schema requirement — unless what the request
+carries is the only thing in the way: every configured host that could hold an accepting build is
+ready and either does not hold it or reports through its engine that it does not take the input,
+no host the pool could rent would, and no host has failed this request already. That is `400
+input_not_accepted`. A host that is not ready, or one the request failed on, may be the one that
+takes it, so either is a `503`.
 
 A host whose agent installs its engine (S9) takes `engine_version`: `latest` (the default) or a
 pinned version, which the agent installs and the supervisor switches to when the host is idle

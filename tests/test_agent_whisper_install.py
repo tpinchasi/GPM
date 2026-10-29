@@ -34,6 +34,7 @@ from gpm_agent.app import create_app
 from gpm_agent.engines import EngineRefused
 from gpm_agent.installs import WHISPER_CPP, Installer, InstallRefused, Target
 from gpm_agent.settings import Settings, SettingsError, fingerprint, load
+from gpm_agent.vllm_state import state_dir_for
 from gpm_agent.whisper_build import (
     BUILD_TIMEOUT_S,
     CMAKE_VERSION,
@@ -56,14 +57,16 @@ HUB_REPO = "someone/whisper-builds"
 TAG = f"{HUB_REPO}/ggml-small.bin"
 HUB_FILES = {"ggml-small.bin": b"s" * 3000}
 
-#: The fake server. Packed by the fake build behind a small shell wrapper, which passes the
-#: version it was built as and its own path, as the real one's command line names it. Told how to
-#: behave by a file beside the test, per version.
+#: The fake server. Packed by the fake build behind a small shell wrapper, which names the version
+#: it was built as in its environment and runs the fake as `python fake.py <program> <arguments>`,
+#: the way the system runs a script — so its command line ends in exactly the argument list the
+#: agent started it with, as the real one's is. Told how to behave by a file beside the test, per
+#: version.
 FAKE_SERVER = '''
 import http.server, json, os, sys
 
-version, control_path, starts_path, program = sys.argv[1:5]
-args = sys.argv[5:]
+version, control_path, starts_path = (os.environ[name] for name in ("FAKE_VERSION", "FAKE_CONTROL", "FAKE_STARTS"))
+program, args = sys.argv[1], sys.argv[2:]
 try:
     control = json.load(open(control_path)).get(version, {})
 except OSError:
@@ -283,8 +286,10 @@ class Commands:
                 program = build / "bin" / "whisper-server"
                 program.parent.mkdir(parents=True)
                 program.write_text(
-                    f'#!/bin/sh\nexec "{sys.executable}" "{self.root / "fake_whisper_server.py"}" "{version}" '
-                    f'"{self.root / "fake-control.json"}" "{self.root / "fake-starts.jsonl"}" "$0" "$@"\n'
+                    f'#!/bin/sh\nFAKE_VERSION="{version}" FAKE_CONTROL="{self.root / "fake-control.json"}" '
+                    f'FAKE_STARTS="{self.root / "fake-starts.jsonl"}"\n'
+                    "export FAKE_VERSION FAKE_CONTROL FAKE_STARTS\n"
+                    f'exec "{sys.executable}" "{self.root / "fake_whisper_server.py"}" "$0" "$@"\n'
                 )
                 (build / "bin" / "whisper-cli").write_text("not kept")
             return ran(0, "[100%] Built target whisper-server")
@@ -760,17 +765,24 @@ async def test_a_switch_restarts_the_server_with_the_new_program_and_the_same_mo
     [first] = rig.starts()
     assert first["program"] == str(rig.program(V1)) and first["version"] == V1
     assert first["args"][:2] == ["-m", str(rig.model_file())] and first["token"] is None
+    # The same command as the owner's program is started with: its uploads in the agent's own
+    # directory, readable by this user alone.
+    uploads = state_dir_for(rig.root / "models") / "tmp"
+    assert first["args"][-4:] == ["--tmp-dir", str(uploads), "-l", "auto"]
+    assert uploads.stat().st_mode & 0o777 == 0o700
 
     rig.publish(V2, C2)
     rig.now += installs.LATEST_EVERY_S + 1
     await rig.want("latest")
     assert rig.installer.state()["staged"] == V2 and len(rig.starts()) == 1, "staged while V1 serves"
+    (uploads / "whisper-server-left.wav").write_bytes(b"a recording ffmpeg could not read")
     await rig.want(V2, switch=True)
 
     state = rig.installer.state()
     assert (state["running"], state["previous"], state["staged"], state["error"]) == (V2, V1, None, None)
     first, second = rig.starts()
     assert second["program"] == str(rig.program(V2)) and second["args"] == first["args"]
+    assert list(uploads.iterdir()) == [], "emptied around the restart"
     assert not host_platform.alive(first["pid"]) or b"fake_whisper_server" not in (host_platform.command_line(first["pid"]) or b"")
     described = await rig.describe()
     assert described["models_loaded"] == [TAG] and described["version"] == V2 and described["models_failed"] == {}

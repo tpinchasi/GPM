@@ -1309,6 +1309,9 @@ class Supervisor:
         if not health.ok:
             host.resident = frozenset()
             host.available = frozenset()
+            # An engine that went away may come back another version, taking other inputs: its
+            # builds are asked again on the first probe that finds it (D143).
+            host.observed_for = frozenset()
             starting = self._agent_is_starting_it(host) if from_agent else None
             if starting:
                 # Its agent fetches the model and starts the server with it (D148): a server not
@@ -1331,6 +1334,7 @@ class Supervisor:
                 host.last_error = str(exc)
                 host.resident = frozenset()
                 host.available = frozenset()
+                host.observed_for = frozenset()
             else:
                 host.resident = resident
                 host.available = available

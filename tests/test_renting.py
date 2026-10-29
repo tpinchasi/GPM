@@ -21,7 +21,7 @@ MODEL = "m1"
 
 def make_config(**rented_overrides):
     rented = {
-        "provider": "fake",
+        "provider": "fake", "engine": "ollama",
         "workers": 2,
         "bidding": {"premium": 0.02},
         "offer_policy": {"min_gpu_memory_gb": 24, "min_disk_gb": 10, "max_all_in_hourly": 0.60},

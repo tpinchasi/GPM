@@ -22,6 +22,7 @@ import anyio
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.requests import ClientDisconnect
 
 from ..config import ConfigError, PoolConfig, load_config
 from ..contract import CONTRACT_VERSION
@@ -33,6 +34,7 @@ from ..engines import (
     MediaNotInline,
     RequestFacts,
     facts_of,
+    kind_of_path,
     openai_api,
     rewrite_of,
 )
@@ -656,7 +658,9 @@ def create_app(
     async def inference(request: Request, full_path: str) -> Response:
         """Bound the body before anything reads it (D144): the caller's key first, so an
         unknown caller never makes the router hold an upload; then its size, declared and
-        actual; then the router's budget for bytes held at once."""
+        actual; then the router's budget for bytes held at once — counted from the moment the
+        bytes start arriving, not once they all have, or a hundred uploads being read at once
+        would each find the budget empty."""
         if _identity(state, request) is None:
             return _error(401, "unauthorized", detail="missing or invalid app key")
         encoding = (request.headers.get("content-encoding") or "identity").strip().lower()
@@ -664,42 +668,52 @@ def create_app(
             return _error(400, "bad_request", "content_encoding", "send the body uncompressed, with no Content-Encoding")
         limit = int(state.config.pool.max_request_mb * 1_000_000)
         too_large = f"the body is over this pool's {state.config.pool.max_request_mb:g} MB limit"
+        full = "the pool is holding as many request bytes as it allows"
         declared = (request.headers.get("content-length") or "").strip()
         if declared.isdigit() and int(declared) > limit:
             return _error(413, "request_too_large", "request_too_large", too_large)
-        received = bytearray()
-        async for chunk in request.stream():
-            received += chunk
-            if len(received) > limit:
-                return _error(413, "request_too_large", "request_too_large", too_large)
-        body = bytes(received)
-        if not state.take_request_bytes(len(body)):
-            return _no_capacity("uploads_full", "the pool is holding as many request bytes as it allows")
+        # Held: what this request has taken from the budget so far. Every way out before the
+        # body is handed on gives it back; from then on the answer does, exactly once.
+        held = 0
+        handed_on = False
+        try:
+            if declared.isdigit():
+                # The length it says it will send, taken before a byte is read: an upload that
+                # will not fit is turned away now, not after it has been held.
+                if not state.take_request_bytes(int(declared)):
+                    return _no_capacity("uploads_full", full)
+                held = int(declared)
+            received = bytearray()
+            async for chunk in request.stream():
+                received += chunk
+                if len(received) > limit:
+                    return _error(413, "request_too_large", "request_too_large", too_large)
+                if len(received) > held:
+                    # Sent in chunks with no length said: taken as it arrives.
+                    if not state.take_request_bytes(len(received) - held):
+                        return _no_capacity("uploads_full", full)
+                    held = len(received)
+            body = bytes(received)
+            del received
+            # Held to what actually arrived.
+            state.give_back_request_bytes(held - len(body))
+            held = len(body)
+            handed_on = True
+        except ClientDisconnect:
+            return Response(status_code=499)  # gone while sending; nobody reads the answer
+        finally:
+            if not handed_on:
+                state.give_back_request_bytes(held)
         try:
             response = await _inference(request, full_path, body)
         except BaseException:
-            state.give_back_request_bytes(len(body))
+            state.give_back_request_bytes(held)
             raise
         if isinstance(response, StreamingResponse):
-            response.body_iterator = _giving_back(response.body_iterator, len(body))
+            response.body_iterator = _giving_back(response.body_iterator, held)
         else:
-            state.give_back_request_bytes(len(body))
+            state.give_back_request_bytes(held)
         return response
-
-    def _inputs_are_why(need: Need) -> bool:
-        """Whether what the request carries is the only reason no host takes it, and waiting
-        cannot change that (D143): ready hosts would serve it without its picture, they report
-        their builds do not take one, and no host the pool could rent would either."""
-        if not state.dispatcher.eligible(dataclasses.replace(need, inputs=frozenset())):
-            return False
-        if state.config.rented is not None:
-            rented = state.config.rented_engine()
-            for build in state.config.builds_reachable(need.model):
-                accepts = build.accepts()
-                if (build.engine is None or build.engine == rented) and need.kind in build.kinds() and (
-                        accepts is None or need.inputs <= accepts):
-                    return False
-        return True
 
     async def _giving_back(chunks: AsyncIterator[bytes], size: int) -> AsyncIterator[bytes]:
         """A streamed answer holds its request's bytes until the stream ends — a resend may
@@ -761,11 +775,17 @@ def create_app(
                 f"{path} is not an inference path of any engine this pool runs ({served})",
             )
 
-        # Read once (D144): the model, the kind, what it carries, how it wants its answer.
+        # Read once (D144): the model, the kind, what it carries, how it wants its answer. The
+        # kind comes from the path first, so a body refused below is still logged as what it
+        # asked for — a broken upload as a transcription, not as chat.
         content_type = request.headers.get("content-type", "")
-        facts = RequestFacts(model=None)
+        facts = RequestFacts(model=None, kind=kind_of_path(engine, path))
         refused: Optional[tuple[str, str]] = None
         try:
+            if len(request.headers.getlist("content-type")) > 1:
+                # Which one frames the body would be a guess, and the engine might guess the
+                # other way (D144).
+                raise BadUpload("the request carries more than one Content-Type header")
             if len(body) > _READ_OFF_LOOP_BYTES:
                 facts = await asyncio.to_thread(facts_of, engine, path, content_type, body)
             else:
@@ -889,12 +909,12 @@ def create_app(
                 await record("rejected", status_code=503, reason=reason)
                 return _no_capacity(reason, "no host is ready to serve this request")
             except NoEligibleHost:
-                if need.inputs and _inputs_are_why(need):
+                if need.inputs and state.refused_for_inputs_alone(need, frozenset(excluded)):
                     await record("rejected", status_code=400, reason="input_not_accepted")
                     return _error(
                         400, "bad_request", "input_not_accepted",
-                        f"the hosts that hold {requested!r} report that its builds do not take {sorted(need.inputs)}, "
-                        "and none the pool could add would",
+                        f"no host that holds {requested!r} takes {sorted(need.inputs)}, by the catalog or by what "
+                        "its engine reports, and none the pool could add would",
                     )
                 await record("rejected", status_code=503, reason="no_eligible_host")
                 return _no_capacity(

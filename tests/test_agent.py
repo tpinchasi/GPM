@@ -129,6 +129,11 @@ def test_the_agent_never_runs_a_shell_or_a_command_it_was_given():
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
         and isinstance(node.func.value, ast.Name) and node.func.value.id == "subprocess"
     ]
+    # `list2cmdline` runs nothing: it quotes a recorded argument list as Windows reads a command
+    # line back, to recognise a server by it (`started_with`), and only there.
+    quoting = [call for call in subprocess_calls if call.func.attr == "list2cmdline"]
+    assert len(quoting) == 1 and quoting[0] in list(ast.walk(functions["started_with"]))
+    subprocess_calls = [call for call in subprocess_calls if call not in quoting]
     assert [call.func.attr for call in subprocess_calls] == ["run"]
     assert subprocess_calls[0] in list(ast.walk(functions["_run"]))
     assert isinstance(subprocess_calls[0].args[0], ast.Name) and subprocess_calls[0].args[0].id == "argv"
@@ -561,6 +566,49 @@ async def test_a_failed_pull_is_left_alone_for_a_while_not_hammered_every_pass()
     await machine.hold(["nope"])
     await machine.hold(["nope"])
     assert [path for path, _, _ in machine.engine.received].count("/api/pull") == 1
+
+
+async def test_a_model_that_leaves_the_set_while_it_loads_is_released_in_the_same_pass():
+    """The pass loading it is still waiting when the pool's next pass empties the set. The pin
+    that load sets is released — not dropped as stale by what the pass saw before the load, with
+    the engine left holding the model for good."""
+    machine = Machine(available={"a"})
+    machine.engine.load_delay_s = 0.5
+    assert (await machine.call("PUT", {"tags": ["a"], "residency": "pinned"})).status_code == 200
+    loading = machine.app.state.work._task
+    await asyncio.sleep(0.1)
+    assert (await machine.call("PUT", {"tags": [], "residency": "pinned"})).status_code == 200
+    await loading
+    assert machine.engine.pinned == set()
+    assert machine.app.state.work.pinned_by_agent == set()
+
+
+async def test_an_error_from_the_system_while_holding_is_reported_and_left_alone_for_a_while():
+    """An engine that starts a program writes files and signals processes: the system can say no
+    — a directory this user may not write, a process it may not signal. That is a refusal like
+    any other: in the snapshot against the model, and not tried again on every pass."""
+    from gpm_agent.models import ModelWork
+
+    class Engine:
+        name = "fake"
+        fetches_without_engine = True
+        loads_by_restart = False
+        holds = 0
+
+        async def describe(self, client):
+            return {"answers": False, "models_on_disk": [{"tag": "m", "size_bytes": 1}], "models_loaded": []}
+
+        async def hold(self, client, tag, *, pinned):
+            Engine.holds += 1
+            raise PermissionError(13, "Permission denied", "/Volumes/models.gpm-state")
+
+    work = ModelWork(Engine(), None, free_disk_bytes=lambda: None, min_free_disk_gb=0, allow_delete=False)
+    for _ in range(3):
+        await work.apply({"tags": ["m"], "residency": "pinned"})
+        await work._task
+    [held] = (await work.snapshot())["models"]
+    assert "Permission denied" in held["error"] and not held["loaded"]
+    assert Engine.holds == 1
 
 
 # --- deletion: the owner's choice, inside three bounds (D40) ---
