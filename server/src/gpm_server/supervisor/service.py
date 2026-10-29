@@ -952,42 +952,64 @@ class Supervisor:
         counters = self.counters.all()
         now = time.time()
         pool = self.config.pool
+        # A host gone from the pool, disabled or without its agent holds nothing back: whatever
+        # was in progress for it is dropped, and said so (D153).
+        eligible = {h.host_id for h in self.hosts.values() if h.config.agent is not None and not h.config.disabled}
+        for host_id in [h for h in {*self.upgrades.active, *self.upgrades.asked} if h not in eligible]:
+            gone = self.upgrades.forget(host_id)
+            if gone is not None:
+                self.events.record("engine_upgrade_abandoned", f"host {host_id}: {gone.reason('the engine')} "
+                                   "given up: the host left the pool, was taken out of service or lost its agent",
+                                   host_id=host_id)
         for host in self.hosts.values():
-            if host.config.agent is None or host.config.disabled:
+            if host.host_id not in eligible:
                 continue
-            counter = counters.get(host.host_id)
-            last = counter.last_request_at if counter is not None else None
-            step = self.upgrades.next_step(
-                host.host_id, host.install,
-                busy=counter.busy if counter is not None else 0,
-                idle_s=max(0.0, now - (last if last is not None else self._started_at)),
-                held=host.resident if host.config.residency == "pinned" else host.available,
-                engine_answers=host.engine_answers,
-                idle_needed_s=pool.engine_upgrade_idle_s,
-                drain_s=pool.engine_upgrade_drain_s,
-                check_s=pool.engine_upgrade_check_s,
-                another_upgrading=any(other != host.host_id for other in self.upgrades.active),
-                now=now,
+            try:
+                await self._upgrade_one(host, counters.get(host.host_id), now, pool)
+            except Exception:  # noqa: BLE001 - one host's answer must not stop the others'
+                log.exception("advancing %s's engine upgrade failed", host.host_id)
+
+    async def _upgrade_one(self, host: SupervisedHost, counter: Any, now: float, pool: Any) -> None:
+        for news in self.upgrades.news(host.host_id, host.install):
+            self.events.record(news.event, f"host {host.host_id}: {news.summary}", host_id=host.host_id,
+                               numbers={"version": news.version} if news.version else None)
+        last = counter.last_request_at if counter is not None else None
+        # Only what the pool asked the host to hold counts: a model its owner loaded by hand, or
+        # one the configuration dropped, is not the new version's to hold.
+        holds = host.resident if host.config.residency == "pinned" else host.available
+        step = self.upgrades.next_step(
+            host.host_id, host.install,
+            busy=counter.busy if counter is not None else 0,
+            idle_s=max(0.0, now - (last if last is not None else self._started_at)),
+            held=holds & host.required_tags,
+            engine_answers=host.engine_answers,
+            idle_needed_s=pool.engine_upgrade_idle_s,
+            drain_s=pool.engine_upgrade_drain_s,
+            check_s=pool.engine_upgrade_check_s,
+            another_upgrading=any(other != host.host_id for other in self.upgrades.active),
+            pinned=None if host.config.engine_version == "latest" else host.config.engine_version,
+            now=now,
+        )
+        if step.event:
+            self.events.record(step.event, f"host {host.host_id}: {step.summary}", host_id=host.host_id,
+                               numbers={"version": step.version} if step.version else None)
+        if step.action in ("switch", "rollback") and step.version:
+            status, answer = await agents.set_engine_version(
+                host.agent_endpoint, step.version, switch=True, transport=self._agent_transport
             )
-            if step.event:
-                self.events.record(step.event, f"host {host.host_id}: {step.summary}", host_id=host.host_id,
-                                   numbers={"version": step.version} if step.version else None)
-            if step.action in ("switch", "rollback") and step.version:
-                status, answer = await agents.set_engine_version(
-                    host.agent_endpoint, step.version, switch=True, transport=self._agent_transport
-                )
-                if answer is not None:
-                    host.install = answer
-                if status != 200 and step.action == "switch":
-                    self.upgrades.active.pop(host.host_id, None)
-                    detail = (answer or {}).get("detail") or (answer or {}).get("error") or f"the agent answered {status}"
-                    self.events.record("engine_upgrade_failed", f"host {host.host_id}: the switch to {step.version} "
-                                       f"was refused: {detail}", host_id=host.host_id)
-            upgrade = self.upgrades.active.get(host.host_id)
-            if upgrade is not None:
-                # Out of routing for the whole of it: draining, switching and checking.
-                host.state = HostState.PREPARING
-                host.last_error = upgrade.reason(str((host.install or {}).get("engine") or "the engine"))
+            if status == 200 and answer is not None:
+                host.install = answer  # a refusal's body is not where the versions stand
+            if status != 200 and step.action == "switch":
+                self.upgrades.active.pop(host.host_id, None)
+                detail = (answer or {}).get("detail") or (answer or {}).get("error") or f"the agent answered {status}"
+                self.events.record("engine_upgrade_failed", f"host {host.host_id}: the switch to {step.version} "
+                                   f"was refused: {detail}", host_id=host.host_id)
+            # A refused rollback is asked again on the next pass, the host still out of routing.
+        upgrade = self.upgrades.active.get(host.host_id)
+        if upgrade is not None:
+            # Out of routing for the whole of it: draining, switching, checking, rolling back.
+            host.state = HostState.PREPARING
+            host.last_error = upgrade.reason(str((host.install or {}).get("engine") or "the engine"))
 
     async def _probe_rented(self) -> None:
         """A rented host is verified exactly like any other: only `ready` hosts are routed to,

@@ -568,9 +568,11 @@ function engineVersions(host, agent) {
       (agent.versions_not_taken || []).length ? el("div", { class: "mono" }, agent.versions_not_taken.join(", ")) : null,
       v.error ? el("div", { class: "k" }, "last error") : null,
       v.error ? el("div", { class: "error" }, v.error) : null),
-    upgrade ? null : el("div", { class: "row" },
+    agent.upgrade_asked && !upgrade ? el("p", { class: "muted" }, `${agent.upgrade_asked === "rollback" ? "Roll back" : "Upgrade now"} asked; it starts on the pool's next pass.`) : null,
+    upgrade || agent.upgrade_asked ? null : el("div", { class: "row" },
       newer ? el("button", { class: "primary", onclick: act("upgrade", "Upgrade now") }, `Upgrade now to ${v.staged}`) : null,
-      v.previous && v.previous !== v.running ? el("button", { onclick: act("rollback", "Roll back") }, `Roll back to ${v.previous}`) : null,
+      v.previous && v.previous !== v.running && agent.engine_version === "latest"
+        ? el("button", { onclick: act("rollback", "Roll back") }, `Roll back to ${v.previous}`) : null,
       newer ? el("span", { class: "muted" }, "otherwise it switches by itself once the host has been quiet for a while") : null));
 }
 

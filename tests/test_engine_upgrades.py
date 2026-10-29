@@ -71,8 +71,12 @@ def test_a_version_that_loses_the_model_set_is_rolled_back_and_never_taken_again
     after = install(running="0.40.12", staged=None, previous="0.40.11")
     step(upgrades, after, 2, held=frozenset())
     back = step(upgrades, after, 2 + 601, held=frozenset())
-    assert (back.action, back.version, back.event) == ("rollback", "0.40.11", "engine_rolled_back")
+    assert (back.action, back.version, back.event) == ("rollback", "0.40.11", "engine_rolling_back")
     assert upgrades.refused["mac"] == {"0.40.12"}
+    # Out of routing until the old version is back, asked again while it is not.
+    assert step(upgrades, after, 2 + 602, held=frozenset()).action == "rollback"
+    assert step(upgrades, install(running="0.40.11", staged="0.40.12"), 2 + 603).event == "engine_rolled_back"
+    assert "mac" not in upgrades.active
     # The agent stages it again, as `latest` still names it: not taken.
     assert step(upgrades, install(), 1000, idle_s=900).action == "wait"
     # A newer release is a new version.
@@ -206,8 +210,8 @@ def test_an_upgrade_runs_through_the_pool_out_of_routing_and_back(monkeypatch):
         assert host.state.value == "ready", host.last_error
         assert agent.install["running"] == "0.40.12"
         assert kinds(pool).count("engine_upgraded") == 1
-        assert [k for k in kinds(pool) if k.startswith("engine_")][:3] == [
-            "engine_upgrade_draining", "engine_upgrade_switching", "engine_switched"]
+        assert [k for k in kinds(pool) if k.startswith("engine_")][:4] == [
+            "engine_staged", "engine_upgrade_draining", "engine_upgrade_switching", "engine_switched"]
 
 
 def test_an_upgrade_that_loses_the_model_set_rolls_back_through_the_pool(monkeypatch):
@@ -261,3 +265,108 @@ def test_anything_but_a_version_is_refused(version):
     with pytest.raises(ValueError, match="engine_version"):
         HostConfig.model_validate({"id": "h", "kind": "local", "engine_version": version,
                                    "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}})
+
+
+# --- after review (PR #78) ---
+
+
+def test_a_pinned_version_holds_and_is_the_only_one_switched_to():
+    upgrades = EngineUpgrades()
+    # Held to what runs: the newer staged version is not taken.
+    held = upgrades.next_step("mac", install(), busy=0, idle_s=900, held=frozenset({MODEL}), engine_answers=True,
+                              another_upgrading=False, now=0, pinned="0.40.11", **WINDOWS)
+    assert held.action == "wait"
+    # Pinned to the previous one: switched back to it.
+    back = upgrades.next_step("mac", install(running="0.40.12", staged=None, previous="0.40.11"), busy=0,
+                              idle_s=900, held=frozenset({MODEL}), engine_answers=True, another_upgrading=False,
+                              now=0, pinned="0.40.11", **WINDOWS)
+    assert back.action == "start" and upgrades.active["mac"].to == "0.40.11"
+
+
+def test_without_an_answer_a_drain_ends_at_once_and_a_check_once_its_window_passes():
+    upgrades = EngineUpgrades()
+    step(upgrades, install(), 0)
+    gone = upgrades.next_step("mac", None, busy=0, idle_s=None, held=frozenset(), engine_answers=True,
+                              another_upgrading=False, now=1, **WINDOWS)
+    assert gone.action == "abandon" and "mac" not in upgrades.active
+    step(upgrades, install(), 10)
+    step(upgrades, install(), 11)
+    step(upgrades, install(running="0.40.12", staged=None, previous="0.40.11"), 12)
+    for now, expected in ((13, "wait"), (12 + 601, "abandon")):
+        assert upgrades.next_step("mac", {"allowed": False}, busy=0, idle_s=None, held=frozenset(),
+                                  engine_answers=True, another_upgrading=False, now=now, **WINDOWS).action == expected
+
+
+def test_a_malformed_answer_is_no_answer_not_a_crash():
+    upgrades = EngineUpgrades()
+    assert step(upgrades, install(staged=["0.40.12"]), 0).action == "wait"
+    assert step(upgrades, "nonsense", 0).action == "wait"
+
+
+def test_a_staged_version_and_an_error_are_each_said_once():
+    upgrades = EngineUpgrades()
+    first = [n.event for n in upgrades.news("mac", install(error="the hub refused"))]
+    assert first == ["engine_staged", "engine_install_error"]
+    assert upgrades.news("mac", install(error="the hub refused")) == []
+
+
+def test_a_host_that_leaves_the_pool_mid_upgrade_holds_no_other_back(monkeypatch):
+    with upgrading_pool(monkeypatch) as pool:
+        agent = InstallingAgent(pool.engines["mac"].fake)
+        pool.supervisor._agent_transport = agent.transport
+        pool.reprobe()
+        assert "mac" in pool.supervisor.upgrades.active
+        pool.supervisor.hosts["mac"].config.disabled = True
+        pool.loop.run(pool.supervisor._upgrade_engines())
+        assert "mac" not in pool.supervisor.upgrades.active
+        assert "engine_upgrade_abandoned" in kinds(pool)
+
+
+def test_a_model_its_owner_loaded_by_hand_is_not_the_new_versions_to_hold(monkeypatch):
+    with upgrading_pool(monkeypatch, engine_upgrade_check_s=0.01) as pool:
+        engine = pool.engines["mac"].fake
+        engine.resident.add("owners-own:7b")
+        agent = InstallingAgent(engine)
+        pool.supervisor._agent_transport = agent.transport
+        real = agent._answer
+
+        def switch_drops_the_extra(request):
+            answer = real(request)
+            if json.loads(request.content or b"{}").get("switch"):
+                engine.resident.discard("owners-own:7b")
+            return answer
+        agent.transport = httpx.MockTransport(switch_drops_the_extra)
+        pool.supervisor._agent_transport = agent.transport
+        for _ in range(6):
+            pool.reprobe()
+            time.sleep(0.02)
+        assert agent.install["running"] == "0.40.12" and "engine_upgraded" in kinds(pool)
+
+
+def test_a_version_with_a_trailing_newline_is_refused():
+    from gpm_server.config import HostConfig
+
+    with pytest.raises(ValueError, match="engine_version"):
+        HostConfig.model_validate({"id": "h", "kind": "local", "engine_version": "0.40.11\n",
+                                   "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}})
+
+
+def test_an_operator_cannot_ask_twice_or_roll_back_a_pinned_host(monkeypatch):
+    with upgrading_pool(monkeypatch, engine_upgrade_idle_s=3600) as pool:
+        agent = InstallingAgent(pool.engines["mac"].fake)
+        pool.supervisor._agent_transport = agent.transport
+        pool.reprobe()
+        server = control(pool)
+        try:
+            with httpx.Client(base_url=server.base_url, headers={"Authorization": "Bearer gpmx_console"}) as http:
+                assert http.post("/pool/hosts/mac/engine/upgrade", json={"confirm": "mac"}).status_code == 200
+                again = http.post("/pool/hosts/mac/engine/upgrade", json={"confirm": "mac"})
+                assert again.status_code == 409 and again.json()["error"] == "upgrade_in_progress"
+                pool.supervisor.upgrades.asked.clear()
+                pool.supervisor.hosts["mac"].config.engine_version = "0.40.11"
+                agent.install = install(running="0.40.12", staged=None, previous="0.40.11")
+                pool.supervisor.hosts["mac"].install = agent.install
+                pinned = http.post("/pool/hosts/mac/engine/rollback", json={"confirm": "mac"})
+                assert pinned.status_code == 409 and pinned.json()["error"] == "version_pinned"
+        finally:
+            server.stop()

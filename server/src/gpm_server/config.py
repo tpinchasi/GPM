@@ -246,7 +246,7 @@ class HostConfig(BaseModel):
     @field_validator("engine_version")
     @classmethod
     def _engine_version_is_a_version(cls, value: str) -> str:
-        if value != "latest" and not ENGINE_VERSION.match(value):
+        if value != "latest" and (len(value) > 64 or not ENGINE_VERSION.fullmatch(value)):
             raise ValueError(f"engine_version is `latest` or a version such as 0.40.11, not {value!r}")
         return value
 

@@ -2117,6 +2117,12 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             return _error(400, "bad_request", "the body must be JSON")
         if not isinstance(body, dict) or body.get("confirm") != host_id:
             return _error(400, "not_confirmed", "type the host id again as `confirm`: the host stops taking requests while it switches")
+        if host_id in supervisor.upgrades.active or host_id in supervisor.upgrades.asked:
+            return _error(409, "upgrade_in_progress",
+                          f"{host_id} already has an engine switch under way or asked for; wait for it to end")
+        if what == "rollback" and host.config.engine_version != "latest":
+            return _error(409, "version_pinned",
+                          f"{host_id} is held to {host.config.engine_version} by its engine_version; change that to go back")
         if what == "rollback" and not install.get("previous"):
             return _error(409, "nothing_to_roll_back_to", f"{host_id} keeps no previous version")
         if what == "upgrade" and (not install.get("staged") or install.get("staged") == install.get("running")):
