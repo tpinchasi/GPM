@@ -26,6 +26,10 @@ process with `--tensor-parallel-size N`, and each card holds a 1/N share of ever
 per copy is the case above. A machine whose cards do not divide into groups of N, or a model whose
 attention heads do not divide by N, is refused before anything starts, as a set that does not fit.
 
+**Each model is started no longer than it goes** (D146): the pool sends one longest sequence for
+every process, and a model whose own files state a shorter one — Whisper's decoder, a reranker —
+is started at its own, which is recorded so the agent can say so.
+
 It stops whatever it started last time before starting anything, so calling it twice is a
 restart and not a second copy fighting the first for the same memory.
 """
@@ -83,22 +87,92 @@ CACHE_RESERVE_BYTES = 3 * 1024**3
 
 # What this launcher started, by model — process, port, log — is read back by the agent to tell
 # a process that has since died from one still loading. The reading lives apart from this
-# module: the agent must never import anything that can start a process (D63).
+# module: the agent never imports this launcher, which starts what the machine's start-up asks
+# (D63). The one program the agent starts itself is whisper.cpp's server, with fixed arguments
+# (D148).
 from .vllm_state import (  # noqa: E402,F401
     STARTED_FILE,
+    capped_lengths,
     failed_engines,
     last_error_line,
     read_record,
     state_dir_for,
 )
 
+#: The pool's one number for every process's longest sequence, which each model is held to its
+#: own maximum of (D146).
+MAX_MODEL_LEN = "GPM_VLLM_MAX_MODEL_LEN"
+
 #: The pool's numbers, under the names the agent writes them in (D41). Only those present are
 #: passed on: an absent one means "the engine's own default", not zero.
 NUMBER_FLAGS = (
     ("GPM_VLLM_MAX_NUM_SEQS", "--max-num-seqs"),
     ("GPM_VLLM_MAX_NUM_BATCHED_TOKENS", "--max-num-batched-tokens"),
-    ("GPM_VLLM_MAX_MODEL_LEN", "--max-model-len"),
+    (MAX_MODEL_LEN, "--max-model-len"),
 )
+
+#: Where a model's configuration states its longest sequence, in the order vLLM v0.29.0 reads
+#: them (`derive_max_model_len_and_key`, vllm/transformers_utils/model_arch_config_convertor.py).
+#: The smallest one present is the model's maximum — except `model_max_length`, which, where set,
+#: is taken as it stands.
+LENGTH_KEYS = (
+    "max_position_embeddings",  # most models
+    "n_positions",  # GPT-2
+    "max_seq_len",  # MPT
+    "seq_length",  # ChatGLM2
+    "model_max_length",  # Command-R
+    "max_target_positions",  # Whisper's decoder
+    "max_sequence_length",
+    "max_seq_length",
+    "seq_len",
+)
+
+#: Where a model built from a text model and another (vision, audio) keeps the text model's own
+#: configuration: the names transformers' `get_text_config()` looks under, and `llm_config`,
+#: which vLLM renames to `text_config` before it looks.
+TEXT_SECTIONS = ("text_encoder", "decoder", "generator", "text_config", "llm_config")
+
+#: Scalings vLLM does not multiply the length by: their `max_position_embeddings` is already the
+#: scaled length.
+UNSCALED_ROPE = ("su", "longrope", "llama3")
+
+#: A sentence-transformers model's own tokenizer settings. vLLM takes `max_seq_length` from the
+#: first of these it finds as the model's maximum outright (`get_sentence_transformer_tokenizer_config`).
+SENTENCE_TRANSFORMER_FILES = (
+    "sentence_bert_config.json",
+    "sentence_roberta_config.json",
+    "sentence_distilbert_config.json",
+    "sentence_camembert_config.json",
+    "sentence_albert_config.json",
+    "sentence_xlm-roberta_config.json",
+    "sentence_xlnet_config.json",
+)
+
+#: What an architecture's name ends in, and whether vLLM v0.29.0 runs a model so named as a
+#: pooling model (embedding, classifying, ranking) rather than generating text — its own table
+#: for a model it does not decide otherwise (`_SUFFIX_TO_DEFAULTS`, vllm/config/model.py), checked
+#: in order, so a generating `…ChatModel` or `…LMHeadModel` is not taken for an encoder's `…Model`.
+POOLING_BY_SUFFIX = (
+    ("ForCausalLM", False),
+    ("ForConditionalGeneration", False),
+    ("ChatModel", False),
+    ("LMHeadModel", False),
+    ("ForTextEncoding", True),
+    ("EmbeddingModel", True),
+    ("ForSequenceClassification", True),
+    ("ForAudioClassification", True),
+    ("ForImageClassification", True),
+    ("ForVideoClassification", True),
+    ("ClassificationModel", True),
+    ("ForRewardModeling", True),
+    ("RewardModel", True),
+    ("Model", True),
+)
+
+#: A sentence-transformers model lists its modules here; one naming a pooling module is run as a
+#: pooling model whatever its architecture (`get_pooling_config`).
+SENTENCE_TRANSFORMER_MODULES = "modules.json"
+SENTENCE_TRANSFORMER_POOLING = "sentence_transformers.models.Pooling"
 
 #: How many cards each copy of a model spans (D114). Absent means one: a copy on each card.
 CARDS_PER_COPY = "GPM_VLLM_CARDS_PER_COPY"
@@ -317,7 +391,9 @@ def memory_plan(
 SPLIT_BETWEEN_COPIES = {"GPM_VLLM_MAX_NUM_SEQS"}
 
 
-def number_flags(env: Mapping[str, str], copies: int = 1) -> list[str]:
+def number_flags(env: Mapping[str, str], copies: int = 1, max_model_len: Optional[int] = None) -> list[str]:
+    """The pool's numbers as flags. `max_model_len` is the model's own maximum, where it states
+    one: the pool's length is held to it, never raised to it."""
     flags: list[str] = []
     for variable, flag in NUMBER_FLAGS:
         value = env.get(variable, "").strip()
@@ -325,8 +401,135 @@ def number_flags(env: Mapping[str, str], copies: int = 1) -> list[str]:
             if variable in SPLIT_BETWEEN_COPIES and copies > 1:
                 # Rounded up: a host of 13 on two cards runs 7 and 7, never 6 and 6.
                 value = str(max(1, math.ceil(int(value) / copies)))
+            if variable == MAX_MODEL_LEN and max_model_len is not None:
+                value = str(min(int(value), max_model_len))
             flags += [flag, value]
     return flags
+
+
+def asked_max_model_len(env: Mapping[str, str]) -> Optional[int]:
+    """The longest sequence the pool asked every process for, or None where it asked for none."""
+    value = env.get(MAX_MODEL_LEN, "").strip()
+    return int(value) if value.isdigit() else None
+
+
+def _json_object(path: Path) -> Optional[dict[str, Any]]:
+    try:
+        found = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return found if isinstance(found, dict) else None
+
+
+def _length(value: Any) -> Optional[float]:
+    """A stated length, or None for anything that is not a positive number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return None
+    return value
+
+
+def text_section(config: dict[str, Any]) -> dict[str, Any]:
+    """The part of a model's configuration that describes its text model: the configuration
+    itself, or the one section nested under a name vLLM looks under."""
+    nested = [config[name] for name in TEXT_SECTIONS if isinstance(config.get(name), dict)]
+    return nested[0] if len(nested) == 1 else config
+
+
+def _rope_scaled(length: float, text: dict[str, Any]) -> float:
+    """The length as vLLM scales it by the model's rotary-position scaling, if any.
+
+    The same rule as vLLM's `_get_and_verify_max_len`: multiplied by the scaling's `factor`,
+    except for scalings already counted in the stated length and for Gemma 3, whose stated
+    length is already scaled; a `yarn` scaling multiplies the length it was trained at instead.
+    """
+    rope = text.get("rope_parameters") or text.get("rope_scaling")
+    if not isinstance(rope, dict) or not rope or "gemma3" in str(text.get("model_type") or ""):
+        return length
+    # One scaling, or one per kind of attention layer.
+    each = list(rope.values()) if all(isinstance(v, dict) for v in rope.values()) else [rope]
+    factor: Any = 1.0
+    for entry in each:
+        kind = entry.get("rope_type") or entry.get("type") or "default"
+        if kind in UNSCALED_ROPE:
+            continue
+        factor = entry.get("factor", factor)
+        if kind == "yarn":
+            trained = (_length(text.get("original_max_position_embeddings"))
+                       or _length(entry.get("original_max_position_embeddings"))
+                       or _length(text.get("max_position_embeddings")))
+            length = trained or length
+    return length * (_length(factor) or 1.0)
+
+
+def runs_as_pooling(directory: Path, config: dict[str, Any]) -> bool:
+    """Does vLLM v0.29.0 run this model as a pooling model — the only kind it holds to its
+    tokenizer's length?
+
+    The rule vLLM applies when the launcher names no runner, which it never does: a
+    sentence-transformers model whose `modules.json` names a pooling module is one, whatever its
+    architecture; otherwise the first architecture in `config.json` whose name ends in a suffix
+    of `POOLING_BY_SUFFIX` decides — `…ForSequenceClassification` and an encoder's bare `…Model`
+    pool, `…ForCausalLM` generates. A model naming none generates, as vLLM's default runner does.
+    vLLM consults its registry of architectures before that table; for the encoders and
+    generators it registers, the two agree.
+    """
+    try:
+        modules = json.loads((directory / SENTENCE_TRANSFORMER_MODULES).read_text())
+    except (OSError, ValueError):
+        modules = None
+    if isinstance(modules, list) and any(
+        isinstance(module, dict) and module.get("type") == SENTENCE_TRANSFORMER_POOLING for module in modules
+    ):
+        return True
+    architectures = config.get("architectures")
+    for architecture in architectures if isinstance(architectures, list) else []:
+        if not isinstance(architecture, str):
+            continue
+        for suffix, pooling in POOLING_BY_SUFFIX:
+            if architecture.endswith(suffix):
+                return pooling
+    return False
+
+
+def max_model_len_of(directory: Path) -> Optional[int]:
+    """The longest sequence vLLM v0.29.0 will start this model with, from the model's own files —
+    or None where they do not say, and vLLM takes whatever it is given.
+
+    vLLM refuses to start a model with a `--max-model-len` above this, and the pool sends one
+    number for every process: a text model's context, which Whisper's decoder (448) and many
+    rerankers (512) are far below (D146). Read the way vLLM derives it (`_get_and_verify_max_len`
+    in vllm/config/model.py): the smallest of the stated lengths in the text model's section,
+    held to the tokenizer's own limit for a pooling model with absolute positions
+    (`runs_as_pooling`) — never for one that generates — scaled as the model's rotary positions
+    are, and replaced outright by a sentence-transformers model's own `max_seq_length`.
+
+    It reads the files, not transformers' classes, so a length a class supplies only by default
+    goes unseen. Missing a stated length makes the answer longer, which costs nothing: vLLM
+    refuses a length too long exactly as it would have refused the pool's own number.
+    """
+    config = _json_object(directory / "config.json")
+    if config is None:
+        return None
+    text = text_section(config)
+    stated = [found for key in LENGTH_KEYS if (found := _length(text.get(key))) is not None]
+    length: Optional[float] = min(stated) if stated else None
+    if (named := _length(text.get("model_max_length"))) is not None:
+        length = named
+    if config.get("position_embedding_type") == "absolute" and runs_as_pooling(directory, config):
+        tokenizer = _json_object(directory / "tokenizer_config.json") or {}
+        if (limit := _length(tokenizer.get("model_max_length"))) is not None:
+            length = limit if length is None else min(length, limit)
+    if length is None:
+        return None
+    length = _rope_scaled(length, text)
+    for name in SENTENCE_TRANSFORMER_FILES:
+        encoder = _json_object(directory / name)
+        if encoder:
+            if "max_seq_length" in encoder and "do_lower_case" in encoder:
+                length = _length(encoder["max_seq_length"]) or length
+            break
+    return int(length)
+
 
 
 def family_of(directory: Path) -> Optional[str]:
@@ -482,12 +685,24 @@ def launch(
     refused = not_grouped or split_refusal(found, per_copy) or refused
     copies = len(placements)
     router = proxy or copies > 1
+    # Each model's own longest sequence, which the pool's one number is held to (D146).
+    maxima = [max_model_len_of(d) for d in found]
+    asked = asked_max_model_len(env)
     started.plan = {
         "card_bytes": card,
         "cards": cards,
         "cards_per_copy": per_copy,
         "models": {served_name(d): {"weights_bytes": s} for d, s in zip(found, sizes, strict=True)},
     }
+    for directory, own in zip(found, maxima, strict=True):
+        if asked is not None and own is not None and own < asked:
+            # Recorded for the agent to report: the host serves this model shorter than the pool
+            # asked, because the model goes no further.
+            started.plan["models"][served_name(directory)]["max_model_len_capped"] = {
+                "asked": asked, "applied": own,
+            }
+            log.info("%s is started at --max-model-len %d, its own maximum; the pool asked for %d",
+                     served_name(directory), own, asked)
     if refused:
         # Said where the agent reads it, so the pool hears the reason instead of watching
         # processes die one by one.
@@ -499,7 +714,7 @@ def launch(
 
     index = 0
     for device in placements:
-        for directory, share in zip(found, shares, strict=True):
+        for directory, share, own in zip(found, shares, maxima, strict=True):
             name = served_name(directory)
             engine_port = port if not router else port + 1 + index
             index += 1
@@ -518,7 +733,7 @@ def launch(
                 "--port", str(engine_port),
                 "--gpu-memory-utilization", str(share),
                 *(["--tensor-parallel-size", str(per_copy)] if per_copy > 1 else []),
-                *number_flags(env, copies),
+                *number_flags(env, copies, own),
                 *extra,
             ]
             process_env = env if device is None else {**env, "CUDA_VISIBLE_DEVICES": device}
@@ -591,4 +806,8 @@ def main(args: Any) -> int:
         print(f"not started: {name} (several models on disk and no router)")
     for what in started.not_applied:
         print(f"not applied: {what}")
+    for name, planned in started.plan.get("models", {}).items():
+        if capped := planned.get("max_model_len_capped"):
+            print(f"capped: {name} at --max-model-len {capped['applied']}, its own maximum "
+                  f"(the pool asked for {capped['asked']})")
     return 0

@@ -31,7 +31,7 @@ def config(**overrides):
 
 def rented(**overrides):
     base = {
-        "provider": "fake", "workers": 2, "capabilities": ["cuda"],
+        "provider": "fake", "engine": "ollama", "workers": 2, "capabilities": ["cuda"],
         "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 0.60}, "bidding": {"premium": 0.02},
     }
     base.update(overrides)
@@ -165,7 +165,7 @@ def test_a_host_declaring_no_models_at_all_is_refused():
 
 
 def test_a_host_asked_for_a_build_its_platform_cannot_run_is_refused():
-    with pytest.raises(ValueError, match="meet no variant's requirements"):
+    with pytest.raises(ValueError, match="no build of them is one it can serve"):
         config(
             pool={"models_per_host": "declared"},
             catalog={BIG: {"variants": [{"tag": "gemma4:26b-mlx", "requires": ["apple-silicon"]}]}},
@@ -195,7 +195,7 @@ def test_that_same_engine_is_fine_once_the_set_is_spread():
                 "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}}],
         # An image built for this engine (D92). `rented.models` is what the pool may rent
         # *for* — each host it buys is given one of them (D94).
-        rented=rented(image="vastai/vllm:v0.29.0-cuda-12.9", models=[SMALL, EMBED]),
+        rented=rented(engine="vllm", image="vastai/vllm:v0.29.0-cuda-12.9", models=[SMALL, EMBED]),
     )
     assert cfg.engine == "vllm" and cfg.models_held_by(cfg.hosts[0]) == [BIG]
 

@@ -33,6 +33,7 @@ def control(tmp_path):
             ],
             "rented": {
                 "provider": "fake",
+                "engine": "ollama",
                 "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 0.60},
                 "scale": {"scale_up_after_s": 0},
             },
@@ -400,6 +401,7 @@ def test_allocation_can_be_switched_on_from_the_rented_screen(control, tmp_path)
         "    transport: { type: http, base_url: 'http://127.0.0.1:1' }\n"
         "rented:\n"
         "  provider: fake\n"
+        "  engine: ollama\n"
         "  offer_policy: { min_disk_gb: 10, max_all_in_hourly: 0.60 }\n"
     )
     from gpm_server.configplan import ConfigStore

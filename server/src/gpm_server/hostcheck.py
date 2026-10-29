@@ -15,12 +15,12 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 import httpx
 
 from .catalog import variants_for_host
-from .config import PoolSettings, TransportConfig
+from .config import PoolSettings, TransportConfig, _is_loopback
 from .transports import build_client
 
 
@@ -38,17 +38,43 @@ class Step:
         return {"name": self.name, "ok": self.ok, "detail": self.detail, "fix": self.fix}
 
 
+def _one_token(engine: Any, tag: str) -> Optional[tuple[str, dict[str, Any]]]:
+    """The shortest generation, on a path this engine serves — Ollama's own, or OpenAI's
+    completions, which needs no chat template. None for an engine that generates no text."""
+    paths = engine.inference_paths()
+    if "/api/generate" in paths:
+        return "/api/generate", {"model": tag, "prompt": "hi", "stream": False, "options": {"num_predict": 1}}
+    if "/v1/completions" in paths:
+        return "/v1/completions", {"model": tag, "prompt": "hi", "max_tokens": 1, "stream": False}
+    return None
+
+
+def _chat_builds(required: set[str], model_set: Sequence[str], catalog: Mapping[str, Any]) -> list[str]:
+    """The builds in `required` that generate text: the concurrency check measures a chat build,
+    never a speech model or a ranker, which answer a different shape of request (D142)."""
+    chat = set()
+    for name in model_set:
+        entry = catalog.get(name)
+        if entry is None:
+            chat.add(name)  # a model with no catalog entry is a chat model under its own name
+            continue
+        chat.update(v.tag for v in entry.variants if "chat" in v.kinds())
+    return sorted(required & chat)
+
+
 async def _concurrency(client: httpx.AsyncClient, engine: Any, tag: str, workers: int) -> Step:
     """n short generations at once, against one. Near n× wall time means the engine is
     serialising, whatever it was asked for."""
     if workers < 2:
         return Step("concurrency", True, "one worker: nothing to check")
-
-    body = {"model": tag, "prompt": "hi", "stream": False, "options": {"num_predict": 1}}
+    request = _one_token(engine, tag)
+    if request is None:
+        return Step("concurrency", True, f"{engine.name} generates no text: nothing to measure")
+    path, body = request
 
     async def once() -> bool:
         try:
-            response = await client.post("/api/generate", json=body, timeout=120)
+            response = await client.post(path, json=body, timeout=120)
             return response.status_code == 200
         except httpx.HTTPError:
             return False
@@ -121,16 +147,35 @@ async def test_connection(
 
     try:
         health = await engine.health(client)
+        if getattr(engine, "residency_from_agent", False):
+            # What saving would refuse is said here too (D148): the server has no authentication,
+            # and serves as many requests at once as the engine says.
+            limit = getattr(engine, "max_workers", None)
+            if transport.type != "tunnel" and not _is_loopback(transport.base_url or ""):
+                steps.append(Step("definition", False, f"{engine.name}'s server has no authentication: reach it "
+                                  "on loopback, or through a tunnel from another machine"))
+                return {"ok": False, "steps": [s.as_dict() for s in steps], "workers": 0}
+            if limit is not None and workers > limit:
+                steps.append(Step("workers", False, f"{engine.name} serves {limit} request at a time; set workers: {limit}"))
+                return {"ok": False, "steps": [s.as_dict() for s in steps], "workers": 0}
+            # Its agent fetches the model and starts the server, and before the host is saved
+            # the agent has been asked for nothing (D148): a server not answering yet is the
+            # expected state, and what it holds is reported once the host is saved.
+            steps.append(Step("reach", True, "the server answered" if health.ok
+                              else "not answering yet: the host's agent starts it once the host is saved"))
+            steps.append(Step("model set", True, "fetched and started by the host's agent"))
+            return {"ok": True, "steps": [s.as_dict() for s in steps], "workers": workers}
         steps.append(Step("reach", health.ok, health.detail or "the engine answered"))
         if not health.ok:
             return {"ok": False, "steps": [s.as_dict() for s in steps], "workers": 0}
+
+        variants = variants_for_host(list(model_set), catalog, frozenset(capabilities), engine.name)
+        required = {group[0].tag for group in variants.values() if group}
 
         resident = await engine.models_resident(client)
         available = await engine.models_available(client)
         steps.append(Step("models", True, f"resident now: {', '.join(sorted(resident)) or 'none'}"))
 
-        variants = variants_for_host(list(model_set), catalog, frozenset(capabilities), engine.name)
-        required = {group[0].tag for group in variants.values() if group}
         residency = host.get("residency", "pinned")
         if residency == "on_demand":
             missing = required - available
@@ -144,8 +189,9 @@ async def test_connection(
 
         steps.append(Step("capabilities", True, ", ".join(capabilities) if capabilities else "none declared; the no-requirements variant is served"))
 
-        if not missing:
-            steps.append(await _concurrency(client, engine, sorted(required)[0], workers))
+        chat = _chat_builds(required, model_set, catalog)
+        if not missing and chat:
+            steps.append(await _concurrency(client, engine, chat[0], workers))
     except httpx.HTTPError as exc:
         steps.append(Step("reach", False, str(exc)))
     finally:

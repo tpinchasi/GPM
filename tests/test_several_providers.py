@@ -53,7 +53,8 @@ def make_fleet(db, providers, enabled=None, **rented):
         "limits": {"max_rented_hosts": 6},
         "workloads": {"min_reliability": 0.0, "eviction_prior_per_hour": 0.0},
         # Each its own provider: a pool has one connection per provider (D133).
-        "rented": {"providers": {name: {"type": f"fake-{name}", "enabled": name in enabled} for name in providers},
+        "rented": {"engine": "ollama",
+                   "providers": {name: {"type": f"fake-{name}", "enabled": name in enabled} for name in providers},
                    "workers": 4, "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 2.0},
                    "bidding": {"premium": 0.02}, "scale": {"scale_up_after_s": 0}, **rented},
     })
@@ -408,7 +409,8 @@ def test_volumes_and_held_back_rows_stop_a_removal_but_are_not_counted_as_hosts(
         "pool": {"name": "t", "model_set": ["m1"]}, "auth": {"app_keys": ["k"]},
         "hosts": [{"id": "l", "kind": "local", "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}}],
         "limits": {"max_rented_hosts": hosts},
-        "rented": {"providers": providers, "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 2.0}}})
+        "rented": {"engine": "ollama", "providers": providers,
+                   "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 2.0}}})
     both = {"a": {"type": "a"}, "b": {"type": "b"}}
     held = [RentedNow("rented-1", 0.5, provider="a"), RentedNow("volume:v-1", 0.01, provider="b")]
     lowered = plan_changes(fleet_config(both, 4), fleet_config(both, 1), held)

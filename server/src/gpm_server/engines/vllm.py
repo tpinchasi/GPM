@@ -22,7 +22,17 @@ from typing import ClassVar, Optional
 import httpx
 
 from . import openai_api
-from .base import EngineOption, Health, Occupancy, PullResult
+from .base import (
+    CHAT,
+    EMBED,
+    RERANK,
+    TRANSCRIBE,
+    EngineOption,
+    Health,
+    Occupancy,
+    PullResult,
+    RequestFacts,
+)
 
 #: What the pool's integers are called in this engine's start-up environment. The engine takes
 #: command-line flags, not variables, so a host that runs it reads these in its own start
@@ -47,8 +57,10 @@ _METRIC = re.compile(r"^(?P<name>vllm:[a-z_]+)(?:\{[^}]*\})?\s+(?P<value>[0-9.eE
 
 
 class VllmEngine:
-    interface_version: ClassVar[str] = "1"
+    interface_version: ClassVar[str] = "2"
     name: ClassVar[str] = "vllm"
+    #: Everything the protocol has: speech and ranking as well as chat and embeddings (D142, D146).
+    kinds: ClassVar[frozenset[str]] = frozenset({CHAT, EMBED, TRANSCRIBE, RERANK})
     #: One process, one model. Several models on one machine means several processes, which
     #: means something in front of them choosing between ports — and that is a component the
     #: pool does not yet ship, so the combination is refused at load rather than at 3 a.m.
@@ -57,6 +69,13 @@ class VllmEngine:
     #: The agent fetches into it and the launcher serves from it (D97).
     models_dir: ClassVar[str] = "/opt/gpm/models"
     image_words: ClassVar[tuple[str, ...]] = ("vllm",)
+    #: The image a rented host starts from when the configuration names none: the project's own
+    #: build, pinned (T10). It leaves out the audio extra; images that carry it say so (D146).
+    default_image: ClassVar[str] = "vllm/vllm-openai:v0.29.0"
+    #: What an image must carry for a kind (D146): speech needs vLLM's `audio` extra, which this
+    #: engine's own image leaves out. Rented hosts holding such a build start only from an image
+    #: whose `capabilities` name it.
+    image_needs: ClassVar[dict[str, str]] = {TRANSCRIBE: "audio-decoding"}
     #: It serves what it was started with; a downloaded model is picked up by starting it again.
     loads_by_restart: ClassVar[bool] = True
     #: The agent's launcher starts a model across a group of cards with `--tensor-parallel-size`.
@@ -103,7 +122,16 @@ class VllmEngine:
     # --- request path: the shared protocol, not this engine's invention ---
 
     def inference_paths(self) -> set[str]:
-        return set(openai_api.INFERENCE_PATHS)
+        return set(openai_api.INFERENCE_PATHS | openai_api.TRANSCRIBE_PATHS | openai_api.RERANK_PATHS)
+
+    def kind_of(self, path: str) -> Optional[str]:
+        return openai_api.kind_of(path) if path in self.inference_paths() else None
+
+    def request_facts(self, path: str, content_type: str, body: bytes) -> RequestFacts:
+        return openai_api.facts(path, content_type, body)
+
+    def rewrite_model(self, path: str, content_type: str, body: bytes, tag: str) -> tuple[str, bytes]:
+        return openai_api.rewrite_model(path, content_type, body, tag)
 
     def requested_model(self, path: str, body: bytes) -> Optional[str]:
         return openai_api.requested_model(body)

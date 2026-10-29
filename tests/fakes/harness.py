@@ -140,10 +140,21 @@ class PoolHarness:
 
         host_entries = []
         for spec in engines:
-            fake = FakeOllama(
-                resident=spec.resident, available=spec.available,
-                chunk_delay_s=spec.chunk_delay_s, chunks=spec.chunks,
-            )
+            if spec.engine == "vllm":
+                from .fake_vllm import FakeVllm
+
+                fake = FakeVllm()
+                fake.start(spec.resident)  # a machine someone else started, serving its models
+            elif spec.engine == "whisper-cpp":
+                from .fake_whisper_cpp import FakeWhisperCpp
+
+                fake = FakeWhisperCpp()
+                fake.start(spec.resident)  # started by its agent, which the test stands in for
+            else:
+                fake = FakeOllama(
+                    resident=spec.resident, available=spec.available,
+                    chunk_delay_s=spec.chunk_delay_s, chunks=spec.chunks,
+                )
             server = ServerHandle(fake.app, self.loop)
             self.engines[spec.id] = RunningEngine(spec=spec, fake=fake, server=server)
             if spec.transport == "tunnel":
@@ -163,6 +174,8 @@ class PoolHarness:
                 "capabilities": spec.capabilities,
                 "transport": dialled,
             }
+            if spec.engine != "ollama":
+                entry["engine"] = spec.engine
             if spec.priority is not None:
                 entry["priority"] = spec.priority
             if spec.residency != "pinned":
@@ -195,6 +208,11 @@ class PoolHarness:
             rentable_urls.append(server.base_url)
 
         rented_section = dict(rented) if rented else None
+        if rented_section is not None and "engine" not in rented_section:
+            # Rented hosts run vLLM unless told otherwise (D147); the hosts a test can rent run
+            # what their specs say, so the configuration says the same.
+            rented_engines = {spec.engine for spec in rentable or []}
+            rented_section["engine"] = "vllm" if rented_engines == {"vllm"} else "ollama"
         if rented_section is not None and "providers" in rented_section:
             connections = {name: dict(conn) for name, conn in rented_section["providers"].items()}
             for conn in connections.values():

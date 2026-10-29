@@ -1,6 +1,6 @@
 [project]
 name = "gpm-server"
-version = "0.34.1"
+version = "0.35.0"
 description = "GPM router: serves GPU inference from a pool of hosts behind one URL, without an app knowing where the GPU runs."
 requires-python = ">=3.11"
 dependencies = [
@@ -25,6 +25,7 @@ vast = "gpm_server.providers.vast:VastProvider"
 [project.entry-points."gpm.engines"]
 ollama = "gpm_server.engines.ollama:OllamaEngine"
 vllm = "gpm_server.engines.vllm:VllmEngine"
+whisper-cpp = "gpm_server.engines.whisper_cpp:WhisperCppEngine"
 
 [build-system]
 requires = ["hatchling"]

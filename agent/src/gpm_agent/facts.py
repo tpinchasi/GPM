@@ -2,7 +2,9 @@
 
 docs/spec/host-agent.md §3. Read-only, cheap and unprivileged. Every probe of the outside world
 goes through `Probes`, so the whole module is tested without the hardware it describes: a test
-supplies what `nvidia-smi` would have printed.
+supplies what `nvidia-smi` would have printed. One probe is the engine image's rather than the
+machine's — whether vLLM's interpreter imports its audio extra (D146) — and is tested against
+stand-ins for that interpreter instead.
 
 A probe that fails reports *nothing* for that fact, never a guess: an absent accelerator list
 means "could not tell", and the pool does not derive a capability from silence.
@@ -13,6 +15,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import platform
+import re
 import shutil
 import subprocess
 from typing import Any, Callable, Optional, Sequence
@@ -164,3 +167,80 @@ def gather(probes: Probes, models_path: str) -> dict[str, Any]:
         "capabilities": derive_capabilities(found),
         "disk": disk(probes, models_path),
     }
+
+
+# --- what the engine's image carries (D146) ---
+
+#: vLLM's `audio` extra, by the names vLLM's own audio code imports it under. At v0.29.0 the extra
+#: is `av`, `scipy`, `soundfile`, `soxr` and `mistral_common[audio]` (its `setup.py`), the last of
+#: which is `soundfile` and `soxr` again; `vllm/multimodal/audio.py` and
+#: `vllm/multimodal/media/audio.py` import `av`, `scipy.signal`, `soxr` and `soundfile`, and put a
+#: placeholder in place of any that is missing — so vLLM starts without them and refuses every
+#: recording, saying why only in its log.
+AUDIO_EXTRA_MODULES = ("av", "scipy.signal", "soundfile", "soxr")
+
+#: Long enough for a cold disk under a model download to import scipy and PyAV; past it, the check
+#: is given up and the answer is "not known", never "missing".
+AUDIO_CHECK_TIMEOUT_S = 120.0
+
+#: What may stand after `#!` for the check to run it: a Python interpreter, by its file name.
+_PYTHON = re.compile(r"python[0-9.]*")
+
+
+def interpreter_of(command: str, path: Optional[str] = None) -> Optional[str]:
+    """The Python interpreter a console script runs under, from its `#!` line — or None when the
+    command is not found or is not a Python script this can name.
+
+    Two forms, the two that installers write: the interpreter's own absolute path
+    (`#!/opt/venv/bin/python3`), and `#!/usr/bin/env python3`, found on the same PATH as the
+    command. Anything else — a binary, a shell wrapper — is not guessed at.
+    """
+    found = shutil.which(command, path=path)
+    if found is None:
+        return None
+    try:
+        with open(found, "rb") as script:
+            first = script.readline(1024)
+    except OSError:
+        return None
+    if not first.startswith(b"#!"):
+        return None
+    words = first[2:].decode(errors="replace").split()
+    if len(words) == 2 and os.path.basename(words[0]) == "env":
+        words = [shutil.which(words[1], path=path) or ""]
+    if len(words) != 1 or not os.path.isabs(words[0]) or not _PYTHON.fullmatch(os.path.basename(words[0])):
+        return None
+    return words[0]
+
+
+def audio_extra(
+    command: str,
+    *,
+    modules: Sequence[str] = AUDIO_EXTRA_MODULES,
+    timeout_s: float = AUDIO_CHECK_TIMEOUT_S,
+    path: Optional[str] = None,
+) -> Optional[tuple[bool, Optional[str]]]:
+    """Whether the interpreter behind `command` imports vLLM's audio extra: `(True, None)`, or
+    `(False, the error's last line)` — or None when the check could not run at all.
+
+    The one command here not written out in full: its interpreter is read from the command's own
+    first line, on this machine. It is run **isolated** (`-I`: no `PYTHON*` variables, no user
+    site, nothing from the working directory) as an argument list, never a shell, so what imports
+    is what the image installed for it and nothing else; the modules are this module's constant.
+    Nothing the pool says reaches it. Slow by this module's standards — seconds, on a cold disk —
+    so the agent runs it once, off its event loop.
+    """
+    interpreter = interpreter_of(command, path)
+    if interpreter is None:
+        return None
+    try:
+        done = subprocess.run(
+            [interpreter, "-I", "-c", "import " + ", ".join(modules)],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout_s, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if done.returncode == 0:
+        return True, None
+    lines = [line.strip() for line in done.stderr.splitlines() if line.strip()]
+    return False, (lines[-1][:200] if lines else f"the import exited with {done.returncode}")

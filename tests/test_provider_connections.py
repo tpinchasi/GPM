@@ -14,7 +14,7 @@ BIG = "big"
 
 
 def pool_config(**rented):
-    base = {"workers": 4, "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 2.0},
+    base = {"engine": "ollama", "workers": 4, "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 2.0},
             "bidding": {"premium": 0.02}, "scale": {"scale_up_after_s": 0}}
     return PoolConfig.model_validate({
         "pool": {"name": "test", "model_set": ["m1", BIG], "models_per_host": "declared"},

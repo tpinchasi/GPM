@@ -4,7 +4,7 @@ An app knows one URL, one API key, and the contract in docs/spec/app-contract.md
 capacity is the default behaviour — an app opts *out*, not in.
 """
 
-from .client import AsyncPoolClient, PoolClient, Reply
+from .client import AsyncPoolClient, PoolClient, Ranked, Ranking, Reply, Transcript, image_part
 from .errors import (
     PoolAuthError,
     PoolError,
@@ -26,12 +26,16 @@ __all__ = [
     "PoolStreamInterrupted",
     "PoolTransport",
     "PoolUnavailable",
+    "Ranked",
+    "Ranking",
     "Reply",
     "RetryPolicy",
+    "Transcript",
     "Workload",
     "WorkloadProvisioner",
     "WorkloadRefused",
     "async_pool_transport",
+    "image_part",
     "pool_transport",
 ]
 

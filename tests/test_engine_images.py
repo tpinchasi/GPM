@@ -33,6 +33,7 @@ def config(images=(), image=None):
     # A vLLM pool, because that is the engine published once per accelerator generation. It
     # serves one model per process, so its set is spread across hosts (D89).
     engine = "vllm" if (images or (image and "vllm" in image)) else "ollama"
+    rented["engine"] = engine
     pool = {"name": "test", "model_set": [MODEL]}
     if engine == "vllm":
         pool["models_per_host"] = "declared"
@@ -167,7 +168,7 @@ def test_a_build_must_say_which_driver_it_needs():
             "hosts": [{"id": "h", "kind": "local", "workers": 1, "models": [MODEL],
                        "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}}],
             "engine": "vllm",
-            "rented": {"provider": "fake", "workers": 1, "capabilities": ["cuda"],
+            "rented": {"provider": "fake", "engine": "ollama", "workers": 1, "capabilities": ["cuda"],
                        "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 1.0}, "bidding": {"premium": 0.0},
                        "images": [{"image": "vastai/vllm:v0.29.0-cuda-13.0"}]},
         })
@@ -177,3 +178,78 @@ def test_the_images_are_read_back_in_the_order_given():
     cfg = config(images=[NEW, OLD])
     assert [i.image for i in cfg.rented.images] == [NEW.image, OLD.image]
     assert cfg.rented.images[0].note == "newest"
+
+
+# --- what the image carries (D146) ---
+
+SPEECH = "speech"
+PLAIN = EngineImage(image="example/vllm:v0.29.0-cuda-13.0", min_driver="580")
+AUDIO = EngineImage(image="example/vllm-audio:v0.29.0-cuda-12.9", min_driver="550", capabilities=["audio-decoding"])
+
+
+def speech_config(rented_models):
+    """vLLM decodes speech only with its audio extra, so a host holding a speech build starts
+    from an image said to carry it — the second listed here, though the first fits the driver."""
+    return PoolConfig.model_validate({
+        "pool": {"name": "test", "model_set": [MODEL, SPEECH], "models_per_host": "declared"},
+        "auth": {"app_keys": ["k"]},
+        "engine": "vllm",
+        "catalog": {SPEECH: {"variants": [{"tag": "owner/speech", "engine": "vllm", "serves": ["transcribe"]}]}},
+        "hosts": [{"id": "local-1", "kind": "local", "workers": 1, "models": [MODEL],
+                   "transport": {"type": "http", "base_url": "http://127.0.0.1:1"}}],
+        "rented": {
+            "provider": "fake", "engine": "vllm", "workers": 2, "capabilities": ["cuda"],
+            "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 2.0}, "bidding": {"premium": 0.02},
+            "scale": {"scale_up_after_s": 0}, "models": rented_models,
+            "images": [PLAIN.model_dump(), AUDIO.model_dump()],
+        },
+    })
+
+
+def test_a_speech_build_gets_an_image_that_decodes_audio_and_a_chat_build_the_first_that_fits(make_fleet):
+    fleet = make_fleet(speech_config([MODEL, SPEECH]), [])
+    chosen, why = fleet.image_for(default_offer(driver_version="590.0"), ["owner/speech"])
+    assert chosen == AUDIO.image and "audio-decoding" in why
+    chosen, _ = fleet.image_for(default_offer(driver_version="590.0"), [MODEL])
+    assert chosen == PLAIN.image
+
+
+async def test_a_host_rented_for_speech_starts_from_the_image_that_decodes_audio(make_fleet):
+    fleet = make_fleet(speech_config([SPEECH]), [default_offer(driver_version="590.0")])
+    fleet.leases.open(workers=2, max_hours=2, max_spend=5.0, allow_rent=True)
+
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+
+    (spec,) = [i.spec for i in fleet.provider.instances.values()]
+    assert spec.image == AUDIO.image
+
+
+async def test_a_host_whose_agent_finds_the_audio_extra_missing_is_given_up_with_the_reason(make_fleet):
+    fleet = make_fleet(speech_config([SPEECH]), [default_offer(driver_version="590.0")])
+    fleet.leases.open(workers=2, max_hours=2, max_spend=5.0, allow_rent=True)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    (host,) = fleet.hosts.values()
+
+    assert fleet.image_falls_short(host) is None  # the agent has said nothing yet
+    host.agent_facts = {"engine": {"name": "vllm", "carries": ["audio-decoding"]}}
+    assert fleet.image_falls_short(host) is None
+    host.agent_facts = {"engine": {"name": "vllm", "carries": [], "carries_detail": "No module named 'soundfile'"}}
+    why = fleet.image_falls_short(host)
+    assert why and "audio-decoding" in why and "soundfile" in why
+
+
+async def test_an_image_found_lacking_is_not_rented_again_for_that_need(make_fleet):
+    """Each round would pay for a machine to learn the same thing again."""
+    fleet = make_fleet(speech_config([SPEECH]), [default_offer("o-1", "m-1", driver_version="590.0"),
+                                                 default_offer("o-2", "m-2", driver_version="590.0")])
+    fleet.leases.open(workers=2, max_hours=2, max_spend=5.0, allow_rent=True)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    (host,) = fleet.hosts.values()
+    assert host.image == AUDIO.image
+    host.agent_facts = {"engine": {"name": "vllm", "carries": []}}
+    assert fleet.image_falls_short(host)
+
+    chosen, why = fleet.image_for(default_offer(driver_version="590.0"), ["owner/speech"])
+    assert chosen is None and "found by a host's agent" in why
+    chosen, _ = fleet.image_for(default_offer(driver_version="590.0"), [MODEL])
+    assert chosen == PLAIN.image, "the image is still used for what it does carry"

@@ -7,10 +7,12 @@ nothing here needs a GPU or vLLM.
 
 import asyncio
 import json
+import logging
+import secrets
 
 import httpx
 import pytest
-from gpm_agent.proxy import Upstreams, create_app
+from gpm_agent.proxy import FORWARDED_PATHS, MAX_BODY_BYTES, Upstreams, create_app
 
 BIG, SMALL = "gemma4:26b", "gemma4:e4b"
 
@@ -28,22 +30,33 @@ async def _frames():
     yield b"data: [DONE]\n\n"
 
 
+async def _once(data: bytes):
+    """One body, sent as a stream as a real engine's is — an upload's answer is relayed raw."""
+    yield data
+
+
 class Engines:
     """Two engine processes, each serving one model, each on its own URL."""
 
     def __init__(self, healthy=(BIG, SMALL)):
         self.healthy = set(healthy)
         self.seen: list[tuple[str, str, bytes]] = []
+        self.headers: list[httpx.Headers] = []
 
     def transport(self) -> httpx.MockTransport:
         def handler(request: httpx.Request) -> httpx.Response:
             which = BIG if request.url.port == 8001 else SMALL
             path = request.url.path
             self.seen.append((which, path, request.content))
+            self.headers.append(request.headers)
             if path == "/health":
                 return httpx.Response(200 if which in self.healthy else 503)
             if path == "/metrics":
                 return httpx.Response(200, text="vllm:num_requests_running 3.0\n")
+            if request.headers.get("content-type", "").startswith("multipart/form-data"):
+                # An upload, answered as a transcription server answers one; never read here.
+                answer = json.dumps({"served_by": which, "text": "a transcript"}).encode()
+                return httpx.Response(200, content=_once(answer), headers={"content-type": "application/json"})
             body = json.loads(request.content or b"{}")
             if body.get("stream"):
                 # A real streaming response, not a pre-read one: the proxy forwards raw bytes
@@ -104,14 +117,17 @@ async def test_the_body_arrives_byte_for_byte(tmp_path):
     assert path == "/v1/chat/completions", "the path is carried through unchanged"
 
 
-async def test_a_model_this_host_does_not_serve_is_refused_by_name(tmp_path):
+async def test_a_model_this_host_does_not_serve_is_refused(tmp_path, caplog):
+    """In fixed words: the name asked for goes to the log, never into the answer (D142)."""
     engines = Engines()
-    async with proxy_for(tmp_path, engines) as proxy:
-        answer = await proxy.post("/v1/chat/completions", json={"model": "gemma4:31b"})
+    with caplog.at_level(logging.WARNING, logger="gpm.proxy"):
+        async with proxy_for(tmp_path, engines) as proxy:
+            answer = await proxy.post("/v1/chat/completions", json={"model": "gemma4:31b"})
 
     assert answer.status_code == 404
-    detail = answer.json()["error"]["message"]
-    assert "gemma4:31b" in detail and BIG in detail, detail
+    assert answer.json()["error"]["type"] == "model_not_found"
+    assert "gemma4:31b" not in answer.text
+    assert "gemma4:31b" in caplog.text and BIG in caplog.text, "the operator still sees both"
     assert not engines.seen, "nothing was asked of any engine"
 
 
@@ -403,3 +419,269 @@ async def test_an_engine_dying_mid_stream_breaks_the_stream_rather_than_ending_i
             async with proxy.stream("POST", "/v1/chat/completions", json={"model": BIG, "stream": True}) as stream:
                 async for _ in stream.aiter_raw():
                     pass
+
+
+# --- the pool names the model; an upload is routed without being read (D144) ---
+
+#: A transcription upload as the pool's router sends one: rebuilt with the router's boundary, the
+#: file's bytes untouched (not valid UTF-8, as audio is not), its `model` part the header's tag.
+UPLOAD_TYPE = "multipart/form-data; boundary=gpm-test-boundary"
+UPLOAD = (
+    b"--gpm-test-boundary\r\n"
+    b'Content-Disposition: form-data; name="file"; filename="clip.wav"\r\n'
+    b"Content-Type: audio/wav\r\n\r\n"
+    b"RIFF\x24\x00\x00\x00WAVEfmt \xff\xfe\x00\x80"
+    b"\r\n--gpm-test-boundary\r\n"
+    b'Content-Disposition: form-data; name="model"\r\n\r\n'
+    + SMALL.encode()
+    + b"\r\n--gpm-test-boundary\r\n"
+    b'Content-Disposition: form-data; name="stream"\r\n\r\n'
+    b"true"
+    b"\r\n--gpm-test-boundary--\r\n"
+)
+
+
+async def test_an_upload_is_routed_by_the_pools_header_without_being_read(tmp_path):
+    """A form names its model in a field, and reading it would mean parsing a whole recording.
+    The pool's router has already chosen, and says so in a header."""
+    engines = Engines()
+    async with proxy_for(tmp_path, engines) as proxy:
+        answer = await proxy.post("/v1/audio/transcriptions", content=UPLOAD,
+                                  headers={"content-type": UPLOAD_TYPE, "x-gpm-model": SMALL})
+
+    assert answer.status_code == 200 and answer.json()["served_by"] == SMALL
+    (which, path, seen) = engines.seen[-1]
+    assert (which, path) == (SMALL, "/v1/audio/transcriptions")
+    assert seen == UPLOAD, "the form leaves byte for byte"
+    assert engines.headers[-1]["content-type"] == UPLOAD_TYPE, "with its boundary"
+
+
+async def test_an_upload_without_the_pools_header_is_refused_rather_than_read(tmp_path):
+    """Only an older router sends no header, and an older router never sent an upload. Its
+    `model` field names a model served here, and is still not looked for."""
+    engines = Engines()
+    async with proxy_for(tmp_path, engines) as proxy:
+        answer = await proxy.post("/v1/audio/transcriptions", content=UPLOAD, headers={"content-type": UPLOAD_TYPE})
+    assert answer.status_code == 404 and answer.json()["error"]["type"] == "model_not_found"
+    assert not engines.seen
+
+
+async def test_the_pools_header_wins_over_the_body(tmp_path):
+    """The router writes the same tag into both; where they differ, the header is the pool's
+    choice and the body only what came with it."""
+    engines = Engines()
+    async with proxy_for(tmp_path, engines) as proxy:
+        answer = await proxy.post("/v1/chat/completions", json={"model": BIG, "messages": []},
+                                  headers={"x-gpm-model": SMALL})
+    assert answer.json()["served_by"] == SMALL
+
+
+async def test_an_empty_header_names_no_model_rather_than_falling_back_to_the_body(tmp_path):
+    engines = Engines()
+    async with proxy_for(tmp_path, engines) as proxy:
+        answer = await proxy.post("/v1/chat/completions", json={"model": BIG}, headers={"x-gpm-model": ""})
+    assert answer.status_code == 404
+    assert not engines.seen
+
+
+async def test_the_pools_headers_never_reach_an_engine(tmp_path):
+    engines = Engines()
+    body = b'{"model":"gemma4:26b","messages":[]}'
+    async with proxy_for(tmp_path, engines) as proxy:
+        await proxy.post("/v1/chat/completions", content=body, headers={
+            "content-type": "application/json", "x-gpm-model": BIG, "x-request-id": "r-1"})
+
+    sent = engines.headers[-1]
+    assert "x-gpm-model" not in sent
+    assert sent["x-request-id"] == "r-1", "every other header goes on as it came"
+    assert engines.seen[-1][2] == body
+
+
+async def test_a_large_json_body_is_still_routed_by_its_model(tmp_path):
+    """Read on a worker thread above a megabyte — a picture inline — and routed the same."""
+    engines = Engines()
+    picture = "x" * 1_500_000
+    async with proxy_for(tmp_path, engines) as proxy:
+        answer = await proxy.post("/v1/chat/completions", json={"model": BIG, "messages": [picture]})
+    assert answer.json()["served_by"] == BIG
+
+
+# --- only inference reaches an engine (D142) ---
+
+
+def test_the_forwarded_paths_are_a_closed_list():
+    """Adding one is a decision: beside these, engines serve routes that load and unload
+    models."""
+    assert FORWARDED_PATHS == {
+        "/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/embeddings",
+        "/v1/audio/transcriptions", "/v1/audio/translations", "/v1/rerank",
+    }
+
+
+@pytest.mark.parametrize("path", sorted(FORWARDED_PATHS))
+async def test_each_inference_path_is_forwarded_as_named(tmp_path, path):
+    engines = Engines()
+    async with proxy_for(tmp_path, engines) as proxy:
+        answer = await proxy.post(path, json={"model": BIG}, headers={"x-gpm-model": BIG})
+    assert answer.status_code == 200
+    assert engines.seen[-1][:2] == (BIG, path)
+
+
+@pytest.mark.parametrize("path", [
+    "/v1/load_lora_adapter",     # vLLM: loads an adapter it is given the path of
+    "/v1/unload_lora_adapter",
+    "/load",                     # whisper.cpp: loads the model file it is given the path of
+    "/v1/audio/speech",          # a kind not served (D142)
+    "/v1/chat/completions/x",    # by name, never by prefix
+    "/v1/chat/completions/",
+    "/V1/chat/completions",
+    "/v1/chat/completions%3Fx",  # decoded, it only starts like an allowed path
+    "/v1/models",                # this process's own, asked with GET
+    "/api/pull",
+])
+async def test_any_other_path_is_refused_and_never_forwarded(tmp_path, path):
+    engines = Engines()
+    async with proxy_for(tmp_path, engines) as proxy:
+        answer = await proxy.post(path, json={"model": BIG}, headers={"x-gpm-model": BIG})
+    assert answer.status_code == 404
+    assert answer.json()["error"]["type"] == "path_not_served"
+    assert not engines.seen, "no engine heard of it"
+
+
+# --- an error answer says nothing the caller sent (D142) ---
+
+
+def hostile() -> str:
+    """Markup, and a string long and random enough that no fixed message holds it by chance."""
+    return f"<script>alert(1)</script>{secrets.token_hex(64)}"
+
+
+async def test_an_unknown_model_is_refused_in_the_same_words_whatever_is_asked(tmp_path, caplog):
+    first, second = hostile(), hostile()
+    engines = Engines()
+    with caplog.at_level(logging.WARNING, logger="gpm.proxy"):
+        async with proxy_for(tmp_path, engines) as proxy:
+            by_header = await proxy.post("/v1/chat/completions", json={"model": first},
+                                         headers={"x-gpm-model": first})
+            by_body = await proxy.post("/v1/chat/completions", json={"model": second})
+            by_form = await proxy.post("/v1/audio/transcriptions", content=UPLOAD,
+                                       headers={"content-type": UPLOAD_TYPE, "x-gpm-model": second})
+
+    for answer in (by_header, by_body, by_form):
+        assert answer.status_code == 404
+        assert first not in answer.text and second not in answer.text and "<script>" not in answer.text
+    assert by_header.json() == by_body.json() == by_form.json()
+    assert first in caplog.text, "the operator still sees what was asked"
+    assert not engines.seen
+
+
+async def test_a_refused_path_is_not_echoed(tmp_path):
+    word = hostile()
+    engines = Engines()
+    async with proxy_for(tmp_path, engines) as proxy:
+        answer = await proxy.post(f"/v1/{word}", json={"model": BIG}, headers={"x-gpm-model": BIG})
+    assert answer.status_code == 404
+    assert word[-128:] not in answer.text and "script" not in answer.text
+
+
+async def test_an_engine_that_did_not_answer_is_reported_without_its_details(tmp_path, caplog):
+    """Neither the model, the copies' addresses nor the connection's error reach the caller."""
+    copies = Copies()
+    copies.refusing = {8001, 8002}
+    with caplog.at_level(logging.WARNING, logger="gpm.proxy"):
+        async with copies_proxy(tmp_path, copies) as proxy:
+            whole = await proxy.post("/v1/chat/completions", json={"model": BIG}, headers={"x-gpm-model": BIG})
+            streamed = await proxy.post("/v1/chat/completions", json={"model": BIG, "stream": True},
+                                        headers={"x-gpm-model": BIG})
+
+    for answer in (whole, streamed):
+        assert answer.status_code == 502 and answer.json()["error"]["type"] == "upstream_unavailable"
+        assert BIG not in answer.text and "8001" not in answer.text and "refused" not in answer.text
+    assert "connection refused" in caplog.text
+
+
+# --- an upload's answer is relayed as it comes ---
+
+
+async def _transcript_events():
+    yield b'data: {"type":"transcript.text.delta","delta":"a trans"}\n\n'
+    yield b'data: {"type":"transcript.text.done","text":"a transcript"}\n\n'
+
+
+@pytest.mark.parametrize("status, content_type, chunks", [
+    (200, "text/event-stream", _transcript_events),
+    (200, "text/plain; charset=utf-8", lambda: _once(b"a transcript")),
+    (400, "application/json", lambda: _once(b'{"error":{"message":"not audio","type":"invalid_request_error"}}')),
+])
+async def test_an_uploads_answer_is_relayed_as_it_comes_with_the_engines_status_and_type(
+        tmp_path, status, content_type, chunks):
+    """Whether a transcription streams is a field of its form, which is not read here — so an
+    upload's answer is always relayed as the engine sends it, and in the engine's own words."""
+    sent = []
+
+    def handler(request):
+        sent.append(request.content)
+        return httpx.Response(status, content=chunks(), headers={"content-type": content_type})
+
+    async with one_copy_proxy(tmp_path, handler) as proxy:
+        answer = await proxy.post("/v1/audio/transcriptions", content=UPLOAD,
+                                  headers={"content-type": UPLOAD_TYPE, "x-gpm-model": BIG})
+
+    assert answer.status_code == status
+    assert answer.headers["content-type"].startswith(content_type)
+    assert answer.content == b"".join([chunk async for chunk in chunks()])
+    assert "content-length" not in answer.headers, "relayed as it came, not held until whole"
+    assert sent == [UPLOAD]
+
+
+# --- a bound on what is held ---
+
+
+def test_the_bound_is_above_the_pools_own_request_limit():
+    """It must not refuse what the pool let through (D144)."""
+    from gpm_server.config import PoolSettings
+
+    assert MAX_BODY_BYTES > PoolSettings.model_fields["max_request_mb"].default * 1_000_000
+
+
+def test_the_bound_is_above_the_most_the_pools_limit_may_be_with_room_for_a_rebuilt_form():
+    """At the largest `pool.max_request_mb` allowed, the pool accepts a body of exactly that size
+    and then rebuilds an upload's form to name the build — a boundary and the model's tag longer.
+    Equal bounds would refuse that body here, after the pool let it through."""
+    from annotated_types import Le
+    from gpm_server.config import PoolSettings
+
+    [most] = [rule.le for rule in PoolSettings.model_fields["max_request_mb"].metadata if isinstance(rule, Le)]
+    assert MAX_BODY_BYTES - most * 1_000_000 >= 64 * 1024
+
+
+def bounded_proxy(tmp_path, engines: Engines, limit: int) -> httpx.AsyncClient:
+    app = create_app(
+        upstream_file(tmp_path, {BIG: "http://127.0.0.1:8001"}),
+        client=httpx.AsyncClient(transport=engines.transport(), timeout=10),
+        max_body_bytes=limit,
+    )
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy")
+
+
+async def test_a_body_over_the_bound_is_refused_before_an_engine_sees_it(tmp_path):
+    engines = Engines()
+    upload = {"content-type": UPLOAD_TYPE, "x-gpm-model": BIG}
+
+    async def undeclared():
+        # Sent with no length, so it can only be counted as it arrives.
+        for _ in range(4):
+            yield b"x" * 300
+
+    async with bounded_proxy(tmp_path, engines, limit=1000) as proxy:
+        # The length it declares is enough: refused before a byte of it is read.
+        declared = await proxy.post("/v1/audio/transcriptions", content=b"x" * 10,
+                                    headers={**upload, "content-length": "1001"})
+        counted = await proxy.post("/v1/audio/transcriptions", content=undeclared(), headers=upload)
+        at_the_bound = await proxy.post("/v1/audio/transcriptions", content=b"x" * 1000, headers=upload)
+
+    for answer in (declared, counted):
+        assert answer.status_code == 413
+        assert answer.json()["error"]["type"] == "request_too_large"
+    assert at_the_bound.status_code == 200
+    assert len(engines.seen) == 1, "only the body within the bound was forwarded"

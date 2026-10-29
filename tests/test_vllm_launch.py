@@ -658,3 +658,165 @@ def test_an_upgraded_host_stops_its_older_launchers_engines_and_nothing_else(tmp
     processes.launch(tmp_path, cmdline=lines.get)
     assert (4242, signal.SIGTERM) in processes.killed and not any(pid == 4343 for pid, _ in processes.killed)
     assert not (tmp_path / vllm_launch.PIDS_FILE).exists()
+
+
+# --- each model no longer than it goes (D146) ---
+
+WHISPER = "openai/whisper-large-v3-turbo"
+RERANKER = "BAAI/bge-reranker-base"
+
+
+def with_files(directory, **files):
+    """A model's own JSON files, by name (`config`, `tokenizer_config`, …)."""
+    for name, body in files.items():
+        (directory / f"{name}.json").write_text(json.dumps(body))
+    return directory
+
+
+# Whisper's own configuration states its decoder's length and no `max_position_embeddings`.
+WHISPER_CONFIG = {"model_type": "whisper", "max_source_positions": 1500, "max_target_positions": 448}
+
+
+def launch_asking(processes, models_dir, length, **kwargs):
+    env = {"GPM_VLLM_MAX_NUM_SEQS": "8"}
+    if length is not None:
+        env["GPM_VLLM_MAX_MODEL_LEN"] = str(length)
+    return vllm_launch.launch(
+        models_dir, 8000, popen=processes.popen, kill=processes.kill, alive=lambda pid: False, env=env,
+        probe_card=lambda: None, probe_devices=lambda env: [], agent="/var/run/gpm/gpm-agent.pyz",
+        python="python3", **kwargs,
+    )
+
+
+def length_flag(argv):
+    return argv[argv.index("--max-model-len") + 1] if "--max-model-len" in argv else None
+
+
+def test_whisper_is_started_at_its_decoders_length_and_says_so(tmp_path):
+    """vLLM refuses to start a model with a length above the one its configuration states, and
+    the pool sends a text model's context to every process: Whisper would never start."""
+    with_files(downloaded(tmp_path, WHISPER, 100), config=WHISPER_CONFIG)
+    processes = Processes()
+    started = launch_asking(processes, tmp_path, 8192)
+
+    assert length_flag(processes.started[0]) == "448"
+    assert started.plan["models"][WHISPER]["max_model_len_capped"] == {"asked": 8192, "applied": 448}
+    assert vllm_launch.capped_lengths(tmp_path) == {WHISPER: {"asked": 8192, "applied": 448}}, \
+        "recorded where the agent reads it"
+
+
+def test_a_model_that_goes_further_than_the_pool_asked_gets_the_pools_number(tmp_path):
+    with_files(downloaded(tmp_path, BIG, 100), config={"model_type": "qwen3", "max_position_embeddings": 131072})
+    processes = Processes()
+    started = launch_asking(processes, tmp_path, 8192)
+    assert length_flag(processes.started[0]) == "8192"
+    assert "max_model_len_capped" not in started.plan["models"][BIG]
+    assert vllm_launch.capped_lengths(tmp_path) == {}
+
+
+def test_a_model_built_around_a_text_model_is_held_to_the_text_models_length(tmp_path):
+    with_files(downloaded(tmp_path, BIG, 100), config={
+        "model_type": "gemma3", "text_config": {"model_type": "gemma3_text", "max_position_embeddings": 4096},
+        "vision_config": {"max_position_embeddings": 999_999},
+    })
+    processes = Processes()
+    launch_asking(processes, tmp_path, 8192)
+    assert length_flag(processes.started[0]) == "4096"
+
+
+def test_a_model_that_states_no_length_gets_the_pools_number(tmp_path):
+    """vLLM then takes whatever it is given, so the launcher has nothing to hold it to."""
+    downloaded(tmp_path, BIG, 100)  # no config.json at all
+    with_files(downloaded(tmp_path, EMBED, 100), config={"model_type": "nomic_bert"})
+    processes = Processes()
+    launch_asking(processes, tmp_path, 8192, proxy=True)
+    assert [length_flag(argv) for argv in processes.started if "serve" in argv] == ["8192", "8192"]
+    assert vllm_launch.capped_lengths(tmp_path) == {}
+
+
+def test_without_the_pools_number_no_length_is_passed_at_all(tmp_path):
+    """Absent means the engine's own default, as for every number the pool sends."""
+    with_files(downloaded(tmp_path, WHISPER, 100), config=WHISPER_CONFIG)
+    processes = Processes()
+    started = launch_asking(processes, tmp_path, None)
+    assert length_flag(processes.started[0]) is None
+    assert "max_model_len_capped" not in started.plan["models"][WHISPER]
+
+
+def test_behind_the_router_each_model_gets_its_own_length_on_every_copy(tmp_path):
+    with_files(downloaded(tmp_path, WHISPER, 100), config=WHISPER_CONFIG)
+    with_files(downloaded(tmp_path, BIG, 100), config={"max_position_embeddings": 131072})
+    processes = Processes()
+    launch_asking(processes, tmp_path, 8192, proxy=True, devices=["0", "1"])
+    lengths = {(argv[4], length_flag(argv)) for argv in processes.started if "serve" in argv}
+    assert lengths == {(WHISPER, "448"), (BIG, "8192")}
+    assert len([argv for argv in processes.started if "serve" in argv]) == 4, "a copy of each on each card"
+
+
+def test_a_refused_start_reports_no_lengths(tmp_path):
+    with_files(downloaded(tmp_path, WHISPER, 19_000), config=WHISPER_CONFIG)
+    processes = Processes()
+    started = launch_asking(processes, tmp_path, 8192, card_bytes=20_000)
+    assert started.refused and vllm_launch.capped_lengths(tmp_path) == {}
+
+
+@pytest.mark.parametrize(("files", "expected"), [
+    # The smallest stated length, wherever vLLM looks for one.
+    ({"config": {"max_position_embeddings": 4096, "n_positions": 2048}}, 2048),
+    ({"config": {"seq_length": 32768}}, 32768),
+    # `model_max_length` stands as it is, even where another key says less (Command-R).
+    ({"config": {"max_position_embeddings": 8192, "model_max_length": 131072}}, 131072),
+    # Lengths that are not numbers are not lengths.
+    ({"config": {"max_position_embeddings": "long", "max_seq_len": True}}, None),
+    # A reranker's encoder is held to its tokenizer's own limit: 514 positions, 512 tokens.
+    ({"config": {"architectures": ["XLMRobertaForSequenceClassification"],
+                 "position_embedding_type": "absolute", "max_position_embeddings": 514},
+      "tokenizer_config": {"model_max_length": 512}}, 512),
+    # … and so is an embedding encoder …
+    ({"config": {"architectures": ["BertModel"], "position_embedding_type": "absolute", "max_position_embeddings": 514},
+      "tokenizer_config": {"model_max_length": 512}}, 512),
+    # … and a sentence-transformers model, whatever its architecture …
+    ({"config": {"architectures": ["SomeForCausalLM"], "position_embedding_type": "absolute",
+                 "max_position_embeddings": 514},
+      "tokenizer_config": {"model_max_length": 512},
+      "modules": [{"idx": 0, "type": "sentence_transformers.models.Transformer", "path": ""},
+                  {"idx": 1, "type": "sentence_transformers.models.Pooling", "path": "1_Pooling"}]}, 512),
+    # … but only a model vLLM runs for pooling: one that generates is not held to it, absolute
+    # positions or not — `…LMHeadModel` included, though it ends in `Model` …
+    ({"config": {"architectures": ["SomeForCausalLM"], "position_embedding_type": "absolute",
+                 "max_position_embeddings": 514},
+      "tokenizer_config": {"model_max_length": 512}}, 514),
+    ({"config": {"architectures": ["SomeLMHeadModel"], "position_embedding_type": "absolute",
+                 "max_position_embeddings": 514},
+      "tokenizer_config": {"model_max_length": 512}}, 514),
+    ({"config": {"position_embedding_type": "absolute", "max_position_embeddings": 514},
+      "tokenizer_config": {"model_max_length": 512}}, 514),
+    # … and only an encoder with absolute positions, as vLLM does.
+    ({"config": {"architectures": ["XLMRobertaForSequenceClassification"], "max_position_embeddings": 514},
+      "tokenizer_config": {"model_max_length": 512}}, 514),
+    # A sentence-transformers model's own `max_seq_length` replaces the rest outright.
+    ({"config": {"max_position_embeddings": 512},
+      "sentence_bert_config": {"max_seq_length": 256, "do_lower_case": False}}, 256),
+    ({"config": {"max_position_embeddings": 512}, "sentence_bert_config": {"max_seq_length": 256}}, 512),
+    # Rotary scaling, as vLLM counts it: multiplied by its factor …
+    ({"config": {"max_position_embeddings": 4096,
+                 "rope_scaling": {"type": "linear", "factor": 2.0}}}, 8192),
+    # … from the length it was trained at, for yarn …
+    ({"config": {"max_position_embeddings": 131072,
+                 "rope_scaling": {"rope_type": "yarn", "factor": 2.0, "original_max_position_embeddings": 32768}}},
+     65536),
+    # … and not at all where the stated length is already the scaled one.
+    ({"config": {"max_position_embeddings": 131072, "rope_scaling": {"rope_type": "llama3", "factor": 8.0}}}, 131072),
+    ({"config": {"model_type": "gemma3_text", "max_position_embeddings": 131072,
+                 "rope_scaling": {"rope_type": "linear", "factor": 8.0}}}, 131072),
+    # One scaling per kind of attention layer.
+    ({"config": {"max_position_embeddings": 4096, "rope_parameters": {
+        "full_attention": {"rope_type": "linear", "factor": 4.0},
+        "sliding_attention": {"rope_type": "default"}}}}, 16384),
+    ({"config": ["not", "a", "configuration"]}, None),
+])
+def test_a_models_own_length_is_read_as_vllm_reads_it(tmp_path, files, expected):
+    directory = tmp_path / "model"
+    directory.mkdir()
+    with_files(directory, **files)
+    assert vllm_launch.max_model_len_of(directory) == expected

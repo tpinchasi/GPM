@@ -198,6 +198,7 @@ gets the default suite, lint, the version check, the secret scan and the depende
 |---|---|
 | [client/](client/) | `gpm_client` — the SDK an app depends on. One dependency: `httpx`. **[How to use it](client/README.md)** |
 | [agent/](agent/) | `gpm_agent` — the optional host agent: tells the pool what a machine is. [Design](docs/spec/host-agent.md) |
+| [examples/](examples/) | Small programs against a pool: a question about a picture, speech to text, ranking, the OpenAI client with the pool's waiting |
 | [server/](server/) | `gpm_server` — the router, the engine adapters, the `pool` command |
 | [tests/](tests/) | The default suite against a fake engine and a fake provider, the opt-in suite against a real Ollama, and [the simulation](docs/simulation.md) |
 
@@ -215,6 +216,7 @@ Start with the overview. The specification is generic and names no adopter.
 |---|---|
 | [STATUS.md](STATUS.md) | Where the project stands, what is decided, what is open, what to do next, session log |
 | [docs/overview.md](docs/overview.md) | The concepts in one read: pool, hosts, workers, model set, routing priority, leases, the two processes, the SDK, the console |
+| [docs/models-beyond-chat.md](docs/models-beyond-chat.md) | Speech to text, pictures in chat and ranking: which engine serves what, setting each up — whisper.cpp on a Mac included — and what an operator is told when a configuration cannot work |
 | [docs/spec/app-contract.md](docs/spec/app-contract.md) | What an app relies on: the engine API plus a small pool dialect, keys, the client SDK and its default wait-and-retry, the time budget |
 | [docs/spec/hosts-routing-capacity.md](docs/spec/hosts-routing-capacity.md) | Host kinds, transports and states; workers per host; the pool's model set; logical model names resolved by host capability; runtime classes; routing |
 | [docs/spec/supervisor.md](docs/spec/supervisor.md) | Process layout, leases, cost controls and spend reconciliation, renting, bidding, evictions, the dead-man timer, preparing a host on request, tear-down, configuration sketch |

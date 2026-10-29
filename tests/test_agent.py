@@ -91,8 +91,9 @@ def test_the_agent_never_runs_a_shell_or_a_command_it_was_given():
                     # facts.py runs literal argument lists to learn what the machine is. The vLLM
                     # launcher (D97) starts `vllm` and the agent's own router, as fixed argument
                     # lists — and is a command-line entry for the machine's restart script,
-                    # reachable from nothing on the agent's protocol (checked below).
-                    assert path.name in ("facts.py", "vllm_launch.py"), f"{path.name} can start a process"
+                    # reachable from nothing on the agent's protocol (checked below). whisper.cpp's
+                    # server is started by the agent itself (D148): checked below for what it runs.
+                    assert path.name in ("facts.py", "vllm_launch.py", "whisper_cpp.py"), f"{path.name} can start a process"
         text = path.read_text()
         assert "os.system" not in text and "os.popen" not in text and "create_subprocess_shell" not in text
         if "create_subprocess_exec" in text:
@@ -108,6 +109,30 @@ def test_the_agent_never_runs_a_shell_or_a_command_it_was_given():
         assert "vllm_launch" not in text, f"{name} reaches the launcher, which can start processes"
     launcher = (root / "vllm_launch.py").read_text()
     assert "shell=" not in launcher and "os.system" not in launcher
+
+    # The one process the agent starts on the pool's behalf (D148): the program — the owner's
+    # `engine_binary`, or `whisper-server` on the agent's PATH — with the argument list built in
+    # `server_argv` from the agent's own constants, a file under its models directory and its
+    # port. The only other command is `ps`, a literal, to read a process's command line.
+    whisper = ast.parse((root / "whisper_cpp.py").read_text())
+    calls = [
+        node for node in ast.walk(whisper)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name) and node.func.value.id == "subprocess"
+    ]
+    assert sorted(call.func.attr for call in calls) == ["Popen", "run"]
+    for call in calls:
+        command = call.args[0]
+        if call.func.attr == "Popen":
+            assert isinstance(command, ast.Name) and command.id == "argv"
+        else:
+            assert isinstance(command, ast.List) and isinstance(command.elts[0], ast.Constant)
+            assert command.elts[0].value == "ps"
+    assigned = [
+        node.value for node in ast.walk(whisper)
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "argv" for t in node.targets)
+    ]
+    assert len(assigned) == 1 and isinstance(assigned[0], ast.Call) and assigned[0].func.id == "server_argv"
 
 
 # --- the agent's own settings ---
@@ -391,7 +416,7 @@ async def test_anything_that_is_not_a_plain_model_tag_never_reaches_the_engine(t
     machine = Machine()
     refused = await machine.call("PUT", {"tags": [tag], "residency": "on_demand"})
     assert refused.status_code == 400 and refused.json()["error"] == "bad_tag"
-    assert machine.engine.received == []
+    assert inference_seen(machine.engine) == []
 
 
 async def test_registry_style_tags_are_plain_tags():
@@ -442,6 +467,49 @@ async def test_a_failed_pull_is_left_alone_for_a_while_not_hammered_every_pass()
     await machine.hold(["nope"])
     await machine.hold(["nope"])
     assert [path for path, _, _ in machine.engine.received].count("/api/pull") == 1
+
+
+async def test_a_model_that_leaves_the_set_while_it_loads_is_released_in_the_same_pass():
+    """The pass loading it is still waiting when the pool's next pass empties the set. The pin
+    that load sets is released — not dropped as stale by what the pass saw before the load, with
+    the engine left holding the model for good."""
+    machine = Machine(available={"a"})
+    machine.engine.load_delay_s = 0.5
+    assert (await machine.call("PUT", {"tags": ["a"], "residency": "pinned"})).status_code == 200
+    loading = machine.app.state.work._task
+    await asyncio.sleep(0.1)
+    assert (await machine.call("PUT", {"tags": [], "residency": "pinned"})).status_code == 200
+    await loading
+    assert machine.engine.pinned == set()
+    assert machine.app.state.work.pinned_by_agent == set()
+
+
+async def test_an_error_from_the_system_while_holding_is_reported_and_left_alone_for_a_while():
+    """An engine that starts a program writes files and signals processes: the system can say no
+    — a directory this user may not write, a process it may not signal. That is a refusal like
+    any other: in the snapshot against the model, and not tried again on every pass."""
+    from gpm_agent.models import ModelWork
+
+    class Engine:
+        name = "fake"
+        fetches_without_engine = True
+        loads_by_restart = False
+        holds = 0
+
+        async def describe(self, client):
+            return {"answers": False, "models_on_disk": [{"tag": "m", "size_bytes": 1}], "models_loaded": []}
+
+        async def hold(self, client, tag, *, pinned):
+            Engine.holds += 1
+            raise PermissionError(13, "Permission denied", "/Volumes/models.gpm-state")
+
+    work = ModelWork(Engine(), None, free_disk_bytes=lambda: None, min_free_disk_gb=0, allow_delete=False)
+    for _ in range(3):
+        await work.apply({"tags": ["m"], "residency": "pinned"})
+        await work._task
+    [held] = (await work.snapshot())["models"]
+    assert "Permission denied" in held["error"] and not held["loaded"]
+    assert Engine.holds == 1
 
 
 # --- deletion: the owner's choice, inside three bounds (D40) ---
@@ -630,6 +698,8 @@ def test_deleting_from_the_console_needs_the_tag_twice_and_never_touches_a_catal
 # =====================================================================================
 
 import sys  # noqa: E402
+
+from fakes.fake_ollama import inference_seen  # noqa: E402
 
 
 def restartable(tmp_path, *, env_file=True, command=None, **more):

@@ -1,13 +1,19 @@
-"""The agent's vLLM side: fetching weights from a hub, and reporting what the engine serves.
+"""The agent's vLLM side: fetching weights from a hub, and reporting what the engine serves and
+what its image carries.
 
 docs/spec/host-agent.md §4. Against a fake hub and a fake engine; nothing here reaches the
 network, needs a GPU, or installs vLLM.
 """
 
+import sys
+import time
+from pathlib import Path
+
 import httpx
 import pytest
-from gpm_agent import modelhub
+from gpm_agent import modelhub, vllm_launch
 from gpm_agent.engines import EngineRefused, VllmFacts, engine_facts
+from gpm_agent.facts import audio_extra, interpreter_of
 
 REPO = "nvidia/Gemma-4-26B-A4B-NVFP4"
 
@@ -360,6 +366,172 @@ def test_the_numbers_read_back_are_the_numbers_written(tmp_path):
         "workers": 84, "models_held": 1, "context": 32768,
     }
     assert engine.settings_from_environment(None) is None
+
+
+# --- what the image carries: vLLM's audio extra, checked on the host (D146) ---
+
+
+def executable(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    path.chmod(0o755)
+    return path
+
+
+def fake_interpreter(bin_dir: Path, *, exit_code: int = 0, said: str = "", sleep_s: float = 0) -> Path:
+    """A stand-in for the image's Python: records how it was run, waits, says a line, exits."""
+    return executable(bin_dir / "python3", (
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$*" >> "{bin_dir}/runs"\n'
+        + (f"sleep {sleep_s}\n" if sleep_s else "")
+        + (f"echo \"{said}\" >&2\n" if said else "")
+        + f"exit {exit_code}\n"
+    ))
+
+
+def vllm_running_under(bin_dir: Path, interpreter: str) -> Path:
+    """A console script as an installer writes it: the interpreter on its first line."""
+    return executable(bin_dir / "vllm", f"#!{interpreter}\nfrom vllm.entrypoints.cli.main import main\nmain()\n")
+
+
+def test_the_interpreter_is_read_from_the_commands_first_line(tmp_path):
+    vllm = vllm_running_under(tmp_path / "bin", "/opt/venv/bin/python3.12")
+    assert interpreter_of(str(vllm)) == "/opt/venv/bin/python3.12"
+
+
+def test_an_interpreter_named_through_env_is_found_on_the_same_path(tmp_path):
+    bin_dir = tmp_path / "bin"
+    python = fake_interpreter(bin_dir)
+    vllm_running_under(bin_dir, "/usr/bin/env python3")
+    assert interpreter_of("vllm", path=str(bin_dir)) == str(python)
+
+
+@pytest.mark.parametrize("first_line", [
+    "import sys",  # no `#!` at all
+    "#!/bin/sh",  # a shell wrapper: not guessed at
+    "#!/usr/bin/env -S python3 -u",
+    "#!python3",  # not an absolute path
+    "#!/usr/bin/env",
+])
+def test_a_command_that_is_not_plainly_a_python_script_is_not_guessed_at(tmp_path, first_line):
+    vllm = executable(tmp_path / "vllm", f"{first_line}\n")
+    assert interpreter_of(str(vllm), path=str(tmp_path)) is None
+
+
+def test_no_command_is_no_interpreter(tmp_path):
+    assert interpreter_of("vllm", path=str(tmp_path)) is None
+
+
+def test_the_check_imports_with_the_commands_own_interpreter_isolated(tmp_path):
+    """The real interpreter, run as vLLM's would be: what imports is what that Python has."""
+    vllm = vllm_running_under(tmp_path / "bin", sys.executable)
+    assert audio_extra(str(vllm), modules=("json", "email.parser")) == (True, None)
+
+
+def test_a_missing_module_is_named_from_the_errors_last_line(tmp_path):
+    vllm = vllm_running_under(tmp_path / "bin", sys.executable)
+    imports, detail = audio_extra(str(vllm), modules=("json", "gpm_no_such_module"))
+    assert imports is False
+    assert detail == "ModuleNotFoundError: No module named 'gpm_no_such_module'"
+
+
+def test_a_module_on_the_agents_own_paths_does_not_count(tmp_path, monkeypatch):
+    """Isolated: neither PYTHONPATH nor the working directory can make the extra look present."""
+    planted = tmp_path / "planted"
+    planted.mkdir()
+    (planted / "gpm_planted_module.py").write_text("")
+    monkeypatch.setenv("PYTHONPATH", str(planted))
+    monkeypatch.chdir(planted)
+    vllm = vllm_running_under(tmp_path / "bin", sys.executable)
+    imports, _ = audio_extra(str(vllm), modules=("gpm_planted_module",))
+    assert imports is False
+
+
+def test_the_check_is_a_fixed_argument_list_of_vllms_audio_modules(tmp_path):
+    bin_dir = tmp_path / "bin"
+    vllm_running_under(bin_dir, str(fake_interpreter(bin_dir)))
+    audio_extra(str(bin_dir / "vllm"))
+    assert (bin_dir / "runs").read_text() == "-I -c import av, scipy.signal, soundfile, soxr\n"
+
+
+def test_a_check_that_could_not_run_says_nothing(tmp_path):
+    """No command, an interpreter that is not there, one that hangs: not known — never missing."""
+    assert audio_extra("vllm", path=str(tmp_path)) is None
+    gone = vllm_running_under(tmp_path / "bin", str(tmp_path / "nowhere" / "python3"))
+    assert audio_extra(str(gone)) is None
+    slow = tmp_path / "slow"
+    vllm_running_under(slow, str(executable(slow / "python3", "#!/bin/sh\nexec sleep 30\n")))
+    started = time.monotonic()
+    assert audio_extra(str(slow / "vllm"), timeout_s=0.3) is None
+    assert time.monotonic() - started < 10, "given up at the timeout, not waited out"
+
+
+async def test_the_facts_say_the_image_carries_audio_decoding(tmp_path):
+    bin_dir = tmp_path / "bin"
+    engine = facts(tmp_path)
+    engine.vllm_command = str(vllm_running_under(bin_dir, str(fake_interpreter(bin_dir))))
+    assert await engine.carries() == {"carries": ["audio-decoding"]}
+    async with engine_answering(SERVING) as client:
+        described = await engine.describe(client)
+    assert described["carries"] == ["audio-decoding"] and "carries_detail" not in described
+
+
+async def test_the_facts_say_what_is_missing_when_the_image_lacks_it(tmp_path):
+    """vLLM's own image: it starts, and answers every recording 400, saying why only in its log."""
+    bin_dir = tmp_path / "bin"
+    python = fake_interpreter(bin_dir, exit_code=1, said="ModuleNotFoundError: No module named 'av'")
+    engine = facts(tmp_path)
+    engine.vllm_command = str(vllm_running_under(bin_dir, str(python)))
+    await engine.carries()
+    async with engine_answering({}) as client:  # the engine not started yet: known all the same
+        described = await engine.describe(client)
+    assert described["carries"] == []
+    assert described["carries_detail"] == "ModuleNotFoundError: No module named 'av'"
+
+
+async def test_the_facts_say_nothing_when_the_check_could_not_run(tmp_path):
+    engine = facts(tmp_path)
+    engine.vllm_command = str(tmp_path / "no-such-vllm")
+    assert await engine.carries() == {}
+    async with engine_answering(SERVING) as client:
+        described = await engine.describe(client)
+    assert "carries" not in described and "carries_detail" not in described
+
+
+async def test_the_check_runs_once_and_never_holds_up_the_facts(tmp_path):
+    """The pool asks for facts on a four-second timeout, on every pass; the image never changes."""
+    bin_dir = tmp_path / "bin"
+    engine = facts(tmp_path)
+    engine.vllm_command = str(vllm_running_under(bin_dir, str(fake_interpreter(bin_dir, sleep_s=1))))
+    async with engine_answering(SERVING) as client:
+        started = time.monotonic()
+        first = await engine.describe(client)
+        assert time.monotonic() - started < 0.9 and "carries" not in first, "not known yet, and not waited for"
+        await engine.carries()
+        for _ in range(3):
+            assert (await engine.describe(client))["carries"] == ["audio-decoding"]
+    assert len((bin_dir / "runs").read_text().splitlines()) == 1
+
+
+# --- each model no longer than it goes (D146) ---
+
+
+async def test_the_facts_say_which_models_were_started_shorter_than_the_pool_asked(tmp_path):
+    whisper = downloaded(tmp_path, "openai/whisper-large-v3-turbo")
+    (whisper / "config.json").write_text('{"model_type": "whisper", "max_target_positions": 448}')
+    downloaded(tmp_path)  # states no length: given the pool's
+    vllm_launch.launch(
+        tmp_path, 8000, proxy=True, env={"GPM_VLLM_MAX_MODEL_LEN": "8192"},
+        popen=lambda argv, **kwargs: type("Process", (), {"pid": None})(), alive=lambda pid: False,
+        probe_card=lambda: None, probe_devices=lambda env: [], agent="gpm-agent.pyz", python="python3",
+    )
+    engine = facts(tmp_path)
+    engine.vllm_command = str(tmp_path / "no-such-vllm")
+    async with engine_answering(SERVING) as client:
+        described = await engine.describe(client)
+    assert described["max_model_len_capped"] == {
+        "openai/whisper-large-v3-turbo": {"asked": 8192, "applied": 448},
+    }
 
 
 def test_the_registry_builds_both_engines_the_same_way(tmp_path):

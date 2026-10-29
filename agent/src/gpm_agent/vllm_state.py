@@ -90,3 +90,18 @@ def failed_engines(models_dir: Path, served: Sequence[str],
         on = "" if card is None else f" on cards {card}" if "," in str(card) else f" on card {card}"
         failed[name] = f"its vLLM process{on} exited before serving it: {reason}"
     return failed
+
+
+def capped_lengths(models_dir: Path) -> dict[str, dict[str, int]]:
+    """Models the launcher started at a shorter `--max-model-len` than the pool asked for — their
+    own maximum (D146) — with both numbers, by model. Nothing from a start it refused: nothing
+    was started at any length."""
+    record = read_record(models_dir)
+    if not record or record.get("refused"):
+        return {}
+    models = (record.get("plan") or {}).get("models") or {}
+    return {
+        name: dict(planned["max_model_len_capped"])
+        for name, planned in models.items()
+        if isinstance(planned, dict) and isinstance(planned.get("max_model_len_capped"), dict)
+    }

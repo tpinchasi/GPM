@@ -9,6 +9,7 @@ import sqlite3
 import textwrap
 
 import pytest
+from fakes.fake_ollama import inference_seen
 from fakes.harness import EngineSpec, pool_harness
 from gpm_server import db as gpm_db
 from gpm_server.config import ConfigError, load_config
@@ -44,7 +45,7 @@ def test_an_on_demand_host_is_ready_with_the_set_on_disk_and_the_engine_loads_on
         assert response.status_code == 200, response.text
         assert response.headers["X-GPM-Served-Model"] == MODEL
         assert MODEL in fake.resident  # the engine loaded it, on use
-        assert [path for path, _, _ in fake.received] == ["/api/chat"]  # and fetched nothing
+        assert [path for path, _, _ in inference_seen(fake)] == ["/api/chat"]  # and fetched nothing
 
 
 def test_a_pinned_host_with_the_set_only_on_disk_stays_out_of_routing():
@@ -54,7 +55,7 @@ def test_a_pinned_host_with_the_set_only_on_disk_stays_out_of_routing():
         assert host.state.value == "preparing"
         assert "not resident" in host.last_error
         assert chat(pool).status_code == 503
-        assert pool.engines["box"].fake.received == []
+        assert inference_seen(pool.engines["box"].fake) == []
 
 
 def test_an_on_demand_host_missing_a_tag_from_disk_stays_out_and_nothing_is_pulled():
@@ -68,7 +69,7 @@ def test_an_on_demand_host_missing_a_tag_from_disk_stays_out_and_nothing_is_pull
         assert host.state.value == "preparing"
         assert "not on disk" in host.last_error
         assert chat(pool).status_code == 503
-        assert pool.engines["laptop"].fake.received == []
+        assert inference_seen(pool.engines["laptop"].fake) == []
 
 
 def test_an_evicted_model_leaves_an_on_demand_host_in_routing_but_takes_a_pinned_one_out():

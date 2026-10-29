@@ -96,6 +96,8 @@ class RentedHost:
     #: (D111). Empty for a host bought without profiles: its builds are the catalog's first.
     profile: Optional[str] = None
     builds: dict[str, str] = dataclasses.field(default_factory=dict)
+    #: The image it was started from, where this pool started it (not known for one adopted).
+    image: Optional[str] = None
     #: How many cards each copy of its models spans (D114), fixed when it was bought: the
     #: machine was searched for that many, and every relaunch must ask for the same.
     cards_per_copy: int = 1
@@ -503,6 +505,9 @@ class Fleet:
         #: The last attempt rented nothing because the workload's budget carried none of its
         #: offers, and nothing else was tried (D126).
         self.last_budget_bound = False
+        #: Images a host's agent found not to carry what they were listed as carrying, by image
+        #: (D146): not rented again for those needs while this supervisor runs.
+        self.images_lacking: dict[str, set[str]] = {}
         #: The machine history, rebuilt from the logs every few seconds (D69).
         self._history: Optional[dict] = None
         self._history_at = 0.0
@@ -1052,7 +1057,7 @@ class Fleet:
                 dict(row)
                 for row in self.events.db.query(
                     "SELECT host_id, outcome, latency_ms, tokens_out, generate_ms FROM request_log "
-                    "WHERE host_id IS NOT NULL ORDER BY id DESC LIMIT 20000"
+                    "WHERE host_id IS NOT NULL AND (kind IS NULL OR kind = 'chat') ORDER BY id DESC LIMIT 20000"
                 )
             ]
         except Exception as exc:  # noqa: BLE001 - a view is never worth failing a bid for
@@ -1453,17 +1458,34 @@ class Fleet:
         before the pool assigned models."""
         return list(host.models) if host.models else self.rented_models
 
-    def image_for(self, offer) -> tuple[Optional[str], str]:
+    def image_for(self, offer, tags: Sequence[str] = ()) -> tuple[Optional[str], str]:
         """Which build of the engine this machine gets, and why (D92).
 
         With a single `image` the answer never varies, and the driver floor in the offer policy
         is what keeps an unusable machine out. With several, the pool takes the first whose
         driver floor this machine meets — so a newer, faster build is used where it can be, and
         an older machine still gets a build that runs rather than being refused outright.
+
+        Only images carrying what the host's builds need are candidates (D146): speech on vLLM
+        needs an image with its audio extra, known before the bid as the driver floor is.
         """
-        images = self.rented.images
+        needs = self.config.image_needs(tags)
+        listed = [i for i in self.rented.images if needs <= set(i.capabilities)]
+        # An image a host's agent found not to carry what it claimed is not rented again for
+        # that need: every round would pay for a machine to learn the same thing (D146).
+        images = [i for i in listed if not needs & self.images_lacking.get(i.image, set())]
+        if not self.rented.images and not needs:
+            return self.config.rented_image(), "the pool's only image"
         if not images:
-            return self.rented.image, "the pool's only image"
+            if listed:
+                return None, (
+                    f"image: {', '.join(i.image for i in listed)} — listed as carrying {sorted(needs)} — "
+                    "was found by a host's agent not to; correct `rented.images` and the pool rents again"
+                )
+            return None, (
+                f"image: no image of the engine is listed as carrying {sorted(needs)}, which this "
+                f"host's builds need"
+            )
         chosen = image_for(offer, images)
         if chosen is None:
             wanted = ", ".join(f"{i.image} needs {i.min_driver}" for i in images)
@@ -1473,6 +1495,7 @@ class Fleet:
             )
         return chosen.image, (
             f"driver {offer.driver_version} meets {chosen.min_driver}"
+            + (f", carries {', '.join(sorted(needs))}" if needs else "")
             + (f" — {chosen.note}" if chosen.note else "")
         )
 
@@ -1879,6 +1902,27 @@ class Fleet:
         else:
             host.agent_facts = None
             host.agent_detail = view.detail
+
+    def image_falls_short(self, host: RentedHost) -> Optional[str]:
+        """Why this host's image cannot serve its builds, when its agent has checked and found
+        it lacks what the image was chosen for (D146) — or None, including when the agent has
+        not said: an agent that cannot tell is not one that found the image wanting."""
+        needs = self.config.image_needs(list(self.builds_of(self.models_of(host), host.builds).values()))
+        engine = (host.agent_facts or {}).get("engine")
+        carries = engine.get("carries") if isinstance(engine, dict) else None
+        if not needs or not isinstance(carries, list):
+            return None
+        missing = needs - set(carries)
+        if not missing:
+            return None
+        if host.image:
+            self.images_lacking.setdefault(host.image, set()).update(missing)
+        detail = engine.get("carries_detail")
+        return (
+            f"its image was listed as carrying {sorted(missing)} and does not"
+            + (f" ({str(detail)[:200]})" if detail else "")
+            + "; correct the image's `capabilities` in rented.images"
+        )
 
     # --- what would happen (spec §3) ---
 
@@ -3884,7 +3928,7 @@ class Fleet:
                                        numbers={"offer": offer.offer_id, "workload": workload}, lease_id=lease.lease_id)
                     continue
 
-            image, image_why = self.image_for(offer)
+            image, image_why = self.image_for(offer, list(self.builds_of(for_this_host, builds).values()))
             if image is None:
                 # Refused *before* the bid: renting a machine whose driver cannot run any build
                 # of the engine buys a host that can never answer, and pays for it until the
@@ -3981,6 +4025,7 @@ class Fleet:
                 disk_gb=policy.min_disk_gb,
                 engine=self.config.rented_engine(),
                 engine_port=self.engine_port,
+                image=image,
             )
             if instance.volume_id is not None and spec is not None and instance_spec.volume is not None:
                 self._record_volume(host, instance, instance_spec.volume, offer, lease, for_this_host, builds)

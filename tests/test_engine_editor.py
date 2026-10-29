@@ -67,6 +67,7 @@ POOL_YAML = textwrap.dedent(
 
     rented:
       provider: fake
+      engine: ollama
       # The provider's own build of the same engine.
       image: vastai/ollama:0.34.2
       # Vast's ssh launch mode replaces the image's entrypoint, so the engine is started here.
@@ -262,3 +263,17 @@ def test_the_status_carries_what_the_editor_starts_from(pool):
     assert engine["image"] == "vastai/ollama:0.34.2" and engine["rented_models"] is None
     assert set(engine["available"]) >= {"ollama", "vllm"}
     assert all("engine" in variant for variant in status["catalog"][BIG])
+
+
+def test_what_an_image_carries_is_kept_through_the_editor(pool):
+    """An image said to decode audio (D146) stays said so when the console saves the engine:
+    dropped, the next host rented for speech would have no image to start from."""
+    supervisor, url, path = pool
+    images = [{**VLLM_IMAGES[0], "capabilities": ["audio-decoding"]}, VLLM_IMAGES[1]]
+    answer = patch(url, {**VLLM_ONE_PER_HOST, "images": images})
+    assert answer.status_code == 200, answer.text
+    written = yaml.safe_load(path.read_text())["rented"]["images"]
+    assert written[0]["capabilities"] == ["audio-decoding"] and "capabilities" not in written[1]
+    with httpx.Client(base_url=url, headers={"Authorization": f"Bearer {ADMIN_KEY}"}, timeout=30) as http:
+        shown = http.get("/pool/status").json()["engine"]["images"]
+    assert [i["capabilities"] for i in shown] == [["audio-decoding"], []]

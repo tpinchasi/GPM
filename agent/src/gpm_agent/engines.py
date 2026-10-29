@@ -7,6 +7,7 @@ the agent's settings name which.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 import time
@@ -15,8 +16,10 @@ from typing import Any, AsyncIterator, Optional
 
 import httpx
 
+from . import facts as machine_facts
 from . import modelhub, vllm_state
 from . import volume as model_volume
+from .whisper_cpp import WhisperCppFacts
 
 
 def _sources_fact(sources: dict[str, tuple[Any, float]]) -> dict[str, dict[str, Any]]:
@@ -216,6 +219,15 @@ class EngineRefused(Exception):
     """The engine said no. The message is the engine's, passed on to the operator."""
 
 
+#: The command the launcher runs vLLM as, found on the same PATH — the restart command runs with
+#: the agent's environment. A literal here: the agent never imports the launcher (D63).
+VLLM_COMMAND = "vllm"
+
+#: What the image is said to carry when the `vllm` command's interpreter imports vLLM's audio
+#: extra — the name `rented.images[].capabilities` uses (D146).
+AUDIO_DECODING = "audio-decoding"
+
+
 class VllmFacts:
     """vLLM, which differs from the first engine in three ways the agent has to know about.
 
@@ -232,6 +244,10 @@ class VllmFacts:
     environment. The host's own start command reads the models directory instead and serves
     what it finds, taking the served name from the directory the agent created (D41 stands:
     the pool sends numbers, the owner's command supplies everything else).
+
+    Beside the three, one fact the pool relied on before renting, which the host must bear out:
+    whether the image carries vLLM's audio extra (D146). The agent asks the `vllm` command's own
+    interpreter rather than taking the image's word for it.
     """
 
     name = "vllm"
@@ -252,10 +268,47 @@ class VllmFacts:
         #: long it took, by tag (D139). Reported in the facts so the pool's history can say
         #: whether a volume pays; a fill still running behind the host says so as it goes.
         self.sources: dict[str, tuple[model_volume.Report, float]] = {}
+        #: The command whose interpreter is asked about the audio extra: the one the launcher runs.
+        self.vllm_command = VLLM_COMMAND
+        #: Whether the image carries vLLM's audio extra (D146): asked once, in the background, and
+        #: kept for the life of this process — the image does not change under it.
+        self._audio_check: Optional[asyncio.Task[Optional[tuple[bool, Optional[str]]]]] = None
 
     @property
     def _models_dir(self) -> str:
         return getattr(self.settings, "models_path", None) or "~/gpm-models"
+
+    def _carries(self) -> dict[str, Any]:
+        """What the image carries beyond the engine, as far as is known yet (D146).
+
+        The check starts on the first facts and never holds them up: the pool asks for facts on a
+        short timeout, and importing scipy and PyAV from a cold disk can take longer than that. Until
+        it has answered — or where it could not run — nothing is said, which the pool reads as
+        "not known", never as "missing".
+        """
+        check = self._audio_check_started()
+        if not check.done() or check.cancelled() or check.exception():
+            return {}
+        found = check.result()
+        if found is None:
+            return {}
+        imports, detail = found
+        if imports:
+            return {"carries": [AUDIO_DECODING]}
+        return {"carries": [], "carries_detail": detail}
+
+    def _audio_check_started(self) -> asyncio.Task[Optional[tuple[bool, Optional[str]]]]:
+        if self._audio_check is None:
+            # In a thread: the import takes seconds, and the event loop answers the pool meanwhile.
+            self._audio_check = asyncio.ensure_future(
+                asyncio.to_thread(machine_facts.audio_extra, self.vllm_command)
+            )
+        return self._audio_check
+
+    async def carries(self) -> dict[str, Any]:
+        """The same, once the check has answered — waiting for it, as `describe` never does."""
+        await asyncio.wait({self._audio_check_started()})
+        return self._carries()
 
     async def describe(self, client: httpx.AsyncClient) -> dict[str, Any]:
         """What this engine is serving, and what is on disk waiting for a restart.
@@ -267,6 +320,11 @@ class VllmFacts:
         # just booted it does not, because it has nothing to serve yet. Reporting nothing then
         # would hide the one fact that decides what happens next.
         on_disk = self._on_disk()
+        # Known whether or not the engine runs, and wanted before it first does (D146): what the
+        # image carries, and each model started shorter than the pool asked because it goes no
+        # further.
+        capped = vllm_state.capped_lengths(Path(self._models_dir).expanduser())
+        known = {**self._carries(), **({"max_model_len_capped": capped} if capped else {})}
         try:
             version = (await client.get("/version")).json().get("version")
         except (httpx.HTTPError, ValueError):
@@ -277,6 +335,7 @@ class VllmFacts:
             return {
                 "name": self.name, "answers": False, "detail": str(exc) or type(exc).__name__,
                 "models_on_disk": on_disk, "models_loaded": [], "models_failed": self._failed([]),
+                **known,
             }
         loaded = sorted(entry["id"] for entry in served if isinstance(entry, dict) and entry.get("id"))
         return {
@@ -289,6 +348,7 @@ class VllmFacts:
             # is a failure, not a model still loading — with the reason from its own log.
             "models_failed": self._failed(loaded),
             **({"model_sources": _sources_fact(self.sources)} if self.sources else {}),
+            **known,
         }
 
     def _failed(self, loaded: list[str]) -> dict[str, str]:
@@ -420,7 +480,7 @@ class VllmFacts:
         return applied
 
 
-_ENGINES = {"ollama": OllamaFacts, "vllm": VllmFacts}
+_ENGINES = {"ollama": OllamaFacts, "vllm": VllmFacts, "whisper-cpp": WhisperCppFacts}
 
 
 def engine_facts(name: str, settings: Any = None) -> Optional[Any]:

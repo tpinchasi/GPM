@@ -325,7 +325,7 @@ def test_a_copy_timeout_must_leave_time_to_fetch():
     with pytest.raises(ValueError, match="copy_timeout_s"):
         PoolConfig.model_validate({
             "pool": {"name": "t", "model_set": ["m"]}, "auth": {"app_keys": ["k"]},
-            "rented": {"provider": "fake", "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 1.0},
+            "rented": {"provider": "fake", "engine": "ollama", "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 1.0},
                        "teardown": {"max_preparing_minutes": 30}},
             "workloads": {"copy_timeout_s": 1200},
         })

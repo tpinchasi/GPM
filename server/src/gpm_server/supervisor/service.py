@@ -67,6 +67,10 @@ class SupervisedHost:
     state: HostState = HostState.UNREACHABLE
     resident: frozenset[str] = frozenset()
     available: frozenset[str] = frozenset()
+    #: What each build accepts, as the engine reported it (D143), and for which builds, when.
+    observed: dict[str, frozenset[str]] = dataclasses.field(default_factory=dict)
+    observed_for: frozenset[str] = frozenset()
+    observed_at: float = 0.0
     #: The last answer from this host's agent, if it has one (docs/spec/host-agent.md).
     agent: Optional[agents.AgentView] = None
     #: The forward to an agent that sits on the far side of this host's SSH tunnel.
@@ -622,8 +626,10 @@ class Supervisor:
         now = time.time()
         counters = self.counters.all()
         rows = self.db.query(
+            # Chat only (D145): a transcription's latency grows with the recording, and says
+            # nothing of how many requests the host can take at once.
             "SELECT host_id, model_served, tokens_out, generate_ms, latency_ms, ts "
-            "FROM request_log WHERE outcome = 'ok' AND ts > ?",
+            "FROM request_log WHERE outcome = 'ok' AND ts > ? AND (kind IS NULL OR kind = 'chat')",
             (now - window * 2,),
         )
         waiting = len(
@@ -722,7 +728,7 @@ class Supervisor:
         rows = self.db.query(
             "SELECT host_id, model_served, tokens_out, latency_ms, ts FROM request_log "
             "WHERE outcome = 'ok' AND ts > ? AND latency_ms IS NOT NULL AND tokens_out > 0 "
-            "AND (status_code IS NULL OR status_code < 400)",
+            "AND (status_code IS NULL OR status_code < 400) AND (kind IS NULL OR kind = 'chat')",
             (now - cfg.window_s,),
         )
         readings = []
@@ -946,6 +952,12 @@ class Supervisor:
                 self._rented_clients[host_id] = client
 
             await self.fleet.ask_agent(host)
+            short = self.fleet.image_falls_short(host)
+            if short is not None:
+                # Chosen because it claimed to carry what this host's builds need, and its agent
+                # found otherwise (D146): it would start and refuse every request of that kind.
+                await self.fleet.destroy(host, short)
+                continue
 
             health = await self.engine_for(host).health(client)
             if not health.ok:
@@ -1195,21 +1207,38 @@ class Supervisor:
             return
 
         previous = host.state
-        health = await self.engine_for(host).health(host.client)
+        engine = self.engine_for(host)
+        from_agent = bool(getattr(engine, "residency_from_agent", False))
+        health = await engine.health(host.client)
         if not health.ok:
-            host.state = HostState.UNREACHABLE
-            host.last_error = health.detail
             host.resident = frozenset()
             host.available = frozenset()
+            # An engine that went away may come back another version, taking other inputs: its
+            # builds are asked again on the first probe that finds it (D143).
+            host.observed_for = frozenset()
+            starting = self._agent_is_starting_it(host) if from_agent else None
+            if starting:
+                # Its agent fetches the model and starts the server with it (D148): a server not
+                # answering yet is one being brought up, not a host that went away.
+                host.state = HostState.PREPARING
+                host.last_error = starting
+            else:
+                host.state = HostState.UNREACHABLE
+                host.last_error = health.detail
         else:
             try:
-                resident = await self.engine_for(host).models_resident(host.client)
-                available = await self.engine_for(host).models_available(host.client)
+                if from_agent:
+                    # The server cannot say what it holds; the agent that started it does (D148).
+                    resident, available = self._agent_holds(host)
+                else:
+                    resident = await engine.models_resident(host.client)
+                    available = await engine.models_available(host.client)
             except httpx.HTTPError as exc:
                 host.state = HostState.UNREACHABLE
                 host.last_error = str(exc)
                 host.resident = frozenset()
                 host.available = frozenset()
+                host.observed_for = frozenset()
             else:
                 host.resident = resident
                 host.available = available
@@ -1227,6 +1256,7 @@ class Supervisor:
                 else:
                     host.state = HostState.READY
                     host.last_error = None
+                await self._observe_inputs(host)
 
         host.last_probe_at = time.monotonic()
         if host.state is not previous:
@@ -1237,6 +1267,53 @@ class Supervisor:
                 host.state.value,
                 host.last_error or "ok",
             )
+
+    @staticmethod
+    def _agent_models(host: SupervisedHost) -> list[dict[str, Any]]:
+        report = (host.agent.models if host.agent is not None and host.agent.reachable else None) or {}
+        return [m for m in report.get("models") or [] if isinstance(m, dict) and isinstance(m.get("tag"), str)]
+
+    def _agent_holds(self, host: SupervisedHost) -> tuple[frozenset[str], frozenset[str]]:
+        """What the agent says its engine serves, and what it has on disk — only for the model
+        set it was asked to hold, which is all it reports on."""
+        models = self._agent_models(host)
+        return (
+            frozenset(m["tag"] for m in models if m.get("loaded")),
+            frozenset(m["tag"] for m in models if m.get("on_disk")),
+        )
+
+    def _agent_is_starting_it(self, host: SupervisedHost) -> Optional[str]:
+        """Why the server is not answering, as its agent tells it — or None when the agent says
+        nothing that explains it, and the host is unreachable like any other."""
+        for model in self._agent_models(host):
+            if model.get("error"):
+                return f"{model['tag']}: {str(model['error'])[:300]}"
+            pulling = model.get("pulling")
+            if isinstance(pulling, dict):
+                done, total = pulling.get("completed_bytes"), pulling.get("total_bytes")
+                share = f" ({done * 100 // total}%)" if isinstance(done, int) and isinstance(total, int) and total else ""
+                return f"its agent is fetching {model['tag']}{share}"
+            if not model.get("on_disk"):
+                return f"its agent has yet to fetch {model['tag']}"
+            if not model.get("loaded"):
+                return f"its agent is starting the server with {model['tag']}"
+        return None
+
+    async def _observe_inputs(self, host: SupervisedHost) -> None:
+        """Ask the engine what each of this host's builds takes, where it can say (D143) — when
+        the builds change, and every ten minutes, which is how an engine upgraded in place is
+        noticed. Never on the request path: the router reads what is published here."""
+        ask = getattr(self.engine_for(host), "observed_inputs", None)
+        if ask is None:
+            return
+        tags = frozenset(v.tag for variants in host.variants.values() for v in variants) & (host.available | host.resident)
+        if tags == host.observed_for and time.monotonic() - host.observed_at < 600:
+            return
+        try:
+            host.observed = await ask(host.client, set(tags))
+        except httpx.HTTPError:
+            return
+        host.observed_for, host.observed_at = tags, time.monotonic()
 
     def _publish_all(self) -> None:
         for host in self.hosts.values():
@@ -1258,6 +1335,7 @@ class Supervisor:
                     },
                     resident=host.resident,
                     available=host.available,
+                    observed={tag: tuple(sorted(found)) for tag, found in host.observed.items()},
                     residency=host.config.residency,
                     engine=self.config.engine_of(host.config),
                     last_error=host.last_error,

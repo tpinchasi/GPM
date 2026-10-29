@@ -14,6 +14,8 @@ launcher drives — so the launcher's choice of model and name is what this ends
 from __future__ import annotations
 
 import asyncio
+import email.parser
+import email.policy
 import time
 from typing import Any, Iterable, Optional
 
@@ -23,8 +25,27 @@ from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
 
+def read_form(content_type: str, body: bytes) -> dict[str, Any]:
+    """A form upload read by the standard library's MIME parser — an implementation that is not
+    the pool's, so a test proves the pool's rebuilt form is read right by someone else's code."""
+    message = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(
+        b"Content-Type: " + content_type.encode() + b"\r\n\r\n" + body
+    )
+    fields: dict[str, Any] = {}
+    for part in message.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        data = part.get_payload(decode=True) or b""
+        fields[name] = {"filename": part.get_filename(), "data": data} if part.get_filename() else data.decode()
+    return fields
+
+
 class FakeVllm:
-    def __init__(self, *, load_delay_s: float = 0.0):
+    def __init__(self, *, load_delay_s: float = 0.0, audio_extra: bool = True):
+        #: Whether the image carried vLLM's audio extra (D146). Without it the real engine starts
+        #: and answers every recording 400, saying why only in its log.
+        self.audio_extra = audio_extra
+        #: The headers of every request, for what the pool sent beside the body.
+        self.headers: list[dict[str, str]] = []
         #: How long after `start()` the engine takes to answer — a real one loads its weights.
         self.load_delay_s = load_delay_s
         self.served: set[str] = set()
@@ -39,6 +60,9 @@ class FakeVllm:
             Route("/metrics", self._metrics, methods=["GET"]),
             Route("/v1/chat/completions", self._chat, methods=["POST"]),
             Route("/v1/embeddings", self._chat, methods=["POST"]),
+            Route("/v1/audio/transcriptions", self._transcribe, methods=["POST"]),
+            Route("/v1/audio/translations", self._transcribe, methods=["POST"]),
+            Route("/v1/rerank", self._rerank, methods=["POST"]),
         ])
 
     def start(self, models: Iterable[str]) -> None:
@@ -93,6 +117,39 @@ class FakeVllm:
                          "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
         })
+
+
+    async def _transcribe(self, request: Request) -> Response:
+        self.headers.append(dict(request.headers))
+        fields = read_form(request.headers.get("content-type", ""), await request.body())
+        self.received.append((request.url.path, fields))
+        if not self.running:
+            return self._down()
+        model = fields.get("model")
+        if model not in self.served:
+            return JSONResponse({"error": {"message": f"The model `{model}` does not exist."}}, status_code=404)
+        if not self.audio_extra:
+            return JSONResponse({"error": {"message": "Invalid or unsupported audio file."}}, status_code=400)
+        upload = fields.get("file") or {}
+        text = f"heard {len(upload.get('data', b''))} bytes"
+        if fields.get("response_format") == "text":
+            return PlainTextResponse(text)
+        return JSONResponse({"text": text})
+
+    async def _rerank(self, request: Request) -> Response:
+        self.headers.append(dict(request.headers))
+        body = await request.json()
+        self.received.append((request.url.path, body))
+        if not self.running:
+            return self._down()
+        model = body.get("model")
+        if model not in self.served:
+            return JSONResponse({"error": {"message": f"The model `{model}` does not exist."}}, status_code=404)
+        documents = body.get("documents") or []
+        results = [
+            {"index": i, "relevance_score": 1.0 / (1 + i), "document": {"text": d}} for i, d in enumerate(documents)
+        ]
+        return JSONResponse({"model": model, "results": results[: body.get("top_n") or len(results)]})
 
 
 class FakeHub:

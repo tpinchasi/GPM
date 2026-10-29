@@ -135,8 +135,9 @@ An engine adapter tells the pool how to talk to one kind of inference server. Th
 written for engine X talks to a pool of engine-X hosts. (Translation is where tool-calling and
 structured-output fidelity get lost; the pool does not take that risk on.)
 
-**A pool may run a different engine on each host** (D93) — `engine:` on a host, `rented.engine`
-for the machines it buys, the pool's own where neither says. What makes this safe is that both
+**A pool may run a different engine on each host** (D93) — `engine:` on a host, the pool's own
+where a host says nothing, and `rented.engine` for the machines it buys, which is `vllm` unless
+it says otherwise (D147). What makes this safe is that both
 shipped engines serve one wire API (D89), so a request is read the same way wherever it goes:
 
 - **The path chooses how a request is read**, not the host: it must be understood before the
@@ -193,6 +194,38 @@ class Engine(Protocol):
 | `looks_corrupt` | Engine-specific signs of a degraded back-end (reserved tokens leaking, repetition collapse); feeds quarantine |
 | `occupancy` | Requests running, requests **waiting inside the engine**, and cache used — or `None` where the engine cannot say, which means "judge me by worker slots". Read by the supervisor on its own pass, never on the request path (D91) |
 | `serves_one_model` | Declared, not inferred. `True` refuses a pool whose `models_per_host` is `all` **at load**, rather than after a machine has been rented that could never become ready (D89) |
+
+### Version 2: kinds, inputs and uploads (D142–D144, D148)
+
+Version 2 adds, every member optional so a version-1 plug-in still loads as one serving chat and
+embeddings: On a path several engines share, the router reads requests with a version-2 engine's
+reader where one is installed, so a version-1 plug-in never switches off what a version-2 one reads.
+
+```python
+    kinds: ClassVar[frozenset[str]]          # what it can serve: chat, embed, transcribe, rerank
+    def kind_of(self, path: str) -> str | None: ...                       # its own paths only
+    def request_facts(self, path: str, content_type: str, body: bytes) -> RequestFacts: ...
+    def rewrite_model(self, path: str, content_type: str, body: bytes, tag: str) -> tuple[str, bytes]: ...
+    async def observed_inputs(self, conn: Connection, tags: set[str]) -> dict[str, set[str]] | None: ...
+    default_image: ClassVar[str]             # the pinned image rented hosts start from (D147)
+    image_needs: ClassVar[dict[str, str]]    # kind -> what the image must carry for it (D146)
+    residency_from_agent: ClassVar[bool]     # what it holds is the host agent's to say (D148)
+    max_workers: ClassVar[int | None]        # requests it serves at once, where it is bounded
+```
+
+| Member | Guarantee |
+|---|---|
+| `kinds`, `kind_of` | Declared, never inferred, and never inherited from a shared list: an engine that cannot run a kind does not claim it. Configuration load refuses a build whose `serves` its engine does not declare (D147) |
+| `request_facts` | Model, stream, schema, kind and the inputs carried (`image`, `audio`), read **once** from a body the router has already bounded (D144). Raises `AmbiguousField` (D141), `MediaNotInline` for a link or an unknown part type (D143), `BadUpload` for a form it would have to guess about (D144) |
+| `rewrite_model` | For JSON, `with_model`'s rule. For an upload, returns a **rebuilt** form — its own boundary, canonical part headers, the `model` part rewritten — and the new content type; every file's bytes untouched |
+| `observed_inputs` | What each tag accepts on this host, where the engine can say (Ollama's capabilities); `None` where it cannot, and the catalog's declaration stands (D143) |
+| `image_needs` | Per kind, an image capability a rented host holding such a build must start from (§"Choosing the build per machine") |
+| `residency_from_agent` | The server cannot say what it holds: the host must carry an agent that manages its models, and the host is resident in what that agent reports loaded. Refused at load without one |
+| `max_workers` | A host running it is refused at load with more workers than this |
+
+The shipped engines: **Ollama** (chat, embeddings), **vLLM** (chat, embeddings, transcription,
+ranking) and **whisper.cpp** (transcription; one model per server; its host must carry an agent,
+D148).
 
 ### Why occupancy exists
 
@@ -276,9 +309,22 @@ the pool takes the first build a machine's driver can run (D92):
 ```yaml
 rented:
   images:
-    - { image: "vastai/vllm:v0.29.0-cuda-13.0", min_driver: "580" }
-    - { image: "vastai/vllm:v0.29.0-cuda-12.9", min_driver: "550" }
+    - { image: "vastai/vllm:v0.29.0-cuda-13.0", min_driver: "580", capabilities: [audio-decoding] }
+    - { image: "vastai/vllm:v0.29.0-cuda-12.9", min_driver: "550", capabilities: [audio-decoding] }
 ```
+
+With neither `images` nor `image` named, rented hosts start from the rented engine's own pinned
+default (`default_image`: `ollama/ollama:0.34.2`, `vllm/vllm-openai:v0.29.0`), so changing engine never
+leaves the other engine's image behind (D147).
+
+An image's `capabilities` say what it carries beyond the engine — `audio-decoding` for vLLM's
+audio extra. An engine names what its image must carry per kind (`image_needs`; vLLM:
+`{transcribe: audio-decoding}`). The pool chooses, among the images carrying what a host's builds
+need, the first whose driver floor the machine meets — refusing the offer before the bid when none
+does — and refuses at load a configuration whose rented models need what no listed image carries
+(`image:` alone carries nothing said). The host's agent verifies the claim: its facts' `engine.carries`
+lists what the engine's installation was found to carry, and a host missing what its image was
+chosen for is given up with the reason (D146).
 
 A machine that can run none is refused **before it is bid on**. `image:` alone still means one
 build for every machine, and the driver floor in the offer policy is then what keeps an unusable

@@ -25,6 +25,7 @@ MODEL = "m1"
 def make_fleet(database, provider, **rented_overrides):
     rented = {
         "provider": "fake",
+        "engine": "ollama",
         "workers": 2,
         "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 0.60}, "bidding": {"premium": 0.02},
         "scale": {"scale_up_after_s": 0},

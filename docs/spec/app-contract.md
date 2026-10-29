@@ -56,6 +56,40 @@ Two differences between the surfaces matter to an app:
 | `X-GPM-Delivery`, `X-GPM-Attempts` (response) | Always reported | How the response reached the app — `stream`, `buffered`, or `stream-after-overflow` — and how many hosts were tried (§5.1) |
 | `X-GPM-Delivery: stream` (request) | Optional, if the operator allows | Asks for tokens as they come from a host that can be interrupted, accepting that the stream may break (§5.1) |
 
+### Beyond chat: what a request asks for, and what it may carry (D142–D144, D149)
+
+The path a request arrives on says what it asks a model to do — its **kind**. Each engine serves
+the kinds it can, and a pool may run several engines (D93):
+
+| Kind | Paths | Served by |
+|---|---|---|
+| chat | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`; Ollama's `/api/chat`, `/api/generate` | Ollama, vLLM |
+| embeddings | `/v1/embeddings`; Ollama's `/api/embed`, `/api/embeddings` | Ollama, vLLM |
+| transcription | `/v1/audio/transcriptions`, `/v1/audio/translations` — a `multipart/form-data` upload | vLLM; whisper.cpp transcribes only (its server answers no translation path) |
+| ranking | `/v1/rerank` | vLLM |
+
+Only these exact paths are forwarded. A model name resolves to a build that serves the kind
+asked for; a name with no such build is refused `400 kind_not_served`.
+
+**Pictures and sound travel inside the request.** A chat message may carry an image (an
+`image_url` part whose URL is a `data:` URL, an `input_image` part, or Ollama's `images`) or
+sound (an `input_audio` part), and the pool sends it only to a build that accepts that input. So
+may what an embedding request embeds (`messages`, or `input` and its items) and a ranking's query
+and each of its documents (a string, or an object of `content` parts), read the same way.
+A picture or sound given by link, or a part type the pool does not know, is refused `400
+media_not_inline`: a link would make the engine host fetch it from its own network.
+
+**An upload is read as the pool reads JSON**: the `model` field once, in lower case, as a field
+of its own and never as a file. The pool rewrites the form before forwarding it, so the engine
+reads exactly what the pool checked; the file's bytes are not changed. A form it cannot read
+cleanly is `400 bad_upload`.
+
+**Every request body has a size limit**, `pool.max_request_mb` (default 24, under the 25 MB
+the engines accept for an upload): over it is `413 request_too_large`, before the body is read.
+
+**Pictures and recordings reach the same hosts text does.** On a pool that rents from a
+marketplace, the operator of a rented host can read them (threat model T7).
+
 ### What else the pool could serve (D101)
 
 `GET /pool/directory?q=` — with the app key, on the pool's one URL — returns the directory the
@@ -73,7 +107,14 @@ It is served from a cached copy, never by asking a third party while the app wai
 | engine's own | — | Passed through | returned |
 | `401` | — | Missing or wrong app key | raise `PoolAuthError`, never retried |
 | `400` | `model_missing` | The body names no model, or is not one JSON object in UTF-8 | raise `PoolRequestError` |
-| `400` | `ambiguous_field` | The body names `model`, `stream`, `response_format` or `format` more than once, or in another letter case — an engine could read a different value than the pool checked (D141) | raise `PoolRequestError` |
+| `400` | `ambiguous_field` | The body names `model`, `stream`, `response_format` or `format` — or a field that carries pictures and sound: `messages`, `input`, `query`, `documents`, a message's `content` or `images` — more than once, or in another letter case: an engine could read a different value than the pool checked (D141, D143) | raise `PoolRequestError` |
+| `400` | `kind_not_served` | No build of this model that the pool could hold does what the path asks — a transcription asked of a chat model, or ranking on a pool with no engine for it | raise `PoolRequestError` |
+| `400` | `input_not_accepted` | Every build of this model the pool could hold refuses what the request carries (a picture, sound) — or every host that could hold a build taking it is ready and either does not hold one or its engine reports the build there does not take it, and no host the pool could rent would | raise `PoolRequestError` |
+| `400` | `media_not_inline` | A picture or sound was given by link, or as a part type the pool does not accept | raise `PoolRequestError` |
+| `400` | `bad_upload` | An upload the pool could not read as one clean form, one naming the model twice, or a request with more than one `Content-Type` header | raise `PoolRequestError` |
+| `400` | `content_encoding` | The request has a `Content-Encoding` other than identity; the pool reads only uncompressed bodies (D144) | raise `PoolRequestError` |
+| `413` | `request_too_large` | The body is over `pool.max_request_mb`; refused before it is read | raise `PoolRequestError` |
+| `404` | `unknown_path` | The path is not an inference path of any engine this pool runs (§2: only those exact paths are forwarded). A path some engine serves, but none this pool runs, is `400 kind_not_served` instead | raise `PoolRequestError` |
 | `404` | `model_not_in_pool` | The model is not in this pool's declared set; it will not be loaded on demand | raise `PoolRequestError` |
 | `503` | `queue_timeout` | All workers busy for longer than the queue limit | wait and retry |
 | `503` | `preparing` | A host is up but still loading the pool's models | wait and retry |
@@ -81,9 +122,11 @@ It is served from a cached copy, never by asking a third party while the app wai
 | `503` | `hosts_unreachable` | Configured hosts are not answering | wait and retry |
 | `503` | `no_offer` | Renting is authorised but no acceptable offer exists right now | wait and retry |
 | `503` | `no_lease` | Only rented hosts could serve this and no lease is open — waiting cannot help | **fail fast** with `PoolUnavailable` (overridable) |
-| `503` | `no_eligible_host` | Hosts are ready, but none may take this request. `detail` says which: the request arrived on one engine's own path (`/api/chat`, say) and every ready host runs an engine that does not serve it — the detail names both and the paths that reach every engine — or none holds a build of this model that satisfies the request's schema requirement or pinned runtime class | for a path no ready host serves, call the `/v1` paths; otherwise wait and retry |
+| `503` | `no_eligible_host` | Hosts are ready, but none may take this request. `detail` says which: the request arrived on one engine's own path (`/api/chat`, say) and every ready host runs an engine that does not serve it — the detail names both and the paths that reach every engine — or none holds a build of this model that satisfies the request's schema requirement or pinned runtime class, or takes what it carries — while a host that would is not ready, or after one that would failed this request | for a path no ready host serves, call the `/v1` paths; otherwise wait and retry |
 | `503` | `host_lost` | The host serving this was taken away before any of the response reached you; nothing partial was sent (§5.1) | wait and retry |
+| `503` | `uploads_full` | The pool is holding as many request bytes as it allows (`pool.max_held_request_mb`) | wait and retry |
 | `504` | `deadline_exceeded` | The request's `X-GPM-Deadline` passed before it could be served | **fail fast** — the app already said the answer would be useless |
+| `504` | `generation_timeout` | The whole request was sent, and the engine did not answer within the pool's read time (`pool.upstream_read_timeout_s`) — a long recording, say. Not a host failure: it is not re-run on another host | **fail fast** — sending it again would take as long again |
 
 ```json
 {"error": "no_capacity", "reason": "recovering", "retry_after_s": 30,
@@ -127,7 +170,7 @@ Its core is an **HTTP transport**, not a wrapper function, so the retry behaviou
 underneath whatever client library the app already uses, with no call-site changes:
 
 ```python
-from gpm_client import PoolClient, pool_transport, async_pool_transport
+from gpm_client import PoolClient, image_part, pool_transport, async_pool_transport
 
 # An app using a higher-level client library: inject the transport once
 client = SomeEngineClient(base_url=POOL_URL,
@@ -138,6 +181,10 @@ pool = PoolClient()                         # GPM_URL, GPM_API_KEY from the envi
 reply = pool.chat("my-model:7b", messages, format=schema, session_id=sid)
 reply.content, reply.served_model
 vectors = pool.embed("my-embedder", texts)
+pool.chat("my-vision-model", [{"role": "user", "content": [
+    {"type": "text", "text": "what is this?"}, image_part("photo.jpg")]}])   # inline picture
+text = pool.transcribe("my-speech-model", "call.m4a", language="he").text
+ranked = pool.rerank("my-reranker", query, documents, top_n=5)            # best first
 pool.wait_until_ready()                     # optional pre-flight for a batch driver
 ```
 
@@ -148,7 +195,8 @@ Every field is overridable per call, per client, or by environment variable, in 
 | Situation | Default |
 |---|---|
 | `503` other than `no_lease` | Retry. Wait `Retry-After` if present, else exponential back-off 2 s → 60 s with jitter |
-| Transport error before any response byte | Retry, same back-off |
+| Transport error before any response byte, other than a read timeout | Retry, same back-off |
+| Read timeout: the request was sent and no answer came within the read time | **Not retried** — `PoolRequestError`, status 504, reason `read_timeout`. The pool may still be working on it; sending it again would run it twice (D144) |
 | Failure **mid-stream**, after output was delivered | **Not retried** — `PoolStreamInterrupted`. The app has consumed partial output; only it can decide to redo the call |
 | `401` | Not retried — `PoolAuthError` |
 | Other `4xx` | Not retried — `PoolRequestError` |
