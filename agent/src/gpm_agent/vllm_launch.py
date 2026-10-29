@@ -148,6 +148,32 @@ SENTENCE_TRANSFORMER_FILES = (
     "sentence_xlnet_config.json",
 )
 
+#: What an architecture's name ends in, and whether vLLM v0.29.0 runs a model so named as a
+#: pooling model (embedding, classifying, ranking) rather than generating text — its own table
+#: for a model it does not decide otherwise (`_SUFFIX_TO_DEFAULTS`, vllm/config/model.py), checked
+#: in order, so a generating `…ChatModel` or `…LMHeadModel` is not taken for an encoder's `…Model`.
+POOLING_BY_SUFFIX = (
+    ("ForCausalLM", False),
+    ("ForConditionalGeneration", False),
+    ("ChatModel", False),
+    ("LMHeadModel", False),
+    ("ForTextEncoding", True),
+    ("EmbeddingModel", True),
+    ("ForSequenceClassification", True),
+    ("ForAudioClassification", True),
+    ("ForImageClassification", True),
+    ("ForVideoClassification", True),
+    ("ClassificationModel", True),
+    ("ForRewardModeling", True),
+    ("RewardModel", True),
+    ("Model", True),
+)
+
+#: A sentence-transformers model lists its modules here; one naming a pooling module is run as a
+#: pooling model whatever its architecture (`get_pooling_config`).
+SENTENCE_TRANSFORMER_MODULES = "modules.json"
+SENTENCE_TRANSFORMER_POOLING = "sentence_transformers.models.Pooling"
+
 #: How many cards each copy of a model spans (D114). Absent means one: a copy on each card.
 CARDS_PER_COPY = "GPM_VLLM_CARDS_PER_COPY"
 #: What vLLM can split a model across: its attention heads are divided between the cards.
@@ -435,6 +461,36 @@ def _rope_scaled(length: float, text: dict[str, Any]) -> float:
     return length * (_length(factor) or 1.0)
 
 
+def runs_as_pooling(directory: Path, config: dict[str, Any]) -> bool:
+    """Does vLLM v0.29.0 run this model as a pooling model — the only kind it holds to its
+    tokenizer's length?
+
+    The rule vLLM applies when the launcher names no runner, which it never does: a
+    sentence-transformers model whose `modules.json` names a pooling module is one, whatever its
+    architecture; otherwise the first architecture in `config.json` whose name ends in a suffix
+    of `POOLING_BY_SUFFIX` decides — `…ForSequenceClassification` and an encoder's bare `…Model`
+    pool, `…ForCausalLM` generates. A model naming none generates, as vLLM's default runner does.
+    vLLM consults its registry of architectures before that table; for the encoders and
+    generators it registers, the two agree.
+    """
+    try:
+        modules = json.loads((directory / SENTENCE_TRANSFORMER_MODULES).read_text())
+    except (OSError, ValueError):
+        modules = None
+    if isinstance(modules, list) and any(
+        isinstance(module, dict) and module.get("type") == SENTENCE_TRANSFORMER_POOLING for module in modules
+    ):
+        return True
+    architectures = config.get("architectures")
+    for architecture in architectures if isinstance(architectures, list) else []:
+        if not isinstance(architecture, str):
+            continue
+        for suffix, pooling in POOLING_BY_SUFFIX:
+            if architecture.endswith(suffix):
+                return pooling
+    return False
+
+
 def max_model_len_of(directory: Path) -> Optional[int]:
     """The longest sequence vLLM v0.29.0 will start this model with, from the model's own files —
     or None where they do not say, and vLLM takes whatever it is given.
@@ -443,9 +499,9 @@ def max_model_len_of(directory: Path) -> Optional[int]:
     number for every process: a text model's context, which Whisper's decoder (448) and many
     rerankers (512) are far below (D146). Read the way vLLM derives it (`_get_and_verify_max_len`
     in vllm/config/model.py): the smallest of the stated lengths in the text model's section,
-    held to the tokenizer's own limit for an encoder with absolute positions (which vLLM runs only
-    as a pooling model), scaled as the model's rotary positions are, and replaced outright by a
-    sentence-transformers model's own `max_seq_length`.
+    held to the tokenizer's own limit for a pooling model with absolute positions
+    (`runs_as_pooling`) — never for one that generates — scaled as the model's rotary positions
+    are, and replaced outright by a sentence-transformers model's own `max_seq_length`.
 
     It reads the files, not transformers' classes, so a length a class supplies only by default
     goes unseen. Missing a stated length makes the answer longer, which costs nothing: vLLM
@@ -459,7 +515,7 @@ def max_model_len_of(directory: Path) -> Optional[int]:
     length: Optional[float] = min(stated) if stated else None
     if (named := _length(text.get("model_max_length"))) is not None:
         length = named
-    if config.get("position_embedding_type") == "absolute":
+    if config.get("position_embedding_type") == "absolute" and runs_as_pooling(directory, config):
         tokenizer = _json_object(directory / "tokenizer_config.json") or {}
         if (limit := _length(tokenizer.get("model_max_length"))) is not None:
             length = limit if length is None else min(length, limit)

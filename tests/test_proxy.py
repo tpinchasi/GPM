@@ -644,6 +644,17 @@ def test_the_bound_is_above_the_pools_own_request_limit():
     assert MAX_BODY_BYTES > PoolSettings.model_fields["max_request_mb"].default * 1_000_000
 
 
+def test_the_bound_is_above_the_most_the_pools_limit_may_be_with_room_for_a_rebuilt_form():
+    """At the largest `pool.max_request_mb` allowed, the pool accepts a body of exactly that size
+    and then rebuilds an upload's form to name the build — a boundary and the model's tag longer.
+    Equal bounds would refuse that body here, after the pool let it through."""
+    from annotated_types import Le
+    from gpm_server.config import PoolSettings
+
+    [most] = [rule.le for rule in PoolSettings.model_fields["max_request_mb"].metadata if isinstance(rule, Le)]
+    assert MAX_BODY_BYTES - most * 1_000_000 >= 64 * 1024
+
+
 def bounded_proxy(tmp_path, engines: Engines, limit: int) -> httpx.AsyncClient:
     app = create_app(
         upstream_file(tmp_path, {BIG: "http://127.0.0.1:8001"}),

@@ -78,10 +78,12 @@ FORWARDED_PATHS = frozenset({
 MODEL_HEADER = "x-gpm-model"
 POOL_HEADER_PREFIX = "x-gpm-"
 
-#: The largest body forwarded. Above the pool's own request limit (24 MB by default, D144), so it
-#: does not refuse what the pool let through; it is here so that nothing reaching this port can
-#: make it hold an unbounded body.
-MAX_BODY_BYTES = 64_000_000
+#: The largest body forwarded. Above the most the pool's own request limit may be set to (64 MB;
+#: 24 MB by default, D144), so it does not refuse what the pool let through — with room for what
+#: the pool adds when it rebuilds an upload's form to name the build (a boundary, the model's
+#: tag), which can make a body the pool accepted at its limit a few hundred bytes longer. It is
+#: here so that nothing reaching this port can make it hold an unbounded body.
+MAX_BODY_BYTES = 65_000_000
 
 #: Above this, a JSON body is read on a worker thread, so one large picture does not stall every
 #: other stream this process carries — the rule the pool's router keeps for itself (D144).

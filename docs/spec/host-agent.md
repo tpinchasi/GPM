@@ -151,21 +151,34 @@ absolute path); the pool never sends a path or a command. Its engine URL is
 - **Fetching.** *Put models* names one build: a file at the root of a hub repository
   (`owner/repo/file.bin`), which the agent checks against the repository's listing and fetches,
   alone, into its own directory `owner__repo__file.bin/` under the models directory — resumably,
-  as every fetch is — refusing a name that leaves it (D40).
+  as every fetch is — refusing a name that leaves it (D40). Each part starts with a letter or
+  digit, holds letters, digits, dots, dashes and underscores, never ends in `_` or holds `__`
+  (so the directory's name reads back as the tag), and the file ends in `.bin`. A desired set
+  naming more than one build is refused (`400 one_model_only`): the server serves one file.
 - **Holding.** Only under `pinned` residency, which the pool requires of such a host. The agent
   starts the server with exactly
-  `whisper-server -m <file> --host 127.0.0.1 --port <port> --inference-path /v1/audio/transcriptions --convert -l auto`
+  `whisper-server -m <file> --host 127.0.0.1 --port <port> --inference-path /v1/audio/transcriptions --convert --tmp-dir <state>/tmp -l auto`
   (`-l auto` because its default language is English), in its own session, with the hub's
-  credential withheld from its environment; its record, its log and its working directory —
-  where it writes converted audio — are the agent's state directory beside the models directory,
-  never inside it. A port another program already answers on is refused. A server that stopped,
-  or a build that changed, is started again on the pool's next pass, and a failed start is tried
-  again only after a pause. The server outlives an agent restart and is recognised by its command
-  line when the agent comes back.
+  credential withheld from its environment; its record and its log are in the agent's state
+  directory beside the models directory (`<state>`), never inside it. **Every recording it is
+  sent lands in `<state>/tmp`**, its working directory and `--tmp-dir`, where whisper.cpp writes
+  it for `ffmpeg` and leaves one it could not convert behind: the state directory and that one
+  are this user's alone (0700, a link refused for the second), and the agent empties it — of
+  regular files, following no link — before every start and after every stop. A port another
+  program already answers on is refused. A server that stopped, or a build that changed, is
+  started again on the pool's next pass, and a failed start — an error from the system included,
+  such as a state directory the agent may not write — is tried again only after a pause. A
+  server whose build has left the set, or a set gone `on_demand`, is stopped. Stopping signals
+  the server's whole process group, so a wrapper script's real server stops with it. The server
+  outlives an agent restart and is recognised when the agent comes back by running exactly the
+  argument list recorded for it (behind a script's interpreter, as the system runs one), looked
+  at again on every pass.
 - **Facts.** The program's version as its installation names it (1.9.2 has no version flag),
   where it was found, whether `ffmpeg` is present (`--convert` needs it: without it the server
   exits at start), the file on disk, whether `GET /` answers, the build loaded only when the
-  agent's own server is running it and answers, and the last line of its log when it stopped.
+  agent's own server is running it and answers, and when it stopped, its exit code and the last
+  line of its log naming an error — never a line it writes about a request, which carries the
+  name a client gave its recording.
 
 This is the one program the agent itself starts, and it starts it only with these fixed
 arguments. One machine running Ollama and whisper.cpp runs two agents, each with its own port and
@@ -182,7 +195,9 @@ gives up a host whose image was chosen for carrying it and does not, with that r
 
 The launcher starts each model with `--max-model-len` at the smaller of the pool's number and the
 maximum vLLM derives from that model's own files — its configuration's text section, rotary
-scaling, and for an absolute-position encoder its tokenizer's length — so Whisper starts at 448
+scaling, and for a model vLLM runs for pooling (a sentence-transformers model, or one whose
+architecture ends `…ForSequenceClassification`, `…Model` and the like, never `…ForCausalLM`) with
+absolute positions, its tokenizer's length — so Whisper starts at 448
 beside a chat model at 8192. A model capped is in the facts: `engine.max_model_len_capped`,
 `{model: {asked, applied}}`.
 
@@ -204,7 +219,7 @@ archive is already on every host the pool creates.
 | Between copies | The one with the fewest requests in flight from the router; a copy that refuses the connection is passed over for the next, since it never saw the request (D107) |
 | Translates | **Nothing.** The request leaves as it arrived, byte for byte, with only the upstream chosen; the pool's `X-GPM-*` headers end here |
 | Streams | A JSON request as its `stream` field says; an upload's answer always, with the engine's status and type, since whether it streams is a field of the form |
-| Bounds | A body over 64 MB — above the most `pool.max_request_mb` may be — is `413 request_too_large`: refused on its declared length before it is read, and counted while it is read |
+| Bounds | A body over 65 MB — above the most `pool.max_request_mb` may be (64 MB), with room for what the pool adds when it rebuilds an upload's form to name the build — is `413 request_too_large`: refused on its declared length before it is read, and counted while it is read |
 | Errors | `{"error": {"message", "type"}}` in fixed words — never the model, header or path a caller sent, nor an exception's text, which go to its log: `path_not_served` and `model_not_found` (404), `request_too_large` (413), `upstream_unavailable` (502) |
 | `/health` | 200 only when **every** engine behind it answers — every copy of every model. A machine serving two models of three is not one the pool can call ready, nor one serving a model on one card of two |
 | `/v1/models` | The union, so the pool sees one host holding a set; a model with copies once every copy answers |
