@@ -20,6 +20,9 @@ from .base import (
 )
 
 _STREAMING_PATHS = frozenset({"/api/chat", "/api/generate"})
+#: Where this engine's own API carries pictures: in `messages` (chat), or in `images` beside the
+#: prompt (generate).
+_OWN_INPUT_FIELDS = frozenset({"messages", "images"})
 
 
 def _decode(body: bytes) -> dict[str, Any]:
@@ -77,15 +80,21 @@ class OllamaEngine:
         # Its own API: the same top-level fields, a picture as base64 in `images` — beside a
         # message's text in chat, beside the prompt in generate — and streaming on by default.
         kind = self.kind_of(path) or CHAT
-        found = openai_api.members(body)
+        found = openai_api.members(body, keep_written=True)
         if found is None:
             return RequestFacts(model=None, kind=kind)
-        model = openai_api.requested_model(body)
+        # This engine matches keys ignoring letter case, so the fields that carry pictures are held
+        # to the rule `model` is (D141): a second `"Messages"` or a message's `"Images"` would be
+        # read by the engine and missed by the pool.
+        model = openai_api.model_of(found, openai_api.POOL_FIELDS | _OWN_INPUT_FIELDS)
         fields = {key: value for key, value, _, _ in found}
         inputs: set[str] = set()
         if kind == CHAT:
-            carriers = [fields] + [m for m in fields.get("messages") or [] if isinstance(m, dict)]
+            messages = fields.get("messages")
+            carriers = [fields] + [m for m in (messages if isinstance(messages, list) else ()) if isinstance(m, dict)]
             for carrier in carriers:
+                if carrier is not fields:
+                    openai_api.written_once(carrier, openai_api.MESSAGE_FIELDS)
                 images = carrier.get("images")
                 if images:
                     if not isinstance(images, list) or not all(isinstance(i, str) and ":" not in i for i in images):

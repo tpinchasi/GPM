@@ -262,17 +262,38 @@ def kinds_of(engine: Any) -> frozenset[str]:
     return frozenset(getattr(engine, "kinds", VERSION_ONE_KINDS))
 
 
+#: Ollama's own paths, and what each asks for (D142) — for an engine that does not map its paths.
+_NATIVE_KINDS = {"/api/chat": CHAT, "/api/generate": CHAT, "/api/embed": EMBED, "/api/embeddings": EMBED}
+
+
+def kind_of_path(engine: Any, path: str) -> str:
+    """What a request on this path asks for. A version-2 engine maps its own paths; for one that
+    does not — a version-1 plug-in — the path says it in the shapes the pool knows, OpenAI's and
+    Ollama's, and any other path is chat, as every request was before kinds existed. Read from
+    the path alone, so even a request refused before its body is understood is logged as what
+    it asked for."""
+    mapper = getattr(engine, "kind_of", None)
+    kind = mapper(path) if mapper is not None else None
+    if kind is not None:
+        return kind
+    from . import openai_api  # here rather than above: that module reads this one's names
+
+    return openai_api.kind_of(path) or _NATIVE_KINDS.get(path, CHAT)
+
+
 def facts_of(engine: Any, path: str, content_type: str, body: bytes) -> RequestFacts:
     """A request's facts, through the engine's version-2 reader where it has one.
 
-    A version-1 plug-in is read the way it always was — three calls — and as chat: it declared
-    no other kind. May raise `AmbiguousField`, `MediaNotInline` or `multipart.BadUpload`.
+    A version-1 plug-in is read the way it always was — three calls — with its kind taken from
+    the path: an embedding is measured as one (D145) whichever version of plug-in serves it. May
+    raise `AmbiguousField`, `MediaNotInline` or `multipart.BadUpload`.
     """
     reader = getattr(engine, "request_facts", None)
     if reader is not None:
         return reader(path, content_type, body)
     return RequestFacts(
         model=engine.requested_model(path, body),
+        kind=kind_of_path(engine, path),
         stream=engine.is_streaming(path, body),
         wants_schema=engine.wants_schema(path, body),
     )
