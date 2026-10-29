@@ -105,8 +105,12 @@ LATEST_EVERY_S = 6 * 3600.0
 SWITCH_TIMEOUT_S = 120.0
 
 #: How long a version that could not be fetched or staged is left alone before another attempt —
-#: long enough not to spend the hour's questions on one failure, short enough to recover.
+#: long enough not to spend the hour's questions on one failure, short enough to recover — and
+#: twice as long after each failure in a row of the same version asked for, up to
+#: `RETRY_AT_MOST_S`: a failure late in an install (a check, a disk that fills, the time limit)
+#: fetches the whole version again on each attempt — some 4 GB for vLLM.
 RETRY_AFTER_S = 300.0
+RETRY_AT_MOST_S = 6 * 3600.0
 
 #: GitHub's API, and where a test or a mirror points instead — the machine owner's environment,
 #: never the pool's word. A token there (`GITHUB_TOKEN`) raises the hourly limit; it is read from
@@ -827,6 +831,19 @@ def _keep_only(downloads: Path, digests: set[str]) -> None:
                 path.unlink()
 
 
+def _remove_all(paths: list[Path]) -> None:
+    """Remove each directory and what is in it, as far as it can be: what is left is removed by
+    the next prune."""
+    for path in paths:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def _remove_if_there(path: Path) -> None:
+    """Remove a directory and what is in it, where there is one; any other failure is raised."""
+    with contextlib.suppress(FileNotFoundError):
+        shutil.rmtree(path)
+
+
 def source_for(
     engine: str, target: Target, *, run: Optional[host_platform.Runner] = None, tools_dir: Optional[Path] = None,
 ) -> Optional[Source]:
@@ -998,6 +1015,10 @@ class Installer:
         self._lock = asyncio.Lock()
         #: When each version asked for may be tried again after a failure, by what was asked.
         self._retry_at: dict[str, float] = {}
+        #: What was asked for when staging last failed, and how long it was then left: the next
+        #: failure of the same is left twice as long; a success, or another version asked for,
+        #: starts again from `RETRY_AFTER_S`.
+        self._backoff: tuple[Optional[str], float] = (None, 0.0)
         #: When a server that would not start may be started again.
         self._start_retry_at = 0.0
         #: What the installer last said in the record's error about what it was asked — a version
@@ -1279,6 +1300,7 @@ class Installer:
                 if release is not None:
                     await self._stage(http, release)
             self._retry_at.pop(wanted, None)
+            self._backoff = (None, 0.0)
             target = self.record.staged
             if self.record.running is None and target:
                 # Nothing runs yet, so there is nothing to drain: the first version starts now.
@@ -1289,7 +1311,10 @@ class Installer:
             # something unforeseen, said in its own words rather than lost with the task.
             if not isinstance(no, (InstallRefused, OSError)):
                 log.exception("installing %s %s failed", self.source.engine, wanted)
-            self._retry_at[wanted] = self.clock() + RETRY_AFTER_S
+            asked, waited = self._backoff
+            wait = min(waited * 2, RETRY_AT_MOST_S) if asked == wanted else RETRY_AFTER_S
+            self._backoff = (wanted, wait)
+            self._retry_at[wanted] = self.clock() + wait
             self.record.error = str(no) or type(no).__name__
             with contextlib.suppress(OSError):
                 self._save()
@@ -1331,8 +1356,8 @@ class Installer:
         # The owner's alone: it holds programs the agent runs as its owner.
         self.engine_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         partial = self.engine_dir / f"{version}{PARTIAL}"
-        with contextlib.suppress(FileNotFoundError):
-            shutil.rmtree(partial)
+        # A version's directories are removed in a thread, as `_prune` removes them: gigabytes.
+        await asyncio.to_thread(_remove_if_there, partial)
         partial.mkdir(mode=0o755)
 
         def room(needed: int, what: str) -> None:
@@ -1342,16 +1367,16 @@ class Installer:
             await self.source.stage(http, release, partial, report, room)
             final = self.engine_dir / version
             if final.exists():
-                shutil.rmtree(final)
+                await asyncio.to_thread(shutil.rmtree, final)
             os.replace(partial, final)
         except BaseException:
-            shutil.rmtree(partial, ignore_errors=True)
+            await asyncio.to_thread(shutil.rmtree, partial, True)
             raise
         _keep_only(self.engine_dir / DOWNLOADS, set())
         self.record.staged = version
         self.record.error = None
-        self._prune()
         self._save()
+        await self._prune()
 
     async def _switch_job(self, target: str) -> None:
         try:
@@ -1416,22 +1441,31 @@ class Installer:
                 elif not before:
                     record.running = None
                 record.error = error
-            self._prune()
             self._save()
+            await self._prune()
 
-    def _prune(self) -> None:
+    async def _prune(self) -> None:
         """Keep the running version, the previous one and the staged one; remove the rest, and
-        any half-staged directory not being staged now."""
+        any half-staged directory not being staged now.
+
+        What goes is chosen here, from the record as it stands; it is removed in a thread — a
+        version of vLLM is some 8 GB in tens of thousands of files, seconds of the event loop
+        the agent answers the pool on. Only a job prunes (a stage, or a switch under the server's
+        lock), and one job runs at a time, so nothing stages or keeps a directory chosen here
+        while it goes."""
         record = self.record
         keep = {record.running, record.previous, record.staged} - {None}
         staging = (self.working or {}).get("version")
         if not self.engine_dir.is_dir():
             return
+        going = []
         for path in self.engine_dir.iterdir():
             if not path.is_dir() or path.is_symlink():
                 continue
             name = path.name
             if VERSION.fullmatch(name) and name not in keep:
-                shutil.rmtree(path, ignore_errors=True)
+                going.append(path)
             elif name.endswith(PARTIAL) and VERSION.fullmatch(name[: -len(PARTIAL)]) and name[: -len(PARTIAL)] != staging:
-                shutil.rmtree(path, ignore_errors=True)
+                going.append(path)
+        if going:
+            await asyncio.to_thread(_remove_all, going)

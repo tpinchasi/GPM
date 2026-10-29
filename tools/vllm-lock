@@ -16,7 +16,10 @@ aarch64), one file, `agent/src/gpm_agent/vllm_sets/vllm-<version>-py<python>-<pr
 1. **Resolved by uv**: `uv pip compile` of `vllm[audio]==<version>` for that Linux and Python,
    wheels only (`--only-binary :all:`, so nothing would be built), with hashes — at the oldest
    manylinux level, the oldest glibc, at which every wheel is published, tried from 2.28 upward.
-   The audio extra is in every set, so a host serving speech has it (D146).
+   The audio extra is in every set, so a host serving speech has it (D146). Every resolution of
+   a run sees PyPI as it stood when the run began (`--exclude-newer`, one time for all), so a
+   dependency released while it runs cannot make one Python's or processor's set differ from
+   another's.
 2. **One wheel for each pin**: its files are read from PyPI's JSON API, and the one pip would
    install on such a machine is chosen, by the order of tags pip prefers; its sha256 must be one
    uv listed for it, two records of one digest. Only that wheel's digest is written — pip then
@@ -34,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import datetime
 import json
 import os
 import re
@@ -90,9 +94,12 @@ def normalized(name: str) -> str:
 # --- what uv resolves ---
 
 
-def uv_compile(requirement: str, python: str, platform: str, glibc: str, index: str) -> str:
+def uv_compile(
+    requirement: str, python: str, platform: str, glibc: str, index: str, exclude_newer: Optional[str] = None,
+) -> str:
     """`uv pip compile` of one requirement for one Linux: its output, or `LockFailed` with uv's
-    own words for why not."""
+    own words for why not. `exclude_newer` (an RFC 3339 time) leaves out every file uploaded
+    after it."""
     uv = shutil.which("uv")
     if uv is None:
         raise LockFailed("uv is not on PATH: https://docs.astral.sh/uv/")
@@ -106,6 +113,7 @@ def uv_compile(requirement: str, python: str, platform: str, glibc: str, index: 
                 "--python-platform", f"{platform}-manylinux_{glibc.replace('.', '_')}",
                 "--python-version", python, "--generate-hashes", "--only-binary", ":all:",
                 "--no-header", "--no-annotate", "--index-url", index,
+                *(["--exclude-newer", exclude_newer] if exclude_newer else []),
             ],
             cwd=work, env=environment, capture_output=True, text=True, check=False,
         )
@@ -248,20 +256,22 @@ def lock(
     python: str,
     platform: str,
     *,
-    compile: Callable[[str, str, str, str, str], str] = uv_compile,
+    compile: Callable[[str, str, str, str, str, Optional[str]], str] = uv_compile,
     files: Callable[[str, str], list[dict[str, Any]]] = pypi_files,
     levels: Iterable[str] = LEVELS,
     index: str = INDEX,
+    exclude_newer: Optional[str] = None,
     workers: int = 8,
 ) -> dict[str, Any]:
-    """One set: `vllm[audio]==version` for CPython `python` on Linux on `platform`."""
+    """One set: `vllm[audio]==version` for CPython `python` on Linux on `platform`, from PyPI as it
+    stood at `exclude_newer` where one is given."""
     if not VERSION.fullmatch(version):
         raise LockFailed(f"{version!r} is not a version of digits and dots, which the agent names a directory by")
     requirement = f"vllm[audio]=={version}"
     tried = []
     for glibc in levels:
         try:
-            compiled = compile(requirement, python, platform, glibc, index)
+            compiled = compile(requirement, python, platform, glibc, index, exclude_newer)
             break
         except LockFailed as no:
             tried.append(f"glibc {glibc}: {str(no).splitlines()[-1] if str(no) else no}")
@@ -306,11 +316,17 @@ def file_name(locked: dict[str, Any]) -> str:
     return f"vllm-{locked['vllm']}-py{locked['python']}-{locked['platform']}.json"
 
 
+def now_rfc3339() -> str:
+    """This moment, as uv's `--exclude-newer` takes it: UTC, to the second."""
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def main(
     argv: Optional[list[str]] = None,
     *,
-    compile: Callable[[str, str, str, str, str], str] = uv_compile,
+    compile: Callable[[str, str, str, str, str, Optional[str]], str] = uv_compile,
     files: Optional[Callable[[str, str], list[dict[str, Any]]]] = None,
+    clock: Callable[[], str] = now_rfc3339,
 ) -> int:
     parser = argparse.ArgumentParser(prog="vllm-lock", description=__doc__.split("\n\n")[0])
     parser.add_argument("version", help="the vLLM version, e.g. 0.32.0")
@@ -333,12 +349,18 @@ def main(
             cache[(name, version)] = fetch(name, version)
         return cache[(name, version)]
 
+    # One moment for every set of the run: each resolution sees PyPI as it stood then.
+    exclude_newer = clock()
+    print(f"vLLM {args.version}: resolving from {args.index} as it stood at {exclude_newer}", file=sys.stderr, flush=True)
     made = []
     try:
         for platform in args.platform:
             for python in args.python:
                 print(f"vLLM {args.version}, Python {python}, {platform}…", file=sys.stderr, flush=True)
-                made.append(lock(args.version, python, platform, compile=compile, files=cached, levels=levels, index=args.index))
+                made.append(lock(
+                    args.version, python, platform, compile=compile, files=cached, levels=levels, index=args.index,
+                    exclude_newer=exclude_newer,
+                ))
     except LockFailed as no:
         print(f"vllm-lock: {no}", file=sys.stderr)
         return 1
@@ -354,7 +376,7 @@ def main(
             f"{path.name}: {locked['wheels']} wheels, {locked['size_bytes'] / 1e9:.2f} GB, glibc {locked['glibc']}, "
             f"CUDA {locked['cuda_runtime']}, driver {locked['driver_floor']} or later"
         )
-    print(f"{len(made)} sets, {total / 1e3:.0f} kB, in {args.out}")
+    print(f"{len(made)} sets, {total / 1e3:.0f} kB, in {args.out}, from PyPI as it stood at {exclude_newer}")
     return 0
 
 
