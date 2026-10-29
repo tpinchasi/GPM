@@ -230,6 +230,15 @@ def engine_offers() -> dict[str, Any]:
 _MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 
 
+def _engine_of_unmarked(config: PoolConfig) -> str:
+    """The engine a build that names none has been serving: the rented hosts' where the pool has
+    no hosts of its own — they run vLLM unless told otherwise (D147) — and otherwise the pool's
+    own engine, which its configured hosts run."""
+    if config.rented is not None and not any(not h.disabled for h in config.hosts):
+        return config.rented_engine()
+    return config.engine
+
+
 def _with_builds(text: str, config: PoolConfig, name: str, builds: dict[str, str], workloads_only: bool = False) -> str:
     """`text` with the catalog entry for `name` holding `builds` — one per engine — and every
     build it already had for other engines (D98, D101).
@@ -241,19 +250,23 @@ def _with_builds(text: str, config: PoolConfig, name: str, builds: dict[str, str
     """
     entry = config.catalog.get(name)
     before = [v.model_dump(exclude_defaults=True) for v in entry.variants] if entry else []
+    unmarked = _engine_of_unmarked(config)
     if entry is not None:
-        variants = [v | {"engine": v.get("engine") or config.engine} for v in before]
+        variants = [v | {"engine": v.get("engine") or unmarked} for v in before]
     elif workloads_only:
         variants = []  # no shared host serves it, so no build of the pool's own engine is implied
     else:
-        variants = [{"tag": name, "engine": config.engine}]
+        variants = [{"tag": name, "engine": unmarked}]
     for engine, tag in builds.items():
+        # A build sent again is kept as written — what it serves and takes, its size — not
+        # reduced to its name (D143).
+        kept = next((v for v in variants if v.get("engine") == engine and v.get("tag") == tag), None)
         variants = [v for v in variants if v.get("engine") != engine]
-        variants.append({"tag": tag, "engine": engine})
+        variants.append(kept or {"tag": tag, "engine": engine})
     written = {"variants": variants, **({"workloads_only": True} if workloads_only else {})}
     if entry is not None and variants == before and entry.workloads_only == workloads_only:
         return text  # nothing about this model changes
-    if entry is None and not workloads_only and variants == [{"tag": name, "engine": config.engine}]:
+    if entry is None and not workloads_only and variants == [{"tag": name, "engine": unmarked}]:
         return text  # served under its own name by the pool's engine: no entry needed
     if entry is not None:
         return set_values(text, ("catalog", name), written)
@@ -277,13 +290,17 @@ def _with_variants(
     what `traits` says it serves and takes, by tag (D143), a None there removing the field."""
     entry = config.catalog.get(name)
     before = [v.model_dump(exclude_defaults=True) for v in entry.variants] if entry else []
+    unmarked = _engine_of_unmarked(config)
     if entry is not None:
-        current = [v | {"engine": v.get("engine") or config.engine} for v in before]
+        # A build that names no engine is marked with the one it has been serving only when a
+        # build for another engine joins it — otherwise it is left as written, and saying what
+        # it serves or takes changes nothing else about it.
+        current = [v | {"engine": v.get("engine") or unmarked} for v in before] if variants else [dict(v) for v in before]
     elif any(v["tag"] == name for v in variants):
         current = []
     else:
-        # Served under its own name by the pool's engine until now: that stays its first build.
-        current = [{"tag": name, "engine": config.engine}] if name in config.pool.model_set else []
+        # Served under its own name until now: that stays its first build.
+        current = [{"tag": name, "engine": unmarked} if variants else {"tag": name}] if name in config.pool.model_set else []
     tags = {v["tag"] for v in current}
     for variant in variants:
         if variant["tag"] not in tags:
@@ -504,7 +521,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         found = []
         for model in config.pool.model_set:
             entry = config.catalog.get(model)
-            variants = entry.variants if entry else [Variant(tag=model, engine=config.engine)]
+            variants = entry.variants if entry else [Variant(tag=model, engine=_engine_of_unmarked(config))]
             looked_up = store.get(HUB, model)
             hub = {b.get("repo"): b for b in (looked_up[0].get("builds", []) if looked_up else [])}
             for variant in variants:
@@ -512,7 +529,9 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 found.append({
                     "model": model,
                     "tag": variant.tag,
-                    "engine": variant.engine or config.engine,
+                    # A build that names no engine is shown as the one it has been serving: the
+                    # rented hosts' in a pool that only rents (D147), the pool's own otherwise.
+                    "engine": variant.engine or _engine_of_unmarked(config),
                     "requires": list(variant.requires),
                     "size_gb": size,
                     "precision": (hub.get(variant.tag) or {}).get("precision"),
@@ -1222,8 +1241,11 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
 
         # What an existing build serves and takes, as the operator corrected it (D143).
         described: dict[str, dict[str, dict[str, Any]]] = {}
-        for item in body.get("describe") or []:
-            name, tag = str((item or {}).get("model") or ""), str((item or {}).get("tag") or "")
+        described_items = body.get("describe") or []
+        if not isinstance(described_items, list) or not all(isinstance(i, dict) for i in described_items):
+            return text, _error(400, "bad_build", "`describe` is a list of {model, tag, serves?, inputs?}")
+        for item in described_items:
+            name, tag = str(item.get("model") or ""), str(item.get("tag") or "")
             listed = config.catalog.get(name)
             # A model with no catalog entry is served under its own name: that is its one build.
             tags = {v.tag for v in listed.variants} if listed else ({name} if name in config.pool.model_set else set())

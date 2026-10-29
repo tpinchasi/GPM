@@ -256,7 +256,8 @@ def test_a_body_over_the_limit_is_refused_before_it_is_read():
 
 
 def test_the_router_holds_no_more_request_bytes_than_it_allows():
-    with gpu_pool(max_held_request_mb=0.001) as pool, pool.client() as client:
+    with gpu_pool(max_request_mb=0.01, max_held_request_mb=0.01) as pool, pool.client() as client:
+        assert pool.state.take_request_bytes(8_000)  # another request's, still held
         response = client.post("/v1/audio/transcriptions", data={"model": WHISPER},
                                files={"file": ("a.wav", b"x" * 5_000, "audio/wav")})
         assert response.status_code == 503
@@ -373,3 +374,21 @@ def test_a_whisper_cpp_host_whose_agent_is_silent_is_unreachable_like_any_other(
         pool.reprobe()
         host = pool.supervisor.hosts["mac-whisper"]
         assert host.state.value == "unreachable"
+
+
+def test_an_engine_that_comes_back_is_asked_again_what_its_builds_take():
+    """Upgraded and restarted, Ollama may now see pictures: the first probe that finds it again
+    asks, rather than serving ten minutes on what the old version said (D143)."""
+    with two_macs([{"tag": "vision:7b-text"}, {"tag": "vision:7b"}]) as pool, pool.client() as client:
+        refused = client.post("/v1/chat/completions", json={"model": "vision", "messages": picture_message()})
+        assert refused.json()["reason"] == "input_not_accepted"
+
+        engine = pool.engines["second"].fake
+        engine.healthy = False
+        pool.reprobe()
+        engine.healthy = True
+        engine.capabilities["vision:7b"] = ["vision"]
+        pool.reprobe()
+        served = client.post("/v1/chat/completions", json={"model": "vision", "messages": picture_message()})
+        assert served.status_code == 200, served.text
+        assert served.headers["X-GPM-Host"] == "second"

@@ -161,12 +161,22 @@ class Workloads:
         variants = variants_for_host(
             list(req.models), self.config.catalog, frozenset(rented.capabilities), self.config.rented_engine()
         )
+        engine = self.config.rented_engine()
+        can = self.config.engine_kinds(engine)
+        traits = self.config.build_traits()
+        carried = [frozenset(i.capabilities) for i in rented.images]
         builds = {}
         for model in req.models:
-            group = variants.get(model) or ()
+            # Only a build the rented engine serves (D142), from an image that carries what it
+            # needs (D146) — else the workload would rent hosts that could never answer it.
+            group = [
+                v for v in variants.get(model) or ()
+                if (traits.get(v.tag, (frozenset({"chat", "embed"}), None))[0] & can)
+                and (not self.config.image_needs([v.tag]) or any(self.config.image_needs([v.tag]) <= c for c in carried))
+            ]
             if not group:
                 raise WorkloadRefused(
-                    f"{model!r} has no build rented hosts can run ({self.config.rented_engine()}); add one to the catalog"
+                    f"{model!r} has no build rented hosts can serve ({engine}, from the images listed); add one to the catalog"
                 )
             builds[model] = group[0].tag
         return builds, 1

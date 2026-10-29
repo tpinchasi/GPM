@@ -65,7 +65,7 @@ the kinds it can, and a pool may run several engines (D93):
 |---|---|---|
 | chat | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`; Ollama's `/api/chat`, `/api/generate` | Ollama, vLLM |
 | embeddings | `/v1/embeddings`; Ollama's `/api/embed`, `/api/embeddings` | Ollama, vLLM |
-| transcription | `/v1/audio/transcriptions`, `/v1/audio/translations` — a `multipart/form-data` upload | vLLM, whisper.cpp |
+| transcription | `/v1/audio/transcriptions`, `/v1/audio/translations` — a `multipart/form-data` upload | vLLM; whisper.cpp transcribes only (its server answers no translation path) |
 | ranking | `/v1/rerank` | vLLM |
 
 Only these exact paths are forwarded. A model name resolves to a build that serves the kind

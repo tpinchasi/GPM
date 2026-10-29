@@ -165,9 +165,9 @@ own, which an older router ignores.
     `vllm` launcher's own interpreter, `python -I`, importing the extra) and fails the host with
     the reason if the image lied; without the extra vLLM starts and answers every transcription
     `400 Invalid or unsupported audio file`, saying why only in its log.
-  - **Rerankers** are catalogued only when their `config.json` names a sequence-classification
-    architecture, which vLLM runs as a pooling model; a reranker that needs per-model overrides
-    is refused at load rather than started wrong.
+  - **Rerankers** are catalogued as sequence-classification models, which vLLM runs as pooling
+    models. Nothing yet checks a reranker's `config.json`: a refusal at load for one needing
+    per-model launch overrides is not built (review, 2026-10-29).
 - **Ollama.** Pictures and sound inside chat on the hosts and tags where §3 observes them;
   never transcription or rerank.
 - **whisper.cpp** — a new engine, `whisper-cpp`, for Whisper builds on a Mac's GPU (or any machine
@@ -367,7 +367,7 @@ and its `-ggml` and `-ct2` builds, Apache-2.0).
 | The console fields belonged on the Profiles tab (D112) | §7 |
 | The proxy forwards any path and lists the host's models in errors | §5 |
 | The host check posts `/api/generate` to the first model by name | §5 |
-| Rerankers needing per-model overrides | §5: refused at load |
+| Rerankers needing per-model overrides | §5: a refusal at load, not built yet |
 | Pictures and recordings on untrusted hosts (T7) | Answer 4: as text, documented |
 | Decisions and spec were the last stage | Build stages: first |
 
