@@ -258,15 +258,16 @@ def test_the_agent_never_runs_a_shell_or_a_command_it_was_given():
     for name in ("app.py", "models.py", "engines.py", "installs.py", "proxy.py", "engine_control.py", "whisper_build.py"):
         assert "host_platform.start(" not in (root / name).read_text(), f"{name} starts a program"
 
-    # What runs through `run_command`, and from where: whisper.cpp's build and checks (D152). Each
-    # command is a literal list — a fixed program, or a path the agent found, then constants — or
-    # comes from one of the builders that write the build's argument lists; nothing else.
-    builders = {"configure_argv", "build_argv", "venv_argv", "pip_argv", "help_argv"}
+    # What runs through `run_command`, and from where: whisper.cpp's build and checks (D152), and
+    # vLLM's environment, pip and its check (D157, D158). Each command is a literal list — a fixed
+    # program, or a path the agent found, then constants — or comes from one of the builders that
+    # write those argument lists; nothing else.
+    builders = {"configure_argv", "build_argv", "venv_argv", "pip_argv", "help_argv", "check_argv"}
     for name in sorted(path.name for path in root.glob("*.py")):
         text = (root / name).read_text()
         if "host_platform.run_command" not in text and "platform import run_command" not in text:
             continue  # startup.py has a `run_command` of its own, for the owner's commands
-        assert name in ("whisper_build.py", "whisper_cpp.py"), f"{name} runs commands"
+        assert name in ("whisper_build.py", "whisper_cpp.py", "vllm_install.py"), f"{name} runs commands"
         tree = ast.parse(text)
         runs = [
             node for node in ast.walk(tree) if isinstance(node, ast.Call) and (

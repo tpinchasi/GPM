@@ -349,17 +349,22 @@ serving and starts the new program with it, with the same arguments and uploads 
 made with the agent's own interpreter (Python 3.11–3.14) under `<engines>/vllm/<port>/<version>/`,
 filled only from that version's **locked set**: a list GPM's release generates and the agent
 carries — every wheel, `vllm`'s and each dependency's, `torch` and CUDA's libraries among them,
-with its sha256, for each supported Python minor version and processor, and the least NVIDIA
-driver the set's CUDA needs. It is installed with `pip install --require-hashes --only-binary
-:all: --no-deps` from PyPI, so no source distribution is built and no file differs from the one
-recorded; `latest` is the newest vLLM the agent has a set for. A version is kept only if its
-`vllm` runs, and imports the audio extra where the host holds a speech model (§2.1, D146). The
-free-disk floor counts a version as its set's size unpacked. It is refused, saying why, on
-anything but Linux on x86_64 or aarch64 with an NVIDIA card of compute capability 7.5 or higher
-and the set's driver. **The agent runs it** (D159): `gpm-agent vllm-start` with `--vllm` naming
-that version's program — accepted only inside the agent's engines directory — once every model the
-host holds is on disk (§2.1's fetch), again whenever that set changes, and stopped to switch
-versions. It runs, holding its share of the card, for as long as the machine is in the pool;
+with its sha256 — one wheel to a pin, the one pip takes there — for each supported Python minor
+version and processor, with the audio extra, the oldest glibc its wheels are published for, and
+the least NVIDIA driver the set's CUDA needs (`tools/vllm-lock`, run by GPM's release). It is
+installed with `pip install --require-hashes --only-binary :all: --no-deps --isolated
+--no-cache-dir` from PyPI, at low priority, so no source distribution is built and no file
+differs from the one recorded; `GPM_PYPI_INDEX` names another index, or a directory of wheels,
+for tests. `latest` is the newest vLLM the agent has a set for. A version is kept only if its
+own `vllm --version` answers with the version, and imports the audio extra where the host holds
+a speech model (§2.1, D146); its programs are pointed at the version's directory before it is
+renamed into place. The free-disk floor counts a version as three times its set's wheels: the
+environment, the `.pyc` pip compiles and the one wheel in flight. It is refused, saying why,
+before anything is fetched, on anything but Linux on x86_64 or aarch64 with the set's glibc, an
+NVIDIA card of compute capability 7.5 or higher and the set's driver. **The agent runs it**
+(D159): `gpm-agent vllm-start` with `--vllm` naming that version's program — accepted only
+inside the agent's engines directory — once every model the host holds is on disk (§2.1's
+fetch), again whenever that set changes, and stopped to switch versions. It runs, holding its share of the card, for as long as the machine is in the pool;
 taking the machine out of service gives the card back.
 
 **An engine of `auto`** (D161) is chosen by the agent each time it starts, from the machine alone:
