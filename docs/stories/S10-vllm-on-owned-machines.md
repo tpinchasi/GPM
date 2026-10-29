@@ -85,12 +85,14 @@ Decided in D157–D161 and specified in [host-agent.md](../spec/host-agent.md) �
 5. **The machine's card**: vLLM holds its share for as long as the machine is in the pool (answer 3).
 6. **`engine: auto`** (answer 5):
    - A host may name `auto` for its engine, and its agent chooses from the machine's facts.
-   - It chooses vLLM only where vLLM can run every model the host holds: an NVIDIA card of
-     compute capability 7.5 or higher; a driver new enough for the locked `torch`'s CUDA; each
-     model's vLLM build within the card's generation (D100's floor for its precision); and the
-     whole set within the card's memory (D104's plan).
-   - Anywhere else — an AMD or Intel card, an older NVIDIA card, no card at all — it chooses
-     Ollama.
+   - It chooses vLLM on Linux with an NVIDIA card of compute capability 8.0 or higher (Ampere
+     onward, where the BF16, FP8 and FP4 builds catalogs carry for vLLM run) and a driver new
+     enough for the locked `torch`'s CUDA. The choice is the machine's alone: the agent learns
+     which builds to fetch only once the engine is chosen.
+   - Anywhere else — an AMD or Intel card, a Turing card (vLLM runs there, but only FP16 and
+     integer builds), an older NVIDIA card, no card at all — it chooses Ollama.
+   - A model the chosen engine cannot hold on that card is shown by the pool as a
+     configuration problem, as for any host.
    - The choice and its reason are in the agent's facts. The pool publishes the host's engine
      from them (D93), routes each model to that engine's build, and says why on the Hosts
      screen.

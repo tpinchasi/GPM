@@ -509,11 +509,12 @@ pinned version, which the agent installs and the supervisor switches to when the
 and drained ([supervisor.md](supervisor.md) §3.1). Ignored, and said so in plan, for a host whose
 agent's owner has not allowed installs.
 
-Such a host may also name **`engine: auto`** (D161): its agent runs vLLM where vLLM can run every
-model the host holds — Linux, an NVIDIA card of compute capability 7.5 or higher with the driver
-vLLM's locked set needs, each model's vLLM build within the card's generation, the whole set within
-the card's memory — and Ollama anywhere else, and the pool routes to it as the engine it chose
-([supervisor.md](supervisor.md) §3.2). Each model an `auto` host holds needs a build for both
+Such a host may also name **`engine: auto`** (D161): its agent runs vLLM on Linux with an NVIDIA
+card of compute capability 8.0 or higher (Ampere onward) and the driver vLLM's locked set needs,
+and Ollama anywhere else, and the pool routes to it as the engine it chose
+([supervisor.md](supervisor.md) §3.2). A model the chosen engine cannot hold on that card — its
+build's precision beyond the card's generation, or the set beyond its memory — is shown as a
+configuration problem, as for any host. Each model an `auto` host holds needs a build for both
 engines in the catalog, or the configuration is refused naming the model; `auto` on a host whose
 agent does not install engines is refused too, since nothing on the machine could act on it.
 

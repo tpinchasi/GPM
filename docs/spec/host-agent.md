@@ -362,12 +362,12 @@ host holds is on disk (§2.1's fetch), again whenever that set changes, and stop
 versions. It runs, holding its share of the card, for as long as the machine is in the pool;
 taking the machine out of service gives the card back.
 
-**An engine of `auto`** (D161) is chosen by the agent each time it starts: vLLM where vLLM can run
-every model the host holds — Linux, an NVIDIA card of compute capability 7.5 or higher, the locked
-set's driver, each model's vLLM build within the card's generation (the floor its precision has in
-the pool's build table, D100) and the whole set within the card's memory (§2.1's plan, D104) —
-and Ollama anywhere else. The facts say which, and each reason against vLLM, under
-`engine.choice`; the pool takes the host's engine from them.
+**An engine of `auto`** (D161) is chosen by the agent each time it starts, from the machine alone:
+vLLM on Linux on x86_64 or aarch64 with an NVIDIA card of compute capability 8.0 or higher
+(Ampere onward, where the BF16, FP8 and FP4 builds catalogs carry for vLLM run) and the locked
+set's driver; Ollama anywhere else, a Turing card included. The facts say which, and each reason
+against vLLM, under `engine.choice` (`{engine, reasons}`); the pool takes the host's engine from
+them, and judges each model's build against the card as it does for any host.
 
 The **first** version is started as soon as it is staged — nothing runs to drain. A version that
 fails to start is switched away from at once and not staged again by `latest` until a newer one is
