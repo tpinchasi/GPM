@@ -669,17 +669,45 @@ async def test_a_model_that_dies_beside_one_that_serves_is_that_models_failure(m
     assert facts["models_failed"][SPEECH].endswith("ValueError: 2.14 GiB KV cache is needed, larger than the available 1.83 GiB")
 
 
-async def test_a_start_where_nothing_serves_says_why(machine):
+async def test_a_start_where_nothing_serves_is_said_for_each_model_and_not_tried_again_alone(machine):
     program = machine.install(V1)
     server = machine.server()
     machine.downloaded(CHAT)
     machine.held = [CHAT]
-    machine.behave(CHAT, exit="RuntimeError: CUDA error: no kernel image is available for execution on the device")
-    problem = await server.start(program, V1, 30)
-    assert problem == (
-        f"{CHAT}: its vLLM process exited before serving it: "
-        "RuntimeError: CUDA error: no kernel image is available for execution on the device"
-    )
+    why = "RuntimeError: CUDA error: no kernel image is available for execution on the device"
+    machine.behave(CHAT, exit=why)
+    assert await server.start(program, V1, 30) is None, "the models' failure, not the version's"
+    facts = await VllmFacts(machine.settings()).describe(machine.client())
+    assert facts["models_failed"][CHAT].endswith(why)
+
+    # Not started again by the agent's own looks: each start would hold the card for minutes.
+    launches = len(machine.launches())
+    assert await server.start(program, V1, 30) is None
+    assert len(machine.launches()) == launches
+    assert f"served none of {CHAT}" in server.waiting and why in server.waiting
+
+    # Stopped and started again — an operator's restart, a switch — it is tried again.
+    machine.behave(CHAT)
+    await server.stop()
+    assert await server.start(program, V1, 30) is None
+    assert len(machine.launches()) == launches + 1
+    assert await machine.serving() == {CHAT}
+
+
+async def test_a_first_version_whose_one_model_will_not_start_is_kept_and_tried_again_on_a_restart(machine):
+    machine.downloaded(CHAT)
+    machine.held = [CHAT]
+    machine.behave(CHAT, exit="ValueError: 2.14 GiB KV cache is needed, larger than the available 1.83 GiB")
+    installer = machine.installer(latest=V1)
+    await installer.want("latest", False)
+    await installer.finished()
+    # Called the version's failure, the machine would have no vLLM until the next release (D153).
+    assert installer.record.running == V1 and V1 not in installer.record.failed
+    assert installer.record.error is None
+
+    machine.behave(CHAT)
+    assert await installer.restart() is None
+    assert await machine.serving() == {CHAT}
 
 
 # --- `auto` choosing again: the engine it ran before is handed over ---

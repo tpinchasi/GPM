@@ -346,8 +346,9 @@ class VllmServer:
         """Start vLLM with `program` for every model on disk, once every model held is there, and
         wait for it to serve them. None once it does, or while it waits for the models (said in
         `waiting`); otherwise why not — and then whatever was started is left for the caller to
-        stop. A model that will not start beside others that do is that model's failure, reported
-        for it in the facts (`models_failed`), not the version's."""
+        stop. A model that will not start is that model's failure, reported for it in the facts
+        (`models_failed`), not the version's — beside others that do, and alone too; the same
+        models are then not started again by this version until they change or it is stopped."""
         if self.ours(fresh=True):
             return "this agent's vLLM is already running"
         if await self.listening():
@@ -355,6 +356,16 @@ class VllmServer:
         if not program.is_file():
             return f"{program} is not there"
         models, waiting = self.to_start()
+        record = self._current()
+        if (
+            models is not None and record is not None and record.get("failed") and not record.get("stopped")
+            and record.get("version") == version and record.get("models") == models
+        ):
+            reasons = "; ".join(f"{model}: {why}" for model, why in sorted(record["failed"].items()))
+            models, waiting = None, (
+                f"vLLM {version} served none of {', '.join(models)} when last started ({reasons}); started "
+                "again when the models on disk change, or when it is restarted"
+            )
         if models is None:
             if waiting != self.waiting:
                 log.info("vLLM %s is not started yet: %s", version, waiting)
@@ -402,7 +413,17 @@ class VllmServer:
                 if started & served:
                     log.warning("vLLM serves %s; not %s", sorted(started & served), failed)
                     return None
-                return "; ".join(f"{model}: {why}" for model, why in sorted(failed.items()))
+                # None served. A model too large for the card and a version that cannot run on it
+                # look the same from here, and only the first is common: called the version's
+                # failure, it would cost a machine on its first version its vLLM until the next
+                # release (D153), for a model. So each model's failure is said for it
+                # (`models_failed`); an upgrade that serves nothing is rolled back by the pool's
+                # check after the switch (supervisor §3.1). Not started again for the same models
+                # until they change or it is restarted: each start holds the card for minutes.
+                record = self._current() or {}
+                self._remember({**record, "failed": {model: str(why) for model, why in sorted(failed.items())}})
+                log.warning("vLLM served none of %s: %s", sorted(started), failed)
+                return None
             if not started or not any(host_platform.alive(pid, os_name=self.os_name) for pid, _ in self._launched()):
                 return "everything the launcher started has exited" if started else "the launcher started nothing"
             if time.monotonic() >= deadline:

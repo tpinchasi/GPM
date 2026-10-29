@@ -357,10 +357,22 @@ recorded; `latest` is the newest vLLM the agent has a set for. A version is kept
 free-disk floor counts a version as its set's size unpacked. It is refused, saying why, on
 anything but Linux on x86_64 or aarch64 with an NVIDIA card of compute capability 7.5 or higher
 and the set's driver. **The agent runs it** (D159): `gpm-agent vllm-start` with `--vllm` naming
-that version's program — accepted only inside the agent's engines directory — once every model the
-host holds is on disk (§2.1's fetch), again whenever that set changes, and stopped to switch
-versions. It runs, holding its share of the card, for as long as the machine is in the pool;
-taking the machine out of service gives the card back.
+that version's program — accepted only as an absolute path to a file named `vllm` inside the
+agent's engines directory, links followed, which `--engines-dir` names — run as a program of its
+own (`python -m gpm_agent.cli`), never imported by the agent that answers the pool (D63). It is
+started once every model the host holds is on disk (§2.1's fetch) — or, until the pool has said
+which, when every model it ran last time still is — again whenever that set changes (a model held
+that has landed, or one deleted; not one on disk that nobody asked for), and stopped to switch
+versions, by `gpm-agent vllm-stop`, which stops only processes that are still an engine, the router
+or the in-turn helper by their own command line. The pool's numbers reach it as the environment
+the launcher reads (`GPM_VLLM_*`), stored in the engine's directory as Ollama's are. A model that
+will not start is that model's failure, said for it (`models_failed`), not the version's — alone as
+well as beside others that serve, since a model too large for the card and a version that cannot
+run on it look the same, and only the first is common; the same models are then not started again
+by that version until they change or it is stopped or restarted. An upgrade that serves nothing is
+rolled back by the pool's check after the switch ([supervisor.md](supervisor.md) §3.1). It runs,
+holding its share of the card, for as long as the machine is in the pool; taking the machine out
+of service gives the card back.
 
 **An engine of `auto`** (D161) is chosen by the agent each time it starts, from the machine alone:
 vLLM on Linux on x86_64 or aarch64 with an NVIDIA card of compute capability 8.0 or higher
@@ -368,6 +380,11 @@ vLLM on Linux on x86_64 or aarch64 with an NVIDIA card of compute capability 8.0
 set's driver; Ollama anywhere else, a Turing card included. The facts say which, and each reason
 against vLLM, under `engine.choice` (`{engine, reasons}`); the pool takes the host's engine from
 them, and judges each model's build against the card as it does for any host.
+The choice is recorded beside the engines (`auto/<port>/choice.json`); where it differs from the
+last, the engine this agent started under the other choice is stopped by its own record before the
+chosen one starts — never one it did not start — and asked again on each look until it is. Both
+engines share the one models path, Ollama's by default: vLLM counts only directories its fetch
+marked complete, so neither reads the other's files.
 
 The **first** version is started as soon as it is staged — nothing runs to drain. A version that
 fails to start is switched away from at once and not staged again by `latest` until a newer one is
