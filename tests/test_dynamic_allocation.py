@@ -19,7 +19,7 @@ MODEL = "m1"
 
 def make_fleet(database, provider, **rented):
     base = {
-        "provider": "fake",
+        "provider": "fake", "engine": "ollama",
         "workers": 2,
         "allocation": "dynamic",
         "dynamic": {"window_s": 0, "ramp_backoff_s": 0},

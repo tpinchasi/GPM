@@ -65,7 +65,7 @@ the kinds it can, and a pool may run several engines (D93):
 |---|---|---|
 | chat | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`; Ollama's `/api/chat`, `/api/generate` | Ollama, vLLM |
 | embeddings | `/v1/embeddings`; Ollama's `/api/embed`, `/api/embeddings` | Ollama, vLLM |
-| transcription | `/v1/audio/transcriptions`, `/v1/audio/translations` — a `multipart/form-data` upload | vLLM, whisper.cpp |
+| transcription | `/v1/audio/transcriptions`, `/v1/audio/translations` — a `multipart/form-data` upload | vLLM; whisper.cpp transcribes only (its server answers no translation path) |
 | ranking | `/v1/rerank` | vLLM |
 
 Only these exact paths are forwarded. A model name resolves to a build that serves the kind
@@ -73,7 +73,9 @@ asked for; a name with no such build is refused `400 kind_not_served`.
 
 **Pictures and sound travel inside the request.** A chat message may carry an image (an
 `image_url` part whose URL is a `data:` URL, an `input_image` part, or Ollama's `images`) or
-sound (an `input_audio` part), and the pool sends it only to a build that accepts that input.
+sound (an `input_audio` part), and the pool sends it only to a build that accepts that input. So
+may what an embedding request embeds (`messages`, or `input` and its items) and a ranking's query
+and each of its documents (a string, or an object of `content` parts), read the same way.
 A picture or sound given by link, or a part type the pool does not know, is refused `400
 media_not_inline`: a link would make the engine host fetch it from its own network.
 
@@ -105,12 +107,14 @@ It is served from a cached copy, never by asking a third party while the app wai
 | engine's own | — | Passed through | returned |
 | `401` | — | Missing or wrong app key | raise `PoolAuthError`, never retried |
 | `400` | `model_missing` | The body names no model, or is not one JSON object in UTF-8 | raise `PoolRequestError` |
-| `400` | `ambiguous_field` | The body names `model`, `stream`, `response_format` or `format` more than once, or in another letter case — an engine could read a different value than the pool checked (D141) | raise `PoolRequestError` |
+| `400` | `ambiguous_field` | The body names `model`, `stream`, `response_format` or `format` — or a field that carries pictures and sound: `messages`, `input`, `query`, `documents`, a message's `content` or `images` — more than once, or in another letter case: an engine could read a different value than the pool checked (D141, D143) | raise `PoolRequestError` |
 | `400` | `kind_not_served` | No build of this model that the pool could hold does what the path asks — a transcription asked of a chat model, or ranking on a pool with no engine for it | raise `PoolRequestError` |
-| `400` | `input_not_accepted` | Every build of this model the pool could hold refuses what the request carries (a picture, sound) | raise `PoolRequestError` |
+| `400` | `input_not_accepted` | Every build of this model the pool could hold refuses what the request carries (a picture, sound) — or every host that could hold a build taking it is ready and either does not hold one or its engine reports the build there does not take it, and no host the pool could rent would | raise `PoolRequestError` |
 | `400` | `media_not_inline` | A picture or sound was given by link, or as a part type the pool does not accept | raise `PoolRequestError` |
-| `400` | `bad_upload` | An upload the pool could not read as one clean form, or one naming the model twice | raise `PoolRequestError` |
+| `400` | `bad_upload` | An upload the pool could not read as one clean form, one naming the model twice, or a request with more than one `Content-Type` header | raise `PoolRequestError` |
+| `400` | `content_encoding` | The request has a `Content-Encoding` other than identity; the pool reads only uncompressed bodies (D144) | raise `PoolRequestError` |
 | `413` | `request_too_large` | The body is over `pool.max_request_mb`; refused before it is read | raise `PoolRequestError` |
+| `404` | `unknown_path` | The path is not an inference path of any engine this pool runs (§2: only those exact paths are forwarded). A path some engine serves, but none this pool runs, is `400 kind_not_served` instead | raise `PoolRequestError` |
 | `404` | `model_not_in_pool` | The model is not in this pool's declared set; it will not be loaded on demand | raise `PoolRequestError` |
 | `503` | `queue_timeout` | All workers busy for longer than the queue limit | wait and retry |
 | `503` | `preparing` | A host is up but still loading the pool's models | wait and retry |
@@ -118,7 +122,7 @@ It is served from a cached copy, never by asking a third party while the app wai
 | `503` | `hosts_unreachable` | Configured hosts are not answering | wait and retry |
 | `503` | `no_offer` | Renting is authorised but no acceptable offer exists right now | wait and retry |
 | `503` | `no_lease` | Only rented hosts could serve this and no lease is open — waiting cannot help | **fail fast** with `PoolUnavailable` (overridable) |
-| `503` | `no_eligible_host` | Hosts are ready, but none may take this request. `detail` says which: the request arrived on one engine's own path (`/api/chat`, say) and every ready host runs an engine that does not serve it — the detail names both and the paths that reach every engine — or none holds a build of this model that satisfies the request's schema requirement or pinned runtime class | for a path no ready host serves, call the `/v1` paths; otherwise wait and retry |
+| `503` | `no_eligible_host` | Hosts are ready, but none may take this request. `detail` says which: the request arrived on one engine's own path (`/api/chat`, say) and every ready host runs an engine that does not serve it — the detail names both and the paths that reach every engine — or none holds a build of this model that satisfies the request's schema requirement or pinned runtime class, or takes what it carries — while a host that would is not ready, or after one that would failed this request | for a path no ready host serves, call the `/v1` paths; otherwise wait and retry |
 | `503` | `host_lost` | The host serving this was taken away before any of the response reached you; nothing partial was sent (§5.1) | wait and retry |
 | `503` | `uploads_full` | The pool is holding as many request bytes as it allows (`pool.max_held_request_mb`) | wait and retry |
 | `504` | `deadline_exceeded` | The request's `X-GPM-Deadline` passed before it could be served | **fail fast** — the app already said the answer would be useless |
@@ -191,7 +195,8 @@ Every field is overridable per call, per client, or by environment variable, in 
 | Situation | Default |
 |---|---|
 | `503` other than `no_lease` | Retry. Wait `Retry-After` if present, else exponential back-off 2 s → 60 s with jitter |
-| Transport error before any response byte | Retry, same back-off |
+| Transport error before any response byte, other than a read timeout | Retry, same back-off |
+| Read timeout: the request was sent and no answer came within the read time | **Not retried** — `PoolRequestError`, status 504, reason `read_timeout`. The pool may still be working on it; sending it again would run it twice (D144) |
 | Failure **mid-stream**, after output was delivered | **Not retried** — `PoolStreamInterrupted`. The app has consumed partial output; only it can decide to redo the call |
 | `401` | Not retried — `PoolAuthError` |
 | Other `4xx` | Not retried — `PoolRequestError` |

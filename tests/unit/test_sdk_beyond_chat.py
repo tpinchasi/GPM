@@ -1,7 +1,8 @@
 """Beyond chat from the SDK: pictures inline, speech to text and ranking (S8 §6).
 
 The real wait-and-retry transport over a scripted one, so what is asserted is what the pool
-would receive: no pool, no GPU, no network.
+would receive: no pool, no GPU, no network. Where it matters, the pool's own upload parser and
+configuration loader read what the SDK sends and what the examples say.
 """
 
 import ast
@@ -15,6 +16,7 @@ from pathlib import Path
 import gpm_client
 import httpx
 import pytest
+import yaml
 from gpm_client import (
     AsyncPoolClient,
     AsyncPoolTransport,
@@ -22,9 +24,12 @@ from gpm_client import (
     PoolRequestError,
     PoolTransport,
     Ranked,
+    Ranking,
     RetryPolicy,
     image_part,
 )
+from gpm_server.config import PoolConfig
+from gpm_server.engines.multipart import parse
 
 EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
 APP_KEY = "gpma_test_key"
@@ -45,15 +50,19 @@ FACTS = {
 
 
 class Recorder:
-    """Answers each request with the next scripted response, and keeps what it was sent."""
+    """Answers each request with the next scripted response — or raises it, where it is an
+    exception — and keeps what it was sent."""
 
-    def __init__(self, *responses: httpx.Response):
+    def __init__(self, *responses: httpx.Response | Exception):
         self.responses = list(responses)
         self.requests: list[httpx.Request] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
-        return self.responses.pop(0)
+        answer = self.responses.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
 
 
 def policy(**kwargs) -> RetryPolicy:
@@ -264,6 +273,70 @@ def test_a_generation_timeout_is_not_retried():
     assert raised.value.reason == "generation_timeout" and len(recorder.requests) == 1
 
 
+def test_a_read_timeout_after_the_upload_was_sent_is_raised_not_sent_again():
+    """The pool has the recording and may still be working on it (D144): re-uploading it until
+    `max_wait` ran out ran it again and again."""
+    recorder = Recorder(httpx.ReadTimeout("timed out"), transcribed())
+    with pool(recorder) as client:
+        with pytest.raises(PoolRequestError) as raised:
+            client.transcribe("speech-model", AUDIO)
+    assert len(recorder.requests) == 1
+    assert raised.value.status_code == 504 and raised.value.reason == "read_timeout"
+    assert "within 900 s" in raised.value.detail and "not sent again" in raised.value.detail
+    assert isinstance(raised.value.__cause__, httpx.ReadTimeout)
+
+
+def test_a_connection_refused_is_still_waited_out(monkeypatch):
+    monkeypatch.setattr("gpm_client.transport.time.sleep", lambda _: None)
+    recorder = Recorder(httpx.ConnectError("refused"), transcribed())
+    with pool(recorder) as client:
+        assert client.transcribe("speech-model", AUDIO).text == "shalom"
+    assert len(recorder.requests) == 2
+
+
+def read_timeout_of(request: httpx.Request) -> float | None:
+    return request.extensions["timeout"]["read"]
+
+
+def test_transcribe_reads_well_past_the_pools_read_time_and_can_be_told_otherwise():
+    """The pool gives the engine 300 s and then answers 504; the SDK's clock also covers the
+    queue, so at 300 s it always ran out first and never heard the pool's answer."""
+    chat_answer = httpx.Response(200, json={"choices": [{"message": {"content": "hi"}}]})
+    recorder = Recorder(transcribed(), transcribed(), chat_answer)
+    with pool(recorder) as client:
+        client.transcribe("speech-model", AUDIO)
+        client.transcribe("speech-model", AUDIO, read_timeout_s=60)
+        client.chat("chat-model", [{"role": "user", "content": "hi"}])
+    assert [read_timeout_of(r) for r in recorder.requests] == [900.0, 60.0, 300.0]
+    assert recorder.requests[0].extensions["timeout"]["connect"] == 5.0
+
+
+def test_transcribe_never_shortens_a_client_read_timeout_that_is_longer():
+    recorder = Recorder(transcribed(), transcribed())
+    transport = PoolTransport(policy=policy(), transport=httpx.MockTransport(recorder))
+    for read in (1800.0, None):
+        with PoolClient(base_url="http://pool", api_key=APP_KEY, transport=transport,
+                        timeout=httpx.Timeout(5.0, read=read)) as client:
+            client.transcribe("speech-model", AUDIO)
+    assert [read_timeout_of(r) for r in recorder.requests] == [1800.0, None]
+
+
+def test_a_file_name_is_sent_in_a_form_the_pools_parser_reads():
+    """httpx writes a backslash as two, which the pool refuses (`400 bad_upload`): such a
+    recording could never be uploaded. The name is only a label; the bytes go as they are."""
+    opened = io.BytesIO(AUDIO)
+    opened.name = 'C:\\calls\\"q3"\x1b\x7f\x85 הקלטה.m4a'
+    recorder = Recorder(transcribed())
+    with pool(recorder) as client:
+        client.transcribe("speech-model", opened)
+
+    request = recorder.requests[0]
+    safe = "C:_calls__q3____ הקלטה.m4a"
+    assert form_of(request)["file"] == (safe, AUDIO)
+    (file,) = [part for part in parse(request.headers["Content-Type"], request.content) if part.name == "file"]
+    assert file.filename == safe and file.data == AUDIO
+
+
 def test_a_busy_pool_is_waited_out_and_the_upload_resent_intact(tmp_path, monkeypatch):
     slept: list[float] = []
     monkeypatch.setattr("gpm_client.transport.time.sleep", slept.append)
@@ -321,6 +394,28 @@ def test_rerank_without_top_n_sends_none():
     assert "top_n" not in json.loads(recorder.requests[0].content)
 
 
+def test_a_ranking_carries_the_facts_of_the_call_and_is_still_a_list():
+    body = {"model": "ranker", "results": [{"index": 0, "relevance_score": 0.5}]}
+    recorder = Recorder(httpx.Response(200, json=body, headers=FACTS))
+    with pool(recorder) as client:
+        results = client.rerank("ranker", "q", ["d"])
+
+    assert isinstance(results, Ranking) and isinstance(results, list)
+    assert results == [Ranked(index=0, score=0.5)] and len(results) == 1
+    assert results.served_model == "speech-model-ct2"
+    assert results.host == "gpu-1" and results.runtime_class == "cuda-ct2"
+    assert results.wait_s == 0.25
+    assert results.raw == body
+
+
+def test_a_ranking_names_the_model_asked_for_when_the_pool_does_not_say():
+    body = {"model": "ranker", "results": []}
+    recorder = Recorder(httpx.Response(200, json=body))
+    with pool(recorder) as client:
+        results = client.rerank("ranker", "q", [])
+    assert results == [] and results.served_model == "ranker" and results.host is None
+
+
 def test_transcription_and_ranking_use_the_v1_paths_whatever_the_client_shape():
     recorder = Recorder(transcribed(), ranked({"index": 0, "relevance_score": 1}))
     with pool(recorder, api="ollama") as client:
@@ -352,6 +447,8 @@ async def test_async_transcribe_and_rerank():
     assert transcript.host == "gpu-1" and transcript.wait_s == 0.25
     assert ranking.url.path == "/v1/rerank"
     assert [r.index for r in results] == [1, 0]
+    assert results.host == "gpu-1" and results.wait_s == 0.25
+    assert read_timeout_of(upload) == 900.0 and read_timeout_of(ranking) == 300.0
 
 
 async def test_async_a_busy_pool_is_waited_out_and_the_upload_resent_intact():
@@ -369,6 +466,15 @@ async def test_async_a_busy_pool_is_waited_out_and_the_upload_resent_intact():
     first, second = recorder.requests
     assert first.content == second.content
     assert form_of(second)["file"] == ("audio", AUDIO)
+
+
+async def test_async_a_read_timeout_is_raised_not_sent_again():
+    recorder = Recorder(httpx.ReadTimeout("timed out"), transcribed())
+    async with async_pool(recorder) as client:
+        with pytest.raises(PoolRequestError) as raised:
+            await client.transcribe("speech-model", AUDIO, read_timeout_s=1200)
+    assert len(recorder.requests) == 1
+    assert raised.value.reason == "read_timeout" and "within 1200 s" in raised.value.detail
 
 
 async def test_async_a_refusal_is_raised_with_its_reason():
@@ -439,6 +545,7 @@ def test_the_rerank_example_runs(tmp_path, monkeypatch, capsys):
     run_example("rerank.py", ["reset my password", *map(str, files), "--top", "2"], monkeypatch)
     lines = capsys.readouterr().out.splitlines()
     assert lines[0].startswith("1. 0.900") and lines[0].endswith("b.txt")
+    assert lines[-1] == "(ranked by speech-model-ct2 on gpu-1, after 0.2s in the queue)"
 
 
 def test_the_picture_example_runs(tmp_path, monkeypatch, capsys):
@@ -450,3 +557,16 @@ def test_the_picture_example_runs(tmp_path, monkeypatch, capsys):
     assert sent["messages"][0]["content"][1] == data_url("image/jpeg", JPEG)
     out = capsys.readouterr().out
     assert out.startswith("42\n") and "on gpu-1, after 0.2s in the queue" in out
+
+
+def test_the_operators_example_loads_once_merged_into_a_pool_of_its_own():
+    """What the example leaves to the operator's own file — keys, and the provider and its
+    search settings — added the smallest way; the rest must load as written."""
+    example = yaml.safe_load((EXAMPLES / "pool-beyond-chat.yaml").read_text())
+    example["auth"] = {"app_keys": ["gpma_example"]}
+    operators_own = {"provider": "fake", "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 0.6}}
+    example["rented"] = {**operators_own, **example["rented"]}
+
+    config = PoolConfig.model_validate(example)
+    assert config.pool.models_per_host == "declared"
+    assert config.rented_engine() == "vllm"

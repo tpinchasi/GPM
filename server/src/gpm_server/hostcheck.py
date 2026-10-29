@@ -20,7 +20,7 @@ from typing import Any, Mapping, Optional, Sequence
 import httpx
 
 from .catalog import variants_for_host
-from .config import PoolSettings, TransportConfig
+from .config import PoolSettings, TransportConfig, _is_loopback
 from .transports import build_client
 
 
@@ -148,6 +148,16 @@ async def test_connection(
     try:
         health = await engine.health(client)
         if getattr(engine, "residency_from_agent", False):
+            # What saving would refuse is said here too (D148): the server has no authentication,
+            # and serves as many requests at once as the engine says.
+            limit = getattr(engine, "max_workers", None)
+            if transport.type != "tunnel" and not _is_loopback(transport.base_url or ""):
+                steps.append(Step("definition", False, f"{engine.name}'s server has no authentication: reach it "
+                                  "on loopback, or through a tunnel from another machine"))
+                return {"ok": False, "steps": [s.as_dict() for s in steps], "workers": 0}
+            if limit is not None and workers > limit:
+                steps.append(Step("workers", False, f"{engine.name} serves {limit} request at a time; set workers: {limit}"))
+                return {"ok": False, "steps": [s.as_dict() for s in steps], "workers": 0}
             # Its agent fetches the model and starts the server, and before the host is saved
             # the agent has been asked for nothing (D148): a server not answering yet is the
             # expected state, and what it holds is reported once the host is saved.

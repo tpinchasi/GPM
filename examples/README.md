@@ -1,8 +1,9 @@
 # Examples
 
 Small, complete programs against a GPM pool. Each reads the pool's address and your app key from
-the environment, waits for capacity like every `gpm-client` call, and prints which build and host
-answered.
+the environment and waits for capacity like every `gpm-client` call. The ones built on
+`PoolClient` also print which build and host answered; through the OpenAI client those facts are
+in each response's `X-GPM-*` headers.
 
 ```sh
 pip install 'gpm-client>=0.7'        # 0.7 adds transcribe(), rerank() and image_part()
@@ -15,7 +16,7 @@ export GPM_API_KEY=gpma_your_app_key  # an app key from the pool's operator — 
 | [`ask_about_a_picture.py`](ask_about_a_picture.py) | A question about a picture, sent inline in a chat message |
 | [`transcribe.py`](transcribe.py) | A recording turned into text — with timestamps if the build gives them |
 | [`rerank.py`](rerank.py) | Documents ranked against a query, best first |
-| [`openai_client.py`](openai_client.py) | The same through the official OpenAI client, with the pool's waiting underneath |
+| [`openai_client.py`](openai_client.py) | The same through the official OpenAI client, with the pool's waiting underneath and the client's own retries off |
 | [`pool-beyond-chat.yaml`](pool-beyond-chat.yaml) | For operators: the catalog and hosts these examples assume |
 
 ```sh

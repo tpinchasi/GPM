@@ -236,3 +236,20 @@ async def test_a_host_whose_agent_finds_the_audio_extra_missing_is_given_up_with
     host.agent_facts = {"engine": {"name": "vllm", "carries": [], "carries_detail": "No module named 'soundfile'"}}
     why = fleet.image_falls_short(host)
     assert why and "audio-decoding" in why and "soundfile" in why
+
+
+async def test_an_image_found_lacking_is_not_rented_again_for_that_need(make_fleet):
+    """Each round would pay for a machine to learn the same thing again."""
+    fleet = make_fleet(speech_config([SPEECH]), [default_offer("o-1", "m-1", driver_version="590.0"),
+                                                 default_offer("o-2", "m-2", driver_version="590.0")])
+    fleet.leases.open(workers=2, max_hours=2, max_spend=5.0, allow_rent=True)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    (host,) = fleet.hosts.values()
+    assert host.image == AUDIO.image
+    host.agent_facts = {"engine": {"name": "vllm", "carries": []}}
+    assert fleet.image_falls_short(host)
+
+    chosen, why = fleet.image_for(default_offer(driver_version="590.0"), ["owner/speech"])
+    assert chosen is None and "found by a host's agent" in why
+    chosen, _ = fleet.image_for(default_offer(driver_version="590.0"), [MODEL])
+    assert chosen == PLAIN.image, "the image is still used for what it does carry"

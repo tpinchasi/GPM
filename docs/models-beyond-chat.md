@@ -29,18 +29,26 @@ transcribes:
 
 ```yaml
 pool:
-  model_set: ["gemma4:31b", "whisper-large-v3-turbo"]
+  model_set: ["gemma4:26b", "whisper-large-v3-turbo"]
+  models_per_host: declared         # vLLM runs one model per process: a rented host per model
 
 catalog:
+  gemma4:26b:
+    variants:
+      - { tag: "google/gemma-4-26B-A4B-it", engine: "vllm" }
   whisper-large-v3-turbo:
     variants:
       - { tag: "openai/whisper-large-v3-turbo", engine: "vllm", serves: [transcribe] }
 
 rented:
-  models: ["gemma4:31b", "whisper-large-v3-turbo"]     # or a model profile, or a workload's models
+  engine: vllm                      # the default for rented hosts, said explicitly
+  models: ["gemma4:26b", "whisper-large-v3-turbo"]     # or a model profile, or a workload's models
   images:
     - { image: "vastai/vllm:v0.29.0-cuda-13.0", min_driver: "580", capabilities: [audio-decoding] }
 ```
+
+Every model rented hosts hold needs a vLLM build in the catalog. `auth`, and the provider and
+its search settings under `rented`, are your pool's own and are left out here.
 
 - **The weights are fetched when a host is prepared**, by the pool's agent on the host, from the
   hub (or the mirror in the host's own `HF_ENDPOINT`) — never because a request asked.
@@ -84,6 +92,9 @@ fetches the model and runs the server, as an agent already does for Ollama's mod
    Face repository, since those repositories hold every size side by side:
 
    ```yaml
+   pool:
+     models_per_host: declared          # a whisper.cpp host holds its one model, not the whole set
+
    hosts:
      - id: mac-whisper
        kind: local
@@ -146,8 +157,9 @@ A picture goes only to a build that accepts pictures.
 
 ## Ranking
 
-vLLM serves `/v1/rerank` for cross-encoder rerankers — models whose configuration names a
-sequence-classification architecture:
+vLLM serves `/v1/rerank` for cross-encoder rerankers. Catalogue a reranker as a
+sequence-classification model — one whose configuration names such an architecture
+(`…ForSequenceClassification`) — which vLLM runs as a pooling model:
 
 ```yaml
 catalog:
@@ -156,19 +168,15 @@ catalog:
       - { tag: "BAAI/bge-reranker-v2-m3", engine: "vllm", serves: [rerank] }
 ```
 
-A reranker that needs model-specific launch overrides is refused at load rather than started
-wrong.
+Add it to `pool.model_set`, and to what rented hosts hold, like any other model.
 
 ## When a model cannot be served
 
 You are told at the first point it is knowable, with the reason and what to change:
 
 1. **The configuration check** (`gpm config plan`, or Apply in the console), before anything is
-   rented or written:
-
-   > whisper-large-v3-turbo is a transcription model; the hosts that would hold it run ollama,
-   > which cannot serve transcription. Rent with vLLM, or hold it on a whisper.cpp host.
-
+   rented or written. The check names the model, the engine that cannot serve it, and what to
+   change — rent with vLLM, say, or hold the model on a whisper.cpp host.
 2. **The console's Profiles tab** shows such a build greyed, with the same reason.
 3. **A workload a program creates** is refused, with the reason, before anything is rented.
 4. **A request that arrives anyway** is answered `400 kind_not_served` at once.
@@ -183,12 +191,15 @@ embeddings — not speech or ranking.
 | Setting | Default | What it bounds |
 |---|---|---|
 | `pool.max_request_mb` | 24 | One request body — about 12 minutes of 16 kHz WAV, 20 or more of MP3. At most 64, which the router in front of several engines on one machine accepts |
-| `pool.max_held_request_mb` | 512 | Request bytes the router holds at once — queued, in flight, kept for a resend |
+| `pool.max_held_request_mb` | 512 | Request bytes the router holds at once — being read, queued, in flight, kept for a resend. At least `max_request_mb` |
 
 - A transcription holds a worker for as long as it runs; there is no separate queue for short
   calls.
-- Long recordings should be split by the app. One that outlasts the pool's read time (`pool.upstream_read_timeout_s`, 300 s) is `504
-  generation_timeout` and is not re-run.
+- Long recordings should be split by the app. One that outlasts the pool's read time
+  (`pool.upstream_read_timeout_s`, 300 s) is `504 generation_timeout` and is not re-run.
+- The SDK's `transcribe()` waits 900 s for an answer, well above that read time plus the queue,
+  so the app hears the pool's `504`. If you raise the read time, tell app developers to raise
+  theirs with it (`read_timeout_s=`).
 - **Privacy:** pictures and recordings go wherever text goes. A pool that includes marketplace
   hosts must not carry media its owner would not show those hosts' operators
   ([threat model](threat-model.md) T7).

@@ -1787,7 +1787,7 @@ function switchEngine(status, d, engine) {
 function variantsFor(status, d) {
   const caps = new Set(status.engine.rented_capabilities || []);
   const found = (status.engine.pool_variants || [])
-    .filter((v) => v.engine === d.rented && (v.requires || []).every((c) => caps.has(c)));
+    .filter((v) => (!v.engine || v.engine === d.rented) && (v.requires || []).every((c) => caps.has(c)));
   for (const [model, list] of Object.entries(d.adds)) {
     for (const v of list) if (v.engine === d.rented) found.push({ model, tag: v.tag, size_gb: v.size_gb, precision: v.precision || null, requires: [] });
   }
@@ -1956,7 +1956,7 @@ function profilesFromStatus(status, rented) {
   }
   // The first variant rented machines can actually run: a build for another platform is not one.
   const caps = new Set(e.rented_capabilities || []);
-  const first = (model) => (pool.find((v) => v.model === model && v.engine === rented
+  const first = (model) => (pool.find((v) => v.model === model && (!v.engine || v.engine === rented)
     && (v.requires || []).every((c) => caps.has(c))) || {}).tag;
   const set = status.model_set || [];
   if (e.models_per_host === "declared") {

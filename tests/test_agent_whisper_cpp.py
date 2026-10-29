@@ -22,14 +22,16 @@ from pathlib import Path
 
 import httpx
 import pytest
-from gpm_agent import cli, modelhub
+from gpm_agent import cli, modelhub, whisper_cpp
+from gpm_agent import platform as host_platform
 from gpm_agent.engines import EngineRefused, engine_facts
-from gpm_agent.models import ModelWork
+from gpm_agent.models import ModelWork, Refused
 from gpm_agent.settings import Settings, SettingsError, load
 from gpm_agent.vllm_state import state_dir_for
 from gpm_agent.whisper_cpp import (
     INFERENCE_PATH,
     WhisperCppFacts,
+    build_in,
     build_of,
     installed_version,
     server_argv,
@@ -48,12 +50,15 @@ FILES = {
 }
 
 #: The fake program. Started by the agent exactly as the real one is; told how to behave by a
-#: file beside it, and records each start — its arguments, where it ran, what it was given.
+#: file beside it, and records each start — its arguments, where it ran, what it was given. Run
+#: as `python fake.py <program> <arguments>`, the way the system runs a script, so its command
+#: line ends in exactly the argument list the agent started it with.
 FAKE_SERVER = '''
 import http.server, json, os, signal, sys, time
 
-control_path, starts_path = sys.argv[1], sys.argv[2]
-args = sys.argv[3:]
+root = os.path.dirname(os.path.dirname(sys.argv[1]))
+control_path, starts_path = os.path.join(root, "fake-control.json"), os.path.join(root, "fake-starts.jsonl")
+args = sys.argv[2:]
 try:
     control = json.load(open(control_path))
 except OSError:
@@ -83,6 +88,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"<h1>Whisper.cpp Server</h1>" if ready else b"loading")
 
+    def do_POST(self):
+        """As whisper.cpp 1.9.2 does with a recording ffmpeg cannot read: it is written to
+        --tmp-dir, the request and the recording's own tags are printed, and the file is left
+        behind with a 500."""
+        name = self.headers.get("x-recording-name", "recording.mp3")
+        body = self.rfile.read(int(self.headers.get("content-length") or 0))
+        print(f"Received request: {name}", flush=True)
+        kept = os.path.join(args[args.index("--tmp-dir") + 1], f"whisper-server-{time.monotonic_ns()}.wav")
+        with open(kept, "wb") as recording:
+            recording.write(body)
+        print(f"Running whisper.cpp inference on {name}", flush=True)
+        print(f"operator(): processing '{name}' (16000 samples, 1.0 sec), 4 threads, lang = auto ...", flush=True)
+        print(f"  Metadata:\\n    title           : {name}", flush=True)
+        self.send_response(500)
+        self.end_headers()
+        self.wfile.write(b'{"error":"FFmpeg conversion failed."}')
+
     def log_message(self, *_):
         pass
 
@@ -111,11 +133,7 @@ class Machine:
         program.parent.mkdir(exist_ok=True)
         (tmp_path / "fake_whisper_server.py").write_text(FAKE_SERVER)
         # A shell wrapper, so the fake runs under this interpreter whatever its path's length.
-        program.write_text(
-            f'#!/bin/sh\nexec "{sys.executable}" "{tmp_path / "fake_whisper_server.py"}" '
-            f'"{self.control}" "{self.starts}" "$@"\n'
-        )
-        program.chmod(0o755)
+        self.wrap(program)
         self.program = str(program)
         self.settings = Settings(
             key_hash="x", engine="whisper-cpp", engine_url=f"http://127.0.0.1:{self.port}",
@@ -127,6 +145,15 @@ class Machine:
         self.hub_requests: list[str] = []
         self.engines: list[WhisperCppFacts] = []
         self.engine = self.new_engine()
+
+    def wrap(self, program: Path, *, replaced: bool = True) -> None:
+        """The program, as a shell script running the fake: replaced by it (`exec`), or as a
+        wrapper that stays, with the fake its child — as an owner's own wrapper script might."""
+        program.write_text(
+            f'#!/bin/sh\n{"exec " if replaced else ""}"{sys.executable}" '
+            f'"{self.root / "fake_whisper_server.py"}" "$0" "$@"\n'
+        )
+        program.chmod(0o755)
 
     def new_engine(self) -> WhisperCppFacts:
         """The engine as a freshly started agent builds it."""
@@ -208,6 +235,10 @@ async def wait_until(condition, seconds=10.0):
     "someone/whisper-builds/ggml-small.bin:latest",
     "/someone/whisper-builds/ggml-small.bin",
     "some__one/whisper-builds/ggml-small.bin",    # could not be read back from its directory
+    "someone_/whisper-builds/ggml-small.bin",     # … nor could a part that runs into the separator
+    "someone/whisper-builds_/ggml-small.bin",
+    "someone/_whisper-builds/ggml-small.bin",
+    "someone/whisper-builds/_ggml-small.bin",
     "someone/whisper-builds/.bin",
     "",
 ])
@@ -223,6 +254,15 @@ def test_a_build_lands_in_a_directory_of_its_own_named_after_it():
     assert (build.repo, build.file, build.directory) == (
         REPO, "ggml-small.bin", "someone__whisper-builds__ggml-small.bin",
     )
+
+
+@pytest.mark.parametrize("tag", [
+    TAG, OTHER, "a/b/c.bin", "some.one-1/whisper_builds.v2/ggml_small-q5_0.bin", "x/y/z_.bin", "x./y-/z.bin",
+])
+def test_every_build_accepted_reads_back_from_its_directory(tag):
+    """What is on disk is reported by reading the directory's name back as a tag. A build that
+    could be fetched and never read back would be fetched again on every pass."""
+    assert build_in(build_of(tag).directory).tag == tag
 
 
 async def test_a_refused_tag_never_reaches_the_hub(machine):
@@ -290,15 +330,17 @@ async def test_holding_a_build_starts_the_server_with_exactly_this_command(machi
 
     [start] = machine.started()
     model_file = machine.file_of(TAG)
+    state = state_dir_for(machine.root / "models")
+    uploads = state / "tmp"
     assert start["args"] == [
         "-m", str(model_file), "--host", "127.0.0.1", "--port", str(machine.port),
-        "--inference-path", "/v1/audio/transcriptions", "--convert", "-l", "auto",
+        "--inference-path", "/v1/audio/transcriptions", "--convert", "--tmp-dir", str(uploads),
+        "-l", "auto",
     ]
     assert machine.engine._current()["argv"] == [machine.program, *start["args"]]
-    assert server_argv(machine.program, model_file, machine.port) == [machine.program, *start["args"]]
+    assert server_argv(machine.program, model_file, machine.port, uploads) == [machine.program, *start["args"]]
     # Its state — the record, its log, the directory it works in — beside the models, never in them.
-    state = state_dir_for(machine.root / "models")
-    assert Path(start["cwd"]).resolve() == state.resolve()
+    assert Path(start["cwd"]).resolve() == uploads.resolve()
     assert (state / "whisper-server.json").is_file() and (state / "logs" / "whisper-server.log").is_file()
     assert not any(p.name.startswith(("whisper-server", "logs")) for p in (machine.root / "models").rglob("*"))
     assert described["answers"] is True and described["models_loaded"] == [TAG]
@@ -493,6 +535,162 @@ async def test_a_recorded_process_that_is_not_the_server_is_never_signalled(mach
         bystander.wait()
 
 
+async def test_a_process_whose_command_line_only_mentions_the_server_is_not_it(machine):
+    """Ours runs the argument list recorded for it, exactly — not a command line that happens to
+    hold the build's file and the transcription path among its words."""
+    await machine.fetch(TAG)
+    state = state_dir_for(machine.root / "models")
+    argv = server_argv(machine.program, machine.file_of(TAG), machine.port, state / "tmp")
+    lookalike = subprocess.Popen([
+        sys.executable, "-c", "import time; time.sleep(60)", str(machine.file_of(TAG)), INFERENCE_PATH,
+    ])
+    try:
+        state.mkdir(parents=True)
+        (state / "whisper-server.json").write_text(json.dumps({
+            "pid": lookalike.pid, "tag": TAG, "file": str(machine.file_of(TAG)), "argv": argv,
+            "log": str(state / "nothing.log"), "log_offset": 0, "started_at": time.time() - 1000,
+        }))
+        engine = machine.new_engine()
+        async with machine.client() as client:
+            described = await engine.describe(client)
+            assert described["models_loaded"] == [] and TAG in described["models_failed"]
+            await engine.hold(client, TAG, pinned=True)
+            assert (await engine.describe(client))["models_loaded"] == [TAG]
+        assert lookalike.poll() is None, "never signalled"
+        assert len(machine.started()) == 1
+    finally:
+        lookalike.kill()
+        lookalike.wait()
+
+
+async def test_a_server_found_running_is_looked_at_again_on_the_next_pass(machine, monkeypatch):
+    """A positive answer is not kept: the number may go to another process after the server
+    ends, and that process must not be taken for it for longer than a moment."""
+    await machine.fetch(TAG)
+    async with machine.client() as client:
+        await machine.engine.hold(client, TAG, pinned=True)
+        threading.Thread(target=machine.engine._process.wait, daemon=True).start()
+        restarted = machine.new_engine()
+        assert (await restarted.describe(client))["models_loaded"] == [TAG]
+
+        monkeypatch.setattr(whisper_cpp, "IDENTITY_TRUSTED_S", 0.0)
+        monkeypatch.setattr(whisper_cpp, "_is_our_server", lambda pid, record: False)
+        described = await restarted.describe(client)
+    assert described["models_loaded"] == [] and TAG in described["models_failed"]
+
+
+# --- what it is sent, and what it leaves ---
+
+
+async def test_recordings_land_in_a_directory_of_the_agents_alone_and_are_cleared(machine):
+    """whisper.cpp writes each recording it is sent to its temp directory, and leaves one ffmpeg
+    could not read behind. That directory is the agent's own, readable by it alone, emptied
+    before every start and after every stop — of regular files only, following no link."""
+    state = state_dir_for(machine.root / "models")
+    uploads = state / "tmp"
+    # As an earlier agent left it: open to everyone, with a recording left behind.
+    uploads.mkdir(parents=True)
+    state.chmod(0o755)
+    uploads.chmod(0o755)
+    (uploads / "whisper-server-old.wav").write_bytes(b"an earlier recording")
+    outside = machine.root / "not-a-recording.txt"
+    outside.write_text("kept")
+    (uploads / "a-link").symlink_to(outside)
+    (uploads / "a-directory").mkdir()
+    (uploads / "a-directory" / "inside.txt").write_text("kept")
+
+    await machine.fetch(TAG)
+    async with machine.client() as client:
+        await machine.engine.hold(client, TAG, pinned=True)
+        assert machine.started()[0]["args"][-4:] == ["--tmp-dir", str(uploads), "-l", "auto"]
+        assert (state.stat().st_mode & 0o777, uploads.stat().st_mode & 0o777) == (0o700, 0o700)
+        assert not (uploads / "whisper-server-old.wav").exists(), "emptied before the start"
+
+        refused = await client.post(INFERENCE_PATH, content=b"not audio", headers={"x-recording-name": "meeting.mp3"})
+        assert refused.status_code == 500
+        assert [p.read_bytes() for p in uploads.glob("whisper-server-*.wav")] == [b"not audio"]
+
+        await machine.engine.hold(client, TAG, pinned=False)
+    assert list(uploads.glob("whisper-server-*")) == [], "emptied after the stop"
+    assert outside.read_text() == "kept" and (uploads / "a-link").is_symlink()
+    assert (uploads / "a-directory" / "inside.txt").read_text() == "kept"
+
+
+async def test_a_wrapper_script_and_the_server_it_runs_are_stopped_together(machine):
+    """An owner's `engine_binary` may be a script that runs the server as its child. The server
+    leads a process group of its own, and the whole group is stopped — not the wrapper alone,
+    which would leave the real server holding the port."""
+    machine.wrap(Path(machine.program), replaced=False)
+    await machine.fetch(TAG)
+    async with machine.client() as client:
+        await machine.engine.hold(client, TAG, pinned=True)
+        wrapper = machine.engine._process
+        [server] = [start["pid"] for start in machine.started()]
+        assert server != wrapper.pid, "the server is the wrapper's child"
+        await machine.engine.hold(client, TAG, pinned=False)
+        assert wrapper.poll() is not None
+        await wait_until(lambda: not host_platform.alive(server))
+        assert (await machine.engine.describe(client))["answers"] is False
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes where the test forbids")
+async def test_a_state_directory_it_may_not_write_is_a_refusal_saying_so(tmp_path):
+    """A models directory at the top of a volume puts the state beside it, where this user may
+    not write. That is the build's error, said as one — not an exception lost in the background
+    with the start tried again on every pass."""
+    machine = Machine(tmp_path / "volume")
+    try:
+        await machine.fetch(TAG)
+        (tmp_path / "volume").chmod(0o500)
+        async with machine.client() as client:
+            with pytest.raises(EngineRefused, match="could not prepare this agent's state directory.*ermission denied"):
+                await machine.engine.hold(client, TAG, pinned=True)
+            work = ModelWork(
+                machine.engine, client, free_disk_bytes=lambda: None, min_free_disk_gb=0, allow_delete=True,
+            )
+            await work.apply({"tags": [TAG], "residency": "pinned"})
+            await work._task
+            held = (await work.snapshot())["models"][0]
+            assert not held["loaded"] and "ermission denied" in held["error"]
+            assert not work._may_retry(TAG), "left alone for a minute"
+            await work.aclose()
+        assert machine.started() == []
+    finally:
+        (tmp_path / "volume").chmod(0o755)
+        machine.stop_everything()
+
+
+async def test_the_reason_a_server_stopped_never_carries_what_a_client_sent(machine):
+    """whisper-server prints the name a client gave its recording on every request, and ffmpeg
+    the recording's own tags. The reason travels to the pool: only a line naming an error is
+    reported, never one about a request — and without one, the exit alone."""
+    machine.behave(last_words="")
+    await machine.fetch(TAG)
+    async with machine.client() as client:
+        await machine.engine.hold(client, TAG, pinned=True)
+        await client.post(INFERENCE_PATH, content=b"audio", headers={"x-recording-name": "error-report-0417.wav"})
+        process = machine.engine._process
+        os.kill(process.pid, signal.SIGUSR1)
+        await wait_until(lambda: process.poll() is not None)
+        reason = (await machine.engine.describe(client))["models_failed"][TAG]
+    assert "0417" not in reason
+    assert reason.split(";")[0] == "its whisper-server exited with code 1"
+
+
+async def test_an_error_after_requests_is_still_the_reason(machine):
+    machine.behave(last_words="error: the device was lost")
+    await machine.fetch(TAG)
+    async with machine.client() as client:
+        await machine.engine.hold(client, TAG, pinned=True)
+        await client.post(INFERENCE_PATH, content=b"audio", headers={"x-recording-name": "error-report-0417.wav"})
+        process = machine.engine._process
+        os.kill(process.pid, signal.SIGUSR1)
+        await wait_until(lambda: process.poll() is not None)
+        reason = (await machine.engine.describe(client))["models_failed"][TAG]
+    assert reason.startswith("its whisper-server exited with code 1: error: the device was lost")
+    assert "0417" not in reason
+
+
 # --- what the agent reports ---
 
 
@@ -580,6 +778,71 @@ async def test_going_on_demand_stops_the_server_the_agent_started(machine):
         assert process.poll() is not None
         assert not (await work.snapshot())["models"][0]["loaded"]
         await work.aclose()
+
+
+async def test_a_build_that_leaves_the_set_while_its_server_starts_is_stopped(machine):
+    """The pass that starts it is still waiting for it to answer when the pool's next pass says
+    the set is empty. The pin it records on answering is released in the same pass — not dropped
+    as stale by what the pass saw before the start, with the server left running."""
+    machine.behave(delay=1.0)
+    await machine.fetch(TAG)
+    async with machine.client() as client:
+        work = ModelWork(
+            machine.engine, client, free_disk_bytes=lambda: None, min_free_disk_gb=0, allow_delete=True,
+        )
+        await work.apply({"tags": [TAG], "residency": "pinned"})
+        await wait_until(lambda: machine.started() != [])
+        starting = work._task
+        process = machine.engine._process
+        await work.apply({"tags": [], "residency": "pinned"})
+        await starting
+        assert process.poll() is not None, "stopped"
+        assert work.pinned_by_agent == set() and machine.engine._current() is None
+        assert (await machine.engine.describe(client))["answers"] is False
+        await work.aclose()
+
+
+async def test_a_server_left_starting_is_stopped_once_its_build_leaves_the_set(machine, monkeypatch):
+    """A start that has not answered in time is left running, pinned by no one. Once its build
+    is no longer wanted, the agent stops the server it started — whatever its pins say."""
+    monkeypatch.setattr(whisper_cpp, "START_TIMEOUT_S", 0.5)
+    machine.behave(delay=60)
+    await machine.fetch(TAG)
+    async with machine.client() as client:
+        work = ModelWork(
+            machine.engine, client, free_disk_bytes=lambda: None, min_free_disk_gb=0, allow_delete=True,
+        )
+        await work.apply({"tags": [TAG], "residency": "pinned"})
+        await work._task
+        process = machine.engine._process
+        assert process.poll() is None and "has not answered" in (await work.snapshot())["models"][0]["error"]
+        assert work.pinned_by_agent == set()
+
+        await work.apply({"tags": [], "residency": "pinned"})
+        await work._task
+        assert process.poll() is not None, "stopped"
+        assert machine.engine._current() is None
+        await work.aclose()
+
+
+async def test_more_than_one_build_in_the_set_is_refused(machine):
+    """The server serves one file. Holding each of two in turn would restart it on every pass,
+    so a set naming two is refused, saying why, and nothing is fetched or started."""
+    async with machine.client() as client:
+        work = ModelWork(
+            machine.engine, client, free_disk_bytes=lambda: None, min_free_disk_gb=0, allow_delete=True,
+        )
+        with pytest.raises(Refused) as refused:
+            await work.apply({"tags": [TAG, OTHER], "residency": "pinned"})
+        assert (refused.value.status, refused.value.error) == (400, "one_model_only")
+        assert "one model at a time" in refused.value.detail and TAG in refused.value.detail
+        assert work.desired.tags == () and work._task is None
+        # One build — named twice or not — is the set it always was.
+        await work.apply({"tags": [TAG, TAG], "residency": "pinned"})
+        await work._task
+        assert (await work.snapshot())["models"][0]["loaded"]
+        await work.aclose()
+    assert machine.hub_requests and len(machine.started()) == 1
 
 
 # --- the agent's settings ---

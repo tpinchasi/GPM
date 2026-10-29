@@ -26,7 +26,7 @@ def control(tmp_path, monkeypatch):
             "auth": {"app_keys": [APP_KEY], "admin_keys": [ADMIN_KEY]},
             "hosts": [],
             "rented": {
-                "provider": "fake",
+                "provider": "fake", "engine": "ollama",
                 "offer_policy": {"min_disk_gb": 10, "max_all_in_hourly": 0.60},
                 "scale": {"scale_up_after_s": 0},
             },

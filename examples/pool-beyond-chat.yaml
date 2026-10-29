@@ -1,8 +1,11 @@
 # For operators: the parts of pool.yaml the examples assume. Merge into your own configuration;
-# keys and other secrets stay out of this file. See docs/models-beyond-chat.md.
+# keys and other secrets stay out of this file. `auth`, and the provider and its search settings
+# under `rented` (provider, offer_policy, bidding), come from your own file: this one does not load
+# without them. See docs/models-beyond-chat.md.
 
 pool:
   model_set: ["gemma4:26b", "whisper-large-v3-turbo", "bge-reranker-v2-m3"]
+  models_per_host: declared     # each host holds the models it names; whisper.cpp and vLLM run one per process
   max_request_mb: 24            # one request body; uploads over it are refused before being read
 
 catalog:
@@ -35,7 +38,8 @@ hosts:
     agent: { url: "http://127.0.0.1:8096", bearer_env: WHISPER_AGENT_KEY }
     models: ["whisper-large-v3-turbo"]
 
-rented:                         # overflow, and the models a Mac cannot run; vLLM is the default
+rented:                         # overflow, and the models a Mac cannot run
+  engine: vllm                  # the default for rented hosts, said explicitly: every model below has a vLLM build
   models: ["gemma4:26b", "whisper-large-v3-turbo", "bge-reranker-v2-m3"]
   images:
     - { image: "vastai/vllm:v0.29.0-cuda-13.0", min_driver: "580", capabilities: [audio-decoding] }

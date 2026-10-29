@@ -9,6 +9,7 @@ server on loopback with it, and reports what it is serving.
 
 from __future__ import annotations
 
+import re
 from typing import Any, ClassVar, Optional
 
 import httpx
@@ -36,6 +37,15 @@ class WhisperCppEngine:
     residency_from_agent: ClassVar[bool] = True
     #: The server holds a global lock: one recording at a time, so one worker.
     max_workers: ClassVar[Optional[int]] = 1
+    #: What one of its builds is called: one `.bin` file at the root of a hub repository,
+    #: `owner/repo/file.bin` — as the host's agent reads it, so a tag it would refuse is refused
+    #: when the configuration loads instead (D148).
+    build_tag: ClassVar[re.Pattern[str]] = re.compile(
+        r"^(?!.*__)(?!.*\.\.)"
+        r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9.-])?/"   # the owner, not ending in `_`
+        r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9.-])?/"   # the repository, likewise
+        r"[A-Za-z0-9][A-Za-z0-9._-]*\.bin$"
+    )
 
     def default_start_command(
         self, *, port: int, models_dir: str, agent_archive: str, proxy: bool,
@@ -45,11 +55,15 @@ class WhisperCppEngine:
 
     # --- request path ---
 
+    #: Its server answers transcription only: it is started with that one path, and translation
+    #: is vLLM's (D142).
+    PATHS: ClassVar[frozenset[str]] = frozenset({"/v1/audio/transcriptions"})
+
     def inference_paths(self) -> set[str]:
-        return set(openai_api.TRANSCRIBE_PATHS)
+        return set(self.PATHS)
 
     def kind_of(self, path: str) -> Optional[str]:
-        return TRANSCRIBE if path in openai_api.TRANSCRIBE_PATHS else None
+        return TRANSCRIBE if path in self.PATHS else None
 
     def request_facts(self, path: str, content_type: str, body: bytes) -> RequestFacts:
         return openai_api.upload_facts(content_type, body)

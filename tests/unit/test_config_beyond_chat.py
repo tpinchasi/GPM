@@ -142,3 +142,54 @@ def test_rented_hosts_cannot_run_whisper_cpp():
 def test_a_request_limit_above_what_a_machine_accepts_is_refused():
     with pytest.raises(ValueError, match="64"):
         config(model_set=["chat"], hosts=[local()], pool={"max_request_mb": 100})
+
+
+def test_a_held_budget_smaller_than_one_request_is_refused():
+    with pytest.raises(ValueError, match="max_held_request_mb"):
+        config(model_set=["chat"], hosts=[local()], pool={"max_request_mb": 24, "max_held_request_mb": 10})
+
+
+@pytest.mark.parametrize("catalog", [
+    {},                                                          # a model served under its own name
+    {"chat": {"variants": [{"tag": "chat:7b"}]}},                # a build that names no engine
+])
+def test_a_pool_that_rented_ollama_without_saying_so_is_refused_not_switched_to_vllm(catalog):
+    """Before D147 rented hosts ran the pool's own engine — Ollama unless named. Such a file,
+    loaded now, must not quietly rent vLLM machines that fetch Ollama tags from the hub."""
+    with pytest.raises(ValueError) as refused:
+        config(model_set=["chat"], catalog=catalog, rented=renting())
+    assert "rented.engine: ollama" in str(refused.value)
+    assert config(model_set=["chat"], catalog=catalog, rented=renting(engine="ollama")).rented_engine() == "ollama"
+
+
+def test_where_the_default_did_not_move_nothing_more_is_asked():
+    vllm_pool = config(model_set=["chat"], catalog={"chat": {"variants": [{"tag": "owner/chat"}]}},
+                       rented=renting(), engine="vllm", pool={"models_per_host": "declared"},
+                       hosts=[local(models=["chat"], engine="ollama")])
+    assert vllm_pool.rented_engine() == "vllm"
+
+
+def test_a_model_only_workloads_hold_is_checked_for_what_rented_hosts_can_serve():
+    speech = {"tag": "owner/whisper", "serves": ["transcribe"]}
+    with pytest.raises(ValueError, match="speech"):
+        config(model_set=["chat"], hosts=[local()],
+               catalog={"speech": {"workloads_only": True, "variants": [speech]}},
+               rented=renting(engine="ollama"))
+    with pytest.raises(ValueError, match="audio-decoding"):
+        config(model_set=["chat"], hosts=[local()],
+               catalog={"speech": {"workloads_only": True, "variants": [{**speech, "engine": "vllm"}]}},
+               rented=renting(engine="vllm"))
+
+
+@pytest.mark.parametrize("tag", ["whisper:turbo", "owner/repo", "owner/repo/model.gguf", "owner/re__po/m.bin",
+                                 "owner/repo/../m.bin", "owner_/repo/m.bin", "owner/repo_/m.bin"])
+def test_a_whisper_cpp_build_must_name_one_file_of_a_hub_repository(tag):
+    with pytest.raises(ValueError, match="owner/repo/file.bin"):
+        config(catalog={WHISPER: {"variants": [{"tag": tag, "engine": "whisper-cpp", "serves": ["transcribe"]}]}},
+               hosts=[whisper_host()])
+
+
+def test_a_whisper_cpp_host_takes_only_a_build_marked_for_it():
+    with pytest.raises(ValueError, match="engine: whisper-cpp"):
+        config(catalog={WHISPER: {"variants": [{"tag": "owner/whisper", "serves": ["transcribe"]}]}},
+               hosts=[whisper_host()])

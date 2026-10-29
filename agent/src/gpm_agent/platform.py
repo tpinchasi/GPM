@@ -8,10 +8,14 @@ system it is on:
 - **Starting a program the agent runs** (whisper.cpp's server, an installed Ollama) so that it
   outlives the agent: its own session on POSIX, its own process group with no console window on
   Windows. Always a fixed argument list built by the caller, never a shell.
-- **Stopping one it started**: asked first, then made to, on POSIX; its process tree ended on
-  Windows, where a program has no signal to be asked with.
+- **Stopping one it started**, with whatever it started: its process group asked first, then
+  made to, on POSIX; its process tree ended on Windows, where a program has no signal to be
+  asked with.
 - **Recognising its own process** after the agent restarts, by the process's command line — a
-  process number from a file is only a number, and may since belong to something else.
+  process number from a file is only a number, and may since belong to something else. Ours runs
+  exactly the argument list it was started with (`started_with`).
+- **Keeping a directory private**: this user's alone (0700) on POSIX; on Windows, where Python
+  reports no owner and no such mode, by where it lives, under the user's profile.
 - **Checking a program's signature** where the system has one: `codesign` on macOS,
   Authenticode on Windows, each with the publisher pinned by the caller (D152).
 - **Running a command and waiting for it** (`run_command`) — a build, or a check of a program the
@@ -32,13 +36,14 @@ import platform as _stdlib_platform
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 MACOS, LINUX, WINDOWS = "macos", "linux", "windows"
 
@@ -74,6 +79,10 @@ COMMAND_TIMEOUT_S = 120.0
 
 #: The longest reading a process's command line may take: it is asked while the agent answers.
 BRIEF_TIMEOUT_S = 5.0
+
+#: How many words a system may put in front of a program's own argument list when it runs it: the
+#: interpreter a script's `#!` line names, and the one argument that line may add.
+SCRIPT_WORDS = 2
 
 
 def system(sys_platform: Optional[str] = None) -> str:
@@ -228,8 +237,9 @@ def alive(pid: int, *, os_name: Optional[str] = None) -> bool:
 
 def command_line(pid: int, *, os_name: Optional[str] = None, run: Optional[Runner] = None) -> Optional[bytes]:
     """A process's command line, or None where it cannot be read: from /proc where there is one,
-    else `ps`; on Windows, the process's record from PowerShell. Asked only before signalling a
-    process, and once when the agent restarts — never on every look."""
+    else `ps`; on Windows, the process's record from PowerShell. Asked only of a process this
+    agent process did not start itself — one it finds in a record after a restart — before
+    signalling it, and to recognise it, a positive answer kept a moment (`started_with`)."""
     run = run or _run_briefly
     pid = int(pid)
     if (os_name or system()) == WINDOWS:
@@ -244,6 +254,49 @@ def command_line(pid: int, *, os_name: Optional[str] = None, run: Optional[Runne
         pass
     said = run(["ps", "-ww", "-o", "command=", "-p", str(pid)])
     return said.output.encode() if said.code == 0 else None
+
+
+def arguments(pid: int, *, os_name: Optional[str] = None) -> Optional[list[str]]:
+    """A process's arguments one by one, where the system lists them so (/proc); else None, and
+    only its command line, joined, can be read (`command_line`)."""
+    if (os_name or system()) == WINDOWS:
+        return None
+    try:
+        raw = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
+    except OSError:
+        return None
+    listed = raw.decode(errors="surrogateescape").split("\0")
+    return listed[:-1] if listed and listed[-1] == "" else listed
+
+
+def started_with(
+    pid: int, argv: Sequence[str], *, os_name: Optional[str] = None, run: Optional[Runner] = None
+) -> bool:
+    """Is process `pid` running exactly the argument list `argv`?
+
+    Exactly — or as the system rewrites it to run a script: up to `SCRIPT_WORDS` words in front
+    of the list, the interpreter a `#!` line names and the one argument it may add. Never a part
+    of it found somewhere in another process's command line. Where the arguments cannot be read
+    one by one, the command line is compared whole: joined by spaces, as `ps` prints it, or
+    quoted as Windows reads a command line back.
+    """
+    os_name = os_name or system()
+    expected = list(argv)
+    if not expected:
+        return False
+    listed = arguments(pid, os_name=os_name)
+    if listed is not None:
+        extra = len(listed) - len(expected)
+        return 0 <= extra <= SCRIPT_WORDS and listed[extra:] == expected
+    said = command_line(pid, os_name=os_name, run=run)
+    if said is None:
+        return False
+    line = said.decode(errors="replace").strip()
+    # `list2cmdline` only quotes the list as Windows' own process creation did; it runs nothing.
+    joined = subprocess.list2cmdline(expected) if os_name == WINDOWS else " ".join(expected)
+    if line == joined:
+        return True
+    return line.endswith(f" {joined}") and 1 <= len(line[: -len(joined) - 1].split()) <= SCRIPT_WORDS
 
 
 async def _until(done: Callable[[], bool], seconds: float, poll_s: float) -> bool:
@@ -267,23 +320,27 @@ async def stop(
     """Stop a program this agent started: `process` when this agent process started it, else the
     process number from its record — which the caller has already checked is that program.
 
-    POSIX: asked (SIGTERM), and after `grace_s` made to (SIGKILL) — its whole session, which an
-    engine's helper processes belong to, since it was started as that session's leader. Windows:
-    its process tree ended (`taskkill /T /F`), as Windows has no signal to ask a program to stop
-    that a program without a console receives.
+    POSIX: asked (SIGTERM), and after `grace_s` made to (SIGKILL) — its whole process group, and
+    waited for until every process in it has ended, since it was started as the leader of a
+    session of its own: an engine's helper processes, or the real server a wrapper script runs,
+    are in that group, and a wrapper that exits at the signal would leave the server behind.
+    A process that does not lead its own group is signalled alone. An error from the system other
+    than the process having gone — not this user's to signal — is raised, for the caller to say.
+    Windows: its process tree ended (`taskkill /T /F`), as Windows has no signal to ask a program
+    to stop that a program without a console receives.
     """
     os_name = os_name or system()
 
-    def gone() -> bool:
+    def leader_gone() -> bool:
         if process is not None:
             return process.poll() is not None
         return not alive(pid, os_name=os_name)
 
-    if gone():
+    if leader_gone():
         return
     if os_name == WINDOWS:
         (run or _run)(["taskkill", "/PID", str(int(pid)), "/T", "/F"])
-        if not await _until(gone, grace_s, poll_s):
+        if not await _until(leader_gone, grace_s, poll_s):
             # taskkill missing or refused: the process itself, at least.
             try:
                 if process is not None:
@@ -292,27 +349,81 @@ async def stop(
                     os.kill(pid, signal.SIGTERM)  # on Windows: TerminateProcess
             except OSError:
                 pass
-            await _until(gone, grace_s, poll_s)
+            await _until(leader_gone, grace_s, poll_s)
         return
-    try:
-        if process is not None:
-            process.terminate()
-        else:
-            os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
+    group = _leads_group(pid)
+
+    def gone() -> bool:
+        return leader_gone() and (not group or _group_gone(pid))
+
+    _signal(pid, signal.SIGTERM, group=group, process=process)
     if await _until(gone, grace_s, poll_s):
         return
-    try:
-        if os.getpgid(pid) == pid:
-            os.killpg(pid, signal.SIGKILL)
-        elif process is not None:
-            process.kill()
-        else:
-            os.kill(pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
+    _signal(pid, signal.SIGKILL, group=group, process=process)
     await _until(gone, grace_s, poll_s)
+
+
+def _leads_group(pid: int) -> bool:
+    """Does this process lead a process group numbered as it is? A program `start` started does:
+    it leads a session of its own — and whatever it starts is in that group too. POSIX only."""
+    try:
+        return os.getpgid(pid) == pid
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def _signal(pid: int, signum: int, *, group: bool, process: Optional[Process] = None) -> None:
+    """Signal a program's whole process group, or, for one that does not lead its own (asked while
+    it ran), that process alone. A process already gone is not an error. POSIX only.
+
+    The group's number cannot have gone to another process while any process is in that group, so
+    it is signalled even once its leader has ended — a wrapper's server left behind."""
+    try:
+        if group:
+            os.killpg(pid, signum)
+        elif process is not None:
+            process.send_signal(signum)
+        else:
+            os.kill(pid, signum)
+    except ProcessLookupError:
+        pass
+
+
+def _group_gone(pid: int) -> bool:
+    """Has every process in the group this program led ended? POSIX only."""
+    try:
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
+def end_now(process: Process, *, os_name: Optional[str] = None) -> None:
+    """End a program this agent has just started, and everything it started, at once — for a
+    start that cannot be kept, such as one whose record could not be written, which nothing
+    would stop once the agent restarts."""
+    _end_now(process, os_name or system())
+
+
+# --- a directory of this user's alone ---
+
+
+def owned_by_this_user(found: os.stat_result, *, os_name: Optional[str] = None) -> bool:
+    """Does a file, as `os.stat` or `os.lstat` found it, belong to the user running this agent?
+    On Windows, where Python reports no owner, yes: a directory there is kept to its user by
+    where it lives, under the user's profile."""
+    if (os_name or system()) == WINDOWS:
+        return True
+    return found.st_uid == os.getuid()
+
+
+def make_private(path: Path, found: os.stat_result, *, os_name: Optional[str] = None) -> None:
+    """Make a directory, as `os.stat` found it, readable by this user alone (0700). Nothing on
+    Windows, where such a mode means nothing (`owned_by_this_user`)."""
+    if (os_name or system()) != WINDOWS and stat.S_IMODE(found.st_mode) != 0o700:
+        os.chmod(path, 0o700)
 
 
 # --- running a command and waiting for it ---

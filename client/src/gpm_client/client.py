@@ -13,8 +13,9 @@ import dataclasses
 import mimetypes
 import os
 import time
+import unicodedata
 from pathlib import Path
-from typing import Any, BinaryIO, Optional, Union
+from typing import Any, BinaryIO, Iterable, Optional, Union
 
 import httpx
 
@@ -55,6 +56,31 @@ class Ranked:
     index: int  # into the documents the call was given
     score: float
     document: Optional[str] = None
+
+
+class Ranking(list):
+    """What `rerank()` returns: the `Ranked` documents, best first, and the facts of the call
+    as a `Reply` carries them — the build that ran, where, and how long the request queued.
+
+    It is a list, so code that iterates, indexes or compares it as one works unchanged.
+    """
+
+    def __init__(
+        self,
+        ranked: Iterable[Ranked] = (),
+        *,
+        served_model: Optional[str] = None,
+        host: Optional[str] = None,
+        runtime_class: Optional[str] = None,
+        wait_s: Optional[float] = None,
+        raw: Optional[dict] = None,
+    ):
+        super().__init__(ranked)
+        self.served_model = served_model
+        self.host = host
+        self.runtime_class = runtime_class
+        self.wait_s = wait_s
+        self.raw = raw if raw is not None else {}
 
 
 #: The two request shapes a pool can speak, and where each keeps its paths and its answer.
@@ -195,13 +221,46 @@ def image_part(source: Source, mime: Optional[str] = None) -> dict:
     return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}}
 
 
+def _upload_name(name: str) -> str:
+    """A file name the pool can read: `\\`, `"` and control characters become `_`.
+
+    The pool reads an upload's quoted file name with no escapes and refuses a backslash, since
+    form parsers disagree on what one means (D144) — and httpx writes `\\` as `\\\\` and `"` as
+    `%22`. The name is only a label; the recording's bytes are sent as they are.
+    """
+    return "".join(
+        "_" if c in ('\\', '"') or unicodedata.category(c) == "Cc" else c for c in name
+    )
+
+
 def _transcription_upload(model: str, file: Source, **options: Any) -> dict[str, Any]:
     """The form a transcription is posted as: `model` and each option given as fields, and the
     recording as a file — held in memory, so a retry sends it again intact."""
     name, data = _read_source(file)
     fields = {"model": model}
     fields.update({key: value for key, value in options.items() if value is not None})
-    return {"data": fields, "files": {"file": (name or "audio", data)}}
+    return {"data": fields, "files": {"file": (_upload_name(name) if name else "audio", data)}}
+
+
+#: How long, at least, `transcribe()` waits for a recording's text once it is sent (D144). The
+#: pool gives the engine `pool.upstream_read_timeout_s` — 300 s unless its operator set
+#: otherwise — and then answers `504 generation_timeout`. The SDK's clock also runs while the
+#: request queues in the pool, so it has to be well above the pool's, or the SDK gives up first
+#: and never hears the pool's answer.
+_TRANSCRIBE_READ_TIMEOUT_S = 900.0
+
+
+def _transcribe_timeout(current: httpx.Timeout, read_timeout_s: Optional[float]) -> httpx.Timeout:
+    """The client's timeouts for one transcription: the read time `read_timeout_s` where given;
+    else the longer of the client's own and `_TRANSCRIBE_READ_TIMEOUT_S` — never shortened, so
+    a client widened to the pool's published budget keeps it."""
+    if read_timeout_s is not None:
+        read: Optional[float] = read_timeout_s
+    elif current.read is None:
+        read = None  # the client was told to wait indefinitely
+    else:
+        read = max(current.read, _TRANSCRIBE_READ_TIMEOUT_S)
+    return httpx.Timeout(connect=current.connect, read=read, write=current.write, pool=current.pool)
 
 
 def _transcript_from_response(
@@ -227,6 +286,11 @@ def _rerank_body(
     if top_n is not None:
         body["top_n"] = top_n
     return body
+
+
+def _ranking_from_response(response: httpx.Response) -> Ranking:
+    data = response.json()
+    return Ranking(_ranked_of(data), raw=data, **_facts(response, data.get("model")))
 
 
 def _ranked_of(data: dict) -> list[Ranked]:
@@ -329,14 +393,22 @@ class PoolClient:
         response_format: Optional[str] = None,
         temperature: Optional[float] = None,
         session_id: Optional[str] = None,
+        read_timeout_s: Optional[float] = None,
     ) -> Transcript:
-        """A recording turned into text. `file` is a path, bytes or a binary file object."""
+        """A recording turned into text. `file` is a path, bytes or a binary file object.
+
+        `read_timeout_s` is how long to wait for the text once the recording is sent. Unset, it
+        is 900 s, or the client's own read timeout where that is longer: well past the pool's
+        read time (300 s by default), so a recording too long for the pool is answered `504
+        generation_timeout` rather than given up on here first.
+        """
         upload = _transcription_upload(
             model, file, language=language, prompt=prompt,
             response_format=response_format, temperature=temperature,
         )
         headers = {"X-GPM-Session": session_id} if session_id else {}
-        response = self._client.post(_TRANSCRIBE_PATH, headers=headers, **upload)
+        timeout = _transcribe_timeout(self._client.timeout, read_timeout_s)
+        response = self._client.post(_TRANSCRIBE_PATH, headers=headers, timeout=timeout, **upload)
         return _transcript_from_response(response, response_format)
 
     def rerank(
@@ -347,12 +419,12 @@ class PoolClient:
         *,
         top_n: Optional[int] = None,
         session_id: Optional[str] = None,
-    ) -> list[Ranked]:
-        """`documents` ranked against `query`, best first."""
+    ) -> Ranking:
+        """`documents` ranked against `query`, best first, with the facts of the call."""
         headers = {"X-GPM-Session": session_id} if session_id else {}
         body = _rerank_body(model, query, documents, top_n)
         response = self._client.post(_RERANK_PATH, json=body, headers=headers)
-        return _ranked_of(response.json())
+        return _ranking_from_response(response)
 
     def wait_until_ready(self, timeout: Optional[float] = None) -> None:
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -444,6 +516,7 @@ class AsyncPoolClient:
         response_format: Optional[str] = None,
         temperature: Optional[float] = None,
         session_id: Optional[str] = None,
+        read_timeout_s: Optional[float] = None,
     ) -> Transcript:
         """See `PoolClient.transcribe`."""
         upload = _transcription_upload(
@@ -451,7 +524,8 @@ class AsyncPoolClient:
             response_format=response_format, temperature=temperature,
         )
         headers = {"X-GPM-Session": session_id} if session_id else {}
-        response = await self._client.post(_TRANSCRIBE_PATH, headers=headers, **upload)
+        timeout = _transcribe_timeout(self._client.timeout, read_timeout_s)
+        response = await self._client.post(_TRANSCRIBE_PATH, headers=headers, timeout=timeout, **upload)
         return _transcript_from_response(response, response_format)
 
     async def rerank(
@@ -462,12 +536,12 @@ class AsyncPoolClient:
         *,
         top_n: Optional[int] = None,
         session_id: Optional[str] = None,
-    ) -> list[Ranked]:
+    ) -> Ranking:
         """See `PoolClient.rerank`."""
         headers = {"X-GPM-Session": session_id} if session_id else {}
         body = _rerank_body(model, query, documents, top_n)
         response = await self._client.post(_RERANK_PATH, json=body, headers=headers)
-        return _ranked_of(response.json())
+        return _ranking_from_response(response)
 
     async def wait_until_ready(self, timeout: Optional[float] = None) -> None:
         deadline = None if timeout is None else time.monotonic() + timeout

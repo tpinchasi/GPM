@@ -198,7 +198,8 @@ class Engine(Protocol):
 ### Version 2: kinds, inputs and uploads (D142–D144, D148)
 
 Version 2 adds, every member optional so a version-1 plug-in still loads as one serving chat and
-embeddings:
+embeddings: On a path several engines share, the router reads requests with a version-2 engine's
+reader where one is installed, so a version-1 plug-in never switches off what a version-2 one reads.
 
 ```python
     kinds: ClassVar[frozenset[str]]          # what it can serve: chat, embed, transcribe, rerank

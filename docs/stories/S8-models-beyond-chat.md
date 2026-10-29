@@ -81,7 +81,12 @@ server, `POST /v1/models/{id}` on speaches).
 
 A request's **inputs** are what it carries besides text, read from a closed table: `image` — an
 `image_url` or `input_image` part, Ollama's `images`; `audio` — an `input_audio` part, or the
-upload of a `transcribe` request. **Media must travel inside the request**: an `image_url` must be
+upload of a `transcribe` request. They are read alike in a chat message, in what an embedding
+request embeds (`messages`, or `input` and its items) and in a ranking's query and each document,
+since vLLM takes pictures in all of them. The fields they are read from (`messages`, `input`, `query`,
+`documents`, and a message's `content` and `images`) follow D141's rule: once, spelled exactly, or
+`400 ambiguous_field` — an engine matching keys in any letter case would otherwise see a picture
+the pool did not. **Media must travel inside the request**: an `image_url` must be
 a `data:` URL, and any other part type (`audio_url`, `video_url`, `file`, `input_file`, or one
 the table does not know) is refused `400 media_not_inline`. An engine given a URL fetches it from
 the host it runs on — the operator's own network for a local or fixed host, the provider's for a
@@ -114,11 +119,17 @@ own, which an older router ignores.
 
 - **`400 kind_not_served` / `400 input_not_accepted`** when no build of the model that any
   configured host, rented profile or rented engine could hold would ever take the request —
-  every one explicitly excludes it. Refused at once, never retried. A request naming a build tag
-  directly is judged by that build; a workload key by its workload's builds; an uncatalogued
-  name states nothing.
+  every one explicitly excludes it. Refused at once, never retried. A name is read as dispatch
+  reads it: a catalogued model first, then a build tag, judged by that build; a workload key by
+  its workload's builds; an uncatalogued name states nothing. What each name is judged by is
+  worked out when the configuration loads, so the request path never looks an engine up.
 - **`503 no_eligible_host`**, as for a schema requirement today, when such a build exists but no
-  ready host holds one, with the detail naming the kind or input.
+  ready host holds one, with the detail naming the kind or input. The exception is a picture or
+  sound that is the only thing in the way: every configured host that could hold an accepting
+  build is ready and either does not hold it or reports, through its engine, that it does not
+  take it; no host the pool could rent would; and no host has failed this request already —
+  `400 input_not_accepted`. A host that is not ready, or one the request failed on, may be the
+  one that takes it, so either is a `503`.
 
 ### 4. Router: read once, bound everything
 
@@ -128,7 +139,9 @@ own, which an older router ignores.
 - **Bounded bodies.** `pool.max_request_mb` (default 24, under the 25 MB vLLM and Ollama accept
   for an upload): a declared length over it is refused `413 request_too_large` before the body
   is read, and a chunked body is counted as it arrives. A pool-wide budget for request bytes held
-  — queued, in flight and kept for a resend (D62) — answers `503` with a retry when full. A
+  — being read, queued, in flight and kept for a resend (D62) — answers `503` with a retry when
+  full: a declared length is taken from it before the body is read, a chunked body as it arrives,
+  and whatever was taken is given back exactly once, however the request ends. A
   request `Content-Encoding` other than `identity` is refused. The form parser that would spool
   uploads to the router's disk is never used.
 - **Uploads, rebuilt.** A `transcribe` body is parsed strictly and **rebuilt**: a boundary the
@@ -146,7 +159,8 @@ own, which an older router ignores.
   generation_timeout`: no re-run elsewhere, no failure counted against the host, not retried by
   the SDK. Today it reads as a host that never answered — counted, re-run on a second host, and
   retried by the SDK for up to half an hour.
-- **Measured by kind.** The request log gains `kind` and `request_bytes`; the token-based
+- **Measured by kind.** The request log gains `kind` — read from the path, so a request refused
+  before its body is understood is logged as what it asked for — and `request_bytes`; the token-based
   measures and the latency curves (worker readings, D75, workload latency, the concurrency curve,
   machine history) filter by kind explicitly.
 - **No new queue** (D23). A transcription waits first come, first served, and a long recording
@@ -165,9 +179,9 @@ own, which an older router ignores.
     `vllm` launcher's own interpreter, `python -I`, importing the extra) and fails the host with
     the reason if the image lied; without the extra vLLM starts and answers every transcription
     `400 Invalid or unsupported audio file`, saying why only in its log.
-  - **Rerankers** are catalogued only when their `config.json` names a sequence-classification
-    architecture, which vLLM runs as a pooling model; a reranker that needs per-model overrides
-    is refused at load rather than started wrong.
+  - **Rerankers** are catalogued as sequence-classification models, which vLLM runs as pooling
+    models. Nothing yet checks a reranker's `config.json`: a refusal at load for one needing
+    per-model launch overrides is not built (review, 2026-10-29).
 - **Ollama.** Pictures and sound inside chat on the hosts and tags where §3 observes them;
   never transcription or rerank.
 - **whisper.cpp** — a new engine, `whisper-cpp`, for Whisper builds on a Mac's GPU (or any machine
@@ -367,7 +381,7 @@ and its `-ggml` and `-ct2` builds, Apache-2.0).
 | The console fields belonged on the Profiles tab (D112) | §7 |
 | The proxy forwards any path and lists the host's models in errors | §5 |
 | The host check posts `/api/generate` to the first model by name | §5 |
-| Rerankers needing per-model overrides | §5: refused at load |
+| Rerankers needing per-model overrides | §5: a refusal at load, not built yet |
 | Pictures and recordings on untrusted hosts (T7) | Answer 4: as text, documented |
 | Decisions and spec were the last stage | Build stages: first |
 
