@@ -480,3 +480,31 @@ def test_a_group_short_of_its_hosts_runs_more_of_each_card_until_they_come(pool)
     pool.reprobe()
     planned = pool.supervisor.workloads.get("research")
     assert planned.cap(CHAT) == 3 and all(h.workers == 6 for h in fleet.hosts_of("research"))
+
+
+def test_a_plan_does_not_hold_a_model_to_the_one_answer_at_a_time_it_was_measured_at(pool):
+    """D156, found live: a model measured only at one answer at a time, well within its target,
+    was planned at one, so no card of its class could hold it beside another model — while the
+    rental, which read the same answers as a floor, would have taken that card."""
+    import time as clock
+
+    from gpm_server.supervisor.workloads import WorkloadRequest
+
+    create(pool, request())
+    fleet = pool.supervisor.fleet
+    until(pool, lambda: len([h for h in fleet.hosts_of("research") if h.state == "ready"]) == 2, "both hosts ready")
+    host = fleet.hosts_of("research")[0]
+    for i in range(25):
+        pool.database.execute(
+            "INSERT INTO request_log (ts, request_id, outcome, host_id, model_served, latency_ms, concurrency, "
+            "model_concurrency, workload) VALUES (?, ?, 'ok', ?, ?, 500, 1, 1, 'research')",
+            (clock.time(), f"m{i}", host.host_id, CHAT))
+    fleet._sizing_cache.clear()
+    fleet._hardware_cache = None
+    assert fleet.model_at_latency(host.offer.hardware, CHAT, 30, ceiling=2).curve == {1: 0.5}
+
+    # One of each at once on a card that runs two: it fits only if chat is not held to one.
+    plan = pool.loop.run(pool.supervisor.workloads.plan(WorkloadRequest.of(
+        "second", targets((CHAT, 30, 1), (EMBED, 5, 1)), 2, max_spend=5.0, placement="together")))
+    assert not plan["refused"], plan["refused"]
+    assert plan["hosts_at_start"] == 1 and plan["workers_measured"] is False

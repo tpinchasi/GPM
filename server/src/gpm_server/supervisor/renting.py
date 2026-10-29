@@ -1119,35 +1119,30 @@ class Fleet:
             return at.workers, f"{why}; held to {at.workers} for the {target.latency_s:g}s target: {at.reasons[0]}"
         return workers, f"{why}; {at.reasons[0]}"
 
-    def per_model_on(self, offer: Offer, spec: Any, models: Sequence[str], builds: dict[str, str],
-                     unrefuted_is_open: bool = False) -> dict[str, int]:
+    def per_model_on(self, offer: Offer, spec: Any, models: Sequence[str], builds: dict[str, str]) -> dict[str, int]:
         """How many answers of each model, alone, one host from this offer serves within the
         model's target: measured where the log has it, else the card's own number (D115, D118).
 
-        `unrefuted_is_open`: a measured number that no higher measured concurrency refutes is a
-        floor, not a ceiling — the card may serve more. A split host only ever runs a model up to
-        its share, so its own answers could otherwise never show the card holds the split, and a
-        lost host of a group could never be replaced on the card it was planned on."""
+        A measured number no higher measured concurrency refutes is a floor, not a ceiling, and
+        the card's own number is used (D156, in `workers_at_latency`): a split host only ever runs
+        a model up to its share, so its own answers could otherwise never show the card holds the
+        split, and a lost host of a group could never be replaced on the card it was planned on.
+        Once the rental's rule only; the plan, which did not use it, sized a model measured at one
+        answer at a time at one."""
         card_workers, _ = self._workers_for_card(offer)
         found = {}
         for model in models:
             target = spec.target(model)
             latency = target.latency_s if target is not None else spec.latency_s
             at = self.model_at_latency(offer.hardware, builds.get(model) or model, latency, ceiling=card_workers)
-            if at.workers is None:
-                found[model] = card_workers
-            elif unrefuted_is_open and not any(c > at.workers and p95 > latency for c, p95 in at.curve.items()):
-                # Nothing measured above it missed the target: it is a floor, not a ceiling.
-                found[model] = card_workers
-            else:
-                found[model] = min(card_workers, at.workers)
+            found[model] = card_workers if at.workers is None else min(card_workers, at.workers)
         return found
 
     def split_fits_on(self, offer: Offer, spec: Any, group: Any) -> bool:
         """Can a host from this offer run the group's split within every target? Judged by what
         has been measured to fail, not by what a split host has had the chance to show."""
         return workload_math.split_fits(
-            group.caps, self.per_model_on(offer, spec, group.models, group.builds, unrefuted_is_open=True))
+            group.caps, self.per_model_on(offer, spec, group.models, group.builds))
 
     def model_at_latency(self, hardware: str, tag: str, latency_s: float, ceiling: int) -> workload_math.AtLatency:
         """What the request log measured for this build on machines of this card: the whole
