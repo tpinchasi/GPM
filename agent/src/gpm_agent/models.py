@@ -19,7 +19,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 
@@ -59,8 +59,12 @@ class ModelWork:
         min_free_disk_gb: float,
         allow_delete: bool,
         state_path: Optional[Path] = None,
+        before_pass: Optional[Callable[[], Awaitable[None]]] = None,
     ):
         self.engine, self.client = engine, client
+        #: Run at the start of every pass: for an engine this agent runs itself (D150), starting
+        #: its server again if it has stopped, so the pass finds an engine to work with.
+        self.before_pass = before_pass
         self.free_disk_bytes = free_disk_bytes
         self.floor_bytes = int(min_free_disk_gb * 1e9)
         self.allow_delete = allow_delete
@@ -183,6 +187,8 @@ class ModelWork:
     # --- working toward it ---
 
     async def _work(self) -> None:
+        if self.before_pass is not None:
+            await self.before_pass()
         state = await self.engine.describe(self.client)
         fetches_alone = bool(getattr(self.engine, "fetches_without_engine", False))
         if not state.get("answers") and not fetches_alone:

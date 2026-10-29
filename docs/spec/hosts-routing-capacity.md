@@ -504,6 +504,11 @@ no host the pool could rent would, and no host has failed this request already. 
 input_not_accepted`. A host that is not ready, or one the request failed on, may be the one that
 takes it, so either is a `503`.
 
+A host whose agent installs its engine (S9) takes `engine_version`: `latest` (the default) or a
+pinned version, which the agent installs and the supervisor switches to when the host is idle
+and drained ([supervisor.md](supervisor.md) §3.1). Ignored, and said so in plan, for a host whose
+agent's owner has not allowed installs.
+
 A **whisper.cpp host** holds the one build it declares, has one worker, and is reached on loopback
 or through a tunnel; it must carry an agent that manages its models, which fetches the build and
 runs the server (D148), and its residency is `pinned` — the server cannot load a build on first

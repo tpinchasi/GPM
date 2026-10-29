@@ -59,7 +59,11 @@ BUILD_MARKER = ".gpm-build.json"
 PARALLEL = 4
 
 _CHUNK = 8 << 20
-_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+#: Directories are opened with links refused. A volume is only ever mounted on a rented Linux
+#: host; the flags are looked up rather than named so that this module, which the agent imports
+#: everywhere, still imports on Windows — which has neither flag nor `dir_fd`, so every open
+#: below fails there rather than follows a link.
+_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 
 
 def _copy_deadline(size: int) -> float:

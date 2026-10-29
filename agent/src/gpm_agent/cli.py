@@ -8,8 +8,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from . import prerequisites, startup, vllm_launch, whisper_cpp
 from . import proxy as proxy_module
-from . import vllm_launch, whisper_cpp
 from .settings import DEFAULT_PATH, Settings, SettingsError, fingerprint, load, mint_key, save
 
 
@@ -18,6 +18,17 @@ def _init(args: argparse.Namespace) -> int:
     if path.exists() and not args.rotate:
         print(f"{path} already exists. Use --rotate to mint a new key and keep the other settings.", file=sys.stderr)
         return 1
+    absolute = str(path.absolute())
+    machine = startup.Machine.this() if (args.start_at_login or args.prerequisites or args.rotate) else None
+    if args.start_at_login:
+        # Said before a key is minted, so a start at login that cannot be set up changes nothing.
+        problem = startup.problem_with_adding(machine, absolute)
+        if problem:
+            print(problem, file=sys.stderr)
+            return 1
+    # A key rotated under an agent that starts with the machine: that agent is started again
+    # below, to take the new key — the one running holds the old one until it is.
+    restarts = bool(args.rotate and not args.start_at_login and path.exists() and startup.registered(machine, absolute))
     key = mint_key()
     if path.exists():
         settings = load(path)
@@ -34,17 +45,48 @@ def _init(args: argparse.Namespace) -> int:
             restart_command=([args.restart_command] if args.restart_command else None),
             engine_env_file=args.engine_env_file,
             engine_binary=args.engine_binary,
+            install_engines=args.install_engines,
         )
+    rotated = path.exists()
     settings.check()
     save(settings, path)
     print(f"Agent key (shown once; only its hash is stored in {path}):\n\n  {key}\n")
     print("Give it to the pool as an environment variable on the pool's machine, and name that")
-    print("variable in the host's `agent.bearer_env`. Then: gpm-agent serve")
-    if settings.engine == "whisper-cpp" and not settings.engine_binary and shutil.which(whisper_cpp.PROGRAM) is None:
+    print("variable in the host's `agent.bearer_env`.")
+    if not (args.start_at_login or restarts):
+        if rotated:
+            # Its settings are read when it starts: one running now takes the old key until then.
+            print("Then start `gpm-agent serve` again wherever it runs, so it takes the new key — or")
+            print("`gpm-agent startup add`, which starts it with the machine from now on.")
+        else:
+            print("Then: gpm-agent serve — or `gpm-agent startup add`, to start it with the machine.")
+    if settings.install_engines:
+        # Said now: the agent never stops a program it did not start, so the owner's own copy
+        # would keep the port and every install would be refused.
+        print(f"\nThis agent installs {settings.engine} and runs it on {settings.engine_url}. If you run")
+        print(f"{settings.engine} yourself, quit it and remove it from login items first.")
+    if (
+        settings.engine == "whisper-cpp" and not settings.install_engines and not settings.engine_binary
+        and shutil.which(whisper_cpp.PROGRAM) is None
+    ):
         # Not a refusal: the owner may install it next. Said now rather than on the first pass.
         print(f"\nNote: {whisper_cpp.PROGRAM} is not on this PATH. Install whisper.cpp, or set")
         print(f"engine_binary in {path} to its program, before the pool asks this machine to serve.")
-    return 0
+    # D154: what only the owner can install, then the agent starting with the machine — last, so
+    # it starts with what was just installed. Either not done makes the whole of `init` fail, so
+    # a script running it learns that something is still to do.
+    outcome = 0
+    if args.prerequisites:
+        print()
+        outcome |= prerequisites.run(machine, engine=settings.engine, admin=args.admin,
+                                     install_engines=bool(getattr(settings, "install_engines", False)))
+    if args.start_at_login:
+        print()
+        outcome |= startup.add(machine, absolute, admin=args.admin, listen=(settings.host, settings.port))
+    elif restarts:
+        print()
+        outcome |= startup.restart(machine, absolute)
+    return 1 if outcome else 0
 
 
 def _serve(args: argparse.Namespace) -> int:
@@ -52,6 +94,9 @@ def _serve(args: argparse.Namespace) -> int:
 
     from .app import create_app
 
+    if args.log_file:
+        # First, so that settings that will not load say so where the owner will look.
+        startup.send_output_to(args.log_file)
     settings = load(args.config)
     # Beside the settings, owner-only: the pins this agent set, so it can release them later.
     state_path = Path(args.config).expanduser().with_suffix(".state.json")
@@ -98,12 +143,25 @@ def main(argv: list[str] | None = None) -> int:
     init.add_argument("--restart-command", default=None, help="how the engine is restarted here (a program to run)")
     init.add_argument("--engine-env-file", default=None, help="where the engine's start-up environment is written")
     init.add_argument("--engine-binary", default=None,
-                      help="the engine's program, for an engine this agent starts (whisper-cpp); PATH if unset")
+                      help="the engine's program, for an engine this agent starts (whisper-cpp) and does not "
+                           "install; PATH if unset")
+    init.add_argument("--install-engines", action="store_true",
+                      help="let this agent install the engine, run it, and switch its version when the "
+                           "pool asks (only the machine's owner can allow this)")
     init.add_argument("--rotate", action="store_true", help="mint a new key, keep everything else")
+    # D154: set up once, by the machine's owner, at a terminal.
+    init.add_argument("--start-at-login", action="store_true",
+                      help="start this agent with the machine, as you (`gpm-agent startup` undoes it)")
+    init.add_argument("--prerequisites", action="store_true",
+                      help="install what the engine needs from the system's package manager (ffmpeg, a compiler)")
+    init.add_argument("--admin", action="store_true",
+                      help="on Linux, use sudo for lingering and packages (asks for the password); else print the commands")
     init.set_defaults(run=_init)
 
     serve = verbs.add_parser("serve", help="answer the pool")
     serve.add_argument("--log-level", default="warning")
+    serve.add_argument("--log-file", default=None,
+                       help="append output to this file (a start at login on Windows, where nothing else keeps it)")
     serve.set_defaults(run=_serve)
 
     # A separate process from the agent, carrying inference traffic and nothing else (D96).
@@ -114,6 +172,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     proxy_module.add_arguments(proxy)
     proxy.set_defaults(run=_proxy)
+
+    # D154: the owner's own verbs for an agent already set up — never reachable from the pool.
+    startup.add_verbs(verbs)
+    prerequisites.add_verbs(verbs)
 
     # Run by the machine's own restart script, never over the agent's protocol (D97).
     start = verbs.add_parser(

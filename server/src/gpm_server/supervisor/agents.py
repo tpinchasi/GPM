@@ -161,6 +161,27 @@ async def restart_engine(
         return 502, {"error": "agent_unreachable", "detail": str(exc) or type(exc).__name__}
 
 
+async def set_engine_version(
+    agent: AgentConfig, version: str, switch: bool = False,
+    *, transport: Optional[httpx.AsyncBaseTransport] = None,
+) -> tuple[int, Optional[dict[str, Any]]]:
+    """Say which engine version the machine should run, and whether to switch to it now (D151).
+    The agent answers at once — a switch happens in the background — with where its versions
+    stand. (status, `engine.install`), or (status, None) when it could not be read."""
+    key = agent.key()
+    if key is None:
+        return 503, None
+    try:
+        async with _client(agent, key, transport) as client:
+            response = await client.put(
+                f"/agent/v{PROTOCOL}/engine/version", json={"version": version, "switch": bool(switch)}
+            )
+        answer = response.json()
+    except (httpx.HTTPError, ValueError):
+        return 502, None
+    return response.status_code, answer if isinstance(answer, dict) else None
+
+
 def wanted_engine_settings(workers: int, models_held: int, cards_per_copy: int = 1) -> dict[str, int]:
     """What this host's engine must run with for the pool's numbers to be true: as many
     requests at once as the host has workers, the whole model set held together, and each

@@ -88,8 +88,8 @@ CACHE_RESERVE_BYTES = 3 * 1024**3
 # What this launcher started, by model — process, port, log — is read back by the agent to tell
 # a process that has since died from one still loading. The reading lives apart from this
 # module: the agent never imports this launcher, which starts what the machine's start-up asks
-# (D63). The one program the agent starts itself is whisper.cpp's server, with fixed arguments
-# (D148).
+# (D63). The programs the agent starts itself are whisper.cpp's server (D148) and, where the
+# machine's owner lets it install engines, Ollama's (D150) — each with fixed arguments.
 from .vllm_state import (  # noqa: E402,F401
     STARTED_FILE,
     capped_lengths,

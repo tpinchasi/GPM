@@ -1,8 +1,9 @@
 """whisper.cpp's `whisper-server`, run by this agent (D148).
 
 The third engine differs from the other two in the one way that matters most here: **nobody else
-starts it.** Ollama is the machine owner's service, and vLLM is started by the machine's restart
-script; whisper.cpp's server is a plain program that serves the one file it was started with,
+starts it.** Ollama is the machine owner's service (unless the owner lets the agent install and
+run it, D150), and vLLM is started by the machine's restart script; whisper.cpp's server is a
+plain program that serves the one file it was started with,
 cannot say which file that is, and has no authentication of its own. So this agent fetches the
 build, starts the server on loopback with it, and reports what it is serving — the pool asks for
 a model set and never learns there is a process to start.
@@ -13,9 +14,12 @@ What keeps that inside the agent's bounds (D40, D41):
   repository, `owner/repo/file.bin`. It must be listed at the repository's root, and lands in a
   directory of its own under the models directory, named after it, so nothing the pool says
   climbs out of that directory.
-- **The program is the owner's.** `whisper-server` on this agent's PATH, or the absolute path in
-  the agent's own `engine_binary` setting. It is started with an argument list written here —
-  the file, the port from the agent's own settings, and constants — never through a shell.
+- **The program is the owner's, or the one this agent installed.** `whisper-server` on this
+  agent's PATH, or the absolute path in the agent's own `engine_binary` setting — or, where the
+  machine's owner lets the agent install engines (D150), the version its installer runs, built
+  here or taken from whisper.cpp's own Windows archives (`whisper_build`), and never either of
+  the others. It is started with an argument list written here — the file, the port from the
+  agent's own settings, and constants — never through a shell.
 - **On loopback, always.** The server has no authentication, so it is started on 127.0.0.1 and
   the agent's settings refuse an engine address that is anything else; the pool reaches it on
   this machine or through a tunnel.
@@ -27,6 +31,10 @@ What keeps that inside the agent's bounds (D40, D41):
 Holding a build is starting the server with it, and the agent's ordinary loop drives the rest: a
 server that has stopped is not serving, so the next pass holds it again — the restart when it
 stops — and a build that will not start is left alone for a minute before the next attempt.
+
+Where the agent installs whisper.cpp, its installer drives the same server through
+`InstalledServer`: a version switch stops it and starts the new program with the file it was
+serving (D153) — with the same arguments, and the same uploads directory, emptied around it.
 """
 
 from __future__ import annotations
@@ -37,18 +45,17 @@ import json
 import os
 import re
 import shutil
-import signal
 import stat
-import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Collection, Iterator, Optional, Sequence
+from typing import Any, AsyncIterator, Awaitable, Callable, Collection, Iterator, Optional
 from urllib.parse import urlsplit
 
 import httpx
 
 from . import modelhub
+from . import platform as host_platform
 from .settings import loopback_engine_url_problem
 from .vllm_state import state_dir_for
 
@@ -97,9 +104,8 @@ UPLOADS_DIR = "tmp"
 #: process is not mistaken for the server for long.
 IDENTITY_TRUSTED_S = 2.0
 
-#: Credentials the agent may hold for the hub. The server has no use for them, so it is started
-#: without them.
-_HUB_CREDENTIALS = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
+#: How long `whisper-server --help` is given. It prints its usage and exits, loading nothing.
+HELP_TIMEOUT_S = 30.0
 
 #: One part of a build's name: a letter or digit, then letters, digits, dots, dashes and
 #: underscores. The tag is flattened into one directory name with `__`, so a part may neither hold
@@ -178,11 +184,12 @@ def build_in(directory_name: str) -> Optional[Build]:
 def server_argv(binary: str, model_file: Path, port: int, uploads: Path) -> list[str]:
     """The whole command the server is started with — a fixed argument list, never a shell line.
 
-    Every part is the agent's: the owner's program, a file under the agent's models directory,
-    the port from the agent's own settings, the agent's own directory for what it is sent.
-    whisper.cpp 1.9.2 serves on 8080 and transcribes as English unless told otherwise, reads only
-    WAV unless `--convert` lets it hand other audio to `ffmpeg` — writing each recording to
-    `--tmp-dir` first, its working directory unless told — and ignores the model a request names.
+    Every part is the agent's: the owner's program or the one it installed, a file under the
+    agent's models directory, the port from the agent's own settings, the agent's own directory
+    for what it is sent. whisper.cpp 1.9.2 serves on 8080 and transcribes as English unless told
+    otherwise, reads only WAV unless `--convert` lets it hand other audio to `ffmpeg` — writing
+    each recording to `--tmp-dir` first, its working directory unless told — and ignores the
+    model a request names.
     """
     return [
         binary, "-m", str(model_file),
@@ -191,6 +198,33 @@ def server_argv(binary: str, model_file: Path, port: int, uploads: Path) -> list
         "--convert", "--tmp-dir", str(uploads),
         "-l", "auto",
     ]
+
+
+def _server_environment() -> dict[str, str]:
+    """What the server, and the check that its program runs, are given of the agent's own
+    environment: the names `platform.program_environment` keeps — never a credential the agent
+    holds for the hub or GitHub, nor one it was started with."""
+    return host_platform.program_environment({})
+
+
+def help_argv(program: str) -> list[str]:
+    """The command that checks a program runs on this machine: its own `--help`, which prints
+    its usage and exits 0 having loaded nothing. Fixed; only the program is the agent's."""
+    return [program, "--help"]
+
+
+async def program_runs(
+    program: Path, run: Optional[Callable[..., Awaitable[host_platform.Ran]]] = None
+) -> Optional[str]:
+    """None when `program --help` exits 0 — the program starts here, its libraries and its
+    accelerator's runtime found; otherwise what it said instead."""
+    run = run or host_platform.run_command
+    said = await run(help_argv(str(program)), env=_server_environment(), timeout_s=HELP_TIMEOUT_S)
+    if said.code == 0:
+        return None
+    lines = [line.strip() for line in said.output.splitlines() if line.strip()]
+    how = f"exited with code {said.code}" if said.code is not None else "did not run"
+    return f"{program.name} --help {how}: {lines[-1][:300] if lines else 'it said nothing'}"
 
 
 _VERSIONED_LIBRARY = re.compile(r"^libwhisper\.(?:so\.)?(\d+\.\d+\.\d+)(?:\.dylib)?$")
@@ -222,100 +256,17 @@ def installed_version(binary: str) -> Optional[str]:
     return None
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # there, and not this user's — which the command-line check then says
-    except OSError:
-        return False
-    return True
-
-
-def _arguments(pid: int) -> Optional[list[str]]:
-    """A process's arguments, one by one, where the system lists them so (/proc)."""
-    try:
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-    except OSError:
-        return None
-    listed = raw.decode(errors="surrogateescape").split("\0")
-    return listed[:-1] if listed and listed[-1] == "" else listed
-
-
-def _command_line(pid: int) -> Optional[str]:
-    """A process's arguments joined by spaces, as `ps` prints them where there is no /proc — run
-    as a literal argument list."""
-    try:
-        done = subprocess.run(
-            ["ps", "-ww", "-o", "command=", "-p", str(pid)],
-            capture_output=True, timeout=5, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return done.stdout.decode(errors="surrogateescape").strip() if done.returncode == 0 else None
-
-
-def _started_with(pid: int, argv: Sequence[str]) -> bool:
-    """Is this process running exactly this argument list?
-
-    Exactly — or as the system rewrites it to run a script: the interpreter the script's `#!`
-    line names, and the one argument that line may add, in front of the list. Never a part of it
-    found somewhere in another process's command line.
-    """
-    listed = _arguments(pid)
-    if listed is not None:
-        extra = len(listed) - len(argv)
-        return 0 <= extra <= 2 and listed[extra:] == list(argv)
-    line = _command_line(pid)
-    if line is None:
-        return False
-    joined = " ".join(argv)
-    if line == joined:
-        return True
-    return line.endswith(f" {joined}") and 1 <= len(line[: -len(joined) - 1].split()) <= 2
-
-
-def _is_our_server(pid: int, record: dict[str, Any]) -> bool:
+def _is_our_server(pid: int, record: dict[str, Any]) -> Optional[bool]:
     """Is this process the server the record describes? A number from a file is only a number:
     the process may have ended and its number gone to another. Ours runs the argument list the
-    record says it was started with; an unrelated process does not."""
+    record says it was started with — its port among it — and, on Windows, was created when the
+    record says (`platform.recognised`); an unrelated process does not. None where that cannot be
+    told now, which is never taken for "no"."""
     recorded = record.get("argv")
     if not isinstance(recorded, list) or not recorded or not all(isinstance(part, str) for part in recorded):
         return False
-    return _started_with(pid, recorded)
-
-
-def _leads_group(pid: int) -> bool:
-    """Does this process lead a process group numbered as it is? The server does: it is started
-    in a session of its own — and whatever it starts, a wrapper script's real server among it,
-    is in that group too."""
-    try:
-        return os.getpgid(pid) == pid
-    except ProcessLookupError:
-        return False
-
-
-def _signal(pid: int, signum: int, *, group: bool) -> None:
-    """Signal the server's whole process group, or, for a process that does not lead its own
-    (`_leads_group`, asked while it ran), that process alone."""
-    with contextlib.suppress(ProcessLookupError):
-        if group:
-            os.killpg(pid, signum)
-        else:
-            os.kill(pid, signum)
-
-
-def _group_gone(pid: int) -> bool:
-    """Has every process in the group this server led ended?"""
-    try:
-        os.killpg(pid, 0)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        return False
-    return False
+    created = record.get("created")
+    return host_platform.recognised(pid, recorded, created=created if isinstance(created, int) else None)
 
 
 def _last_error_line(log: Optional[str], offset: int) -> Optional[str]:
@@ -360,13 +311,12 @@ def _own_directory(path: Path, *, follow: bool) -> None:
     found = os.stat(path) if follow else os.lstat(path)
     if not stat.S_ISDIR(found.st_mode):
         raise _refused(f"{path} is not a directory; this agent keeps {PROGRAM}'s state there")
-    if found.st_uid != os.getuid():
+    if not host_platform.owned_by_this_user(found):
         raise _refused(
             f"{path} belongs to another user; this agent keeps {PROGRAM}'s state, and the "
             "recordings it is sent, only in a directory of its own"
         )
-    if stat.S_IMODE(found.st_mode) != 0o700:
-        os.chmod(path, 0o700)
+    host_platform.make_private(path, found)
 
 
 def _empty(directory: Path) -> None:
@@ -376,7 +326,7 @@ def _empty(directory: Path) -> None:
         found = os.lstat(directory)
     except FileNotFoundError:
         return
-    if not stat.S_ISDIR(found.st_mode) or found.st_uid != os.getuid():
+    if not stat.S_ISDIR(found.st_mode) or not host_platform.owned_by_this_user(found):
         return  # not the directory this agent made: nothing of its own to remove
     with os.scandir(directory) as entries:
         for entry in entries:
@@ -407,15 +357,22 @@ class WhisperCppFacts:
         self.hub_transport = hub_transport
         #: The server this agent process started, while it lives. After the agent's own restart
         #: there is none, and the record on disk says what was started before.
-        self._process: Optional[subprocess.Popen[bytes]] = None
+        self._process: Optional[host_platform.Process] = None
         self._record: Optional[dict[str, Any]] = None
         self._record_read = False
         #: A process recorded before this agent started, found to be the server, and when —
         #: looked at again once that is more than `IDENTITY_TRUSTED_S` ago.
         self._confirmed: Optional[tuple[int, float]] = None
         self._versions: dict[str, Optional[str]] = {}
-        #: One start, stop or removal at a time.
+        #: One start, stop or removal at a time — the installer's too (`InstalledServer`).
         self._lock = asyncio.Lock()
+        #: The installer, where the machine's owner lets this agent install whisper.cpp (D150).
+        #: The program is then the version it runs, and never one from PATH or the settings.
+        self.installer: Any = None
+
+    def use_installer(self, installer: Any) -> None:
+        """Take the program from `installer`'s running version from now on."""
+        self.installer = installer
 
     # --- where things are ---
 
@@ -460,7 +417,31 @@ class WhisperCppFacts:
             return str(path) if path.is_file() and os.access(path, os.X_OK) else None
         return shutil.which(PROGRAM)
 
+    def _program(self) -> tuple[Optional[str], Optional[str]]:
+        """The program and its version. Where this agent installs whisper.cpp, the version its
+        installer runs — none until one is installed; otherwise the owner's, as `_binary` finds it."""
+        if self.installer is not None:
+            running = self.installer.record.running
+            if running is None:
+                return None, None
+            program = self.installer.program(running)
+            return (str(program) if program.is_file() else None), running
+        binary = self._binary()
+        return binary, self._version(binary)
+
     def _no_binary(self) -> str:
+        if self.installer is not None:
+            running = self.installer.record.running
+            if running:
+                return (
+                    f"whisper.cpp {running}, installed by this agent, has no {PROGRAM} at "
+                    f"{self.installer.program(running)}: something other than this agent changed its "
+                    "directory; switching to another version replaces it"
+                )
+            return (
+                "whisper.cpp is not installed here yet: this agent installs it when the pool names a "
+                "version, and its facts say how that stands (engine.install)"
+            )
         named = getattr(self.settings, "engine_binary", None)
         if named:
             return (
@@ -506,28 +487,34 @@ class WhisperCppFacts:
         with _refusing(f"could not remove {PROGRAM}'s record from {self._state_dir}"):
             (self._state_dir / RECORD_FILE).unlink(missing_ok=True)
 
-    def _own_process(self, record: dict[str, Any]) -> Optional[subprocess.Popen[bytes]]:
+    def _own_process(self, record: dict[str, Any]) -> Optional[host_platform.Process]:
         if self._process is not None and self._process.pid == record.get("pid"):
             return self._process
         return None
 
-    def _alive(self, record: dict[str, Any]) -> bool:
+    def _alive(self, record: dict[str, Any], *, fresh: bool = False) -> bool:
         """Is the recorded server still running? Asked of the process itself when this agent
         started it; otherwise of the system, with its identity looked at again whenever the last
-        look is more than a moment old."""
+        look is more than a moment old, or `fresh` asks for a look now. A look that could not be
+        made is no answer: the last one stands, and is not kept any longer for it. A server the
+        installer stopped to start another version is not, whatever has its number since."""
+        if record.get("stopped"):
+            return False
         own = self._own_process(record)
         if own is not None:
             return own.poll() is None
         pid = record["pid"]
-        if not _pid_alive(pid):
+        if not host_platform.alive(pid):
+            self._confirmed = None
             return False
-        confirmed = self._confirmed
-        if confirmed is not None and confirmed[0] == pid and time.monotonic() - confirmed[1] < IDENTITY_TRUSTED_S:
+        confirmed = self._confirmed if self._confirmed is not None and self._confirmed[0] == pid else None
+        if not fresh and confirmed is not None and time.monotonic() - confirmed[1] < IDENTITY_TRUSTED_S:
             return True
-        if _is_our_server(pid, record):
-            self._confirmed = (pid, time.monotonic())
-            return True
-        return False
+        said = _is_our_server(pid, record)
+        if said is None:
+            return confirmed is not None
+        self._confirmed = (pid, time.monotonic()) if said else None
+        return said
 
     def _why_stopped(self, record: dict[str, Any]) -> str:
         own = self._own_process(record)
@@ -548,22 +535,24 @@ class WhisperCppFacts:
 
         A build is loaded only while the server this agent started runs **and** answers: the
         server cannot say which file it holds, and something else answering on the port is not
-        it. A server that has stopped is reported as that build's failure, with its last words.
+        it. A server that has stopped is reported as that build's failure, with its last words —
+        unless the installer stopped it, to start another version with the same file.
         """
-        binary = self._binary()
+        binary, version = self._program()
         record = self._current()
         alive = record is not None and self._alive(record)
         answers = await self._answers(client)
         return {
             "name": self.name,
             "answers": answers,
-            "version": self._version(binary),
+            "version": version,
             "binary": binary,
             "ffmpeg": shutil.which("ffmpeg") is not None,
             "models_on_disk": self._on_disk(),
             "models_loaded": [record["tag"]] if record is not None and alive and answers else [],
             "models_failed": (
-                {record["tag"]: self._why_stopped(record)} if record is not None and not alive else {}
+                {record["tag"]: self._why_stopped(record)}
+                if record is not None and not alive and not record.get("stopped") else {}
             ),
         }
 
@@ -632,7 +621,9 @@ class WhisperCppFacts:
         """Stop the server this agent started unless the build it runs is one of `tags` — the
         builds the pool wants held — whatever this agent's pins say. A pin is recorded only once
         a start is answered, so a server still starting, or left running silent, when its build
-        left the set would otherwise be left running with nothing to stop it."""
+        left the set would otherwise be left running with nothing to stop it. A build the
+        installer stopped the server of, to start another version with it, is forgotten too once
+        it leaves the set: the new version then has no file to start with, and is checked alone."""
         async with self._lock:
             record = self._current()
             if record is not None and record.get("tag") not in tags:
@@ -651,7 +642,12 @@ class WhisperCppFacts:
             window = max(QUIET_GRACE_S, float(record.get("started_at") or 0) + START_TIMEOUT_S - time.time())
             if await self._answered_within(client, record, window):
                 return
-        binary = self._binary()
+        if self.installer is not None and self.installer.starting:
+            # The installer is stopping or starting this server — a switch, a restart — and starts
+            # it with the file it holds. Started here as well, the two would take turns at the
+            # port; the next pass holds this build if that one is not it.
+            return
+        binary, version = self._program()
         if binary is None:
             raise _refused(self._no_binary())
         port = self._port()
@@ -661,7 +657,7 @@ class WhisperCppFacts:
                 f"something else already answers on port {port}, where this agent starts "
                 f"{PROGRAM}; stop it, or give this agent another engine_url"
             )
-        record = self._start(binary, model_file, port, build)
+        record = self._start(binary, model_file, port, build, version)
         if await self._answered_within(client, record, START_TIMEOUT_S):
             return
         if not self._alive(record):
@@ -684,89 +680,86 @@ class WhisperCppFacts:
             await asyncio.sleep(POLL_S)
         return False
 
-    def _start(self, binary: str, model_file: Path, port: int, build: Build) -> dict[str, Any]:
+    def _start(
+        self, binary: str, model_file: Path, port: int, build: Build, version: Optional[str] = None
+    ) -> dict[str, Any]:
         uploads = self._prepare_state()
         logs = self._state_dir / "logs"
         log_path = logs / LOG_FILE
         argv = server_argv(binary, model_file, port, uploads)
-        environment = {name: value for name, value in os.environ.items() if name not in _HUB_CREDENTIALS}
+        environment = _server_environment()
         with _refusing(f"could not open {PROGRAM}'s log {log_path}"):
             logs.mkdir(mode=0o700, exist_ok=True)
-            out = open(log_path, "ab")
-        with out:
-            with _refusing(f"could not write {PROGRAM}'s log {log_path}"):
-                out.write(f"--- gpm-agent: starting {PROGRAM} with {build.tag} at {time.ctime()}\n".encode())
-                out.flush()
-                offset = out.tell()
-            try:
-                # Its own session, so it outlives an agent restart and keeps serving — and leads
-                # a process group of its own, which is what is stopped. It works in the uploads
-                # directory, so whatever it writes there is emptied with them.
-                process = subprocess.Popen(
-                    argv, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
-                    cwd=uploads, env=environment, start_new_session=True,
-                )
-            except OSError as exc:
-                raise _refused(f"could not start {binary}: {exc}") from exc
+        try:
+            # Its own session, so it outlives an agent restart and keeps serving — and leads a
+            # process group of its own, which is what is stopped. It works in the uploads
+            # directory, so whatever it writes there is emptied with them.
+            process, offset = host_platform.start(
+                argv, env=environment, log=log_path, cwd=uploads,
+                note=f"starting {PROGRAM} with {build.tag}",
+            )
+        except OSError as exc:
+            raise _refused(f"could not start {binary}: {exc}") from exc
         self._process = process
         record = {
             "pid": process.pid, "tag": build.tag, "file": str(model_file), "argv": argv,
+            "program": binary, "version": version, "created": host_platform.creation_time(process.pid),
             "log": str(log_path), "log_offset": offset, "started_at": time.time(),
         }
         try:
             self._remember(record)
         except OSError as exc:
             # A server nothing records is one nothing would stop once this agent restarts.
-            _signal(process.pid, signal.SIGKILL, group=True)
-            process.wait()
+            host_platform.end_now(process)
             self._process = None
             raise _refused(f"could not record the {PROGRAM} it started in {self._state_dir}: {exc}") from exc
         return record
 
-    async def _stop(self) -> None:
-        """Stop the server this agent started, if it runs — with whatever it started — forget it,
-        and empty its uploads. A process found only in the record is signalled only once its own
-        command line says it is that server."""
+    async def _stop(self, *, forget: bool = True) -> None:
+        """Stop the server this agent started, if it runs — with whatever it started — and forget
+        it, or, for the installer's switch, remember the build it served, marked stopped, so the
+        next version is started with the same file; then empty its uploads. A process found only
+        in the record is signalled only once its own command line, read now, says it is that
+        server."""
         record = self._current()
         if record is None:
             return
         pid = record["pid"]
         own = self._own_process(record)
-        if own is not None:
-            running = own.poll() is None
-
-            def leader_gone() -> bool:
-                return own.poll() is not None
+        with _refusing(f"could not stop {PROGRAM} (process {pid})"):
+            if own is not None:
+                await host_platform.stop(pid, process=own, grace_s=STOP_GRACE_S, poll_s=POLL_S / 2)
+            elif not record.get("stopped") and host_platform.alive(pid):
+                said = _is_our_server(pid, record)
+                if said is None:
+                    # Neither signalled nor forgotten: asked again on the next attempt.
+                    raise _refused(f"whether process {pid} is the {PROGRAM} it started could not be read now; it is not stopped")
+                if said:
+                    await host_platform.stop(pid, grace_s=STOP_GRACE_S, poll_s=POLL_S / 2)
+        if forget:
+            self._forget()
         else:
-            running = _pid_alive(pid) and _is_our_server(pid, record)
-
-            def leader_gone() -> bool:
-                return not _pid_alive(pid)
-
-        if running:
-            with _refusing(f"could not stop {PROGRAM} (process {pid})"):
-                group = _leads_group(pid)
-
-                def gone() -> bool:
-                    # A wrapper that exits at the signal may leave the server it started behind.
-                    return leader_gone() and (not group or _group_gone(pid))
-
-                _signal(pid, signal.SIGTERM, group=group)
-                if not await self._gone(gone):
-                    _signal(pid, signal.SIGKILL, group=group)
-                    await self._gone(gone)
-        self._forget()
+            self._process, self._confirmed = None, None
+            with _refusing(f"could not record in {self._state_dir} that {PROGRAM} was stopped"):
+                self._remember({**record, "stopped": True})
         with _refusing(f"could not empty {PROGRAM}'s uploads in {self._uploads_dir}"):
             _empty(self._uploads_dir)
 
-    @staticmethod
-    async def _gone(gone: Callable[[], bool]) -> bool:
-        deadline = time.monotonic() + STOP_GRACE_S
-        while not gone():
-            if time.monotonic() >= deadline:
-                return False
-            await asyncio.sleep(POLL_S / 2)
-        return True
+    def _held(self) -> Optional[tuple[Build, Path]]:
+        """The build this agent's server serves, or served until the installer stopped it, and its
+        file — while that file is still whole on disk."""
+        record = self._current()
+        if record is None:
+            return None
+        try:
+            build = build_of(record.get("tag"))
+        except Exception:  # noqa: BLE001 - a record that names no build holds nothing
+            return None
+        directory = self._models_dir / build.directory
+        model_file = directory / build.file
+        if str(model_file) != record.get("file") or not modelhub.is_complete(directory) or not model_file.is_file():
+            return None
+        return build, model_file
 
     async def delete(self, client: httpx.AsyncClient, tag: str) -> None:
         """Remove a build from disk — stopping the server first if it is serving it."""
@@ -795,3 +788,104 @@ class WhisperCppFacts:
 
     def settings_from_environment(self, environment: Optional[dict[str, str]]) -> Optional[dict[str, Optional[int]]]:
         return None
+
+
+class InstalledServer:
+    """whisper-server as the installer drives it (`installs.Server`), where this agent installs
+    whisper.cpp (D150, D153). The same server the engine's model work holds builds with — one
+    record, one lock — started from the version the installer names.
+
+    What a switch needs that holding a build does not: stopping the server while keeping the
+    build it served, so that the next version is started with **the same file** the pool chose
+    (`PUT /models` still chooses it); and, before any file is held, a check that a version runs
+    here at all. With no file there is nothing to start, so that check is the program's own
+    `--help` — which loads nothing, but does load the program, its libraries and its
+    accelerator's runtime: a build for the wrong card or a missing library fails it. The version
+    is then recorded as running, and the server is started with it once the pool holds a build.
+    """
+
+    def __init__(
+        self,
+        engine: WhisperCppFacts,
+        client: httpx.AsyncClient,
+        *,
+        run: Optional[Callable[..., Awaitable[host_platform.Ran]]] = None,
+    ) -> None:
+        self.engine = engine
+        self.client = client
+        #: How `--help` is run — only ever replaced by a test.
+        self.run = run or host_platform.run_command
+        port = urlsplit(getattr(engine.settings, "engine_url", "")).port
+        self.foreign_reason = (
+            f"something this agent did not start already answers on port {port}, where it starts "
+            f"{PROGRAM}: stop the whisper-server you run yourself, or give this agent another engine_url"
+        )
+        #: Programs that answered `--help` here, so one with no file to serve is checked once.
+        self._runs: set[str] = set()
+
+    def ours(self, *, fresh: bool = False) -> bool:
+        record = self.engine._current()
+        return record is not None and self.engine._alive(record, fresh=fresh)
+
+    def running_version(self) -> Optional[str]:
+        record = self.engine._current()
+        return record.get("version") if record is not None and self.engine._alive(record) else None
+
+    async def foreign(self) -> bool:
+        return not self.ours() and await self.engine._listening(self.client)
+
+    def pool_environment(self) -> Optional[dict[str, str]]:
+        """None: none of the pool's numbers has a name for this server (`launch_environment`)."""
+        return None
+
+    def set_pool_environment(self, environment: dict[str, str]) -> bool:
+        return False
+
+    async def start(self, program: Path, version: str, timeout_s: float) -> Optional[str]:
+        """Start `program` with the file this agent's server holds, and wait for it to answer;
+        with no file held, check that `program` runs. None once it does; otherwise why not — and
+        then whatever was started is left for the caller to stop."""
+        from .engines import EngineRefused
+
+        engine = self.engine
+        async with engine._lock:
+            held = engine._held()
+            if held is None:
+                return await self._check(program)
+            build, model_file = held
+            record = engine._current()
+            try:
+                if record is not None and engine._alive(record):
+                    # Started meanwhile, from the version before, by a pass holding this build:
+                    # this start is the installer's, and replaces it.
+                    await engine._stop(forget=False)
+                if await engine._listening(self.client):
+                    return self.foreign_reason
+                if not program.is_file():
+                    return f"{program} is not there"
+                # The same command a pass holding the build starts — its uploads directory
+                # emptied first, as `_stop` empties it after — with this version's program.
+                record = engine._start(str(program), model_file, engine._port(), build, version)
+            except EngineRefused as no:
+                return str(no)
+            if await engine._answered_within(self.client, record, timeout_s):
+                return None
+            if not engine._alive(record):
+                return engine._why_stopped(record)
+            return f"it did not answer within {timeout_s:.0f}s of starting with {build.tag}"
+
+    async def _check(self, program: Path) -> Optional[str]:
+        if str(program) in self._runs:
+            return None
+        if not program.is_file():
+            return f"{program} is not there"
+        problem = await program_runs(program, self.run)
+        if problem is None:
+            self._runs.add(str(program))
+        return problem
+
+    async def stop(self) -> None:
+        """Stop the server, keeping the build it served for the start that follows, and empty its
+        uploads. An error from the system is raised as the engine's refusal (`_refusing`)."""
+        async with self.engine._lock:
+            await self.engine._stop(forget=False)

@@ -207,6 +207,10 @@ class AgentConfig(BaseModel):
 _DEFAULT_PRIORITY = {"local": 0, "fixed-remote": 10, "rented-interruptible": 20, "rented-on-demand": 20}
 
 
+#: A version as engines publish them: digits and dots, and an optional pre-release suffix (D151).
+ENGINE_VERSION = re.compile(r"^\d+(\.\d+){1,3}(-[0-9A-Za-z.]+)?$")
+
+
 class HostConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -235,6 +239,16 @@ class HostConfig(BaseModel):
     models: Optional[list[str]] = None
     #: Optional. With an agent the pool learns what the machine is, rather than being told.
     agent: Optional[AgentConfig] = None
+    #: The engine version this host's agent installs and runs, where the machine's owner let it
+    #: (S9, D153): `latest`, followed with an automatic rollback, or a version to hold.
+    engine_version: str = "latest"
+
+    @field_validator("engine_version")
+    @classmethod
+    def _engine_version_is_a_version(cls, value: str) -> str:
+        if value != "latest" and (len(value) > 64 or not ENGINE_VERSION.fullmatch(value)):
+            raise ValueError(f"engine_version is `latest` or a version such as 0.40.11, not {value!r}")
+        return value
 
     @model_validator(mode="after")
     def _agent_matches_transport(self) -> "HostConfig":
@@ -412,6 +426,14 @@ class PoolSettings(BaseModel):
     #: The most request bytes the router holds at once — queued, in flight and kept for a
     #: resend (D144). Full is `503 uploads_full`, waited out like any 503.
     max_held_request_mb: float = Field(default=512.0, gt=0)
+    #: An engine its agent installed is switched to a new version only once its host has served
+    #: nothing for this long (S9, D153) — or when an operator says *Upgrade now*.
+    engine_upgrade_idle_s: float = Field(default=600.0, ge=0)
+    #: How long its requests in flight may take to finish before the switch is put off.
+    engine_upgrade_drain_s: float = Field(default=300.0, gt=0)
+    #: How long the new version has to answer and hold what the host held before; then it is
+    #: rolled back.
+    engine_upgrade_check_s: float = Field(default=600.0, gt=0)
 
     @field_validator("model_set")
     @classmethod

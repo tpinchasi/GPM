@@ -142,9 +142,11 @@ Three rules the hub fetch keeps:
 
 ### whisper.cpp (D148)
 
-An agent whose settings name `engine: whisper-cpp` manages a **`whisper-server`** — the program
-installed on the machine, found on the agent's `PATH` or at `engine_binary` in its settings (an
-absolute path); the pool never sends a path or a command. Its engine URL is
+An agent whose settings name `engine: whisper-cpp` manages a **`whisper-server`** — the version the
+agent built or installed itself where its owner allows installs (§2.3,
+`<engines>/whisper-cpp/<version>/bin/whisper-server`), or otherwise the program on the machine,
+found on the agent's `PATH` or at `engine_binary` in its settings (an absolute path; refused
+together with `install_engines`); the pool never sends a path or a command. Its engine URL is
 `http://127.0.0.1:<port>` or `http://localhost:<port>` (8178 by default), and its models live in
 `~/gpm-whisper-models` unless set.
 
@@ -158,8 +160,8 @@ absolute path); the pool never sends a path or a command. Its engine URL is
 - **Holding.** Only under `pinned` residency, which the pool requires of such a host. The agent
   starts the server with exactly
   `whisper-server -m <file> --host 127.0.0.1 --port <port> --inference-path /v1/audio/transcriptions --convert --tmp-dir <state>/tmp -l auto`
-  (`-l auto` because its default language is English), in its own session, with the hub's
-  credential withheld from its environment; its record and its log are in the agent's state
+  (`-l auto` because its default language is English), in its own session, given only the list of
+  the agent's environment variables §2.3 names — never a credential; its record and its log are in the agent's state
   directory beside the models directory (`<state>`), never inside it. **Every recording it is
   sent lands in `<state>/tmp`**, its working directory and `--tmp-dir`, where whisper.cpp writes
   it for `ffmpeg` and leaves one it could not convert behind: the state directory and that one
@@ -169,7 +171,8 @@ absolute path); the pool never sends a path or a command. Its engine URL is
   started again on the pool's next pass, and a failed start — an error from the system included,
   such as a state directory the agent may not write — is tried again only after a pause. A
   server whose build has left the set, or a set gone `on_demand`, is stopped. Stopping signals
-  the server's whole process group, so a wrapper script's real server stops with it. The server
+  the server's whole process group (ends its process tree, on Windows), so a wrapper script's
+  real server stops with it. The server
   outlives an agent restart and is recognised when the agent comes back by running exactly the
   argument list recorded for it (behind a script's interpreter, as the system runs one), looked
   at again on every pass.
@@ -180,8 +183,8 @@ absolute path); the pool never sends a path or a command. Its engine URL is
   line of its log naming an error — never a line it writes about a request, which carries the
   name a client gave its recording.
 
-This is the one program the agent itself starts, and it starts it only with these fixed
-arguments. One machine running Ollama and whisper.cpp runs two agents, each with its own port and
+The agent starts it only with these fixed arguments — as it starts an engine it installed
+(§2.3), and nothing else. One machine running Ollama and whisper.cpp runs two agents, each with its own port and
 key.
 
 ### vLLM's audio extra and each model's length (D146)
@@ -227,6 +230,170 @@ archive is already on every host the pool creates.
 
 The pool names a model, in a header. It never names a port, a path or a command.
 
+## 2.3 Installing and running engines on the owner's machine (S9, D150–D154)
+
+On a machine its owner gives it — `install_engines: true` in the agent's own settings, which
+`gpm-agent init --install-engines` writes and the pool cannot change — the agent installs the
+engine it manages, runs it, and keeps it at the version the pool asks for. Hosts the pool rents
+are unchanged: their engine comes with the image.
+
+**It runs the engine itself**, as it runs whisper.cpp's server (D148): `ollama serve` on
+loopback at the engine URL's port, with the models directory and the pool's numbers (workers,
+models held, context) as its environment, built here from integers. A restart or new settings
+need no command from the owner. An engine on the port that the agent did not start is reported
+(`engine.foreign`) and left alone: the agent never stops a program it did not start, so a
+machine moving to an agent-run engine has its own copy quit first by its owner. Its own server is
+known after an agent restart, and stopped, as whisper.cpp's is: by running exactly the argument
+list recorded for it, on the port recorded for it (another agent's `ollama serve` on another port
+runs the same command, and is not it), looked at again on every pass and afresh whenever the
+agent decides whether to start it, and with its whole process group (process tree, on Windows).
+On Windows, where a process number goes to the next program at once, the time Windows says the
+process was created is recorded at its start and compared, in one call, instead of reading its
+command line through PowerShell. A look that could not be made — a command that failed or ran out
+of time — is no answer: the last one stands, and a server that cannot be looked at is neither
+signalled nor forgotten. Why it stopped is its exit code and the last line of its log naming an
+error, never a line about a request. The log begins afresh at every start; the one before is kept
+beside it (`ollama.log.1`, likewise `whisper-server.log.1`), its last 20 MB at most.
+
+**Its environment is a list, never everything less a few.** A program the agent starts — Ollama,
+whisper.cpp's server and its `--help` check, the build's `cmake`, pip, and the build's looks at
+`xcode-select` and `nvidia-smi` — is given of the agent's own environment only `PATH`, `HOME`, `USER`, `LOGNAME`,
+`SHELL`, `LANG`, `LC_*`, `TMPDIR`, `TMP`, `TEMP` and `TZ` (on Windows also `SystemRoot`,
+`SystemDrive`, `windir`, `LOCALAPPDATA`, `APPDATA`, `USERPROFILE`, `ProgramData`, `PATHEXT`,
+`COMSPEC`, `NUMBER_OF_PROCESSORS` and `PROCESSOR_ARCHITECTURE`, in any case), and the cards'
+own settings — `CUDA_*`, `NVIDIA_*`, `HIP_*`, `ROCM_*`, `HSA_*`, `GPU_*` — as the owner set them;
+then what the agent writes itself: the address, the models directory and the pool's numbers. So
+no credential the agent was started with — a provider's key, a token — reaches a program it
+downloaded, and no `OLLAMA_*` setting reaches Ollama but the ones the agent writes. A proxy in the
+environment does not reach pip either: cmake from PyPI on a machine behind one is installed by
+its owner. On Windows the commands the agent runs to manage its engine — `taskkill`, PowerShell,
+a build or a check — open no console window: at logon it runs under `pythonw.exe`, which has none.
+
+**Where from** (D152) — only the engine's official repository, through a table inside the agent:
+
+| | macOS | Linux | Windows |
+|---|---|---|---|
+| Ollama | `ollama-darwin.tgz`, signed by team `3MU9H2V9Y9` | `ollama-linux-<arch>.tar.zst`, with `-rocm` on AMD | `ollama-windows-<arch>.zip`, with `-rocm` on AMD |
+| whisper.cpp | Built from the tag's source: static, Metal | Built from the tag's source: static, CUDA where `nvcc` is, else CPU | The release's archive: CUDA 12.4 or 11.8 by the driver, else BLAS |
+| ffmpeg | Homebrew, at `init` | apt or dnf, at `init` | winget, at `init` |
+
+Every file is checked against its release's published digest; on macOS, every Mach-O program
+and library — thin or universal, 32 or 64 bits — is also checked against one code requirement,
+`codesign --verify --strict -R='anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6]
+exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate
+leaf[subject.OU] = "3MU9H2V9Y9"'`: a Developer ID Application certificate of the pinned team,
+through Apple's Developer ID intermediate, anchored at Apple's root. Its exit code is the whole
+answer — no output is read, so nothing a file's name prints can pass for a team — and the team is
+taken only from the agent's table, in its own form (ten capitals and digits). An ad-hoc signature,
+a certificate anyone made, and Apple's own programs all fail it. Archives unpack only into their
+own directory (no absolute paths, `..`, links out, or control characters in a name); no install
+script runs.
+
+**Never past the owner's free-disk floor.** Before anything of a version is fetched, it must fit
+on the engines' volume and leave `min_free_disk_gb` free: an archive counts four times its size —
+itself, kept until the version is whole, and what it unpacks to, up to three times it — and a
+build from source 2 GB, an estimate (its source, its build tree, about a gigabyte for CUDA's
+kernels, and cmake from PyPI). Otherwise the version is refused, `error` saying the sizes, and
+tried again after five minutes. A source build reads the tag's commit from the
+repository and fetches the archive of that commit, with `cmake` from PyPI's official wheels where
+the machine has none, at low priority.
+
+**Versions side by side** (D153). Each version lives in its own directory under the engines
+directory — `~/Library/Application Support/gpm/engines/<engine>/<port>/<version>` on macOS,
+`~/.local/share/gpm/engines/…` on Linux, `%LOCALAPPDATA%\gpm\engines\…` on Windows — beside the
+agent's record of which is running, which is staged and which came before, and of the server it
+started. By the engine URL's port, so two agents on one machine (two Ollamas, or two whisper.cpp
+servers, one build each) never share a record nor remove a version the other runs. The running
+version and the previous one are kept; older ones are removed. *Set engine version* names the
+version wanted; the agent resolves `latest` from the repository at most every six hours, stages a
+newer version in the background while the engine keeps serving, and switches only when asked to.
+One request is looked at at a time, so two at once never start two jobs. Switching stops the
+running server, starts the staged one and waits for it to answer; a server that does not answer
+is stopped and the previous started again, at once. A server that cannot be stopped — an error
+from the system — is a switch that did not happen: said in `error`, the new version left staged,
+and the one before started again if it stopped after all; a restart that cannot stop it says so
+too. A restart takes the version to start only once nothing else can start or stop the server,
+so one that waited for a switch starts what the switch left running.
+
+**Forward, and back one step** (T35). A version older than the one running is refused — `409
+older_than_running`, the reason also in `error` — unless it is the previous one, which is a
+rollback. A `latest` older than the one running (a release withdrawn, or a version asked for by
+name that is newer) is ignored, and `error` says so. Versions are compared by their numbers, part
+by part (`0.9.0` before `0.10.0`), a pre-release before its release.
+
+**whisper.cpp's build** (macOS, Linux) runs `cmake` configure and `cmake --build … --target
+whisper-server -j <half the cores>` at low priority (`nice -n 10`), logging to
+`<engines>/whisper-cpp/logs/build.log`, in a work directory removed afterwards; the program must
+then answer `--help`. `cmake` is the machine's, or 4.4.4 from PyPI in a private environment under
+`<engines>/.tools/`, installed with `--require-hashes`. A compiler is required — Xcode's
+command-line tools, or `c++` and `make` — and its absence refuses the version, naming `gpm-agent
+prerequisites`, before anything is fetched. Switching whisper.cpp keeps the model file it was
+serving and starts the new program with it, with the same arguments and uploads directory
+(§2.1), emptied as the server stops and before it starts; with no file held yet, the check is
+`--help`.
+
+The **first** version is started as soon as it is staged — nothing runs to drain. A version that
+fails to start is switched away from at once and not staged again by `latest` until a newer one is
+released; one named explicitly is refused. Files come through the repository's API (`GPM_GITHUB_API`
+names another for tests; a `GITHUB_TOKEN` in the machine's environment is sent only to it), and a
+cut download resumes. Linux's `.tar.zst` archives need Python 3.14 or the `zstandard` package.
+`install_engines` excludes `restart_command` and `engine_env_file` — the agent runs the engine — and
+needs a loopback engine URL with a port; `engines_path` moves the engines directory, and
+`min_free_disk_gb` is the floor installs keep as pulls do.
+
+**Facts** add, under `engine.install`: `allowed`, `engine`, `running`, `staged`, `previous`,
+`latest` and `latest_checked_at`, `wanted`, `working` (`{step, version, done, total}` while
+resolving, downloading, verifying, unpacking, building or switching), `error`, and `signature`
+(`checked` or `not checked`); and `engine.foreign` when an engine the agent did not start holds
+its port.
+
+**Running across reboots** (D154): `gpm-agent init --start-at-login` — or `gpm-agent startup
+add|remove|status` for an agent already set up — makes the agent start with the machine, running
+`<its interpreter> -I -m gpm_agent.cli --config <settings> serve` — on macOS and Linux with only
+the owner's `PATH` copied; on Windows with `pythonw.exe` and `--log-file`, in the logon session's
+own environment, where the engines it starts and the programs it reads facts with (`nvidia-smi`)
+are given no console window:
+
+| | Where | How |
+|---|---|---|
+| macOS | `~/Library/LaunchAgents/<name>.plist` | `launchctl bootstrap gui/<uid>`; `RunAtLoad`, kept alive after a failure, `ProcessType=Interactive` |
+| Linux | `~/.config/systemd/user/<name>.service` | `systemctl --user enable` and `restart`; `Restart=on-failure`, `KillMode=process` (engines outlive an agent restart); lingering checked, and enabled with `sudo` only under `--admin` at a terminal |
+| Windows | a task definition beside the settings | `schtasks /Create /XML` at logon for this user: no time limit, runs on battery, restarted after a failure |
+
+`<name>` follows the settings file, so two agents on one machine get two entries. Nothing else
+holding that name is replaced or stopped — each refused before anything is written: a definition
+for other settings; a launchd job by that label loaded from another file (`launchctl print` names
+the file); a unit by that name that `systemctl --user show -p FragmentPath` finds in another
+directory of the user search path, which ours would take the place of; a task Task Scheduler
+holds for other settings. A task's settings file is read back from Task Scheduler itself
+(`schtasks /Query /XML`), never from the definition beside the settings: its description names
+the file, with a digest of it that survives the console's code page. macOS and Windows start it
+at login, so an unattended machine logs its owner in automatically.
+
+`add` says the agent was *started*, and `startup status` whether it answers on its port; when
+something already answers there before one is set up — a `gpm-agent serve` started by hand — it
+says so, since the agent started with the machine cannot listen until that one stops.
+`init --rotate` starts again an agent set up to start with the machine, so the new key takes at
+once. `startup remove` stops the agent and not its engine servers, which outlive it as they
+outlive any restart of it (D148), and says so: they serve until the machine restarts or the owner
+ends them.
+
+A start from `uvx`'s cache is refused — a `CACHEDIR.TAG` *above* the agent's environment; uv tags
+every environment it makes, the lasting one `uv tool install` makes too, so the environment's own
+directory (the one with `pyvenv.cfg`) is passed over: install it with `uv tool install gpm-agent`.
+`init --prerequisites` (or `gpm-agent prerequisites`) installs what the engine needs and is
+missing — ffmpeg, and for whisper.cpp's build on Linux `c++`, `make` and `cmake` (with
+`python3-venv` on apt, for cmake from PyPI) — with administrator rights only under `--admin` at a
+terminal, and otherwise prints the exact commands; `init` then ends non-zero while anything is
+still needed. The agent never asks for elevation itself, and does not update itself.
+
+**On Windows** a file's permission bits mean nothing to Python and the standard library reads no
+access control list, so the agent trusts a file by where it lives: its settings file, and the
+programs they name for it to run (`engine_binary`, `engines_path`), must lie under the user's
+profile (`%USERPROFILE%`, or `%LOCALAPPDATA%` where it is moved), links followed. Anything
+elsewhere is refused with the reason: a folder made at a drive's root inherits a rule letting
+every signed-in user change what is in it, and so what the agent runs as its owner.
+
 ## 3. What it reports — facts
 
 Read-only, cheap, no privileges: operating system and architecture; accelerators (kind, name,
@@ -248,7 +415,8 @@ silent override in either direction.
 | **Load, pin, or unload a model** | To make `residency` true: `pinned` loads and pins the whole set; `on_demand` leaves loading to the engine |
 | **Report surplus models** | Models on disk that no pool configuration names are *listed*, with sizes |
 | **Delete a model** | Only as an **explicit operator action in the console** — never by the supervisor's own reconciliation, so no configuration change, bug or pass can delete anything. The tag is typed again to confirm; a tag this pool requires on that host is refused; and the agent refuses all deletion when its own configuration says `allow_delete: false`, which the machine's owner sets and the pool cannot change |
-| **Restart the engine, apply engine settings** (parallelism, keep-alive, models held at once) | Only through a command the **operator wrote into the agent's own configuration on that host**. The pool can ask for it to be run; it cannot say what it is |
+| **Restart the engine, apply engine settings** (parallelism, keep-alive, models held at once) | Only through a command the **operator wrote into the agent's own configuration on that host** — or, for an engine the agent runs itself (§2.3), by restarting its own process with the pool's numbers. The pool can ask for it to be run; it cannot say what it is |
+| **Install an engine, and switch its version** (§2.3) | Only where the machine's owner set `install_engines: true`. An engine name from the agent's own list and a version — never a URL, path or command; only from the engine's official repository, each file checked against its published digest and, where the platform has one, its pinned signature. Switched only when the pool asks, after draining the host; the previous version kept for going back |
 
 | May not, ever | |
 |---|---|
@@ -268,8 +436,10 @@ refuses app and admin keys by name, and the control API and router refuse an age
 
 ```sh
 # on the host
-uvx gpm-agent init          # mints the key, prints it once, stores only its hash (0600)
-uvx gpm-agent serve         # loopback by default
+uv tool install gpm-agent   # a lasting install; a start at login is refused from uvx's cache
+gpm-agent init              # mints the key, prints it once, stores only its hash (0600 on
+                            # macOS and Linux; on Windows, only under the user's profile, §2.3)
+gpm-agent serve             # loopback by default
 ```
 
 The operator adds the host in the console with its agent address; the key goes where every
@@ -301,7 +471,7 @@ today. The console says the agent is unreachable; nothing is inferred from its s
 
 ## 7. The protocol
 
-Four verbs, all under `/agent/v1`, all behind the agent key. The list is closed, and a test
+Six verbs, all under `/agent/v1`, all behind the agent key. The list is closed, and a test
 fails until it is edited on purpose to admit another.
 
 | Verb | Body | Does |
@@ -310,7 +480,8 @@ fails until it is edited on purpose to admit another.
 | `PUT /models` | `{tags, residency}` — the **whole** desired state | Starts working toward it in the background, one pull at a time, and answers at once with where each tag stands (on disk, loaded, pulling with bytes, last error), free disk, the owner's floor, and the surplus. A tag that failed is left alone for a minute, not retried every pass |
 | `DELETE /models` | `{tag}` | §4's deletion, inside its bounds |
 | `POST /heartbeat` | — | Touches the dead-man timer's file on a host the pool created (D63). No body, and no other bound: it can only *postpone* a shutdown the pool could equally cause by going silent. A machine nobody rented carries no timer, and the verb says so |
-| `POST /engine` | `{settings}` — `null`, or `{workers, models_held, context?, cards_per_copy?}` as bounded whole numbers; `cards_per_copy` is 1, 2, 4 or 8, and refused for an engine that cannot split a model (D114) | Writes the engine's start-up environment to the file the owner named, if it changed; runs the owner's restart command; waits for the engine to answer; reports the exit code, the tail of the output, and whether the engine came back |
+| `PUT /engine/version` | `{version, switch}` and nothing else — `version` is `latest` or a version in the engine's own form; `switch` is a boolean (D151) | Works toward that version in the background — resolving, fetching or building, checking, staging — and answers **at once**, even to a switch, with `engine.install` (§2.3). `switch: true` starts the staged version, or the previous one when that is the version named — a rollback — in the background. Refused: `403 installs_not_allowed` unless the owner set `install_engines: true`; `409 busy` (a switch running), `not_staged`, `foreign_engine` (an engine it did not start holds the port), `older_than_running` (older than the version running, and not the one before it); `400` for anything else in the body |
+| `POST /engine` | `{settings}` — `null`, or `{workers, models_held, context?, cards_per_copy?}` as bounded whole numbers; `cards_per_copy` is 1, 2, 4 or 8, and refused for an engine that cannot split a model (D114) | Writes the engine's start-up environment to the file the owner named, if it changed; runs the owner's restart command; waits for the engine to answer; reports the exit code, the tail of the output, and whether the engine came back — or, for an engine the agent runs itself (§2.3), stores the numbers beside its versions and restarts its own server with them |
 
 A tag travels in a body, never a path, and must be a plain model tag — a name, optionally
 namespaced and versioned. Anything with a scheme, a space, `..` or a leading dash is refused

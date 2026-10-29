@@ -128,6 +128,37 @@ Every pass (default 15 s):
 
 `gpm plan` prints what the supervisor would do and spends nothing.
 
+### 3.1 Upgrading an engine the agent installed (S9, D153)
+
+For a configured host whose agent installs its engine (`engine.install.allowed` in its facts), the
+pass sends the host's `engine_version` — `latest` unless pinned — with each agent call, and the
+agent stages a newer version while the host serves; each version staged, and each error the agent
+reports, is an event once. The target is the staged version on `latest`; with a pinned version it
+is that version alone, once the agent has it on disk (staged or kept as the previous one) — a pin
+both holds a host back and brings it back, and *Roll back* is refused on a pinned host.
+
+When there is a target, the pass waits for the host to have nothing in flight and to have started
+no request for `pool.engine_upgrade_idle_s` (600 s) — counted from the supervisor's start when the
+router has seen none — or for an operator's *Upgrade now*; then it takes the host out of routing
+(`preparing`: *upgrading Ollama 0.40.11 → 0.40.12*), waits for its requests in flight to end, up
+to `pool.engine_upgrade_drain_s` (300 s; after that it puts the host back and tries at the next
+quiet moment), and asks the agent to switch — a switch the agent carries out in the background, so
+the pass never waits on it. Within `pool.engine_upgrade_check_s` (600 s) the engine must answer and
+the host hold what it held before of its own model set — its resident set when pinned, the models
+on its disk when on demand; a model loaded by hand is not counted. Otherwise the version is
+recorded as one this host does not take again (a newer release is tried as usual), and the host
+stays out of routing while the pass asks the agent for the previous version, again on each pass,
+until it runs — or, after five minutes, says it could not be brought back.
+
+One host upgrades at a time, except where an operator asked. A host that leaves the pool, is taken
+out of service or loses its agent drops what was in progress for it; one whose agent stops
+answering about its versions ends a drain at once and any later step once its window passes, so a
+host that serves is never kept out of routing for good. An operator's ask while one is pending or
+an upgrade is running is refused. What is in progress is held in the supervisor's memory: a restart
+mid-upgrade leaves the version that runs unchecked, and the host is then judged as any other —
+ready when it holds its model set — with *Roll back* from the console. Every step is an event:
+staged, draining, switching, switched, upgraded, rolling back, rolled back, put off, abandoned.
+
 ## 4. Cost controls
 
 Ordered by value — idle time, not the hourly rate, dominates cost.

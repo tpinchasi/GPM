@@ -23,6 +23,7 @@ from pathlib import Path
 import httpx
 import pytest
 from gpm_agent import cli, modelhub, whisper_cpp
+from gpm_agent import platform as host_platform
 from gpm_agent.engines import EngineRefused, engine_facts
 from gpm_agent.models import ModelWork, Refused
 from gpm_agent.settings import Settings, SettingsError, load
@@ -628,7 +629,7 @@ async def test_a_wrapper_script_and_the_server_it_runs_are_stopped_together(mach
         assert server != wrapper.pid, "the server is the wrapper's child"
         await machine.engine.hold(client, TAG, pinned=False)
         assert wrapper.poll() is not None
-        await wait_until(lambda: not whisper_cpp._pid_alive(server))
+        await wait_until(lambda: not host_platform.alive(server))
         assert (await machine.engine.describe(client))["answers"] is False
 
 

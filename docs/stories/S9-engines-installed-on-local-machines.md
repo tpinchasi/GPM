@@ -1,8 +1,8 @@
 # S9 — Engines installed and kept current on the machines the pool manages
 
-> Status: **proposed** (2026-10-26) — the owner's requirement, a first design and open questions;
-> nothing decided. Part of the [feature list](README.md). Follows S8, which needs Ollama and
-> whisper.cpp on local machines and, until this story, leaves installing them to the owner.
+> Status: **built** (2026-10-26) — D150–D154; stages 1–3 done, the laptop (stage 4) next, asked first. Part of the [feature list](README.md).
+> Follows S8, which needs Ollama and whisper.cpp on local machines and, until this story, leaves
+> installing them to the owner.
 
 ## The story
 
@@ -21,53 +21,61 @@ the machine runs. The engines are infrastructure, like the pool's own processes.
 - **Rented hosts already work this way**: the engine arrives with the image, and the agent runs
   it (D63, D97). Machines the operator owns have no equivalent.
 
-## A first design
+## The owner's answers (2026-10-26)
 
-1. **The host's agent installs, never the pool directly.** The agent already runs on the machine,
-   as the owner's user, and already fetches models and restarts engines. A new verb, *install
-   engine*, takes an engine name from the agent's own closed list and a version — a validated
-   string, or `latest` — and never a URL, a path or a command: the agent maps them to that
-   engine's **official release for its operating system and architecture** from a table built
-   into the agent. Adding the verb is a decision (D40).
-2. **Nothing runs unverified.** The release's published digest is checked; then the platform's own
-   signature — on macOS notarization and the developer team pinned in the agent, on Windows the
-   Authenticode publisher pinned likewise, on Linux the checksum and a signature where one is
-   published. Never a piped install script. The version before is kept for a rollback.
-3. **User-level installs, no administrator rights**, where each platform allows: a user-owned
-   applications folder, a prefix under the home directory, a per-user service.
-4. **The version is configuration**: per host, a pinned `engine_version`, or `latest` to follow
-   releases. An upgrade waits until the host is idle and drained, and rolls back by itself if the
-   engine then fails its health check or no longer holds its model set as before — the check
-   that would have caught the Ollama update that split the first adopter's two models. The plan
-   says what will be installed, and how large, before Apply.
-5. **The console** shows each host's installed and wanted version, with Upgrade and Roll back.
-6. **The agent itself** needs a way onto the machine and a way to stay running across reboots —
-   a per-user launch agent, systemd user unit or Windows service — which `gpm-agent init` could
-   set up. Today the agent assumes a POSIX machine (its engine restart is a shell script), so
-   Windows is new for it as well as for the engines.
+1. **Versions follow the latest release, automatically, with rollback.**
+2. **whisper.cpp: built by GPM.** First answered "Homebrew, else built from source"; then, told
+   that Homebrew's build links Homebrew's shared `ggml` — which moves with other formulas, so a
+   version kept on disk cannot be gone back to — the owner chose GPM's own build.
+3. **Windows, Linux and macOS, all in the first build.**
+4. **Administrator rights where a platform needs them.**
+5. **Ollama on a Mac runs headless**, started by the agent — not the app, whose own updater
+   would compete with the pool's version. The app is quit and removed from login items once.
 
-## What each platform needs — to be verified before deciding
+## Design
 
-| | macOS | Linux | Windows |
-|---|---|---|---|
-| **Ollama** | The notarized app archive from its GitHub release (checked by hand 2026-10-26: digest published, team `3MU9H2V9Y9`) into the user's Applications folder | The release tarball for the architecture and GPU (CUDA, ROCm) into a user prefix, run as a user service | The release's installer or archive, per-user — *unverified* |
-| **whisper.cpp** | Homebrew's build, if Homebrew is there; otherwise a build from source (Xcode's command-line tools) — *no official macOS binary found yet* | A build from source with the GPU's backend (CUDA, Vulkan), or release binaries if published — *unverified* | Release archives with CPU and CUDA builds — *unverified* |
-| **ffmpeg** (for whisper.cpp's `--convert`) | Homebrew | The distribution's package, or a static build | A static build — *unverified* |
-| **Keeping the agent running** | A launch agent | A systemd user unit | A service or scheduled task — *new* |
+Decided in D150–D154 and specified in [host-agent.md](../spec/host-agent.md) §2.3 and §7,
+[supervisor.md](../spec/supervisor.md) §3.1, [hosts-routing-capacity.md](../spec/hosts-routing-capacity.md)
+§4 and the console's Hosts screen. In short:
 
-## Questions for the owner
+- **The agent installs, runs and upgrades** the engine it manages, on a machine whose owner set
+  `install_engines: true` (D150). It runs `ollama serve` itself, as it runs whisper.cpp's server,
+  and never stops a program it did not start.
+- **One new verb, *set engine version*** — `latest` or a version, and whether to switch now (D151).
+- **Official sources only, checked** (D152): Ollama's release archives by platform (the headless
+  macOS one signed by team `3MU9H2V9Y9`); whisper.cpp built from its tag's source on macOS and
+  Linux, its release archives on Windows; ffmpeg from the platform's package manager at `init`.
+  Digests always; signatures pinned where published; no install scripts.
+- **Side by side, staged, drained, checked, rolled back** (D153): a new version is staged while
+  the host serves, switched only when the host is idle and drained, kept only if the engine
+  answers and holds the model set as before.
+- **All three operating systems; elevation only at `init`** (D154).
 
-1. **Version policy by default**: pinned, upgraded from the console — or `latest`, followed
-   automatically with the rollback check?
-2. **whisper.cpp where no official binary exists** (macOS at least): rely on Homebrew where
-   present, build from source on the machine, or publish GPM's own signed builds?
-3. **Windows**: in the first build, or macOS and Linux first with Windows after?
-4. **Administrator rights**: never (recommended — user-level only), or allowed where a platform
-   needs them?
+## Build stages
+
+1. **Decisions and specification** — done 2026-10-26: D150–D154, the agent's §2.3 and verb, the
+   supervisor's upgrade pass, configuration, console, threat model T35.
+2. **The agent** — built and tested against fakes 2026-10-26 (whisper.cpp's build also run for real
+   on the first adopter's laptop, into a scratch directory): the platform layer (paths, processes, starting with the machine) for all three;
+   the installer (the release table, resolving `latest`, download with resume, digests, macOS
+   signatures, safe unpacking, versions side by side, switching and going back); Ollama run by
+   the agent; whisper.cpp built from source and from Windows archives; ffmpeg at `init`; the verb
+   and facts — against a fake repository and fake programs.
+3. **The pool** — built and tested 2026-10-26: `engine_version`, the idle wait, the drain, the switch, the check and the
+   rollback; plan and events; the console's versions with *Upgrade now* and *Roll back*.
+4. **On the first adopter's laptop**, asked first: the app quit, the headless Ollama installed and
+   switched to, the laptop's whisper.cpp built and run by its own agent.
+
+## Unverified
+
+In [decisions.md](../decisions.md): the headless macOS archive serving the laptop's MLX builds;
+Ollama's Windows signatures; whisper.cpp's builds on Linux and its archives on Windows; the agent's
+scheduled task on Windows (registration as a standard user, restart after a crash — Task
+Scheduler's `RestartOnFailure` is commonly reported to act only when a task fails to launch);
+lingering on Linux; AMD cards. whisper.cpp's static Metal build with PyPI's `cmake` is verified.
 
 ## What it touches
 
-The agent's closed verb list (a new verb, D40), the agent's install footprint and its platform
-support, the threat model (the agent downloads and runs programs: a supply-chain entry), the
-configuration (`engine_version`), the plan, and the console's Hosts screen. It changes nothing on
-the request path.
+The agent's closed verb list (D151), its platform support and install footprint, the threat model
+(T35), the configuration (`engine_version`, `install_engines`), the supervisor's pass, the plan,
+and the console's Hosts screen. Nothing on the request path.

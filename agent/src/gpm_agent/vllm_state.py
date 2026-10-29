@@ -15,6 +15,8 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
+from . import platform as host_platform
+
 #: Written by the launcher on every start: process, port and log per model, or why nothing was
 #: started.
 STARTED_FILE = ".gpm-vllm.started.json"
@@ -72,11 +74,9 @@ def failed_engines(models_dir: Path, served: Sequence[str],
     def is_alive(pid: int) -> bool:
         if alive is not None:
             return alive(pid)
-        try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
+        # Asked of the system the way it answers safely: on Windows `os.kill(pid, 0)` would end
+        # the process rather than look at it (`platform.alive`).
+        return host_platform.alive(pid)
 
     failed: dict[str, str] = {}
     for engine in record.get("engines") or []:
