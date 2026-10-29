@@ -426,7 +426,7 @@ def held_comes_to(pool, size, timeout=5.0):
 
 def test_an_upload_still_arriving_holds_the_length_it_declared():
     body = padded_chat(8_000)
-    with gpu_pool(max_held_request_mb=0.01) as pool, pool.client() as client:
+    with gpu_pool(max_request_mb=0.01, max_held_request_mb=0.01) as pool, pool.client() as client:
         slow = send_partly(pool, body, sent=100)
         try:
             held_comes_to(pool, 8_000)
@@ -442,7 +442,7 @@ def test_an_upload_still_arriving_holds_the_length_it_declared():
 
 def test_an_upload_sent_in_chunks_is_counted_as_it_arrives():
     body = padded_chat(9_000)
-    with gpu_pool(max_held_request_mb=0.01) as pool, pool.client() as client:
+    with gpu_pool(max_request_mb=0.01, max_held_request_mb=0.01) as pool, pool.client() as client:
         slow = send_partly(pool, body, sent=6_000, chunked=True)
         try:
             held_comes_to(pool, 6_000)
