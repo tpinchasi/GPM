@@ -18,13 +18,18 @@ What keeps an install inside the agent's bounds (T35):
   else: wheels only (`--only-binary :all:`), so no build script runs; nothing they depend on
   beyond the list (`--no-deps`); every file checked against the sha256 the set records
   (`--require-hashes`), so a file replaced on PyPI, or on the way, refuses the version. pip runs
-  isolated from the owner's configuration (`-I`, `--isolated`), with the agent's short list of
-  environment names (`platform.program_environment`), at low priority.
+  isolated from the owner's configuration — `-I` and `--isolated`, which leave out pip's
+  environment variables and the user's own file, and `PIP_CONFIG_FILE` set to the null device,
+  which leaves out every other file (`/etc/pip.conf`, `/etc/xdg/pip/pip.conf`, the environment's
+  own) — with the agent's short list of environment names (`platform.program_environment`), at
+  low priority. An index address carrying a user name or password is refused: the command pip
+  runs is written to the install log.
 - **Refused before anything is fetched** where the machine cannot run it: not Linux, a processor
-  or Python with no set, a C library older than the set's wheels need, no NVIDIA card of compute
-  capability 7.5 or higher, or a driver below the set's floor — and where the engines' volume has
-  no room for it above the owner's floor.
-- **Kept only if it runs**: the version's own `vllm --version` must answer with the version.
+  or Python with no set (a free-threaded Python among them), a C library older than the set's
+  wheels need, no NVIDIA card of compute capability 7.5 or higher, or a driver below the set's
+  floor — and where the engines' volume has no room for it above the owner's floor.
+- **Kept only if it runs**: the version's own `vllm --version` must answer with the version, and
+  its first lines must name the interpreter of the environment where the version will live.
 """
 
 from __future__ import annotations
@@ -36,6 +41,8 @@ import os
 import re
 import shutil
 import sys
+import sysconfig
+import urllib.parse
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Optional, Sequence
 
@@ -124,6 +131,21 @@ def machine_can_run(
         reasons.append(f"vLLM runs on Linux only, and this machine runs {os_name}")
     if arch not in PLATFORMS:
         reasons.append(f"vLLM publishes no build for the {arch or 'unknown'} processor")
+    return reasons + card_reasons(accelerators, minimum=minimum, driver_floor=driver_floor)
+
+
+def card_reasons(
+    accelerators: Iterable[Mapping[str, Any]],
+    *,
+    minimum: tuple[int, int] = MIN_CAPABILITY,
+    driver_floor: Optional[str] = None,
+) -> list[str]:
+    """Every reason this machine's cards cannot run vLLM, in words — none where they can: no
+    NVIDIA card, a card below `minimum` or whose compute capability could not be read, and where
+    `driver_floor` is given, a driver below it. Every card counts, whichever the owner lets vLLM
+    use (`CUDA_VISIBLE_DEVICES`)."""
+    reasons: list[str] = []
+    accelerators = list(accelerators)
     cards = [a for a in accelerators if a.get("kind") == "cuda"]
     if not cards:
         others = sorted({str(a.get("kind")) for a in accelerators if a.get("kind")})
@@ -176,18 +198,26 @@ def newest_driver_floor(python: str, platform: str, sets: Optional[Sequence[Lock
 #: environment, never the pool's word, as `GPM_GITHUB_API` is for GitHub. A value that is not an
 #: http(s) address names a directory of wheels, read with no index at all (`--no-index
 #: --find-links`). Wherever the files come from, each must match the digest its set records.
+#: A directory must hold the set's own wheels and no other build of the same release: pip
+#: chooses among a directory's files by their tags before it checks a digest, so a better-tagged
+#: wheel beside the one a set names refuses the version. An index lists each file with its digest,
+#: and pip chooses only among the files the set names. An address with a user name or password is
+#: refused: the command pip runs, and so the address, is written to the install log.
 DEFAULT_INDEX = "https://pypi.org/simple"
 INDEX_ENV = "GPM_PYPI_INDEX"
 
 #: How much room a version asks for on the engines' volume, as a multiple of its wheels' size.
-#: pip fetches one wheel at a time into a work directory beside the versions and installs it at
-#: once, keeping no cache (`--no-cache-dir`), so what is written is the environment itself, the
-#: `.pyc` pip compiles beside each Python file, and the one wheel in flight. vLLM 0.32.0's sets,
-#: read from each wheel's own listing of its files: 4.02 GB of wheels unpack to 8.51 GB on
-#: x86_64 (2.1 times), 0.40 GB of it Python source, the largest wheel 0.53 GB — about 2.35 times
-#: at the most, which three times covers with a quarter to spare as sets grow. Until a real
-#: install measures one, an estimate (decisions.md, Unverified assumptions).
-UNPACKED_MARGIN = 3
+#: pip, under `--require-hashes`, downloads every wheel of the set into its temporary directory —
+#: `TMPDIR`, a work directory beside the versions — while it resolves, before it installs any,
+#: and keeps them all until it exits; it keeps no cache (`--no-cache-dir`). So at the most the
+#: volume holds every wheel, the environment they unpack to, and the `.pyc` pip compiles beside
+#: each Python file. vLLM 0.32.0's sets, read from each wheel's own listing of its files: 4.02 GB
+#: of wheels unpack to 8.51 GB on x86_64, 0.40 GB of it Python source, whose `.pyc` take about as
+#: much again — some 12.9 GB, 3.2 times the wheels (3.1 on aarch64: 4.07 GB to 8.18 GB). Four
+#: times leaves about three-quarters of the wheels' size to spare — 3 GB at 0.32.0 — as sets grow,
+#: and is what an archive counts (`installs.UNPACK_MARGIN`). Until a real install measures one,
+#: an estimate (decisions.md, Unverified assumptions).
+UNPACKED_MARGIN = 4
 
 #: Making the environment: seconds (ensurepip installs pip into it from the wheel Python carries).
 VENV_TIMEOUT_S = 10 * 60.0
@@ -228,8 +258,18 @@ def _installs() -> Any:
 
 
 def this_python() -> str:
-    """The agent's own Python minor version ("3.12"): every environment is made with it."""
-    return f"{sys.version_info.major}.{sys.version_info.minor}"
+    """The agent's own Python minor version ("3.12"): every environment is made with it, and a set
+    must be for it. A free-threaded build is "3.13t": its extension modules are built for another
+    ABI (`cp313t`), and every set's wheels for the regular one, so no set is for it."""
+    free_threaded = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+    return f"{sys.version_info.major}.{sys.version_info.minor}" + ("t" if free_threaded else "")
+
+
+def python_named(python: str) -> str:
+    """A Python minor version as the owner is told it, saying what a free-threaded one's `t` is."""
+    if python.endswith("t"):
+        return f"Python {python} (free-threaded, which vLLM's wheels are not built for)"
+    return f"Python {python}"
 
 
 def machine_glibc() -> Optional[str]:
@@ -254,6 +294,15 @@ def nvidia_cards() -> Optional[list[dict[str, Any]]]:
 def index_arguments(environ: Mapping[str, str]) -> list[str]:
     """Where pip fetches the wheels from: PyPI, or what the owner's environment names instead."""
     named = (environ.get(INDEX_ENV) or "").strip() or DEFAULT_INDEX
+    netloc = urllib.parse.urlsplit(named).netloc
+    if "@" in netloc:
+        # Said without the credential: this refusal reaches the facts, and the pool's console.
+        shown = named.replace(netloc, netloc.rpartition("@")[2], 1)
+        raise _installs().InstallRefused(
+            f"{INDEX_ENV} names an index with a user name or password in its address ({shown}): the agent "
+            "writes each command it runs to its install log, so the credential would be kept there in plain "
+            "text; name an index that needs none, such as a mirror on this machine or its network"
+        )
     if named.startswith(("https://", "http://")):
         return ["--index-url", named]
     directory = Path(named)
@@ -269,10 +318,18 @@ def venv_argv(python: str, venv: Path) -> list[str]:
     return [python, "-I", "-m", "venv", str(venv)]
 
 
+#: What pip is given beside the agent's short list of names: the null device for its
+#: configuration file, which makes pip read no configuration file at all — not the machine's
+#: (`/etc/pip.conf`, `/etc/xdg/pip/pip.conf`) nor the environment's own `pip.conf`, which
+#: `--isolated` still reads (pip's `Configuration._load_config_files`). ensurepip does the same.
+PIP_SETTINGS = {"PIP_CONFIG_FILE": os.devnull}
+
+
 def pip_argv(venv: Path, requirements: Path, index: Sequence[str]) -> list[str]:
     """pip, in the version's environment, installing exactly the set: wheels only, so no build
     script runs; nothing beyond the list; every file checked against the digest it records; none
-    of the owner's pip configuration (`--isolated`), and no cache left behind."""
+    of the owner's pip settings (`--isolated`, and `PIP_SETTINGS` in its environment), and no
+    cache left behind."""
     return [
         str(venv / "bin" / "python"), "-I", "-m", "pip", "install", "--isolated",
         "--require-hashes", "--only-binary=:all:", "--no-deps", "--no-input",
@@ -312,6 +369,8 @@ def move_environment(venv: Path, to: Path) -> None:
     if venv == to:
         return
     old, new = os.fsencode(str(venv)), os.fsencode(str(to))
+    # Both as Python names its own interpreter, and so as pip writes it: absolute, with no `..`.
+    old, new = os.path.abspath(old), os.path.abspath(new)
     for path in [*sorted((venv / "bin").iterdir()), venv / "pyvenv.cfg"]:
         if path.is_symlink() or not path.is_file():
             continue
@@ -327,6 +386,25 @@ def move_environment(venv: Path, to: Path) -> None:
             changed = data.replace(old, new)
         if changed != data:
             path.write_bytes(changed)
+
+
+#: The second line of pip's form for a long interpreter path: `'''exec' <python> "$0" "$@"`, the
+#: path in double quotes where it holds a space.
+_SH_EXEC = re.compile(rb"""'''exec' ("[^"]*"|\S+) "\$0" "\$@"$""")
+
+
+def interpreter_named(program: Path) -> Optional[bytes]:
+    """The interpreter a script pip wrote names in its first lines — `#!<python>`, or `#!/bin/sh`
+    and a line running `<python>` — or None where it names none this reads."""
+    with Path(program).open("rb") as handle:
+        lines = _head(handle.read(64 * 1024))[0].split(b"\n")
+    if not lines[0].startswith(b"#!"):
+        return None
+    first = lines[0][2:].strip()
+    if first != b"/bin/sh":
+        return first
+    found = _SH_EXEC.match(lines[1].rstrip()) if len(lines) > 1 else None
+    return found.group(1).strip(b'"') if found else None
 
 
 def _says_version(output: str, version: str) -> bool:
@@ -396,7 +474,7 @@ class VllmSource:
     def _no_set(self, version: Optional[str]) -> str:
         """Why there is no set to install, in words for the machine's owner."""
         carried = list(load_sets() if self.sets is None else self.sets)
-        here = f"Python {self.python} on {self.processor}"
+        here = f"{python_named(self.python)} on {self.processor}"
         if version is not None and any(s.vllm == version for s in carried):
             others = sorted({f"Python {s.python} on {s.platform}" for s in carried if s.vllm == version})
             return f"vLLM {version} has no locked set for {here}, only for {', '.join(others)}"
@@ -480,18 +558,22 @@ class VllmSource:
                 "at a terminal here says what the machine needs"
             )
         index = index_arguments(os.environ if self.environ is None else self.environ)
-        if room is not None:
-            room(locked.size_bytes * UNPACKED_MARGIN, (
-                f"its locked set's wheels, {installs.size_words(locked.size_bytes)}, installed at up to "
-                f"{UNPACKED_MARGIN} times that"
-            ))
 
+        # As Python names its own interpreter, and so as pip writes it in each program's first
+        # line: absolute, with no `..` — or the environment would not be found in them to move.
+        into = Path(os.path.abspath(into))
         # Where the version will live once whole: the installer renames `<version>.partial` into
         # place, and the environment must name that place, not this one.
         final = into.with_name(into.name[: -len(installs.PARTIAL)]) if into.name.endswith(installs.PARTIAL) else into
         engine_dir = into.parent
         work = engine_dir / WORK
-        await asyncio.to_thread(shutil.rmtree, work, True)  # an install stopped half-way
+        # An install stopped half-way left its wheels here: gone before the room is asked for.
+        await asyncio.to_thread(shutil.rmtree, work, True)
+        if room is not None:
+            room(locked.size_bytes * UNPACKED_MARGIN, (
+                f"its locked set's wheels, {installs.size_words(locked.size_bytes)}, held while they install, "
+                f"and the environment they make: up to {UNPACKED_MARGIN} times that"
+            ))
         work.mkdir(mode=0o700, parents=True)
         log = engine_dir / "logs" / INSTALL_LOG
         log.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -512,7 +594,8 @@ class VllmSource:
             requirements = into / REQUIREMENTS
             requirements.write_text(locked.requirements)
             installed = await self.run(
-                pip_argv(venv, requirements, index), env=host_platform.program_environment({"TMPDIR": str(work)}),
+                pip_argv(venv, requirements, index),
+                env=host_platform.program_environment({"TMPDIR": str(work), **PIP_SETTINGS}),
                 timeout_s=INSTALL_TIMEOUT_S, low_priority=True, log=log,
             )
             if installed.code != 0:
@@ -529,6 +612,15 @@ class VllmSource:
         if not program_in(into).is_file():
             raise refused(f"vLLM {version}'s locked set installed no `vllm` program")
         await asyncio.to_thread(move_environment, venv, final / VENV)
+        # The check below runs the program with the environment's interpreter, as a script, so
+        # it would pass whatever the first line names: that line is what the launcher runs by.
+        named = await asyncio.to_thread(interpreter_named, program_in(into))
+        if named != os.fsencode(str(final / VENV / "bin" / "python")):
+            said = os.fsdecode(named) if named is not None else "no interpreter"
+            raise refused(
+                f"vLLM {version}, installed, has a `vllm` that names {said} to run it, not the interpreter of "
+                f"the environment it will live in ({final / VENV / 'bin' / 'python'}); nothing of it is kept"
+            )
         checked = await self.run(
             check_argv(venv), env=host_platform.program_environment({}), timeout_s=CHECK_TIMEOUT_S, log=log,
         )

@@ -13,18 +13,22 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import http.server
 import importlib.machinery
 import importlib.util
 import json
 import os
+import socketserver
 import subprocess
 import sys
+import threading
 import zipfile
 from pathlib import Path
 from typing import Optional
 
 import pytest
 from gpm_agent import installs, vllm_install
+from gpm_agent import platform as host_platform
 from gpm_agent.installs import Installer, InstallRefused, Target
 from gpm_agent.platform import LINUX, MACOS, WINDOWS, Ran
 from gpm_agent.vllm_install import LockedSet, VllmSource
@@ -104,6 +108,25 @@ async def test_a_machine_vllm_publishes_nothing_for_is_refused_at_every_step(tar
             await step
 
 
+async def test_a_free_threaded_python_is_one_no_set_is_for(monkeypatch):
+    """A free-threaded build loads only extensions built for its own ABI (`cp313t`); every set's
+    wheels are built for the regular one. So it is named apart — "3.13t" — and no set matches it,
+    where taking it for "3.13" would install a set that cannot be imported."""
+    regular = f"{sys.version_info.major}.{sys.version_info.minor}"
+    sets = [locked(python=regular)]
+    monkeypatch.setattr(vllm_install.sysconfig, "get_config_var", lambda name: 1 if name == "Py_GIL_DISABLED" else None)
+    assert vllm_install.this_python() == f"{regular}t"
+    assert vllm_install.sets_for(vllm_install.this_python(), "x86_64", sets) == []
+    assert vllm_install.newest_driver_floor(vllm_install.this_python(), "x86_64", sets) is None
+    with pytest.raises(InstallRefused) as refused:
+        await VllmSource(LINUX_X86, sets=sets, cards=lambda: [AMPERE], glibc=lambda: "2.35", run=never_run, environ={}).latest(None)
+    assert str(refused.value).startswith(
+        f"this agent carries no vLLM set for Python {regular}t (free-threaded, which vLLM's wheels are not built for) on x86_64"
+    )
+    monkeypatch.setattr(vllm_install.sysconfig, "get_config_var", lambda name: 0 if name == "Py_GIL_DISABLED" else None)
+    assert vllm_install.this_python() == regular
+
+
 def test_the_installer_takes_vllm_from_its_table():
     found = installs.source_for("vllm", LINUX_X86)
     assert isinstance(found, VllmSource) and found.engine == "vllm" and found.signature == "not checked"
@@ -141,7 +164,7 @@ async def test_a_turing_card_runs_vllm_where_the_host_names_it(tmp_path):
     assert vllm_install.machine_can_run([TURING], os_name="Linux", arch="x86_64", minimum=vllm_install.AUTO_MIN_CAPABILITY)
 
 
-async def test_the_room_asked_for_is_three_times_the_sets_wheels_before_anything_runs(tmp_path):
+async def test_the_room_asked_for_is_four_times_the_sets_wheels_before_anything_runs(tmp_path):
     def no_room(needed, what):
         raise InstallRefused(f"no room for {needed}: {what}")
 
@@ -149,7 +172,42 @@ async def test_the_room_asked_for_is_three_times_the_sets_wheels_before_anything
         await source(locked(size=4_015_673_214)).stage(
             None, installs.Release("0.32.0", "v0.32.0", ()), tmp_path / "0.32.0.partial", nothing, no_room,
         )
-    assert str(refused.value) == "no room for 12047019642: its locked set's wheels, 4.0 GB, installed at up to 3 times that"
+    assert str(refused.value) == (
+        "no room for 16062692856: its locked set's wheels, 4.0 GB, held while they install, and the environment "
+        "they make: up to 4 times that"
+    )
+
+
+@pytest.mark.parametrize(("wheels", "unpacked", "source"), [
+    (4.02, 8.51, 0.40),  # vLLM 0.32.0 on x86_64, from each wheel's own listing of its files
+    (4.07, 8.18, 0.40),  # on aarch64
+])
+def test_the_room_holds_every_wheel_beside_the_environment_and_its_pyc(wheels, unpacked, source):
+    """pip holds every wheel of the set while it installs them
+    (`test_pip_holds_every_wheel_of_the_set_before_it_installs_any`), so at its peak the volume
+    holds the wheels, what they unpack to, and the `.pyc` compiled beside each Python file — about
+    as large as the source. What is asked for must cover that, with room to spare as sets grow."""
+    peak = wheels + unpacked + source
+    assert vllm_install.UNPACKED_MARGIN * wheels >= peak * 1.2
+
+
+async def test_an_install_stopped_half_way_leaves_nothing_counted_against_the_room(tmp_path):
+    """The wheels a stopped install left in pip's work directory are gone before the room is
+    asked for: a set's wheels are gigabytes, and would be counted twice."""
+    engine_dir = tmp_path / "vllm" / "8000"
+    (engine_dir / "pip-work" / "pip-unpack-1").mkdir(parents=True)
+    (engine_dir / "pip-work" / "pip-unpack-1" / "torch.whl").write_bytes(b"x" * 1000)
+    seen = []
+
+    def room(needed, what):
+        seen.append((engine_dir / "pip-work").exists())
+        raise InstallRefused("no room")
+
+    with pytest.raises(InstallRefused, match="no room"):
+        await source(locked()).stage(
+            None, installs.Release("0.32.0", "v0.32.0", ()), engine_dir / "0.32.0.partial", nothing, room,
+        )
+    assert seen == [False]
 
 
 async def test_an_index_the_environment_names_must_be_an_address_or_a_directory(tmp_path):
@@ -167,6 +225,29 @@ async def test_an_index_the_environment_names_must_be_an_address_or_a_directory(
         )
 
 
+@pytest.mark.parametrize("named", [
+    "https://owner:notreal@mirror.example/simple",
+    "http://token-notreal@mirror.example:8080/simple",
+    "ftp://owner:notreal@mirror.example/simple",
+])
+async def test_an_index_with_a_credential_in_its_address_is_refused_and_the_credential_never_said(named, tmp_path):
+    """Every command the agent runs is written to the install log, pip's arguments with it: a
+    password in the index's address would be kept there in plain text (CLAUDE.md: no secret in a
+    log). Refused before anything runs — and the refusal, which reaches the pool's console, does
+    not repeat it."""
+    with pytest.raises(InstallRefused) as refused:
+        vllm_install.index_arguments({"GPM_PYPI_INDEX": named})
+    said = str(refused.value)
+    assert said.startswith("GPM_PYPI_INDEX names an index with a user name or password in its address (")
+    assert "notreal" not in said and "mirror.example" in said and "install log" in said
+    engine_dir = tmp_path / "vllm" / "8000"
+    with pytest.raises(InstallRefused, match="user name or password"):
+        await source(locked(), environ={"GPM_PYPI_INDEX": named}).stage(
+            None, installs.Release("0.32.0", "v0.32.0", ()), engine_dir / "0.32.0.partial", nothing, nothing,
+        )
+    assert not (engine_dir / "logs").exists()
+
+
 # --- staging, with the commands stood in for ---
 
 
@@ -174,8 +255,10 @@ class Commands:
     """pip, venv and the check, as the source runs them: each recorded, and each doing what a
     test says — by default making an environment whose `vllm` answers as `says`."""
 
-    def __init__(self, *, venv=0, pip=(0, ""), check=None, says="0.32.0"):
+    def __init__(self, *, venv=0, pip=(0, ""), check=None, says="0.32.0", first_line=None):
         self.venv, self.pip, self.check, self.says = venv, pip, check, says
+        #: The program's first line pip writes — None: the environment's own interpreter.
+        self.first_line = first_line
         self.calls: list[tuple[list[str], dict]] = []
 
     async def __call__(self, argv, **options):
@@ -189,7 +272,7 @@ class Commands:
             code, said = self.pip
             if code == 0:
                 venv = Path(argv[0]).parent.parent
-                (venv / "bin" / "vllm").write_text(f"#!{venv}/bin/python\nimport sys\n")
+                (venv / "bin" / "vllm").write_text(f"{self.first_line or f'#!{venv}/bin/python'}\nimport sys\n")
             return Ran(code, said)
         if argv[-1] == "--version":
             return self.check or Ran(0, f"INFO 10-30 a line of logging\n{self.says}\n")
@@ -235,6 +318,8 @@ async def test_a_version_is_installed_with_exactly_its_set_wheels_only_checked_a
     # none of pip's own settings — the cards' are the owner's and pass.
     assert pip["low_priority"] is True and pip["env"]["TMPDIR"] == str(engine_dir / "pip-work")
     assert "HF_TOKEN" not in pip["env"] and "PIP_INDEX_URL" not in pip["env"] and pip["env"]["CUDA_VISIBLE_DEVICES"] == "0"
+    # No configuration file at all: the machine's and the environment's are read even --isolated.
+    assert pip["env"]["PIP_CONFIG_FILE"] == os.devnull
     assert pip["log"] == engine_dir / "logs" / "install.log" and pip["timeout_s"] == vllm_install.INSTALL_TIMEOUT_S
     assert commands.argv("--version") == [str(venv / "bin" / "python"), "-I", str(venv / "bin" / "vllm"), "--version"]
     assert commands.options("--version")["timeout_s"] == vllm_install.CHECK_TIMEOUT_S
@@ -257,6 +342,10 @@ async def test_a_version_is_installed_with_exactly_its_set_wheels_only_checked_a
      "vLLM 0.32.0, installed, does not run: it did not run to the end"),
     (Commands(says="0.31.0"), "vLLM 0.32.0, installed, says it is another version (exit code 0: 0.31.0)"),
     (Commands(says="0.32.01"), "says it is another version"),
+    # The check runs the program as a script, by its environment's interpreter, and would pass
+    # whatever its first line names — the line the launcher runs it by.
+    (Commands(first_line="#!/usr/bin/python3"), "vLLM 0.32.0, installed, has a `vllm` that names /usr/bin/python3 to run it"),
+    (Commands(first_line="import sys"), "has a `vllm` that names no interpreter to run it"),
 ])
 async def test_a_version_that_does_not_install_or_run_is_refused(commands, says, tmp_path):
     with pytest.raises(InstallRefused) as refused:
@@ -287,6 +376,34 @@ def test_the_environment_is_moved_to_where_the_version_will_live(tmp_path):
     assert (bin_ / "ninja").read_bytes() == b"\x7fELF" + str(made).encode()
     assert os.readlink(bin_ / "python") == sys.executable
     assert (made / "pyvenv.cfg").read_text().endswith(f"-m venv {lives}\n")
+
+
+def test_an_environment_named_through_dotdot_is_moved_as_python_names_it(tmp_path):
+    """Python names its own interpreter absolute with no `..`, and pip writes that name: an
+    environment made under a path holding `..` is found by its normalised name, or not at all."""
+    (tmp_path / "data").mkdir()
+    made = tmp_path / "data" / ".." / "0.32.0.partial" / "venv"
+    lives = tmp_path / "data" / ".." / "0.32.0" / "venv"
+    (made / "bin").mkdir(parents=True)
+    written = os.path.normpath(made)
+    (made / "bin" / "vllm").write_text(f"#!{written}/bin/python\nimport sys\n")
+
+    vllm_install.move_environment(made, lives)
+
+    assert vllm_install.interpreter_named(made / "bin" / "vllm") == os.fsencode(os.path.normpath(lives / "bin" / "python"))
+
+
+@pytest.mark.parametrize(("head", "names"), [
+    ("#!/e/0.32.0/venv/bin/python\n", b"/e/0.32.0/venv/bin/python"),
+    # pip's form for an interpreter path too long for `#!`, or holding a space (quoted).
+    ("#!/bin/sh\n'''exec' /e/0.32.0/venv/bin/python \"$0\" \"$@\"\n' '''\n", b"/e/0.32.0/venv/bin/python"),
+    ("#!/bin/sh\n'''exec' \"/e e/venv/bin/python\" \"$0\" \"$@\"\n' '''\n", b"/e e/venv/bin/python"),
+    ("#!/bin/sh\necho elsewhere\n", None),
+    ("import sys\n", None),
+])
+def test_the_interpreter_a_program_names_is_read_from_its_first_lines(tmp_path, head, names):
+    (tmp_path / "vllm").write_text(f"{head}import sys\n")
+    assert vllm_install.interpreter_named(tmp_path / "vllm") == names
 
 
 # --- with real pip, from a directory of wheels made here ---
@@ -377,6 +494,114 @@ async def test_a_set_installs_with_real_pip_and_its_vllm_runs_from_where_the_ver
     ran = subprocess.run([str(program), "--version"], capture_output=True, text=True, timeout=60, check=False)
     assert (ran.returncode, ran.stdout) == (0, "0.32.0\n")
     assert "Successfully installed" in (engine_dir / "logs" / "install.log").read_text()
+
+
+def a_set_of(directory: Path) -> tuple[str, int]:
+    """The fake release made in `directory`, as a set's requirements and size."""
+    vllm, dep = fake_release(directory)
+    requirements = (
+        f"fakedep==1.0 \\\n    --hash=sha256:{sha256(dep)}\n"
+        f"vllm==0.32.0 \\\n    --hash=sha256:{sha256(vllm)}\n"
+    )
+    return requirements, vllm.stat().st_size + dep.stat().st_size
+
+
+async def test_an_engines_directory_named_through_dotdot_gets_a_vllm_that_runs_where_it_lives(tmp_path):
+    """`engines_path` is absolute, and may hold `..`. pip writes each program's first line with the
+    interpreter's name as Python makes it — with no `..` — so the version is made, moved and
+    checked by that name: its `vllm` runs as the launcher runs it, by its first line."""
+    requirements, size = a_set_of(tmp_path / "wheels")
+    vllm_source = VllmSource(
+        LINUX_X86, sets=[locked(requirements=requirements, size=size)], cards=lambda: [AMPERE], glibc=lambda: "2.35",
+        environ={"GPM_PYPI_INDEX": str(tmp_path / "wheels")},
+    )
+    (tmp_path / "data").mkdir()
+    engine_dir, server = tmp_path / "data" / ".." / "engines" / "vllm" / "8000", Started()
+    installer = Installer(vllm_source, engine_dir, server, free_disk_bytes=lambda: 10**12)  # not this disk's
+    await installer.want("latest", False)
+    await installer.finished()
+
+    assert installer.state()["error"] is None and installer.state()["running"] == "0.32.0"
+    program = engine_dir / "0.32.0" / "venv" / "bin" / "vllm"
+    lives = os.path.normpath(engine_dir / "0.32.0" / "venv" / "bin" / "python")
+    assert program.read_text().splitlines()[0] == f"#!{lives}"
+    ran = subprocess.run([str(program), "--version"], capture_output=True, text=True, timeout=60, check=False)
+    assert (ran.returncode, ran.stdout) == (0, "0.32.0\n")
+
+
+async def test_pip_reads_no_configuration_file_not_even_the_environments_own(tmp_path):
+    """`--isolated` leaves out pip's environment variables and the user's file, but pip still reads
+    the machine's (`/etc/pip.conf`, `/etc/xdg/pip/pip.conf`) and the environment's own `pip.conf`;
+    `PIP_CONFIG_FILE` naming the null device leaves out every one. One the environment carries,
+    asking for a `--user` install — which pip refuses inside an environment — stands for them."""
+    requirements, size = a_set_of(tmp_path / "wheels")
+
+    async def with_a_pip_conf(argv, **options):
+        ran = await host_platform.run_command(argv, **options)
+        if argv[1:4] == ["-I", "-m", "venv"] and ran.code == 0:
+            (Path(argv[4]) / "pip.conf").write_text("[install]\nuser = true\n")
+        return ran
+
+    vllm_source = VllmSource(
+        LINUX_X86, sets=[locked(requirements=requirements, size=size)], cards=lambda: [AMPERE], glibc=lambda: "2.35",
+        environ={"GPM_PYPI_INDEX": str(tmp_path / "wheels")}, run=with_a_pip_conf,
+    )
+    engine_dir = tmp_path / "engines" / "vllm" / "8000"
+    installer = Installer(vllm_source, engine_dir, Started(), free_disk_bytes=lambda: 10**12)  # not this disk's
+    await installer.want("latest", False)
+    await installer.finished()
+    assert installer.state()["error"] is None and installer.state()["running"] == "0.32.0"
+    assert (engine_dir / "0.32.0" / "venv" / "pip.conf").is_file()  # there, and not read
+
+
+async def test_pip_holds_every_wheel_of_the_set_before_it_installs_any(tmp_path):
+    """Why the room asked for counts the wheels beside the environment they make
+    (`UNPACKED_MARGIN`): under `--require-hashes` pip fetches the whole set into its work directory
+    while it resolves, before it installs anything. Served by an index here, as PyPI serves it."""
+    files, simple = tmp_path / "index" / "files", tmp_path / "index" / "simple"
+    files.parent.mkdir()
+    made = [*fake_release(files), *(wheel(files, name, "1.0", {f"{name}/__init__.py": "X = 1\n"}) for name in ("pkga", "pkgb"))]
+    requirements = ""
+    for path in made:
+        name = path.name.split("-")[0]
+        (simple / name).mkdir(parents=True)
+        (simple / name / "index.html").write_text(f'<a href="../../files/{path.name}#sha256={sha256(path)}">{path.name}</a>\n')
+        requirements += f"{name}=={path.name.split('-')[1]} \\\n    --hash=sha256:{sha256(path)}\n"
+    engine_dir = tmp_path / "engines" / "vllm" / "8000"
+    work, venv = engine_dir / "pip-work", engine_dir / "0.32.0.partial" / "venv"
+    seen: list[tuple[str, int, bool]] = []
+
+    class Index(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=str(tmp_path / "index"), **kwargs)
+
+        def do_GET(self):
+            if self.path.endswith(".whl"):
+                held = len(list(work.rglob("*.whl"))) if work.is_dir() else 0
+                installed = [p.name for p in venv.rglob("*.dist-info") if not p.name.startswith("pip-")]
+                seen.append((Path(self.path).name, held, bool(installed)))
+            super().do_GET()
+
+        def log_message(self, *args):
+            pass
+
+    server = socketserver.TCPServer(("127.0.0.1", 0), Index)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        vllm_source = VllmSource(
+            LINUX_X86, sets=[locked(requirements=requirements)], cards=lambda: [AMPERE], glibc=lambda: "2.35",
+            environ={"GPM_PYPI_INDEX": f"http://127.0.0.1:{server.server_address[1]}/simple"},
+        )
+        installer = Installer(vllm_source, engine_dir, Started(), free_disk_bytes=lambda: 10**12)  # not this disk's
+        await installer.want("0.32.0", False)
+        await installer.finished()
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert installer.state()["error"] is None and installer.state()["running"] == "0.32.0"
+    # Each wheel fetched while every one fetched before it is still held, and none installed yet.
+    assert sorted(name for name, _, _ in seen) == sorted(path.name for path in made)
+    assert [(held, installed) for _, held, installed in seen] == [(count, False) for count in range(len(made))]
 
 
 async def test_a_wheel_that_does_not_match_its_sets_digest_refuses_the_version_and_nothing_stays(tmp_path):
@@ -502,8 +727,8 @@ def uv_says(pins=None, missing=()):
 def uv(levels_that_resolve=("2.31",), said=None):
     asked = []
 
-    def compile(requirement, python, platform, glibc, index):
-        asked.append((requirement, python, platform, glibc, index))
+    def compile(requirement, python, platform, glibc, index, exclude_newer):
+        asked.append((requirement, python, platform, glibc, index, exclude_newer))
         if glibc not in levels_that_resolve:
             raise TOOL.LockFailed(f"× No solution found\nBecause llguidance has no wheels for manylinux_{glibc}")
         return said if said is not None else uv_says()
@@ -514,7 +739,7 @@ def uv(levels_that_resolve=("2.31",), said=None):
 def test_a_set_is_resolved_at_the_oldest_glibc_every_wheel_is_published_for():
     compile, asked = uv(levels_that_resolve=("2.31", "2.34"))
     made = TOOL.lock("0.32.0", "3.12", "x86_64", compile=compile, files=pypi_files)
-    assert [glibc for *_, glibc, _ in asked] == ["2.28", "2.31"]
+    assert [glibc for *_, glibc, _, _ in asked] == ["2.28", "2.31"]
     assert asked[0][:3] == ("vllm[audio]==0.32.0", "3.12", "x86_64") and asked[0][4] == "https://pypi.org/simple"
     assert list(made) == ["vllm", "python", "platform", "driver_floor", "glibc", "cuda_runtime", "wheels", "size_bytes", "requirements"]
     assert (made["vllm"], made["python"], made["platform"], made["glibc"]) == ("0.32.0", "3.12", "x86_64", "2.31")
@@ -592,7 +817,7 @@ def test_the_tool_writes_every_set_or_none(tmp_path, capsys):
     said = uv_says(pins=[(pin, PYPI[pin]) for pin in portable])
     asked = []
 
-    def compile(requirement, python, platform, glibc, index):
+    def compile(requirement, python, platform, glibc, index, exclude_newer):
         asked.append(python)
         if python == "3.11":
             raise TOOL.LockFailed("× No solution found when resolving dependencies")
@@ -612,6 +837,36 @@ def test_the_tool_writes_every_set_or_none(tmp_path, capsys):
                      compile=compile, files=pypi_files) == 1
     assert not elsewhere.exists()
     assert "vllm[audio]==0.32.0 does not resolve for Python 3.11 on x86_64" in capsys.readouterr().err
+
+
+def test_every_set_of_a_run_is_resolved_from_pypi_as_it_stood_when_the_run_began(tmp_path, capsys):
+    """A version's sets are resolved one after another, for minutes: a dependency released
+    meanwhile would make one Python's or processor's set differ from another's. Every resolution
+    is given the one moment the run began (`--exclude-newer`)."""
+    portable = [("vllm", "0.32.0"), ("regex", "2026.9.29"), ("nvidia-cuda-runtime", "13.0.96")]
+    compile, asked = uv(said=uv_says(pins=[(pin, PYPI[pin]) for pin in portable]))
+    moments = iter(["2026-10-30T09:00:00Z", "2026-10-30T09:05:00Z"])
+    assert TOOL.main(["0.32.0", "--python", "3.12", "3.13", "--platform", "x86_64", "--out", str(tmp_path / "sets")],
+                     compile=compile, files=pypi_files, clock=lambda: next(moments)) == 0
+    assert [python for _, python, *_ in asked] == ["3.12", "3.12", "3.13", "3.13"]  # 2.28, then 2.31, each
+    assert {exclude_newer for *_, exclude_newer in asked} == {"2026-10-30T09:00:00Z"}
+    assert "as it stood at 2026-10-30T09:00:00Z" in capsys.readouterr().out
+    assert TOOL.now_rfc3339().endswith("Z") and len(TOOL.now_rfc3339()) == len("2026-10-30T09:00:00Z")
+
+
+def test_uv_is_asked_for_nothing_uploaded_after_that_moment(monkeypatch):
+    ran = []
+
+    def run(argv, **options):
+        ran.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="vllm==0.32.0\n", stderr="")
+
+    monkeypatch.setattr(TOOL.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(TOOL.subprocess, "run", run)
+    TOOL.uv_compile("vllm[audio]==0.32.0", "3.12", "x86_64", "2.31", TOOL.INDEX, "2026-10-30T09:00:00Z")
+    TOOL.uv_compile("vllm[audio]==0.32.0", "3.12", "x86_64", "2.31", TOOL.INDEX)
+    assert ran[0][ran[0].index("--exclude-newer") + 1] == "2026-10-30T09:00:00Z"
+    assert "--exclude-newer" not in ran[1]
 
 
 def test_a_version_the_agent_could_not_name_a_directory_by_is_refused():
