@@ -69,8 +69,10 @@ Decided in D150–D154 and specified in [host-agent.md](../spec/host-agent.md) �
 ## Unverified
 
 In [decisions.md](../decisions.md): the headless macOS archive serving the laptop's MLX builds;
-Ollama's Windows signatures; whisper.cpp's static Metal build with PyPI's `cmake`; lingering on
-Linux.
+Ollama's Windows signatures; whisper.cpp's builds on Linux and its archives on Windows; the agent's
+scheduled task on Windows (registration as a standard user, restart after a crash — Task
+Scheduler's `RestartOnFailure` is commonly reported to act only when a task fails to launch);
+lingering on Linux; AMD cards. whisper.cpp's static Metal build with PyPI's `cmake` is verified.
 
 ## What it touches
 

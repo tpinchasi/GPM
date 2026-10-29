@@ -7,4 +7,6 @@ of verbs — there is no "run this".
 
 #: The protocol version this agent speaks, as the first path segment (`/agent/v1/...`).
 PROTOCOL_VERSION = "1"
-__version__ = "0.2.3"
+#: The package's own version, reported in the facts — kept equal to `pyproject.toml`'s by a test,
+#: as the agent also runs from a zipapp on rented hosts, where no package metadata is installed.
+__version__ = "0.13.0"

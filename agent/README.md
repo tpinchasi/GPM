@@ -5,9 +5,15 @@ pool and the pool learns **what the machine is** — accelerators, memory, free 
 version, models on disk — instead of being told, and checked by nobody.
 
 ```sh
-uvx gpm-agent init      # mints the agent key, prints it once, stores only its hash
-uvx gpm-agent serve     # loopback by default, port 8095
+uv tool install gpm-agent   # a lasting install (`uvx` runs from a cache uv may clear)
+gpm-agent init              # mints the agent key, prints it once, stores only its hash
+gpm-agent serve             # loopback by default, port 8095
 ```
+
+On a machine whose owner gives it the engine (S9): `gpm-agent init --install-engines
+--start-at-login --prerequisites` — the agent then installs, runs and upgrades the engine,
+starts with the machine, and installs ffmpeg and a compiler where missing (`--admin` lets it use
+`sudo` where a platform needs it).
 
 On the pool's machine, put the key in an environment variable and name it on the host:
 

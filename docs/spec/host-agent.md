@@ -277,7 +277,9 @@ its port.
 
 **Running across reboots** (D154): `gpm-agent init --start-at-login` — or `gpm-agent startup
 add|remove|status` for an agent already set up — makes the agent start with the machine, running
-`<its interpreter> -I -m gpm_agent.cli --config <settings> serve` with only the owner's `PATH`:
+`<its interpreter> -I -m gpm_agent.cli --config <settings> serve` — on macOS and Linux with only
+the owner's `PATH` copied; on Windows with `pythonw.exe` and `--log-file`, in the logon session's
+own environment:
 
 | | Where | How |
 |---|---|---|
@@ -335,8 +337,10 @@ refuses app and admin keys by name, and the control API and router refuse an age
 
 ```sh
 # on the host
-uvx gpm-agent init          # mints the key, prints it once, stores only its hash (0600)
-uvx gpm-agent serve         # loopback by default
+uv tool install gpm-agent   # a lasting install; a start at login is refused from uvx's cache
+gpm-agent init              # mints the key, prints it once, stores only its hash (0600 on
+                            # macOS and Linux; on Windows, the profile's own access rules)
+gpm-agent serve             # loopback by default
 ```
 
 The operator adds the host in the console with its agent address; the key goes where every

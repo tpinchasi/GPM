@@ -1255,3 +1255,13 @@ def test_an_answer_not_in_the_shape_of_facts_is_no_answer_never_an_exception(mon
         transport = httpx.MockTransport(lambda request, body=body: httpx.Response(200, json=body))
         view = asyncio.run(agents.ask(agent, transport=transport))
         assert not view.reachable and "shape" in view.detail
+
+
+def test_the_version_the_agent_reports_is_its_packages():
+    import tomllib
+    from pathlib import Path
+
+    import gpm_agent
+
+    pyproject = Path(__file__).resolve().parents[1] / "agent" / "pyproject.toml"
+    assert gpm_agent.__version__ == tomllib.loads(pyproject.read_text())["project"]["version"]
