@@ -161,3 +161,16 @@ def test_the_split_is_the_fewest_hosts_that_fit():
         split = w.split_together(parallel, per_host)
         fewer = split.hosts - 1
         assert fewer < 1 or sum(-(-parallel[m] // fewer) / per_host[m] for m in parallel) > 1 + 1e-9
+
+
+def test_a_target_met_with_nothing_measured_above_is_not_a_limit():
+    """D156, found live: measured only at one at a time, 3 s against 60 s, a model was sized at one
+    and no card of its class could hold it beside another."""
+    got = w.workers_at_latency(samples(1, 3.0) + samples(2, 2.8, n=w.MIN_SAMPLES - 1), target_s=60, ceiling=16)
+    assert got.workers is None and not got.measured, "the card's own number"
+    assert "nothing above it has been measured" in got.reasons[0]
+
+
+def test_a_measured_level_that_missed_the_target_still_caps_it():
+    got = w.workers_at_latency(samples(1, 3.0) + samples(4, 90.0), target_s=60, ceiling=16)
+    assert got.workers == 1 and got.measured

@@ -65,7 +65,11 @@ def workers_at_latency(
     the request log. A concurrency counts only with `MIN_SAMPLES` answers. The answer never
     exceeds `ceiling` — the capacity profile's number for the card, which is what the engine was
     sized for — and is None when no measured concurrency met the target or nothing was measured:
-    a target is a wish until there is a log.
+    a target is a wish until there is a log. It is None too — the card's own number, unmeasured —
+    when the target was met and nothing measured above that level up to the card's number failed
+    it (D156): the log then says nothing against more. Found live: Gemma 4 E4B measured at one
+    answer at a time, 3 s at p95 against a 60 s target, was sized at one, and no card of the
+    class could hold it beside another model.
     """
     by_concurrency: dict[int, list[float]] = {}
     for concurrency, latency in samples:
@@ -86,6 +90,12 @@ def workers_at_latency(
                      f"the card's own number is used, and the target will not be met on this class"],
         )
     best = max(meeting)
+    if not any(best < c <= ceiling for c in curve):
+        return AtLatency(
+            workers=None, measured=False, curve=curve,
+            reasons=[f"{best} at once measured {curve[best]:g}s at p95, within {target_s:g}s, and nothing above it "
+                     "has been measured; the card's own number is used, unmeasured beyond it"],
+        )
     return AtLatency(
         workers=best, measured=True, curve=curve,
         reasons=[f"{best} at once measured {curve[best]:g}s at p95, within {target_s:g}s"

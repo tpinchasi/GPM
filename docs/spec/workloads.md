@@ -51,7 +51,9 @@ these steps — and does nothing until the budget is confirmed:
 2. **Workers per host at the latency.** The most answers one host of a card class may serve at
    once and still meet `latency_s` at p95: read from the request log for that (hardware, model)
    where the pool has served it at that concurrency, else the card's capacity profile number with
-   the target marked **unmeasured** in the plan. It is what the host runs, and automatic
+   the target marked **unmeasured** in the plan. A concurrency that met the target with nothing
+   measured above it, up to the card's number, is not a limit: the card's number is used,
+   unmeasured beyond it (D156) — only a measured level that missed the target caps it. It is what the host runs, and automatic
    adjustment (D67) does not climb past it.
 3. **Hosts at the start** `= ceil(parallel ÷ workers per host)`.
 4. **The budget.** `--max-spend` typed, or derived: hosts × hours × the hourly price of the first
