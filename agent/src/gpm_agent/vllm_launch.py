@@ -32,6 +32,12 @@ is started at its own, which is recorded so the agent can say so.
 
 It stops whatever it started last time before starting anything, so calling it twice is a
 restart and not a second copy fighting the first for the same memory.
+
+**On a machine whose agent installs vLLM** (D159) the agent runs this launcher itself, as a
+program — `python -m gpm_agent.cli vllm-start` — with `--vllm` naming the installed version's own
+program. That option takes only a file named `vllm` inside the agent's engines directory, so still
+nothing the pool sends becomes part of a command (D41); and the agent stops what this started with
+`gpm-agent vllm-stop`, never by importing this module (D63).
 """
 
 from __future__ import annotations
@@ -571,10 +577,13 @@ def option_flags(options: Sequence[str], family: Optional[str]) -> tuple[list[st
 
 
 def _cmdline(pid: int) -> Optional[bytes]:
+    """A process's command line: from /proc, where vLLM runs; elsewhere as the system's `ps` says
+    it, so that what a test machine starts is recognised too (`platform.command_line`)."""
     try:
         return Path(f"/proc/{pid}/cmdline").read_bytes()
     except OSError:
-        return None
+        pass
+    return host_platform.command_line(pid)
 
 
 def _ours(pid: int, cmdline: Callable[[int], Optional[bytes]]) -> bool:
@@ -589,10 +598,15 @@ def stop_previous(models_dir: Path, *, kill: Callable[[int, int], None] = os.kil
                   cmdline: Callable[[int], Optional[bytes]] = _cmdline) -> list[int]:
     """Stop what the last call started. A process already gone is not an error.
 
+    Only a process that is still an engine, the router or the helper by its own command line is
+    signalled: a number in a file is only a number. On a machine its owner uses for other things
+    too (D159), one restarted since has handed those numbers to the owner's own programs, and the
+    next start — the agent's own, as it starts — would otherwise end them.
+
     What an older launcher started is listed in the models directory, where it kept its state
     then: on a host upgraded in place those engines still hold the cards and ports. They are
-    stopped too — but only processes that are an engine or the router by their own command line,
-    since that file may equally have come from another machine with the models (D139)."""
+    stopped too, by the same rule, since that file may equally have come from another machine
+    with the models (D139)."""
     pids_file = state_dir_for(models_dir) / PIDS_FILE
     # What starts a card's models in turn goes first, and is waited for: until it has gone it
     # may start one more, after the list below was read — an engine nothing would then stop.
@@ -608,9 +622,10 @@ def stop_previous(models_dir: Path, *, kill: Callable[[int, int], None] = os.kil
         older = [int(p) for p in json.loads((Path(models_dir) / PIDS_FILE).read_text())]
     except (OSError, ValueError, TypeError):
         older = []
-    pids += [p for p in older if p not in pids and _ours(p, cmdline)]
+    pids += [p for p in older if p not in pids]
     # The helper's number is in the list too, and was dealt with above — or is no longer its.
-    stopped += _stop([p for p in pids if p not in stopped and p != turns], kill=kill, alive=alive, grace_s=grace_s)
+    listed = [p for p in pids if p not in stopped and p != turns]
+    stopped += _stop([p for p in listed if _ours(p, cmdline)], kill=kill, alive=alive, grace_s=grace_s)
     pids_file.unlink(missing_ok=True)
     return stopped
 
@@ -653,13 +668,53 @@ def _stop(pids: Sequence[int], *, kill: Callable[[int, int], None], alive: Optio
     return stopped
 
 
+def agent_command() -> list[str]:
+    """How this launcher's helpers — the router, and what starts a card's models in turn — run the
+    agent again: as this process was run. From the agent's archive or its `gpm-agent` program,
+    that file; as a module (`python -m gpm_agent.cli`, as the agent that runs vLLM itself starts
+    this, D159), the module again, under the same guard on where it imports from — its file alone
+    is part of a package, and would not run."""
+    main_module = sys.modules.get("__main__")
+    spec = getattr(main_module, "__spec__", None)
+    if spec is not None and spec.name == "gpm_agent.cli":
+        guard = ["-I"] if sys.flags.isolated else ["-P"] if getattr(sys.flags, "safe_path", False) else []
+        return [*guard, "-m", "gpm_agent.cli"]
+    return [sys.argv[0]]
+
+
+#: The program `--vllm` may name: a file of this name, inside the agent's engines directory.
+VLLM_PROGRAM = "vllm"
+
+
+def vllm_refusal(vllm: str, engines_dir: Path) -> Optional[str]:
+    """Why `vllm` may not be run as vLLM here, or None. Only the program of a version the agent
+    installed (D157): an absolute path to a file named `vllm` that is, links followed, inside the
+    agent's engines directory. The pool never sends a path (D41); this holds even if something
+    else on the machine one day did."""
+    path = Path(vllm)
+    if not path.is_absolute():
+        return f"--vllm must be an absolute path, and {vllm!r} is not"
+    if path.name != VLLM_PROGRAM:
+        return f"--vllm names {path.name!r}; only a program named {VLLM_PROGRAM!r} is run as vLLM"
+    root = os.path.realpath(engines_dir)
+    real = os.path.realpath(path)
+    if os.path.commonpath([root, real]) != root:
+        return (
+            f"--vllm {vllm} is not inside this agent's engines directory ({engines_dir}): only a "
+            "version of vLLM the agent installed is run this way"
+        )
+    if not os.path.isfile(real):
+        return f"--vllm {vllm} is not a file"
+    return None
+
+
 def launch(
     models_dir: str | Path,
     port: int,
     *,
     proxy: bool = False,
     options: Sequence[str] = (),
-    vllm: str = "vllm",
+    vllm: str = VLLM_PROGRAM,
     agent: Optional[str] = None,
     python: str = sys.executable,
     env: Optional[Mapping[str, str]] = None,
@@ -676,6 +731,10 @@ def launch(
 
     Nothing on disk yet is the ordinary state of a machine that has just booted, and is not an
     error: this returns having started nothing, and is called again once the fetch has finished.
+
+    `vllm` is the program each engine runs: `vllm` on the PATH, or a version the agent installed,
+    which `main` has checked (`vllm_refusal`). `agent` is how the helpers run the agent again
+    (`agent_command`, where unnamed).
     """
     models_dir = Path(models_dir).expanduser()
     state = state_dir_for(models_dir)
@@ -783,8 +842,9 @@ def launch(
             later["waiting"] = True
     waiting = [queue for queue in turns.values() if len(queue) > 1]
     helper = None
+    itself = [agent] if agent else agent_command()
     if waiting:
-        argv = [python, agent or sys.argv[0], "vllm-in-turn", "--models-dir", str(models_dir)]
+        argv = [python, *itself, "vllm-in-turn", "--models-dir", str(models_dir)]
         out = open(logs / "in-turn.log", "ab")
         helper = popen(argv, stdin=subprocess.PIPE, stdout=out, stderr=subprocess.STDOUT, env=env,
                        start_new_session=True)
@@ -795,7 +855,7 @@ def launch(
         draft = map_file.with_suffix(".new")
         draft.write_text(json.dumps(upstreams, indent=2, sort_keys=True))
         draft.replace(map_file)
-        argv = [python, agent or sys.argv[0], "proxy", "--upstreams", str(map_file),
+        argv = [python, *itself, "proxy", "--upstreams", str(map_file),
                 "--host", "127.0.0.1", "--port", str(port)]
         out = open(logs / "proxy.log", "ab")
         process = popen(argv, stdout=out, stderr=subprocess.STDOUT, env=env, start_new_session=True)
@@ -990,6 +1050,24 @@ def _note_finished(models_dir: Path, own_pid: int) -> None:
             _write_json(state / PIDS_FILE, [p for p in pids if p != own_pid])
 
 
+def stop(models_dir: str | Path, **kwargs: Any) -> list[int]:
+    """Stop what the launcher last started here, and forget its record of it: nothing then runs,
+    and nothing it started is a model that failed. For the agent that runs vLLM itself (D159), to
+    switch versions or hand the port to another engine — run as `gpm-agent vllm-stop`, never in
+    the agent's own process (D63)."""
+    models_dir = Path(models_dir).expanduser()
+    stopped = stop_previous(models_dir, **kwargs)
+    (state_dir_for(models_dir) / STARTED_FILE).unlink(missing_ok=True)
+    return stopped
+
+
+def main_stop(args: Any) -> int:
+    """`gpm-agent vllm-stop`: what the last `vllm-start` began, stopped."""
+    stopped = stop(args.models_dir)
+    print(f"gpm-agent vllm-stop: stopped {len(stopped)} process{'' if len(stopped) == 1 else 'es'}")
+    return 0
+
+
 def main_in_turn(args: Any) -> int:
     """`gpm-agent vllm-in-turn`: started by the launcher, which hands it the plan on its input."""
     turns = json.loads(sys.stdin.read() or "[]")
@@ -1020,12 +1098,31 @@ def add_arguments(parser: Any) -> None:
                         help="one engine per model, with the router on --port in front of them")
     parser.add_argument("--option", action="append", default=[], choices=sorted(OPTIONS),
                         help="a named option; each model gets it if its family has it (D100)")
-    # Deliberately no way to name another program: this runs `vllm` and the agent's own router,
-    # as fixed argument lists, and nothing on its command line can change which.
+    # The one way to name another program: a version of vLLM the agent installed, by its own
+    # program, inside the agent's engines directory and nowhere else (D159). The agent passes it;
+    # the pool never can, since nothing it says reaches this command line (D41).
+    parser.add_argument("--vllm", default=None,
+                        help="a version of vLLM this agent installed: its `vllm` program, inside the "
+                             "agent's engines directory (`vllm` on the PATH if unset)")
+    parser.add_argument("--engines-dir", default=None,
+                        help="the agent's engines directory, where its owner moved it (engines_path); "
+                             "the system's own place if unset")
+
+
+def add_stop_arguments(parser: Any) -> None:
+    parser.add_argument("--models-dir", required=True, help="where the agent fetched the models")
 
 
 def main(args: Any) -> int:
-    started = launch(args.models_dir, args.port, proxy=args.proxy, options=args.option)
+    vllm = VLLM_PROGRAM
+    if args.vllm is not None:
+        engines = Path(args.engines_dir).expanduser() if args.engines_dir else host_platform.engines_dir()
+        refused = vllm_refusal(args.vllm, engines)
+        if refused:
+            print(f"gpm-agent vllm-start: not started — {refused}")
+            return 2
+        vllm = args.vllm
+    started = launch(args.models_dir, args.port, proxy=args.proxy, options=args.option, vllm=vllm)
     if started.refused:
         print(f"gpm-agent vllm-start: not started — {started.refused}")
         return 1

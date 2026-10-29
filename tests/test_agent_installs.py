@@ -1281,8 +1281,9 @@ def test_install_engines_is_the_owners_and_keeps_ollama_on_loopback():
     Settings(key_hash="x", install_engines=True).check()
     with pytest.raises(SettingsError, match="loopback|D150"):
         Settings(key_hash="x", install_engines=True, engine_url="http://10.0.0.5:11434").check()
-    with pytest.raises(SettingsError, match="cannot install vllm"):
-        Settings(key_hash="x", engine="vllm", install_engines=True).check()
+    with pytest.raises(SettingsError, match="cannot install sglang"):
+        Settings(key_hash="x", engine="sglang", install_engines=True).check()
+    Settings(key_hash="x", engine="vllm", install_engines=True).check()  # S10 (D157)
     with pytest.raises(SettingsError, match="restart_command"):
         Settings(key_hash="x", install_engines=True, restart_command=["systemctl", "restart", "ollama"]).check()
     with pytest.raises(SettingsError, match="engines_path"):

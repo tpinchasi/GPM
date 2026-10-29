@@ -156,14 +156,19 @@ class EngineControl:
                 changed = self.installer.server.set_pool_environment(self.engine.launch_environment(**wanted))
             problem = await self.installer.restart()
         running = self.installer.record.running
+        # vLLM is started only once every model it holds is on disk (D159): until then a restart
+        # stores the numbers, stops what ran, and starts nothing yet — said, not claimed served.
+        waiting = getattr(self.installer.server, "waiting", None) if problem is None else None
         return {
             "settings_written": changed,
             "applied": self.applied(),
             "restart_exit_code": 0 if problem is None else None,
             "restart_output": (
-                f"the agent started {self.engine.name} {running} again" if problem is None else problem
+                problem if problem is not None
+                else f"{self.engine.name} {running} is not started yet: {waiting}" if waiting
+                else f"the agent started {self.engine.name} {running} again"
             ),
-            "engine_answers": problem is None,
+            "engine_answers": problem is None and not waiting,
         }
 
     async def _restart(self) -> tuple[Optional[int], str]:

@@ -199,8 +199,31 @@ def test_the_agent_never_runs_a_shell_or_a_command_it_was_given():
             if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "argv" for t in node.targets)
         ]
         assert len(assigned) == 1 and isinstance(assigned[0], ast.Call) and assigned[0].func.id == builder, name
-    for name in ("app.py", "models.py", "engines.py", "installs.py", "proxy.py", "engine_control.py", "whisper_build.py"):
+    for name in ("app.py", "models.py", "engines.py", "installs.py", "proxy.py", "engine_control.py", "whisper_build.py",
+                 "vllm_server.py"):
         assert "host_platform.start(" not in (root / name).read_text(), f"{name} starts a program"
+
+    # vLLM run by the agent (D159): only the agent's own launcher and its stop, as programs, each
+    # command built in one place — the agent's interpreter, its guard, its own module and a verb,
+    # then the agent's settings and the installed program — and run as built.
+    tree = ast.parse((root / "vllm_server.py").read_text())
+    methods = {node.name: node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    for builder, verb in (("launcher_argv", "vllm-start"), ("stop_argv", "vllm-stop")):
+        lists = [node for node in ast.walk(methods[builder]) if isinstance(node, ast.List)]
+        head = ast.unparse(lists[0])
+        assert head.startswith("[self.python, *interpreter_guard(), *AGENT_MODULE, ") and f"'{verb}'" in head, head
+    module = next(node.value for node in tree.body
+                  if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", None) == "AGENT_MODULE")
+    assert ast.unparse(module) == "('-m', 'gpm_agent.cli')"
+    runs = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "run" and getattr(node.func.value, "id", None) == "self"]
+    assert len(runs) == 2
+    for call in runs:
+        command = ast.unparse(call.args[0])
+        assert command in ("argv", "self.stop_argv()"), command
+    assigned = [ast.unparse(node.value) for node in ast.walk(methods["start"])
+                if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "argv" for t in node.targets)]
+    assert assigned == ["self.launcher_argv(program, models)"]
 
     # What runs through `run_command`, and from where: whisper.cpp's build and checks (D152). Each
     # command is a literal list — a fixed program, or a path the agent found, then constants — or
@@ -210,6 +233,8 @@ def test_the_agent_never_runs_a_shell_or_a_command_it_was_given():
         text = (root / name).read_text()
         if "host_platform.run_command" not in text and "platform import run_command" not in text:
             continue  # startup.py has a `run_command` of its own, for the owner's commands
+        if name == "vllm_server.py":
+            continue  # its launcher and stop, above
         assert name in ("whisper_build.py", "whisper_cpp.py"), f"{name} runs commands"
         tree = ast.parse(text)
         runs = [
