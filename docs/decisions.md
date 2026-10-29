@@ -201,6 +201,7 @@
 |---|---|
 | vLLM v0.29.0 starts Whisper with `--max-model-len` capped at 448, and runs a sequence-classification reranker with no extra flag | D146 — checked on one cheap rented host before S8 is called done |
 | The Gemma 4 builds the catalog serves on vLLM keep the vision tower | D143 — the same host |
+| The agent's table of which architectures vLLM v0.29.0 runs for pooling (`runs_as_pooling`: `…ForSequenceClassification`, `…Model`, sentence-transformers' Pooling module; `…ForCausalLM`, `…ForConditionalGeneration` generating) matches vLLM's own suffix table — written from memory, and only deciding whether a tokenizer's length caps an absolute-position encoder | D146 — read vLLM's `_SUFFIX_TO_DEFAULTS` at v0.29.0 |
 | whisper.cpp's server queues a second request rather than refusing it | D148's one worker — on the laptop |
 | Verda's OS image `ubuntu-22.04-cuda-12.4-docker` has Docker and the GPU's container runtime, so `docker run --gpus all` works from the start-up script, which runs as root once the machine boots; and a start-up script is read at creation, so deleting it with its machine (not before) is enough | The Verda plug-in (D140): every host |
 | A Verda spot machine taken back reads `discontinued` (or is no longer found), with its OS volume deleted as `on_spot_discontinue: delete_permanently` asks; and a running machine's `price_per_hour` is what it bills | Replacing a spot host, and its spend (D140) |

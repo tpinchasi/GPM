@@ -41,7 +41,10 @@ class WhisperCppEngine:
     #: `owner/repo/file.bin` — as the host's agent reads it, so a tag it would refuse is refused
     #: when the configuration loads instead (D148).
     build_tag: ClassVar[re.Pattern[str]] = re.compile(
-        r"^(?!.*__)(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*\.bin$"
+        r"^(?!.*__)(?!.*\.\.)"
+        r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9.-])?/"   # the owner, not ending in `_`
+        r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9.-])?/"   # the repository, likewise
+        r"[A-Za-z0-9][A-Za-z0-9._-]*\.bin$"
     )
 
     def default_start_command(

@@ -182,7 +182,7 @@ def test_a_model_only_workloads_hold_is_checked_for_what_rented_hosts_can_serve(
 
 
 @pytest.mark.parametrize("tag", ["whisper:turbo", "owner/repo", "owner/repo/model.gguf", "owner/re__po/m.bin",
-                                 "owner/repo/../m.bin"])
+                                 "owner/repo/../m.bin", "owner_/repo/m.bin", "owner/repo_/m.bin"])
 def test_a_whisper_cpp_build_must_name_one_file_of_a_hub_repository(tag):
     with pytest.raises(ValueError, match="owner/repo/file.bin"):
         config(catalog={WHISPER: {"variants": [{"tag": tag, "engine": "whisper-cpp", "serves": ["transcribe"]}]}},
