@@ -370,6 +370,18 @@ async def test_an_eviction_inside_a_lease_is_recovered_unattended(fleet):
     assert not fleet.hosts or next(iter(fleet.hosts.values())).state != "stopped"
 
 
+async def test_an_eviction_keeps_what_the_provider_said_about_the_machine(fleet):
+    open_lease(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    host = next(iter(fleet.hosts.values()))
+
+    fleet.provider.evict(host.instance.instance_id, said="actual loading, intended stopped, next_state stopped")
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+
+    (eviction,) = [e for e in fleet.events.recent(50) if e["kind"] == "eviction"]
+    assert eviction["numbers"]["provider_said"] == "actual loading, intended stopped, next_state stopped"
+
+
 async def test_winning_a_host_back_after_an_eviction_respects_the_pools_burn_cap(fleet):
     """A re-bid is new spending: the pool's hourly cap is checked with the host at its new price."""
     open_lease(fleet)
@@ -569,6 +581,22 @@ async def test_an_on_demand_host_that_stops_is_not_treated_as_outbid(fleet):
     assert host.released
     kinds_seen = kinds(fleet)
     assert "host_stopped" in kinds_seen and "eviction" not in kinds_seen
+
+
+async def test_a_host_lost_as_stopped_keeps_what_the_provider_said_about_it(fleet):
+    """The machine is destroyed straight after; the event is all that is left of why."""
+    fleet.rented.mode = "on_demand"
+    fleet.provider.offers = [on_demand_offer()]
+    open_lease(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    (host,) = fleet.hosts.values()
+
+    fleet.provider.evict(host.instance.instance_id, said="actual exited, intended running: no space left on device")
+    await fleet.handle_evictions()
+
+    (stopped,) = [e for e in fleet.events.recent(50) if e["kind"] == "host_stopped"]
+    assert stopped["numbers"]["provider_said"] == "actual exited, intended running: no space left on device"
+    assert "no space left on device" in stopped["summary"]
 
 
 async def test_which_listings_are_searched_follows_the_mode(fleet):

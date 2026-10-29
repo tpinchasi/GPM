@@ -539,6 +539,7 @@ class VastProvider:
             # Seen live: an instance created with a start-up script and reported back without
             # one. The field is always present on this API, so its emptiness is an answer.
             startup_material=bool(entry["onstart"]) if "onstart" in entry else None,
+            reported=_state_line(entry),
         )
 
     async def set_bid(self, instance: Instance, bid: float) -> None:

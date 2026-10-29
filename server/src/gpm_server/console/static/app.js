@@ -30,6 +30,8 @@ async function call(method, path, body) {
   if (!response.ok) {
     const detail = payload?.detail || payload?.error || `${response.status}`;
     const failure = new Error(detail);
+    failure.status = response.status;
+    failure.code = payload?.error;  // the pool's own name for what went wrong, where it gives one
     if (payload?.changes) failure.changes = payload.changes;  // a refused plan explains itself
     throw failure;
   }
@@ -156,10 +158,19 @@ async function drawHost() {
   try {
     detail = await api.hostDetail(id);
   } catch (error) {
-    document.getElementById("host-dialog-body").replaceChildren(
-      el("p", { class: "error" }, error.message),
-      el("p", { class: "muted" }, "A pool running an older supervisor has no per-host view; restart it to get one."));
     clearInterval(hostWatch.timer);
+    // A host released while its window was open answers "unknown_host": it is gone, not the
+    // view. Only a route the supervisor does not have says it is older than this console.
+    const gone = error.code === "unknown_host";
+    document.getElementById("host-dialog-body").replaceChildren(...[
+      gone
+        ? el("p", {}, `${id} is no longer in the pool: it was released, or its workload ended. `,
+          "Why is on the ", el("a", { href: "#decisions", onclick: () => closeHost() }, "Decisions"), " screen.")
+        : el("p", { class: "error" }, error.message),
+      !gone && error.status === 404
+        ? el("p", { class: "muted" }, "A pool running an older supervisor has no per-host view; restart it to get one.")
+        : null,
+    ].filter(Boolean));
     return;
   }
   if (hostWatch.id !== id) return;  // closed or switched while we were asking

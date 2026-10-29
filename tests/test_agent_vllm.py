@@ -5,6 +5,7 @@ docs/spec/host-agent.md §4. Against a fake hub and a fake engine; nothing here 
 network, needs a GPU, or installs vLLM.
 """
 
+import io
 import sys
 import time
 from pathlib import Path
@@ -522,7 +523,7 @@ async def test_the_facts_say_which_models_were_started_shorter_than_the_pool_ask
     downloaded(tmp_path)  # states no length: given the pool's
     vllm_launch.launch(
         tmp_path, 8000, proxy=True, env={"GPM_VLLM_MAX_MODEL_LEN": "8192"},
-        popen=lambda argv, **kwargs: type("Process", (), {"pid": None})(), alive=lambda pid: False,
+        popen=lambda argv, **kwargs: type("Process", (), {"pid": None, "stdin": io.BytesIO()})(), alive=lambda pid: False,
         probe_card=lambda: None, probe_devices=lambda env: [], agent="gpm-agent.pyz", python="python3",
     )
     engine = facts(tmp_path)

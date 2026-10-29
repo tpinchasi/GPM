@@ -7,6 +7,8 @@ GPU, or installs vLLM.
 
 import json
 import signal
+import subprocess
+import time
 from pathlib import Path
 
 import httpx
@@ -25,6 +27,21 @@ def downloaded(models_dir, repo, size):
     return into
 
 
+class Pipe:
+    """A process's standard input, as the launcher writes to it."""
+
+    def __init__(self):
+        self.data = b""
+        self.closed = False
+
+    def write(self, data):
+        assert not self.closed
+        self.data += data
+
+    def close(self):
+        self.closed = True
+
+
 class Processes:
     """Records what would have been started, and hands out pids."""
 
@@ -33,6 +50,8 @@ class Processes:
         self.envs: list[dict] = []
         self.killed: list[tuple[int, int]] = []
         self.alive: set[int] = set()
+        self.inputs: dict[int, Pipe] = {}
+        self.env_of: dict[int, dict] = {}
         self._next = 1000
 
     def popen(self, argv, **kwargs):
@@ -41,8 +60,30 @@ class Processes:
         self.started.append(argv)
         self.envs.append(kwargs.get("env") or {})
         self._next += 1
+        self.env_of[self._next] = kwargs.get("env") or {}
         self.alive.add(self._next)
-        return type("Process", (), {"pid": self._next})()
+        process = type("Process", (), {"pid": self._next})()
+        if kwargs.get("stdin") == subprocess.PIPE:
+            process.stdin = self.inputs[self._next] = Pipe()
+        return process
+
+    def engines(self):
+        """The `vllm serve` processes started, in order."""
+        return [argv for argv in self.started if argv[1:2] == ["serve"]]
+
+    def handed_to_in_turn(self):
+        """The plan the launcher gave what starts the rest of each card's models."""
+        (pid,) = list(self.inputs)
+        assert self.inputs[pid].closed
+        return json.loads(self.inputs[pid].data)
+
+    def take_turns(self, models_dir, ready=lambda port: True):
+        """Run what starts the rest of each card's models, as the launcher started it (D155)."""
+        if self.inputs:
+            vllm_launch.run_in_turn(
+                models_dir, self.handed_to_in_turn(), env={}, popen=self.popen, ready=ready,
+                alive=lambda pid: pid in self.alive, sleep=lambda s: None, say=lambda line: None,
+            )
 
     def kill(self, pid, sig):
         self.killed.append((pid, sig))
@@ -278,6 +319,7 @@ def test_each_model_gets_its_own_familys_flags_behind_the_router(tmp_path):
     with_family(downloaded(tmp_path, "Qwen/Qwen3-8B", 100), "qwen3")
     processes = Processes()
     processes.launch(tmp_path, proxy=True, options=["tool_calling"])
+    processes.take_turns(tmp_path)
     by_model = {argv[4]: argv for argv in processes.started if "serve" in argv}
     assert by_model["Qwen/Qwen3-8B"][-2:] == ["--tool-call-parser", "hermes"]
     assert by_model[BIG][-2:] == ["--tool-call-parser", "gemma4"]
@@ -422,14 +464,15 @@ def test_every_model_runs_once_on_each_card_pinned_to_it(tmp_path):
     downloaded(tmp_path, EMBED, 2_000)
     processes = Processes()
     started = processes.launch(tmp_path, proxy=True, devices=["0", "1"])
+    processes.take_turns(tmp_path)
 
-    engines = started.engines
+    engines = vllm_launch.read_record(tmp_path)["engines"]
     assert len(engines) == 6, "three models, two cards"
     for card in ("0", "1"):
         on_card = [e for e in engines if e["card"] == card]
         assert {e["model"] for e in on_card} == {BIG, SMALL, EMBED}
-    for engine, env in zip(engines, processes.envs, strict=False):
-        assert env["CUDA_VISIBLE_DEVICES"] == engine["card"], "each copy sees only its card"
+    for engine in engines:
+        assert processes.env_of[engine["pid"]]["CUDA_VISIBLE_DEVICES"] == engine["card"], "each copy sees only its card"
     assert sorted(e["port"] for e in engines) == list(range(8001, 8007))
     # The memory plan is per card: each copy of a model gets the same share of its own card.
     shares = {(e["model"], e["card"]): e["memory_share"] for e in engines}
@@ -730,6 +773,7 @@ def test_a_model_that_states_no_length_gets_the_pools_number(tmp_path):
     with_files(downloaded(tmp_path, EMBED, 100), config={"model_type": "nomic_bert"})
     processes = Processes()
     launch_asking(processes, tmp_path, 8192, proxy=True)
+    processes.take_turns(tmp_path)
     assert [length_flag(argv) for argv in processes.started if "serve" in argv] == ["8192", "8192"]
     assert vllm_launch.capped_lengths(tmp_path) == {}
 
@@ -748,6 +792,7 @@ def test_behind_the_router_each_model_gets_its_own_length_on_every_copy(tmp_path
     with_files(downloaded(tmp_path, BIG, 100), config={"max_position_embeddings": 131072})
     processes = Processes()
     launch_asking(processes, tmp_path, 8192, proxy=True, devices=["0", "1"])
+    processes.take_turns(tmp_path)
     lengths = {(argv[4], length_flag(argv)) for argv in processes.started if "serve" in argv}
     assert lengths == {(WHISPER, "448"), (BIG, "8192")}
     assert len([argv for argv in processes.started if "serve" in argv]) == 4, "a copy of each on each card"
@@ -820,3 +865,200 @@ def test_a_models_own_length_is_read_as_vllm_reads_it(tmp_path, files, expected)
     directory.mkdir()
     with_files(directory, **files)
     assert vllm_launch.max_model_len_of(directory) == expected
+
+
+# --- a card's models start one after another (D155) ---
+
+
+def test_the_models_on_one_card_start_one_after_another(tmp_path):
+    """vLLM sizes its cache from the card's free memory across its own start, so a neighbour
+    loading meanwhile is counted as its own use. Only the first starts with the launcher."""
+    downloaded(tmp_path, BIG, 19_000)
+    downloaded(tmp_path, EMBED, 300)
+    processes = Processes()
+    started = processes.launch(tmp_path, proxy=True)
+
+    assert len(processes.engines()) == 1, "one engine now, the other in turn"
+    first, second = vllm_launch.read_record(tmp_path)["engines"]
+    assert first["pid"] in processes.alive and second["pid"] is None and second["waiting"]
+    helper = [argv for argv in processes.started if "vllm-in-turn" in argv]
+    assert helper == [["python3", "/var/run/gpm/gpm-agent.pyz", "vllm-in-turn", "--models-dir", str(tmp_path)]]
+    assert started.in_turn["pid"] in started.pids(), "the next start stops it too"
+    (queue,) = processes.handed_to_in_turn()
+    assert [e["model"] for e in queue] == [first["model"], second["model"]]
+    assert queue[0]["pid"] == first["pid"]
+
+    answers = iter([False, False, True])
+    processes.take_turns(tmp_path, ready=lambda port: next(answers))
+    assert len(processes.engines()) == 2
+    record = vllm_launch.read_record(tmp_path)["engines"]
+    assert record[1]["pid"] in processes.alive and "waiting" not in record[1]
+    pids = json.loads((vllm_launch.state_dir_for(tmp_path) / vllm_launch.PIDS_FILE).read_text())
+    assert record[1]["pid"] in pids, "a process started in turn is stopped by the next start"
+
+
+def test_the_next_model_waits_for_the_one_before_it_to_answer(tmp_path):
+    downloaded(tmp_path, BIG, 19_000)
+    downloaded(tmp_path, EMBED, 300)
+    processes = Processes()
+    processes.launch(tmp_path, proxy=True)
+    asked: list[int] = []
+    engines_when_asked: list[int] = []
+
+    def ready(port):
+        asked.append(port)
+        engines_when_asked.append(len(processes.engines()))
+        return len(asked) >= 4
+
+    processes.take_turns(tmp_path, ready=ready)
+    first_port = vllm_launch.read_record(tmp_path)["engines"][0]["port"]
+    assert asked == [first_port] * 4
+    assert engines_when_asked == [1, 1, 1, 1], "nothing more started while the first was loading"
+    assert len(processes.engines()) == 2
+
+
+def test_a_model_after_one_that_died_still_starts(tmp_path):
+    """Its failure is reported from its own log; the rest of the card may still serve."""
+    downloaded(tmp_path, BIG, 19_000)
+    downloaded(tmp_path, EMBED, 300)
+    processes = Processes()
+    processes.launch(tmp_path, proxy=True)
+    processes.alive.discard(vllm_launch.read_record(tmp_path)["engines"][0]["pid"])
+    processes.take_turns(tmp_path, ready=lambda port: False)
+    assert len(processes.engines()) == 2
+
+
+def test_separate_cards_start_together_and_each_card_in_turn(tmp_path):
+    downloaded(tmp_path, BIG, 19_000)
+    downloaded(tmp_path, EMBED, 300)
+    processes = Processes()
+    processes.launch(tmp_path, proxy=True, devices=["0", "1"])
+    now = vllm_launch.read_record(tmp_path)["engines"]
+    assert sorted(e["card"] for e in now if e["pid"]) == ["0", "1"], "the first model on each card at once"
+    queues = processes.handed_to_in_turn()
+    assert [[e["card"] for e in queue] for queue in queues] == [["0", "0"], ["1", "1"]]
+
+
+def test_one_model_on_a_card_needs_nothing_started_in_turn(tmp_path):
+    downloaded(tmp_path, BIG, 1000)
+    processes = Processes()
+    started = processes.launch(tmp_path)
+    assert started.in_turn is None and not processes.inputs
+    assert vllm_launch.read_record(tmp_path)["in_turn"] is None
+
+
+def test_a_model_waiting_its_turn_is_not_failed_while_what_starts_it_runs(tmp_path):
+    downloaded(tmp_path, BIG, 19_000)
+    downloaded(tmp_path, EMBED, 300)
+    processes = Processes()
+    processes.launch(tmp_path, proxy=True)
+    alive = lambda pid: pid in processes.alive  # noqa: E731
+    assert vllm_launch.failed_engines(tmp_path, served=[], alive=alive) == {}
+
+    processes.alive.discard(vllm_launch.read_record(tmp_path)["in_turn"]["pid"])
+    waiting = vllm_launch.read_record(tmp_path)["engines"][1]["model"]
+    failed = vllm_launch.failed_engines(tmp_path, served=[], alive=alive)
+    assert set(failed) == {waiting}
+    assert "was never started" in failed[waiting]
+
+
+def test_starting_again_stops_what_starts_models_in_turn_before_anything_else(tmp_path):
+    """Until it has gone it may start one more engine, after the list of what to stop was read."""
+    downloaded(tmp_path, BIG, 19_000)
+    downloaded(tmp_path, EMBED, 300)
+    processes = Processes()
+    first = processes.launch(tmp_path, proxy=True)
+    processes.launch(tmp_path, proxy=True)
+    assert processes.killed[0] == (first.in_turn["pid"], signal.SIGTERM)
+    assert {pid for pid, _ in processes.killed} >= set(first.pids())
+
+
+def test_what_starts_models_in_turn_starts_only_the_launchers_vllm(tmp_path):
+    processes = Processes()
+    planted = [[{"model": "a", "port": 8001, "card": None, "pid": 5, "argv": ["vllm", "serve", "a"], "log": str(tmp_path / "a.log")},
+                {"model": "b", "port": 8002, "card": None, "pid": None, "argv": ["sh", "-c", "anything"], "log": str(tmp_path / "b.log")}]]
+    with pytest.raises(ValueError):
+        vllm_launch.run_in_turn(tmp_path, planted, env={}, popen=processes.popen, ready=lambda port: True,
+                                alive=lambda pid: True, sleep=lambda s: None, say=lambda line: None)
+    assert processes.started == []
+
+
+# --- why an engine stopped, from its log ---
+
+
+def test_the_reason_is_the_engines_own_exception_not_the_line_pointing_at_it(tmp_path):
+    """Found live: all the pool heard was "Engine core initialization failed. See root cause
+    above.", and the machine was gone before anyone could read what was above."""
+    log = tmp_path / "engine.log"
+    log.write_text(
+        "(EngineCore_DP0 pid=95) ERROR 10-29 20:24:58 [core.py:946] EngineCore failed to start.\n"
+        "(EngineCore_DP0 pid=95) ERROR 10-29 20:24:58 [core.py:946] Traceback (most recent call last):\n"
+        '(EngineCore_DP0 pid=95) ERROR 10-29 20:24:58 [core.py:946]     raise ValueError(\n'
+        "(EngineCore_DP0 pid=95) ERROR 10-29 20:24:58 [core.py:946] ValueError: No available memory for the cache blocks. Try increasing `gpu_memory_utilization` when initializing the engine.\n"
+        "(APIServer pid=1) Traceback (most recent call last):\n"
+        '(APIServer pid=1)   File "/usr/lib/python3/vllm/v1/engine/utils.py", line 900, in wait_for_engine_startup\n'
+        "(APIServer pid=1)     raise RuntimeError(\n"
+        "(APIServer pid=1) RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}\n"
+    )
+    assert vllm_launch.last_error_line(str(log)) == (
+        "ValueError: No available memory for the cache blocks. Try increasing `gpu_memory_utilization` "
+        "when initializing the engine."
+    )
+
+
+def test_a_pointer_is_reported_when_nothing_better_is_in_the_log(tmp_path):
+    log = tmp_path / "engine.log"
+    log.write_text("(APIServer pid=1) RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}\n")
+    assert vllm_launch.last_error_line(str(log)).startswith("RuntimeError: Engine core initialization failed")
+
+
+def test_a_reason_far_above_a_long_closing_traceback_is_still_found(tmp_path):
+    log = tmp_path / "engine.log"
+    log.write_text(
+        "(EngineCore_DP0 pid=95) torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB.\n"
+        + "(APIServer pid=1)   File \"/usr/lib/python3/somewhere.py\", line 1, in f\n" * 300
+        + "(APIServer pid=1) RuntimeError: Engine core initialization failed. See root cause above.\n"
+    )
+    assert vllm_launch.last_error_line(str(log)).startswith("torch.OutOfMemoryError: CUDA out of memory")
+
+
+def test_the_helper_runs_as_its_own_process_from_the_plan_on_its_input(tmp_path):
+    """The command the launcher starts, run for real: it reads the plan from its input, starts the
+    next model once the one before has gone, writes it down, and ends."""
+    import os
+    import sys
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    vllm = bin_dir / "vllm"
+    vllm.write_text(f"#!/bin/sh\necho \"$@\" > {tmp_path / 'started'}\n")
+    vllm.chmod(0o755)
+    models = tmp_path / "models"
+    models.mkdir()
+    state = vllm_launch.state_dir_for(models)
+    state.mkdir()
+    gone = 2**22 + 11  # no such process: the first model has exited
+    engines = [
+        {"model": "a", "port": 8001, "card": None, "pid": gone, "log": str(state / "a.log")},
+        {"model": "b", "port": 8002, "card": None, "pid": None, "waiting": True, "log": str(state / "b.log")},
+    ]
+    (state / vllm_launch.STARTED_FILE).write_text(json.dumps({"engines": engines, "in_turn": {"pid": 1}}))
+    (state / vllm_launch.PIDS_FILE).write_text(json.dumps([gone]))
+    plan = [[{**engines[0], "argv": [str(vllm), "serve", "a"]}, {**engines[1], "argv": [str(vllm), "serve", "b"]}]]
+
+    agent_src = Path(vllm_launch.__file__).parents[1]
+    done = subprocess.run(
+        [sys.executable, "-m", "gpm_agent.cli", "vllm-in-turn", "--models-dir", str(models)],
+        input=json.dumps(plan).encode(), capture_output=True, timeout=30,
+        env={**os.environ, "PYTHONPATH": str(agent_src)},
+    )
+    assert done.returncode == 0, done.stderr.decode()
+    assert b"started b on 8002, once a exited" in done.stdout
+    for _ in range(50):  # the fake engine runs on its own
+        if (tmp_path / "started").exists():
+            break
+        time.sleep(0.1)
+    assert (tmp_path / "started").read_text().split() == ["serve", "b"]
+    second = vllm_launch.read_record(models)["engines"][1]
+    assert isinstance(second["pid"], int) and "waiting" not in second
+    assert second["pid"] in json.loads((state / vllm_launch.PIDS_FILE).read_text())

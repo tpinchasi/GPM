@@ -54,6 +54,8 @@ class FakeInstance:
     billed: float = 0.0
     #: What the provider *says* it cost — may deliberately drift from the pool's estimate.
     charge_multiplier: float = 1.0
+    #: The provider's own words for the instance's state, where a test gives it some.
+    reported: Optional[str] = None
     #: Scripted: an interruption warning has been given (D132).
     interrupting: bool = False
     #: The most the pool said it would pay for a spot instance, where it said (D132).
@@ -151,12 +153,14 @@ class FakeProvider:
             for offer in self.offers
         ]
 
-    def evict(self, instance_id: str) -> None:
-        """The provider outbids the pool: the instance stops without being asked to."""
+    def evict(self, instance_id: str, said: Optional[str] = None) -> None:
+        """The provider outbids the pool: the instance stops without being asked to — saying
+        `said` about it, where a test gives the provider words."""
         instance = self.instances[instance_id]
         instance.state = InstanceState.STOPPED
         instance.stopped_by_provider = True
         instance.running_since = None
+        instance.reported = said
 
     def set_spot_price(self, instance_id: str, price: float) -> None:
         """The provider moves a spot instance's price while it runs (D132)."""
@@ -394,6 +398,7 @@ class FakeProvider:
             bid_hourly=found.bid_hourly,
             startup_material=bool(found.spec.onstart),
             interrupting=found.interrupting if self.capabilities.interruption_notice else None,
+            reported=found.reported,
         )
 
     async def connection(self, instance: Instance) -> ConnectionInfo:

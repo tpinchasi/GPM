@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
@@ -39,8 +40,22 @@ def read_record(models_dir: Path) -> Optional[dict[str, Any]]:
         return None
 
 
-def last_error_line(log_path: str, tail_bytes: int = 16384) -> Optional[str]:
-    """The last line of an engine's log that names an error — what the operator would read."""
+#: An exception as Python prints it, closing a traceback: `ValueError: …`, `torch.OutOfMemoryError: …`.
+_EXCEPTION = re.compile(r"(?:^|\s)((?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*(?:Error|Exception)): (\S.*)$")
+
+#: What vLLM's API server says when its engine process failed: true, and never the reason — that
+#: is the engine process's own exception, further up the same log.
+_POINTS_ELSEWHERE = re.compile(r"See root cause above|Engine core initialization failed|Failed core proc")
+
+
+def last_error_line(log_path: str, tail_bytes: int = 65536) -> Optional[str]:
+    """Why an engine stopped, from its log — the line the operator would look for.
+
+    The last exception that is a reason, not a pointer to one. Found live: a vLLM process ended
+    on `RuntimeError: Engine core initialization failed. See root cause above.`, which was all
+    the pool heard, and the machine was gone before anyone could read what was above. A
+    traceback's own source lines (`raise RuntimeError(`) are not exceptions; a pointer is kept
+    only for want of anything better, and a line that merely mentions an error after that."""
     try:
         with open(log_path, "rb") as f:
             f.seek(0, os.SEEK_END)
@@ -48,6 +63,18 @@ def last_error_line(log_path: str, tail_bytes: int = 16384) -> Optional[str]:
             lines = f.read().decode(errors="replace").splitlines()
     except OSError:
         return None
+    pointer: Optional[str] = None
+    for line in reversed(lines):
+        found = _EXCEPTION.search(line)
+        if not found:
+            continue
+        reason = f"{found.group(1)}: {found.group(2).strip()}"[:300]
+        if _POINTS_ELSEWHERE.search(reason):
+            pointer = pointer or reason
+            continue
+        return reason
+    if pointer:
+        return pointer
     for line in reversed(lines):
         if "Error" in line or "error:" in line.lower():
             # vLLM prefixes every line with the process that wrote it; that is not the reason.
@@ -79,9 +106,22 @@ def failed_engines(models_dir: Path, served: Sequence[str],
         return host_platform.alive(pid)
 
     failed: dict[str, str] = {}
+    turns = (record.get("in_turn") or {}).get("pid")
     for engine in record.get("engines") or []:
         name, pid = engine.get("model"), engine.get("pid")
-        if not name or name in served or not isinstance(pid, int):
+        if not name or name in served:
+            continue
+        if pid is None and engine.get("waiting"):
+            # Started in turn, after the model before it on its card (D155): waiting is not
+            # failing while what starts it is still there to do so.
+            if isinstance(turns, int) and is_alive(turns):
+                continue
+            card = engine.get("card")
+            on = "" if card is None else f" on card {card}"
+            failed[name] = (f"its vLLM process{on} was never started: what starts the models on a "
+                            "card one after another stopped before its turn")
+            continue
+        if not isinstance(pid, int):
             continue
         if is_alive(pid):
             continue

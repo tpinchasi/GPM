@@ -3139,12 +3139,20 @@ class Fleet:
                 # premium, and paid ten cents an hour more to outbid itself (D106).
                 continue
 
+            # What the provider said, kept with whatever the pool does next: the only account of
+            # why a machine was lost, once it is destroyed.
+            said = {"provider_said": status.reported} if status.reported else {}
+            if status.reported:
+                log.warning("%s read as stopped; the provider says: %s", host.host_id, status.reported)
+
             if not host.interruptible:
                 # Nobody outbid this one — it is not that kind of rental. Something else
                 # stopped it, so there is nothing to re-bid: give it up and say so (D52).
                 self.events.record(
                     "host_stopped",
-                    f"{host.host_id} stopped, and it was rented on demand so it was not outbid; releasing it",
+                    f"{host.host_id} stopped, and it was rented on demand so it was not outbid; releasing it"
+                    + (f" (the provider says: {status.reported})" if status.reported else ""),
+                    numbers=said,
                     host_id=host.host_id,
                     lease_id=host.lease_id,
                 )
@@ -3164,7 +3172,7 @@ class Fleet:
                     "rebid_lost",
                     f"{host.host_id}: the re-bid at ${host.bid_hourly:.3f}/h did not win "
                     f"{host.offer.machine_id} back within {self.REBID_GRACE_S:.0f}s; releasing it",
-                    numbers={"bid": host.bid_hourly, "machine": host.offer.machine_id},
+                    numbers={"bid": host.bid_hourly, "machine": host.offer.machine_id, **said},
                     host_id=host.host_id,
                     lease_id=host.lease_id,
                 )
@@ -3226,7 +3234,7 @@ class Fleet:
             self.events.record(
                 "eviction",
                 f"{host.host_id} was outbid: {outcome}",
-                numbers={"action": decision.action, "reasons": decision.reasons, "bid": decision.bid},
+                numbers={"action": decision.action, "reasons": decision.reasons, "bid": decision.bid, **said},
                 host_id=host.host_id,
                 lease_id=lease.lease_id,
             )
