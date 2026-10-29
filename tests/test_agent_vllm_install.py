@@ -363,7 +363,7 @@ async def test_a_set_installs_with_real_pip_and_its_vllm_runs_from_where_the_ver
         cards=lambda: [AMPERE], glibc=lambda: "2.35", environ={"GPM_PYPI_INDEX": str(tmp_path / "wheels")},
     )
     engine_dir, server = tmp_path / "engines" / "vllm" / "8000", Started()
-    installer = Installer(vllm_source, engine_dir, server)
+    installer = Installer(vllm_source, engine_dir, server, free_disk_bytes=lambda: 10**12)  # not this disk's
     await installer.want("latest", False)
     await installer.finished()
 
@@ -390,7 +390,7 @@ async def test_a_wheel_that_does_not_match_its_sets_digest_refuses_the_version_a
         environ={"GPM_PYPI_INDEX": str(tmp_path / "wheels")},
     )
     engine_dir, server = tmp_path / "engines" / "vllm" / "8000", Started()
-    installer = Installer(vllm_source, engine_dir, server)
+    installer = Installer(vllm_source, engine_dir, server, free_disk_bytes=lambda: 10**12)  # not this disk's
     await installer.want("0.32.0", False)
     await installer.finished()
 
