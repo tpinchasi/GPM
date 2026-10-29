@@ -10,7 +10,7 @@ from typing import Any
 
 from . import prerequisites, startup, vllm_launch, whisper_cpp
 from . import proxy as proxy_module
-from .settings import DEFAULT_PATH, Settings, SettingsError, fingerprint, load, mint_key, save
+from .settings import AUTO, DEFAULT_PATH, Settings, SettingsError, fingerprint, load, mint_key, save
 
 
 def _init(args: argparse.Namespace) -> int:
@@ -63,8 +63,13 @@ def _init(args: argparse.Namespace) -> int:
     if settings.install_engines:
         # Said now: the agent never stops a program it did not start, so the owner's own copy
         # would keep the port and every install would be refused.
-        print(f"\nThis agent installs {settings.engine} and runs it on {settings.engine_url}. If you run")
-        print(f"{settings.engine} yourself, quit it and remove it from login items first.")
+        if settings.engine == AUTO:
+            print("\nThis agent chooses its engine each time it starts — vLLM on Linux with an NVIDIA card of")
+            print("compute capability 8.0 or higher, Ollama anywhere else — installs it and runs it on")
+            print(f"{settings.engine_url}. If you run either yourself, quit it and remove it from login items first.")
+        else:
+            print(f"\nThis agent installs {settings.engine} and runs it on {settings.engine_url}. If you run")
+            print(f"{settings.engine} yourself, quit it and remove it from login items first.")
     if (
         settings.engine == "whisper-cpp" and not settings.install_engines and not settings.engine_binary
         and shutil.which(whisper_cpp.PROGRAM) is None
@@ -134,7 +139,9 @@ def main(argv: list[str] | None = None) -> int:
     init = verbs.add_parser("init", help="mint the agent key and write this machine's settings")
     init.add_argument("--host", default="127.0.0.1")
     init.add_argument("--port", type=int, default=8095)
-    init.add_argument("--engine", default="ollama", help="which engine this machine runs")
+    init.add_argument("--engine", default="ollama",
+                      help="which engine this machine runs; `auto` lets the agent choose vLLM or Ollama "
+                           "from the machine (with --install-engines)")
     init.add_argument("--engine-url", default=None,
                       help="where the engine answers; the engine's usual address if unset")
     init.add_argument("--models-path", default=None,
@@ -189,6 +196,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     in_turn.add_argument("--models-dir", required=True)
     in_turn.set_defaults(run=vllm_launch.main_in_turn)
+    # Run by the agent that runs vLLM itself (D159), as a program of its own: the agent's process
+    # never imports the launcher (D63).
+    stop = verbs.add_parser("vllm-stop", help="stop what vllm-start last started here")
+    vllm_launch.add_stop_arguments(stop)
+    stop.set_defaults(run=vllm_launch.main_stop)
 
     args = parser.parse_args(argv)
     try:

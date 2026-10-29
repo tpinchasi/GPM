@@ -228,6 +228,20 @@ VLLM_COMMAND = "vllm"
 AUDIO_DECODING = "audio-decoding"
 
 
+def complete_tags(models_dir: str | Path) -> set[str]:
+    """The models in `models_dir` whose every file has landed, by tag — what the launcher would
+    start now (its `complete_models`, read here: the agent never imports the launcher, D63).
+    Cheap, unlike the facts' list: no sizes are added up."""
+    root = Path(models_dir).expanduser()
+    if not root.is_dir():
+        return set()
+    return {
+        directory.name.replace("__", "/", 1)
+        for directory in root.iterdir()
+        if directory.is_dir() and not directory.name.startswith(".") and modelhub.is_complete(directory)
+    }
+
+
 class VllmFacts:
     """vLLM, which differs from the first engine in three ways the agent has to know about.
 
@@ -256,7 +270,9 @@ class VllmFacts:
     #: forever on a machine that has just booted (D97).
     fetches_without_engine = True
     #: A model is "loaded" by starting the engine again with it on disk. The agent fetches and
-    #: reports; the pool, seeing a model downloaded and not yet served, asks for the restart.
+    #: reports; the pool, seeing a model downloaded and not yet served, asks for the restart — or,
+    #: where the agent runs vLLM itself, the agent starts it once every model it holds is on disk
+    #: (`vllm_server`, D159).
     loads_by_restart = True
     #: A model may be split across a group of cards (tensor parallelism, D114); the launcher
     #: reads how many from the environment written here.
@@ -270,9 +286,27 @@ class VllmFacts:
         self.sources: dict[str, tuple[model_volume.Report, float]] = {}
         #: The command whose interpreter is asked about the audio extra: the one the launcher runs.
         self.vllm_command = VLLM_COMMAND
+        #: Where this agent installs vLLM itself (D157): the installer, whose running version's
+        #: program is the one the launcher runs instead.
+        self.installer: Any = None
         #: Whether the image carries vLLM's audio extra (D146): asked once, in the background, and
-        #: kept for the life of this process — the image does not change under it.
+        #: kept for the life of this process — the image does not change under it. Where the agent
+        #: installs vLLM, asked again of each version it runs.
         self._audio_check: Optional[asyncio.Task[Optional[tuple[bool, Optional[str]]]]] = None
+        self._audio_checked: Optional[str] = None
+
+    def use_installer(self, installer: Any) -> None:
+        """Take the `vllm` program from `installer`'s running version from now on (D159)."""
+        self.installer = installer
+
+    def _command(self) -> Optional[str]:
+        """The `vllm` the launcher runs here: the installed version's program where this agent
+        installs vLLM — none until one is — and otherwise the one on the PATH."""
+        installer = self.installer
+        if installer is None:
+            return self.vllm_command
+        running = installer.record.running
+        return str(installer.program(running)) if running else None
 
     @property
     def _models_dir(self) -> str:
@@ -287,7 +321,7 @@ class VllmFacts:
         "not known", never as "missing".
         """
         check = self._audio_check_started()
-        if not check.done() or check.cancelled() or check.exception():
+        if check is None or not check.done() or check.cancelled() or check.exception():
             return {}
         found = check.result()
         if found is None:
@@ -297,17 +331,23 @@ class VllmFacts:
             return {"carries": [AUDIO_DECODING]}
         return {"carries": [], "carries_detail": detail}
 
-    def _audio_check_started(self) -> asyncio.Task[Optional[tuple[bool, Optional[str]]]]:
-        if self._audio_check is None:
+    def _audio_check_started(self) -> Optional[asyncio.Task[Optional[tuple[bool, Optional[str]]]]]:
+        """The check of the program the launcher runs now — started afresh when that changes (a
+        version this agent switched to), and none while there is no such program yet."""
+        command = self._command()
+        if command is None:
+            return None
+        if self._audio_check is None or self._audio_checked != command:
             # In a thread: the import takes seconds, and the event loop answers the pool meanwhile.
-            self._audio_check = asyncio.ensure_future(
-                asyncio.to_thread(machine_facts.audio_extra, self.vllm_command)
-            )
+            self._audio_checked = command
+            self._audio_check = asyncio.ensure_future(asyncio.to_thread(machine_facts.audio_extra, command))
         return self._audio_check
 
     async def carries(self) -> dict[str, Any]:
         """The same, once the check has answered — waiting for it, as `describe` never does."""
-        await asyncio.wait({self._audio_check_started()})
+        check = self._audio_check_started()
+        if check is not None:
+            await asyncio.wait({check})
         return self._carries()
 
     async def describe(self, client: httpx.AsyncClient) -> dict[str, Any]:

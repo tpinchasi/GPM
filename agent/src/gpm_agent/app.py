@@ -11,10 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
+import json
 import logging
+import os
+import sys
 import time
 from pathlib import Path
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Mapping, Optional, Sequence
 from urllib.parse import urlsplit
 
 import httpx
@@ -23,14 +27,16 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from . import PROTOCOL_VERSION, __version__, installs
+from . import PROTOCOL_VERSION, __version__, installs, vllm_install
 from . import platform as host_platform
 from .engine_control import EngineControl
-from .engines import engine_facts
+from .engines import VllmFacts, engine_facts
 from .facts import Probes, disk, gather
 from .models import ModelWork, Refused
 from .ollama_server import OllamaServer
-from .settings import FOREIGN_PREFIXES, INSTALLABLE_ENGINES, Settings
+from .settings import AUTO, AUTO_ENGINES, FOREIGN_PREFIXES, INSTALLABLE_ENGINES, Settings
+from .vllm_server import START_TIMEOUT_S as VLLM_START_TIMEOUT_S
+from .vllm_server import VllmServer
 from .whisper_cpp import InstalledServer, WhisperCppFacts
 
 log = logging.getLogger("gpm_agent")
@@ -51,6 +57,33 @@ def engine_dir_for(engines: Path, settings: Settings) -> Path:
     return engines / settings.engine / str(urlsplit(settings.engine_url).port)
 
 
+def engines_dir_of(settings: Settings) -> Path:
+    """The engines directory: where the owner moved it (`engines_path`), else the system's place."""
+    return Path(settings.engines_path).expanduser() if settings.engines_path else host_platform.engines_dir()
+
+
+def server_for(
+    engine_name: str, settings: Settings, engine_client: httpx.AsyncClient, engine: Any = None,
+) -> Optional[installs.Server]:
+    """The server this agent runs for `engine_name`, as the installer drives it — known by its own
+    record in the engine's directory, so it is found again after the agent restarts. For
+    whisper.cpp, `engine`'s own server, which then takes its program from the installer."""
+    engines = engines_dir_of(settings)
+    engine_dir = engine_dir_for(engines, dataclasses.replace(settings, engine=engine_name))
+    if engine_name == "whisper-cpp":
+        if not isinstance(engine, WhisperCppFacts):
+            return None  # nothing to drive: its server is the engine's own
+        return InstalledServer(engine, engine_client)
+    if engine_name == "vllm":
+        return VllmServer(
+            engine_dir, engine_url=settings.engine_url, models_path=settings.models_path, client=engine_client,
+            engines_dir=engines,
+        )
+    return OllamaServer(
+        engine_dir, engine_url=settings.engine_url, models_path=settings.models_path, client=engine_client,
+    )
+
+
 def default_installer(
     settings: Settings, engine_client: httpx.AsyncClient, engine: Any = None
 ) -> Optional[installs.Installer]:
@@ -58,23 +91,94 @@ def default_installer(
     For whisper.cpp it drives `engine`'s own server, which then takes its program from it."""
     if not settings.install_engines or settings.engine not in INSTALLABLE_ENGINES:
         return None
-    engines = Path(settings.engines_path).expanduser() if settings.engines_path else host_platform.engines_dir()
+    engines = engines_dir_of(settings)
     source = installs.source_for(settings.engine, installs.this_machine(), tools_dir=engines / installs.TOOLS)
     if source is None:
         return None
-    engine_dir = engine_dir_for(engines, settings)
-    if settings.engine == "whisper-cpp":
-        if not isinstance(engine, WhisperCppFacts):
-            return None  # nothing to drive: its server is the engine's own
-        server: installs.Server = InstalledServer(engine, engine_client)
-    else:
-        server = OllamaServer(
-            engine_dir, engine_url=settings.engine_url, models_path=settings.models_path, client=engine_client,
-        )
-    installer = installs.Installer(source, engine_dir, server, min_free_disk_gb=settings.min_free_disk_gb)
+    server = server_for(settings.engine, settings, engine_client, engine)
+    if server is None:
+        return None
+    installer = installs.Installer(
+        source, engine_dir_for(engines, settings), server, min_free_disk_gb=settings.min_free_disk_gb,
+        # vLLM serves once its models are loaded, which takes minutes, not Ollama's second.
+        **({"switch_timeout_s": VLLM_START_TIMEOUT_S} if settings.engine == "vllm" else {}),
+    )
     if isinstance(engine, WhisperCppFacts):
         engine.use_installer(installer)
     return installer
+
+
+# --- an engine of `auto` (D161) ---
+
+#: Where an agent of `auto` records the engine it chose, beside the engines' own directories.
+CHOICE_FILE = "choice.json"
+
+
+def this_python() -> str:
+    """The agent's own Python minor version — the one a vLLM version's environment is made with."""
+    return f"{sys.version_info.major}.{sys.version_info.minor}"
+
+
+def choose_engine(
+    machine: Mapping[str, Any], *, python: Optional[str] = None,
+    sets: Optional[Sequence[vllm_install.LockedSet]] = None,
+) -> dict[str, Any]:
+    """`engine.choice` for an agent of `auto` (D161): vLLM where the machine runs the builds
+    catalogs carry for it — Linux on x86_64 or aarch64, every NVIDIA card Ampere or newer, a
+    driver at the newest locked set's floor, and a set for this Python at all — and Ollama
+    anywhere else, with every reason against vLLM. From the machine alone: its facts
+    (`facts.gather`), as the pool reads them."""
+    os_name, arch = machine.get("os"), machine.get("arch")
+    python = python or this_python()
+    floor = vllm_install.newest_driver_floor(python, arch or "", sets)
+    reasons = vllm_install.machine_can_run(
+        machine.get("accelerators") or [], os_name=os_name or "", arch=arch or "",
+        minimum=vllm_install.AUTO_MIN_CAPABILITY, driver_floor=floor,
+    )
+    if floor is None and os_name == "Linux" and arch in vllm_install.PLATFORMS:
+        # Nothing to install vLLM from here: the sets are generated per Python and processor.
+        reasons.append(f"the agent carries no vLLM set for Python {python} on {arch}")
+    return {"engine": "ollama" if reasons else "vllm", "reasons": reasons}
+
+
+class HandOver:
+    """An agent of `auto` that chose another engine than the last time it started — a card
+    changed, a driver was upgraded — finds the engine it started then still running on the port:
+    engines outlive the agent (D148). Before the chosen one is started, that one is stopped, by its
+    own record, so only what this agent started is ever stopped; then the choice is recorded.
+    Tried on every look until it is done: a stop that fails says so, and is asked again."""
+
+    def __init__(self, record: Path, chosen: str, other: Optional[installs.Server]) -> None:
+        self.record, self.chosen, self.other = record, chosen, other
+        self.done = False
+
+    def recorded(self) -> Optional[str]:
+        try:
+            found = json.loads(self.record.read_text()).get("engine")
+        except (OSError, ValueError, AttributeError):
+            return None
+        return found if found in AUTO_ENGINES else None
+
+    async def settle(self) -> bool:
+        """True once the engine chosen may be started."""
+        if self.done:
+            return True
+        if self.recorded() != self.chosen:
+            if self.other is not None:
+                try:
+                    await self.other.stop()
+                except Exception as exc:  # noqa: BLE001 - said, and asked again on the next look
+                    log.warning("could not stop the engine this agent ran before choosing %s: %s", self.chosen, exc)
+                    return False
+            try:
+                self.record.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                draft = self.record.with_name(self.record.name + ".new")
+                draft.write_text(json.dumps({"engine": self.chosen}))
+                os.replace(draft, self.record)
+            except OSError as exc:
+                log.warning("could not record the engine chosen in %s: %s", self.record, exc)
+        self.done = True
+        return True
 
 
 def create_app(
@@ -84,20 +188,72 @@ def create_app(
     engine_transport: Optional[httpx.AsyncBaseTransport] = None,
     state_path: Optional[Path] = None,
     installer: Optional[installs.Installer] = None,
+    vllm_sets: Optional[Sequence[vllm_install.LockedSet]] = None,
 ) -> Starlette:
-    """The agent. `installer` replaces the one its settings would make — for a test, which points
-    it at a fake repository and fake programs."""
+    """The agent. `installer` replaces the one its settings would make, and `vllm_sets` the locked
+    sets an agent of `auto` chooses by — for a test, which points them at a fake repository, fake
+    programs and a machine of its own."""
     probes = probes or Probes()
+    # Made here rather than at start-up so the app answers the same however it is served.
+    engine_client = httpx.AsyncClient(base_url=settings.engine_url, timeout=10, transport=engine_transport)
+
+    choice: Optional[dict[str, Any]] = None
+    hand_over: Optional[HandOver] = None
+    if settings.engine == AUTO:
+        # Chosen once, as the agent starts, from the machine alone (D161); from then on this agent
+        # is exactly one configured with the engine it chose — its directory, facts and installer.
+        choice = choose_engine(gather(probes, settings.models_path), sets=vllm_sets)
+        settings = dataclasses.replace(settings, engine=choice["engine"])
+        other = next(name for name in AUTO_ENGINES if name != choice["engine"])
+        hand_over = HandOver(
+            engine_dir_for(engines_dir_of(settings), dataclasses.replace(settings, engine=AUTO)) / CHOICE_FILE,
+            choice["engine"], server_for(other, settings, engine_client),
+        )
+        log.info("engine: auto chose %s%s", choice["engine"],
+                 f" ({'; '.join(choice['reasons'])})" if choice["reasons"] else "")
+
     engine = engine_facts(settings.engine, settings)
     if installer is not None and getattr(installer.server, "engine", None) is not None:
         # A server the installer drives through the engine itself (whisper.cpp's): the same
         # object, so the model work and the installer see one record of what runs.
         engine = installer.server.engine
 
-    # Made here rather than at start-up so the app answers the same however it is served.
-    engine_client = httpx.AsyncClient(base_url=settings.engine_url, timeout=10, transport=engine_transport)
     if engine is not None and installer is None:
         installer = default_installer(settings, engine_client, engine)
+    if isinstance(engine, VllmFacts) and installer is not None:
+        engine.use_installer(installer)
+    runs_vllm = installer is not None and isinstance(installer.server, VllmServer)
+
+    async def keep() -> None:
+        """One look at the engine this agent runs: the engine an `auto` agent ran before handed
+        over first, then started if it is not running — and vLLM started again when the models it
+        holds on disk have changed (D159)."""
+        try:
+            if hand_over is not None and not await hand_over.settle():
+                return
+            await installer.ensure_running()
+            if runs_vllm and installer.server.wants_restart():
+                with contextlib.suppress(Refused):  # busy, or not installed yet: the next look
+                    await installer.restart()
+        except Exception:  # noqa: BLE001 - a bad look must never end the looking
+            log.exception("starting the engine again failed")
+
+    #: The look in progress, if any: one at a time, whether the agent's own clock or a pass asked.
+    looking: Optional[asyncio.Task[None]] = None
+
+    def look() -> asyncio.Task[None]:
+        nonlocal looking
+        if looking is None or looking.done():
+            looking = asyncio.create_task(keep(), name="gpm-agent:keep")
+        return looking
+
+    async def before_pass() -> None:
+        """At the start of each of the pool's model passes. Ollama's and whisper.cpp's pass waits
+        for the look, to find an engine to work with; vLLM's does not — its fetch needs no engine,
+        and a start that takes minutes would hold up the fetch of every model meanwhile."""
+        task = look()
+        if not runs_vllm:
+            await asyncio.shield(task)
 
     work = (
         ModelWork(
@@ -106,25 +262,28 @@ def create_app(
             min_free_disk_gb=settings.min_free_disk_gb,
             allow_delete=settings.allow_delete,
             state_path=state_path,
-            before_pass=installer.ensure_running if installer is not None else None,
+            before_pass=before_pass if installer is not None else None,
         )
         if engine is not None else None
     )
+    if runs_vllm and work is not None:
+        # What the pool told this machine to hold, once it has said: the model work starts blank,
+        # and the pool's first pass replaces that with its set.
+        untold = work.desired
+        installer.server.held = lambda: None if work.desired is untold else work.desired.tags
 
     control = EngineControl(settings, engine, engine_client, installer) if engine is not None else None
 
     async def keep_running() -> None:
         """Start the engine this agent runs when the agent starts, and again whenever it stops."""
         while True:
-            try:
-                await installer.ensure_running()
-            except Exception:  # noqa: BLE001 - a bad look must never end the looking
-                log.exception("starting the engine again failed")
+            with contextlib.suppress(Exception):  # said by `keep`; a bad look never ends the looking
+                await asyncio.shield(look())
             await asyncio.sleep(KEEP_EVERY_S)
 
     @contextlib.asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
-        keeper = asyncio.create_task(keep_running(), name="gpm-agent:keep") if installer is not None else None
+        keeper = asyncio.create_task(keep_running(), name="gpm-agent:keeping") if installer is not None else None
         try:
             yield
         finally:
@@ -132,6 +291,10 @@ def create_app(
                 keeper.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await keeper
+            if looking is not None and not looking.done():
+                looking.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await looking
             if installer is not None:
                 # The server is left running: it outlives the agent, which knows it again on return.
                 await installer.aclose()
@@ -168,6 +331,10 @@ def create_app(
             # Something answering on the engine's port that this agent did not start: reported,
             # and left alone (D150).
             described["foreign"] = bool(described.get("answers")) and not installer.server.ours()
+        if choice is not None:
+            # Which engine an agent of `auto` chose, and every reason against vLLM (D161): the
+            # pool publishes the host's engine from this, and holds nothing there until it is said.
+            described["choice"] = {"engine": choice["engine"], "reasons": list(choice["reasons"])}
         applied = control.applied() if control is not None else None
         body: dict[str, Any] = {
             "agent": {"version": __version__, "protocol": PROTOCOL_VERSION},
@@ -282,4 +449,7 @@ def create_app(
     )
     app.state.work = work
     app.state.installer = installer
+    #: One look at the engine this agent runs, as its own clock takes them — for a test, which
+    #: serves the app without its lifespan.
+    app.state.look = look if installer is not None else None
     return app
