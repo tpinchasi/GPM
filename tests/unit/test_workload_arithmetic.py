@@ -168,9 +168,28 @@ def test_a_target_met_with_nothing_measured_above_is_not_a_limit():
     and no card of its class could hold it beside another."""
     got = w.workers_at_latency(samples(1, 3.0) + samples(2, 2.8, n=w.MIN_SAMPLES - 1), target_s=60, ceiling=16)
     assert got.workers is None and not got.measured, "the card's own number"
-    assert "nothing above it has been measured" in got.reasons[0]
+    assert "nothing measured above it missed the target" in got.reasons[0]
 
 
 def test_a_measured_level_that_missed_the_target_still_caps_it():
     got = w.workers_at_latency(samples(1, 3.0) + samples(4, 90.0), target_s=60, ceiling=16)
     assert got.workers == 1 and got.measured
+
+
+def test_a_miss_measured_above_the_cards_number_still_caps_it():
+    """The log is kept per class of card: a bigger machine of the class that missed at 16 limits
+    a smaller one whose own number is 8, as it did before D156."""
+    got = w.workers_at_latency(samples(4, 3.0) + samples(16, 90.0), target_s=60, ceiling=8)
+    assert got.workers == 4 and got.measured
+
+
+def test_a_level_measured_within_target_at_the_cards_number_is_measured():
+    got = w.workers_at_latency(samples(8, 50.0) + samples(16, 90.0), target_s=60, ceiling=8)
+    assert got.workers == 8 and got.measured
+    got = w.workers_at_latency(samples(8, 50.0), target_s=60, ceiling=8)
+    assert got.workers == 8 and got.measured
+
+
+def test_a_level_above_the_cards_number_that_met_the_target_refutes_nothing():
+    got = w.workers_at_latency(samples(2, 3.0) + samples(32, 20.0), target_s=60, ceiling=16)
+    assert got.workers is None and not got.measured

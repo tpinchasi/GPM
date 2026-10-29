@@ -66,10 +66,10 @@ def workers_at_latency(
     exceeds `ceiling` — the capacity profile's number for the card, which is what the engine was
     sized for — and is None when no measured concurrency met the target or nothing was measured:
     a target is a wish until there is a log. It is None too — the card's own number, unmeasured —
-    when the target was met and nothing measured above that level up to the card's number failed
-    it (D156): the log then says nothing against more. Found live: Gemma 4 E4B measured at one
-    answer at a time, 3 s at p95 against a 60 s target, was sized at one, and no card of the
-    class could hold it beside another model.
+    when the best level met the target below the card's number and no level measured above it
+    missed the target (D156): a measured number nothing refutes is a floor, not a ceiling. Found
+    live: Gemma 4 E4B measured at one answer at a time, 3 s at p95 against a 60 s target, was
+    sized at one, and no card of the class could hold it beside another model.
     """
     by_concurrency: dict[int, list[float]] = {}
     for concurrency, latency in samples:
@@ -90,11 +90,13 @@ def workers_at_latency(
                      f"the card's own number is used, and the target will not be met on this class"],
         )
     best = max(meeting)
-    if not any(best < c <= ceiling for c in curve):
+    # Any measured miss above it is a limit, wherever it was measured — above the card's number
+    # too: the log is kept per class of card, and a bigger machine of the class may have missed.
+    if best < ceiling and not any(c > best and value > target_s for c, value in curve.items()):
         return AtLatency(
             workers=None, measured=False, curve=curve,
-            reasons=[f"{best} at once measured {curve[best]:g}s at p95, within {target_s:g}s, and nothing above it "
-                     "has been measured; the card's own number is used, unmeasured beyond it"],
+            reasons=[f"{best} at once measured {curve[best]:g}s at p95, within {target_s:g}s, and nothing measured "
+                     f"above it missed the target; the card's own number is used, unmeasured beyond {best}"],
         )
     return AtLatency(
         workers=best, measured=True, curve=curve,
