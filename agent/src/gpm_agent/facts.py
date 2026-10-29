@@ -154,6 +154,68 @@ def memory(probes: Probes) -> dict[str, Optional[int]]:
     return {"total_bytes": fields.get("MemTotal"), "available_bytes": fields.get("MemAvailable")}
 
 
+#: What an NVIDIA card's compute capability and its driver's version look like as `nvidia-smi`
+#: prints them ("8.6", "575.51.03"); anything else is not taken for one.
+_CAPABILITY = re.compile(r"\d+\.\d+")
+_DRIVER = re.compile(r"\d+(\.\d+)+")
+
+#: The query for each card's name and memory, the one every NVIDIA driver answers.
+NVIDIA_CARDS = ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"]
+#: Each card's compute capability and the driver's version (D157, D161), asked apart: a driver
+#: too old to know `compute_cap` refuses the whole query it is in, and must not cost the card its
+#: name and memory. Where it refuses, the driver's version is asked alone (`NVIDIA_DRIVER`).
+NVIDIA_DETAILS = ["nvidia-smi", "--query-gpu=compute_cap,driver_version", "--format=csv,noheader"]
+NVIDIA_DRIVER = ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"]
+
+
+def _nvidia_details(probes: Probes, count: int) -> list[dict[str, str]]:
+    """Each card's compute capability and driver's version, in the order `nvidia-smi` lists the
+    cards — nothing for a card whose line does not read as one, and nothing at all where the
+    lines are not one a card, since which card each belongs to would then be a guess."""
+    said = probes.run(NVIDIA_DETAILS)
+    if said is not None:
+        lines = [line for line in said.splitlines() if line.strip()]
+        if len(lines) != count:
+            return [{} for _ in range(count)]
+        details = []
+        for line in lines:
+            capability, _, driver = (part.strip() for part in line.partition(","))
+            found = {}
+            if _CAPABILITY.fullmatch(capability):
+                found["compute_capability"] = capability
+            if _DRIVER.fullmatch(driver):
+                found["driver"] = driver
+            details.append(found)
+        return details
+    said = probes.run(NVIDIA_DRIVER)
+    lines = [line.strip() for line in (said or "").splitlines() if line.strip()]
+    if len(lines) != count:
+        return [{} for _ in range(count)]
+    return [{"driver": line} if _DRIVER.fullmatch(line) else {} for line in lines]
+
+
+def nvidia_cards(probes: Probes) -> Optional[list[dict[str, Any]]]:
+    """The NVIDIA cards `nvidia-smi` lists — each with its compute capability and the driver's
+    version where those could be read — or None where it did not answer: no driver, or none
+    that works."""
+    said = probes.run(NVIDIA_CARDS)
+    if said is None:
+        return None
+    cards = []
+    for line in said.splitlines():
+        name, _, mebibytes = line.rpartition(",")
+        size = _int(mebibytes)
+        if name.strip():
+            cards.append({
+                "kind": "cuda", "name": name.strip(),
+                "memory_bytes": size * 1024 * 1024 if size is not None else None, "unified": False,
+            })
+    if cards:
+        for card, details in zip(cards, _nvidia_details(probes, len(cards)), strict=True):
+            card.update(details)
+    return cards
+
+
 def accelerators(probes: Probes) -> Optional[list[dict[str, Any]]]:
     """Accelerators found, or None when this machine gave no way to tell."""
     found: list[dict[str, Any]] = []
@@ -168,19 +230,10 @@ def accelerators(probes: Probes) -> Optional[list[dict[str, Any]]]:
             "memory_bytes": _int(probes.run(["sysctl", "-n", "hw.memsize"])), "unified": True,
         })
 
-    nvidia = probes.run(
-        ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"]
-    )
+    nvidia = nvidia_cards(probes)
     if nvidia is not None:
         could_tell = True
-        for line in nvidia.splitlines():
-            name, _, mebibytes = line.rpartition(",")
-            size = _int(mebibytes)
-            if name.strip():
-                found.append({
-                    "kind": "cuda", "name": name.strip(),
-                    "memory_bytes": size * 1024 * 1024 if size is not None else None, "unified": False,
-                })
+        found.extend(nvidia)
 
     # On Windows NVIDIA's cards are all this asks about — `nvidia-smi` ships with the driver there
     # too — and nothing else is claimed: there a machine without NVIDIA's answer is one this could
