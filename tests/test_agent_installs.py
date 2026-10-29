@@ -865,6 +865,120 @@ async def test_a_cut_download_resumes_where_it_stopped(rig):
     assert not (rig.engines / "ollama" / "downloads").exists() or not any((rig.engines / "ollama" / "downloads").iterdir())
 
 
+class Scripted:
+    """A source each attempt at which is timed, and fails or succeeds as the test says: what the
+    installer does after a failure, apart from what fails. A version staged is one small file."""
+
+    engine, signature = "ollama", "not checked"
+
+    def __init__(self, clock) -> None:
+        self.clock = clock
+        self.newest = V1
+        self.fails = True
+        self.attempts: list[tuple[float, str]] = []
+
+    async def latest(self, http) -> installs.Release:
+        return installs.Release(self.newest, f"v{self.newest}", ())
+
+    async def release(self, http, version: str) -> installs.Release:
+        return installs.Release(version, f"v{version}", ())
+
+    async def stage(self, http, release, into, progress, room=None) -> None:
+        self.attempts.append((self.clock(), release.version))
+        if self.fails:
+            raise InstallRefused(f"ollama {release.version}, installed, does not run")
+        (into / "ollama").write_text(release.version)
+
+    def program(self, version_dir: Path) -> Path:
+        return version_dir / "ollama"
+
+
+def scripted(tmp_path: Path) -> tuple[Scripted, Installer, list[float]]:
+    now = [1_800_000_000.0]
+    source = Scripted(lambda: now[0])
+    return source, Installer(source, tmp_path / "engines" / "ollama", StandInServer(), clock=lambda: now[0]), now
+
+
+async def asked_every_minute(installer: Installer, now: list[float], version: str, minutes: int) -> None:
+    """The pool's passes: the same version asked for each minute."""
+    for _ in range(minutes):
+        await installer.want(version, False)
+        await installer.finished()
+        now[0] += 60
+
+
+def waits(attempts: list[tuple[float, str]]) -> list[float]:
+    times = [when for when, _ in attempts]
+    return [later - earlier for earlier, later in zip(times, times[1:], strict=False)]
+
+
+async def test_a_version_failing_again_and_again_is_tried_ever_less_often_up_to_six_hours(tmp_path):
+    """A failure late in an install — a check, a disk that fills, the time limit — fetches the
+    whole version again on each attempt: some 4 GB for vLLM. Five minutes after the first
+    failure, then twice as long after each in a row, up to six hours."""
+    source, installer, now = scripted(tmp_path)
+    await asked_every_minute(installer, now, V1, 30 * 60)
+    assert waits(source.attempts) == [300, 600, 1200, 2400, 4800, 9600, 19200, 21600, 21600, 21600]
+    assert installer.state()["error"] == f"ollama {V1}, installed, does not run"
+
+
+async def test_once_a_version_is_staged_the_next_failure_waits_five_minutes_again(tmp_path):
+    source, installer, now = scripted(tmp_path)
+    await asked_every_minute(installer, now, "latest", 60)
+    assert waits(source.attempts) == [300, 600, 1200]
+
+    source.fails = False
+    now[0] += installs.RETRY_AT_MOST_S
+    await asked_every_minute(installer, now, "latest", 1)
+    assert installer.state()["running"] == V1
+
+    # A newer release, read once the latest is no longer fresh, fails as the last one did.
+    source.newest, source.fails, source.attempts = V2, True, []
+    now[0] += installs.LATEST_EVERY_S
+    await asked_every_minute(installer, now, "latest", 30)
+    assert [version for _, version in source.attempts] == [V2, V2, V2] and waits(source.attempts) == [300, 600]
+
+
+async def test_another_version_asked_for_is_tried_at_once_and_waits_from_five_minutes(tmp_path):
+    source, installer, now = scripted(tmp_path)
+    await asked_every_minute(installer, now, V1, 60)
+    assert waits(source.attempts) == [300, 600, 1200]
+    source.attempts = []
+    await asked_every_minute(installer, now, V2, 20)
+    assert source.attempts[0] == (1_800_000_000.0 + 60 * 60, V2) and waits(source.attempts) == [300, 600]
+
+
+async def test_versions_are_removed_away_from_the_event_loop_the_agent_answers_on(tmp_path, monkeypatch):
+    """A version of vLLM is some 8 GB in tens of thousands of files: removing one takes seconds,
+    in which the agent would answer no one. Every version and half-staged directory goes in a
+    thread — the ones pruned, and a failed stage's."""
+    removed: list[tuple[str, bool]] = []
+    real = shutil.rmtree
+
+    def rmtree(path, *args, **kwargs):
+        removed.append((Path(path).name, threading.current_thread() is threading.main_thread()))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(installs.shutil, "rmtree", rmtree)
+    source, installer, now = scripted(tmp_path)
+    source.fails = False
+    for version in (V1, V2, V3):
+        source.newest = version
+        await installer.want(version, False)
+        await installer.finished()
+        if installer.record.staged:
+            await installer.want(version, True)
+            await installer.finished()
+    source.fails = True
+    await installer.want("0.42.0", False)
+    await installer.finished()
+
+    assert (installer.record.running, installer.record.previous) == (V3, V2)
+    assert {p.name for p in installer.engine_dir.iterdir() if p.is_dir()} == {V2, V3}
+    assert (V1, False) in removed and ("0.42.0.partial", False) in removed
+    assert all(not on_the_loop for _, on_the_loop in removed), removed
+
+
 async def test_an_archive_reaching_outside_is_refused_and_nothing_of_it_stays(rig):
     rig.github.publish(V1, {"ollama-darwin.tgz": tgz([("ollama", rig.program(V1), 0o755), ("../../escaped", b"x", 0o644)])})
     await rig.want(V1)
