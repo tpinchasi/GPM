@@ -37,8 +37,9 @@ stand (`Installer.state`), and the pool reads how it went on its next passes.
 A **source** is what one engine's releases are made into a version directory by (`Source`).
 Ollama's are archives (`ArchiveSource`, with the table's `OLLAMA` row); whisper.cpp's are built
 from the release's source on macOS and Linux and taken from its own archives on Windows
-(`whisper_build.WhisperCppSource`, with the table's `WHISPER_CPP` row), through the same four
-operations.
+(`whisper_build.WhisperCppSource`, with the table's `WHISPER_CPP` row); vLLM's are private
+Python environments filled from PyPI with the locked set the agent carries for each version
+(`vllm_install.VllmSource`, with the table's `VLLM` row) — through the same four operations.
 """
 
 from __future__ import annotations
@@ -701,7 +702,23 @@ WHISPER_CPP = BuiltRelease(
     driver_floors={"cuda-12.4": (550, 0), "cuda-11.8": (452, 39)},
 )
 
-RELEASES: dict[str, ArchiveRelease | BuiltRelease] = {"ollama": OLLAMA, "whisper-cpp": WHISPER_CPP}
+@dataclasses.dataclass(frozen=True)
+class LockedRelease:
+    """An engine installed from PyPI's wheels, only as one of the locked sets the agent carries
+    says (D158): its versions are the sets', never PyPI's listing."""
+
+    engine: str
+    #: The project on PyPI.
+    project: str
+
+
+#: vLLM (D157, D158): a private Python environment per version, from its locked set
+#: (`vllm_install.VllmSource`).
+VLLM = LockedRelease(engine="vllm", project="vllm")
+
+RELEASES: dict[str, ArchiveRelease | BuiltRelease | LockedRelease] = {
+    "ollama": OLLAMA, "whisper-cpp": WHISPER_CPP, "vllm": VLLM,
+}
 
 
 class ArchiveSource(GitHubReleases):
@@ -823,6 +840,10 @@ def source_for(
         from .whisper_build import WhisperCppSource
 
         return WhisperCppSource(table, target, tools_dir=tools_dir)
+    if isinstance(table, LockedRelease):
+        from .vllm_install import VllmSource
+
+        return VllmSource(target)
     return None
 
 

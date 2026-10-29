@@ -8,10 +8,13 @@ command is the exact argument list, and what is left is said with the command th
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 from gpm_agent import cli, prerequisites, startup
 from gpm_agent.settings import Settings, fingerprint, save
 from gpm_agent.startup import Machine, Ran
+from gpm_agent.vllm_install import LockedSet
 
 
 class Runner:
@@ -43,7 +46,8 @@ def a_machine(system, on_path=(), runner=None, interactive=True):
 
 def test_only_whisper_cpp_needs_anything_and_a_compiler_only_where_the_agent_builds_it():
     assert prerequisites.needs("ollama", True, "Linux") == []
-    assert prerequisites.needs("vllm", True, "Linux") == []
+    # vLLM its owner installed needs nothing of this command; one the agent installs, below.
+    assert prerequisites.needs("vllm", False, "Linux") == []
     assert prerequisites.needs("whisper-cpp", False, "Linux") == ["ffmpeg"]
     assert prerequisites.needs("whisper-cpp", True, "Darwin") == ["ffmpeg", "command-line tools"]
     assert prerequisites.needs("whisper-cpp", True, "Linux") == ["ffmpeg", "compiler"]
@@ -180,3 +184,147 @@ def test_init_fails_while_a_prerequisite_is_still_needed(monkeypatch, tmp_path, 
     assert cli.main(["-c", str(path), "init", "--engine", "whisper-cpp", "--prerequisites"]) == 1
     out = capsys.readouterr().out
     assert path.exists() and "Agent key" in out and "Still needed" in out and runner.commands == []
+
+
+# --- vLLM, where the agent installs it (D157, D158) ---
+
+SETS = (
+    LockedSet(vllm="0.31.0", python="3.12", platform="x86_64", driver_floor="525.60.13", requirements="", size_bytes=1),
+    LockedSet(vllm="0.32.0", python="3.12", platform="x86_64", driver_floor="580.65.06", requirements="", size_bytes=1),
+    LockedSet(vllm="0.32.0", python="3.13", platform="x86_64", driver_floor="580.65.06", requirements="", size_bytes=1),
+)
+HERE = prerequisites.ForVllm(python="3.12", processor="x86_64", sets=SETS)
+
+
+class VllmMachine(Runner):
+    """A Linux machine as vLLM's checks see it: whether the agent's Python makes an environment,
+    and what `nvidia-smi` says of the driver (None: it does not run)."""
+
+    def __init__(self, venv_works=True, driver="580.95.05"):
+        super().__init__()
+        self.venv_works, self.driver = venv_works, driver
+
+    def __call__(self, argv, *, on_terminal=False):
+        self.calls.append((list(argv), on_terminal))
+        if argv[1:4] == ["-I", "-m", "venv"]:
+            return Ran(0) if self.venv_works else Ran(1, "The virtual environment was not successfully created because ensurepip is not available.")
+        if argv[0] == "nvidia-smi":
+            return Ran(0, f"{self.driver}\n{self.driver}\n") if self.driver else Ran(127, "nvidia-smi was not found")
+        return Ran(0)
+
+
+def test_vllm_the_agent_installs_needs_venv_a_set_and_a_driver_on_linux_and_linux_elsewhere():
+    assert prerequisites.needs("vllm", True, "Linux") == ["venv", "vllm set", "nvidia driver"]
+    assert prerequisites.needs("vllm", True, "Darwin") == ["linux"]
+    assert prerequisites.needs("vllm", True, "Windows") == ["linux"]
+
+
+def test_a_machine_ready_for_vllm_is_told_so_and_nothing_runs_with_sudo():
+    runner = VllmMachine()
+    report = prerequisites.ensure(a_machine("Linux", ("apt-get",), runner), engine="vllm", install_engines=True, admin=True, vllm=HERE)
+    assert [need for need, _ in report.present] == ["venv", "vllm set", "nvidia driver"]
+    assert report.installed == [] and report.still_needed == []
+    assert dict(report.present)["nvidia driver"] == "580.95.05, at or above vLLM 0.32.0's 580.65.06"
+    # The environment is tried as the installer makes it: the agent's own Python, isolated, in a
+    # directory of its own.
+    venv = next(argv for argv in runner.commands if "venv" in argv)
+    assert venv[:4] == ["/usr/bin/python3", "-I", "-m", "venv"] and venv[4].endswith("/venv")
+    assert not any(argv[0] == "sudo" for argv in runner.commands)
+
+
+def test_pythons_venv_is_installed_through_apt_on_the_owners_word_and_printed_otherwise(capsys):
+    runner = VllmMachine(venv_works=False)
+    machine = a_machine("Linux", ("apt-get",), runner)
+    report = prerequisites.ensure(machine, engine="vllm", install_engines=True, admin=True, vllm=HERE)
+    assert report.installed == [("venv", "sudo apt-get install -y python3-venv")]
+    assert ["sudo", "apt-get", "install", "-y", "python3-venv"] in runner.commands
+
+    runner = VllmMachine(venv_works=False)
+    assert prerequisites.run(a_machine("Linux", ("apt-get",), runner), engine="vllm", install_engines=True, admin=False, vllm=HERE) == 1
+    assert "sudo apt-get install -y python3-venv" in capsys.readouterr().out
+    assert not any(argv[0] == "sudo" for argv in runner.commands)
+
+
+def test_dnf_names_no_package_for_venv_and_says_whose_python_lacks_it():
+    runner = VllmMachine(venv_works=False)
+    report = prerequisites.ensure(a_machine("Linux", ("dnf",), runner), engine="vllm", install_engines=True, admin=True, vllm=HERE)
+    assert report.still_needed == [(
+        "venv", "install Python's venv module, for the agent's own Python (/usr/bin/python3) with this distribution's package manager",
+    )]
+    assert not any(argv[0] == "sudo" for argv in runner.commands)
+
+
+@pytest.mark.parametrize(("driver", "said"), [
+    ("575.51.03", "the NVIDIA driver here is 575.51.03: install NVIDIA's driver 580.65.06 or later, which vLLM 0.32.0's CUDA needs"),
+    (None, "no NVIDIA driver answers here (nvidia-smi does not run): install NVIDIA's driver 580.65.06 or later"),
+])
+def test_a_driver_missing_or_older_than_the_newest_sets_floor_is_said_and_never_installed(driver, said, capsys):
+    """The newest set's floor, not an older one's that the driver would meet; and with --admin at
+    a terminal still nothing is installed for it: a driver is the owner's to choose, with a restart."""
+    runner = VllmMachine(driver=driver)
+    machine = a_machine("Linux", ("apt-get",), runner)
+    assert prerequisites.run(machine, engine="vllm", install_engines=True, admin=True, vllm=HERE) == 1
+    out = capsys.readouterr().out
+    assert said in out and "the agent never installs a driver" in out
+    assert "an NVIDIA driver new enough for vLLM's CUDA" in out
+    assert not any(argv[0] == "sudo" for argv in runner.commands)
+
+
+def test_a_python_the_agent_carries_no_set_for_is_told_which_it_does():
+    runner = VllmMachine()
+    other = prerequisites.ForVllm(python="3.15", processor="x86_64", sets=SETS)
+    report = prerequisites.ensure(a_machine("Linux", ("apt-get",), runner), engine="vllm", install_engines=True, admin=True, vllm=other)
+    (need, how), = report.still_needed
+    assert need == "vllm set"
+    assert how == (
+        "this agent runs on Python 3.15, and carries vLLM's sets for Python 3.12, 3.13 on x86_64: install it on one "
+        "of those (`uv tool install --python 3.13 gpm-agent`)"
+    )
+    odd = prerequisites.ForVllm(python="3.12", processor="ppc64le", sets=SETS)
+    report = prerequisites.ensure(a_machine("Linux", ("apt-get",), runner), engine="vllm", install_engines=True, admin=True, vllm=odd)
+    assert ("vllm set", "vLLM publishes no build for the ppc64le processor") in report.still_needed
+
+
+def test_vllm_on_a_mac_is_told_it_runs_on_linux_only(capsys):
+    machine = a_machine("Darwin", ("brew",), Runner())
+    assert prerequisites.run(machine, engine="vllm", install_engines=True, admin=True, vllm=HERE) == 1
+    out = capsys.readouterr().out
+    assert "Linux, for vLLM" in out and "vLLM publishes its builds for Linux only" in out
+    assert machine.run.commands == []
+
+
+def test_the_sets_the_agent_carries_are_what_prerequisites_judge_by_unless_told():
+    """`ForVllm.this()`: the agent's own Python and this processor, and the sets in the agent."""
+    here = prerequisites.ForVllm.this()
+    assert here.sets is None and here.python == f"{sys.version_info.major}.{sys.version_info.minor}"
+
+
+# --- an engine of `auto` (D161): the needs of the engine the agent would choose here ---
+
+
+def probes_with_card(capability: str, driver: str):
+    """This machine's facts as the agent's choice reads them: Linux on x86_64, one NVIDIA card."""
+    from gpm_agent.facts import NVIDIA_CARDS, NVIDIA_DETAILS, Probes
+
+    answers = {tuple(NVIDIA_CARDS): "NVIDIA RTX A6000, 49140\n", tuple(NVIDIA_DETAILS): f"{capability}, {driver}\n"}
+    return Probes(system=lambda: "Linux", machine=lambda: "x86_64", run=lambda argv: answers.get(tuple(argv)),
+                  read=lambda path: None)
+
+
+def test_auto_installs_what_the_engine_it_would_choose_here_needs_and_says_why_not_vllm(monkeypatch, capsys):
+    from gpm_agent import app as agent_app
+
+    monkeypatch.setattr(agent_app, "this_python", lambda: "3.12")
+    monkeypatch.setattr(agent_app.vllm_install, "load_sets", lambda *a, **k: list(SETS))
+    settings = Settings(key_hash="x", engine="auto", install_engines=True)
+    machine = a_machine("Linux", ("apt-get",), VllmMachine())
+
+    assert prerequisites.run_for(machine, settings, admin=True, probes=probes_with_card("8.6", "580.95.05"), vllm=HERE) == 0
+    out = capsys.readouterr().out
+    assert "on this machine the agent runs vllm" in out and "What vllm needs on this machine" in out
+
+    # A Turing card: Ollama, which needs nothing here — and the owner is told why not vLLM.
+    assert prerequisites.run_for(machine, settings, admin=True, probes=probes_with_card("7.5", "580.95.05"), vllm=HERE) == 0
+    out = capsys.readouterr().out
+    assert "the agent runs ollama; not vLLM: NVIDIA RTX A6000 has compute capability 7.5" in out
+    assert "Nothing to install for ollama" in out

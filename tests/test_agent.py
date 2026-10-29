@@ -70,6 +70,62 @@ def test_every_cuda_card_is_listed_with_its_own_memory():
     assert found["memory"]["total_bytes"] == 131072000 * 1024
 
 
+def nvidia_box(details=None, driver=None):
+    """A Linux machine with two NVIDIA cards, by what each of `nvidia-smi`'s queries prints: None
+    for a query its driver refuses, as an old one refuses a field it does not know."""
+    outputs = {
+        " ".join(agent_facts.NVIDIA_CARDS): "NVIDIA RTX A6000, 49140\nNVIDIA GeForce RTX 2080 Ti, 11264\n",
+        " ".join(agent_facts.NVIDIA_DETAILS): details,
+        " ".join(agent_facts.NVIDIA_DRIVER): driver,
+    }
+    asked = []
+
+    def run(command):
+        asked.append(" ".join(command))
+        return outputs.get(" ".join(command))
+
+    return agent_facts.Probes(system=lambda: "Linux", machine=lambda: "x86_64", run=run, read=lambda path: None), asked
+
+
+def test_an_nvidia_card_says_its_compute_capability_and_driver():
+    """What vLLM's floor (7.5) and `engine: auto`'s (8.0) are judged by, and the locked set's
+    driver (D157, D161)."""
+    probes, _ = nvidia_box(details="8.6, 575.51.03\n7.5, 575.51.03\n")
+    cards = agent_facts.accelerators(probes)
+    assert [(c["name"], c["compute_capability"], c["driver"]) for c in cards] == [
+        ("NVIDIA RTX A6000", "8.6", "575.51.03"), ("NVIDIA GeForce RTX 2080 Ti", "7.5", "575.51.03"),
+    ]
+    assert cards[0]["memory_bytes"] == 49140 * 1024 * 1024
+
+
+def test_a_driver_that_does_not_know_compute_cap_keeps_the_cards_name_memory_and_its_version():
+    """An old driver refuses the whole query a field it does not know is in: asked apart, so the
+    card is still listed, and its driver's version — what the owner must change — is asked alone."""
+    probes, asked = nvidia_box(details=None, driver="470.82.01\n470.82.01\n")
+    cards = agent_facts.accelerators(probes)
+    assert [c["name"] for c in cards] == ["NVIDIA RTX A6000", "NVIDIA GeForce RTX 2080 Ti"]
+    assert [c["memory_bytes"] for c in cards] == [49140 * 1024 * 1024, 11264 * 1024 * 1024]
+    assert all("compute_capability" not in c and c["driver"] == "470.82.01" for c in cards)
+    assert asked[:3] == [" ".join(q) for q in (agent_facts.NVIDIA_CARDS, agent_facts.NVIDIA_DETAILS, agent_facts.NVIDIA_DRIVER)]
+
+    probes, _ = nvidia_box(details=None, driver=None)
+    assert all(set(c) == {"kind", "name", "memory_bytes", "unified"} for c in agent_facts.accelerators(probes))
+
+
+@pytest.mark.parametrize("details", [
+    "8.6, 575.51.03\n",                      # one line for two cards: which is whose would be a guess
+    "[N/A], 575.51.03\nwhat, ever\n",       # not a capability, not a version
+])
+def test_details_that_do_not_read_as_each_cards_own_are_left_out_never_guessed(details):
+    probes, _ = nvidia_box(details=details)
+    cards = agent_facts.accelerators(probes)
+    assert all("compute_capability" not in c for c in cards)
+    if details.count("\n") == 2:
+        assert cards[0]["driver"] == "575.51.03" and "driver" not in cards[1]
+    else:
+        assert all("driver" not in c for c in cards)
+
+
 def test_no_accelerator_and_could_not_tell_are_different_answers():
     """The pool derives nothing from silence, so the agent must not turn one into the other."""
     assert agent_facts.gather(PLAIN_LINUX, "/models")["capabilities"] == []
@@ -225,17 +281,18 @@ def test_the_agent_never_runs_a_shell_or_a_command_it_was_given():
                 if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "argv" for t in node.targets)]
     assert assigned == ["self.launcher_argv(program, models)"]
 
-    # What runs through `run_command`, and from where: whisper.cpp's build and checks (D152). Each
-    # command is a literal list — a fixed program, or a path the agent found, then constants — or
-    # comes from one of the builders that write the build's argument lists; nothing else.
-    builders = {"configure_argv", "build_argv", "venv_argv", "pip_argv", "help_argv"}
+    # What runs through `run_command`, and from where: whisper.cpp's build and checks (D152), and
+    # vLLM's environment, pip and its check (D157, D158). Each command is a literal list — a fixed
+    # program, or a path the agent found, then constants — or comes from one of the builders that
+    # write those argument lists; nothing else.
+    builders = {"configure_argv", "build_argv", "venv_argv", "pip_argv", "help_argv", "check_argv"}
     for name in sorted(path.name for path in root.glob("*.py")):
         text = (root / name).read_text()
         if "host_platform.run_command" not in text and "platform import run_command" not in text:
             continue  # startup.py has a `run_command` of its own, for the owner's commands
         if name == "vllm_server.py":
             continue  # its launcher and stop, above
-        assert name in ("whisper_build.py", "whisper_cpp.py"), f"{name} runs commands"
+        assert name in ("whisper_build.py", "whisper_cpp.py", "vllm_install.py"), f"{name} runs commands"
         tree = ast.parse(text)
         runs = [
             node for node in ast.walk(tree) if isinstance(node, ast.Call) and (

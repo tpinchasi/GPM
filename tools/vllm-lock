@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""Generate vLLM's locked sets, for a release of GPM (D158).
+
+The agent installs vLLM on a machine its owner gives it only from a locked set: every wheel —
+`vllm`'s and each dependency's, torch's and CUDA's libraries among them — pinned, with its
+sha256, for one Python minor version and one processor, and the least NVIDIA driver the set's
+CUDA needs. GPM's release runs this for each vLLM version it supports and commits what it writes
+(docs/release-checklist.md):
+
+    tools/vllm-lock 0.32.0
+    tools/vllm-lock 0.32.0 --python 3.12 3.13 --platform x86_64
+
+For each Python minor version (3.11–3.14) and each processor vLLM publishes a wheel for (x86_64,
+aarch64), one file, `agent/src/gpm_agent/vllm_sets/vllm-<version>-py<python>-<processor>.json`:
+
+1. **Resolved by uv**: `uv pip compile` of `vllm[audio]==<version>` for that Linux and Python,
+   wheels only (`--only-binary :all:`, so nothing would be built), with hashes — at the oldest
+   manylinux level, the oldest glibc, at which every wheel is published, tried from 2.28 upward.
+   The audio extra is in every set, so a host serving speech has it (D146).
+2. **One wheel for each pin**: its files are read from PyPI's JSON API, and the one pip would
+   install on such a machine is chosen, by the order of tags pip prefers; its sha256 must be one
+   uv listed for it, two records of one digest. Only that wheel's digest is written — pip then
+   takes no other file — so every machine installs exactly the same files, and a set stays a few
+   tens of kilobytes (uv lists every file of every pin, all platforms', some 400 kB a set).
+3. **The driver**: the CUDA major of the set's runtime (`nvidia-cuda-runtime`) gives the least
+   NVIDIA driver, by `DRIVER_FLOORS`; the size is the chosen wheels' sum, which the agent's
+   free-disk floor counts from.
+
+Standalone: the standard library and `uv` on PATH, never the agent's own code. It reads PyPI and
+installs nothing. A version is digits and dots only: the agent names a directory by it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Callable, Iterable, Optional
+
+REPO = Path(__file__).resolve().parent.parent
+SETS_DIR = REPO / "agent" / "src" / "gpm_agent" / "vllm_sets"
+
+#: vLLM's own range (`requires_python`, <3.15,>=3.11 at 0.32.0) and the processors it publishes
+#: a wheel for, as `platform.machine()` names them on Linux.
+PYTHONS = ("3.11", "3.12", "3.13", "3.14")
+PLATFORMS = ("x86_64", "aarch64")
+
+#: The manylinux levels — glibc versions — a resolution is tried at, oldest first: torch has
+#: needed glibc 2.28 since 2.6, and a set is resolved at the first level every wheel is published
+#: for. At vLLM 0.32.0: 2.31 on x86_64 (`llguidance`), 2.34 on aarch64 (`pynvvideocodec`).
+LEVELS = ("2.28", "2.31", "2.34", "2.35", "2.39")
+
+#: The least NVIDIA driver each CUDA major runs on, on Linux, by NVIDIA's minor-version
+#: compatibility (its CUDA Compatibility guide): any CUDA 12.x on 525.60.13 or later, any 13.x on
+#: 580.65.06 or later — the drivers released with 12.0 and with 13.0. A table, not a reading of
+#: each release's notes: unverified until a set runs on such a driver (decisions.md).
+DRIVER_FLOORS = {12: "525.60.13", 13: "580.65.06"}
+
+PYPI = "https://pypi.org"
+INDEX = "https://pypi.org/simple"
+VERSION = re.compile(r"^\d+(\.\d+){1,3}$")
+_PIN = re.compile(r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)(\[[^\]]*\])?==(?P<version>[^\s;\\]+)")
+_HASH = re.compile(r"--hash=sha256:([0-9a-f]{64})")
+_RUNTIME = re.compile(r"^nvidia-cuda-runtime(-cu(?P<suffix>\d+))?$")
+
+#: What uv is given of the environment it runs in: none of uv's or pip's own settings, which
+#: could add an index or change what is resolved; the rest (PATH, HOME, the cache) as it is.
+_DROPPED = ("UV_", "PIP_")
+_KEPT = ("UV_CACHE_DIR",)
+
+
+class LockFailed(Exception):
+    """A set could not be made, and why."""
+
+
+def normalized(name: str) -> str:
+    """A project's name as PyPI compares it (PEP 503)."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+# --- what uv resolves ---
+
+
+def uv_compile(requirement: str, python: str, platform: str, glibc: str, index: str) -> str:
+    """`uv pip compile` of one requirement for one Linux: its output, or `LockFailed` with uv's
+    own words for why not."""
+    uv = shutil.which("uv")
+    if uv is None:
+        raise LockFailed("uv is not on PATH: https://docs.astral.sh/uv/")
+    environment = {k: v for k, v in os.environ.items() if not k.startswith(_DROPPED) or k in _KEPT}
+    with tempfile.TemporaryDirectory(prefix="vllm-lock-") as work:
+        source = Path(work) / "requirements.in"
+        source.write_text(requirement + "\n")
+        done = subprocess.run(
+            [
+                uv, "pip", "compile", "--no-config", "--quiet", str(source),
+                "--python-platform", f"{platform}-manylinux_{glibc.replace('.', '_')}",
+                "--python-version", python, "--generate-hashes", "--only-binary", ":all:",
+                "--no-header", "--no-annotate", "--index-url", index,
+            ],
+            cwd=work, env=environment, capture_output=True, text=True, check=False,
+        )
+    if done.returncode != 0:
+        raise LockFailed((done.stderr or done.stdout).strip() or f"uv exited with {done.returncode}")
+    return done.stdout
+
+
+def parse_compiled(text: str) -> dict[str, tuple[str, set[str]]]:
+    """uv's requirements: each project's name → its pinned version and the digests listed for it."""
+    pins: dict[str, tuple[str, set[str]]] = {}
+    logical = re.sub(r"\\\n", " ", text)
+    for line in logical.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        found = _PIN.match(line)
+        if found is None:
+            raise LockFailed(f"uv wrote a line this does not read as a pin: {line[:120]!r}")
+        pins[normalized(found.group("name"))] = (found.group("version"), set(_HASH.findall(line)))
+    return pins
+
+
+# --- the one wheel pip would install ---
+
+
+def platform_tags(platform: str, glibc: str) -> list[str]:
+    """The platform tags pip accepts on a Linux with `glibc`, most preferred first: each
+    manylinux level from that glibc down (to 2.17, or 2.5 on x86_64), each legacy name beside the
+    level it stands for, then the bare `linux_`."""
+    newest = int(glibc.split(".")[1])
+    oldest = 5 if platform == "x86_64" else 17
+    legacy = {17: "manylinux2014", 12: "manylinux2010", 5: "manylinux1"}
+    tags = []
+    for minor in range(newest, oldest - 1, -1):
+        tags.append(f"manylinux_2_{minor}_{platform}")
+        if minor in legacy and (minor == 17 or platform == "x86_64"):
+            tags.append(f"{legacy[minor]}_{platform}")
+    tags.append(f"linux_{platform}")
+    return tags
+
+
+def supported_tags(python: str, platform: str, glibc: str) -> list[tuple[str, str, str]]:
+    """Every wheel tag CPython `python` accepts on that Linux, most preferred first — the order
+    pip itself takes them in (`packaging.tags.sys_tags`): its own ABI, the stable ABI of it and
+    of each older version, no ABI; then pure-Python builds for each platform, then for any."""
+    major, minor = (int(part) for part in python.split("."))
+    platforms = platform_tags(platform, glibc)
+    cp = f"cp{major}{minor}"
+    tags = [(cp, cp, p) for p in platforms]
+    tags += [(cp, "abi3", p) for p in platforms]
+    tags += [(cp, "none", p) for p in platforms]
+    for older in range(minor - 1, 1, -1):
+        tags += [(f"cp{major}{older}", "abi3", p) for p in platforms]
+    pythons = [f"py{major}{minor}", f"py{major}"] + [f"py{major}{m}" for m in range(minor - 1, -1, -1)]
+    tags += [(v, "none", p) for v in pythons for p in platforms]
+    tags.append((cp, "none", "any"))
+    tags += [(v, "none", "any") for v in pythons]
+    return tags
+
+
+def wheel_tags(filename: str) -> set[tuple[str, str, str]]:
+    """The tags a wheel's name says it is for, each compressed set (`a.b`) expanded."""
+    parts = filename[: -len(".whl")].split("-")
+    if len(parts) < 5:
+        return set()
+    pythons, abis, platforms = (part.split(".") for part in parts[-3:])
+    return {(p, a, f) for p in pythons for a in abis for f in platforms}
+
+
+def choose_wheel(files: Iterable[dict[str, Any]], preference: list[tuple[str, str, str]]) -> Optional[dict[str, Any]]:
+    """The file pip would install among a release's: the wheel whose best tag comes first in
+    `preference` — None where no wheel fits."""
+    rank = {tag: index for index, tag in enumerate(preference)}
+    ranked = []
+    for entry in files:
+        name = entry.get("filename", "")
+        if entry.get("packagetype") != "bdist_wheel" or not name.endswith(".whl"):
+            continue
+        best = min((rank[tag] for tag in wheel_tags(name) if tag in rank), default=None)
+        if best is not None:
+            ranked.append((best, name, entry))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda found: found[:2])
+    if len(ranked) > 1 and ranked[0][0] == ranked[1][0]:
+        raise LockFailed(f"{ranked[0][1]} and {ranked[1][1]} fit equally; which pip takes is not known here")
+    return ranked[0][2]
+
+
+def pypi_files(name: str, version: str, pypi: str = PYPI) -> list[dict[str, Any]]:
+    """A release's files as PyPI's JSON API lists them: name, size, sha256, kind."""
+    url = f"{pypi.rstrip('/')}/pypi/{urllib.parse.quote(name)}/{urllib.parse.quote(version)}/json"
+    request = urllib.request.Request(url, headers={"User-Agent": "gpm vllm-lock", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310 - PyPI's own address, https
+            body = json.load(response)
+    except (OSError, ValueError) as exc:
+        raise LockFailed(f"PyPI did not answer about {name} {version}: {exc}") from exc
+    return [
+        {
+            "filename": entry.get("filename"), "size": entry.get("size"),
+            "sha256": (entry.get("digests") or {}).get("sha256"), "packagetype": entry.get("packagetype"),
+        }
+        for entry in body.get("urls") or []
+    ]
+
+
+# --- the set ---
+
+
+def cuda_runtime(pins: dict[str, tuple[str, set[str]]]) -> tuple[int, str]:
+    """The CUDA major of the set's runtime, and the runtime's version: `nvidia-cuda-runtime`,
+    named with its major (`-cu12`) or not (13 onward), else `cuda-toolkit`'s."""
+    found = []
+    for name, (version, _) in pins.items():
+        matched = _RUNTIME.match(name)
+        if matched:
+            major = int(matched.group("suffix") or version.split(".")[0])
+            found.append((major, version))
+    if not found and "cuda-toolkit" in pins:
+        version = pins["cuda-toolkit"][0]
+        found.append((int(version.split(".")[0]), version))
+    majors = {major for major, _ in found}
+    if len(majors) != 1:
+        raise LockFailed(
+            "the set holds no CUDA runtime (nvidia-cuda-runtime): is this a CUDA build?" if not majors
+            else f"the set holds CUDA runtimes of more than one major version: {sorted(majors)}"
+        )
+    return found[0]
+
+
+def requirements_text(chosen: list[tuple[str, str, str]]) -> str:
+    """pip's requirements, each line pinned and hashed with the one wheel it may take."""
+    return "".join(f"{name}=={version} \\\n    --hash=sha256:{digest}\n" for name, version, digest in chosen)
+
+
+def lock(
+    version: str,
+    python: str,
+    platform: str,
+    *,
+    compile: Callable[[str, str, str, str, str], str] = uv_compile,
+    files: Callable[[str, str], list[dict[str, Any]]] = pypi_files,
+    levels: Iterable[str] = LEVELS,
+    index: str = INDEX,
+    workers: int = 8,
+) -> dict[str, Any]:
+    """One set: `vllm[audio]==version` for CPython `python` on Linux on `platform`."""
+    if not VERSION.fullmatch(version):
+        raise LockFailed(f"{version!r} is not a version of digits and dots, which the agent names a directory by")
+    requirement = f"vllm[audio]=={version}"
+    tried = []
+    for glibc in levels:
+        try:
+            compiled = compile(requirement, python, platform, glibc, index)
+            break
+        except LockFailed as no:
+            tried.append(f"glibc {glibc}: {str(no).splitlines()[-1] if str(no) else no}")
+    else:
+        raise LockFailed(f"{requirement} does not resolve for Python {python} on {platform}:\n  " + "\n  ".join(tried))
+
+    pins = parse_compiled(compiled)
+    if pins.get("vllm", ("",))[0] != version:
+        raise LockFailed(f"uv's resolution does not pin vllm=={version}")
+    preference = supported_tags(python, platform, glibc)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        listed = {name: found for name, found in zip(pins, pool.map(lambda name: files(name, pins[name][0]), pins))}
+    chosen, size = [], 0
+    for name in sorted(pins):
+        pinned, digests = pins[name]
+        wheel = choose_wheel(listed[name], preference)
+        if wheel is None:
+            raise LockFailed(f"{name} {pinned} has no wheel for Python {python} on {platform} with glibc {glibc}")
+        if wheel["sha256"] not in digests:
+            raise LockFailed(f"{wheel['filename']}'s digest on PyPI is not one uv listed for {name} {pinned}")
+        if not isinstance(wheel["size"], int):
+            raise LockFailed(f"PyPI gives no size for {wheel['filename']}")
+        chosen.append((name, pinned, wheel["sha256"]))
+        size += wheel["size"]
+    major, runtime = cuda_runtime(pins)
+    if major not in DRIVER_FLOORS:
+        raise LockFailed(f"the set's CUDA is {runtime} (CUDA {major}), whose least driver this tool's table does not name")
+    return {
+        "vllm": version,
+        "python": python,
+        "platform": platform,
+        "driver_floor": DRIVER_FLOORS[major],
+        "glibc": glibc,
+        "cuda_runtime": runtime,
+        "wheels": len(chosen),
+        "size_bytes": size,
+        "requirements": requirements_text(chosen),
+    }
+
+
+def file_name(locked: dict[str, Any]) -> str:
+    return f"vllm-{locked['vllm']}-py{locked['python']}-{locked['platform']}.json"
+
+
+def main(
+    argv: Optional[list[str]] = None,
+    *,
+    compile: Callable[[str, str, str, str, str], str] = uv_compile,
+    files: Optional[Callable[[str, str], list[dict[str, Any]]]] = None,
+) -> int:
+    parser = argparse.ArgumentParser(prog="vllm-lock", description=__doc__.split("\n\n")[0])
+    parser.add_argument("version", help="the vLLM version, e.g. 0.32.0")
+    parser.add_argument("--python", nargs="+", default=list(PYTHONS), help="Python minor versions (default: 3.11–3.14)")
+    parser.add_argument("--platform", nargs="+", default=list(PLATFORMS), choices=PLATFORMS, help="processors")
+    parser.add_argument("--glibc", help="resolve at this glibc only (e.g. 2.31), not the oldest that resolves")
+    parser.add_argument("--out", type=Path, default=SETS_DIR, help="where the sets are written")
+    parser.add_argument("--index", default=INDEX, help="the package index uv resolves from")
+    parser.add_argument("--pypi", default=PYPI, help="where PyPI's JSON API is, for each file's size and digest")
+    args = parser.parse_args(argv)
+    for python in args.python:
+        if not re.fullmatch(r"3\.\d{1,2}", python):
+            parser.error(f"{python!r} is not a Python minor version such as 3.12")
+    levels = (args.glibc,) if args.glibc else LEVELS
+    fetch = files or (lambda name, version: pypi_files(name, version, args.pypi))
+    cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
+
+    def cached(name: str, version: str) -> list[dict[str, Any]]:
+        if (name, version) not in cache:
+            cache[(name, version)] = fetch(name, version)
+        return cache[(name, version)]
+
+    made = []
+    try:
+        for platform in args.platform:
+            for python in args.python:
+                print(f"vLLM {args.version}, Python {python}, {platform}…", file=sys.stderr, flush=True)
+                made.append(lock(args.version, python, platform, compile=compile, files=cached, levels=levels, index=args.index))
+    except LockFailed as no:
+        print(f"vllm-lock: {no}", file=sys.stderr)
+        return 1
+    # Written only once every set is made: a release never ships some of a version's sets.
+    args.out.mkdir(parents=True, exist_ok=True)
+    total = 0
+    for locked in made:
+        path = args.out / file_name(locked)
+        text = json.dumps(locked, indent=1) + "\n"
+        path.write_text(text)
+        total += len(text.encode())
+        print(
+            f"{path.name}: {locked['wheels']} wheels, {locked['size_bytes'] / 1e9:.2f} GB, glibc {locked['glibc']}, "
+            f"CUDA {locked['cuda_runtime']}, driver {locked['driver_floor']} or later"
+        )
+    print(f"{len(made)} sets, {total / 1e3:.0f} kB, in {args.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

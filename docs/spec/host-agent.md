@@ -345,34 +345,39 @@ serving and starts the new program with it, with the same arguments and uploads 
 (§2.1), emptied as the server stops and before it starts; with no file held yet, the check is
 `--help`.
 
-**vLLM** (Linux with an NVIDIA card, D157–D159) is a private Python environment per version,
-made with the agent's own interpreter (Python 3.11–3.14) under `<engines>/vllm/<port>/<version>/`,
+**vLLM** (Linux with an NVIDIA card, D157–D159) is a private Python environment per version, made
+with the agent's own interpreter (Python 3.11–3.14) under `<engines>/vllm/<port>/<version>/`,
 filled only from that version's **locked set**: a list GPM's release generates and the agent
 carries — every wheel, `vllm`'s and each dependency's, `torch` and CUDA's libraries among them,
-with its sha256, for each supported Python minor version and processor, and the least NVIDIA
-driver the set's CUDA needs. It is installed with `pip install --require-hashes --only-binary
-:all: --no-deps` from PyPI, so no source distribution is built and no file differs from the one
-recorded; `latest` is the newest vLLM the agent has a set for. A version is kept only if its
-`vllm` runs, and imports the audio extra where the host holds a speech model (§2.1, D146). The
-free-disk floor counts a version as its set's size unpacked. It is refused, saying why, on
-anything but Linux on x86_64 or aarch64 with an NVIDIA card of compute capability 7.5 or higher
-and the set's driver. **The agent runs it** (D159): `gpm-agent vllm-start` with `--vllm` naming
-that version's program — accepted only as an absolute path to a file named `vllm` inside the
-agent's engines directory, links followed, which `--engines-dir` names — run as a program of its
-own (`python -m gpm_agent.cli`), never imported by the agent that answers the pool (D63). It is
-started once every model the host holds is on disk (§2.1's fetch) — or, until the pool has said
-which, when every model it ran last time still is — again whenever that set changes (a model held
-that has landed, or one deleted; not one on disk that nobody asked for), and stopped to switch
-versions, by `gpm-agent vllm-stop`, which stops only processes that are still an engine, the router
-or the in-turn helper by their own command line. The pool's numbers reach it as the environment
-the launcher reads (`GPM_VLLM_*`), stored in the engine's directory as Ollama's are. A model that
-will not start is that model's failure, said for it (`models_failed`), not the version's — alone as
-well as beside others that serve, since a model too large for the card and a version that cannot
-run on it look the same, and only the first is common; the same models are then not started again
-by that version until they change or it is stopped or restarted. An upgrade that serves nothing is
-rolled back by the pool's check after the switch ([supervisor.md](supervisor.md) §3.1). It runs,
-holding its share of the card, for as long as the machine is in the pool; taking the machine out
-of service gives the card back.
+with its sha256 — one wheel to a pin, the one pip takes there — for each supported Python minor
+version and processor, with the audio extra, the oldest glibc its wheels are published for, and the
+least NVIDIA driver the set's CUDA needs (`tools/vllm-lock`, run by GPM's release). It is installed
+with `pip install --require-hashes --only-binary :all: --no-deps --isolated --no-cache-dir` from
+PyPI, at low priority, so no source distribution is built and no file differs from the one
+recorded; `GPM_PYPI_INDEX` names another index, or a directory of wheels, for tests. `latest` is
+the newest vLLM the agent has a set for. A version is kept only if its own `vllm --version` answers
+with the version; every set carries the audio extra, and whether it imports is asked of the running
+version's program and said in the facts (§2.1, D146); its programs are pointed at the version's
+directory before it is renamed into place. The free-disk floor counts a version as three times its
+set's wheels: the environment, the `.pyc` pip compiles and the one wheel in flight. It is refused,
+saying why, before anything is fetched, on anything but Linux on x86_64 or aarch64 with the set's
+glibc, an NVIDIA card of compute capability 7.5 or higher and the set's driver. **The agent runs
+it** (D159): `gpm-agent vllm-start` with `--vllm` naming that version's program — accepted only as
+an absolute path to a file named `vllm` inside the agent's engines directory, links followed, which
+`--engines-dir` names — run as a program of its own (`python -m gpm_agent.cli`), never imported by
+the agent that answers the pool (D63). It is started once every model the host holds is on disk
+(§2.1's fetch) — or, until the pool has said which, when every model it ran last time still is —
+again whenever that set changes (a model held that has landed, or one deleted; not one on disk that
+nobody asked for), and stopped to switch versions, by `gpm-agent vllm-stop`, which stops only
+processes that are still an engine, the router or the in-turn helper by their own command line. The
+pool's numbers reach it as the environment the launcher reads (`GPM_VLLM_*`), stored in the
+engine's directory as Ollama's are. A model that will not start is that model's failure, said for
+it (`models_failed`), not the version's — alone as well as beside others that serve, since a model
+too large for the card and a version that cannot run on it look the same, and only the first is
+common; the same models are then not started again by that version until they change or it is
+stopped or restarted. An upgrade that serves nothing is rolled back by the pool's check after the
+switch ([supervisor.md](supervisor.md) §3.1). It runs, holding its share of the card, for as long
+as the machine is in the pool; taking the machine out of service gives the card back.
 
 **An engine of `auto`** (D161) is chosen by the agent each time it starts, from the machine alone:
 vLLM on Linux on x86_64 or aarch64 with an NVIDIA card of compute capability 8.0 or higher

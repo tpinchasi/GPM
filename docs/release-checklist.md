@@ -127,7 +127,19 @@ Each line was re-checked against the code on 2026-09-19; the test that holds it 
       pointed at the code or test that provides it — [threat-model.md](threat-model.md) §6, and
       `tests/test_threat_model.py` for the invariants a refactor could silently lose.
 
-## 3. Deliberately not promised at first release
+## 3. Every release
+
+- [ ] **vLLM's locked sets** (D158): for each vLLM version the agent supports — the newest vLLM
+      release at least, and the one before it so a rollback has its set — run
+      `tools/vllm-lock <version>` (`uv` on PATH; it reads PyPI and installs nothing). It writes one
+      set for each Python 3.11–3.14 and each processor, x86_64 and aarch64, or none if any fails.
+      Read its summary before committing `agent/src/gpm_agent/vllm_sets/`: the driver floor (a CUDA
+      major its table does not name refuses the set — add the major's least driver, from NVIDIA's
+      CUDA Compatibility guide, first), the glibc, and the size. Remove the sets of versions no
+      longer supported. The sets ship inside the agent: the release carries them, and a machine's
+      `latest` is the newest of them.
+
+## 4. Deliberately not promised at first release
 
 Stated up front so expectations are set: more than one provider or engine; multi-pool
 management; per-client limits or fairness inside a pool; data-trust levels per host; advanced

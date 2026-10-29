@@ -83,8 +83,7 @@ def _init(args: argparse.Namespace) -> int:
     outcome = 0
     if args.prerequisites:
         print()
-        outcome |= prerequisites.run(machine, engine=settings.engine, admin=args.admin,
-                                     install_engines=bool(getattr(settings, "install_engines", False)))
+        outcome |= prerequisites.run_for(machine, settings, admin=args.admin)
     if args.start_at_login:
         print()
         outcome |= startup.add(machine, absolute, admin=args.admin, listen=(settings.host, settings.port))

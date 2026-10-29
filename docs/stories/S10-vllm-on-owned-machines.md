@@ -148,13 +148,15 @@ Decided in D157â€“D161 and specified in [host-agent.md](../spec/host-agent.md) Â
 
 ## Unverified
 
-- The CUDA version of PyPI's `torch` 2.13.0 build, and the NVIDIA driver it needs.
-- The NVIDIA driver the CUDA 12.9 build needs on a machine with no CUDA toolkit: 525 or later by
-  CUDA 12's minor-version compatibility, or 575 for 12.9 itself.
+Since the build (2026-10-30), vLLM 0.32.0 on PyPI is known to be a **CUDA 13** build (`torch`
+2.13.0 depends on `cuda-toolkit` 13.0.3), not the CUDA 12.9 its documentation names: its sets
+need NVIDIA driver 580.65.06 or later. Still unverified, each until the first real install:
+
+- That a set runs on that driver by NVIDIA's minor-version compatibility.
+- That one version takes at most three times its wheels while it installs (about 12 GB asked).
+- That a set installs on every Linux with the glibc it names (2.31 on x86_64, 2.34 on aarch64).
+- Whether `vllm --version` answers on a machine with no card free.
 - What the audio extra needs from the system on a bare Linux.
-- The disk one vLLM version takes.
-- Whether a hash-locked set generated on one machine installs on every supported Linux
-  (manylinux tags, glibc).
 
 ## What it gives up
 
