@@ -105,3 +105,24 @@ def test_a_host_gone_while_its_window_is_open_is_said_to_be_gone_not_an_older_su
         page.js("api.hostDetail = async () => { const e = new Error('Not Found'); e.status = 404; throw e; };"
                 "openHost('laptop'); true")
         page.until(f"{body}.includes('older supervisor')", within=30, what="the older supervisor's hint")
+
+
+@pytest.mark.timeout(240)
+def test_the_auto_line_reads_a_missing_or_partial_choice_and_a_silent_agents_last(served):
+    """An `auto` host's line (D161) is drawn from what its agent said: a choice may be missing,
+    partial, or the last one of an agent now silent — never a broken screen."""
+    _, url, _ = served
+    with open_page(f"{url}/ui/#hosts") as page:
+        page.until("(document.getElementById('key-dialog') || {}).open === true", within=60, what="the page")
+
+        def line(host):
+            return page.js(f"autoEngineLine({json.dumps(host)}).textContent")
+
+        assert line({}) == "auto: its agent has not chosen yet"
+        assert line({"engine_choice": None}) == "auto: its agent has not chosen yet"
+        assert line({"engine_choice": {"reasons": ["x"]}}) == "auto: its agent has not chosen yet"
+        assert line({"engine_choice": {"engine": "vllm"}}) == "auto"
+        assert line({"engine_choice": {"engine": "ollama", "reasons": "not a list"}}) == "auto"
+        assert line({"engine_choice": {"engine": "ollama", "reasons": [7, "old card"]}}) == "auto: not vLLM — old card"
+        assert line({"engine_choice": {"engine": "vllm", "reasons": [], "said_now": False}}) == (
+            "auto: vllm, as its agent last said — it is silent now")

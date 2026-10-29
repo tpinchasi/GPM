@@ -260,8 +260,8 @@ class HostConfig(BaseModel):
         if self.engine == AUTO_ENGINE and self.agent is None:
             raise ValueError(
                 f"host {self.id!r}: `engine: auto` is chosen by the host's agent from the machine "
-                "(D161), and this host has no `agent`. Give it one whose owner allows installs "
-                "(`gpm-agent init --install-engines`), or name its engine."
+                "(D161), and this host has no `agent`. Give it one set to choose, whose owner allows installs "
+                "(`gpm-agent init --engine auto --install-engines`), or name its engine."
             )
         if self.engine == AUTO_ENGINE and self.engine_version != "latest":
             # A version number means nothing until the engine is known, and the same number can
@@ -1262,8 +1262,10 @@ class PoolConfig(BaseModel):
         self._builds_serve_what_their_engine_can()
         self._agent_managed_engines_are_well_placed()
         self._rented_images_carry_what_builds_need()
-        self._hosts_can_serve_what_they_are_asked_for()
+        # Declared models first: a host that declares one it cannot hold is refused naming it and
+        # the build it lacks, not as a host with no usable build of anything.
         self._declared_models_are_in_the_set()
+        self._hosts_can_serve_what_they_are_asked_for()
         self._every_model_is_held_by_somebody()
         return self
 
@@ -1325,21 +1327,30 @@ class PoolConfig(BaseModel):
         """Models this host could serve: a build its platform can run **and its engine can
         read** (D93). A build named for another engine is not one this host has. A host whose
         agent chooses its engine (`auto`, D161) must be able to serve each on either."""
+        return [name for name in self.pool.model_set if not self._engines_without_a_build(host, name)]
+
+    def _engines_without_a_build(self, host: "HostConfig", name: str) -> list[str]:
+        """The engines this host may run that have no build of `name` it can serve: one its
+        platform runs, for that engine (or for any), of a kind the engine serves."""
         caps = set(host.capabilities)
-        servable = []
-        for name in self.pool.model_set:
-            entry = self.catalog.get(name)
-            variants = entry.variants if entry else [Variant(tag=name)]
-            if all(
-                any(
-                    set(v.requires) <= caps and (v.engine is None or v.engine == engine)
-                    and v.kinds() & self.engine_kinds(engine)
-                    for v in variants
-                )
-                for engine in self.engines_of(host)
-            ):
-                servable.append(name)
-        return servable
+        entry = self.catalog.get(name)
+        variants = entry.variants if entry else [Variant(tag=name)]
+        return [
+            engine for engine in self.engines_of(host)
+            if not any(
+                set(v.requires) <= caps and (v.engine is None or v.engine == engine)
+                and v.kinds() & self.engine_kinds(engine)
+                for v in variants
+            )
+        ]
+
+    def _builds_missing(self, host: "HostConfig", names: Iterable[str]) -> str:
+        """Which build each model lacks on a host of `auto`, as its refusal says it (D161)."""
+        if self.engine_of(host) != AUTO_ENGINE:
+            return ""
+        said = [f"{name!r} has no build for {' or '.join(lacking)}" for name in sorted(names)
+                if (lacking := self._engines_without_a_build(host, name))]
+        return f" {'; '.join(said)}." if said else ""
 
     def _engine_words(self, host: "HostConfig") -> str:
         """Which engine a host runs, as a refusal says it."""
@@ -1377,6 +1388,7 @@ class PoolConfig(BaseModel):
                     f"serve: it runs {self._engine_words(host)}, which serves "
                     f"{sorted(set().union(*(self.engine_kinds(e) for e in self.engines_of(host))))}, with capabilities "
                     f"{sorted(set(host.capabilities))}."
+                    + self._builds_missing(host, cannot)
                     + "".join(self._kind_hint(cannot, e) for e in self.engines_of(host))
                 )
         if self.rented is not None:
@@ -1452,13 +1464,20 @@ class PoolConfig(BaseModel):
             if host.disabled:
                 continue
             asked = self.models_held_by(host)
-            engine = self.engine_of(host)
-            if len(asked) > 1 and holds_one(engine):
-                raise ValueError(
-                    f"host {host.id!r} runs {engine!r}, which serves one model per process, but "
-                    f"is asked to hold {len(asked)}: {asked}. Give it a single model in its "
-                    f"`models`, or run an engine that holds several at once."
-                )
+            # Under `auto`, each engine its agent may choose, as that agent runs it: an agent of
+            # `auto` always installs and runs its engine itself (D150, D161), and starts vLLM with
+            # its router in front of several models (`gpm-agent vllm-start --proxy`, D96, D159) —
+            # so neither engine is held to one model there. A host that names its engine is judged
+            # by that engine alone: whether its agent runs it is the machine's setting, not one
+            # this file can see.
+            behind_proxy = self.engine_of(host) == AUTO_ENGINE
+            for engine in self.engines_of(host):
+                if len(asked) > 1 and holds_one(engine, behind_proxy=behind_proxy):
+                    raise ValueError(
+                        f"host {host.id!r} runs {engine!r}, which serves one model per process, but "
+                        f"is asked to hold {len(asked)}: {asked}. Give it a single model in its "
+                        f"`models`, or run an engine that holds several at once."
+                    )
 
         # Rented hosts differ from configured ones: with the set spread across hosts,
         # `rented.models` is the set the pool may rent **for**, and each host it buys is given
@@ -1794,14 +1813,15 @@ class PoolConfig(BaseModel):
                     raise ValueError(
                         f"host {host.id!r} has no usable variant of {name!r}: it runs "
                         f"{self._engine_words(host)} with capabilities {sorted(caps)}, and no "
-                        f"variant matches both. Give it the capability, add a variant for that "
-                        f"engine, add a fallback with no requirements, or remove the host."
+                        f"variant matches both.{self._builds_missing(host, [name])} Give it the capability, "
+                        f"add a variant for that engine, add a fallback with no requirements, or remove the host."
                     )
             if not servable:
                 raise ValueError(
-                    f"host {host.id!r} has no usable variant of any model in the pool's set: its "
-                    f"capabilities {sorted(caps)} meet no variant's requirements. Give it the "
-                    f"capability, add a fallback variant with no requirements, or remove the host."
+                    f"host {host.id!r} has no usable variant of any model in the pool's set: it runs "
+                    f"{self._engine_words(host)}, and its capabilities {sorted(caps)} meet no variant's "
+                    f"requirements for that.{self._builds_missing(host, self.pool.model_set)} Give it the "
+                    f"capability, add a variant for its engine or a fallback with no requirements, or remove the host."
                 )
 
 

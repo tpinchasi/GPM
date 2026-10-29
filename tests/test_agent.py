@@ -980,8 +980,12 @@ async def test_a_restart_command_that_fails_or_does_not_exist_is_reported_not_ra
 
 
 def test_the_pool_restarts_only_when_an_operator_says_so_with_the_host_named_twice(monkeypatch, tmp_path):
-    # The pass restarts no engine that serves its set (D41); its one restart is of an engine that
-    # serves none of it yet, once its models are on disk (D160, tested in test_engine_auto.py).
+    # What this proves is the operator's restart, through the real agent and the owner's command:
+    # an Ollama host serving its set is never restarted by the pass, and a restart needs the host
+    # named twice. The pass's one restart of its own (D160) is of an engine that serves only what
+    # it was started with and serves none of its set yet; that needs an agent reporting a model
+    # waiting for a start, which this agent over Ollama never does — its guards (once per set,
+    # never a ready host, never under requests in flight) are proven in test_engine_auto.py.
     with pool_harness([EngineSpec(id="box", resident={MODEL}, workers=3)], model_set=[MODEL], host_overrides={"box": agent_block(monkeypatch)}) as pool:
         machine = restartable(tmp_path)
         pool.supervisor._agent_transport = machine.transport
@@ -996,10 +1000,19 @@ def test_the_pool_restarts_only_when_an_operator_says_so_with_the_host_named_twi
                 url = "/pool/hosts/box/engine/restart"
                 assert http.post(url, json={"apply_settings": True}).json()["error"] == "not_confirmed"
                 assert not machine.marker.exists()
-                done = http.post(url, json={"apply_settings": True, "confirm": "box"})
-                assert done.status_code == 200 and done.json()["applied"]["OLLAMA_NUM_PARALLEL"] == "3"
+                # Answered at once; the restart runs in the background, its outcome an event.
+                asked = http.post(url, json={"apply_settings": True, "confirm": "box"})
+                assert asked.status_code == 202 and asked.json()["settings"] == {"workers": 3, "models_held": 1}
+                task = pool.supervisor.hosts["box"].restart_task
+
+                async def finished():
+                    await task
+
+                pool.loop.run(finished())
         finally:
             server.stop()
+        assert machine.marker.read_text() == "yes"
+        assert "OLLAMA_NUM_PARALLEL=3" in machine.env_file.read_text()
         event = next(e for e in pool.supervisor.events.recent(10) if e["kind"] == "agent_engine_restarted")
         assert "with the pool's settings" in event["summary"]
 
