@@ -485,3 +485,16 @@ async def test_what_gone_machines_left_behind_is_deleted_and_nothing_else():
 async def test_a_failed_tidy_never_fails_the_listing():
     api = Api(**{"GET /v1/instances": [], "GET /v1/scripts": httpx.Response(500, json={"code": "server_error", "message": "x"})})
     assert await provider(api).list_instances("gpm-test/") == []
+
+
+async def test_the_first_tidy_runs_on_a_machine_booted_moments_ago(monkeypatch):
+    """The monotonic clock counts from boot: on a machine up for a minute, a tidy timed from
+    zero would wait out its interval before ever running once."""
+    import gpm_server.providers.verda as verda_module
+
+    monkeypatch.setattr(verda_module.time, "monotonic", lambda: 60.0)
+    scripts = [{"id": "s-old", "name": "gpm-test/rented-1", "created_at": OLD, "script": ""}]
+    api = Api(**{"GET /v1/instances": [], "GET /v1/scripts": scripts, "GET /v1/volumes": [],
+                 "DELETE /v1/scripts/s-old": None})
+    await provider(api).list_instances("gpm-test/")
+    assert [p for p in api.paths() if p.startswith("DELETE")] == ["DELETE /v1/scripts/s-old"]
