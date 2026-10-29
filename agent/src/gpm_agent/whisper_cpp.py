@@ -104,10 +104,6 @@ UPLOADS_DIR = "tmp"
 #: process is not mistaken for the server for long.
 IDENTITY_TRUSTED_S = 2.0
 
-#: Credentials the agent may hold — for the hub, and for GitHub's releases where it installs
-#: engines. The server has no use for any of them, so it is started, and checked, without them.
-_WITHHELD = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "GITHUB_TOKEN")
-
 #: How long `whisper-server --help` is given. It prints its usage and exits, loading nothing.
 HELP_TIMEOUT_S = 30.0
 
@@ -205,8 +201,10 @@ def server_argv(binary: str, model_file: Path, port: int, uploads: Path) -> list
 
 
 def _server_environment() -> dict[str, str]:
-    """The agent's own environment, less the credentials the server has no use for."""
-    return {name: value for name, value in os.environ.items() if name not in _WITHHELD}
+    """What the server, and the check that its program runs, are given of the agent's own
+    environment: the names `platform.program_environment` keeps — never a credential the agent
+    holds for the hub or GitHub, nor one it was started with."""
+    return host_platform.program_environment({})
 
 
 def help_argv(program: str) -> list[str]:
@@ -258,14 +256,17 @@ def installed_version(binary: str) -> Optional[str]:
     return None
 
 
-def _is_our_server(pid: int, record: dict[str, Any]) -> bool:
+def _is_our_server(pid: int, record: dict[str, Any]) -> Optional[bool]:
     """Is this process the server the record describes? A number from a file is only a number:
     the process may have ended and its number gone to another. Ours runs the argument list the
-    record says it was started with (`platform.started_with`); an unrelated process does not."""
+    record says it was started with — its port among it — and, on Windows, was created when the
+    record says (`platform.recognised`); an unrelated process does not. None where that cannot be
+    told now, which is never taken for "no"."""
     recorded = record.get("argv")
     if not isinstance(recorded, list) or not recorded or not all(isinstance(part, str) for part in recorded):
         return False
-    return host_platform.started_with(pid, recorded)
+    created = record.get("created")
+    return host_platform.recognised(pid, recorded, created=created if isinstance(created, int) else None)
 
 
 def _last_error_line(log: Optional[str], offset: int) -> Optional[str]:
@@ -491,11 +492,12 @@ class WhisperCppFacts:
             return self._process
         return None
 
-    def _alive(self, record: dict[str, Any]) -> bool:
+    def _alive(self, record: dict[str, Any], *, fresh: bool = False) -> bool:
         """Is the recorded server still running? Asked of the process itself when this agent
         started it; otherwise of the system, with its identity looked at again whenever the last
-        look is more than a moment old. A server the installer stopped to start another version
-        is not, whatever has its number since."""
+        look is more than a moment old, or `fresh` asks for a look now. A look that could not be
+        made is no answer: the last one stands, and is not kept any longer for it. A server the
+        installer stopped to start another version is not, whatever has its number since."""
         if record.get("stopped"):
             return False
         own = self._own_process(record)
@@ -503,14 +505,16 @@ class WhisperCppFacts:
             return own.poll() is None
         pid = record["pid"]
         if not host_platform.alive(pid):
+            self._confirmed = None
             return False
-        confirmed = self._confirmed
-        if confirmed is not None and confirmed[0] == pid and time.monotonic() - confirmed[1] < IDENTITY_TRUSTED_S:
+        confirmed = self._confirmed if self._confirmed is not None and self._confirmed[0] == pid else None
+        if not fresh and confirmed is not None and time.monotonic() - confirmed[1] < IDENTITY_TRUSTED_S:
             return True
-        if _is_our_server(pid, record):
-            self._confirmed = (pid, time.monotonic())
-            return True
-        return False
+        said = _is_our_server(pid, record)
+        if said is None:
+            return confirmed is not None
+        self._confirmed = (pid, time.monotonic()) if said else None
+        return said
 
     def _why_stopped(self, record: dict[str, Any]) -> str:
         own = self._own_process(record)
@@ -699,7 +703,7 @@ class WhisperCppFacts:
         self._process = process
         record = {
             "pid": process.pid, "tag": build.tag, "file": str(model_file), "argv": argv,
-            "program": binary, "version": version,
+            "program": binary, "version": version, "created": host_platform.creation_time(process.pid),
             "log": str(log_path), "log_offset": offset, "started_at": time.time(),
         }
         try:
@@ -725,8 +729,13 @@ class WhisperCppFacts:
         with _refusing(f"could not stop {PROGRAM} (process {pid})"):
             if own is not None:
                 await host_platform.stop(pid, process=own, grace_s=STOP_GRACE_S, poll_s=POLL_S / 2)
-            elif not record.get("stopped") and host_platform.alive(pid) and _is_our_server(pid, record):
-                await host_platform.stop(pid, grace_s=STOP_GRACE_S, poll_s=POLL_S / 2)
+            elif not record.get("stopped") and host_platform.alive(pid):
+                said = _is_our_server(pid, record)
+                if said is None:
+                    # Neither signalled nor forgotten: asked again on the next attempt.
+                    raise _refused(f"whether process {pid} is the {PROGRAM} it started could not be read now; it is not stopped")
+                if said:
+                    await host_platform.stop(pid, grace_s=STOP_GRACE_S, poll_s=POLL_S / 2)
         if forget:
             self._forget()
         else:
@@ -814,9 +823,9 @@ class InstalledServer:
         #: Programs that answered `--help` here, so one with no file to serve is checked once.
         self._runs: set[str] = set()
 
-    def ours(self) -> bool:
+    def ours(self, *, fresh: bool = False) -> bool:
         record = self.engine._current()
-        return record is not None and self.engine._alive(record)
+        return record is not None and self.engine._alive(record, fresh=fresh)
 
     def running_version(self) -> Optional[str]:
         record = self.engine._current()

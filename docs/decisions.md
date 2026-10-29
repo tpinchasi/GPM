@@ -212,6 +212,7 @@
 | The Gemma 4 builds the catalog serves on vLLM keep the vision tower | D143 — the same host |
 | `ollama serve` from the headless macOS archive serves the MLX builds as the app does, and keeps `~/.ollama/models` | D150, D152 — on the first adopter's laptop, stage 4 |
 | Ollama's Windows programs are Authenticode-signed, by a publisher name the agent can pin | D152 — read from a release archive before Windows ships |
+| An engine's release archive unpacks to at most three times its size, and a whisper.cpp build from source — its source, its build tree (about a gigabyte for CUDA's kernels for one card) and cmake from PyPI — takes under 2 GB | The agent's free-disk floor for installs (host-agent.md §2.3): room is asked for as four times an archive's size, and 2 GB for a build — measured on the first real installs of each |
 | whisper.cpp builds on Linux (CPU, and CUDA, which links the toolkit's shared libraries — so a CUDA toolkit upgraded across a major version could break versions kept on disk); its Windows archives run under the agent, with `nvidia-smi` on the task's `PATH`; the driver floors 550 (CUDA 12.4) and 452.39 (CUDA 11.8) | D152 — on such machines |
 | The agent's AMD card check (`/dev/kfd` on Linux, `amdhip64*.dll` on Windows) finds the cards Ollama's ROCm archive serves, and the macOS archive serves Intel Macs | D152 — on such machines |
 | A process the agent starts from a Windows scheduled task outlives the task's job object | D154 — on a Windows machine |

@@ -3,7 +3,8 @@
 docs/spec/host-agent.md §2.3 and §7. Against a fake GitHub — releases with per-file digests, and
 small archives built here — and a fake `ollama` program: a small Python program that answers
 `GET /api/version` as the version it was packed as. Nothing here reaches the network, downloads
-a real engine, or needs a GPU; the platform's commands (`codesign`, PowerShell) are stood in for.
+a real engine, or needs a GPU; the platform's commands (`codesign`, PowerShell) are stood in for —
+but for one check that runs this Mac's own `codesign`, where there is one.
 """
 
 from __future__ import annotations
@@ -14,9 +15,11 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import signal
 import socket
 import stat
+import subprocess
 import sys
 import tarfile
 import threading
@@ -55,7 +58,8 @@ try:
 except OSError:
     control = {}
 watched = ["OLLAMA_HOST", "OLLAMA_MODELS", "OLLAMA_NUM_PARALLEL", "OLLAMA_MAX_LOADED_MODELS",
-           "OLLAMA_CONTEXT_LENGTH", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "GITHUB_TOKEN"]
+           "OLLAMA_CONTEXT_LENGTH", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "GITHUB_TOKEN",
+           "VAST_API_KEY", "SOME_SERVICE_TOKEN", "OLLAMA_ORIGINS", "CUDA_VISIBLE_DEVICES", "PATH", "HOME"]
 with open(starts_path, "a") as starts:
     starts.write(json.dumps({"version": version, "program": program, "args": args, "pid": os.getpid(),
                              "cwd": os.getcwd(), "env": {k: os.environ.get(k) for k in watched}}) + "\\n")
@@ -217,7 +221,8 @@ class Rig:
     """A machine whose agent installs Ollama: an engines directory, a port, a fake GitHub, and
     the installer and server as the agent builds them."""
 
-    def __init__(self, root: Path, *, table=UNSIGNED, target=MAC, run=None, switch_timeout_s=20.0):
+    def __init__(self, root: Path, *, table=UNSIGNED, target=MAC, run=None, switch_timeout_s=20.0,
+                 min_free_disk_gb=0.0, free_bytes=None):
         root.mkdir(parents=True, exist_ok=True)
         self.root = root
         self.port = free_port()
@@ -229,6 +234,7 @@ class Rig:
         self.github = FakeGitHub()
         self.table, self.target, self.run = table, target, run
         self.switch_timeout_s = switch_timeout_s
+        self.min_free_disk_gb, self.free_bytes = min_free_disk_gb, free_bytes
         self.now = 1_800_000_000.0
         self.clients: list[httpx.AsyncClient] = []
         self.servers: list[OllamaServer] = []
@@ -252,6 +258,8 @@ class Rig:
         return Installer(
             source, self.engines / "ollama", server, http_transport=self.github.transport(),
             clock=lambda: self.now, switch_timeout_s=self.switch_timeout_s,
+            min_free_disk_gb=self.min_free_disk_gb,
+            free_disk_bytes=(lambda: self.free_bytes) if self.free_bytes is not None else None,
         )
 
     def program(self, version: str) -> bytes:
@@ -543,23 +551,80 @@ def test_on_windows_liveness_is_asked_of_windows_and_never_with_a_signal(tmp_pat
     assert signals == [], "a process was signalled on Windows"
 
 
-def test_on_macos_a_signature_is_checked_with_codesign_and_the_team_pinned(tmp_path):
+#: Ollama's team as the requirement names it: a Developer ID chain anchored at Apple's root.
+OLLAMA_REQUIREMENT = (
+    "anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists"
+    " and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
+    ' and certificate leaf[subject.OU] = "3MU9H2V9Y9"'
+)
+
+
+def test_on_macos_a_signature_is_one_requirement_anchored_at_apple_with_the_team_pinned(tmp_path):
     ran = []
 
     def run(argv, env=None):
         ran.append(argv)
-        if argv[1] == "--verify":
-            return host_platform.Ran(0, "")
-        return host_platform.Ran(0, "Executable=/x/ollama\nAuthority=Developer ID Application: Someone (3MU9H2V9Y9)\nTeamIdentifier=3MU9H2V9Y9\n")
+        return host_platform.Ran(0, "")
 
     program = tmp_path / "ollama"
     assert host_platform.signature_problem(program, "3MU9H2V9Y9", os_name="macos", run=run) is None
-    assert ran == [["codesign", "--verify", "--strict", str(program)], ["codesign", "-dv", str(program)]]
-    assert "not 0000000000" in host_platform.signature_problem(program, "0000000000", os_name="macos", run=run)
-    unsigned = host_platform.signature_problem(
-        program, "3MU9H2V9Y9", os_name="macos", run=lambda argv, env=None: host_platform.Ran(1, "code object is not signed at all"),
+    assert ran == [["codesign", "--verify", "--strict", f"-R={OLLAMA_REQUIREMENT}", str(program)]]
+    failed = host_platform.signature_problem(
+        program, "3MU9H2V9Y9", os_name="macos",
+        run=lambda argv, env=None: host_platform.Ran(3, "test-requirement: code failed to satisfy specified code requirement(s)"),
     )
-    assert "fails `codesign --verify --strict`: code object is not signed at all" in unsigned
+    assert "not signed for distribution by team 3MU9H2V9Y9" in failed and "failed to satisfy" in failed
+    # The requirement is built from a team's own form and nothing else; the table's is one.
+    ran.clear()
+    for odd in ('3MU9H2V9Y9" or anchor apple', "3mu9h2v9y9", "3MU9H2V9Y", "", "3MU9H2V9Y9\n"):
+        assert "is not an Apple Developer ID team" in host_platform.signature_problem(program, odd, os_name="macos", run=run)
+    assert ran == []
+    assert host_platform.TEAM_ID.fullmatch(OLLAMA.signers["macos"])
+
+
+def test_a_file_name_cannot_write_the_team_into_what_is_checked(tmp_path):
+    """`codesign` as it answers for a program signed ad hoc: valid on its own, failing any
+    Developer ID requirement — and describing itself with its file's name first, so a name can
+    print a line of its own. The answer is the requirement's exit code alone."""
+    named = tmp_path / "ollama\nTeamIdentifier=3MU9H2V9Y9"
+
+    def codesign(argv, env=None):
+        if any(part.startswith("-R=") for part in argv):
+            return host_platform.Ran(3, f"{argv[-1]}: test-requirement: code failed to satisfy specified code requirement(s)")
+        if "-dv" in argv:
+            return host_platform.Ran(0, f"Executable={argv[-1]}\nIdentifier=adhoc\nSignature=adhoc\nTeamIdentifier=not set\n")
+        return host_platform.Ran(0, "")
+
+    assert host_platform.signature_problem(named, "3MU9H2V9Y9", os_name="macos", run=codesign) is not None
+
+
+@pytest.mark.skipif(sys.platform != "darwin" or shutil.which("codesign") is None, reason="codesign is macOS's")
+def test_on_this_mac_codesign_refuses_an_ad_hoc_signature_and_apples_own(tmp_path):
+    """The real `codesign`: a program signed ad hoc — named to print the team, as an archive could
+    name it — and one of Apple's own, signed but by no Developer ID team, both fail."""
+    named = tmp_path / "ollama\nTeamIdentifier=3MU9H2V9Y9"
+    shutil.copyfile("/usr/bin/true", named)
+    named.chmod(0o755)
+    signed = subprocess.run(["codesign", "--sign", "-", "--force", str(named)], capture_output=True, text=True)
+    assert signed.returncode == 0, signed.stderr
+    problem = host_platform.signature_problem(named, "3MU9H2V9Y9", os_name="macos")
+    assert problem is not None and "not signed for distribution by team 3MU9H2V9Y9" in problem
+    assert host_platform.signature_problem(Path("/usr/bin/true"), "3MU9H2V9Y9", os_name="macos") is not None
+
+
+@pytest.mark.parametrize("head", [
+    b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",  # thin, 32 bits, either byte order
+    b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",  # thin, 64 bits
+    b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",  # universal
+    b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca",  # universal, 64-bit offsets
+])
+def test_every_kind_of_mach_o_file_must_carry_the_signature(tmp_path, head):
+    """However many slices a universal binary says it has: counting them to tell one from a Java
+    class file would let one of many slices go unchecked."""
+    (tmp_path / "program").write_bytes(head + (60).to_bytes(4, "big") + b"\0" * 56)
+    (tmp_path / "mlx.metallib").write_bytes(b"MTLB" + b"\0" * 60)
+    (tmp_path / "short").write_bytes(head[:3])
+    assert installs.signed_files(tmp_path, "macos") == [tmp_path / "program"]
 
 
 def test_on_windows_a_signature_is_read_with_the_path_in_the_environment_never_the_script(tmp_path):
@@ -591,6 +656,11 @@ def test_on_windows_a_signature_is_read_with_the_path_in_the_environment_never_t
     ([link("hard", "nothing-here", tarfile.LNKTYPE)], "not a file it holds"),
     ([link("dev", "", tarfile.CHRTYPE)], "device or special file"),
     ([link("fifo", "", tarfile.FIFOTYPE)], "device or special file"),
+    # A name that would print a line of its own where it is reported.
+    ([("ollama\nTeamIdentifier=3MU9H2V9Y9", b"x", 0o755)], "will not write"),
+    ([("lib/\x1b[2Jlibggml.dylib", b"x", 0o644)], "will not write"),
+    ([("lib/libggml\x85.dylib", b"x", 0o644)], "will not write"),
+    ([link("lib/out", "libggml.dylib\nx")], "outside its directory"),
 ])
 def test_an_archive_that_reaches_outside_its_directory_is_refused(tmp_path, entries, says):
     archive = tmp_path / "bad.tgz"
@@ -806,11 +876,11 @@ async def test_an_archive_reaching_outside_is_refused_and_nothing_of_it_stays(ri
 
 async def test_on_macos_every_program_is_checked_for_ollamas_team(tmp_path):
     ran = []
-    team = {"value": "3MU9H2V9Y9"}
+    signed = {"by_the_team": True}
 
     def run(argv, env=None):
         ran.append(argv)
-        return host_platform.Ran(0, "" if argv[1] == "--verify" else f"TeamIdentifier={team['value']}\n")
+        return host_platform.Ran(0 if signed["by_the_team"] else 3, "test-requirement: code failed to satisfy specified code requirement(s)")
 
     rig = Rig(tmp_path, table=OLLAMA, run=run)
     try:
@@ -827,14 +897,14 @@ async def test_on_macos_every_program_is_checked_for_ollamas_team(tmp_path):
             await source.stage(http, release, into, lambda *_: None)
         program, library = into / "ollama", into / "lib" / "ollama" / "libmlx.dylib"
         assert ran == [
-            ["codesign", "--verify", "--strict", str(library)], ["codesign", "-dv", str(library)],
-            ["codesign", "--verify", "--strict", str(program)], ["codesign", "-dv", str(program)],
+            ["codesign", "--verify", "--strict", f"-R={OLLAMA_REQUIREMENT}", str(library)],
+            ["codesign", "--verify", "--strict", f"-R={OLLAMA_REQUIREMENT}", str(program)],
         ]
 
-        team["value"] = "0000000000"
+        signed["by_the_team"] = False
         await rig.want(V1)
         state = rig.installer.state()
-        assert "signed by team 0000000000, not 3MU9H2V9Y9" in state["error"]
+        assert "is not signed for distribution by team 3MU9H2V9Y9" in state["error"]
         assert state["staged"] is None and rig.versions_on_disk() == set() and state["signature"] == "checked"
     finally:
         await rig.close()
@@ -1229,3 +1299,434 @@ def test_init_with_install_engines_writes_it_and_says_what_to_quit(tmp_path, cap
     plain = tmp_path / "plain.json"
     assert cli.main(["-c", str(plain), "init"]) == 0
     assert load(plain).install_engines is False
+
+
+# --- what a program the agent starts is given of its environment ---
+
+
+def test_a_program_is_given_the_names_it_needs_and_nothing_else():
+    environ = {
+        "PATH": "/usr/bin", "HOME": "/home/me", "LANG": "C.UTF-8", "LC_ALL": "C", "TMPDIR": "/tmp/me",
+        "CUDA_VISIBLE_DEVICES": "1", "HSA_OVERRIDE_GFX_VERSION": "11.0.0", "NVIDIA_VISIBLE_DEVICES": "all",
+        "VAST_API_KEY": "not-a-real-key", "SOME_SERVICE_TOKEN": "not-a-real-token", "GITHUB_TOKEN": "x",
+        "HF_TOKEN": "x", "OLLAMA_ORIGINS": "*", "OLLAMA_HOST": "0.0.0.0:11434", "LD_PRELOAD": "/x.so",
+        "DYLD_INSERT_LIBRARIES": "/x.dylib", "PYTHONPATH": "/p", "HTTPS_PROXY": "http://user:pass@proxy",
+    }
+    given = host_platform.program_environment({"OLLAMA_HOST": "127.0.0.1:11434"}, environ=environ, os_name="linux")
+    assert given == {
+        "PATH": "/usr/bin", "HOME": "/home/me", "LANG": "C.UTF-8", "LC_ALL": "C", "TMPDIR": "/tmp/me",
+        "CUDA_VISIBLE_DEVICES": "1", "HSA_OVERRIDE_GFX_VERSION": "11.0.0", "NVIDIA_VISIBLE_DEVICES": "all",
+        "OLLAMA_HOST": "127.0.0.1:11434",
+    }
+    # Windows reads names in any case, and Python hands them over in capitals.
+    windows = {"PATH": r"C:\Windows", "SYSTEMROOT": r"C:\Windows", "COMSPEC": r"C:\Windows\cmd.exe",
+               "LOCALAPPDATA": r"C:\Users\me\AppData\Local", "USERPROFILE": r"C:\Users\me", "VAST_API_KEY": "x",
+               "CUDA_PATH": r"C:\CUDA", "OLLAMA_MODELS": r"D:\elsewhere"}
+    assert host_platform.program_environment({}, environ=windows, os_name="windows") == {
+        name: value for name, value in windows.items() if name not in ("VAST_API_KEY", "OLLAMA_MODELS")
+    }
+    assert "SYSTEMROOT" not in host_platform.program_environment({}, environ=windows, os_name="linux")
+
+
+async def test_no_credential_or_setting_of_its_own_reaches_the_server(rig, monkeypatch):
+    monkeypatch.setenv("VAST_API_KEY", "not-a-real-key")
+    monkeypatch.setenv("SOME_SERVICE_TOKEN", "not-a-real-token")
+    monkeypatch.setenv("OLLAMA_ORIGINS", "*")
+    monkeypatch.setenv("OLLAMA_HOST", "0.0.0.0:1")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")
+    rig.release(V1)
+    await rig.want("latest")
+    env = rig.starts()[0]["env"]
+    assert env["VAST_API_KEY"] is None and env["SOME_SERVICE_TOKEN"] is None and env["OLLAMA_ORIGINS"] is None
+    assert env["OLLAMA_HOST"] == f"127.0.0.1:{rig.port}" and env["CUDA_VISIBLE_DEVICES"] == "1"
+    assert env["PATH"] == os.environ["PATH"] and env["HOME"] == os.environ["HOME"]
+
+
+# --- the free-disk floor ---
+
+
+async def test_nothing_is_fetched_that_would_leave_less_free_than_the_owners_floor(tmp_path):
+    rig = Rig(tmp_path, min_free_disk_gb=10, free_bytes=10 * 10**9 + 1000)
+    try:
+        rig.release(V1)
+        await rig.want(V1)
+        state = rig.installer.state()
+        archive = rig.github.releases[V1]["ollama-darwin.tgz"]
+        assert f"ollama {V1} is not installed: it needs about {installs.size_words(len(archive) * installs.UNPACK_MARGIN)}" in state["error"]
+        assert "ollama-darwin.tgz" in state["error"] and "10.0 GB free" in state["error"]
+        assert "the 10.0 GB this machine's owner keeps free (min_free_disk_gb)" in state["error"]
+        assert rig.github.asked("/releases/assets/") == 0, "fetched before the room was asked for"
+        assert state["running"] is None and rig.versions_on_disk() == set()
+
+        rig.free_bytes = 100 * 10**9
+        rig.now += installs.RETRY_AFTER_S + 1
+        await rig.want(V1)
+        assert rig.installer.state()["running"] == V1 and rig.installer.state()["error"] is None
+    finally:
+        await rig.close()
+
+
+async def test_the_agent_installs_with_its_owners_floor_and_each_port_keeps_its_own_record(tmp_path):
+    """Two agents on one machine — two Ollamas, two whisper.cpp servers — keep their versions and
+    their records apart: neither takes the other's server for its own, nor removes what it runs."""
+
+    def installer_on(port: int, engine: str = "ollama") -> Installer:
+        return create_app(Settings(
+            key_hash=fingerprint(AGENT_KEY), engine=engine, engine_url=f"http://127.0.0.1:{port}",
+            models_path=str(tmp_path / f"models-{port}"), install_engines=True,
+            engines_path=str(tmp_path / "engines"), min_free_disk_gb=12,
+        )).state.installer
+
+    first, second = free_port(), free_port()
+    one, two = installer_on(first), installer_on(second)
+    assert one.engine_dir == tmp_path / "engines" / "ollama" / str(first)
+    assert two.engine_dir == tmp_path / "engines" / "ollama" / str(second)
+    assert one.floor_bytes == 12 * 10**9
+    assert installer_on(first, "whisper-cpp").engine_dir == tmp_path / "engines" / "whisper-cpp" / str(first)
+
+
+async def test_another_agents_server_on_another_port_is_never_taken_for_this_ones(rig):
+    rig.release(V1)
+    await rig.want("latest")
+    async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{free_port()}", timeout=3) as client:
+        other = OllamaServer(rig.engines / "ollama", engine_url=str(client.base_url), models_path=str(rig.root / "models"),
+                             client=client)
+        assert not other.ours(fresh=True) and other.running_version() is None
+    restarted = rig.new_installer()
+    assert restarted.server.ours(fresh=True), "the same port's agent knows it again"
+    assert json.loads((rig.engines / "ollama" / "server.json").read_text())["port"] == rig.port
+
+
+# --- the server's log ---
+
+
+def test_each_start_begins_the_log_afresh_and_keeps_the_one_before_cut_to_its_end(tmp_path, monkeypatch):
+    monkeypatch.setattr(host_platform, "LOG_KEEP_BYTES", 1000)
+    log = tmp_path / "ollama.log"
+    log.write_bytes(b"x" * 5000 + b"Error: the last words\n")
+    previous = tmp_path / "ollama.log.1"
+
+    def popen(argv, **options):
+        options["stdout"].write(b"serving\n")
+        return type("Started", (), {"pid": 4242})()
+
+    def start(n: int) -> int:
+        _, offset = host_platform.start(["/x/ollama", "serve"], env={}, log=log, cwd=tmp_path, note=f"start {n}",
+                                        os_name="linux", popen=popen)
+        return offset
+
+    offset = start(0)
+    assert log.read_text().startswith("--- gpm-agent: start 0") and log.read_bytes()[offset:] == b"serving\n"
+    assert previous.stat().st_size == 1000 and previous.read_bytes().endswith(b"Error: the last words\n")
+    start(1)
+    start(2)
+    assert "start 2" in log.read_text() and "start 1" not in log.read_text()
+    assert "start 1" in previous.read_text() and "start 0" not in previous.read_text()
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["ollama.log", "ollama.log.1"]
+
+
+# --- knowing its own server ---
+
+
+def test_on_windows_a_server_is_known_by_when_it_was_created_with_no_powershell(tmp_path, monkeypatch):
+    """Windows reuses a process number at once; the time a process was created, asked of Windows
+    in one call, tells the server from whatever has its number since — every pass, cheaply."""
+    import ctypes
+
+    monkeypatch.setattr(host_platform, "system", lambda sys_platform=None: "windows")
+    monkeypatch.setattr(host_platform, "_run_briefly", lambda argv, env=None: pytest.fail(f"ran {argv}"))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: pytest.fail("a process was signalled"))
+    created = {4242: 133_400_000_000_000_000}
+
+    class Kernel32:
+        def OpenProcess(self, access, inherit, pid):  # noqa: N802 - Windows' own names
+            return 77 if pid in created else 0
+
+        def GetExitCodeProcess(self, handle, code):  # noqa: N802
+            code._obj.value = 259  # STILL_ACTIVE
+            return 1
+
+        def GetProcessTimes(self, handle, made, exited, kernel, user):  # noqa: N802
+            made._obj.low, made._obj.high = created[4242] & 0xFFFFFFFF, created[4242] >> 32
+            return 1
+
+        def CloseHandle(self, handle):  # noqa: N802
+            return 1
+
+    monkeypatch.setattr(ctypes, "WinDLL", lambda name, use_last_error=False: Kernel32(), raising=False)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 87, raising=False)
+    assert host_platform.creation_time(4242) == created[4242]
+    engine_dir = tmp_path / "ollama"
+    engine_dir.mkdir()
+    (engine_dir / "server.json").write_text(json.dumps({
+        "pid": 4242, "program": r"C:\e\ollama.exe", "version": V1, "argv": [r"C:\e\ollama.exe", "serve"],
+        "port": 11434, "created": created[4242],
+    }))
+    server = OllamaServer(engine_dir, engine_url="http://127.0.0.1:11434", models_path="~/.ollama/models",
+                          client=httpx.AsyncClient(), os_name="windows")
+    assert server.ours(fresh=True) and server.running_version() == V1
+    created[4242] += 1  # the number has gone to a process created since
+    assert not server.ours(fresh=True)
+
+
+async def test_a_look_that_could_not_be_made_is_never_taken_for_not_ours(tmp_path, monkeypatch):
+    """A PowerShell that ran out of time says nothing: the last answer stands — the server is not
+    reported as something else's, nor started over, nor stopped unlooked-at, nor forgotten."""
+    from gpm_agent.whisper_cpp import WhisperCppFacts
+
+    answers: list[host_platform.Ran] = []
+    monkeypatch.setattr(host_platform, "_run_briefly", lambda argv, env=None: answers.pop(0))
+    monkeypatch.setattr(host_platform, "alive", lambda pid, os_name=None: True)
+    monkeypatch.setattr(host_platform, "system", lambda sys_platform=None: "windows")
+    timed_out = host_platform.Ran(None, "it did not finish within 5s")
+
+    engine_dir = tmp_path / "ollama"
+    engine_dir.mkdir()
+    (engine_dir / "server.json").write_text(json.dumps({
+        "pid": 4242, "program": "/x/ollama", "version": V1, "argv": ["/x/ollama", "serve"], "port": 11434,
+    }))
+    server = OllamaServer(engine_dir, engine_url="http://127.0.0.1:11434", models_path="~/.ollama/models",
+                          client=httpx.AsyncClient(), os_name="windows")
+    answers[:] = [host_platform.Ran(0, "/x/ollama serve\r\n"), timed_out]
+    assert server.ours(fresh=True)
+    assert server.ours(fresh=True), "a look that ran out of time was taken for not ours"
+    answers[:] = [timed_out]
+    with pytest.raises(OSError, match="could not be read now"):
+        await server.stop()
+    assert (engine_dir / "server.json").exists(), "forgotten without being looked at"
+
+    whisper = WhisperCppFacts(Settings(
+        key_hash="x", engine="whisper-cpp", engine_url="http://127.0.0.1:8178", models_path=str(tmp_path / "w"),
+    ))
+    record = {"pid": 4243, "tag": "o/r/f.bin", "argv": ["/e/whisper-server", "--port", "8178"]}
+    answers[:] = [host_platform.Ran(0, "/e/whisper-server --port 8178\r\n"), timed_out]
+    assert whisper._alive(record, fresh=True)
+    assert whisper._alive(record, fresh=True), "a look that ran out of time was taken for not ours"
+    answers[:] = [host_platform.Ran(0, "someone else's program\r\n")]
+    assert not whisper._alive(record, fresh=True)
+
+
+async def test_a_server_whose_number_went_to_another_program_is_started_again_at_once(rig):
+    """A look a moment old said the server runs; its number has since gone to another program — as
+    Windows reuses numbers at once. Deciding whether to start it, the agent looks again."""
+    rig.release(V1)
+    await rig.want("latest")
+    first = rig.installer.server._process
+    threading.Thread(target=first.wait, daemon=True).start()
+    restarted = rig.new_installer()
+    assert restarted.server.ours()
+    first.kill()
+    await wait_until(lambda: first.poll() is not None)
+    bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        restarted.server._record["pid"] = bystander.pid
+        restarted.server._confirmed = (bystander.pid, time.monotonic())
+        await restarted.ensure_running()
+        assert len(rig.starts()) == 2 and bystander.poll() is None
+        assert await rig.answering() == V1
+    finally:
+        bystander.kill()
+        bystander.wait()
+
+
+# --- one request at a time, and versions only forward ---
+
+
+async def test_two_requests_at_once_start_one_job(rig):
+    rig.release(V1)
+    await asyncio.gather(rig.installer.want(V1, False), rig.installer.want(V1, False))
+    await rig.installer.finished()
+    assert rig.github.asked(f"/releases/tags/v{V1}") == 1, "two jobs were started"
+    assert rig.installer.state()["running"] == V1 and len(rig.starts()) == 1
+    rig.release(V2)
+    await rig.want(V2)
+    answers = await asyncio.gather(rig.installer.want(V2, True), rig.installer.want(V2, True), return_exceptions=True)
+    [refused] = [answer for answer in answers if isinstance(answer, Refused)]
+    assert refused.error == "busy"
+    await rig.installer.finished()
+    assert [start["version"] for start in rig.starts()] == [V1, V2]
+
+
+def test_versions_are_ordered_by_their_numbers_and_a_pre_release_comes_before_its_release():
+    ordered = ["0.9.0", "0.10.0-beta", "0.10.0-rc1", "0.10.0-rc2", "0.10.0-rc10", "0.10.0", "0.10.1", "1.0", "1.0.0.1"]
+    assert sorted(reversed(ordered), key=installs.version_key) == ordered
+    assert installs.version_key("1.2") == installs.version_key("1.2.0")
+    assert installs.older(V1, V2) and not installs.older(V2, V2) and not installs.older(V3, V2)
+
+
+async def test_the_pool_moves_an_engine_forward_and_back_only_to_the_version_before(rig):
+    for version in (V1, V2, V3):
+        rig.release(version, latest=False)
+    await rig.want(V2)
+    for switch in (False, True):
+        with pytest.raises(Refused) as older:
+            await rig.installer.want(V1, switch)
+        assert older.value.status == 409 and older.value.error == "older_than_running"
+        assert f"ollama {V1} is older than the {V2} running here" in older.value.detail
+    state = rig.installer.state()
+    assert state["error"] == older.value.detail and state["wanted"] == V2, "the facts say why"
+    assert rig.github.asked(f"/releases/tags/v{V1}") == 0
+    app = create_app(rig.settings(), installer=rig.installer)
+    answer = await call(app, "PUT", "/agent/v1/engine/version", {"version": V1, "switch": False})
+    assert answer.status_code == 409 and answer.json()["error"] == "older_than_running"
+
+    await rig.want(V3)
+    assert rig.installer.state()["error"] is None, "said while it held, and no longer"
+    await rig.want(V3, True)
+    await rig.want(V2, True)  # back to the version before: a rollback
+    state = rig.installer.state()
+    assert (state["running"], state["previous"]) == (V2, V3) and await rig.answering() == V2
+    with pytest.raises(Refused, match="older than"):
+        await rig.installer.want(V1, False)
+
+
+async def test_a_latest_older_than_what_runs_is_ignored_and_the_facts_say_so(rig):
+    v4 = "0.42.0"
+    rig.release(V3, latest=False)
+    rig.release(V2)  # the latest, as the repository marks it: older than the one asked for by name
+    await rig.want(V3)
+    await rig.want("latest")
+    state = rig.installer.state()
+    assert (state["running"], state["staged"], state["latest"]) == (V3, None, V2)
+    assert f"the latest release of ollama, {V2}, is older than the {V3} running here; it is ignored" in state["error"]
+    assert rig.github.asked(f"/releases/tags/v{V2}") == 0 and rig.versions_on_disk() == {V3}
+    assert (await rig.installer.want("latest", True))["working"] is None, "nothing to switch to"
+    rig.release(v4)
+    rig.now += installs.LATEST_EVERY_S + 1
+    await rig.want("latest")
+    state = rig.installer.state()
+    assert (state["running"], state["staged"], state["error"]) == (V3, v4, None)
+
+
+# --- a restart and a switch, and a server that will not stop ---
+
+
+class StandInServer:
+    """A server driven step by step: what runs, a start held at a gate, a look at the port held
+    while asked, and stops that fail as the system's own errors do."""
+
+    foreign_reason = "something else answers"
+
+    def __init__(self) -> None:
+        self.version: Optional[str] = None
+        self.started: list[str] = []
+        self.start_gate = asyncio.Event()
+        self.start_gate.set()
+        self.look_gate = asyncio.Event()
+        self.look_gate.set()
+        self.hold_looks = False
+        #: What each stop in turn raises — None for a stop that works — and then none does.
+        self.stops_fail: list[Optional[Exception]] = []
+        self.problems: dict[str, str] = {}
+
+    def ours(self, *, fresh: bool = False) -> bool:
+        return self.version is not None
+
+    def running_version(self) -> Optional[str]:
+        return self.version
+
+    async def foreign(self) -> bool:
+        if self.hold_looks:
+            await self.look_gate.wait()
+        await asyncio.sleep(0)
+        return False
+
+    async def start(self, program: Path, version: str, timeout_s: float) -> Optional[str]:
+        await self.start_gate.wait()
+        if self.version is not None:
+            return "this agent's server is already running"
+        self.started.append(version)
+        self.version = version
+        return self.problems.get(version)
+
+    async def stop(self) -> None:
+        await asyncio.sleep(0)
+        failure = self.stops_fail.pop(0) if self.stops_fail else None
+        if failure is not None:
+            raise failure
+        self.version = None
+
+    def pool_environment(self) -> None:
+        return None
+
+
+def stand_in(tmp_path: Path, *, running: str, staged: Optional[str] = None) -> tuple[StandInServer, Installer]:
+    server = StandInServer()
+    engine_dir = tmp_path / "engines" / "ollama"
+    for version in (running, staged):
+        if version:
+            (engine_dir / version).mkdir(parents=True)
+    installs.InstallState(running=running, staged=staged).write(engine_dir / installs.STATE_FILE)
+    server.version = running
+    return server, Installer(ArchiveSource(UNSIGNED, MAC), engine_dir, server, switch_timeout_s=5)
+
+
+async def settle() -> None:
+    for _ in range(50):
+        await asyncio.sleep(0)
+
+
+async def test_a_restart_that_waited_for_a_switch_restarts_what_runs_after_it(tmp_path):
+    server, installer = stand_in(tmp_path, running=V1, staged=V2)
+    server.hold_looks = True
+    server.look_gate.clear()
+    restart = asyncio.create_task(installer.restart())
+    await settle()  # past its own look at whether anything is in hand; looking at the port
+    server.hold_looks = False
+    server.start_gate.clear()
+    await installer.want(V2, True)
+    await settle()  # the switch holds the server, starting V2
+    server.look_gate.set()
+    await settle()  # the restart waits for the switch
+    server.start_gate.set()
+    assert await restart is None
+    await installer.finished()
+    assert installer.record.running == V2 and server.version == V2, "the record and what runs disagree"
+    assert server.started == [V2, V2]
+
+
+async def test_a_server_that_will_not_stop_is_a_switch_that_did_not_happen_said_so(tmp_path):
+    server, installer = stand_in(tmp_path, running=V1, staged=V2)
+    server.stops_fail = [PermissionError(1, "Operation not permitted")]
+    await installer.want(V2, True)
+    await installer.finished()
+    assert installer._job.exception() is None
+    record = installer.record
+    assert (record.running, record.staged, server.version) == (V1, V2, V1)
+    assert f"ollama {V2} was not started: {V1} could not be stopped: [Errno 1] Operation not permitted" in record.error
+    assert V2 not in record.failed, "not the new version's fault"
+
+    # The new version fails, and will not stop either: said, and the one before tried again.
+    server.problems[V2] = "it answered as version 0.0.0"
+    server.stops_fail = [None, OSError("the record could not be written")]
+    await installer.want(V2, True)
+    await installer.finished()
+    assert installer._job.exception() is None
+    assert record.running == V1 and V2 in record.failed
+    assert "did not start: it answered as version 0.0.0; and it could not be stopped: the record could not be written" in record.error
+    assert f"and {V1}, started again, did not answer either: this agent's server is already running" in record.error
+
+    # A restart whose stop fails says so, rather than raising.
+    server.version = V1
+    server.stops_fail = [PermissionError(1, "Operation not permitted")]
+    assert "could not be stopped: [Errno 1] Operation not permitted" in await installer.restart()
+
+
+# --- Windows: no console window for any command ---
+
+
+def test_on_windows_every_command_of_the_platforms_runs_with_no_console_window(monkeypatch):
+    seen = []
+
+    def run(argv, **options):
+        seen.append(options)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(host_platform, "system", lambda sys_platform=None: "windows")
+    host_platform.command_line(4242)
+    host_platform.signature_problem(Path("C:/e/ollama.exe"), "Some Publisher", environ={})
+    assert len(seen) == 2 and all(options["creationflags"] == host_platform.CREATE_NO_WINDOW for options in seen)
+    monkeypatch.setattr(host_platform, "system", lambda sys_platform=None: "linux")
+    host_platform._run(["ps", "-p", "1"])
+    assert "creationflags" not in seen[-1], "a flag POSIX refuses"

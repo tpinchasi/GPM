@@ -9,16 +9,21 @@ agent installs Ollama itself (`installs`) and runs it, as it runs whisper.cpp's 
 - **On loopback, at the engine URL's port**, with the models directory the agent's settings name
   (`~/.ollama/models` unless set, so nothing already downloaded is downloaded again), and the
   pool's numbers — workers, models held, context — as the environment Ollama reads them from,
-  built from integers by the engine's adapter. The hub's and GitHub's credentials are withheld.
-- **Recognised as its own** by a record of what it started and the process's command line —
-  exactly the argument list it was started with (`platform.started_with`) — so that it is still
-  known as the agent's own after the agent restarts, and a process number that has since gone to
-  another program is never signalled.
+  built from integers by the engine's adapter. Of the agent's own environment it is given only
+  the names `platform.program_environment` keeps — never a credential, never an `OLLAMA_*`
+  setting the agent did not write.
+- **Recognised as its own** by a record of what it started — the port among it — and the
+  process's command line, exactly the argument list it was started with (`platform.recognised`;
+  on Windows, the time the process was created), so that it is still known as the agent's own
+  after the agent restarts, a process number that has since gone to another program is never
+  signalled, and another agent's server on another port is never taken for it.
 - **Never over something it did not start.** If anything else answers on the port — the Ollama
   app, or an `ollama serve` the owner started — the agent reports it and leaves it alone.
 
 The record, the pool's numbers and the log live in the engine's own directory under the engines
-directory, beside its versions.
+directory, beside its versions — one per port (`app.default_installer`), so two agents on one
+machine keep two. The log begins afresh with each start, the one before kept beside it
+(`platform.rotate_log`).
 """
 
 from __future__ import annotations
@@ -43,10 +48,6 @@ LOG_FILE = "ollama.log"
 #: The pool's numbers as Ollama reads them — the only names the agent ever writes for it, and the
 #: only ones read back from its own file (`engines.OllamaFacts.launch_environment` builds them).
 POOL_NAMES = ("OLLAMA_NUM_PARALLEL", "OLLAMA_MAX_LOADED_MODELS", "OLLAMA_CONTEXT_LENGTH")
-
-#: Credentials the agent may hold — for the model hub, and for GitHub's releases. The server has
-#: no use for either, so it is started without them.
-WITHHELD = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "GITHUB_TOKEN")
 
 #: The longest one look at the server may take. Short: the facts look on every pass.
 ANSWER_TIMEOUT_S = 3.0
@@ -151,13 +152,13 @@ class OllamaServer:
         return True
 
     def environment(self) -> dict[str, str]:
-        """The server's whole environment: the agent's own, less its credentials, with the pool's
-        numbers and — last, so nothing overrides them — the address and the models directory."""
-        environment = {name: value for name, value in os.environ.items() if name not in WITHHELD}
-        environment.update(self.pool_environment() or {})
-        environment["OLLAMA_HOST"] = f"127.0.0.1:{self.port}"
-        environment["OLLAMA_MODELS"] = str(Path(self.models_path).expanduser())
-        return environment
+        """The server's whole environment: what `platform.program_environment` keeps of the
+        agent's own, with the pool's numbers and — last, so nothing overrides them — the address
+        and the models directory. Every `OLLAMA_*` name in it is one written here."""
+        own = dict(self.pool_environment() or {})
+        own["OLLAMA_HOST"] = f"127.0.0.1:{self.port}"
+        own["OLLAMA_MODELS"] = str(Path(self.models_path).expanduser())
+        return host_platform.program_environment(own, os_name=self.os_name)
 
     # --- what was started ---
 
@@ -189,37 +190,48 @@ class OllamaServer:
             return self._process
         return None
 
-    def _is_ours(self, pid: int, record: dict[str, Any]) -> bool:
-        """Is process `pid` the server the record describes? Running exactly the argument list
-        recorded for it; a program that has since taken the number is not."""
+    def _is_ours(self, pid: int, record: dict[str, Any]) -> Optional[bool]:
+        """Is process `pid` the server the record describes? Started by an agent on this port,
+        running exactly the argument list recorded for it — and, on Windows, created when the
+        record says. A program that has since taken the number is not; nor is another agent's
+        server on another port, whose command line is the same. None where it cannot be told now."""
         recorded = record.get("argv")
         if not isinstance(recorded, list) or not recorded or not all(isinstance(part, str) for part in recorded):
             return False
-        return host_platform.started_with(pid, recorded, os_name=self.os_name)
+        if record.get("port") != self.port:
+            return False
+        created = record.get("created")
+        return host_platform.recognised(
+            pid, recorded, created=created if isinstance(created, int) else None, os_name=self.os_name,
+        )
 
-    def _alive(self, record: dict[str, Any]) -> bool:
+    def _alive(self, record: dict[str, Any], *, fresh: bool = False) -> bool:
         """Asked of the process itself when this agent started it; otherwise of the system, with
-        its identity looked at again whenever the last look is more than a moment old — a
-        positive answer is kept only that long, and a negative one not at all."""
+        its identity looked at again whenever the last look is more than a moment old, or `fresh`
+        asks for a look now — a positive answer is kept only that long, and a negative one not at
+        all. A look that could not be made (a command that failed or ran out of time) is no
+        answer: the last one stands, and is not kept any longer for it."""
         own = self._own_process(record)
         if own is not None:
             return own.poll() is None
         pid = record["pid"]
         if not host_platform.alive(pid, os_name=self.os_name):
+            self._confirmed = None
             return False
-        confirmed = self._confirmed
-        if confirmed is not None and confirmed[0] == pid and time.monotonic() - confirmed[1] < IDENTITY_TRUSTED_S:
+        confirmed = self._confirmed if self._confirmed is not None and self._confirmed[0] == pid else None
+        if not fresh and confirmed is not None and time.monotonic() - confirmed[1] < IDENTITY_TRUSTED_S:
             return True
-        if self._is_ours(pid, record):
-            self._confirmed = (pid, time.monotonic())
-            return True
-        return False
+        said = self._is_ours(pid, record)
+        if said is None:
+            return confirmed is not None
+        self._confirmed = (pid, time.monotonic()) if said else None
+        return said
 
-    def ours(self) -> bool:
+    def ours(self, *, fresh: bool = False) -> bool:
         """Is the server this agent started running now — started by this agent process, or by
-        the one before it, and still the same program?"""
+        the one before it, and still the same program? `fresh` looks again now."""
         record = self._current()
-        return record is not None and self._alive(record)
+        return record is not None and self._alive(record, fresh=fresh)
 
     def running_version(self) -> Optional[str]:
         record = self._current()
@@ -292,7 +304,8 @@ class OllamaServer:
             return f"could not start {program}: {exc}"
         self._process = process
         record = {
-            "pid": process.pid, "version": version, "program": str(program), "argv": argv,
+            "pid": process.pid, "version": version, "program": str(program), "argv": argv, "port": self.port,
+            "created": host_platform.creation_time(process.pid, os_name=self.os_name),
             "log": str(log_path), "log_offset": offset, "started_at": time.time(),
         }
         try:
@@ -317,8 +330,9 @@ class OllamaServer:
 
     async def stop(self) -> None:
         """Stop the server this agent started, if it runs — with whatever it started — and forget
-        it. A process known only from the record is signalled only once its command line, read
-        now, says it is that server."""
+        it. A process known only from the record is signalled only once a look now says it is
+        that server; one that cannot be looked at now is neither signalled nor forgotten, and the
+        stop fails, saying so, to be asked again (an OSError, as an error from the system is)."""
         record = self._current()
         if record is None:
             return
@@ -327,6 +341,10 @@ class OllamaServer:
             await host_platform.stop(own.pid, process=own, os_name=self.os_name)
         else:
             pid = record["pid"]
-            if host_platform.alive(pid, os_name=self.os_name) and self._is_ours(pid, record):
-                await host_platform.stop(pid, os_name=self.os_name)
+            if host_platform.alive(pid, os_name=self.os_name):
+                said = self._is_ours(pid, record)
+                if said is None:
+                    raise OSError(f"whether process {pid} is the ollama serve it started could not be read now")
+                if said:
+                    await host_platform.stop(pid, os_name=self.os_name)
         self._forget()

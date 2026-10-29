@@ -25,6 +25,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -76,7 +77,8 @@ if args == ["--help"]:
     sys.exit(control.get("help_code", 0))
 with open(starts_path, "a") as starts:
     starts.write(json.dumps({"version": version, "program": program, "args": args, "pid": os.getpid(),
-                             "token": os.environ.get("GITHUB_TOKEN")}) + "\\n")
+                             "token": os.environ.get("GITHUB_TOKEN"),
+                             "env": {k: os.environ.get(k) for k in ("VAST_API_KEY", "SOME_SERVICE_TOKEN", "PATH")}}) + "\\n")
 print("whisper_init_from_file_with_params_no_state: loading model", flush=True)
 if control.get("exit"):
     print(control["exit"], flush=True)
@@ -309,7 +311,8 @@ class Rig:
     """A machine whose agent installs whisper.cpp: engines and models directories, a port, a fake
     GitHub, a fake hub, the machine's commands stood in for, and the agent's own pieces."""
 
-    def __init__(self, root: Path, *, target: Target = MAC, which: Optional[dict] = None, **commands) -> None:
+    def __init__(self, root: Path, *, target: Target = MAC, which: Optional[dict] = None,
+                 min_free_disk_gb: float = 0.0, free_bytes: Optional[int] = None, **commands) -> None:
         root.mkdir(parents=True, exist_ok=True)
         self.root = root
         (root / "fake_whisper_server.py").write_text(FAKE_SERVER)
@@ -320,6 +323,7 @@ class Rig:
         self.commands = Commands(root, **commands)
         self.which = dict(ON_PATH if which is None else which)
         self.target = target
+        self.min_free_disk_gb, self.free_bytes = min_free_disk_gb, free_bytes
         self.now = 1_800_000_000.0
         self.settings = Settings(
             key_hash=fingerprint(AGENT_KEY), engine="whisper-cpp", engine_url=self.url,
@@ -345,6 +349,8 @@ class Rig:
         installer = Installer(
             self.source(), self.engines / "whisper-cpp", InstalledServer(engine, client),
             http_transport=self.github.transport(), clock=lambda: self.now, switch_timeout_s=20.0,
+            min_free_disk_gb=self.min_free_disk_gb,
+            free_disk_bytes=(lambda: self.free_bytes) if self.free_bytes is not None else None,
         )
         engine.use_installer(installer)
         return engine, installer
@@ -632,6 +638,56 @@ async def test_a_built_program_that_does_not_run_is_not_kept(rig):
     assert not staged(rig, V2).exists()
 
 
+async def test_no_credential_reaches_the_build_pip_the_checks_or_the_server(rig, monkeypatch):
+    monkeypatch.setenv("VAST_API_KEY", "not-a-real-key")
+    monkeypatch.setenv("SOME_SERVICE_TOKEN", "not-a-real-token")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    rig.which["cmake"] = None  # cmake from PyPI: pip runs too
+    rig.publish(V1, C1)
+    await rig.want("latest")
+    await rig.hold(TAG)
+    ran = [argv[0] if "-m" not in argv[:3] else " ".join(argv[1:4]) for argv in rig.commands.argvs()]
+    assert any("venv" in name for name in ran) and any("pip" in name for name in ran)
+    for argv, _, env in rig.commands.calls:
+        assert env is not None, f"{argv} was given the agent's whole environment"
+        assert "VAST_API_KEY" not in env and "SOME_SERVICE_TOKEN" not in env, argv
+        assert env["PATH"] == os.environ["PATH"] and env["CUDA_VISIBLE_DEVICES"] == "0", argv
+    [start] = rig.starts()
+    assert start["env"]["VAST_API_KEY"] is None and start["env"]["SOME_SERVICE_TOKEN"] is None
+    assert start["env"]["PATH"] == os.environ["PATH"]
+
+
+async def test_a_build_is_not_begun_that_would_leave_less_free_than_the_owners_floor(tmp_path):
+    rig = Rig(tmp_path, min_free_disk_gb=10, free_bytes=11 * 10**9)
+    try:
+        rig.publish(V2, C2)
+        await rig.want("latest")
+        error = rig.installer.state()["error"]
+        assert "whisper-cpp 1.9.5 is not installed: it needs about 2.0 GB on the engines' volume" in error
+        assert "a build from its source, estimated at 2.0 GB" in error and "11.0 GB free" in error
+        assert "min_free_disk_gb" in error
+        assert not rig.github.asked("/tarball/") and not any("-S" in argv for argv in rig.commands.argvs())
+        rig.free_bytes = 13 * 10**9
+        rig.now += installs.RETRY_AFTER_S + 1
+        await rig.want("latest")
+        assert rig.installer.state()["running"] == V2
+    finally:
+        await rig.close()
+
+
+async def test_on_windows_an_archive_is_not_fetched_that_would_leave_less_free_than_the_floor(tmp_path):
+    rig = Rig(tmp_path, target=WIN, min_free_disk_gb=10, free_bytes=10 * 10**9 + 10)
+    try:
+        rig.publish(V2, C2)
+        rig.github.build_tag("b5454", C2, {"whisper-blas-bin-x64.zip": windows_zip(WINDOWS_BUILD)}, at=1)
+        await rig.want("latest")
+        error = rig.installer.state()["error"]
+        assert "whisper-blas-bin-x64.zip" in error and "and up to 3 times that unpacked" in error
+        assert "min_free_disk_gb" in error and not rig.github.asked("/releases/assets/")
+    finally:
+        await rig.close()
+
+
 async def test_the_source_comes_through_the_api_the_machines_owner_names(rig, monkeypatch):
     monkeypatch.setenv("GPM_GITHUB_API", "https://mirror.example/api")
     rig.publish(V2, C2)
@@ -906,7 +962,7 @@ async def test_an_agent_set_to_install_whisper_cpp_builds_its_installer_around_i
     assert app.state.work.engine.installer is installer
     assert isinstance(installer.source, WhisperCppSource)
     assert installer.source.tools_dir == tmp_path / "engines" / ".tools"
-    assert installer.engine_dir == tmp_path / "engines" / "whisper-cpp"
+    assert installer.engine_dir == tmp_path / "engines" / "whisper-cpp" / str(urlsplit(settings.engine_url).port)
 
     plain = create_app(Settings(key_hash="x", engine="whisper-cpp", engine_url=f"http://127.0.0.1:{free_port()}"))
     assert plain.state.installer is None and plain.state.work.engine.installer is None

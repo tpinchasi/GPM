@@ -18,7 +18,10 @@ What keeps a build inside the agent's bounds:
   `build_argv`): a Release build of the server alone, static — nothing it links can move under a
   kept version — with Metal on a Mac, CUDA where NVIDIA's compiler is installed, and the CPU
   otherwise; on half the machine's cores and at low priority, so the owner's own work comes
-  first; with the agent's credentials withheld. Nothing from the source is run but its build.
+  first; given of the agent's environment only the names `platform.program_environment` keeps,
+  so no credential the agent was started with reaches the build or pip. Nothing from the source
+  is run but its build. Before anything is fetched, the engines' volume must have room for it
+  above the owner's free-disk floor (`BUILD_NEEDS_BYTES`, an estimate).
 - **Only the program is kept.** `whisper-server` is copied from the build into the version's
   `bin/`, checked to run (`--help`), and the build's directory — beside the versions, never in
   the models directory — removed. Its log stays, the last build's only.
@@ -52,6 +55,7 @@ import httpx
 from . import platform as host_platform
 from .installs import (
     DOWNLOADS,
+    UNPACK_MARGIN,
     VERSION,
     Asset,
     BuiltRelease,
@@ -59,10 +63,12 @@ from .installs import (
     InstallRefused,
     Progress,
     Release,
+    Room,
     Target,
     _api,
     _headers,
     _keep_only,
+    size_words,
     unpack,
 )
 from .platform import LINUX, MACOS, WINDOWS
@@ -84,6 +90,13 @@ MAX_SOURCE_BYTES = 512 * 1024 * 1024
 #: The longest a configure or a build may take. A CUDA build for one card on half the cores of a
 #: small machine takes tens of minutes; two hours means something is wrong.
 BUILD_TIMEOUT_S = 2 * 3600.0
+
+#: What a build takes on the engines' volume at most, asked for before anything is fetched: the
+#: source (about 10 MB, unpacked to some 50 MB), its build tree — a few hundred MB for the CPU or
+#: Metal, about a gigabyte for CUDA's kernels for one card — and cmake from PyPI (about 100 MB
+#: installed), where the machine has none. A build's size is known only once it is done, so this is
+#: an estimate, twice the largest of them.
+BUILD_NEEDS_BYTES = 2 * 10**9
 
 #: The longest a quick look takes: `xcode-select -p`, `nvidia-smi`, `cmake --version`.
 LOOK_TIMEOUT_S = 30.0
@@ -143,9 +156,6 @@ LIST_PAGES = 5
 MAX_CANDIDATES = 4
 _DRIVER = re.compile(r"^\s*(\d+)\.(\d+)")
 
-#: Credentials the agent may hold. Neither a build nor pip has a use for them.
-_WITHHELD = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "GITHUB_TOKEN")
-
 
 # --- the commands, each a fixed argument list ---
 
@@ -194,10 +204,9 @@ def requirements_text() -> str:
 
 
 def _environment(**more: str) -> dict[str, str]:
-    """The agent's own environment, less its credentials, with `more`."""
-    environment = {name: value for name, value in os.environ.items() if name not in _WITHHELD}
-    environment.update(more)
-    return environment
+    """What a build, pip or a look at the machine is given of the agent's environment — the names
+    `platform.program_environment` keeps, never a credential — with `more`, the agent's own."""
+    return host_platform.program_environment(more)
 
 
 def _last_words(said: host_platform.Ran) -> str:
@@ -324,19 +333,25 @@ class WhisperCppSource(GitHubReleases):
             body = await self._get(http, f"/repos/{self.repo}/git/tags/{sha}", f"{self.repo}'s tag {tag} could not be read")
         raise InstallRefused(f"{self.repo}'s tag {tag} leads through too many tags to reach a commit")
 
-    async def stage(self, http: httpx.AsyncClient, release: Release, into: Path, progress: Progress) -> None:
+    async def stage(
+        self, http: httpx.AsyncClient, release: Release, into: Path, progress: Progress, room: Optional[Room] = None,
+    ) -> None:
         if self.target.os == WINDOWS:
-            await self._stage_archive(http, release, into, progress)
+            await self._stage_archive(http, release, into, progress, room)
         elif self.target.os in (MACOS, LINUX):
-            await self._stage_build(http, release, into, progress)
+            await self._stage_build(http, release, into, progress, room)
         else:
             raise InstallRefused(f"this agent installs whisper.cpp on macOS, Linux and Windows, not on {self.target.os}")
 
     # --- macOS and Linux: built here ---
 
-    async def _stage_build(self, http: httpx.AsyncClient, release: Release, into: Path, progress: Progress) -> None:
+    async def _stage_build(
+        self, http: httpx.AsyncClient, release: Release, into: Path, progress: Progress, room: Optional[Room],
+    ) -> None:
         engine_dir = into.parent
         await self._need_compiler()
+        if room is not None:
+            room(BUILD_NEEDS_BYTES, f"a build from its source, estimated at {size_words(BUILD_NEEDS_BYTES)}")
         commit = await self.commit_of(http, release.tag)
         cmake = await self._cmake(progress)
         work = engine_dir / WORK
@@ -387,7 +402,7 @@ class WhisperCppSource(GitHubReleases):
     async def _need_compiler(self) -> None:
         """Refuse, before anything is fetched, on a machine that cannot compile."""
         if self.target.os == MACOS:
-            if (await self.run(["xcode-select", "-p"], timeout_s=LOOK_TIMEOUT_S)).code == 0:
+            if (await self.run(["xcode-select", "-p"], env=_environment(), timeout_s=LOOK_TIMEOUT_S)).code == 0:
                 return
             missing = "Xcode's command-line tools"
         else:
@@ -472,7 +487,9 @@ class WhisperCppSource(GitHubReleases):
 
     # --- Windows: the project's own archives ---
 
-    async def _stage_archive(self, http: httpx.AsyncClient, release: Release, into: Path, progress: Progress) -> None:
+    async def _stage_archive(
+        self, http: httpx.AsyncClient, release: Release, into: Path, progress: Progress, room: Optional[Room],
+    ) -> None:
         names = self.table.windows[await self._windows_kind()]
         asset = next((found for name in names if (found := release.asset(name)) is not None), None)
         where = release.tag
@@ -480,6 +497,10 @@ class WhisperCppSource(GitHubReleases):
             where, asset = await self._build_tag_for(http, release, names)
         if asset.sha256 is None:
             raise InstallRefused(f"{self.repo} {where} publishes no digest for {asset.name}; nothing unchecked is installed")
+        if room is not None:
+            room(asset.size * UNPACK_MARGIN, (
+                f"{asset.name}, {size_words(asset.size)}, and up to {UNPACK_MARGIN - 1} times that unpacked"
+            ))
         downloads = into.parent / DOWNLOADS
         _keep_only(downloads, {asset.sha256})
         progress("downloading", 0, asset.size)
@@ -511,7 +532,9 @@ class WhisperCppSource(GitHubReleases):
 
     async def _nvidia_driver(self) -> Optional[tuple[int, int]]:
         """The NVIDIA driver's version, (major, minor) — None without an NVIDIA card and driver."""
-        said = await self.run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"], timeout_s=LOOK_TIMEOUT_S)
+        said = await self.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"], env=_environment(), timeout_s=LOOK_TIMEOUT_S,
+        )
         if said.code != 0:
             return None
         for line in said.output.splitlines():

@@ -11,9 +11,12 @@ system it is on:
 - **Stopping one it started**, with whatever it started: its process group asked first, then
   made to, on POSIX; its process tree ended on Windows, where a program has no signal to be
   asked with.
+- **What a program it starts is given of the agent's environment**: a short list of names, by
+  name, never everything less a few (`program_environment`).
 - **Recognising its own process** after the agent restarts, by the process's command line — a
   process number from a file is only a number, and may since belong to something else. Ours runs
-  exactly the argument list it was started with (`started_with`).
+  exactly the argument list it was started with (`started_with`); on Windows it was also created
+  when its record says (`creation_time`), which is asked of Windows itself, cheaply.
 - **Keeping a directory private**: this user's alone (0700) on POSIX; on Windows, where Python
   reports no owner and no such mode, by where it lives, under the user's profile.
 - **Checking a program's signature** where the system has one: `codesign` on macOS,
@@ -84,6 +87,26 @@ BRIEF_TIMEOUT_S = 5.0
 #: interpreter a script's `#!` line names, and the one argument that line may add.
 SCRIPT_WORDS = 2
 
+#: How much of a server's log from before its latest start is kept, beside the log, as
+#: `<log>.1`: the end of it, where the reason it stopped is. Each start begins the log afresh, so
+#: what a server writes over months of starts is never all kept.
+LOG_KEEP_BYTES = 20 * 1024 * 1024
+
+#: What a program the agent starts — an engine, a build, pip — is given of the environment the
+#: agent was started in: where programs and the user's files are, who the user is, the language
+#: and the time zone, a temporary directory. Nothing else is passed on, so a credential in that
+#: environment — a provider's key, a token — never reaches a program the agent downloaded.
+KEPT_NAMES = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TMPDIR", "TMP", "TEMP", "TZ")
+#: …and on Windows what a program needs there to run at all. Windows reads names in any case.
+KEPT_ON_WINDOWS = (
+    "SystemRoot", "SystemDrive", "windir", "LOCALAPPDATA", "APPDATA", "USERPROFILE", "ProgramData",
+    "PATHEXT", "COMSPEC", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+)
+#: …and every name that begins so: the locale's own settings, and the accelerators' — which cards
+#: a program may use, and how, as the machine's owner set them for the cards' runtimes. An
+#: engine's own settings (`OLLAMA_*`) are never passed on: only those the agent writes itself.
+KEPT_PREFIXES = ("LC_", "CUDA_", "NVIDIA_", "HIP_", "ROCM_", "HSA_", "GPU_")
+
 
 def system(sys_platform: Optional[str] = None) -> str:
     """`macos`, `linux` or `windows` — or, for any other system, its own name, which nothing in
@@ -136,6 +159,30 @@ def engines_dir() -> Path:
     return Path(engines_dir_for(system(), os.environ, Path.home()))
 
 
+def program_environment(
+    own: Mapping[str, str], *, environ: Optional[Mapping[str, str]] = None, os_name: Optional[str] = None,
+) -> dict[str, str]:
+    """The whole environment of a program this agent starts: the names `KEPT_NAMES`,
+    `KEPT_ON_WINDOWS` (on Windows, in any case) and `KEPT_PREFIXES` allow from the agent's own
+    environment, and then `own` — what the agent sets itself, which nothing overrides."""
+    os_name = os_name or system()
+    environ = os.environ if environ is None else environ
+    if os_name == WINDOWS:
+        names = {name.upper() for name in (*KEPT_NAMES, *KEPT_ON_WINDOWS)}
+
+        def kept(name: str) -> bool:
+            return name.upper() in names or name.upper().startswith(KEPT_PREFIXES)
+    else:
+        names = set(KEPT_NAMES)
+
+        def kept(name: str) -> bool:
+            return name in names or name.startswith(KEPT_PREFIXES)
+
+    environment = {name: value for name, value in environ.items() if kept(name)}
+    environment.update(own)
+    return environment
+
+
 # --- running a program ---
 
 
@@ -152,11 +199,15 @@ Runner = Callable[..., Ran]
 
 def _run(argv: list[str], env: Optional[Mapping[str, str]] = None, timeout_s: float = COMMAND_TIMEOUT_S) -> Ran:
     """Run one of this module's literal commands, without a shell. A command that cannot start or
-    does not finish is an answer too — `code` None — never an exception."""
+    does not finish is an answer too — `code` None — never an exception.
+
+    On Windows with no console window: the agent runs at logon under `pythonw.exe`, which has
+    none, and every console program it ran would otherwise open one on the owner's screen."""
+    placement: dict[str, Any] = {"creationflags": CREATE_NO_WINDOW} if system() == WINDOWS else {}
     try:
         done = subprocess.run(
             argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
-            timeout=timeout_s, check=False, env=None if env is None else dict(env),
+            timeout=timeout_s, check=False, env=None if env is None else dict(env), **placement,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return Ran(None, str(exc) or type(exc).__name__)
@@ -178,14 +229,18 @@ def start(
     popen: Optional[Callable[..., Any]] = None,
 ) -> tuple[Process, int]:
     """Start `argv` — the caller's fixed argument list — so that it outlives this agent, its
-    output appended to `log` after a line saying what was started. Returns the process and where
+    output written to `log` after a line saying what was started. Returns the process and where
     in the log its own output begins. Raises OSError when the program cannot be started.
+
+    The log begins afresh with each start: the one before is kept as `<log>.1`, its last
+    `LOG_KEEP_BYTES` at most (`rotate_log`), so two starts' logs are kept and never more.
 
     On POSIX in its own session, so the agent's restart or its terminal closing does not take it
     down. On Windows in its own process group, with no console window (`WINDOWS_START_FLAGS`).
     """
     os_name = os_name or system()
     launch = popen or subprocess.Popen
+    rotate_log(log)
     with open(log, "ab") as out:
         out.write(f"--- gpm-agent: {note} at {time.ctime()}\n".encode())
         out.flush()
@@ -199,6 +254,31 @@ def start(
             cwd=cwd, env=dict(env), **placement,
         )
     return process, offset
+
+
+def rotate_log(log: Path, keep_bytes: Optional[int] = None) -> None:
+    """Move a server's log aside before it starts again: to `<log>.1`, replacing the one before
+    it, and cut to its last `keep_bytes` (`LOG_KEEP_BYTES`). Nothing is lost but what is older; a
+    log that cannot be moved — still open in another program, on Windows — is left to be added to.
+    """
+    keep = LOG_KEEP_BYTES if keep_bytes is None else keep_bytes
+    previous = log.with_name(log.name + ".1")
+    try:
+        size = log.stat().st_size
+    except OSError:
+        return  # no log yet
+    try:
+        if size <= keep:
+            os.replace(log, previous)
+            return
+        draft = log.with_name(log.name + ".1.new")
+        with open(log, "rb") as source, open(draft, "wb") as sink:
+            source.seek(size - keep)
+            shutil.copyfileobj(source, sink, 1 << 20)
+        os.replace(draft, previous)
+        os.unlink(log)
+    except OSError:
+        pass
 
 
 def _windows_alive(pid: int) -> bool:
@@ -216,6 +296,34 @@ def _windows_alive(pid: int) -> bool:
         if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
             return False
         return code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def creation_time(pid: int, *, os_name: Optional[str] = None) -> Optional[int]:
+    """When process `pid` was created, as Windows counts it (`GetProcessTimes`, in 100 ns since
+    1601) — None where that cannot be read: on another system, or for a process that has ended or
+    is not this user's to open. Two processes alive at different times never share it, so with the
+    process number it names one process, where the number alone may since have gone to another."""
+    if (os_name or system()) != WINDOWS:
+        return None
+    import ctypes
+
+    class FileTime(ctypes.Structure):
+        _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    query_limited_information = 0x1000
+    handle = kernel32.OpenProcess(query_limited_information, False, int(pid))
+    if not handle:
+        return None
+    try:
+        created, exited, kernel, user = FileTime(), FileTime(), FileTime(), FileTime()
+        if not kernel32.GetProcessTimes(
+            handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user),
+        ):
+            return None
+        return (created.high << 32) | created.low
     finally:
         kernel32.CloseHandle(handle)
 
@@ -271,8 +379,10 @@ def arguments(pid: int, *, os_name: Optional[str] = None) -> Optional[list[str]]
 
 def started_with(
     pid: int, argv: Sequence[str], *, os_name: Optional[str] = None, run: Optional[Runner] = None
-) -> bool:
-    """Is process `pid` running exactly the argument list `argv`?
+) -> Optional[bool]:
+    """Is process `pid` running exactly the argument list `argv`? True or False — or None where
+    its command line could not be read now (`ps` or PowerShell failed, or ran out of time), which
+    says nothing either way and must never be taken for "no".
 
     Exactly — or as the system rewrites it to run a script: up to `SCRIPT_WORDS` words in front
     of the list, the interpreter a `#!` line names and the one argument it may add. Never a part
@@ -290,13 +400,36 @@ def started_with(
         return 0 <= extra <= SCRIPT_WORDS and listed[extra:] == expected
     said = command_line(pid, os_name=os_name, run=run)
     if said is None:
-        return False
+        return None
     line = said.decode(errors="replace").strip()
     # `list2cmdline` only quotes the list as Windows' own process creation did; it runs nothing.
     joined = subprocess.list2cmdline(expected) if os_name == WINDOWS else " ".join(expected)
     if line == joined:
         return True
     return line.endswith(f" {joined}") and 1 <= len(line[: -len(joined) - 1].split()) <= SCRIPT_WORDS
+
+
+def recognised(
+    pid: int,
+    argv: Sequence[str],
+    *,
+    created: Optional[int] = None,
+    os_name: Optional[str] = None,
+    run: Optional[Runner] = None,
+) -> Optional[bool]:
+    """Is process `pid` the program this agent recorded starting with `argv` — created at
+    `created`, where its record says? True, False, or None where that cannot be told now.
+
+    On Windows with a creation time recorded, that is all that is asked: Windows' own answer, read
+    in one call, where reading the command line takes a PowerShell — a second or more, and on every
+    look. A process this user cannot open is not one this agent started. Elsewhere, and for a
+    record without it, the argument list is compared (`started_with`).
+    """
+    os_name = os_name or system()
+    if os_name == WINDOWS and created is not None:
+        now = creation_time(pid, os_name=os_name)
+        return now is not None and now == created
+    return started_with(pid, argv, os_name=os_name, run=run)
 
 
 async def _until(done: Callable[[], bool], seconds: float, poll_s: float) -> bool:
@@ -535,8 +668,28 @@ _AUTHENTICODE_SCRIPT = (
     "if ($s.SignerCertificate) { $s.SignerCertificate.Subject } else { '' }"
 )
 
-_TEAM = re.compile(r"^TeamIdentifier=(\S+)\s*$", re.MULTILINE)
+#: An Apple Developer ID team: ten capitals and digits. The only text a code requirement is built
+#: from besides its own constants, so it is checked to be exactly this first.
+TEAM_ID = re.compile(r"^[A-Z0-9]{10}$")
 _COMMON_NAME = re.compile(r'(?:^|,\s*)CN=(?:"([^"]*)"|([^,]*))')
+
+
+def developer_id_requirement(team: str) -> str:
+    """The code requirement a program signed for distribution by `team` meets: a certificate
+    chain anchored at Apple's root, through Apple's Developer ID intermediate (its marker
+    extension, 1.2.840.113635.100.6.2.6), to a Developer ID Application certificate (its marker,
+    1.2.840.113635.100.6.1.13) whose organisational unit — the team — is `team`. Apple's own
+    programs, an ad-hoc signature and a certificate anyone made all fail it. `codesign` evaluates
+    it against the signature itself, so nothing is read back from text a file name can write into.
+    """
+    if not TEAM_ID.fullmatch(team):
+        raise ValueError(f"{team!r} is not an Apple Developer ID team")
+    return (
+        "anchor apple generic"
+        " and certificate 1[field.1.2.840.113635.100.6.2.6] exists"
+        " and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
+        f' and certificate leaf[subject.OU] = "{team}"'
+    )
 
 
 def _last_words(output: str) -> str:
@@ -554,22 +707,25 @@ def signature_problem(
 ) -> Optional[str]:
     """None when `path` carries a valid signature by `publisher`; otherwise what is wrong.
 
-    macOS: `codesign --verify --strict` must pass, and `codesign -dv` must name `publisher` as
-    the signing team (`TeamIdentifier=`). Windows: `Get-AuthenticodeSignature` must say `Valid`,
-    with `publisher` the signing certificate's common name. On any other system there is no
-    signature to check, and asking is a mistake the caller made.
+    macOS: one command, `codesign --verify --strict` with the Developer ID requirement for team
+    `publisher` (`developer_id_requirement`) — its exit code is the whole answer; no output is
+    parsed. Windows: `Get-AuthenticodeSignature` must say `Valid`, with `publisher` the signing
+    certificate's common name. On any other system there is no signature to check, and asking is
+    a mistake the caller made.
     """
     os_name = os_name or system()
     run = run or _run
     if os_name == MACOS:
-        verified = run(["codesign", "--verify", "--strict", str(path)])
+        if not TEAM_ID.fullmatch(publisher):
+            return f"{publisher!r} is not an Apple Developer ID team; {path.name} is not checked against it"
+        verified = run([
+            "codesign", "--verify", "--strict", f"-R={developer_id_requirement(publisher)}", str(path),
+        ])
         if verified.code != 0:
-            return f"{path.name} fails `codesign --verify --strict`: {_last_words(verified.output)}"
-        described = run(["codesign", "-dv", str(path)])
-        found = _TEAM.search(described.output) if described.code == 0 else None
-        team = found.group(1) if found else None
-        if team != publisher:
-            return f"{path.name} is signed by team {team or '(none)'}, not {publisher}"
+            return (
+                f"{path.name} is not signed for distribution by team {publisher} "
+                f"(`codesign --verify --strict` with its requirement: {_last_words(verified.output)})"
+            )
         return None
     if os_name == WINDOWS:
         environment = dict(os.environ if environ is None else environ)

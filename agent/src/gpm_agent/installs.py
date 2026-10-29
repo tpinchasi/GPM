@@ -12,13 +12,19 @@ What keeps that inside the agent's bounds:
   (GitHub's per-asset `sha256`), and also against the release's own list of digests where it
   publishes one; a file with no published digest is refused. Where the platform signs programs
   and the table pins the publisher, every program unpacked must carry that signature (Ollama on
-  macOS: Developer ID team `3MU9H2V9Y9`); elsewhere the facts say the signature was not checked.
+  macOS: a Developer ID certificate of team `3MU9H2V9Y9`, anchored at Apple's root, checked as one
+  code requirement); elsewhere the facts say the signature was not checked.
   A source archive, for which no release publishes a digest, is fetched by the commit its tag
   names — read from the repository — and must say it is that commit; the tools a build needs and
   the machine lacks come pinned to their own published digests (`whisper_build`).
 - **Archives unpack only into their own directory.** No absolute path, no `..`, no link that
-  leads out, no device file; anything else refuses the whole version. Nothing in an archive is
-  ever run but the engine's own program, and no install script runs at all.
+  leads out, no device file, no control character in a name; anything else refuses the whole
+  version. Nothing in an archive is ever run but the engine's own program, and no install script
+  runs at all.
+- **Forward, and back only one step.** A version older than the one running is refused unless it
+  is the one before it (a rollback), and a `latest` older than the one running is ignored.
+- **Never past the owner's free-disk floor.** Before anything is fetched, what it will take on the
+  engines' volume — an archive and what it unpacks to, or a build — must leave `min_free_disk_gb`.
 - **Versions side by side** (D153), each in its own directory under the engine's directory: the
   one running, the one before it, and one staged — downloaded, checked and unpacked while the
   engine keeps serving, in a `<version>.partial` directory renamed into place only when whole.
@@ -68,6 +74,26 @@ log = logging.getLogger("gpm_agent.installs")
 VERSION = re.compile(r"^\d+(\.\d+){1,3}(-[0-9A-Za-z.]+)?$")
 LATEST = "latest"
 
+_SUFFIX_PART = re.compile(r"\d+|[^\d.]+")
+
+
+def version_key(version: str) -> tuple[Any, ...]:
+    """How versions are ordered: by their numbers, part by part (`0.9.0` before `0.10.0`, `1.2`
+    the same as `1.2.0`), and a pre-release before its release (`0.12.0-rc2` before `0.12.0`),
+    pre-releases among themselves by their numbers and words in turn (`rc2` before `rc10`)."""
+    numbers, _, suffix = version.partition("-")
+    parts = [int(part) for part in numbers.split(".")]
+    parts += [0] * (4 - len(parts))
+    if not suffix:
+        return (tuple(parts), 1, ())
+    words = tuple((0, int(part), "") if part.isdigit() else (1, 0, part) for part in _SUFFIX_PART.findall(suffix))
+    return (tuple(parts), 0, words)
+
+
+def older(version: str, than: str) -> bool:
+    return version_key(version) < version_key(than)
+
+
 #: How long the latest release, once read, is taken as still the latest. The pool says `latest`
 #: on every pass; GitHub allows a machine without a token sixty questions an hour.
 LATEST_EVERY_S = 6 * 3600.0
@@ -96,13 +122,37 @@ PARTIAL = ".partial"
 #: from PyPI, where the machine has none), kept for the next build.
 TOOLS = ".tools"
 
+#: How much room an archive needs on the engines' volume, as a multiple of its size: the archive
+#: itself, kept until its version is whole (1×), and what it unpacks to. Programs and libraries
+#: compress to between a half and a third of their size in the archives engines publish, so
+#: they unpack to up to three times it (3×).
+UNPACK_MARGIN = 4
+
 _CHUNK = 1 << 20
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _CHECKSUM_LINE = re.compile(r"^([0-9a-fA-F]{64})\s+\*?(?:\./)?(\S.*?)\s*$")
+#: Control characters — a newline among them — in a name an archive gives: never written. A
+#: name reaches commands' output and the agent's own messages, where one could pass for a line.
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
 class InstallRefused(Exception):
     """A version will not be installed here, and why — in words for an operator."""
+
+
+def size_words(size: int) -> str:
+    """A size in words: gigabytes, or megabytes or kilobytes under one."""
+    if size >= 10**9:
+        return f"{size / 1e9:.1f} GB"
+    if size >= 10**6:
+        return f"{size / 1e6:.0f} MB"
+    return f"{size / 1e3:.0f} kB"
+
+
+#: How a source asks, before it fetches anything, for room on the engines' volume: the bytes it
+#: will write at most, and what they are, in words. Refuses (`InstallRefused`) where there is not
+#: room for them above the floor the machine's owner keeps free.
+Room = Callable[[int, str], None]
 
 
 # --- what a release is ---
@@ -140,7 +190,8 @@ class Source(Protocol):
     `stage` fills `into` — a fresh, empty directory — with the version, or raises
     `InstallRefused` saying why it would not. It may keep what it downloads beside `into`, in
     `into.parent / DOWNLOADS`, so a cut transfer resumes on the next attempt. It reports its steps
-    through `progress`: `downloading`, `verifying`, `unpacking` or `building`.
+    through `progress`: `downloading`, `verifying`, `unpacking` or `building`. Before it fetches
+    anything it asks `room`, where given, for what it will write.
     """
 
     engine: str
@@ -152,7 +203,9 @@ class Source(Protocol):
 
     async def release(self, http: httpx.AsyncClient, version: str) -> Release: ...
 
-    async def stage(self, http: httpx.AsyncClient, release: Release, into: Path, progress: Progress) -> None: ...
+    async def stage(
+        self, http: httpx.AsyncClient, release: Release, into: Path, progress: Progress, room: Optional[Room] = None,
+    ) -> None: ...
 
     def program(self, version_dir: Path) -> Path: ...
 
@@ -361,7 +414,7 @@ class GitHubReleases:
 def _member(name: str) -> Optional[PurePosixPath]:
     """An archive member's path inside the version directory, or a refusal. None for the
     archive's own top (`./`)."""
-    if not name or "\x00" in name or "\\" in name:
+    if not name or _CONTROL.search(name) or "\\" in name:
         raise InstallRefused(f"the archive names a file {name!r} this agent will not write")
     path = PurePosixPath(name)
     if path.is_absolute() or re.match(r"^[A-Za-z]:", name):
@@ -411,7 +464,7 @@ class _Unpacking:
             shutil.copyfileobj(source, sink, _CHUNK)
 
     def link(self, member: PurePosixPath, pointing_to: str) -> None:
-        if not pointing_to or "\x00" in pointing_to or posixpath.isabs(pointing_to) or "\\" in pointing_to:
+        if not pointing_to or _CONTROL.search(pointing_to) or posixpath.isabs(pointing_to) or "\\" in pointing_to:
             raise InstallRefused(f"the archive's link {member} points to {pointing_to!r}, outside its directory")
         lexical = posixpath.normpath(posixpath.join(str(member.parent), pointing_to))
         if lexical == ".." or lexical.startswith("../"):
@@ -527,22 +580,26 @@ def unpack(archive: Path, name: str, into: Path) -> None:
 
 # --- signatures ---
 
-#: The first four bytes of a Mach-O program or library, either byte order, thin or universal.
-_MACH_O = {
-    b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe",
-}
+#: The first four bytes of every kind of Mach-O file, in either byte order: thin, 32 and 64 bits
+#: (`MH_MAGIC`, `MH_MAGIC_64`), and universal, with 32- and 64-bit offsets (`FAT_MAGIC`,
+#: `FAT_MAGIC_64`). A Java class file begins as a 32-bit universal binary does; one in an engine's
+#: archive is taken for one and must be signed too — the safe side, where telling them apart by
+#: the count that follows would let a universal binary of many slices go unchecked.
+_MACH_O = frozenset({
+    b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",  # MH_MAGIC
+    b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",  # MH_MAGIC_64
+    b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",  # FAT_MAGIC
+    b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca",  # FAT_MAGIC_64
+})
 
 
 def _is_mach_o(path: Path) -> bool:
     try:
         with path.open("rb") as handle:
-            head = handle.read(8)
+            head = handle.read(4)
     except OSError:
         return False
-    if head[:4] != b"\xca\xfe\xba\xbe":
-        return head[:4] in _MACH_O
-    # A universal binary counts its architectures where a Java class file has its version, 45+.
-    return len(head) == 8 and int.from_bytes(head[4:], "big") < 45
+    return head in _MACH_O
 
 
 def signed_files(version_dir: Path, os_name: str) -> list[Path]:
@@ -677,7 +734,9 @@ class ArchiveSource(GitHubReleases):
                 return path
         return version_dir.joinpath(*candidates[0].split("/"))
 
-    async def stage(self, http: httpx.AsyncClient, release: Release, into: Path, progress: Progress) -> None:
+    async def stage(
+        self, http: httpx.AsyncClient, release: Release, into: Path, progress: Progress, room: Optional[Room] = None,
+    ) -> None:
         assets = []
         for name in self.archive_names():
             asset = release.asset(name)
@@ -688,6 +747,12 @@ class ArchiveSource(GitHubReleases):
                     f"{self.table.repo} {release.tag} publishes no digest for {name}; nothing unchecked is installed"
                 )
             assets.append(asset)
+        if room is not None:
+            size = sum(asset.size for asset in assets)
+            room(size * UNPACK_MARGIN, (
+                f"{' and '.join(asset.name for asset in assets)}, {size_words(size)}, "
+                f"and up to {UNPACK_MARGIN - 1} times that unpacked"
+            ))
         downloads = into.parent / DOWNLOADS
         listed = release.asset(self.table.checksums) if self.table.checksums else None
         _keep_only(downloads, {a.sha256 for a in [*assets, listed] if a is not None and a.sha256})
@@ -841,11 +906,13 @@ def validated(body: Any) -> tuple[str, bool]:
 
 class Server(Protocol):
     """The engine's server as the installer drives it (`ollama_server.OllamaServer`,
-    `whisper_cpp.InstalledServer`)."""
+    `whisper_cpp.InstalledServer`). `stop` may raise on an error from the system — a process
+    this user may not signal, a record that cannot be written — which the installer says as the
+    reason its switch or restart did not happen, never lets end its work unsaid."""
 
     foreign_reason: str
 
-    def ours(self) -> bool: ...
+    def ours(self, *, fresh: bool = False) -> bool: ...
 
     def running_version(self) -> Optional[str]: ...
 
@@ -856,12 +923,29 @@ class Server(Protocol):
     async def stop(self) -> None: ...
 
 
+def free_bytes_at(path: Path) -> Optional[int]:
+    """Free space on the volume `path` is on — measured at its nearest existing parent, so a
+    directory not made yet reports where it would land — or None where it cannot be read."""
+    probe = path
+    while not probe.exists() and probe.parent != probe:
+        probe = probe.parent
+    try:
+        return shutil.disk_usage(probe).free
+    except OSError:
+        return None
+
+
 class Installer:
     """One engine's versions on this machine, worked toward in the background, one job at a time.
 
     `want` records what the pool asked for and starts the work it needs — resolving `latest`,
     staging a version, or a switch — and answers at once with `state`. The pool reads how the
     work went on its next passes: a staged version, a version running, or an error.
+
+    The pool moves an engine forward, and back only to the version it ran before (T35): a version
+    older than the one running is refused unless it is that one, and a `latest` older than the one
+    running — a release withdrawn — is ignored, saying so. Nothing is fetched that would leave the
+    engines' volume with less free than the floor the machine's owner keeps (`min_free_disk_gb`).
     """
 
     def __init__(
@@ -873,20 +957,31 @@ class Installer:
         http_transport: Optional[httpx.AsyncBaseTransport] = None,
         clock: Callable[[], float] = time.time,
         switch_timeout_s: float = SWITCH_TIMEOUT_S,
+        min_free_disk_gb: float = 0.0,
+        free_disk_bytes: Optional[Callable[[], Optional[int]]] = None,
     ) -> None:
         self.source, self.engine_dir, self.server = source, engine_dir, server
         self.http_transport = http_transport
         self.clock = clock
         self.switch_timeout_s = switch_timeout_s
+        #: The machine owner's floor, and how free space on the engines' volume is read.
+        self.floor_bytes = int(min_free_disk_gb * 1e9)
+        self.free_disk_bytes = free_disk_bytes or (lambda: free_bytes_at(self.engine_dir))
         self.record = InstallState.read(engine_dir / STATE_FILE)
         self.working: Optional[dict[str, Any]] = None
         self._job: Optional[asyncio.Task[None]] = None
+        #: One of the pool's requests at a time: each is answered before the next is looked at, so
+        #: two that arrive together never both find nothing in hand and both start work.
+        self._asking = asyncio.Lock()
         #: One start or stop of the server at a time — a switch, a restart, or bringing it back.
         self._lock = asyncio.Lock()
         #: When each version asked for may be tried again after a failure, by what was asked.
         self._retry_at: dict[str, float] = {}
         #: When a server that would not start may be started again.
         self._start_retry_at = 0.0
+        #: What the installer last said in the record's error about what it was asked — a version
+        #: it will not go back to, a latest older than what runs — removed once that no longer holds.
+        self._told: Optional[str] = None
 
     # --- what the pool sees ---
 
@@ -925,15 +1020,30 @@ class Installer:
     async def want(self, version: str, switch: bool) -> dict[str, Any]:
         """Work toward `version` — `latest` or a version — and, with `switch`, start the staged or
         previous version now. Answers at once; the work goes on in the background."""
+        async with self._asking:
+            return await self._want(version, switch)
+
+    async def _want(self, version: str, switch: bool) -> dict[str, Any]:
+        record = self.record
+        if version != LATEST and self._older_than_running(version):
+            said = (
+                f"{self.source.engine} {version} is older than the {record.running} running here and is not "
+                f"the version it ran before ({record.previous or 'none is kept'}): the pool moves an engine "
+                "forward, and back only to the version before it; an older one is the machine owner's to install"
+            )
+            self._tell(said)
+            raise Refused(409, "older_than_running", said)
         if switch and self.busy:
             raise Refused(409, "busy", f"{self.source.engine} is already being {self._doing()}; ask again when it is done")
-        if self.record.wanted != version:
-            self.record.wanted = version
+        if record.wanted != version:
+            record.wanted = version
             self._save()
         if self.busy:
             return self.state()  # the next pass asks again, and is taken up then
         if await self.server.foreign():
             raise Refused(409, "foreign_engine", self.server.foreign_reason)
+        notice = self._latest_is_older() if version == LATEST and self._latest_fresh() else None
+        self._tell(notice)
         if switch:
             target = self._switch_target(version)
             if target is None:
@@ -941,7 +1051,7 @@ class Installer:
             self.working = {"step": "switching", "version": target, "done": 0, "total": None}
             self._job = asyncio.create_task(self._switch_job(target), name="gpm-agent:switch")
             return self.state()
-        if not self._needs_work(version) or self.clock() < self._retry_at.get(version, 0.0):
+        if notice or not self._needs_work(version) or self.clock() < self._retry_at.get(version, 0.0):
             return self.state()
         self.working = {"step": "resolving", "version": version, "done": 0, "total": None}
         self._job = asyncio.create_task(self._stage_job(version), name="gpm-agent:stage")
@@ -951,14 +1061,50 @@ class Installer:
         step = (self.working or {}).get("step")
         return "switched" if step == "switching" else "installed"
 
+    def _older_than_running(self, version: str) -> bool:
+        """Is `version` older than the one running here, and not the one before it — a downgrade
+        past what a rollback reaches, which the pool cannot ask for (T35)?"""
+        record = self.record
+        return record.running is not None and version != record.previous and older(version, record.running)
+
+    def _latest_fresh(self) -> bool:
+        checked = self.record.latest_checked_at
+        return checked is not None and self.clock() - checked < LATEST_EVERY_S
+
+    def _latest_is_older(self) -> Optional[str]:
+        """What to say when the latest release, as last read, is older than the version running —
+        a release withdrawn, or a version asked for by name that is newer: it is ignored."""
+        record = self.record
+        if record.latest and record.running and older(record.latest, record.running):
+            return (
+                f"the latest release of {self.source.engine}, {record.latest}, is older than the "
+                f"{record.running} running here; it is ignored, and {record.running} keeps running"
+            )
+        return None
+
+    def _tell(self, notice: Optional[str]) -> None:
+        """Put `notice` in the record's error, or take out the one put there before, if it is
+        still what the error says — never an error the work itself recorded."""
+        record = self.record
+        if notice is None:
+            if self._told is not None and record.error == self._told:
+                record.error = None
+                self._save()
+            self._told = None
+            return
+        self._told = notice
+        if record.error != notice:
+            record.error = notice
+            self._save()
+
     def _switch_target(self, version: str) -> Optional[str]:
         """The version a switch would start, None where it already runs — or a refusal."""
         record = self.record
         if version == LATEST:
             if record.staged:
                 return record.staged
-            if record.running and record.running == record.latest:
-                return None
+            if record.running and record.latest and not older(record.running, record.latest):
+                return None  # the latest runs, or one newer than it
             raise Refused(409, "not_staged", "no newer version is staged here yet; it is staged first, then switched to")
         if version == record.running:
             return None
@@ -975,8 +1121,7 @@ class Installer:
         record = self.record
         on_disk = {record.running, record.staged, record.previous} - {None}
         if version == LATEST:
-            fresh = record.latest_checked_at is not None and self.clock() - record.latest_checked_at < LATEST_EVERY_S
-            if not fresh:
+            if not self._latest_fresh():
                 return True
             version = record.latest or ""
         if version in record.failed:
@@ -1008,10 +1153,19 @@ class Installer:
         """Start the running version afresh — new settings, an operator's restart. None when it
         answers again; otherwise why not."""
         await self.restartable()
-        running = self.record.running
         async with self._lock:
-            await self.server.stop()
-            problem = await self.server.start(self.program(running), running, self.switch_timeout_s)
+            # Asked again, and the version read, only now that nothing else can start or stop the
+            # server: a switch that took it first has changed what runs, and is not undone here.
+            if self.busy:
+                raise Refused(409, "busy", f"{self.source.engine} is being {self._doing()}; ask again when it is done")
+            running = self.record.running
+            if running is None:
+                raise Refused(409, "not_installed", f"no version of {self.source.engine} is installed here yet")
+            stopped = await self._stop()
+            if stopped is None:
+                problem = await self.server.start(self.program(running), running, self.switch_timeout_s)
+            else:
+                problem = f"it could not be stopped: {stopped}"
             if problem:
                 self._start_retry_at = self.clock() + RETRY_AFTER_S / 5
                 self.record.error = f"{self.source.engine} {running} did not start again: {problem}"
@@ -1022,21 +1176,28 @@ class Installer:
 
     async def ensure_running(self) -> None:
         """Start the running version if this agent's server is not up: when the agent starts, and
-        on the pool's passes after it has stopped. Never over something it did not start."""
-        running = self.record.running
-        if running is None or self.busy or self._lock.locked():
+        on the pool's passes after it has stopped. Never over something it did not start.
+
+        Whether it is up is looked at afresh, never taken from a look a moment ago: a server that
+        has stopped since, its number gone to another program, would otherwise pass for running."""
+        if self.record.running is None or self.busy or self._lock.locked():
             return
-        if self.server.ours():
-            if self.server.running_version() in (None, running):
+        if self.server.ours(fresh=True):
+            if self.server.running_version() in (None, self.record.running):
                 return
             # Another version of its own runs: a switch this agent was stopped in the middle of,
             # before the version it was trying had been checked. The version on record goes back.
             async with self._lock:
-                await self.server.stop()
+                stopped = await self._stop()
+                if stopped is not None:
+                    self.record.error = f"{self.source.engine} could not be stopped to start {self.record.running} again: {stopped}"
+                    self._save()
+                    return
         if self.clock() < self._start_retry_at or await self.server.foreign():
             return
         async with self._lock:
-            if self.server.ours():
+            running = self.record.running
+            if running is None or self.busy or self.server.ours(fresh=True):
                 return
             problem = await self.server.start(self.program(running), running, self.switch_timeout_s)
             if problem:
@@ -1068,6 +1229,26 @@ class Installer:
 
         return report
 
+    def _room(self, version: str, needed: int, what: str) -> None:
+        """Refuse a version whose files would leave the engines' volume with less free than the
+        machine owner's floor — before anything of it is fetched."""
+        free = self.free_disk_bytes()
+        if free is not None and free - needed < self.floor_bytes:
+            raise InstallRefused(
+                f"{self.source.engine} {version} is not installed: it needs about {size_words(needed)} on the "
+                f"engines' volume ({what}), which has {size_words(free)} free, and that would leave less than the "
+                f"{size_words(self.floor_bytes)} this machine's owner keeps free (min_free_disk_gb)"
+            )
+
+    async def _stop(self) -> Optional[str]:
+        """Stop the server: None once it is, else the error from the system that kept it from
+        stopping — said as the reason a switch or a restart did not happen, never raised."""
+        try:
+            await self.server.stop()
+        except Exception as exc:  # noqa: BLE001 - a process not this user's, a record not written: said
+            return str(exc) or type(exc).__name__
+        return None
+
     async def _stage_job(self, wanted: str) -> None:
         try:
             async with httpx.AsyncClient(
@@ -1098,17 +1279,22 @@ class Installer:
         """The release to stage for `wanted`, or None where there is nothing to stage."""
         record = self.record
         if wanted == LATEST:
-            fresh = record.latest_checked_at is not None and self.clock() - record.latest_checked_at < LATEST_EVERY_S
             release = None
-            if not fresh:
+            if not self._latest_fresh():
                 release = await self.source.latest(http)
                 record.latest, record.latest_checked_at = release.version, self.clock()
                 # Versions that failed here are not tried again once a newer one is out (D153).
                 record.failed = {v: why for v, why in record.failed.items() if v == release.version}
                 self._save()
             version = record.latest
+            notice = self._latest_is_older()
+            self._tell(notice)
+            if notice:
+                return None
         else:
             release, version = None, wanted
+            if self._older_than_running(version):
+                raise InstallRefused(f"{self.source.engine} {version} is older than the {record.running} running here")
         if version is None:
             return None
         if version in record.failed:
@@ -1127,8 +1313,12 @@ class Installer:
         with contextlib.suppress(FileNotFoundError):
             shutil.rmtree(partial)
         partial.mkdir(mode=0o755)
+
+        def room(needed: int, what: str) -> None:
+            self._room(version, needed, what)
+
         try:
-            await self.source.stage(http, release, partial, report)
+            await self.source.stage(http, release, partial, report, room)
             final = self.engine_dir / version
             if final.exists():
                 shutil.rmtree(final)
@@ -1150,15 +1340,30 @@ class Installer:
 
     async def _switch(self, target: str) -> None:
         """Stop what runs, start `target`, and keep it only if it answers as that version — or
-        stop it and start again the version that ran before, at once, by itself (D153)."""
+        stop it and start again the version that ran before, at once, by itself (D153). A server
+        that will not stop is a switch that did not happen, said so, with what ran started again
+        if it stopped after all."""
+        engine = self.source.engine
         async with self._lock:
             record = self.record
             before = record.running
-            await self.server.stop()
+            stopped = await self._stop()
+            if stopped is not None:
+                # Not the new version's fault: it stays staged, to be switched to again.
+                error = f"{engine} {target} was not started: {before or 'the server'} could not be stopped: {stopped}"
+                if before and not self.server.ours(fresh=True):
+                    back = await self.server.start(self.program(before), before, self.switch_timeout_s)
+                    error += (
+                        f"; {before} runs again" if back is None
+                        else f"; and {before}, started again, did not answer: {back}"
+                    )
+                record.error = error
+                self._save()
+                return
             if await self.server.foreign():
                 # Something else took the port as this agent's server stopped: not the new
                 # version's fault, and nothing of this agent's is started over it.
-                record.error = f"{self.source.engine} {target} was not started: {self.server.foreign_reason}"
+                record.error = f"{engine} {target} was not started: {self.server.foreign_reason}"
                 self._save()
                 return
             problem = await self.server.start(self.program(target), target, self.switch_timeout_s)
@@ -1172,13 +1377,15 @@ class Installer:
                 record.running, record.error = target, None
                 self._start_retry_at = 0.0
             else:
-                await self.server.stop()
+                stopped = await self._stop()
                 record.failed[target] = problem
                 if record.staged == target:
                     record.staged = None
                 if record.previous == target:
                     record.previous = None
-                error = f"{self.source.engine} {target} did not start: {problem}"
+                error = f"{engine} {target} did not start: {problem}"
+                if stopped is not None:
+                    error += f"; and it could not be stopped: {stopped}"
                 if before and before != target:
                     back = await self.server.start(self.program(before), before, self.switch_timeout_s)
                     error += (

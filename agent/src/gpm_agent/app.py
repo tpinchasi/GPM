@@ -15,6 +15,7 @@ import logging
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
+from urllib.parse import urlsplit
 
 import httpx
 from starlette.applications import Starlette
@@ -43,6 +44,13 @@ def _error(status: int, error: str, detail: str) -> JSONResponse:
     return JSONResponse({"error": error, "detail": detail}, status_code=status)
 
 
+def engine_dir_for(engines: Path, settings: Settings) -> Path:
+    """Where this agent keeps its engine's versions and records: `<engines>/<engine>/<port>`. By
+    port, so two agents on one machine — two Ollamas, or two whisper.cpp servers, one build each —
+    each keep their own record of what they run, and neither removes a version the other runs."""
+    return engines / settings.engine / str(urlsplit(settings.engine_url).port)
+
+
 def default_installer(
     settings: Settings, engine_client: httpx.AsyncClient, engine: Any = None
 ) -> Optional[installs.Installer]:
@@ -54,17 +62,19 @@ def default_installer(
     source = installs.source_for(settings.engine, installs.this_machine(), tools_dir=engines / installs.TOOLS)
     if source is None:
         return None
-    engine_dir = engines / settings.engine
+    engine_dir = engine_dir_for(engines, settings)
     if settings.engine == "whisper-cpp":
         if not isinstance(engine, WhisperCppFacts):
             return None  # nothing to drive: its server is the engine's own
-        installer = installs.Installer(source, engine_dir, InstalledServer(engine, engine_client))
+        server: installs.Server = InstalledServer(engine, engine_client)
+    else:
+        server = OllamaServer(
+            engine_dir, engine_url=settings.engine_url, models_path=settings.models_path, client=engine_client,
+        )
+    installer = installs.Installer(source, engine_dir, server, min_free_disk_gb=settings.min_free_disk_gb)
+    if isinstance(engine, WhisperCppFacts):
         engine.use_installer(installer)
-        return installer
-    server = OllamaServer(
-        engine_dir, engine_url=settings.engine_url, models_path=settings.models_path, client=engine_client,
-    )
-    return installs.Installer(source, engine_dir, server)
+    return installer
 
 
 def create_app(
