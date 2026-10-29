@@ -263,6 +263,14 @@ class HostConfig(BaseModel):
                 "(D161), and this host has no `agent`. Give it one whose owner allows installs "
                 "(`gpm-agent init --install-engines`), or name its engine."
             )
+        if self.engine == AUTO_ENGINE and self.engine_version != "latest":
+            # A version number means nothing until the engine is known, and the same number can
+            # be a real version of either engine: a pin would install whichever the agent chose.
+            raise ValueError(
+                f"host {self.id!r}: `engine: auto` takes `engine_version: latest` only — "
+                f"{self.engine_version!r} would be a version of whichever engine its agent chooses. "
+                "Name the engine to pin its version."
+            )
         return self
 
     @model_validator(mode="after")

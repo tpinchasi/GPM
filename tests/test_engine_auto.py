@@ -111,6 +111,12 @@ def test_each_model_an_auto_host_holds_needs_a_build_for_both_engines():
         })
 
 
+def test_an_auto_host_cannot_pin_a_version_of_an_engine_not_yet_chosen():
+    with pytest.raises(ValueError, match="takes `engine_version: latest` only"):
+        config([host(engine_version="0.32.0")])
+    assert config([host(engine_version="latest")]).hosts[0].engine_version == "latest"
+
+
 def test_auto_is_a_hosts_not_the_pools_nor_the_rented_machines():
     with pytest.raises(ValueError, match="pool's `engine` cannot be `auto`"):
         config([host(engine="ollama", agent=None)], engine="auto")
@@ -127,6 +133,16 @@ def test_an_auto_host_waits_for_its_agents_choice_and_holds_nothing_meanwhile(mo
         box = pool.supervisor.hosts["box"]
         assert box.state.value == "preparing" and "choosing its engine" in box.last_error
         assert agent.held == [], "an agent told to hold nothing may remove what it has"
+
+
+def test_an_auto_host_whose_agent_does_not_install_engines_says_it_never_will_choose(monkeypatch):
+    with auto_pool(monkeypatch) as pool:
+        agent = Agent(pool.engines["box"].fake, chosen=None, installs=False)
+        pool.supervisor._agent_transport = agent.transport
+        pool.reprobe()
+        box = pool.supervisor.hosts["box"]
+        assert box.state.value == "preparing" and "does not install engines" in box.last_error
+        assert agent.held == []
 
 
 def test_the_engine_its_agent_chose_is_published_and_its_builds_held(monkeypatch):

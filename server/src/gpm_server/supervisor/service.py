@@ -1433,10 +1433,17 @@ class Supervisor:
         if self.engine_name_of(host) is None:
             # `auto`, and its agent has not said which engine it runs (D161): nothing to probe yet.
             host.state = HostState.PREPARING
-            host.last_error = (
-                "choosing its engine: its agent runs vLLM or Ollama by the machine (engine: auto), and has not said which"
-                if host.agent is None or host.agent.reachable else f"choosing its engine: {host.agent.detail or 'its agent is silent'}"
-            )
+            install = ((host.agent.facts or {}).get("engine") or {}).get("install") if host.agent and host.agent.reachable else None
+            if isinstance(install, dict) and install.get("allowed") is False:
+                # Only an agent that installs engines chooses one: this one never will.
+                host.last_error = (
+                    "engine: auto, and its agent does not install engines, so nothing on the machine chooses one — "
+                    "run `gpm-agent init --install-engines` there, or name this host's engine"
+                )
+            elif host.agent is None or host.agent.reachable:
+                host.last_error = "choosing its engine: its agent runs vLLM or Ollama by the machine (engine: auto), and has not said which"
+            else:
+                host.last_error = f"choosing its engine: {host.agent.detail or 'its agent is silent'}"
             host.engine_answers = False
             host.last_probe_at = time.monotonic()
             return
