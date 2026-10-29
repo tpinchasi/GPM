@@ -22,7 +22,9 @@ and runs outside the owner's session and profile, where the models are (D154).
 **One command everywhere** (`serve_command`): this agent's own interpreter, isolated, serving the
 one settings file. A definition already there for *another* settings file is never replaced, so
 two agents on one machine — one for each engine — live side by side, each under a name taken from
-its settings file. Everything that decides what is written and run is a pure function of a
+its settings file. Nor is anything else holding that name: a launchd job loaded from another file,
+a unit installed in another directory systemd searches, a task Task Scheduler says was registered
+for other settings. Everything that decides what is written and run is a pure function of a
 `Machine`, which a test supplies; `run_command` is the only place a process starts, always from an
 argument list written here, never through a shell.
 """
@@ -39,6 +41,7 @@ import posixpath
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -57,6 +60,12 @@ MODULE = "gpm_agent.cli"
 
 #: How long a query of the system's service manager may take.
 QUERY_TIMEOUT_S = 30.0
+
+#: How long a look at the agent's own port waits for something to answer there.
+ANSWER_TIMEOUT_S = 1.0
+
+#: The systems an agent is made to start with.
+SYSTEMS = ("Darwin", "Linux", "Windows")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -98,6 +107,17 @@ def shown(argv: Sequence[str], system: str) -> str:
     return subprocess.list2cmdline(list(argv)) if system == "Windows" else shlex.join(argv)
 
 
+def port_answers(host: str, port: int) -> bool:
+    """Whether something on this machine accepts a connection at `host`:`port` — on loopback for
+    an agent that listens on every address."""
+    target = {"": "127.0.0.1", "0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
+    try:
+        with socket.create_connection((target, port), timeout=ANSWER_TIMEOUT_S):
+            return True
+    except OSError:
+        return False
+
+
 class Files:
     """The file system, as this module uses it. A test supplies a dictionary instead, so each
     system's definitions are written and read back in that system's own paths."""
@@ -113,11 +133,16 @@ class Files:
 
     def write(self, path: str, content: bytes) -> None:
         """Replace `path` whole: written beside it, then moved over it. Readable by all and
-        writable by the owner only, as launchd and systemd require of a definition."""
+        writable by the owner only, as launchd and systemd require of a definition.
+
+        In binary mode on Windows (`O_BINARY`), where a descriptor opened without it is in text
+        mode and turns every 0x0A byte written into 0x0D 0x0A — inside a UTF-16 task definition, a
+        byte of a character, so the file Task Scheduler reads would be corrupt."""
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         draft = target.with_name(target.name + ".new")
-        descriptor = os.open(draft, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0)
+        descriptor = os.open(draft, flags, 0o644)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(content)
         os.replace(draft, target)
@@ -152,6 +177,8 @@ class Machine:
     #: Whether a person is at a terminal to answer `sudo`.
     interactive: bool
     run: Callable[..., Ran] = run_command
+    #: Whether something answers at a host and port: `port_answers`.
+    answers: Callable[[str, int], bool] = port_answers
     which: Callable[[str], Optional[str]] = shutil.which
     files: Files = dataclasses.field(default_factory=Files)
     sleep: Callable[[float], None] = time.sleep
@@ -325,9 +352,20 @@ def systemd_unit(command: Sequence[str], *, settings_path: str, working_director
     ])
 
 
-#: How a task definition says which settings file it serves, for `owner_of` to read back.
+#: How a task definition says which settings file it serves, for `owner_of` to read back from Task
+#: Scheduler: the path, for the owner, and a mark of it (`task_mark`) to compare.
 _TASK_DESCRIPTION = "GPM host agent, "
-_TASK_SETTINGS = re.compile(f"<Description>{_TASK_DESCRIPTION}(.*?)</Description>")
+_TASK_SETTINGS = re.compile(f"<Description>{_TASK_DESCRIPTION}(.*) \\(id ([0-9a-f]{{16}})\\)</Description>")
+
+
+def task_mark(settings_path: str) -> str:
+    """The settings file a task serves, as text that survives being read back.
+
+    Task Scheduler hands a task's definition back (`schtasks /Query /XML`) in the console's code
+    page, where a path with a letter outside ASCII — a user named José — does not read back as
+    written. A digest of the path in hexadecimal does. Windows' paths ignore case, and so does
+    this."""
+    return hashlib.sha256(ntpath.normcase(settings_path).encode("utf-8")).hexdigest()[:16]
 
 
 def task_xml(command: Sequence[str], *, user: str, settings_path: str, working_directory: str) -> bytes:
@@ -347,7 +385,7 @@ def task_xml(command: Sequence[str], *, user: str, settings_path: str, working_d
     body = f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>{_TASK_DESCRIPTION}{escape(settings_path)}</Description>
+    <Description>{_TASK_DESCRIPTION}{escape(settings_path)} (id {task_mark(settings_path)})</Description>
   </RegistrationInfo>
   <Triggers>
     <LogonTrigger>
@@ -406,6 +444,8 @@ class Entry:
     file: str
     content: bytes
     command: list[str]
+    #: The settings file the agent serves.
+    settings: str
     #: The file the agent's output is appended to, where the system keeps none.
     log: Optional[str] = None
 
@@ -435,7 +475,7 @@ def entry_for(machine: Machine, settings_path: str) -> Entry:
             file=posixpath.join(machine.home, "Library", "LaunchAgents", f"{name}.plist"),
             content=launchd_plist(name, command, working_directory=working_directory,
                                   path=agent_path(machine), log=log),
-            command=command, log=log,
+            command=command, settings=settings_path, log=log,
         )
     if machine.system == "Linux":
         return Entry(
@@ -443,7 +483,7 @@ def entry_for(machine: Machine, settings_path: str) -> Entry:
             file=posixpath.join(unit_directory(machine), f"{name}.service"),
             content=systemd_unit(command, settings_path=settings_path, working_directory=working_directory,
                                  path=agent_path(machine)).encode(),
-            command=command,
+            command=command, settings=settings_path,
         )
     if machine.system == "Windows":
         return Entry(
@@ -451,7 +491,7 @@ def entry_for(machine: Machine, settings_path: str) -> Entry:
             file=ntpath.join(working_directory, f"{name}.task.xml"),
             content=task_xml(command, user=machine.user, settings_path=settings_path,
                              working_directory=working_directory),
-            command=command, log=log_path(machine, settings_path),
+            command=command, settings=settings_path, log=log_path(machine, settings_path),
         )
     raise ValueError(f"no way to start with the machine on {machine.system}")
 
@@ -478,6 +518,8 @@ def systemd_commands(entry: Entry) -> dict[str, list[str]]:
         "disable": ["systemctl", "--user", "disable", "--now", entry.name],
         "enabled": ["systemctl", "--user", "is-enabled", entry.name],
         "active": ["systemctl", "--user", "is-active", entry.name],
+        # Where the user manager finds a unit by this name, in any directory it searches.
+        "installed": ["systemctl", "--user", "show", "-p", "FragmentPath", entry.name],
     }
 
 
@@ -496,6 +538,8 @@ def task_commands(machine: Machine, entry: Entry) -> dict[str, list[str]]:
         "stop": [program, "/End", "/TN", entry.name],
         "delete": [program, "/Delete", "/TN", entry.name, "/F"],
         "query": [program, "/Query", "/TN", entry.name, "/FO", "LIST", "/V"],
+        # The task as Task Scheduler holds it: what `owner_of` reads its settings file from.
+        "definition": [program, "/Query", "/TN", entry.name, "/XML"],
     }
 
 
@@ -508,11 +552,17 @@ def temporary_environment(machine: Machine) -> Optional[str]:
     `uvx gpm-agent` runs the agent from an environment in uv's cache, which uv deletes or rebuilds
     whenever its cache is cleaned: a start at login pointing into it would one day point at
     nothing — or, rebuilt, at a version nobody chose. A cache directory marks itself with
-    `CACHEDIR.TAG`, as uv's does."""
+    `CACHEDIR.TAG`, as uv's does.
+
+    An environment's own directory — the one holding its `pyvenv.cfg` — is passed over: uv writes
+    `CACHEDIR.TAG` into every environment it makes, the lasting one `uv tool install` makes among
+    them, so that backup tools skip it. Only a tag above the environment is a cache's."""
     paths = machine.paths
     folder = machine.prefix
     while folder:
-        if machine.files.exists(paths.join(folder, "CACHEDIR.TAG")):
+        if machine.files.exists(paths.join(folder, "CACHEDIR.TAG")) and not machine.files.exists(
+            paths.join(folder, "pyvenv.cfg")
+        ):
             return folder
         parent = paths.dirname(folder)
         if parent == folder:
@@ -532,14 +582,20 @@ def _installed_version() -> str:
 def owner_of(machine: Machine, entry: Entry) -> tuple[bool, Optional[str]]:
     """Whether a definition by this name is already there, and which settings file it serves —
     None when it is there and says nothing this module wrote, so is someone else's."""
-    existing = machine.files.read(entry.file)
     if machine.system == "Windows":
-        # The task lives in Task Scheduler; the definition kept beside the settings is this
-        # module's mark on it. A task by this name with no such definition is someone else's.
-        if existing is None:
-            return machine.run(task_commands(machine, entry)["query"]).ok, None
-        found = _TASK_SETTINGS.search(existing.decode("utf-16", errors="replace"))
-        return True, (unescape(found.group(1)) if found else None)
+        # The task lives in Task Scheduler, which is asked for it: the definition kept beside
+        # these settings says only what this agent would register, not what holds the name — a
+        # task another agent registered, from settings elsewhere, would have none here.
+        ran = machine.run(task_commands(machine, entry)["definition"])
+        if not ran.ok:
+            return False, None
+        found = _TASK_SETTINGS.search(ran.output)
+        if found is None:
+            return True, None
+        if found.group(2) == task_mark(entry.settings):
+            return True, entry.settings
+        return True, unescape(found.group(1))
+    existing = machine.files.read(entry.file)
     if existing is None:
         return False, None
     if machine.system == "Darwin":
@@ -554,10 +610,38 @@ def owner_of(machine: Machine, entry: Entry) -> tuple[bool, Optional[str]]:
     return True, None
 
 
+def registered(machine: Machine, settings_path: str) -> bool:
+    """Whether the agent serving `settings_path` is set to start with this machine."""
+    if machine.system not in SYSTEMS:
+        return False
+    there, said = owner_of(machine, entry_for(machine, settings_path))
+    return there and said == settings_path
+
+
+def launchd_job(machine: Machine, entry: Entry) -> tuple[bool, Optional[str]]:
+    """Whether a job with this label is loaded in the owner's session, and the file launchd loaded
+    it from — None when it does not say. A label is a name anyone may give a job, so the file is
+    what says whose it is: this module boots out only a job loaded from its own."""
+    ran = machine.run(launchd_commands(machine, entry)["query"])
+    if not ran.ok:
+        return False, None
+    found = re.search(r"^\s*path = (.+)$", ran.output, re.MULTILINE)
+    return True, (found.group(1).strip() if found else None)
+
+
+def _someone_elses_job(entry: Entry, source: Optional[str]) -> str:
+    return (
+        f"A launchd job labelled {entry.name} is loaded in your session from "
+        f"{source or 'a file launchctl does not name'}, not from {entry.file}: another program's, "
+        "which booting it out would stop. Nothing was changed. Remove it first, or give these "
+        "settings a file name of their own — the label follows it."
+    )
+
+
 def problem_with_adding(machine: Machine, settings_path: str) -> Optional[str]:
     """Why this agent cannot be made to start with this machine — said before anything is written
     — or None."""
-    if machine.system not in ("Darwin", "Linux", "Windows"):
+    if machine.system not in SYSTEMS:
         return (
             f"Starting with the machine is done for macOS, Linux and Windows, not {machine.system}. "
             "Have this system's own service manager run, as you:\n\n  "
@@ -594,6 +678,30 @@ def problem_with_adding(machine: Machine, settings_path: str) -> Optional[str]:
             f"A {entry.kind} named {entry.name} is already there, {whose}. Nothing was changed. "
             "Remove it first, or give these settings a file name of their own — the name follows it."
         )
+    if machine.system == "Darwin":
+        loaded, source = launchd_job(machine, entry)
+        if loaded and source != entry.file:
+            return _someone_elses_job(entry, source)
+    if machine.system == "Linux":
+        # The user manager searches several directories, and one in ours takes the place of a
+        # unit by the same name in /etc/systemd/user or /usr/lib/systemd/user — a program's own.
+        ran = machine.run(systemd_commands(entry)["installed"])
+        if not ran.ok:
+            return (
+                f"`systemctl --user` would not say whether a unit named {entry.name} is installed"
+                + (f" ({ran.output})" if ran.output else "") + ". Nothing was changed. Run this in "
+                "your own login session, where `systemctl --user status` answers."
+            )
+        installed = next(
+            (line.partition("=")[2].strip() for line in ran.output.splitlines() if line.startswith("FragmentPath=")),
+            "",
+        )
+        if installed and installed != entry.file:
+            return (
+                f"A systemd user unit named {entry.name} is installed at {installed}; one written at "
+                f"{entry.file} would take its place. Nothing was changed. Remove it first, or give "
+                "these settings a file name of their own — the name follows it."
+            )
     return None
 
 
@@ -645,14 +753,24 @@ def _ensure_linger(machine: Machine, admin: bool) -> bool:
     return False
 
 
-def add(machine: Machine, settings_path: str, *, admin: bool = False) -> int:
+def add(
+    machine: Machine, settings_path: str, *, admin: bool = False, listen: Optional[tuple[str, int]] = None,
+) -> int:
     """Make the agent serving `settings_path` start with the machine, and (re)start it now with the
-    settings as they are."""
+    settings as they are. `listen` is where those settings have it listen, to look at first."""
     problem = problem_with_adding(machine, settings_path)
     if problem:
         print(problem, file=sys.stderr)
         return 1
     entry = entry_for(machine, settings_path)
+    if listen is not None and machine.answers(*listen) and not owner_of(machine, entry)[0]:
+        # Not this agent started at login, which is not set up yet: most likely one started by
+        # hand, which keeps the port — and the one started here failing, and started again.
+        host, port = listen
+        print(
+            f"Something already answers on {host}:{port} — a `gpm-agent serve` you started yourself?\n"
+            "The agent started with the machine cannot listen there until that stops: stop it.\n"
+        )
     machine.files.write(entry.file, entry.content)
     if entry.log:
         machine.files.create_private(entry.log)
@@ -660,7 +778,9 @@ def add(machine: Machine, settings_path: str, *, admin: bool = False) -> int:
     print(f"It runs: {shown(entry.command, machine.system)}")
     started = _start(machine, entry, admin)
     if started:
-        print("The agent is running now, and starts with the machine; there is no need to run `gpm-agent serve`.")
+        # Started is all that is known here: whether it then answers, `status` looks.
+        print("Started, and it starts with the machine; there is no need to run `gpm-agent serve`.")
+        print("`gpm-agent startup status` shows whether it answers.")
     if entry.log:
         print(f"Its output: {entry.log}")
     elif machine.system == "Linux":
@@ -668,24 +788,64 @@ def add(machine: Machine, settings_path: str, *, admin: bool = False) -> int:
     return 0 if started else 1
 
 
+def restart(machine: Machine, settings_path: str) -> int:
+    """Start again the agent that starts with the machine for `settings_path`, so that it reads its
+    settings again — a key rotated by `gpm-agent init --rotate`. Its definition is left as it is."""
+    entry = entry_for(machine, settings_path)
+    if machine.system == "Darwin":
+        started = _load_launchd(machine, entry)
+    elif machine.system == "Linux":
+        command = systemd_commands(entry)["restart"]
+        ran = machine.run(command)
+        if not ran.ok:
+            _say_failed(command, ran, machine.system)
+        started = ran.ok
+    else:
+        started = _run_task(machine, entry)
+    if started:
+        print(f"Started the {entry.kind} {entry.name} again, with these settings. "
+              "`gpm-agent startup status` shows whether it answers.")
+    return 0 if started else 1
+
+
+def _load_launchd(machine: Machine, entry: Entry) -> bool:
+    """Load the agent's launchd definition into the owner's session — out first if it is loaded
+    already, so what is on disk now is what runs; never a job loaded from another file."""
+    commands = launchd_commands(machine, entry)
+    loaded, source = launchd_job(machine, entry)
+    if loaded:
+        if source != entry.file:
+            print("  " + _someone_elses_job(entry, source))
+            return False
+        machine.run(commands["stop"])
+    # launchd can still be letting go of the old one; a few tries, a second apart.
+    for attempt in range(3):
+        ran = machine.run(commands["start"])
+        if ran.ok:
+            return True
+        if attempt < 2:
+            machine.sleep(1.0)
+    _say_failed(commands["start"], ran, machine.system)
+    print(
+        "  launchd loads it at your next login. Without a login session at this Mac's screen —\n"
+        "  over SSH, say — `gui/` has nothing to load it into until someone logs in."
+    )
+    return False
+
+
+def _run_task(machine: Machine, entry: Entry) -> bool:
+    """End the task if it runs, and run it: what runs reads its settings as they are now."""
+    commands = task_commands(machine, entry)
+    machine.run(commands["stop"])
+    ran = machine.run(commands["start"])
+    if not ran.ok:
+        _say_failed(commands["start"], ran, machine.system)
+    return ran.ok
+
+
 def _start(machine: Machine, entry: Entry, admin: bool) -> bool:
     if machine.system == "Darwin":
-        commands = launchd_commands(machine, entry)
-        if machine.run(commands["query"]).ok:  # loaded already: out first, to load what was written
-            machine.run(commands["stop"])
-        # launchd can still be letting go of the old one; a few tries, a second apart.
-        for attempt in range(3):
-            ran = machine.run(commands["start"])
-            if ran.ok:
-                return True
-            if attempt < 2:
-                machine.sleep(1.0)
-        _say_failed(commands["start"], ran, machine.system)
-        print(
-            "  launchd loads it at your next login. Without a login session at this Mac's screen —\n"
-            "  over SSH, say — `gui/` has nothing to load it into until someone logs in."
-        )
-        return False
+        return _load_launchd(machine, entry)
     if machine.system == "Linux":
         commands = systemd_commands(entry)
         for step in ("reload", "enable", "restart"):
@@ -702,18 +862,22 @@ def _start(machine: Machine, entry: Entry, admin: bool) -> bool:
         return False
     print("  It starts when you log on, as you, and runs while you are logged on: a machine nobody")
     print("  logs on to needs Windows' automatic sign-in for the agent to start by itself.")
-    machine.run(commands["stop"])  # one running from before is ended, to start with these settings
-    ran = machine.run(commands["start"])
-    if not ran.ok:
-        _say_failed(commands["start"], ran, machine.system)
-        return False
-    return True
+    return _run_task(machine, entry)
+
+
+#: How the owner ends an engine server the agent left running, per system.
+_END_A_PROCESS = {
+    "Darwin": "in Activity Monitor, or with `kill`",
+    "Linux": "with `kill`",
+    "Windows": "in Task Manager",
+}
 
 
 def remove(machine: Machine, settings_path: str) -> int:
     """Stop the agent serving `settings_path` and take its definition away. Lingering is left as
-    it is: other units of the owner's may need it."""
-    if machine.system not in ("Darwin", "Linux", "Windows"):
+    it is: other units of the owner's may need it. The engine servers the agent started are left
+    running, as they are whenever the agent stops (D148), and the owner is told so."""
+    if machine.system not in SYSTEMS:
         print(f"Nothing to remove: starting with the machine is not done on {machine.system}.")
         return 0
     entry = entry_for(machine, settings_path)
@@ -727,7 +891,12 @@ def remove(machine: Machine, settings_path: str) -> int:
         return 1
     failed = False
     if machine.system == "Darwin":
-        machine.run(launchd_commands(machine, entry)["stop"])  # fails only when it was not loaded
+        loaded, source = launchd_job(machine, entry)
+        if loaded and source == entry.file:
+            machine.run(launchd_commands(machine, entry)["stop"])
+        elif loaded:
+            print(f"A launchd job labelled {entry.name} is loaded from {source or 'a file launchctl does not name'}, "
+                  f"not from {entry.file}; it was left running.")
     elif machine.system == "Linux":
         commands = systemd_commands(entry)
         machine.run(commands["disable"])
@@ -743,13 +912,18 @@ def remove(machine: Machine, settings_path: str) -> int:
         if machine.system == "Linux":
             machine.run(systemd_commands(entry)["reload"])
         print(f"Removed the {entry.kind} {entry.name}; the agent no longer starts with the machine.")
+        print(
+            "An engine server it started — Ollama, whisper.cpp's — goes on serving until this machine\n"
+            f"restarts, or until you end that process yourself ({_END_A_PROCESS[machine.system]})."
+        )
     return 1 if failed else 0
 
 
-def status(machine: Machine, settings_path: str) -> int:
-    """Say whether the agent serving `settings_path` starts with the machine, and whether it runs.
-    0 when it is set up, 1 when not."""
-    if machine.system not in ("Darwin", "Linux", "Windows"):
+def status(machine: Machine, settings_path: str, *, listen: Optional[tuple[str, int]] = None) -> int:
+    """Say whether the agent serving `settings_path` starts with the machine, whether it runs, and
+    — given `listen`, where its settings have it listen — whether it answers there. 0 when it is
+    set up, 1 when not."""
+    if machine.system not in SYSTEMS:
         print(f"Starting with the machine is not done on {machine.system}.")
         return 1
     entry = entry_for(machine, settings_path)
@@ -779,12 +953,12 @@ def status(machine: Machine, settings_path: str) -> int:
         print("  lingering: " + {True: "on (starts at boot)", False: "off (starts at login)", None: "unknown"}[lingering])
     else:
         ran = machine.run(task_commands(machine, entry)["query"])
-        if not ran.ok:
-            print("  its definition is here but the task is not registered")
-            return 1
         for line in ran.output.splitlines():
             if line.strip():
                 print("  " + line.strip())
+    if listen is not None:
+        host, port = listen
+        print(f"  {'answers' if machine.answers(host, port) else 'nothing answers'} on {host}:{port}")
     if entry.log:
         print(f"  output: {entry.log}")
     return 0
@@ -793,7 +967,9 @@ def status(machine: Machine, settings_path: str) -> int:
 def send_output_to(path: str) -> None:
     """Append this process's output to `path`, owner-only — for an agent started at logon on
     Windows by `pythonw.exe`, which has no standard streams to write to."""
-    descriptor = os.open(os.path.expanduser(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    # Binary on Windows (see `Files.write`): the stream writes its own line endings.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(os.path.expanduser(path), flags, 0o600)
     stream = os.fdopen(descriptor, "a", buffering=1, encoding="utf-8", errors="replace")
     sys.stdout = sys.stderr = stream
 
@@ -806,16 +982,21 @@ def settings_path_of(args: Any) -> str:
 
 
 def _verb(args: Any) -> int:
-    from .settings import load
+    from .settings import SettingsError, load
 
     path = settings_path_of(args)
     machine = Machine.this()
     if args.action == "add":
-        load(path)  # an agent that would not start is not set to start at login
-        return add(machine, path, admin=args.admin)
+        settings = load(path)  # an agent that would not start is not set to start at login
+        return add(machine, path, admin=args.admin, listen=(settings.host, settings.port))
     if args.action == "remove":
         return remove(machine, path)
-    return status(machine, path)
+    try:
+        settings = load(path)
+    except SettingsError as problem:
+        print(f"Its settings do not load, so it cannot run: {problem}")
+        return status(machine, path)
+    return status(machine, path, listen=(settings.host, settings.port))
 
 
 def add_verbs(verbs: Any) -> None:

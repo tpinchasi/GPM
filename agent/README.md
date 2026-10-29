@@ -12,8 +12,14 @@ gpm-agent serve             # loopback by default, port 8095
 
 On a machine whose owner gives it the engine (S9): `gpm-agent init --install-engines
 --start-at-login --prerequisites` — the agent then installs, runs and upgrades the engine,
-starts with the machine, and installs ffmpeg and a compiler where missing (`--admin` lets it use
-`sudo` where a platform needs it).
+starts with the machine, and installs ffmpeg and a compiler (on Linux with `make` and `cmake`)
+where missing (`--admin` lets it use `sudo` where a platform needs it); `init` ends non-zero while
+something is still needed. `gpm-agent startup status` shows whether the agent started with the
+machine answers; `gpm-agent init --rotate` starts it again with the new key; `gpm-agent startup
+remove` stops it, and leaves the engine it started serving until the machine restarts or you end
+that process. On Windows the settings file, and any program or engines directory it names, must
+be under your profile (`%USERPROFILE%`): a folder elsewhere is usually one every user of the
+machine can change.
 
 On the pool's machine, put the key in an environment variable and name it on the host:
 

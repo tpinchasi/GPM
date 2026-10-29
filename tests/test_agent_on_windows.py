@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import collections
 import ctypes
+import ntpath
 import subprocess
 import sys
 import textwrap
@@ -104,13 +105,79 @@ def test_linux_and_macos_are_asked_what_they_were_asked_before():
     assert asked == ["nvidia-smi", "rocm-smi", "nvidia-smi", "rocm-smi"]
 
 
-def test_settings_load_on_windows_where_file_modes_mean_nothing(tmp_path, monkeypatch):
-    path = save(Settings(key_hash="x"), tmp_path / "agent.json")
+def test_facts_run_their_commands_without_a_console_window_on_windows():
+    """The agent started at logon runs under `pythonw.exe`: each console program it starts would
+    otherwise open a window on the owner's screen, `nvidia-smi` on every facts call."""
+    calls = []
+
+    def run(argv, **options):
+        calls.append(options)
+        return subprocess.CompletedProcess(argv, 0, stdout="NVIDIA GeForce RTX 4090, 24564\n")
+
+    nvidia = ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"]
+    found = agent_facts._run(nvidia, system=lambda: "Windows", which=lambda name: "C:\\nvidia-smi.exe", run=run)
+    assert found == "NVIDIA GeForce RTX 4090, 24564\n"
+    assert calls[-1]["creationflags"] == 0x08000000  # CREATE_NO_WINDOW
+    agent_facts._run(nvidia, system=lambda: "Linux", which=lambda name: "/usr/bin/nvidia-smi", run=run)
+    assert "creationflags" not in calls[-1]  # refused off Windows unless 0
+
+
+def test_settings_load_on_windows_where_file_modes_mean_nothing_but_the_place_does(tmp_path, monkeypatch):
+    profile = tmp_path / "Users" / "owner"
+    path = save(Settings(key_hash="x"), profile / ".config" / "gpm-agent" / "agent.json")
     path.chmod(0o644)  # as Python reports every writable file on Windows
     with pytest.raises(SettingsError, match="readable"):
         load(path)
-    monkeypatch.setattr(agent_settings, "CHECKS_FILE_MODE", False)
+    monkeypatch.setattr(agent_settings, "WINDOWS", True)
+    monkeypatch.setenv("USERPROFILE", str(profile))
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
     assert load(path).key_hash == "x"
+
+
+def test_on_windows_settings_outside_the_profile_are_refused(tmp_path, monkeypatch):
+    """A folder made at a drive's root inherits "Authenticated Users: Modify": any user of the
+    machine could then name the program this agent runs as its owner. The standard library
+    reads no access control list, so on Windows the place decides."""
+    profile, shared = tmp_path / "Users" / "owner", tmp_path / "Shared"
+    elsewhere = save(Settings(key_hash="x"), shared / "agent.json")
+    monkeypatch.setattr(agent_settings, "WINDOWS", True)
+    monkeypatch.setenv("USERPROFILE", str(profile))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local"))
+    with pytest.raises(SettingsError, match="outside your profile"):
+        load(elsewhere)
+    with pytest.raises(SettingsError, match="outside your profile"):
+        save(Settings(key_hash="x"), shared / "other.json")  # `init` writes nothing there
+    assert not (shared / "other.json").exists()
+    # A link out of the profile is where it leads.
+    (profile / "link").parent.mkdir(parents=True)
+    (profile / "link").symlink_to(shared, target_is_directory=True)
+    with pytest.raises(SettingsError, match="outside your profile"):
+        load(profile / "link" / "agent.json")
+    # Under the profile, or the local application data moved out of it: loaded.
+    assert load(save(Settings(key_hash="x"), profile / "agent.json")).key_hash == "x"
+    assert load(save(Settings(key_hash="x"), tmp_path / "Local" / "gpm" / "agent.json")).key_hash == "x"
+    # What the settings name for the agent to run, likewise.
+    with pytest.raises(SettingsError, match="engine_binary .* outside your profile"):
+        Settings(key_hash="x", engine="whisper-cpp", engine_url="http://127.0.0.1:8178",
+                 engine_binary=str(shared / "whisper-server.exe")).check()
+    with pytest.raises(SettingsError, match="engines_path .* outside your profile"):
+        Settings(key_hash="x", engines_path=str(shared / "engines")).check()
+    Settings(key_hash="x", engines_path=str(profile / "engines"),
+             engine_binary=str(profile / "bin" / "whisper-server.exe")).check()
+    monkeypatch.delenv("USERPROFILE")
+    monkeypatch.delenv("LOCALAPPDATA")
+    with pytest.raises(SettingsError, match="USERPROFILE does not say"):
+        load(profile / "agent.json")
+
+
+def test_the_profile_is_read_with_windows_path_rules():
+    environ = {"USERPROFILE": "C:\\Users\\Owner", "LOCALAPPDATA": "D:\\Local\\owner"}
+    assert agent_settings.outside_profile("c:\\users\\owner\\.config\\gpm-agent\\agent.json", environ, ntpath) is None
+    assert agent_settings.outside_profile("D:\\Local\\owner\\gpm\\engines", environ, ntpath) is None
+    assert "outside your profile (C:\\Users\\Owner)" in agent_settings.outside_profile("C:\\GPM\\agent.json", environ, ntpath)
+    assert agent_settings.outside_profile("C:\\Users\\Owner2\\agent.json", environ, ntpath)  # not a prefix of a name
+    assert agent_settings.outside_profile("E:\\agent.json", environ, ntpath)  # another drive
+    assert agent_settings.outside_profile("C:\\Users\\Owner\\x.json", {"USERPROFILE": "Users\\Owner"}, ntpath)
 
 
 def test_the_agent_imports_and_builds_its_app_without_the_names_only_posix_has(tmp_path):

@@ -18,13 +18,17 @@ def _init(args: argparse.Namespace) -> int:
     if path.exists() and not args.rotate:
         print(f"{path} already exists. Use --rotate to mint a new key and keep the other settings.", file=sys.stderr)
         return 1
-    machine = startup.Machine.this() if (args.start_at_login or args.prerequisites) else None
+    absolute = str(path.absolute())
+    machine = startup.Machine.this() if (args.start_at_login or args.prerequisites or args.rotate) else None
     if args.start_at_login:
         # Said before a key is minted, so a start at login that cannot be set up changes nothing.
-        problem = startup.problem_with_adding(machine, str(path.absolute()))
+        problem = startup.problem_with_adding(machine, absolute)
         if problem:
             print(problem, file=sys.stderr)
             return 1
+    # A key rotated under an agent that starts with the machine: that agent is started again
+    # below, to take the new key — the one running holds the old one until it is.
+    restarts = bool(args.rotate and not args.start_at_login and path.exists() and startup.registered(machine, absolute))
     key = mint_key()
     if path.exists():
         settings = load(path)
@@ -43,11 +47,19 @@ def _init(args: argparse.Namespace) -> int:
             engine_binary=args.engine_binary,
             install_engines=args.install_engines,
         )
+    rotated = path.exists()
     settings.check()
     save(settings, path)
     print(f"Agent key (shown once; only its hash is stored in {path}):\n\n  {key}\n")
     print("Give it to the pool as an environment variable on the pool's machine, and name that")
-    print("variable in the host's `agent.bearer_env`." + ("" if args.start_at_login else " Then: gpm-agent serve"))
+    print("variable in the host's `agent.bearer_env`.")
+    if not (args.start_at_login or restarts):
+        if rotated:
+            # Its settings are read when it starts: one running now takes the old key until then.
+            print("Then start `gpm-agent serve` again wherever it runs, so it takes the new key — or")
+            print("`gpm-agent startup add`, which starts it with the machine from now on.")
+        else:
+            print("Then: gpm-agent serve — or `gpm-agent startup add`, to start it with the machine.")
     if settings.install_engines:
         # Said now: the agent never stops a program it did not start, so the owner's own copy
         # would keep the port and every install would be refused.
@@ -61,15 +73,20 @@ def _init(args: argparse.Namespace) -> int:
         print(f"\nNote: {whisper_cpp.PROGRAM} is not on this PATH. Install whisper.cpp, or set")
         print(f"engine_binary in {path} to its program, before the pool asks this machine to serve.")
     # D154: what only the owner can install, then the agent starting with the machine — last, so
-    # it starts with what was just installed.
+    # it starts with what was just installed. Either not done makes the whole of `init` fail, so
+    # a script running it learns that something is still to do.
+    outcome = 0
     if args.prerequisites:
         print()
-        prerequisites.run(machine, engine=settings.engine, admin=args.admin,
-                          install_engines=bool(getattr(settings, "install_engines", False)))
+        outcome |= prerequisites.run(machine, engine=settings.engine, admin=args.admin,
+                                     install_engines=bool(getattr(settings, "install_engines", False)))
     if args.start_at_login:
         print()
-        return startup.add(machine, str(path.absolute()), admin=args.admin)
-    return 0
+        outcome |= startup.add(machine, absolute, admin=args.admin, listen=(settings.host, settings.port))
+    elif restarts:
+        print()
+        outcome |= startup.restart(machine, absolute)
+    return 1 if outcome else 0
 
 
 def _serve(args: argparse.Namespace) -> int:

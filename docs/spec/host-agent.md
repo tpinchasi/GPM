@@ -301,7 +301,8 @@ its port.
 add|remove|status` for an agent already set up — makes the agent start with the machine, running
 `<its interpreter> -I -m gpm_agent.cli --config <settings> serve` — on macOS and Linux with only
 the owner's `PATH` copied; on Windows with `pythonw.exe` and `--log-file`, in the logon session's
-own environment:
+own environment, where the engines it starts and the programs it reads facts with (`nvidia-smi`)
+are given no console window:
 
 | | Where | How |
 |---|---|---|
@@ -309,13 +310,39 @@ own environment:
 | Linux | `~/.config/systemd/user/<name>.service` | `systemctl --user enable` and `restart`; `Restart=on-failure`, `KillMode=process` (engines outlive an agent restart); lingering checked, and enabled with `sudo` only under `--admin` at a terminal |
 | Windows | a task definition beside the settings | `schtasks /Create /XML` at logon for this user: no time limit, runs on battery, restarted after a failure |
 
-`<name>` follows the settings file, so two agents on one machine get two entries. macOS and Windows
-start it at login, so an unattended machine logs its owner in automatically. A start from `uvx`'s
-cache is refused: install it with `uv tool install gpm-agent`. `init --prerequisites` (or
-`gpm-agent prerequisites`) installs what the engine needs and is missing — ffmpeg, and a compiler
-for whisper.cpp's build — with administrator rights only under `--admin` at a terminal, and
-otherwise prints the exact commands. The agent never asks for elevation itself, and does not
-update itself.
+`<name>` follows the settings file, so two agents on one machine get two entries. Nothing else
+holding that name is replaced or stopped — each refused before anything is written: a definition
+for other settings; a launchd job by that label loaded from another file (`launchctl print` names
+the file); a unit by that name that `systemctl --user show -p FragmentPath` finds in another
+directory of the user search path, which ours would take the place of; a task Task Scheduler
+holds for other settings. A task's settings file is read back from Task Scheduler itself
+(`schtasks /Query /XML`), never from the definition beside the settings: its description names
+the file, with a digest of it that survives the console's code page. macOS and Windows start it
+at login, so an unattended machine logs its owner in automatically.
+
+`add` says the agent was *started*, and `startup status` whether it answers on its port; when
+something already answers there before one is set up — a `gpm-agent serve` started by hand — it
+says so, since the agent started with the machine cannot listen until that one stops.
+`init --rotate` starts again an agent set up to start with the machine, so the new key takes at
+once. `startup remove` stops the agent and not its engine servers, which outlive it as they
+outlive any restart of it (D148), and says so: they serve until the machine restarts or the owner
+ends them.
+
+A start from `uvx`'s cache is refused — a `CACHEDIR.TAG` *above* the agent's environment; uv tags
+every environment it makes, the lasting one `uv tool install` makes too, so the environment's own
+directory (the one with `pyvenv.cfg`) is passed over: install it with `uv tool install gpm-agent`.
+`init --prerequisites` (or `gpm-agent prerequisites`) installs what the engine needs and is
+missing — ffmpeg, and for whisper.cpp's build on Linux `c++`, `make` and `cmake` (with
+`python3-venv` on apt, for cmake from PyPI) — with administrator rights only under `--admin` at a
+terminal, and otherwise prints the exact commands; `init` then ends non-zero while anything is
+still needed. The agent never asks for elevation itself, and does not update itself.
+
+**On Windows** a file's permission bits mean nothing to Python and the standard library reads no
+access control list, so the agent trusts a file by where it lives: its settings file, and the
+programs they name for it to run (`engine_binary`, `engines_path`), must lie under the user's
+profile (`%USERPROFILE%`, or `%LOCALAPPDATA%` where it is moved), links followed. Anything
+elsewhere is refused with the reason: a folder made at a drive's root inherits a rule letting
+every signed-in user change what is in it, and so what the agent runs as its owner.
 
 ## 3. What it reports — facts
 
@@ -361,7 +388,7 @@ refuses app and admin keys by name, and the control API and router refuse an age
 # on the host
 uv tool install gpm-agent   # a lasting install; a start at login is refused from uvx's cache
 gpm-agent init              # mints the key, prints it once, stores only its hash (0600 on
-                            # macOS and Linux; on Windows, the profile's own access rules)
+                            # macOS and Linux; on Windows, only under the user's profile, §2.3)
 gpm-agent serve             # loopback by default
 ```
 

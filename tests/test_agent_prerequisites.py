@@ -60,7 +60,7 @@ def test_what_is_already_there_is_left_alone():
     assert runner.commands == [["xcode-select", "-p"]]  # a look, and nothing installed
 
     runner = Runner()
-    machine = a_machine("Linux", on_path=("ffmpeg", "g++", "make", "apt-get", "sudo"), runner=runner)
+    machine = a_machine("Linux", on_path=("ffmpeg", "c++", "make", "cmake", "apt-get", "sudo"), runner=runner)
     report = prerequisites.ensure(machine, engine="whisper-cpp", install_engines=True, admin=True)
     assert [need for need, _ in report.present] == ["ffmpeg", "compiler"] and runner.commands == []
 
@@ -90,9 +90,19 @@ def test_linux_installs_through_sudo_only_with_admin_at_a_terminal():
     report = prerequisites.ensure(machine, engine="whisper-cpp", install_engines=True, admin=True)
     assert runner.calls == [
         (["sudo", "apt-get", "update"], True),
-        (["sudo", "apt-get", "install", "-y", "ffmpeg", "g++", "make"], True),
+        (["sudo", "apt-get", "install", "-y", "ffmpeg", "g++", "make", "cmake", "python3-venv"], True),
     ]
     assert [need for need, _ in report.installed] == ["ffmpeg", "compiler"] and report.still_needed == []
+
+
+def test_the_compiler_is_looked_for_by_the_names_the_build_runs():
+    """whisper.cpp's build runs `c++`, `make` and `cmake`: a `g++` without `c++` is refused there,
+    so it is not "already here"; and cmake comes with the compiler, from the same packages."""
+    assert prerequisites.found(a_machine("Linux", on_path=("g++", "make", "cmake")), "compiler") is None
+    assert prerequisites.found(a_machine("Linux", on_path=("c++", "make")), "compiler") is None
+    assert prerequisites.found(a_machine("Linux", on_path=("c++", "make", "cmake")), "compiler") == (
+        "/usr/bin/c++, /usr/bin/make, /usr/bin/cmake"
+    )
 
 
 @pytest.mark.parametrize("admin, interactive", [(False, True), (True, False), (False, False)])
@@ -106,7 +116,7 @@ def test_linux_without_the_owners_word_at_a_terminal_prints_the_exact_command(ad
 
 
 def test_dnf_gets_its_own_package_names_and_a_failure_is_still_needed(capsys):
-    install = ("sudo", "dnf", "install", "-y", "ffmpeg", "gcc-c++", "make")
+    install = ("sudo", "dnf", "install", "-y", "ffmpeg", "gcc-c++", "make", "cmake")
     runner = Runner({install: Ran(1)})
     machine = a_machine("Linux", on_path=("dnf",), runner=runner)
     assert prerequisites.run(machine, engine="whisper-cpp", install_engines=True, admin=True) == 1
@@ -158,3 +168,15 @@ def test_init_and_the_verb_install_what_the_settings_engine_needs(monkeypatch, t
 
     ollama = save(Settings(key_hash=fingerprint("gpmg_notreal")), tmp_path / "agent.json")
     assert cli.main(["-c", str(ollama), "prerequisites", "--admin"]) == 0
+
+
+def test_init_fails_while_a_prerequisite_is_still_needed(monkeypatch, tmp_path, capsys):
+    """The settings are written and the key shown, but `init` ends non-zero, so a script running
+    it learns that something is still to do."""
+    runner = Runner()
+    machine = a_machine("Linux", on_path=("apt-get",), runner=runner)
+    monkeypatch.setattr(startup.Machine, "this", classmethod(lambda cls: machine))
+    path = tmp_path / "whisper.json"
+    assert cli.main(["-c", str(path), "init", "--engine", "whisper-cpp", "--prerequisites"]) == 1
+    out = capsys.readouterr().out
+    assert path.exists() and "Agent key" in out and "Still needed" in out and runner.commands == []

@@ -8,8 +8,8 @@ they are installed once, here, at a terminal, by the person who owns the machine
   (`--convert`). Homebrew on macOS; apt or dnf on Linux, through `sudo`; winget on Windows, for
   this user only.
 - **A compiler**, where this agent builds whisper.cpp from source (D152): on macOS Xcode's
-  command-line tools — whose installer is a dialog, so it is only named; on Linux `g++` and
-  `make`, through `sudo`. Windows takes whisper.cpp's own builds and needs none.
+  command-line tools — whose installer is a dialog, so it is only named; on Linux a C++ compiler,
+  `make` and `cmake`, through `sudo`. Windows takes whisper.cpp's own builds and needs none.
 
 What is already there is found first and left alone. `sudo` runs only when the owner said
 `--admin` at a terminal, where it asks for the password itself; otherwise the exact command is
@@ -35,17 +35,22 @@ WINGET_FFMPEG = [
     "--accept-package-agreements", "--accept-source-agreements",
 ]
 
-#: Each Linux package manager's names for what is needed.
+#: Each Linux package manager's names for what is needed. The build (`whisper_build`) runs `c++`,
+#: `make` and `cmake` — cmake from PyPI where the machine has none, in a private environment made
+#: with Python's `venv`, which Debian and Ubuntu ship apart from Python itself (`python3-venv`).
 LINUX_PACKAGES = {
-    "apt-get": {"ffmpeg": ["ffmpeg"], "compiler": ["g++", "make"]},
-    "dnf": {"ffmpeg": ["ffmpeg"], "compiler": ["gcc-c++", "make"]},
+    "apt-get": {"ffmpeg": ["ffmpeg"], "compiler": ["g++", "make", "cmake", "python3-venv"]},
+    "dnf": {"ffmpeg": ["ffmpeg"], "compiler": ["gcc-c++", "make", "cmake"]},
 }
+
+#: The programs the build runs, each looked for by the name it runs it by.
+BUILD_PROGRAMS = ("c++", "make", "cmake")
 
 #: What each need is called, for the owner.
 TITLES = {
     "ffmpeg": "ffmpeg",
     "command-line tools": "Xcode's command-line tools",
-    "compiler": "a C++ compiler and make",
+    "compiler": "a C++ compiler (c++), make and cmake",
 }
 
 
@@ -80,9 +85,9 @@ def found(machine: Machine, need: str) -> Optional[str]:
         ran = machine.run(["xcode-select", "-p"])
         return (ran.output.strip() or "installed") if ran.ok else None
     if need == "compiler":
-        compiler = machine.which("c++") or machine.which("g++")
-        make = machine.which("make")
-        return f"{compiler}, {make}" if compiler and make else None
+        # As the build looks: `c++` itself — a `g++` without it is refused there.
+        programs = [machine.which(name) for name in BUILD_PROGRAMS]
+        return ", ".join(str(program) for program in programs) if all(programs) else None
     raise ValueError(need)
 
 

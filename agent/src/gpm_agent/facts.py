@@ -21,17 +21,30 @@ import shutil
 import subprocess
 from typing import Any, Callable, Optional, Sequence
 
+from .platform import CREATE_NO_WINDOW
+
 _TIMEOUT_S = 5
 
 
-def _run(command: Sequence[str]) -> Optional[str]:
+def _run(
+    command: Sequence[str],
+    *,
+    system: Callable[[], str] = platform.system,
+    which: Callable[[str], Optional[str]] = shutil.which,
+    run: Callable[..., Any] = subprocess.run,
+) -> Optional[str]:
     """Output of a fixed, argument-list command, or None. Never a shell, never input from
-    the pool: every command this module runs is a literal written here."""
-    if shutil.which(command[0]) is None:
+    the pool: every command this module runs is a literal written here.
+
+    On Windows with no console window: the agent started at logon runs under `pythonw.exe`, which
+    has none, so each console program it starts — `nvidia-smi`, on every facts call — would open
+    a window of its own on the owner's screen."""
+    if which(command[0]) is None:
         return None
+    options: dict[str, Any] = {"creationflags": CREATE_NO_WINDOW} if system() == "Windows" else {}
     try:
-        done = subprocess.run(
-            list(command), capture_output=True, text=True, timeout=_TIMEOUT_S, check=False
+        done = run(
+            list(command), capture_output=True, text=True, timeout=_TIMEOUT_S, check=False, **options
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
