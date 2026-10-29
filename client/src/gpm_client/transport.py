@@ -41,6 +41,27 @@ def _parse_error(response: httpx.Response) -> tuple[Optional[str], Optional[str]
     return body.get("reason"), body.get("detail") or body.get("error")
 
 
+def _read_timed_out(request: httpx.Request) -> PoolRequestError:
+    """A read timeout, raised rather than retried (D144).
+
+    httpx raises `ReadTimeout` while waiting for the answer to a request it has written: the
+    pool has it, and is queueing it or running it. Sending it again would run it twice — a long
+    transcription re-uploaded until `max_wait` ran out — so it is reported, like the pool's own
+    `504 generation_timeout`, for the caller to allow longer or send shorter work. Every other
+    transport error — a refused connection, say — is retried as before.
+    """
+    read_s = (request.extensions.get("timeout") or {}).get("read")
+    within = f"within {read_s:g} s " if isinstance(read_s, (int, float)) else ""
+    return PoolRequestError(
+        504,
+        reason="read_timeout",
+        detail=(
+            f"no answer {within}after the request was sent; the pool may still be working on "
+            "it, so it was not sent again. Allow a longer read timeout, or send shorter work"
+        ),
+    )
+
+
 def _next_wait(policy: RetryPolicy, start: float, attempt: int, retry_after: Optional[float] = None) -> Optional[float]:
     """How long to wait before trying again, or None when the budget is spent.
 
@@ -119,6 +140,8 @@ class PoolTransport(httpx.BaseTransport):
         while True:
             try:
                 response = self._inner.handle_request(request)
+            except httpx.ReadTimeout as exc:
+                raise _read_timed_out(request) from exc
             except httpx.TransportError as exc:
                 wait_s = _next_wait(policy, start, attempt)
                 if wait_s is None:
@@ -173,6 +196,8 @@ class AsyncPoolTransport(httpx.AsyncBaseTransport):
         while True:
             try:
                 response = await self._inner.handle_async_request(request)
+            except httpx.ReadTimeout as exc:
+                raise _read_timed_out(request) from exc
             except httpx.TransportError as exc:
                 wait_s = _next_wait(policy, start, attempt)
                 if wait_s is None:

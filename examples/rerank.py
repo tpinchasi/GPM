@@ -27,6 +27,7 @@ def main() -> None:
 
     for place, result in enumerate(ranked, 1):
         print(f"{place}. {result.score:.3f}  {args.files[result.index]}")
+    print(f"\n(ranked by {ranked.served_model} on {ranked.host}, after {ranked.wait_s or 0:.1f}s in the queue)")
 
 
 if __name__ == "__main__":

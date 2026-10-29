@@ -110,7 +110,9 @@ It is served from a cached copy, never by asking a third party while the app wai
 | `400` | `input_not_accepted` | Every build of this model the pool could hold refuses what the request carries (a picture, sound) | raise `PoolRequestError` |
 | `400` | `media_not_inline` | A picture or sound was given by link, or as a part type the pool does not accept | raise `PoolRequestError` |
 | `400` | `bad_upload` | An upload the pool could not read as one clean form, or one naming the model twice | raise `PoolRequestError` |
+| `400` | `content_encoding` | The request has a `Content-Encoding` other than identity; the pool reads only uncompressed bodies (D144) | raise `PoolRequestError` |
 | `413` | `request_too_large` | The body is over `pool.max_request_mb`; refused before it is read | raise `PoolRequestError` |
+| `404` | `unknown_path` | The path is not an inference path of any engine this pool runs (§2: only those exact paths are forwarded). A path some engine serves, but none this pool runs, is `400 kind_not_served` instead | raise `PoolRequestError` |
 | `404` | `model_not_in_pool` | The model is not in this pool's declared set; it will not be loaded on demand | raise `PoolRequestError` |
 | `503` | `queue_timeout` | All workers busy for longer than the queue limit | wait and retry |
 | `503` | `preparing` | A host is up but still loading the pool's models | wait and retry |
@@ -191,7 +193,8 @@ Every field is overridable per call, per client, or by environment variable, in 
 | Situation | Default |
 |---|---|
 | `503` other than `no_lease` | Retry. Wait `Retry-After` if present, else exponential back-off 2 s → 60 s with jitter |
-| Transport error before any response byte | Retry, same back-off |
+| Transport error before any response byte, other than a read timeout | Retry, same back-off |
+| Read timeout: the request was sent and no answer came within the read time | **Not retried** — `PoolRequestError`, status 504, reason `read_timeout`. The pool may still be working on it; sending it again would run it twice (D144) |
 | Failure **mid-stream**, after output was delivered | **Not retried** — `PoolStreamInterrupted`. The app has consumed partial output; only it can decide to redo the call |
 | `401` | Not retried — `PoolAuthError` |
 | Other `4xx` | Not retried — `PoolRequestError` |
