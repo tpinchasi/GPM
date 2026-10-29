@@ -59,7 +59,7 @@ except OSError:
     control = {}
 watched = ["OLLAMA_HOST", "OLLAMA_MODELS", "OLLAMA_NUM_PARALLEL", "OLLAMA_MAX_LOADED_MODELS",
            "OLLAMA_CONTEXT_LENGTH", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "GITHUB_TOKEN",
-           "VAST_API_KEY", "SOME_SERVICE_TOKEN", "OLLAMA_ORIGINS", "CUDA_VISIBLE_DEVICES", "PATH", "HOME"]
+           "CONTAINER_API_KEY", "SOME_SERVICE_TOKEN", "OLLAMA_ORIGINS", "CUDA_VISIBLE_DEVICES", "PATH", "HOME"]
 with open(starts_path, "a") as starts:
     starts.write(json.dumps({"version": version, "program": program, "args": args, "pid": os.getpid(),
                              "cwd": os.getcwd(), "env": {k: os.environ.get(k) for k in watched}}) + "\\n")
@@ -1329,7 +1329,7 @@ def test_a_program_is_given_the_names_it_needs_and_nothing_else():
 
 
 async def test_no_credential_or_setting_of_its_own_reaches_the_server(rig, monkeypatch):
-    monkeypatch.setenv("VAST_API_KEY", "not-a-real-key")
+    monkeypatch.setenv("CONTAINER_API_KEY", "not-a-real-key")
     monkeypatch.setenv("SOME_SERVICE_TOKEN", "not-a-real-token")
     monkeypatch.setenv("OLLAMA_ORIGINS", "*")
     monkeypatch.setenv("OLLAMA_HOST", "0.0.0.0:1")
@@ -1337,7 +1337,7 @@ async def test_no_credential_or_setting_of_its_own_reaches_the_server(rig, monke
     rig.release(V1)
     await rig.want("latest")
     env = rig.starts()[0]["env"]
-    assert env["VAST_API_KEY"] is None and env["SOME_SERVICE_TOKEN"] is None and env["OLLAMA_ORIGINS"] is None
+    assert env["CONTAINER_API_KEY"] is None and env["SOME_SERVICE_TOKEN"] is None and env["OLLAMA_ORIGINS"] is None
     assert env["OLLAMA_HOST"] == f"127.0.0.1:{rig.port}" and env["CUDA_VISIBLE_DEVICES"] == "1"
     assert env["PATH"] == os.environ["PATH"] and env["HOME"] == os.environ["HOME"]
 
