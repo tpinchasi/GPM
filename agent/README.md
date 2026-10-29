@@ -21,6 +21,16 @@ that process. On Windows the settings file, and any program or engines directory
 be under your profile (`%USERPROFILE%`): a folder elsewhere is usually one every user of the
 machine can change.
 
+On a Linux machine with an NVIDIA card (S10), `--engine vllm` with `--install-engines` has the
+agent install vLLM from PyPI — only the exact wheels, checked by hash, of the locked set it carries
+for its Python (3.11–3.14) and processor — and run it once the models it holds are on disk.
+vLLM 0.32.0 needs NVIDIA driver 580.65.06 or later and a card of compute capability 7.5 or higher;
+`--prerequisites` checks both and installs Python's `venv`. `--engine auto` lets the agent choose
+each time it starts: vLLM on an Ampere or newer card with that driver, Ollama anywhere else, with
+the reasons in its facts and on the pool's Hosts screen. **Not yet run on real hardware**: built
+and tested against fakes only, so the first install on a real machine is also its first check —
+see the story's [unverified list](../docs/stories/S10-vllm-on-owned-machines.md#unverified).
+
 On the pool's machine, put the key in an environment variable and name it on the host:
 
 ```yaml

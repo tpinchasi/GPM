@@ -1,7 +1,8 @@
 # S10 — vLLM on the machines the operator owns
 
-> Status: **built against fakes** (2026-10-30) — D157–D161; gpm-server 0.37.0, gpm-agent 0.15.0; the live
-> check on a Linux NVIDIA machine next, asked first. Part of the [feature list](README.md).
+> Status: **built against fakes** (2026-10-30) — D157–D161; gpm-server 0.37.0, gpm-agent 0.15.0. **Not
+> yet run on real hardware**: the owner will check it on a Linux machine with an NVIDIA card of
+> their own. Part of the [feature list](README.md).
 > Extends S9, which installs, runs and upgrades Ollama and whisper.cpp on the operator's own
 > machines, to vLLM on a Linux machine with an NVIDIA card.
 
@@ -144,10 +145,11 @@ Decided in D157–D161 and specified in [host-agent.md](../spec/host-agent.md) �
    console. — Built 2026-10-30 with stage 2: the upgrade pass and the console's versions were
    already engine-agnostic; added the `auto` choice on the Hosts screen, `engine_version: latest`
    only under `auto`, and an `auto` host whose agent does not install engines said so.
-4. **Live, asked first**: on a Linux machine with an NVIDIA card, owned or rented for the check
-   as a bare Ubuntu machine treated as the operator's own (about $0.50). vLLM installed by the
-   agent; one chat model and Whisper served, a picture answered, then an upgrade and a
-   rollback.
+4. **Live**: on a Linux machine with an NVIDIA card the owner has (2026-10-30: none yet; a rented
+   one was declined — a container run as root shows the install, not the owner's machine: start
+   with the machine, `sudo` prerequisites, a card that also drives a screen). vLLM installed by the
+   agent; one chat model and Whisper served, a picture answered, then an upgrade and a rollback —
+   which needs a second version's set first (`tools/vllm-lock` for the release before 0.32.0).
 
 ## Unverified
 
