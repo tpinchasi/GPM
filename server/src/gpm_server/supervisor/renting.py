@@ -37,6 +37,7 @@ from ..providers.base import (
     Instance,
     InstanceSpec,
     InstanceState,
+    InstanceStatus,
     Offer,
     OfferGone,
     OfferQuery,
@@ -67,6 +68,24 @@ from ..workload_store import Volume, WorkloadStore, group_key
 from . import agents, hostagent
 
 log = logging.getLogger("gpm.renting")
+
+#: The most of a provider's own words kept with an event or a log line.
+PROVIDER_WORDS_MAX = 300
+
+
+def provider_words(status: InstanceStatus) -> Optional[str]:
+    """What the provider said about an instance, made safe to keep: one line of printable text,
+    bounded. A provider's message may be relayed from the machine's own operator, whom the pool
+    does not trust (T7) — a line break in it would forge a log line, an escape sequence would
+    reach the terminal reading the log. A plug-in without its own words gives its `detail`."""
+    text = status.reported or status.detail
+    if not text:
+        return None
+    printable = "".join(c if c.isprintable() else " " for c in str(text))
+    one_line = " ".join(printable.split())
+    if len(one_line) > PROVIDER_WORDS_MAX:
+        one_line = one_line[:PROVIDER_WORDS_MAX - 1] + "…"
+    return one_line or None
 
 
 class PullTooSlow(Exception):
@@ -3141,9 +3160,10 @@ class Fleet:
 
             # What the provider said, kept with whatever the pool does next: the only account of
             # why a machine was lost, once it is destroyed.
-            said = {"provider_said": status.reported} if status.reported else {}
-            if status.reported:
-                log.warning("%s read as stopped; the provider says: %s", host.host_id, status.reported)
+            words = provider_words(status)
+            said = {"provider_said": words} if words else {}
+            if words:
+                log.warning("%s read as stopped; the provider says: %s", host.host_id, words)
 
             if not host.interruptible:
                 # Nobody outbid this one — it is not that kind of rental. Something else
@@ -3151,7 +3171,7 @@ class Fleet:
                 self.events.record(
                     "host_stopped",
                     f"{host.host_id} stopped, and it was rented on demand so it was not outbid; releasing it"
-                    + (f" (the provider says: {status.reported})" if status.reported else ""),
+                    + (f" (the provider says: {words})" if words else ""),
                     numbers=said,
                     host_id=host.host_id,
                     lease_id=host.lease_id,

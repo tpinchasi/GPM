@@ -373,6 +373,7 @@ class FakeProvider:
         found.state = InstanceState.RUNNING
         found.stopped_by_provider = False
         found.running_since = time.time()
+        found.reported = None
 
     async def stop(self, instance: Instance) -> None:
         self._guard("stop")

@@ -58,7 +58,8 @@ def _state_line(entry: dict[str, Any]) -> str:
         if entry.get(name):
             parts.append(f"{name} {entry[name]}")
     line = ", ".join(parts)
-    message = str(entry.get("status_msg") or "").strip()
+    # One line, printable: the message may come from the machine's own operator (T7).
+    message = " ".join("".join(c if c.isprintable() else " " for c in str(entry.get("status_msg") or "")).split())
     return f"{line}: {message[:200]}" if message else line
 
 

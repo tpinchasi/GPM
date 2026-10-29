@@ -340,7 +340,20 @@ def alive(pid: int, *, os_name: Optional[str] = None) -> bool:
         return True  # there, and not this user's — which the command-line check then says
     except OSError:
         return False
-    return True
+    return not _zombie(pid)
+
+
+def _zombie(pid: int) -> bool:
+    """Has the process exited without being reaped? It still answers a signal, and read as
+    running it would be waited for for ever — as a model is behind one that died at start, or any
+    process whose parent is a container's first process that never reaps. Known from /proc;
+    where there is none, it is taken as running."""
+    try:
+        stat = Path(f"/proc/{int(pid)}/stat").read_text()
+    except (OSError, ValueError):
+        return False
+    # The state follows the command name, which is in parentheses and may itself hold any of them.
+    return stat.rpartition(")")[2].split()[:1] == ["Z"]
 
 
 def command_line(pid: int, *, os_name: Optional[str] = None, run: Optional[Runner] = None) -> Optional[bytes]:

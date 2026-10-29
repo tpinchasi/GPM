@@ -41,21 +41,43 @@ def read_record(models_dir: Path) -> Optional[dict[str, Any]]:
 
 
 #: An exception as Python prints it, closing a traceback: `ValueError: …`, `torch.OutOfMemoryError: …`.
-_EXCEPTION = re.compile(r"(?:^|\s)((?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*(?:Error|Exception)): (\S.*)$")
+_EXCEPTION = re.compile(r"(?:^|\s)((?:[A-Za-z_]\w*\.)*\w*(?:Error|Exception)): (\S.*)$")
+
+#: One with nothing after its name — `AssertionError`, common in vLLM — alone on its line once the
+#: process's and the logger's prefixes are taken off, so that a sentence ending in "Error" is not one.
+_BARE_EXCEPTION = re.compile(r"(?:[A-Za-z_]\w*\.)*\w*(?:Error|Exception)")
+_PREFIXES = re.compile(r"^(?:\([^)]*\)\s*)?(?:[A-Z]+\s+\d\d-\d\d\s+[\d:.]+\s+\[[^\]]*\]\s*)?")
 
 #: What vLLM's API server says when its engine process failed: true, and never the reason — that
 #: is the engine process's own exception, further up the same log.
 _POINTS_ELSEWHERE = re.compile(r"See root cause above|Engine core initialization failed|Failed core proc")
 
+#: Written by the launcher into an engine's log before each start: the log is kept across starts,
+#: and a reason from an earlier one is not this one's.
+RUN_MARKER = "=== gpm-agent: vLLM started here ==="
+
+
+#: How the helper that starts a card's models in turn is known by its command line (D155).
+IN_TURN_VERB = b"vllm-in-turn"
+
+
+def in_turn_helper(pid: int, command_line: Callable[[int], Optional[bytes]]) -> bool:
+    """Is `pid` still the helper that starts models in turn? A number in a file is only a number:
+    once the helper has gone it may be any process's. Where the command line cannot be read, the
+    number is taken at its word."""
+    said = command_line(pid)
+    return said is None or IN_TURN_VERB in said
+
 
 def last_error_line(log_path: str, tail_bytes: int = 65536) -> Optional[str]:
     """Why an engine stopped, from its log — the line the operator would look for.
 
-    The last exception that is a reason, not a pointer to one. Found live: a vLLM process ended
-    on `RuntimeError: Engine core initialization failed. See root cause above.`, which was all
-    the pool heard, and the machine was gone before anyone could read what was above. A
-    traceback's own source lines (`raise RuntimeError(`) are not exceptions; a pointer is kept
-    only for want of anything better, and a line that merely mentions an error after that."""
+    The last exception of this start that is a reason, not a pointer to one. Found live: a vLLM
+    process ended on `RuntimeError: Engine core initialization failed. See root cause above.`,
+    which was all the pool heard, and the machine was gone before anyone could read what was
+    above. A traceback's own source lines (`raise RuntimeError(`) are not exceptions; a pointer
+    is kept only for want of anything better, and a line that merely mentions an error after
+    that. Only what follows the last start's marker is read."""
     try:
         with open(log_path, "rb") as f:
             f.seek(0, os.SEEK_END)
@@ -63,12 +85,18 @@ def last_error_line(log_path: str, tail_bytes: int = 65536) -> Optional[str]:
             lines = f.read().decode(errors="replace").splitlines()
     except OSError:
         return None
+    starts = [i for i, line in enumerate(lines) if RUN_MARKER in line]
+    if starts:
+        lines = lines[starts[-1] + 1:]
     pointer: Optional[str] = None
     for line in reversed(lines):
         found = _EXCEPTION.search(line)
-        if not found:
+        if found:
+            reason = f"{found.group(1)}: {found.group(2).strip()}"[:300]
+        elif _BARE_EXCEPTION.fullmatch(_PREFIXES.sub("", line).strip()):
+            reason = _PREFIXES.sub("", line).strip()[:300]
+        else:
             continue
-        reason = f"{found.group(1)}: {found.group(2).strip()}"[:300]
         if _POINTS_ELSEWHERE.search(reason):
             pointer = pointer or reason
             continue
@@ -84,7 +112,8 @@ def last_error_line(log_path: str, tail_bytes: int = 65536) -> Optional[str]:
 
 
 def failed_engines(models_dir: Path, served: Sequence[str],
-                   alive: Optional[Callable[[int], bool]] = None) -> dict[str, str]:
+                   alive: Optional[Callable[[int], bool]] = None,
+                   command_line: Callable[[int], Optional[bytes]] = host_platform.command_line) -> dict[str, str]:
     """Models whose engine process is gone without ever serving them, and why, by the log.
 
     A process that is still up is loading, however long it takes; only one that has exited
@@ -114,7 +143,7 @@ def failed_engines(models_dir: Path, served: Sequence[str],
         if pid is None and engine.get("waiting"):
             # Started in turn, after the model before it on its card (D155): waiting is not
             # failing while what starts it is still there to do so.
-            if isinstance(turns, int) and is_alive(turns):
+            if isinstance(turns, int) and is_alive(turns) and in_turn_helper(turns, command_line):
                 continue
             card = engine.get("card")
             on = "" if card is None else f" on card {card}"

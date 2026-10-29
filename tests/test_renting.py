@@ -1184,3 +1184,24 @@ async def test_the_provider_is_asked_to_filter_only_what_the_pool_would_also_rej
     assert "card memory ≥ 24 GB" in describe_query(query)
     broad = fleet.query_for(None, True, False)
     assert broad.min_gpu_memory_gb == 0 and broad.max_all_in_hourly is None, "finding a held machine asks broadly"
+
+
+def test_a_providers_words_are_kept_as_one_bounded_printable_line():
+    """The message may come from the machine's own operator (T7): a line break in it would forge
+    a log line, an escape sequence would reach the terminal reading the log."""
+    from gpm_server.providers.base import InstanceStatus
+    from gpm_server.supervisor.renting import PROVIDER_WORDS_MAX, provider_words
+
+    forged = "exited\n2026-10-29 20:00:00 gpm.renting INFO all is well\x1b[2J"
+    words = provider_words(InstanceStatus(state="stopped", reported=forged))
+    assert "\n" not in words and "\x1b" not in words
+    assert words.startswith("exited 2026-10-29 20:00:00 gpm.renting INFO all is well")
+    assert len(provider_words(InstanceStatus(state="stopped", reported="x" * 5000))) == PROVIDER_WORDS_MAX
+
+
+def test_a_provider_without_its_own_words_is_heard_through_its_detail():
+    from gpm_server.providers.base import InstanceStatus
+    from gpm_server.supervisor.renting import provider_words
+
+    assert provider_words(InstanceStatus(state="stopped", detail="status EXITED")) == "status EXITED"
+    assert provider_words(InstanceStatus(state="stopped")) is None

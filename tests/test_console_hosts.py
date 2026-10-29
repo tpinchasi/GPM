@@ -95,9 +95,9 @@ def test_a_host_gone_while_its_window_is_open_is_said_to_be_gone_not_an_older_su
         page.until("!!__row('laptop')", within=30, what="the hosts table")
 
         page.js("openHost('rented-released'); true")
-        page.until(f"{body}.includes('no longer in the pool')", within=30, what="the gone host's window")
+        page.until(f"{body}.includes('not in the pool')", within=30, what="the gone host's window")
         said = page.js(body)
-        assert "rented-released is no longer in the pool" in said
+        assert "rented-released is not in the pool's host table any more" in said
         assert "older supervisor" not in said
         page.js("closeHost(); true")
 

@@ -76,6 +76,14 @@ that can tell whether an instance still carries the start-up material it was cre
 so, and the pool ends a host that lost it (D65). A provider that cannot leaves it unknown, and
 the pool falls back to its give-up rule for hosts that never start.
 
+**Optional in an instance's status: `reported`** — the provider's own words for the instance's
+state, on one line (Vast's, for example: its actual, intended, current and next state and its
+message). The pool keeps it with the event whenever it acts on a stopped instance, since the
+machine is destroyed straight after and that line is the only account of why; a provider
+without it is heard through its `detail`. The pool makes it one printable line of at most 300
+characters before it keeps it anywhere: a provider's message may be relayed from the machine's
+own operator (T7).
+
 ### Declared capabilities
 
 A provider states what it can do; the pool adapts rather than assumes.

@@ -158,14 +158,15 @@ async function drawHost() {
   try {
     detail = await api.hostDetail(id);
   } catch (error) {
+    if (hostWatch.id !== id) return;  // closed or switched while we were asking
     clearInterval(hostWatch.timer);
     // A host released while its window was open answers "unknown_host": it is gone, not the
     // view. Only a route the supervisor does not have says it is older than this console.
     const gone = error.code === "unknown_host";
     document.getElementById("host-dialog-body").replaceChildren(...[
       gone
-        ? el("p", {}, `${id} is no longer in the pool: it was released, or its workload ended. `,
-          "Why is on the ", el("a", { href: "#decisions", onclick: () => closeHost() }, "Decisions"), " screen.")
+        ? el("p", {}, `${id} is not in the pool's host table any more — most often released, or its workload ended. `,
+          "What happened to it is on the ", el("a", { href: "#decisions", onclick: () => closeHost() }, "Decisions"), " screen.")
         : el("p", { class: "error" }, error.message),
       !gone && error.status === 404
         ? el("p", { class: "muted" }, "A pool running an older supervisor has no per-host view; restart it to get one.")

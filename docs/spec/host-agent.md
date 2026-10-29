@@ -80,7 +80,9 @@ whole preparation in, and folding them into one number would hide it (D97):
   `/health` or has exited — vLLM sizes its cache from the card's free memory measured across its
   own start, so a neighbour loading meanwhile would be counted as its own use. Separate cards
   start together. A model waiting its turn is not a failure while that helper runs; a restart
-  stops the helper first. On a host the pool created, the pool asks
+  stops the helper first, and the helper drops its own number from the record once it has
+  started everything. Each start is marked in the engine's log, and a process that has exited
+  without being reaped counts as gone. On a host the pool created, the pool asks
   for that restart once every model the host was bought for is on disk (§4).
 - With the router, each model is given **its weights plus a cache reserve** of the card the driver
   reports, the rest spread by weight; a set that needs more than nine tenths of the card is
