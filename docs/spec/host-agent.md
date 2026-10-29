@@ -71,7 +71,8 @@ whole preparation in, and folding them into one number would hide it (D97):
   resumes, never a finished model.
 - A model on disk and not yet served is reported **`awaiting_restart`** — not a failed hold.
 - The engine is started by **`gpm-agent vllm-start`**, run by the machine's own restart script
-  (never over the protocol): one vLLM process on the engine port, or, with the router, one per
+  (never over the protocol) — or, on a machine whose agent installs vLLM, by the agent itself
+  (§2.3, D159): one vLLM process on the engine port, or, with the router, one per
   model on the ports above it with the card's memory split by weight size (floored at a tenth,
   so a small model can still start) and the router on the engine port. It stops what it started
   last time first, so starting again is a restart. **The models on one card start one after
@@ -244,8 +245,9 @@ The pool names a model, in a header. It never names a port, a path or a command.
 
 On a machine its owner gives it — `install_engines: true` in the agent's own settings, which
 `gpm-agent init --install-engines` writes and the pool cannot change — the agent installs the
-engine it manages, runs it, and keeps it at the version the pool asks for. Hosts the pool rents
-are unchanged: their engine comes with the image.
+engine it manages (Ollama, whisper.cpp, and on Linux with an NVIDIA card vLLM), runs it, and keeps
+it at the version the pool asks for. Hosts the pool rents are unchanged: their engine comes with
+the image.
 
 **It runs the engine itself**, as it runs whisper.cpp's server (D148): `ollama serve` on
 loopback at the engine URL's port, with the models directory and the pool's numbers (workers,
@@ -285,6 +287,7 @@ a build or a check — open no console window: at logon it runs under `pythonw.e
 |---|---|---|---|
 | Ollama | `ollama-darwin.tgz`, signed by team `3MU9H2V9Y9` | `ollama-linux-<arch>.tar.zst`, with `-rocm` on AMD | `ollama-windows-<arch>.zip`, with `-rocm` on AMD |
 | whisper.cpp | Built from the tag's source: static, Metal | Built from the tag's source: static, CUDA where `nvcc` is, else CPU | The release's archive: CUDA 12.4 or 11.8 by the driver, else BLAS |
+| vLLM (D157, D158) | — (Ollama under `auto`) | PyPI's wheels from the version's locked set, NVIDIA cards of compute capability 7.5 or higher | — (Ollama under `auto`) |
 | ffmpeg | Homebrew, at `init` | apt or dnf, at `init` | winget, at `init` |
 
 Every file is checked against its release's published digest; on macOS, every Mach-O program
@@ -341,6 +344,30 @@ prerequisites`, before anything is fetched. Switching whisper.cpp keeps the mode
 serving and starts the new program with it, with the same arguments and uploads directory
 (§2.1), emptied as the server stops and before it starts; with no file held yet, the check is
 `--help`.
+
+**vLLM** (Linux with an NVIDIA card, D157–D159) is a private Python environment per version,
+made with the agent's own interpreter (Python 3.11–3.14) under `<engines>/vllm/<port>/<version>/`,
+filled only from that version's **locked set**: a list GPM's release generates and the agent
+carries — every wheel, `vllm`'s and each dependency's, `torch` and CUDA's libraries among them,
+with its sha256, for each supported Python minor version and processor, and the least NVIDIA
+driver the set's CUDA needs. It is installed with `pip install --require-hashes --only-binary
+:all: --no-deps` from PyPI, so no source distribution is built and no file differs from the one
+recorded; `latest` is the newest vLLM the agent has a set for. A version is kept only if its
+`vllm` runs, and imports the audio extra where the host holds a speech model (§2.1, D146). The
+free-disk floor counts a version as its set's size unpacked. It is refused, saying why, on
+anything but Linux on x86_64 or aarch64 with an NVIDIA card of compute capability 7.5 or higher
+and the set's driver. **The agent runs it** (D159): `gpm-agent vllm-start` with `--vllm` naming
+that version's program — accepted only inside the agent's engines directory — once every model the
+host holds is on disk (§2.1's fetch), again whenever that set changes, and stopped to switch
+versions. It runs, holding its share of the card, for as long as the machine is in the pool;
+taking the machine out of service gives the card back.
+
+**An engine of `auto`** (D161) is chosen by the agent each time it starts: vLLM where vLLM can run
+every model the host holds — Linux, an NVIDIA card of compute capability 7.5 or higher, the locked
+set's driver, each model's vLLM build within the card's generation (the floor its precision has in
+the pool's build table, D100) and the whole set within the card's memory (§2.1's plan, D104) —
+and Ollama anywhere else. The facts say which, and each reason against vLLM, under
+`engine.choice`; the pool takes the host's engine from them.
 
 The **first** version is started as soon as it is staged — nothing runs to drain. A version that
 fails to start is switched away from at once and not staged again by `latest` until a newer one is
@@ -407,7 +434,8 @@ every signed-in user change what is in it, and so what the agent runs as its own
 ## 3. What it reports — facts
 
 Read-only, cheap, no privileges: operating system and architecture; accelerators (kind, name,
-memory each); total and available system memory; free disk where the engine keeps models;
+memory each, and for an NVIDIA card its compute capability and the driver's version);
+total and available system memory; free disk where the engine keeps models;
 engine name, version and whether it answers; models on disk with sizes; models loaded.
 
 From facts the pool **derives the host's capabilities** (`apple-silicon`, `cuda`, …) instead of

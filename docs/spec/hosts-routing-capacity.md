@@ -509,6 +509,14 @@ pinned version, which the agent installs and the supervisor switches to when the
 and drained ([supervisor.md](supervisor.md) §3.1). Ignored, and said so in plan, for a host whose
 agent's owner has not allowed installs.
 
+Such a host may also name **`engine: auto`** (D161): its agent runs vLLM where vLLM can run every
+model the host holds — Linux, an NVIDIA card of compute capability 7.5 or higher with the driver
+vLLM's locked set needs, each model's vLLM build within the card's generation, the whole set within
+the card's memory — and Ollama anywhere else, and the pool routes to it as the engine it chose
+([supervisor.md](supervisor.md) §3.2). Each model an `auto` host holds needs a build for both
+engines in the catalog, or the configuration is refused naming the model; `auto` on a host whose
+agent does not install engines is refused too, since nothing on the machine could act on it.
+
 A **whisper.cpp host** holds the one build it declares, has one worker, and is reached on loopback
 or through a tunnel; it must carry an agent that manages its models, which fetches the build and
 runs the server (D148), and its residency is `pinned` — the server cannot load a build on first

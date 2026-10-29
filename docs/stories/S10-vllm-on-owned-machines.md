@@ -1,6 +1,6 @@
 # S10 — vLLM on the machines the operator owns
 
-> Status: **planned** (2026-10-29) — the owner's answers recorded; decisions and build next. Part of the [feature list](README.md).
+> Status: **decided** (2026-10-29) — D157–D161, specified; the build next. Part of the [feature list](README.md).
 > Extends S9, which installs, runs and upgrades Ollama and whisper.cpp on the operator's own
 > machines, to vLLM on a Linux machine with an NVIDIA card.
 
@@ -43,7 +43,12 @@ an application sees none of it.
   its own package index (`wheels.vllm.ai`), not on PyPI. Such a machine falls back to Ollama
   (answer 5), whose AMD build the agent already installs.
 
-## Design (proposed — nothing here is decided)
+## Design
+
+Decided in D157–D161 and specified in [host-agent.md](../spec/host-agent.md) §2.1 and §2.3,
+[supervisor.md](../spec/supervisor.md) §3.2, [hosts-routing-capacity.md](../spec/hosts-routing-capacity.md)
+§4 and the threat model (T35). In short:
+
 
 1. **The pool starts a configured vLLM host once its models are on disk.** This is the missing
    step, for a vLLM the owner installed. When every model the host is told to hold is on disk
@@ -117,14 +122,15 @@ an application sees none of it.
 
 ## Build stages
 
-1. **Decisions and specification**: the owner's answers as D157 onward; host-agent §2.3 and §7,
-   supervisor §3.1, configuration and the threat model.
+1. **Decisions and specification** — done 2026-10-29: D157–D161; host-agent §2.1, §2.3 and §3,
+   supervisor §3.2, configuration (`engine: auto`), threat model T35.
 2. **The agent installs and runs vLLM, and the pool starts a configured vLLM host** (design 1),
    in one build, against fakes:
    - the pool's start once the models are on disk, with a test driving the real supervisor and
      agent against a fake vLLM;
    - the PyPI source and versions side by side;
-   - the dependency set;
+   - the dependency set, and the tool GPM's release runs to generate one per vLLM version (with
+     a step in the release checklist);
    - the checks;
    - the launcher's `--vllm`;
    - starting and restarting;

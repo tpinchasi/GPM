@@ -159,6 +159,23 @@ mid-upgrade leaves the version that runs unchecked, and the host is then judged 
 ready when it holds its model set — with *Roll back* from the console. Every step is an event:
 staged, draining, switching, switched, upgraded, rolling back, rolled back, put off, abandoned.
 
+### 3.2 Engines on configured hosts: starting once on disk, and `auto` (S10, D160, D161)
+
+**Starting an engine its owner installed** (D160). For a configured host whose agent has a restart
+command — a vLLM its owner installed, started by the owner's script running `gpm-agent
+vllm-start` — the pass asks the agent to restart the engine once every model the host holds is on
+disk and waiting for a start (`awaiting_restart` in its facts): once per set on disk, and again only
+after the retry interval, exactly as for a host it rents (§8, D97). A host whose agent runs the
+engine itself (D150, D159) is never asked: its agent starts it.
+
+**An engine of `auto`** (D161). The host's engine is the one its agent chose and reports under
+`engine.choice`; until the agent has said, the host is `preparing` (*choosing its engine*) and
+holds nothing. The pass publishes the chosen engine in the host table (D93), so the router sends
+the host only that engine's paths and builds, and the Hosts screen shows the choice with its
+reasons. A choice that changes — the agent started again on a machine with another card — is
+carried out as an upgrade is (§3.1): the host taken out of routing when quiet, drained, the agent
+asked to switch, the host held to its model set again on the new engine.
+
 ## 4. Cost controls
 
 Ordered by value — idle time, not the hourly rate, dominates cost.
