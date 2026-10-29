@@ -1,6 +1,7 @@
 # S10 — vLLM on the machines the operator owns
 
-> Status: **decided** (2026-10-29) — D157–D161, specified; the build next. Part of the [feature list](README.md).
+> Status: **built against fakes** (2026-10-30) — D157–D161; gpm-server 0.37.0, gpm-agent 0.15.0; the live
+> check on a Linux NVIDIA machine next, asked first. Part of the [feature list](README.md).
 > Extends S9, which installs, runs and upgrades Ollama and whisper.cpp on the operator's own
 > machines, to vLLM on a Linux machine with an NVIDIA card.
 
@@ -128,7 +129,7 @@ Decided in D157–D161 and specified in [host-agent.md](../spec/host-agent.md) �
 1. **Decisions and specification** — done 2026-10-29: D157–D161; host-agent §2.1, §2.3 and §3,
    supervisor §3.2, configuration (`engine: auto`), threat model T35.
 2. **The agent installs and runs vLLM, and the pool starts a configured vLLM host** (design 1),
-   in one build, against fakes:
+   in one build, against fakes — built 2026-10-30:
    - the pool's start once the models are on disk, with a test driving the real supervisor and
      agent against a fake vLLM;
    - the PyPI source and versions side by side;
@@ -140,7 +141,9 @@ Decided in D157–D161 and specified in [host-agent.md](../spec/host-agent.md) �
    - the prerequisites;
    - the driver in the facts.
 3. **The pool**: `engine_version` and the upgrade pass for vLLM hosts (mostly S9's), and the
-   console.
+   console. — Built 2026-10-30 with stage 2: the upgrade pass and the console's versions were
+   already engine-agnostic; added the `auto` choice on the Hosts screen, `engine_version: latest`
+   only under `auto`, and an `auto` host whose agent does not install engines said so.
 4. **Live, asked first**: on a Linux machine with an NVIDIA card, owned or rented for the check
    as a bare Ubuntu machine treated as the operator's own (about $0.50). vLLM installed by the
    agent; one chat model and Whisper served, a picture answered, then an upgrade and a
