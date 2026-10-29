@@ -370,6 +370,18 @@ async def test_an_eviction_inside_a_lease_is_recovered_unattended(fleet):
     assert not fleet.hosts or next(iter(fleet.hosts.values())).state != "stopped"
 
 
+async def test_an_eviction_keeps_what_the_provider_said_about_the_machine(fleet):
+    open_lease(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    host = next(iter(fleet.hosts.values()))
+
+    fleet.provider.evict(host.instance.instance_id, said="actual loading, intended stopped, next_state stopped")
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+
+    (eviction,) = [e for e in fleet.events.recent(50) if e["kind"] == "eviction"]
+    assert eviction["numbers"]["provider_said"] == "actual loading, intended stopped, next_state stopped"
+
+
 async def test_winning_a_host_back_after_an_eviction_respects_the_pools_burn_cap(fleet):
     """A re-bid is new spending: the pool's hourly cap is checked with the host at its new price."""
     open_lease(fleet)
@@ -569,6 +581,22 @@ async def test_an_on_demand_host_that_stops_is_not_treated_as_outbid(fleet):
     assert host.released
     kinds_seen = kinds(fleet)
     assert "host_stopped" in kinds_seen and "eviction" not in kinds_seen
+
+
+async def test_a_host_lost_as_stopped_keeps_what_the_provider_said_about_it(fleet):
+    """The machine is destroyed straight after; the event is all that is left of why."""
+    fleet.rented.mode = "on_demand"
+    fleet.provider.offers = [on_demand_offer()]
+    open_lease(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    (host,) = fleet.hosts.values()
+
+    fleet.provider.evict(host.instance.instance_id, said="actual exited, intended running: no space left on device")
+    await fleet.handle_evictions()
+
+    (stopped,) = [e for e in fleet.events.recent(50) if e["kind"] == "host_stopped"]
+    assert stopped["numbers"]["provider_said"] == "actual exited, intended running: no space left on device"
+    assert "no space left on device" in stopped["summary"]
 
 
 async def test_which_listings_are_searched_follows_the_mode(fleet):
@@ -1156,3 +1184,24 @@ async def test_the_provider_is_asked_to_filter_only_what_the_pool_would_also_rej
     assert "card memory ≥ 24 GB" in describe_query(query)
     broad = fleet.query_for(None, True, False)
     assert broad.min_gpu_memory_gb == 0 and broad.max_all_in_hourly is None, "finding a held machine asks broadly"
+
+
+def test_a_providers_words_are_kept_as_one_bounded_printable_line():
+    """The message may come from the machine's own operator (T7): a line break in it would forge
+    a log line, an escape sequence would reach the terminal reading the log."""
+    from gpm_server.providers.base import InstanceStatus
+    from gpm_server.supervisor.renting import PROVIDER_WORDS_MAX, provider_words
+
+    forged = "exited\n2026-10-29 20:00:00 gpm.renting INFO all is well\x1b[2J"
+    words = provider_words(InstanceStatus(state="stopped", reported=forged))
+    assert "\n" not in words and "\x1b" not in words
+    assert words.startswith("exited 2026-10-29 20:00:00 gpm.renting INFO all is well")
+    assert len(provider_words(InstanceStatus(state="stopped", reported="x" * 5000))) == PROVIDER_WORDS_MAX
+
+
+def test_a_provider_without_its_own_words_is_heard_through_its_detail():
+    from gpm_server.providers.base import InstanceStatus
+    from gpm_server.supervisor.renting import provider_words
+
+    assert provider_words(InstanceStatus(state="stopped", detail="status EXITED")) == "status EXITED"
+    assert provider_words(InstanceStatus(state="stopped")) is None

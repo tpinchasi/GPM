@@ -183,6 +183,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     vllm_launch.add_arguments(start)
     start.set_defaults(run=vllm_launch.main)
+    # Started by `vllm-start` alone, which hands it the plan on its input (D155).
+    in_turn = verbs.add_parser(
+        "vllm-in-turn", help="(started by vllm-start) start a card's further models one after another"
+    )
+    in_turn.add_argument("--models-dir", required=True)
+    in_turn.set_defaults(run=vllm_launch.main_in_turn)
 
     args = parser.parse_args(argv)
     try:

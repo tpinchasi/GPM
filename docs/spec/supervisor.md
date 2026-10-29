@@ -322,6 +322,12 @@ running, and a stop that outlasts it means the re-bid did not win: the host is r
 D109). Without this the machine's floor —
 the pool's own bid, once it is the top bidder — plus the premium was bid again every pass.
 
+An `eviction`, a `rebid_lost`, and a `host_stopped` for a host rented on demand (which nobody
+outbids) each keep **what the provider said** about the instance (`provider_said`: its
+`reported` state, else its `detail` — plugin-interfaces.md), as one printable line of at most
+300 characters, and the supervisor's log too. The machine is destroyed straight after; that
+line is the only account of why it was lost.
+
 *(Also post-v1: sampling each rented machine's floor every pass, proactive re-bid before being
 outbid, re-bidding downward once it is verified the provider charges the bid rather than a
 clearing price, and a thrash guard per machine and per hardware class.)*

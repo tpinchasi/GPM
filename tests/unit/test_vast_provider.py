@@ -297,6 +297,26 @@ async def test_outbid_while_its_image_is_still_loading_reads_as_stopped():
     assert status.state == InstanceState.STOPPED
 
 
+async def test_the_status_carries_the_providers_own_words_for_the_record():
+    """Found live: four machines dropped in an evening, and nothing kept said what the provider
+    had reported for any of them."""
+    payload = {"instances": {
+        "actual_status": "exited", "intended_status": "running", "cur_state": "stopped",
+        "status_msg": "Error response from daemon: failed to create task",
+    }}
+    status = await provider(lambda r: httpx.Response(200, json=payload)).status(Instance("1"))
+    assert status.reported == (
+        "actual exited, intended running, cur_state stopped: Error response from daemon: failed to create task"
+    )
+
+
+async def test_the_providers_words_never_carry_a_line_break_or_an_escape():
+    payload = {"instances": {"actual_status": "exited", "intended_status": "running",
+                             "status_msg": "pulling\nfake log line\x1b[31m red"}}
+    status = await provider(lambda r: httpx.Response(200, json=payload)).status(Instance("1"))
+    assert status.reported == "actual exited, intended running: pulling fake log line [31m red"
+
+
 async def test_a_machines_own_price_is_asked_of_the_machine_rentable_or_not():
     """A machine the pool was just outbid on is held by whoever outbid it, so the ordinary
     search, which asks for rentable machines only, cannot see it (D109)."""

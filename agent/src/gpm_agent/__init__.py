@@ -9,4 +9,4 @@ of verbs — there is no "run this".
 PROTOCOL_VERSION = "1"
 #: The package's own version, reported in the facts — kept equal to `pyproject.toml`'s by a test,
 #: as the agent also runs from a zipapp on rented hosts, where no package metadata is installed.
-__version__ = "0.13.0"
+__version__ = "0.14.0"

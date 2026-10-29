@@ -24,6 +24,8 @@ Both of the owner's placements are driven: a model to a host, and every model on
 behind the router.
 """
 
+import io
+import json
 import time
 from pathlib import Path
 
@@ -148,14 +150,26 @@ class Machines:
                         return type("Process", (), {"pid": 2**22 + 7})()  # no such process
                     names.append(name_started)
                     machines.commands.append((argv, (kwargs.get("env") or {}).get("CUDA_VISIBLE_DEVICES")))
-                return type("Process", (), {"pid": None})()
+                process = type("Process", (), {"pid": None})()
+                if "vllm-in-turn" in argv:
+                    process.stdin = handed = io.BytesIO()
+                    handed.close = lambda: None  # read back below, as the helper would
+                    helpers.append(handed)
+                return process
 
+            helpers: list[io.BytesIO] = []
+            env = engine_control.read_applied(control.settings.engine_env_file) or {}
             vllm_launch.launch(
-                disk, 8000, proxy=proxy, popen=popen, alive=lambda pid: False,
-                env=engine_control.read_applied(control.settings.engine_env_file) or {},
+                disk, 8000, proxy=proxy, popen=popen, alive=lambda pid: False, env=env,
                 agent="/var/run/gpm/gpm-agent.pyz", probe_card=lambda: None,
                 probe_devices=lambda env: list(machines.devices),
             )
+            # The rest of each card's models, started in turn (D155) by the helper the launcher
+            # started — here at once, as if each answered the moment it was asked.
+            for handed in helpers:
+                vllm_launch.run_in_turn(disk, json.loads(handed.getvalue()), env=env, popen=popen,
+                                        ready=lambda port: True, alive=lambda pid: False,
+                                        sleep=lambda s: None, say=lambda line: None)
             # One port in front of whatever was started — the router's job when there are several.
             engine.start(names)
             machines.launches.append((name, on_disk, names, proxy))

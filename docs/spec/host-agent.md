@@ -74,15 +74,25 @@ whole preparation in, and folding them into one number would hide it (D97):
   (never over the protocol): one vLLM process on the engine port, or, with the router, one per
   model on the ports above it with the card's memory split by weight size (floored at a tenth,
   so a small model can still start) and the router on the engine port. It stops what it started
-  last time first, so starting again is a restart. On a host the pool created, the pool asks
+  last time first, so starting again is a restart. **The models on one card start one after
+  another** (D155): the launcher starts the first on each card and hands the rest, on its
+  standard input, to `gpm-agent vllm-in-turn`, which starts each once the one before answers
+  `/health` or has exited — vLLM sizes its cache from the card's free memory measured across its
+  own start, so a neighbour loading meanwhile would be counted as its own use. Separate cards
+  start together. A model waiting its turn is not a failure while that helper runs; a restart
+  stops the helper first, and the helper drops its own number from the record once it has
+  started everything. Each start is marked in the engine's log, and a process that has exited
+  without being reaped counts as gone. On a host the pool created, the pool asks
   for that restart once every model the host was bought for is on disk (§4).
 - With the router, each model is given **its weights plus a cache reserve** of the card the driver
   reports, the rest spread by weight; a set that needs more than nine tenths of the card is
   **refused before anything starts**, and the refusal is reported for every model (D104). What
   was started is recorded beside the models directory, never in it (`<models>.gpm-state/`, with the
   process ids, logs and the router's map — D139); a process that has exited without ever
-  serving its model is reported as that model's error, with the last error line of its log, and
-  the pool gives the host up saying so — never as "still preparing".
+  serving its model is reported as that model's error, with the exception in its log that is
+  the reason — never vLLM's closing `Engine core initialization failed. See root cause above.`,
+  which only points at it — and the pool gives the host up saying so, never as "still
+  preparing".
 - It takes **named options** (`--option tool_calling`, `--option reasoning`, D100) from a closed
   list its command line enforces, and turns each into vLLM's flags per model, by the family in
   that model's own `config.json` — `gemma4` gets the `gemma4` parsers, `qwen3` the `hermes` tool

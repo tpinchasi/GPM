@@ -43,10 +43,13 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
+import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
 
 # Written by the hub fetch when every file of a model has landed. A directory without it is a
 # download in progress, and serving half a model is worse than serving none.
@@ -90,10 +93,14 @@ CACHE_RESERVE_BYTES = 3 * 1024**3
 # module: the agent never imports this launcher, which starts what the machine's start-up asks
 # (D63). The programs the agent starts itself are whisper.cpp's server (D148) and, where the
 # machine's owner lets it install engines, Ollama's (D150) — each with fixed arguments.
+from . import platform as host_platform  # noqa: E402
 from .vllm_state import (  # noqa: E402,F401
+    IN_TURN_VERB,
+    RUN_MARKER,
     STARTED_FILE,
     capped_lengths,
     failed_engines,
+    in_turn_helper,
     last_error_line,
     read_record,
     state_dir_for,
@@ -215,11 +222,14 @@ class Started:
     refused: Optional[str] = None
     #: Each model's share of the card and what it was sized for, for the record.
     plan: dict[str, Any] = field(default_factory=dict)
+    #: What starts the rest of a card's models, one after another (D155) — when there are any.
+    in_turn: Optional[dict[str, Any]] = None
 
     def pids(self) -> list[int]:
         found = [e["pid"] for e in self.engines if e.get("pid")]
-        if self.proxy and self.proxy.get("pid"):
-            found.append(self.proxy["pid"])
+        for helper in (self.proxy, self.in_turn):
+            if helper and helper.get("pid"):
+                found.append(helper["pid"])
         return found
 
 
@@ -584,6 +594,12 @@ def stop_previous(models_dir: Path, *, kill: Callable[[int, int], None] = os.kil
     stopped too — but only processes that are an engine or the router by their own command line,
     since that file may equally have come from another machine with the models (D139)."""
     pids_file = state_dir_for(models_dir) / PIDS_FILE
+    # What starts a card's models in turn goes first, and is waited for: until it has gone it
+    # may start one more, after the list below was read — an engine nothing would then stop.
+    record = read_record(Path(models_dir)) or {}
+    turns = (record.get("in_turn") or {}).get("pid")
+    stopped = (_stop([turns], kill=kill, alive=alive, grace_s=grace_s)
+               if isinstance(turns, int) and in_turn_helper(turns, cmdline) else [])
     try:
         pids = [int(p) for p in json.loads(pids_file.read_text())]
     except (OSError, ValueError, TypeError):
@@ -593,17 +609,28 @@ def stop_previous(models_dir: Path, *, kill: Callable[[int, int], None] = os.kil
     except (OSError, ValueError, TypeError):
         older = []
     pids += [p for p in older if p not in pids and _ours(p, cmdline)]
-    if not pids:
-        return []
+    # The helper's number is in the list too, and was dealt with above — or is no longer its.
+    stopped += _stop([p for p in pids if p not in stopped and p != turns], kill=kill, alive=alive, grace_s=grace_s)
+    pids_file.unlink(missing_ok=True)
+    return stopped
 
+
+def _alive_by_signal(pid: int, kill: Callable[[int, int], None] = os.kill) -> bool:
+    try:
+        kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _stop(pids: Sequence[int], *, kill: Callable[[int, int], None], alive: Optional[Callable[[int], bool]],
+          grace_s: float) -> list[int]:
+    """Ask each process to end, give them `grace_s` together, then end those still there."""
     def is_alive(pid: int) -> bool:
         if alive is not None:
             return alive(pid)
-        try:
-            kill(pid, 0)
-            return True
-        except OSError:
-            return False
+        # The system's own answer, which knows an exited process nobody reaped is not running.
+        return host_platform.alive(pid) if kill is os.kill else _alive_by_signal(pid, kill)
 
     stopped = []
     for pid in pids:
@@ -623,7 +650,6 @@ def stop_previous(models_dir: Path, *, kill: Callable[[int, int], None] = os.kil
                 kill(pid, signal.SIGKILL)
             except OSError:
                 pass
-    pids_file.unlink(missing_ok=True)
     return stopped
 
 
@@ -736,16 +762,33 @@ def launch(
                 *number_flags(env, copies, own),
                 *extra,
             ]
-            process_env = env if device is None else {**env, "CUDA_VISIBLE_DEVICES": device}
             log_path = logs / (f"{directory.name}.log" if device is None
                                else f"{directory.name}.card{device.replace(',', '-')}.log")
-            out = open(log_path, "ab")
-            process = popen(argv, stdout=out, stderr=subprocess.STDOUT, env=process_env,
-                            start_new_session=True)
             started.engines.append({"model": name, "port": engine_port, "memory_share": share,
-                                    "card": device, "pid": getattr(process, "pid", None),
-                                    "argv": argv, "log": str(log_path)})
+                                    "card": device, "pid": None, "argv": argv, "log": str(log_path)})
             upstreams.setdefault(name, []).append(f"http://127.0.0.1:{engine_port}")
+
+    # The models on one card start one after another, each once the one before it answers or
+    # has exited (D155). vLLM sizes its cache from the card's free memory measured across its own
+    # start, assuming nothing else on the card changes meanwhile, so a neighbour loading at the
+    # same moment is counted as its own use. Seen live: Whisper beside Gemma 4 E4B on one card
+    # ended with "Engine core initialization failed" — which this explains; the lines that would
+    # have said for certain were lost with the machine. Separate cards still start together.
+    turns: dict[Optional[str], list[dict[str, Any]]] = {}
+    for engine in started.engines:
+        turns.setdefault(engine["card"], []).append(engine)
+    for queue in turns.values():
+        start_engine(queue[0], env, popen)
+        for later in queue[1:]:
+            later["waiting"] = True
+    waiting = [queue for queue in turns.values() if len(queue) > 1]
+    helper = None
+    if waiting:
+        argv = [python, agent or sys.argv[0], "vllm-in-turn", "--models-dir", str(models_dir)]
+        out = open(logs / "in-turn.log", "ab")
+        helper = popen(argv, stdin=subprocess.PIPE, stdout=out, stderr=subprocess.STDOUT, env=env,
+                       start_new_session=True)
+        started.in_turn = {"pid": getattr(helper, "pid", None), "argv": argv}
 
     if router:
         map_file = state / UPSTREAMS_FILE
@@ -760,7 +803,198 @@ def launch(
 
     (state / PIDS_FILE).write_text(json.dumps(started.pids()))
     _record(models_dir, started)
+    if helper is not None:
+        # Handed over only now that the record it updates is written; through its standard
+        # input, so no list of commands is ever left on disk for something else to edit.
+        turns_plan = [[{k: e.get(k) for k in ("model", "port", "card", "pid", "argv", "log")} for e in queue]
+                      for queue in waiting]
+        try:
+            helper.stdin.write(json.dumps(turns_plan).encode())
+            helper.stdin.close()
+        except OSError as exc:
+            # Gone before it read its plan: the models waiting for it are reported as never
+            # started, from the record, and the pool gives the host up saying so.
+            log.warning("what starts the rest of each card's models did not take its plan (%s)", exc)
     return started
+
+
+def start_engine(engine: dict[str, Any], env: Mapping[str, str], popen: Callable[..., Any]) -> Any:
+    """Start one planned engine — on its own card, if it has one — and note its process. Its log
+    is kept across starts, so each start is marked in it first: the reason a start failed is read
+    from after its own mark."""
+    card = engine.get("card")
+    process_env = dict(env) if card is None else {**env, "CUDA_VISIBLE_DEVICES": card}
+    with open(engine["log"], "ab") as out:  # the process keeps its own copy
+        out.write(f"\n{RUN_MARKER} {time.strftime('%Y-%m-%d %H:%M:%S')}\n".encode())
+        out.flush()
+        process = popen(engine["argv"], stdout=out, stderr=subprocess.STDOUT, env=process_env,
+                        start_new_session=True)
+    engine["pid"] = getattr(process, "pid", None)
+    engine.pop("waiting", None)
+    return process
+
+
+# --- the rest of a card's models, one after another (D155) ---
+
+
+def engine_answers(port: int, timeout_s: float = 2.0) -> bool:
+    """Does the engine on this loopback port say it is up? vLLM's `/health` answers 200 once its
+    model is loaded and its cache allocated — when its use of the card has stopped growing."""
+    # Never through a proxy the machine's environment names: this is the engine beside it.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(f"http://127.0.0.1:{int(port)}/health", timeout=timeout_s) as answer:
+            return answer.status == 200
+    except (OSError, ValueError):
+        return False
+
+
+def _is_vllm_serve(argv: Any) -> bool:
+    """Only what the launcher plans is started here: `vllm serve …`, as an argument list."""
+    return (isinstance(argv, list) and len(argv) >= 3 and all(isinstance(a, str) for a in argv)
+            and Path(argv[0]).name == "vllm" and argv[1] == "serve")
+
+
+@contextmanager
+def _not_interrupted() -> Iterator[None]:
+    """Hold off a stop while a process is started and written down, so that one stopping this
+    helper never leaves an engine running that no list names; the stop is acted on after.
+
+    By a handler that only notes it, never by blocking the signal: a blocked signal stays blocked
+    in every process started meanwhile, through `exec` — found in review, an engine started so
+    ignored the next restart's request to stop, and its engine process kept the card. A caught
+    signal goes back to its default in a program that is started."""
+    if threading.current_thread() is not threading.main_thread():
+        yield  # only the main thread may set a handler; the helper runs on its own
+        return
+    asked: list[int] = []
+    before = signal.signal(signal.SIGTERM, lambda signum, frame: asked.append(signum))
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, before)
+        if asked:
+            os.kill(os.getpid(), signal.SIGTERM)
+
+
+def _write_json(path: Path, value: Any) -> None:
+    draft = path.with_suffix(path.suffix + ".new")
+    draft.write_text(json.dumps(value, indent=2))
+    draft.replace(path)
+
+
+def _note_started(models_dir: Path, engine: dict[str, Any]) -> None:
+    """Add a process started in turn to the record the agent reads and to the list the next
+    start stops."""
+    state = state_dir_for(models_dir)
+    record = read_record(models_dir)
+    if record is None:
+        # Never written over with less than it held: the process is still listed below, to stop.
+        log.warning("the launcher's record could not be read; %s is listed to stop, not recorded", engine["model"])
+    else:
+        for planned in record.get("engines") or []:
+            if (planned.get("model"), planned.get("card"), planned.get("port")) == (
+                    engine["model"], engine.get("card"), engine["port"]):
+                planned["pid"] = engine["pid"]
+                planned.pop("waiting", None)
+        _write_json(state / STARTED_FILE, record)
+    try:
+        pids = [int(p) for p in json.loads((state / PIDS_FILE).read_text())]
+    except (OSError, ValueError, TypeError):
+        pids = []
+    if engine["pid"] is not None and engine["pid"] not in pids:
+        pids.append(engine["pid"])
+    _write_json(state / PIDS_FILE, pids)
+
+
+def run_in_turn(
+    models_dir: str | Path,
+    turns: Sequence[Sequence[dict[str, Any]]],
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    popen: Callable[..., Any] = subprocess.Popen,
+    ready: Callable[[int], bool] = engine_answers,
+    alive: Optional[Callable[[int], bool]] = None,
+    sleep: Callable[[float], None] = time.sleep,
+    poll_s: float = 2.0,
+    say: Callable[[str], None] = lambda line: print(line, flush=True),
+    own_pid: Optional[int] = None,
+) -> None:
+    """Start each card's waiting models, each once the one before it answers or has exited.
+
+    `turns` is the launcher's plan, a list per card whose first engine it started itself. One
+    that exits rather than answering does not hold the rest back: its failure is reported from
+    its own log, and the models after it may still serve. Nothing here waits on a clock — a
+    large model loads for as long as it takes, and the pool decides when a host has taken too
+    long. Once every model is started it takes its own number (`own_pid`) out of the record and
+    the list the next start stops: that number will soon be some other process's."""
+    models_dir = Path(models_dir).expanduser()
+    env = dict(os.environ if env is None else env)
+    queues = [[dict(e) for e in queue] for queue in turns if queue]
+    for queue in queues:
+        for engine in queue:
+            if not _is_vllm_serve(engine.get("argv")):
+                raise ValueError("vllm-in-turn starts only the launcher's own `vllm serve` processes")
+
+    # The engines started here are this process's children: one that has exited is known by its
+    # process object, which also reaps it. Found in review: left unreaped, an engine that died at
+    # start still answered a signal, read as loading for ever, and the model after it never
+    # started. The engines the launcher started are asked of the system, which knows the same.
+    children: dict[int, Any] = {}
+
+    def is_alive(pid: int) -> bool:
+        child = children.get(pid)
+        if child is not None and callable(getattr(child, "poll", None)):
+            return child.poll() is None
+        return alive(pid) if alive is not None else host_platform.alive(pid)
+
+    at = [0] * len(queues)
+    while any(at[i] < len(queue) - 1 for i, queue in enumerate(queues)):
+        moved = False
+        for i, queue in enumerate(queues):
+            if at[i] >= len(queue) - 1:
+                continue
+            current = queue[at[i]]
+            pid = current.get("pid")
+            if isinstance(pid, int) and is_alive(pid) and not ready(current["port"]):
+                continue  # still loading
+            following = queue[at[i] + 1]
+            with _not_interrupted():
+                process = start_engine(following, env, popen)
+                if isinstance(following.get("pid"), int):
+                    children[following["pid"]] = process
+                _note_started(models_dir, following)
+            after = "answered" if isinstance(pid, int) and is_alive(pid) else "exited"
+            say(f"started {following['model']} on {following['port']}, once {current['model']} {after}")
+            at[i] += 1
+            moved = True
+        if not moved:
+            sleep(poll_s)
+    if own_pid is not None:
+        _note_finished(models_dir, own_pid)
+
+
+def _note_finished(models_dir: Path, own_pid: int) -> None:
+    """Every model started: this helper is no longer anything to stop or wait for."""
+    state = state_dir_for(models_dir)
+    with _not_interrupted():
+        record = read_record(models_dir)
+        if record is not None and (record.get("in_turn") or {}).get("pid") == own_pid:
+            record["in_turn"] = None
+            _write_json(state / STARTED_FILE, record)
+        try:
+            pids = [int(p) for p in json.loads((state / PIDS_FILE).read_text())]
+        except (OSError, ValueError, TypeError):
+            return
+        if own_pid in pids:
+            _write_json(state / PIDS_FILE, [p for p in pids if p != own_pid])
+
+
+def main_in_turn(args: Any) -> int:
+    """`gpm-agent vllm-in-turn`: started by the launcher, which hands it the plan on its input."""
+    turns = json.loads(sys.stdin.read() or "[]")
+    run_in_turn(args.models_dir, turns, own_pid=os.getpid())
+    return 0
 
 
 def _record(models_dir: Path, started: Started) -> None:
@@ -771,6 +1005,7 @@ def _record(models_dir: Path, started: Started) -> None:
         "plan": started.plan,
         "engines": [{k: v for k, v in e.items() if k != "argv"} for e in started.engines],
         "proxy": {k: v for k, v in started.proxy.items() if k != "argv"} if started.proxy else None,
+        "in_turn": {k: v for k, v in started.in_turn.items() if k != "argv"} if started.in_turn else None,
     }
     target = state_dir_for(models_dir) / STARTED_FILE
     draft = target.with_suffix(".new")
@@ -799,7 +1034,10 @@ def main(args: Any) -> int:
         return 0
     for engine in started.engines:
         on = f", card {engine['card']}" if engine.get("card") is not None else ""
-        print(f"started {engine['model']} on {engine['port']} (memory {engine['memory_share']}{on})")
+        verb = "to start in turn" if engine.get("waiting") else "started"
+        print(f"{verb} {engine['model']} on {engine['port']} (memory {engine['memory_share']}{on})")
+    if started.in_turn:
+        print("the rest of each card's models start one after another, each once the one before it answers")
     if started.proxy:
         print(f"started the router on {started.proxy['port']}")
     for name in started.skipped:

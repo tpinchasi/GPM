@@ -297,6 +297,10 @@ class InstanceStatus:
     #: The provider has warned that it is about to take the instance away (D132), where it can
     #: say (`interruption_notice`). None where it cannot.
     interrupting: Optional[bool] = None
+    #: The provider's own words for the instance's state, on one line, recorded whenever the pool
+    #: acts on it. Found live: four machines dropped in an evening as stopped or outbid, and
+    #: nothing kept said what the provider had reported for any of them.
+    reported: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)

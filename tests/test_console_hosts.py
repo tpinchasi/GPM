@@ -79,3 +79,29 @@ def test_the_laptop_is_taken_out_of_service_returned_and_another_host_removed(se
 
     assert set(hosts_in(path)) == {"laptop"}
     assert [h.id for h in supervisor.config.hosts] == ["laptop"]
+
+
+@pytest.mark.timeout(240)
+def test_a_host_gone_while_its_window_is_open_is_said_to_be_gone_not_an_older_supervisor(served):
+    """Found live: a rented host released while its window was open showed "A pool running an
+    older supervisor has no per-host view; restart it" — on a supervisor of the same version."""
+    supervisor, url, path = served
+    body = "document.getElementById('host-dialog-body').textContent"
+    with open_page(f"{url}/ui/#hosts") as page:
+        page.until("(document.getElementById('key-dialog') || {}).open === true", within=60, what="the page")
+        page.js(f"document.getElementById('key-input').value = {json.dumps(ADMIN_KEY)};"
+                "document.getElementById('key-form').requestSubmit(); true")
+        page.js(HELPERS)
+        page.until("!!__row('laptop')", within=30, what="the hosts table")
+
+        page.js("openHost('rented-released'); true")
+        page.until(f"{body}.includes('not in the pool')", within=30, what="the gone host's window")
+        said = page.js(body)
+        assert "rented-released is not in the pool's host table any more" in said
+        assert "older supervisor" not in said
+        page.js("closeHost(); true")
+
+        # A supervisor without the view answers 404 with no name for it: that one is older.
+        page.js("api.hostDetail = async () => { const e = new Error('Not Found'); e.status = 404; throw e; };"
+                "openHost('laptop'); true")
+        page.until(f"{body}.includes('older supervisor')", within=30, what="the older supervisor's hint")

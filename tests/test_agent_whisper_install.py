@@ -78,7 +78,7 @@ if args == ["--help"]:
 with open(starts_path, "a") as starts:
     starts.write(json.dumps({"version": version, "program": program, "args": args, "pid": os.getpid(),
                              "token": os.environ.get("GITHUB_TOKEN"),
-                             "env": {k: os.environ.get(k) for k in ("VAST_API_KEY", "SOME_SERVICE_TOKEN", "PATH")}}) + "\\n")
+                             "env": {k: os.environ.get(k) for k in ("CONTAINER_API_KEY", "SOME_SERVICE_TOKEN", "PATH")}}) + "\\n")
 print("whisper_init_from_file_with_params_no_state: loading model", flush=True)
 if control.get("exit"):
     print(control["exit"], flush=True)
@@ -639,7 +639,7 @@ async def test_a_built_program_that_does_not_run_is_not_kept(rig):
 
 
 async def test_no_credential_reaches_the_build_pip_the_checks_or_the_server(rig, monkeypatch):
-    monkeypatch.setenv("VAST_API_KEY", "not-a-real-key")
+    monkeypatch.setenv("CONTAINER_API_KEY", "not-a-real-key")
     monkeypatch.setenv("SOME_SERVICE_TOKEN", "not-a-real-token")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
     rig.which["cmake"] = None  # cmake from PyPI: pip runs too
@@ -650,10 +650,10 @@ async def test_no_credential_reaches_the_build_pip_the_checks_or_the_server(rig,
     assert any("venv" in name for name in ran) and any("pip" in name for name in ran)
     for argv, _, env in rig.commands.calls:
         assert env is not None, f"{argv} was given the agent's whole environment"
-        assert "VAST_API_KEY" not in env and "SOME_SERVICE_TOKEN" not in env, argv
+        assert "CONTAINER_API_KEY" not in env and "SOME_SERVICE_TOKEN" not in env, argv
         assert env["PATH"] == os.environ["PATH"] and env["CUDA_VISIBLE_DEVICES"] == "0", argv
     [start] = rig.starts()
-    assert start["env"]["VAST_API_KEY"] is None and start["env"]["SOME_SERVICE_TOKEN"] is None
+    assert start["env"]["CONTAINER_API_KEY"] is None and start["env"]["SOME_SERVICE_TOKEN"] is None
     assert start["env"]["PATH"] == os.environ["PATH"]
 
 
