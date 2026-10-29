@@ -488,6 +488,9 @@ screens.hosts = (status) => [
       // A pool may run a different engine on each machine (D93), and which models this one
       // holds is now a per-host fact too (D89).
       el("td", { class: "mono" }, host.engine || "—",
+        // Under `auto` its agent chose from the machine (D161): said, with why not vLLM.
+        host.engine_configured === "auto" ? el("div", { class: "muted", title: ((host.engine_choice || {}).reasons || []).join("\n") },
+          host.engine_choice ? `auto${(host.engine_choice.reasons || []).length ? ": not vLLM — " + host.engine_choice.reasons[0] : ""}` : "auto: its agent has not chosen yet") : null,
         (host.holds || []).length ? el("div", { class: "muted" }, `holds ${host.holds.join(", ")}`) : null),
       el("td", {}, host.transport),
       el("td", {}, pill(host.state), host.last_error ? el("div", { class: "muted" }, host.last_error) : null),

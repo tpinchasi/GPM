@@ -898,14 +898,14 @@ async def test_a_restart_command_that_fails_or_does_not_exist_is_reported_not_ra
 
 
 def test_the_pool_restarts_only_when_an_operator_says_so_with_the_host_named_twice(monkeypatch, tmp_path):
-    from gpm_server.supervisor import service
-
-    assert "restart_engine" not in pathlib.Path(service.__file__).read_text()  # never from the pass
-
+    # The pass restarts no engine that serves its set (D41); its one restart is of an engine that
+    # serves none of it yet, once its models are on disk (D160, tested in test_engine_auto.py).
     with pool_harness([EngineSpec(id="box", resident={MODEL}, workers=3)], model_set=[MODEL], host_overrides={"box": agent_block(monkeypatch)}) as pool:
         machine = restartable(tmp_path)
         pool.supervisor._agent_transport = machine.transport
         pool.reprobe()
+        pool.reprobe()
+        assert not machine.marker.exists(), "never from the pass"
         server = control(pool)
         try:
             with httpx.Client(base_url=server.base_url, headers={"Authorization": "Bearer gpmx_console"}, timeout=60) as http:

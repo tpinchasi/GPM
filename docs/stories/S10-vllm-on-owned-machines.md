@@ -98,8 +98,9 @@ Decided in D157â€“D161 and specified in [host-agent.md](../spec/host-agent.md) Â
      screen.
    - Each model an `auto` host holds needs a build for both engines, or the configuration is
      refused saying which.
-   - The choice is made again whenever the agent starts, so a new card is seen. Changing
-     engine on a running host is drained and switched like an upgrade (D153).
+   - The choice is made again whenever the agent starts, so a new card is seen; the agent then
+     stops the engine it had started and starts the other, and the pool holds the new engine's
+     builds.
 7. **The threat model** (T35 extended):
    - PyPI becomes a source, every file in a version's locked set checked by its hash (answer 2).
    - No `--trust-remote-code`.

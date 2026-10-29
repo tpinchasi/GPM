@@ -343,6 +343,8 @@ def _machine_changes(candidate: PoolConfig, machines: Mapping[str, MachineNow]) 
             ))
         if not host.agent.manage_models:
             continue
+        if candidate.engine_of(host) == "auto":
+            continue  # its agent chooses the engine, and with it the builds it fetches (D161)
         capabilities = frozenset(host.capabilities) | (found or frozenset() if not stated else frozenset())
         # What the supervisor will ask this agent to hold: the host's share of the set (D89),
         # in its own engine's builds (D93) — not the whole set in the pool's engine.

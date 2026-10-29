@@ -172,9 +172,12 @@ engine itself (D150, D159) is never asked: its agent starts it.
 `engine.choice`; until the agent has said, the host is `preparing` (*choosing its engine*) and
 holds nothing. The pass publishes the chosen engine in the host table (D93), so the router sends
 the host only that engine's paths and builds, and the Hosts screen shows the choice with its
-reasons. A choice that changes — the agent started again on a machine with another card — is
-carried out as an upgrade is (§3.1): the host taken out of routing when quiet, drained, the agent
-asked to switch, the host held to its model set again on the new engine.
+reasons. The choice is made when the agent starts, so one that changes — the agent started again on
+a machine with another card — has already been carried out by the agent: it stopped the engine it
+had started and started the other. The pool takes the new engine as it finds it, says so
+(`engine_chosen`), and holds that engine's builds; until they are on the machine the host is
+`preparing`. Nothing is held on an `auto` host before its agent has chosen: a set resolved without
+an engine is empty, and an agent told to hold nothing may remove what it has.
 
 ## 4. Cost controls
 

@@ -342,9 +342,20 @@ def _traits_from(item: Any) -> tuple[dict[str, Any], Optional[str]]:
     return said, None
 
 
+def _engine_choice(host: Any) -> Optional[dict[str, Any]]:
+    """What an `auto` host's agent chose, and why not vLLM where it did not (D161) — from its facts."""
+    engine = ((host.agent.facts or {}).get("engine") or {}) if host.agent is not None else {}
+    choice = engine.get("choice") if isinstance(engine, dict) else None
+    return dict(choice) if isinstance(choice, dict) else None
+
+
 def _host_can_serve(config: PoolConfig, host: Any, name: str, added: list[dict[str, Any]]) -> bool:
-    """Could this configured host serve `name`, with the builds being added for it?"""
-    engine = config.engine_of(host)
+    """Could this configured host serve `name`, with the builds being added for it? Under `auto`,
+    on either engine its agent may choose (D161)."""
+    return all(_host_can_serve_on(config, host, name, added, engine) for engine in config.engines_of(host))
+
+
+def _host_can_serve_on(config: PoolConfig, host: Any, name: str, added: list[dict[str, Any]], engine: str) -> bool:
     caps = set(host.capabilities)
     entry = config.catalog.get(name)
     listed = [v.model_dump() for v in entry.variants] if entry else []
@@ -597,8 +608,11 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 "resident": sorted(host.resident),
                 "available": sorted(host.available),
                 "residency": host.config.residency,
-                # What this machine runs, and which of the pool's models it holds (D89, D93).
-                "engine": supervisor.config.engine_of(host.config),
+                # What this machine runs, and which of the pool's models it holds (D89, D93) —
+                # under `auto`, what its agent chose and why (D161).
+                "engine": supervisor.engine_name_of(host) or supervisor.config.engine_of(host.config),
+                "engine_configured": supervisor.config.engine_of(host.config),
+                "engine_choice": _engine_choice(host),
                 "holds": supervisor.config.models_held_by(host.config),
                 "served": served_on(host.variants, host.resident, host.available),
                 "last_error": host.last_error,

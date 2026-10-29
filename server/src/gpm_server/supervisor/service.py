@@ -27,6 +27,8 @@ import httpx
 from .. import strategies
 from ..catalog import ResolvedVariant, literal_variants_for_host, variants_for_host
 from ..config import (
+    AUTO_ENGINE,
+    AUTO_ENGINES,
     AgentConfig,
     ConfigError,
     HostConfig,
@@ -82,6 +84,14 @@ class SupervisedHost:
     install: Optional[dict[str, Any]] = None
     #: Whether the engine answered at the last probe — what an upgrade's check reads.
     engine_answers: bool = False
+    #: Under `engine: auto`, the engine its agent chose from the machine (D161) — None until it
+    #: has said; kept while the agent is silent, since the machine has not changed by that.
+    chosen_engine: Optional[str] = None
+    #: An engine its owner installed, started by its agent once its models are on disk (D160):
+    #: the set it was last asked to start on, when, and the request in flight.
+    restarted_for: Optional[frozenset[str]] = None
+    restart_asked_at: Optional[float] = None
+    restart_task: Optional[asyncio.Task] = None
 
     @property
     def host_id(self) -> str:
@@ -108,6 +118,9 @@ class SupervisedHost:
 
 
 class Supervisor:
+    #: After a restart request that did not take, how long before asking again (D160, as D97).
+    RESTART_RETRY_S = 120.0
+
     def __init__(
         self,
         config: PoolConfig,
@@ -212,12 +225,7 @@ class Supervisor:
         return SupervisedHost(
             config=host_config,
             client=build_client(host_config.transport, self.config.pool, dial_url),
-            variants=variants_for_host(
-                self.config.models_held_by(host_config),
-                self.config.catalog,
-                capabilities,
-                self.config.engine_of(host_config),
-            ),
+            variants=self._variants_of(self.config, host_config, capabilities, self._configured_engine(host_config)),
             dial_url=dial_url,
             tunnel=tunnel,
             state=HostState.DISABLED if host_config.disabled else HostState.UNREACHABLE,
@@ -582,9 +590,10 @@ class Supervisor:
                     asyncio.create_task(tunnel.start())
             else:
                 existing.config = host_config
-                existing.variants = variants_for_host(
-                    new.models_held_by(host_config), new.catalog, existing.capabilities,
-                    new.engine_of(host_config),
+                if new.engine_of(host_config) != AUTO_ENGINE:
+                    existing.chosen_engine = None
+                existing.variants = self._variants_of(
+                    new, host_config, existing.capabilities, self.engine_name_of(existing, new),
                 )
                 if host_config.disabled and existing.state is not HostState.DISABLED:
                     existing.state = HostState.DISABLED
@@ -907,18 +916,20 @@ class Supervisor:
                 f"host {host.host_id}: " + ("its agent answers" if host.agent.reachable else host.agent.detail or "agent silent"),
                 host_id=host.host_id,
             )
+        chosen = self._note_engine_choice(host)
+        if host.capabilities != before or chosen:
+            host.variants = self._variants_of(self.config, host.config, host.capabilities, self.engine_name_of(host))
         if host.capabilities != before:
-            host.variants = variants_for_host(
-                self.config.models_held_by(host.config), self.config.catalog, host.capabilities,
-                self.config.engine_of(host.config),
-            )
             self.events.record(
                 "capabilities_derived",
                 f"host {host.host_id}: the agent found {sorted(host.capabilities - before)}; builds re-resolved",
                 host_id=host.host_id,
                 numbers={"capabilities": sorted(host.capabilities)},
             )
-        if host.agent.reachable and host.config.agent.manage_models:
+        waiting_for_choice = self.config.engine_of(host.config) == AUTO_ENGINE and host.chosen_engine is None
+        if host.agent.reachable and host.config.agent.manage_models and not waiting_for_choice:
+            # Never before an `auto` host's engine is known: its set would be empty, and an agent
+            # told to hold nothing may remove what it has.
             # After the platform is known, so the machine is asked for the right builds.
             models = await agents.hold(
                 host.agent_endpoint, host.required_tags, host.config.residency, transport=self._agent_transport
@@ -926,9 +937,121 @@ class Supervisor:
             host.agent = dataclasses.replace(host.agent, models=models)
             for kind, summary, numbers in agents.model_events(models_before, models):
                 self.events.record(kind, f"host {host.host_id}: {summary}", host_id=host.host_id, numbers=numbers)
+            self._start_when_on_disk(host)
         elif host.agent.reachable is False and models_before is not None:
             host.agent = dataclasses.replace(host.agent, models=None)
         await self._say_engine_version(host)
+
+    # --- which engine a configured host runs (D93, D161) ---
+
+    def _configured_engine(self, host_config: HostConfig) -> Optional[str]:
+        """The engine configuration names for a host — None under `auto`, which its agent says."""
+        name = self.config.engine_of(host_config)
+        return None if name == AUTO_ENGINE else name
+
+    def engine_name_of(self, host: SupervisedHost, config: Optional[PoolConfig] = None) -> Optional[str]:
+        """The engine this configured host runs: the one it names or inherits, or under `auto` the
+        one its agent chose (D161) — None until the agent has said."""
+        name = (config or self.config).engine_of(host.config)
+        return host.chosen_engine if name == AUTO_ENGINE else name
+
+    @staticmethod
+    def _variants_of(
+        config: PoolConfig, host_config: HostConfig, capabilities: frozenset[str], engine: Optional[str],
+    ) -> dict[str, tuple[ResolvedVariant, ...]]:
+        """The builds of each model this host holds, for its engine — none while it has no engine yet."""
+        if engine is None:
+            return {}
+        return variants_for_host(config.models_held_by(host_config), config.catalog, capabilities, engine)
+
+    def _note_engine_choice(self, host: SupervisedHost) -> bool:
+        """Take an `auto` host's engine from its agent's facts (`engine.choice`, D161). True when
+        it changed — the builds it holds then change with it."""
+        if self.config.engine_of(host.config) != AUTO_ENGINE or host.agent is None or not host.agent.reachable:
+            return False
+        engine = (host.agent.facts or {}).get("engine") or {}
+        choice = engine.get("choice") if isinstance(engine, dict) else None
+        chosen = choice.get("engine") if isinstance(choice, dict) else None
+        if chosen not in AUTO_ENGINES or chosen == host.chosen_engine:
+            return False
+        before, host.chosen_engine = host.chosen_engine, chosen
+        reasons = [str(r) for r in (choice.get("reasons") or []) if r][:6]
+        self.events.record(
+            "engine_chosen",
+            f"host {host.host_id}: its agent runs {chosen}"
+            + (f" (was {before})" if before else "")
+            + (f" — not vLLM: {'; '.join(reasons)}" if chosen != "vllm" and reasons else ""),
+            host_id=host.host_id,
+            numbers={"engine": chosen, "previous": before, "reasons": reasons},
+        )
+        return True
+
+    def _start_when_on_disk(self, host: SupervisedHost) -> None:
+        """Start an engine its owner installed once every model the host holds is on disk (D160),
+        as the pool does on a host it rents (D97): a vLLM started by the owner's script serves
+        only what it was started with, and its agent fetched the models without starting it. Never
+        where the agent runs the engine itself (D150, D159) — it starts it on its own. Asked in the
+        background: a restart waits for the engine to answer."""
+        engine_name = self.engine_name_of(host)
+        if host.agent is None or not host.agent.reachable or engine_name is None:
+            return
+        try:
+            engine = self.engine_for(host)
+        except Exception:  # noqa: BLE001 - an engine that cannot be loaded is reported elsewhere
+            return
+        if not getattr(engine, "loads_by_restart", False):
+            return
+        facts = host.agent.facts or {}
+        if not (facts.get("allows") or {}).get("restart"):
+            return  # no restart command: nothing the pool could ask for
+        install = ((facts.get("engine") or {}).get("install") or {}) if isinstance(facts.get("engine"), dict) else {}
+        if isinstance(install, dict) and install.get("allowed"):
+            return  # the agent runs this engine itself
+        tags = sorted(host.required_tags)
+        held = {m["tag"]: m for m in self._agent_models(host)}
+        if not tags or not all(held.get(tag, {}).get("on_disk") for tag in tags):
+            return
+        if any(held.get(tag, {}).get("pulling") for tag in tags):
+            return
+        if not any(held.get(tag, {}).get("awaiting_restart") for tag in tags):
+            return
+        # D41 holds a restart to an operator's act because it cuts off the requests in flight.
+        # This one is the pass's only exception, and cuts off none: the engine does not serve the
+        # set it was asked to hold — the host is out of routing for it — and it waits until the
+        # requests already sent to it have ended.
+        if host.state is HostState.READY:
+            return
+        counter = self.counters.all().get(host.host_id)
+        if counter is not None and counter.busy:
+            return
+        on_disk = frozenset(tags)
+        now = time.time()
+        if host.restarted_for == on_disk:
+            return
+        if host.restart_asked_at is not None and now - host.restart_asked_at < self.RESTART_RETRY_S:
+            return
+        if host.restart_task is not None and not host.restart_task.done():
+            return
+        host.restarted_for, host.restart_asked_at = on_disk, now
+        self.events.record(
+            "engine_restart",
+            f"host {host.host_id}: every model it holds is on disk ({', '.join(tags)}); starting its engine on them",
+            host_id=host.host_id,
+        )
+        settings = agents.wanted_engine_settings(host.config.workers, len(tags))
+
+        async def ask() -> None:
+            status, answer = await agents.restart_engine(host.agent_endpoint, settings, transport=self._agent_transport)
+            if status != 200:
+                host.restarted_for = None  # asked again after the pause, not waited on
+                self.events.record(
+                    "engine_restart_failed",
+                    f"host {host.host_id}: its agent did not restart the engine — "
+                    f"{answer.get('detail') or answer.get('error') or status}",
+                    host_id=host.host_id,
+                )
+
+        host.restart_task = asyncio.create_task(ask(), name=f"gpm:restart:{host.host_id}")
 
     async def _say_engine_version(self, host: SupervisedHost) -> None:
         """Tell an agent that installs its engine which version this host should run (D151) —
@@ -1207,7 +1330,11 @@ class Supervisor:
             # What the machine was rented to run, not what the pool rents now (D98): a switch
             # of engine must not make a running host look like the other one.
             return self.fleet.engine_of(host)
-        name = self.config.engine_of(config) if config is not None else self.config.rented_engine()
+        if config is not None:
+            # Under `auto`, the engine its agent chose — the pool's own until it has said (D161).
+            name = self.engine_name_of(host) or self.config.engine
+        else:
+            name = self.config.rented_engine()
         if name not in self.engines:
             # An engine the file started naming after this process began — loaded on first use
             # rather than silently answered by the pool's default adapter.
@@ -1303,6 +1430,16 @@ class Supervisor:
             return
 
         previous = host.state
+        if self.engine_name_of(host) is None:
+            # `auto`, and its agent has not said which engine it runs (D161): nothing to probe yet.
+            host.state = HostState.PREPARING
+            host.last_error = (
+                "choosing its engine: its agent runs vLLM or Ollama by the machine (engine: auto), and has not said which"
+                if host.agent is None or host.agent.reachable else f"choosing its engine: {host.agent.detail or 'its agent is silent'}"
+            )
+            host.engine_answers = False
+            host.last_probe_at = time.monotonic()
+            return
         engine = self.engine_for(host)
         from_agent = bool(getattr(engine, "residency_from_agent", False))
         health = await engine.health(host.client)
@@ -1439,7 +1576,7 @@ class Supervisor:
                     available=host.available,
                     observed={tag: tuple(sorted(found)) for tag, found in host.observed.items()},
                     residency=host.config.residency,
-                    engine=self.config.engine_of(host.config),
+                    engine=self.engine_name_of(host) or self.config.engine,
                     last_error=host.last_error,
                 )
             )
