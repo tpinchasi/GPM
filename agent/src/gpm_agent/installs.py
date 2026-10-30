@@ -923,7 +923,7 @@ def not_allowed(engine: str) -> dict[str, Any]:
     return {
         "allowed": False, "engine": engine, "running": None, "staged": None, "previous": None,
         "latest": None, "latest_checked_at": None, "wanted": None, "working": None, "error": None,
-        "signature": None,
+        "signature": None, "switch_bound_s": None,
     }
 
 
@@ -995,6 +995,7 @@ class Installer:
         http_transport: Optional[httpx.AsyncBaseTransport] = None,
         clock: Callable[[], float] = time.time,
         switch_timeout_s: float = SWITCH_TIMEOUT_S,
+        switch_bound_s: Optional[float] = None,
         min_free_disk_gb: float = 0.0,
         free_disk_bytes: Optional[Callable[[], Optional[int]]] = None,
     ) -> None:
@@ -1002,6 +1003,11 @@ class Installer:
         self.http_transport = http_transport
         self.clock = clock
         self.switch_timeout_s = switch_timeout_s
+        #: The longest one switch or start of this engine takes until it has an outcome, said in
+        #: `engine.install` for the pool to wait as long (`app.switch_bound_s`, from the server's
+        #: own times). Where whoever made this installer does not say: the start's wait twice —
+        #: the version, and the one before it after a failure — and a minute for the stops.
+        self.switch_bound_s = float(switch_bound_s) if switch_bound_s is not None else 2 * switch_timeout_s + 60.0
         #: The machine owner's floor, and how free space on the engines' volume is read.
         self.floor_bytes = int(min_free_disk_gb * 1e9)
         self.free_disk_bytes = free_disk_bytes or (lambda: free_bytes_at(self.engine_dir))
@@ -1042,6 +1048,7 @@ class Installer:
             "working": dict(self.working) if self.working else None,
             "error": record.error,
             "signature": self.source.signature,
+            "switch_bound_s": self.switch_bound_s,
         }
 
     @property

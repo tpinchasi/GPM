@@ -701,13 +701,19 @@ def test_an_upgraded_host_stops_its_older_launchers_engines_and_nothing_else(tmp
     # On a host upgraded in place, the older launcher's engines still hold the cards; its list is
     # in the models directory. Only processes that are an engine by their own command line are
     # stopped — the list may as well be another machine's (the code review's finding).
-    downloaded(tmp_path, BIG, 1000)
+    big = downloaded(tmp_path, BIG, 1000)
     processes = Processes()
-    processes.alive.update({4242, 4343})
-    (tmp_path / vllm_launch.PIDS_FILE).write_text("[4242, 4343]")
-    lines = {4242: b"python3\x00-m\x00vllm\x00serve", 4343: b"/usr/sbin/sshd"}
+    processes.alive.update({4242, 4343, 4444})
+    (tmp_path / vllm_launch.PIDS_FILE).write_text("[4242, 4343, 4444]")
+    lines = {
+        # As the older launcher started them: an engine, and its router with the map beside the models.
+        4242: f"/usr/bin/python3\x00/usr/local/bin/vllm\x00serve\x00{big}\x00--port\x008001".encode(),
+        4343: b"/usr/sbin/sshd",
+        4444: f"python3\x00/opt/gpm-agent.pyz\x00proxy\x00--upstreams\x00{tmp_path / vllm_launch.UPSTREAMS_FILE}".encode(),
+    }
     processes.launch(tmp_path, cmdline=lines.get)
-    assert (4242, signal.SIGTERM) in processes.killed and not any(pid == 4343 for pid, _ in processes.killed)
+    assert (4242, signal.SIGTERM) in processes.killed and (4444, signal.SIGTERM) in processes.killed
+    assert not any(pid == 4343 for pid, _ in processes.killed)
     assert not (tmp_path / vllm_launch.PIDS_FILE).exists()
 
 
@@ -1250,3 +1256,124 @@ def test_each_start_is_marked_in_its_log(tmp_path):
     processes.launch(tmp_path)
     (engine,) = vllm_launch.read_record(tmp_path)["engines"]
     assert Path(engine["log"]).read_text().count(vllm_launch.RUN_MARKER) == 2
+
+
+# --- only the models the agent holds (R4) ---
+
+
+def test_with_models_from_only_the_models_it_names_are_started(tmp_path):
+    """The agent names the models the pool told it to hold: one on disk that it no longer holds is
+    not started beside them, taking its share of the card."""
+    big = downloaded(tmp_path, BIG, 1000)
+    downloaded(tmp_path, EMBED, 100)
+    processes = Processes()
+    started = processes.launch(tmp_path, proxy=True, only={big.name})
+    assert [e["model"] for e in started.engines] == [BIG]
+    assert set(started.plan["models"]) == {BIG}
+    # Without it — a rented host's restart script — every complete model on disk, as before.
+    assert {e["model"] for e in processes.launch(tmp_path, proxy=True).engines} == {BIG, EMBED}
+
+
+@pytest.mark.parametrize("content", [
+    "not json",
+    '{"models": ["acme/chat"]}',
+    "[1]",
+    '["../../etc"]',
+    '["acme/chat/extra"]',
+    '["acme/.."]',
+    '["acme/--trust-remote-code"]',
+    '["acme/chat", "-x/y"]',
+    '["' + "a" * 100 + "/" + "b" * 101 + '"]',
+])
+def test_models_from_names_only_model_repositories_or_nothing_starts(tmp_path, capsys, monkeypatch, content):
+    """As strictly as the fetch names a model's directory (`modelhub.REPO_ID`): anything else in the
+    file refuses the start, which the agent hears as a start that could not begin (exit 2)."""
+    started = []
+    monkeypatch.setattr(vllm_launch, "launch", lambda *args, **kwargs: started.append(kwargs) or vllm_launch.Started())
+    named = tmp_path / "models.json"
+    named.write_text(content)
+    assert vllm_launch.run_verb("vllm-start", [
+        "--models-dir", str(tmp_path / "models"), "--port", "8000", "--models-from", str(named)]) == 2
+    assert started == [] and "--models-from" in capsys.readouterr().out
+
+
+def test_models_from_chooses_among_the_directories_the_fetch_made(tmp_path, monkeypatch):
+    started = []
+    monkeypatch.setattr(vllm_launch, "launch", lambda *args, **kwargs: started.append(kwargs) or vllm_launch.Started())
+    named = tmp_path / "models.json"
+    named.write_text(json.dumps([BIG, EMBED]))
+    assert vllm_launch.run_verb("vllm-start", [
+        "--models-dir", str(tmp_path / "models"), "--port", "8000", "--models-from", str(named)]) == 0
+    assert started[-1]["only"] == {modelhub.directory_for(tmp_path, BIG).name, modelhub.directory_for(tmp_path, EMBED).name}
+    assert vllm_launch.run_verb("vllm-start", [
+        "--models-dir", str(tmp_path / "models"), "--port", "8000", "--models-from", str(tmp_path / "missing.json")]) == 2
+    assert vllm_launch.run_verb("vllm-start", ["--models-dir", str(tmp_path / "models"), "--port", "8000"]) == 0
+    assert started[-1]["only"] is None, "every complete model, as before"
+
+
+# --- stopping an engine and everything it started (R9) ---
+
+
+@pytest.mark.parametrize("leader_stops", [False, True], ids=["nothing-stops-when-asked", "the-leader-alone-stops"])
+def test_a_stop_ends_each_engine_with_its_own_processes_and_waits_until_they_are_gone(tmp_path, leader_stops):
+    """An engine leads a session of its own, and vLLM's workers are in its process group: signalled
+    alone, the engine's leader ends and its workers keep the card — also where the leader ends when
+    asked and a worker does not. Once made to end, they are waited for, so the next start does not
+    size its cache from memory they still hold."""
+    import contextlib
+    import os
+    import sys
+    import threading
+
+    from gpm_agent import platform as host_platform
+
+    models = tmp_path / "models"
+    model = downloaded(models, BIG, 10)
+    engine = tmp_path / "bin" / "vllm"
+    engine.parent.mkdir()
+    # An engine with a worker that will not stop when asked.
+    engine.write_text(
+        f"#!{sys.executable}\n"
+        "import signal, subprocess, sys, time\n"
+        + ("" if leader_stops else "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n")
+        + "worker = subprocess.Popen([sys.executable, '-c', "
+        "'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)'])\n"
+        "print(worker.pid, flush=True)\n"
+        "time.sleep(120)\n"
+    )
+    engine.chmod(0o755)
+    leader = subprocess.Popen([str(engine), "serve", str(model), "--port", "8001"], stdout=subprocess.PIPE,
+                              text=True, start_new_session=True)
+    worker = int(leader.stdout.readline())
+    # On the machine the system reaps what the launcher started; here the test does.
+    threading.Thread(target=leader.wait, daemon=True).start()
+    state = vllm_launch.state_dir_for(models)
+    state.mkdir()
+    (state / vllm_launch.PIDS_FILE).write_text(json.dumps([leader.pid]))
+    try:
+        assert vllm_launch.stop(models, grace_s=0.5) == [leader.pid]
+        assert not host_platform.alive(leader.pid) and not host_platform.alive(worker), "gone when the stop returns"
+    finally:
+        for pid in (worker, leader.pid):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+
+
+def test_a_group_left_only_with_processes_nobody_reaps_has_ended(tmp_path):
+    """In a container whose first process never reaps, an engine and its workers end as zombies,
+    which still answer a signal to their group: read from /proc, they have ended, and nothing waits
+    on them."""
+    proc = tmp_path / "proc"
+
+    def process(pid, state, group):
+        (proc / str(pid)).mkdir(parents=True)
+        (proc / str(pid) / "stat").write_text(f"{pid} (vllm serve (x)) {state} 1 {group} {group} 0 -1\n")
+
+    (proc / "self").mkdir(parents=True)
+    (proc / "self" / "stat").write_text("1 (python) R 0 1 1 0 -1\n")
+    process(4001, "Z", 4001)
+    process(4002, "Z", 4001)
+    process(5000, "S", 5000)  # another group
+    assert vllm_launch._group_gone(4001, proc=proc)
+    process(4003, "S", 4001)  # a worker still running
+    assert not vllm_launch._group_gone(4001, proc=proc)

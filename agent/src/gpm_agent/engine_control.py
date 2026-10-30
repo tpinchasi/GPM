@@ -157,7 +157,9 @@ class EngineControl:
             problem = await self.installer.restart()
         running = self.installer.record.running
         # vLLM is started only once every model it holds is on disk (D159): until then a restart
-        # stores the numbers, stops what ran, and starts nothing yet — said, not claimed served.
+        # stores the numbers, stops what ran, and starts nothing yet. And a start in which no model
+        # serves is the models' failure, not the version's: the restart happened, and nothing is
+        # served. Either is said, never claimed served.
         waiting = getattr(self.installer.server, "waiting", None) if problem is None else None
         return {
             "settings_written": changed,
@@ -165,7 +167,7 @@ class EngineControl:
             "restart_exit_code": 0 if problem is None else None,
             "restart_output": (
                 problem if problem is not None
-                else f"{self.engine.name} {running} is not started yet: {waiting}" if waiting
+                else f"{self.engine.name} {running} is not serving: {waiting}" if waiting
                 else f"the agent started {self.engine.name} {running} again"
             ),
             "engine_answers": problem is None and not waiting,
