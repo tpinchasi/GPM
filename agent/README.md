@@ -64,9 +64,12 @@ To let the pool restart the engine and set how it runs, add both to `agent.json`
 "engine_env_file": "/etc/ollama/gpm.env"
 ```
 
-and point the engine's service at that file (systemd: `EnvironmentFile=/etc/ollama/gpm.env`).
-The pool sends whole numbers — requests at once, models held — and the agent writes them under
-the engine's own variable names. It never receives a variable name, a value as text, a path or
-a command, and a restart only happens when an operator presses the button for it.
+and point the engine's service at that file (systemd: `EnvironmentFile=/etc/ollama/gpm.env`). The
+pool sends whole numbers — requests at once, models held — and the agent writes them under the
+engine's own variable names. It never receives a variable name, a value as text, a path or a
+command, and a restart happens only when an operator presses the button for it — or, for an engine
+like vLLM that serves only what it was started with, when every model the pool asked for is on disk
+and the engine serves none of them yet (D160). Without `engine_env_file`, that restart is your
+command alone, with no numbers.
 
 The full design: [docs/spec/host-agent.md](../docs/spec/host-agent.md).

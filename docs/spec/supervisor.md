@@ -140,15 +140,18 @@ both holds a host back and brings it back, and *Roll back* is refused on a pinne
 When there is a target, the pass waits for the host to have nothing in flight and to have started
 no request for `pool.engine_upgrade_idle_s` (600 s) — counted from the supervisor's start when the
 router has seen none — or for an operator's *Upgrade now*; then it takes the host out of routing
-(`preparing`: *upgrading Ollama 0.40.11 → 0.40.12*), waits for its requests in flight to end, up
-to `pool.engine_upgrade_drain_s` (300 s; after that it puts the host back and tries at the next
-quiet moment), and asks the agent to switch — a switch the agent carries out in the background, so
-the pass never waits on it. Within `pool.engine_upgrade_check_s` (600 s) the engine must answer and
-the host hold what it held before of its own model set — its resident set when pinned, the models
-on its disk when on demand; a model loaded by hand is not counted. Otherwise the version is
-recorded as one this host does not take again (a newer release is tried as usual), and the host
-stays out of routing while the pass asks the agent for the previous version, again on each pass,
-until it runs — or, after five minutes, says it could not be brought back.
+(`preparing`: *upgrading Ollama 0.40.11 → 0.40.12*), waits for its requests in flight to end, up to
+`pool.engine_upgrade_drain_s` (300 s; after that it puts the host back and tries at the next quiet
+moment), and asks the agent to switch — a switch the agent carries out in the background, so the
+pass never waits on it. The switch is waited on for as long as the agent says one switch of its
+engine may take (`switch_bound_s` in `engine.install`) and a minute more — at least five minutes,
+at most four hours, and five minutes where the agent does not say: a vLLM loads for many minutes,
+an Ollama for seconds. Within `pool.engine_upgrade_check_s` (600 s) the engine must answer and the
+host hold what it held before of its own model set — its resident set when pinned, the models on
+its disk when on demand; a model loaded by hand is not counted. Otherwise the version is recorded
+as one this host does not take again (a newer release is tried as usual), and the host stays out of
+routing while the pass asks the agent for the previous version, again on each pass, until it runs —
+or, after the same wait as a switch, says it could not be brought back.
 
 One host upgrades at a time, except where an operator asked. A host that leaves the pool, is taken
 out of service or loses its agent drops what was in progress for it; one whose agent stops
@@ -158,15 +161,28 @@ an upgrade is running is refused. What is in progress is held in the supervisor'
 mid-upgrade leaves the version that runs unchecked, and the host is then judged as any other —
 ready when it holds its model set — with *Roll back* from the console. Every step is an event:
 staged, draining, switching, switched, upgraded, rolling back, rolled back, put off, abandoned.
+What the pass holds of a host's versions — refused, staged, asked for, in progress — is of one
+engine: when the agent reports another (an `auto` host whose agent chose again, D161), it is
+forgotten, and an upgrade in progress is given up and said so. A host whose engine the pool cannot
+say — `auto` with no choice, or a choice that differs from the engine configured — is left out of
+the pass, and its agent is told no version.
 
 ### 3.2 Engines on configured hosts: starting once on disk, and `auto` (S10, D160, D161)
 
 **Starting an engine its owner installed** (D160). For a configured host whose agent has a restart
-command — a vLLM its owner installed, started by the owner's script running `gpm-agent
-vllm-start` — the pass asks the agent to restart the engine once every model the host holds is on
-disk and waiting for a start (`awaiting_restart` in its facts): once per set on disk, and again only
-after the retry interval, exactly as for a host it rents (§8, D97). A host whose agent runs the
-engine itself (D150, D159) is never asked: its agent starts it.
+command — a vLLM its owner installed, started by the owner's script running `gpm-agent vllm-start`
+— the pass asks the agent to restart the engine once every model the host holds is on disk and
+waiting for a start (`awaiting_restart` in its facts), the host is in service and was not found
+serving its set by this pass's probe, and nothing is in flight on it: once per set on disk. The
+pool's settings go with the request only where the owner set an `engine_env_file`
+(`allows.engine_settings`); otherwise it is a plain restart. A start refused, or whose command
+exited other than 0, is an event in the agent's words and asked again after the retry interval (120
+s), as for a host it rents (§8, D97); one whose outcome is not known — the engine not answering
+yet, another restart under way there (`409 restart_in_progress`), or no answer within the pool's
+wait — is asked again only after 30 minutes, and only if the models still wait. The pool's start
+and an operator's restart take turns on a host; an operator's runs in the background, answered at
+once, its outcome an event (D162). A host whose agent runs the engine itself (D150, D159) is never
+asked: its agent starts it.
 
 **An engine of `auto`** (D161). The host's engine is the one its agent chose and reports under
 `engine.choice`; until the agent has said, the host is `preparing` (*choosing its engine*) and
@@ -177,7 +193,13 @@ a machine with another card — has already been carried out by the agent: it st
 had started and started the other. The pool takes the new engine as it finds it, says so
 (`engine_chosen`), and holds that engine's builds; until they are on the machine the host is
 `preparing`. Nothing is held on an `auto` host before its agent has chosen: a set resolved without
-an engine is empty, and an agent told to hold nothing may remove what it has.
+an engine is empty, and an agent told to hold nothing may remove what it has. An agent that answers
+with no choice was set up with an engine of its own: the host is `preparing`, saying which engine
+its agent runs and that `gpm-agent init --engine auto --install-engines` there, or naming the
+engine here, settles it; it holds nothing and is not upgraded. A host that names an engine whose
+agent chose another (it is set to `auto` on the machine) is kept `preparing` and holds nothing
+until the two agree (`engine_mismatch`). The choice is kept while the agent is silent — the Hosts
+screen says it is the last one said — and through changes of configuration.
 
 ## 4. Cost controls
 

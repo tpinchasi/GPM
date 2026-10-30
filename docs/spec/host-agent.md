@@ -565,16 +565,19 @@ A tag travels in a body, never a path, and must be a plain model tag — a name,
 namespaced and versioned. Anything with a scheme, a space, `..` or a leading dash is refused
 before the engine sees it. `manage_models: false` on a host keeps its agent to `GET /facts`.
 
-**Engine settings are numbers, the command is the owner's (D41).** The pool says how many
-requests at once and how many models held; the agent's engine adapter turns those into the
-engine's own variable names, so no name or text from the pool is ever written to a file or put
-in a process's environment. Where they are written (`engine_env_file`) and what restarts the
-engine (`restart_command`, an argument list, never a shell line) live in the agent's settings on
-that machine; without them the verb is refused and the console says what the owner would add.
-A restart drops whatever the engine is doing, so it is **only ever an operator's act** — the
-host id typed again — and never the supervisor's pass. The agent reports the settings back as
-the same numbers, so the console can show *what the pool needs* beside *what is set* without
-knowing any engine's vocabulary.
+**Engine settings are numbers, the command is the owner's (D41).** The pool says how many requests
+at once and how many models held; the agent's engine adapter turns those into the engine's own
+variable names, so no name or text from the pool is ever written to a file or put in a process's
+environment. Where they are written (`engine_env_file`) and what restarts the engine
+(`restart_command`, an argument list, never a shell line) live in the agent's settings on that
+machine; without them the verb is refused and the console says what the owner would add. A restart
+drops whatever the engine is doing, so it is an operator's act — the host id typed again, answered
+at once and carried out in the background (D162) — with one exception: the supervisor's pass asks
+for one to start an engine its owner installed that serves none of the set it holds yet, once every
+model is on disk, never while the host serves its set or has requests in flight (D160), and sends
+the numbers only where the owner set `engine_env_file`. The agent reports the settings back as the
+same numbers, so the console can show *what the pool needs* beside *what is set* without knowing
+any engine's vocabulary.
 
 A pull is stopped by closing its connection, which is how the engine cancels one; nothing is
 left installed. The agent only ever releases a pin **it** set: a model the machine's owner keeps
