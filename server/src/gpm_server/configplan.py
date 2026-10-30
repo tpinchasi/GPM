@@ -21,7 +21,7 @@ from typing import Any, Mapping, Optional, Sequence
 
 import yaml
 
-from .config import ConfigError, PoolConfig, load_config
+from .config import AUTO_ENGINE, AUTO_ENGINES, ConfigError, PoolConfig, load_config
 
 #: Applied versions kept beside the file (spec §1: the last 50, with a diff and rollback).
 HISTORY_LIMIT = 50
@@ -59,6 +59,9 @@ class MachineNow:
     capabilities: Optional[frozenset[str]]
     on_disk: frozenset[str]
     free_disk_bytes: Optional[int]
+    #: The engine the agent chose from the machine (`engine.choice`, D161), as the pool holds it;
+    #: None where it has not said.
+    chosen_engine: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -343,13 +346,22 @@ def _machine_changes(candidate: PoolConfig, machines: Mapping[str, MachineNow]) 
             ))
         if not host.agent.manage_models:
             continue
-        if candidate.engine_of(host) == "auto":
-            continue  # its agent chooses the engine, and with it the builds it fetches (D161)
+        engine, chose = candidate.engine_of(host), ""
+        if engine == AUTO_ENGINE:
+            # Its agent chooses the engine, and with it the builds it fetches (D161).
+            if machine.chosen_engine not in AUTO_ENGINES:
+                changes.append(Change(
+                    "agent_download",
+                    f"host {host.id!r}: its agent chooses its engine from the machine (engine: auto) and has not "
+                    "said which yet; what it downloads follows that choice",
+                ))
+                continue
+            engine, chose = machine.chosen_engine, f" (engine: auto; its agent chose {machine.chosen_engine})"
         capabilities = frozenset(host.capabilities) | (found or frozenset() if not stated else frozenset())
         # What the supervisor will ask this agent to hold: the host's share of the set (D89),
         # in its own engine's builds (D93) — not the whole set in the pool's engine.
         variants = variants_for_host(
-            candidate.models_held_by(host), candidate.catalog, capabilities, candidate.engine_of(host),
+            candidate.models_held_by(host), candidate.catalog, capabilities, engine,
         )
         missing = sorted({group[0].tag for group in variants.values() if group} - machine.on_disk)
         if not missing:
@@ -359,7 +371,7 @@ def _machine_changes(candidate: PoolConfig, machines: Mapping[str, MachineNow]) 
             f"at least {sum(known):.1f} GB; some sizes are not stated in the catalog" if known else "sizes not stated in the catalog"
         )
         free = "" if machine.free_disk_bytes is None else f"; {machine.free_disk_bytes / 1e9:.0f} GB free there"
-        detail = f"host {host.id!r}: its agent will download {missing} ({size}{free})"
+        detail = f"host {host.id!r}{chose}: its agent will download {missing} ({size}{free})"
         if known and machine.free_disk_bytes is not None and sum(known) * 1e9 > machine.free_disk_bytes:
             detail += " — which does not fit, so the agent will refuse and the host will stay out of routing"
         changes.append(Change("agent_download", detail))

@@ -132,6 +132,79 @@ def test_a_machine_with_nothing_running_yet_is_left_to_its_agent_which_starts_th
     assert "mac" not in upgrades.active
 
 
+# --- an engine that takes long to start: vLLM (D159) ---
+
+#: What an agent running vLLM says one switch may take: stopping it, its launcher, and serving.
+VLLM_BOUND = 2160
+
+
+def vllm(running="0.32.0", staged="0.33.0", previous=None, **more):
+    return install(running=running, staged=staged, previous=previous, engine="vllm",
+                   switch_bound_s=VLLM_BOUND, **more)
+
+
+def test_a_slow_switch_is_waited_on_as_long_as_the_agent_says_and_then_checked():
+    """The pool once gave up at 300 s on a vLLM still loading: a false rollback, the version
+    refused, and — when the switch then finished — no check of what it served (D159)."""
+    upgrades = EngineUpgrades()
+    step(upgrades, vllm(), 0)
+    assert step(upgrades, vllm(), 15).action == "switch"
+    loading = vllm(working={"step": "switching", "version": "0.33.0"})
+    for after in (60, 330, 1200, VLLM_BOUND):
+        assert step(upgrades, loading, 15 + after, held=frozenset()).action == "wait", after
+    assert "mac" not in upgrades.refused
+    switched = vllm(running="0.33.0", staged=None, previous="0.32.0")
+    assert step(upgrades, switched, 15 + VLLM_BOUND + 30, held=frozenset()).event == "engine_switched"
+    # Serving none of what the host held: the check D159 relies on rolls it back.
+    back = step(upgrades, switched, 15 + VLLM_BOUND + 30 + 601, held=frozenset())
+    assert (back.action, back.version) == ("rollback", "0.32.0")
+    assert upgrades.refused["mac"] == {"0.33.0"}
+
+
+def test_a_slow_rollback_is_waited_on_as_long_and_says_how_long_it_waited():
+    upgrades = EngineUpgrades()
+    step(upgrades, vllm(), 0)
+    step(upgrades, vllm(), 1)
+    switched = vllm(running="0.33.0", staged=None, previous="0.32.0")
+    step(upgrades, switched, 2, held=frozenset())
+    assert step(upgrades, switched, 2 + 601, held=frozenset()).action == "rollback"
+    going_back = vllm(running="0.33.0", staged=None, previous="0.32.0",
+                      working={"step": "switching", "version": "0.32.0"})
+    assert step(upgrades, going_back, 2 + 601 + 400, held=frozenset()).action == "wait", "not a failed rollback"
+    failed = step(upgrades, going_back, 2 + 601 + VLLM_BOUND + 61, held=frozenset())
+    assert failed.event == "engine_rollback_failed" and f"{VLLM_BOUND + 60}s" in failed.summary
+
+
+@pytest.mark.parametrize(("bound", "waited"), [
+    (None, SWITCH_TIMEOUT_S), (True, SWITCH_TIMEOUT_S), ("2160", SWITCH_TIMEOUT_S), (-5, SWITCH_TIMEOUT_S),
+    (0, SWITCH_TIMEOUT_S), (float("nan"), SWITCH_TIMEOUT_S), (float("inf"), SWITCH_TIMEOUT_S),
+    (10, SWITCH_TIMEOUT_S), (VLLM_BOUND, VLLM_BOUND + 60), (10**9, 4 * 3600),
+])
+def test_what_an_agent_says_of_its_bound_is_read_with_care(bound, waited):
+    """An older agent says nothing, and keeps the pool's own 300 s; an odd number is no number;
+    and no agent keeps a host out of routing for more than four hours."""
+    from gpm_server.supervisor.upgrades import switch_timeout
+
+    said = install(**({} if bound is None else {"switch_bound_s": bound}))
+    assert switch_timeout(said) == waited
+
+
+def test_a_host_whose_agent_now_runs_another_engine_starts_its_versions_from_nothing():
+    """An `auto` host whose agent chose again (D161): a vLLM version refused there, or a switch in
+    progress, says nothing of Ollama's."""
+    upgrades = EngineUpgrades()
+    upgrades.refuse("mac", "0.40.12")
+    upgrades.news("mac", vllm())
+    step(upgrades, vllm(), 0)
+    assert upgrades.active["mac"].to == "0.33.0"
+    ollama = install(running="0.40.11", staged="0.40.12")
+    said = upgrades.news("mac", ollama)
+    assert said[0].event == "engine_upgrade_abandoned" and "now runs ollama" in said[0].summary
+    assert "mac" not in upgrades.refused, "0.40.12 was refused as a vLLM version, if at all"
+    started = step(upgrades, ollama, 1, idle_s=900)
+    assert started.action == "start" and "0.40.11 → 0.40.12" in started.summary
+
+
 # --- through the pool ---
 
 

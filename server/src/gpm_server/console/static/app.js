@@ -475,6 +475,19 @@ const feed = () => el("div", { class: "panel feed" }, state.events.slice(0, 40).
     el("span", { class: "k" }, `${clock(event.ts)}  ${event.kind}  `),
     event.summary)));
 
+// Under `auto` its agent chose from the machine (D161): said, with why not vLLM. Read with care —
+// a choice missing or partial is said as such — and, while the agent is silent, the engine the
+// pool still takes this host to run.
+function autoEngineLine(host) {
+  const choice = host.engine_choice && typeof host.engine_choice === "object" ? host.engine_choice : null;
+  const reasons = Array.isArray(choice && choice.reasons) ? choice.reasons.filter((r) => typeof r === "string") : [];
+  let text;
+  if (!choice || typeof choice.engine !== "string") text = "auto: its agent has not chosen yet";
+  else if (choice.said_now === false) text = `auto: ${choice.engine}, as its agent last said — it is silent now`;
+  else text = `auto${reasons.length ? ": not vLLM — " + reasons[0] : ""}`;
+  return el("div", { class: "muted", title: reasons.join("\n") }, text);
+}
+
 screens.hosts = (status) => [
   el("h1", {}, "Hosts"),
   el("p", { class: "muted" }, "Hosts you configured, rather than rented. Take one out of service or remove it here; adding and editing one are on the Configuration screen. Rented hosts are released from Rented capacity."),
@@ -488,9 +501,7 @@ screens.hosts = (status) => [
       // A pool may run a different engine on each machine (D93), and which models this one
       // holds is now a per-host fact too (D89).
       el("td", { class: "mono" }, host.engine || "—",
-        // Under `auto` its agent chose from the machine (D161): said, with why not vLLM.
-        host.engine_configured === "auto" ? el("div", { class: "muted", title: ((host.engine_choice || {}).reasons || []).join("\n") },
-          host.engine_choice ? `auto${(host.engine_choice.reasons || []).length ? ": not vLLM — " + host.engine_choice.reasons[0] : ""}` : "auto: its agent has not chosen yet") : null,
+        host.engine_configured === "auto" ? autoEngineLine(host) : null,
         (host.holds || []).length ? el("div", { class: "muted" }, `holds ${host.holds.join(", ")}`) : null),
       el("td", {}, host.transport),
       el("td", {}, pill(host.state), host.last_error ? el("div", { class: "muted" }, host.last_error) : null),
@@ -607,12 +618,12 @@ function engineControl(host, agent, facts) {
       retype: host.host_id,
     });
     if (!ok) return;
-    const button = e.target; const label = button.textContent; button.disabled = true; button.textContent = "restarting…";
+    const button = e.target; const label = button.textContent; button.disabled = true; button.textContent = "asking…";
     try {
+      // Answered at once: the restart runs in the background — a vLLM takes minutes to start —
+      // and how it went is an event below.
       const result = await api.restartEngine(host.host_id, applySettings);
-      alert(result.engine_answers
-        ? `Restarted (exit ${result.restart_exit_code}). The engine is answering.`
-        : `The command ran (exit ${result.restart_exit_code}) but the engine is NOT answering.\n\n${result.restart_output || ""}`);
+      alert(`${(result && result.detail) || "The engine is restarting."}`);
       await refresh();
     } catch (error) { alert(error.message); } finally { button.disabled = false; button.textContent = label; }
   };
