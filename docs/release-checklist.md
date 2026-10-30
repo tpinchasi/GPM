@@ -133,6 +133,9 @@ Each line was re-checked against the code on 2026-09-19; the test that holds it 
       release at least, and the one before it so a rollback has its set — run
       `tools/vllm-lock <version>` (`uv` on PATH; it reads PyPI and installs nothing). It writes one
       set for each Python 3.11–3.14 and each processor, x86_64 and aarch64, or none if any fails.
+      All of a run's sets are resolved from PyPI as it stood when the run began (`--exclude-newer`;
+      the summary names that moment), so run it once per version for every Python and processor
+      together, never set by set.
       Read its summary before committing `agent/src/gpm_agent/vllm_sets/`: the driver floor (a CUDA
       major its table does not name refuses the set — add the major's least driver, from NVIDIA's
       CUDA Compatibility guide, first), the glibc, and the size. Remove the sets of versions no
