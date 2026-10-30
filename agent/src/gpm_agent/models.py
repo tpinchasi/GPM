@@ -148,6 +148,8 @@ class ModelWork:
         on_disk = {m["tag"]: m.get("size_bytes") for m in state.get("models_on_disk", [])}
         loaded = set(state.get("models_loaded", []))
         failed = state.get("models_failed") or {}
+        # Started and still on its way (vLLM's start takes minutes): not waiting for a start.
+        loading = set(state.get("models_loading") or [])
         restarts = bool(getattr(self.engine, "loads_by_restart", False))
         return {
             "engine_answers": bool(state.get("answers")),
@@ -170,7 +172,9 @@ class ModelWork:
                     "pulling": dict(self.pulling) if self.pulling and self.pulling["tag"] == tag else None,
                     # Downloaded, and waiting for the engine to be started with it — the normal
                     # state of such an engine between its fetch and its restart, not a failure.
-                    "awaiting_restart": restarts and tag in on_disk and tag not in loaded and tag not in failed,
+                    "awaiting_restart": (
+                        restarts and tag in on_disk and tag not in loaded and tag not in failed and tag not in loading
+                    ),
                     "error": self.errors[tag][1] if tag in self.errors else failed.get(tag),
                 }
                 for tag in self.desired.tags

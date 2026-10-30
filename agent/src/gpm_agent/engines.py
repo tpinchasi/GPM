@@ -375,6 +375,7 @@ class VllmFacts:
             return {
                 "name": self.name, "answers": False, "detail": str(exc) or type(exc).__name__,
                 "models_on_disk": on_disk, "models_loaded": [], "models_failed": self._failed([]),
+                "models_loading": self._loading([]),
                 **known,
             }
         loaded = sorted(entry["id"] for entry in served if isinstance(entry, dict) and entry.get("id"))
@@ -387,12 +388,23 @@ class VllmFacts:
             # A process the launcher started that has since exited without serving its model
             # is a failure, not a model still loading — with the reason from its own log.
             "models_failed": self._failed(loaded),
+            # One whose process is still starting — or that waits its turn on its card while what
+            # starts it runs (D155) — is loading: on disk and not served, and yet not waiting for a
+            # start, which would only begin a start of minutes again.
+            "models_loading": self._loading(loaded),
             **({"model_sources": _sources_fact(self.sources)} if self.sources else {}),
             **known,
         }
 
     def _failed(self, loaded: list[str]) -> dict[str, str]:
-        return vllm_state.failed_engines(Path(self._models_dir).expanduser(), loaded)
+        # Where this agent runs vLLM, it knows which models its start served: one of those whose
+        # process is gone exited after serving, which is said so (a crash, not a model too large).
+        server = getattr(self.installer, "server", None)
+        served_before = server.served_when_started() if hasattr(server, "served_when_started") else []
+        return vllm_state.failed_engines(Path(self._models_dir).expanduser(), loaded, served_before=served_before)
+
+    def _loading(self, loaded: list[str]) -> list[str]:
+        return sorted(vllm_state.loading_engines(Path(self._models_dir).expanduser(), loaded))
 
     def _on_disk(self) -> list[dict[str, Any]]:
         root = Path(self._models_dir).expanduser()

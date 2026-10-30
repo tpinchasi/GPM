@@ -21,7 +21,7 @@ import shutil
 import subprocess
 from typing import Any, Callable, Optional, Sequence
 
-from .platform import CREATE_NO_WINDOW
+from .platform import CREATE_NO_WINDOW, program_environment
 
 _TIMEOUT_S = 5
 
@@ -32,9 +32,11 @@ def _run(
     system: Callable[[], str] = platform.system,
     which: Callable[[str], Optional[str]] = shutil.which,
     run: Callable[..., Any] = subprocess.run,
+    timeout_s: float = _TIMEOUT_S,
 ) -> Optional[str]:
     """Output of a fixed, argument-list command, or None. Never a shell, never input from
-    the pool: every command this module runs is a literal written here.
+    the pool: every command this module runs is a literal written here. `timeout_s` is longer only
+    where an agent of `auto` asks again, as it starts, about cards it could not read (`app`).
 
     On Windows with no console window: the agent started at logon runs under `pythonw.exe`, which
     has none, so each console program it starts — `nvidia-smi`, on every facts call — would open
@@ -44,7 +46,7 @@ def _run(
     options: dict[str, Any] = {"creationflags": CREATE_NO_WINDOW} if system() == "Windows" else {}
     try:
         done = run(
-            list(command), capture_output=True, text=True, timeout=_TIMEOUT_S, check=False, **options
+            list(command), capture_output=True, text=True, timeout=timeout_s, check=False, **options
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -352,6 +354,9 @@ def audio_extra(
         done = subprocess.run(
             [interpreter, "-I", "-c", "import " + ", ".join(modules)],
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout_s, check=False,
+            # What it imports was downloaded: none of the agent's own credentials (`HF_TOKEN`, a
+            # provider's key) reach it — only what any program the agent starts is given.
+            env=program_environment({}),
         )
     except (OSError, subprocess.TimeoutExpired):
         return None

@@ -6,6 +6,8 @@ network, needs a GPU, or installs vLLM.
 """
 
 import io
+import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -455,6 +457,21 @@ def test_the_check_is_a_fixed_argument_list_of_vllms_audio_modules(tmp_path):
     assert (bin_dir / "runs").read_text() == "-I -c import av, scipy.signal, soundfile, soxr\n"
 
 
+def test_the_check_gives_the_downloaded_python_none_of_the_agents_credentials(tmp_path, monkeypatch):
+    """What it imports came from PyPI: the agent's own environment — a hub token, a provider's
+    key — never reaches it; only what every program the agent starts is given (R8)."""
+    monkeypatch.setenv("HF_TOKEN", "not-a-real-token")
+    monkeypatch.setenv("SOME_PROVIDER_KEY", "not-real")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")
+    bin_dir = tmp_path / "bin"
+    seen = bin_dir / "environment"
+    python = executable(bin_dir / "python3", f'#!/bin/sh\nenv > "{seen}"\nexit 0\n')
+    assert audio_extra(str(vllm_running_under(bin_dir, str(python)))) == (True, None)
+    names = {line.split("=", 1)[0] for line in seen.read_text().splitlines() if "=" in line}
+    assert "HF_TOKEN" not in names and "SOME_PROVIDER_KEY" not in names
+    assert {"PATH", "CUDA_VISIBLE_DEVICES"} <= names, "what any program it starts is given"
+
+
 def test_a_check_that_could_not_run_says_nothing(tmp_path):
     """No command, an interpreter that is not there, one that hangs: not known — never missing."""
     assert audio_extra("vllm", path=str(tmp_path)) is None
@@ -533,6 +550,61 @@ async def test_the_facts_say_which_models_were_started_shorter_than_the_pool_ask
     assert described["max_model_len_capped"] == {
         "openai/whisper-large-v3-turbo": {"asked": 8192, "applied": 448},
     }
+
+
+# --- a start still on its way is loading, not waiting for a start (P7) ---
+
+
+def launched(models_dir, engines, in_turn=None):
+    """The launcher's record of a start, as it writes it."""
+    state = vllm_launch.state_dir_for(models_dir)
+    state.mkdir(parents=True, exist_ok=True)
+    (state / vllm_launch.STARTED_FILE).write_text(json.dumps({
+        "at": time.time(), "refused": None, "plan": {}, "engines": engines, "proxy": None, "in_turn": in_turn,
+    }))
+
+
+async def test_a_model_whose_start_is_still_on_its_way_is_loading_not_waiting_for_a_start(tmp_path):
+    """A start takes minutes, the models on one card one after another (D155): one whose process
+    is still up, or that waits its turn while what starts it runs, is loading — not on disk and
+    waiting to be started, which would have the pool ask for the start again (D160)."""
+    from gpm_agent.models import ModelWork
+
+    other = "acme/speech-model"
+    downloaded(tmp_path)
+    downloaded(tmp_path, other)
+    loading = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    helper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)",
+                               "vllm-in-turn", "--models-dir", str(tmp_path)])
+    try:
+        launched(tmp_path, [
+            {"model": REPO, "pid": loading.pid, "card": None, "log": ""},
+            {"model": other, "pid": None, "waiting": True, "card": None, "log": ""},
+        ], in_turn={"pid": helper.pid})
+        engine = facts(tmp_path)
+        work = ModelWork(engine, engine_answering({"/v1/models": {"data": []}}), free_disk_bytes=lambda: 10**12,
+                         min_free_disk_gb=0, allow_delete=False)
+        work.desired = type(work.desired)((REPO, other), "pinned")
+        snapshot = await work.snapshot()
+        assert {m["tag"]: m["awaiting_restart"] for m in snapshot["models"]} == {REPO: False, other: False}
+        assert (await engine.describe(work.client))["models_loading"] == sorted([REPO, other])
+
+        # What starts it in turn gone, and the process loading gone: failed, and not loading.
+        for process in (loading, helper):
+            process.kill()
+            process.wait()
+        described = await engine.describe(work.client)
+        assert described["models_loading"] == [] and set(described["models_failed"]) == {REPO, other}
+        # A model on disk that nothing started is the one waiting for a start.
+        launched(tmp_path, [])
+        snapshot = await work.snapshot()
+        assert {m["tag"]: m["awaiting_restart"] for m in snapshot["models"]} == {REPO: True, other: True}
+        await work.aclose()
+    finally:
+        for process in (loading, helper):
+            if process.poll() is None:
+                process.kill()
+                process.wait()
 
 
 def test_the_registry_builds_both_engines_the_same_way(tmp_path):

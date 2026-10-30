@@ -1237,7 +1237,7 @@ async def test_the_verb_answers_with_where_the_versions_stand_and_the_facts_carr
     assert answer.status_code == 200
     assert set(answer.json()) == {
         "allowed", "engine", "running", "staged", "previous", "latest", "latest_checked_at", "wanted",
-        "working", "error", "signature",
+        "working", "error", "signature", "switch_bound_s",
     }
     assert answer.json()["allowed"] is True and answer.json()["engine"] == "ollama"
     await rig.installer.finished()

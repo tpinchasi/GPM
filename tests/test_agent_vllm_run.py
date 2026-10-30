@@ -12,8 +12,10 @@ vLLM itself; the model hub is pointed at a closed port, so nothing could be fetc
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -29,14 +31,16 @@ import gpm_agent
 import httpx
 import pytest
 from gpm_agent import app as agent_app
-from gpm_agent import cli, installs, modelhub, vllm_install, vllm_launch, vllm_server
+from gpm_agent import cli, installs, modelhub, vllm_install, vllm_launch, vllm_server, vllm_state
+from gpm_agent import facts as facts_module
 from gpm_agent import platform as host_platform
 from gpm_agent.app import CHOICE_FILE, choose_engine, create_app
 from gpm_agent.engines import VllmFacts
+from gpm_agent.facts import Probes
 from gpm_agent.installs import Installer, Release
 from gpm_agent.models import Refused
 from gpm_agent.ollama_server import OllamaServer
-from gpm_agent.settings import Settings, SettingsError, fingerprint, load
+from gpm_agent.settings import Settings, SettingsError, fingerprint, load, save
 from gpm_agent.vllm_server import VllmServer
 
 AGENT_KEY = "gpmg_" + "c" * 64
@@ -68,6 +72,8 @@ print("INFO starting vLLM", VERSION, "for", name, flush=True)
 if control.get("exit"):
     print(control["exit"], flush=True)
     sys.exit(1)
+if control.get("silent"):
+    time.sleep(600)  # loading, for longer than anyone waits
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -225,10 +231,10 @@ class Machine:
             engines_dir=self.engines, held=lambda: self.held, run=self.run, poll_s=0.05,
         )
 
-    def installer(self, server: Optional[VllmServer] = None, latest: str = V1) -> Installer:
+    def installer(self, server: Optional[VllmServer] = None, latest: str = V1, switch_timeout_s: float = 30) -> Installer:
         return Installer(
             FakeSource(self, latest), self.engine_dir, server or self.server(),
-            http_transport=httpx.MockTransport(lambda request: httpx.Response(404)), switch_timeout_s=30,
+            http_transport=httpx.MockTransport(lambda request: httpx.Response(404)), switch_timeout_s=switch_timeout_s,
         )
 
     def settings(self, **more) -> Settings:
@@ -366,6 +372,126 @@ async def test_an_agent_of_auto_is_an_agent_of_the_engine_it_chose_and_says_so(m
     assert facts["engine"]["name"] == "vllm" and facts["engine"]["install"]["engine"] == "vllm"
 
 
+GLIBC_SET = dataclasses.replace(SET, glibc="2.31")
+
+
+@pytest.mark.parametrize("glibc, engine, reasons", [
+    ("2.35", "vllm", []),
+    ("2.31", "vllm", []),
+    ("2.28", "ollama", ["vLLM's wheels need glibc 2.31 or later, and this machine has 2.28"]),  # RHEL 8
+    (None, "ollama", ["vLLM's wheels need glibc 2.31 or later, and this machine's C library is not glibc"]),
+])
+def test_auto_chooses_vllm_only_where_the_newest_sets_glibc_runs(glibc, engine, reasons, monkeypatch):
+    """R7: every install of a set whose wheels need a newer glibc is refused, for ever — so `auto`
+    must not choose vLLM there."""
+    monkeypatch.setattr(vllm_install, "machine_glibc", lambda: glibc)  # the C library this machine has
+    assert choose_engine(facts_of(), python="3.12", sets=[GLIBC_SET]) == {
+        "engine": engine, "reasons": reasons,
+    }
+
+
+def test_auto_names_its_python_as_the_installer_does(monkeypatch):
+    """A free-threaded interpreter, say, which the installer names apart, has no set: not vLLM."""
+    monkeypatch.setattr(vllm_install, "this_python", lambda: "3.13t")
+    assert agent_app.this_python() == "3.13t"
+    assert choose_engine(facts_of(), sets=[SET]) == {
+        "engine": "ollama", "reasons": ["the agent carries no vLLM set for Python 3.13t on x86_64"],
+    }
+
+
+# --- an `auto` agent whose cards could not be read as it started (R6) ---
+
+NVIDIA_SAYS = {
+    " ".join(facts_module.NVIDIA_CARDS): "NVIDIA RTX A6000, 49140\n",
+    " ".join(facts_module.NVIDIA_DETAILS): "8.6, 580.65.06\n",
+}
+
+
+def linux(answers: dict, *, driver: bool = True, asked: Optional[list] = None) -> Probes:
+    """A Linux machine as the facts look at it: `nvidia-smi` answering `answers`, and the NVIDIA
+    driver's own file where `driver`."""
+    def run(command):
+        if asked is not None:
+            asked.append(list(command))
+        return answers.get(" ".join(command))
+
+    return Probes(system=lambda: "Linux", machine=lambda: "x86_64", run=run,
+                  read=lambda path: "NVRM version: 580.65.06" if driver and path == agent_app.NVIDIA_DRIVER_FILE else None)
+
+
+def test_cards_that_could_not_be_read_as_it_started_are_asked_again_patiently(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_app, "this_python", lambda: "3.12")
+    asked: list = []
+    choice = agent_app.choose_at_start(linux({}), str(tmp_path), sets=[SET], patient=linux(NVIDIA_SAYS, asked=asked),
+                                       which=lambda name: None)
+    assert choice == {"engine": "vllm", "reasons": []} and asked, "asked again before choosing"
+
+    # A card listed whose details timed out is not read either.
+    names_only = {" ".join(facts_module.NVIDIA_CARDS): NVIDIA_SAYS[" ".join(facts_module.NVIDIA_CARDS)]}
+    choice = agent_app.choose_at_start(linux(names_only), str(tmp_path), sets=[SET], patient=linux(NVIDIA_SAYS),
+                                       which=lambda name: None)
+    assert choice == {"engine": "vllm", "reasons": []}
+
+
+@pytest.mark.parametrize("recorded, engine", [("vllm", "vllm"), ("ollama", "ollama"), (None, "ollama")])
+def test_cards_still_unread_keep_the_engine_chosen_before_or_choose_ollama_saying_why(tmp_path, monkeypatch,
+                                                                                     recorded, engine):
+    monkeypatch.setattr(agent_app, "this_python", lambda: "3.12")
+    choice = agent_app.choose_at_start(linux({}), str(tmp_path), recorded=recorded, sets=[SET], patient=linux({}),
+                                       which=lambda name: None)
+    assert choice["engine"] == engine
+    (why,) = choice["reasons"]
+    assert "its cards could not be read" in why
+    assert (f"{recorded}, which this agent chose when it last started, is kept" in why) if recorded else (
+        "has chosen no engine before" in why)
+
+
+def test_a_machine_without_an_nvidia_driver_is_not_asked_again(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_app, "this_python", lambda: "3.12")
+    asked: list = []
+    choice = agent_app.choose_at_start(linux({}, driver=False), str(tmp_path), sets=[SET],
+                                       patient=linux(NVIDIA_SAYS, asked=asked), which=lambda name: None)
+    assert choice == {"engine": "ollama", "reasons": ["no NVIDIA card"]} and asked == []
+    # `nvidia-smi` on the PATH says a driver is there just as well.
+    choice = agent_app.choose_at_start(linux({}, driver=False), str(tmp_path), sets=[SET],
+                                       patient=linux(NVIDIA_SAYS, asked=asked), which=lambda name: "/usr/bin/nvidia-smi")
+    assert choice == {"engine": "vllm", "reasons": []} and asked
+
+
+async def test_an_auto_agent_that_cannot_read_its_cards_keeps_the_engine_it_ran(machine, monkeypatch):
+    """Taken for "no card", the slow look would hand the port to Ollama and fetch every model again."""
+    monkeypatch.setattr(agent_app, "this_python", lambda: "3.12")
+    chose_before(machine, "vllm")
+    app = create_app(machine.settings(engine="auto"), probes=linux({}), patient_probes=linux({}), vllm_sets=[SET],
+                     installer=machine.installer())
+    choice = (await call(app, "GET", "/agent/v1/facts")).json()["engine"]["choice"]
+    assert choice["engine"] == "vllm" and "is kept" in choice["reasons"][0]
+    assert app.state.installer.engine_dir == machine.engine_dir
+
+
+# --- how long one switch can take (R1) ---
+
+
+async def test_the_install_facts_say_how_long_one_switch_can_take(machine):
+    """The pool waits this long for a switch before it judges it: sized for a switch that fails —
+    stopped, started and waited for, then stopped again and the version before started and waited
+    for, all within one switch."""
+    bound = vllm_server.switch_bound_s()
+    stop, launch, start = vllm_server.STOP_TIMEOUT_S, vllm_server.LAUNCH_TIMEOUT_S, vllm_server.START_TIMEOUT_S
+    assert bound >= 2 * (stop + launch + start) > stop + launch + start == 2160, "a failed switch: two starts"
+    facts = (await call(create_app(machine.settings()), "GET", "/agent/v1/facts")).json()
+    assert facts["engine"]["install"]["switch_bound_s"] == bound == agent_app.switch_bound_s("vllm", start)
+
+    for engine in ("ollama", "whisper-cpp"):
+        posix = agent_app.switch_bound_s(engine, installs.SWITCH_TIMEOUT_S, os_name=host_platform.LINUX)
+        # Its start's wait twice, with each stop's grace and the stop it is made to after.
+        assert posix >= 2 * (installs.SWITCH_TIMEOUT_S + 2 * host_platform.STOP_GRACE_S)
+        assert agent_app.switch_bound_s(engine, installs.SWITCH_TIMEOUT_S, os_name=host_platform.WINDOWS) > posix, "taskkill"
+    assert Installer(FakeSource(machine), machine.engine_dir, machine.server(), switch_bound_s=99.0).state()[
+        "switch_bound_s"] == 99.0
+    assert installs.not_allowed("vllm")["switch_bound_s"] is None
+
+
 async def test_an_agent_that_names_its_engine_reports_no_choice(machine):
     facts = (await call(create_app(machine.settings(), installer=machine.installer()), "GET", "/agent/v1/facts")).json()
     assert "choice" not in facts["engine"]
@@ -428,10 +554,13 @@ async def test_it_starts_the_installed_program_through_its_own_launcher_with_the
 
     assert await server.start(program, V1, 30) is None
     (launcher, env), = machine.ran
+    models_file = machine.engine_dir / vllm_server.MODELS_FILE
     assert launcher == [
         sys.executable, "-P", "-m", "gpm_agent.cli", "vllm-start", "--models-dir", str(machine.models),
         "--port", str(machine.port), "--vllm", str(program), "--engines-dir", str(machine.engines),
+        "--models-from", str(models_file),
     ], "one model: no router"
+    assert json.loads(models_file.read_text()) == [CHAT], "the models it holds, in the agent's own file"
     assert {k: env[k] for k in numbers} == numbers
     assert not {"HF_TOKEN", "SOME_SERVICE_TOKEN", "GITHUB_TOKEN", "PYTHONPATH"} & set(env)
 
@@ -465,7 +594,7 @@ async def test_the_pools_numbers_through_the_restart_verb_reach_the_next_start(m
 
     answer = (await call(app, "POST", "/agent/v1/engine", {"settings": {"workers": 4, "models_held": 1, "context": 8192}})).json()
     assert answer["settings_written"] is True and answer["engine_answers"] is False
-    assert answer["restart_output"].startswith(f"vllm {V1} is not started yet: waiting for the pool")
+    assert answer["restart_output"].startswith(f"vllm {V1} is not serving: waiting for the pool")
     facts = (await call(app, "GET", "/agent/v1/facts")).json()
     assert facts["engine_settings"] == {"workers": 4, "models_held": 1, "context": 8192}
     assert facts["allows"]["restart"] is True and facts["allows"]["engine_settings"] is True
@@ -684,7 +813,7 @@ async def test_a_start_where_nothing_serves_is_said_for_each_model_and_not_tried
     launches = len(machine.launches())
     assert await server.start(program, V1, 30) is None
     assert len(machine.launches()) == launches
-    assert f"served none of {CHAT}" in server.waiting and why in server.waiting
+    assert f"did not serve {CHAT}" in server.waiting and why in server.waiting
 
     # Stopped and started again — an operator's restart, a switch — it is tried again.
     machine.behave(CHAT)
@@ -708,6 +837,157 @@ async def test_a_first_version_whose_one_model_will_not_start_is_kept_and_tried_
     machine.behave(CHAT)
     assert await installer.restart() is None
     assert await machine.serving() == {CHAT}
+
+
+async def test_a_set_the_launcher_refuses_is_the_models_failure_and_a_first_version_is_kept(machine):
+    """R2: the launcher refuses the set as the pool configured it — here split across two cards
+    on a machine whose driver lists none; in the field, a set larger than the card. Not the
+    version's failure: a first install keeps its vLLM, and a restart with the numbers fixed serves."""
+    machine.downloaded(CHAT)
+    machine.held = [CHAT]
+    installer = machine.installer(latest=V1)
+    installer.server.set_pool_environment({"GPM_VLLM_CARDS_PER_COPY": "2"})
+    await installer.want("latest", False)
+    await installer.finished()
+    assert installer.record.running == V1 and installer.record.failed == {} and installer.record.error is None
+    assert "split across 2 cards" in installer.server.waiting
+
+    # Not started again for the same models, look after look: each start holds the card.
+    launches = len(machine.launches())
+    for _ in range(2):
+        await installer.ensure_running()
+    assert len(machine.launches()) == launches
+
+    # The pool's numbers fixed, through the restart verb's store: a restart serves.
+    installer.server.set_pool_environment({})
+    assert await installer.restart() is None
+    assert await machine.serving() == {CHAT} and installer.server.waiting is None
+
+
+async def test_a_launcher_that_starts_nothing_is_the_models_failure(machine):
+    """R2: the launcher found none of the models complete when it looked — one removed meanwhile."""
+    program = machine.install(V1)
+    machine.downloaded(CHAT)
+    machine.held = [CHAT]
+    server = machine.server()
+    runner = server.run
+
+    async def removed_meanwhile(argv, **options):
+        if "vllm-start" in argv:
+            shutil.rmtree(modelhub.directory_for(machine.models, CHAT))
+        return await runner(argv, **options)
+
+    server.run = removed_meanwhile
+    assert await server.start(program, V1, 30) is None
+    assert "the launcher started none of the models" in server.waiting
+
+
+async def test_a_start_that_does_not_serve_in_time_is_left_running_and_kept(machine):
+    """R2: the wait for it to serve runs out. Not the version's failure — a first install keeps its
+    vLLM — and what was started is left running: it may yet serve, and is loading meanwhile."""
+    machine.downloaded(CHAT)
+    machine.held = [CHAT]
+    machine.behave(CHAT, silent=True)
+    installer = machine.installer(latest=V1, switch_timeout_s=1)
+    await installer.want("latest", False)
+    await installer.finished()
+    assert installer.record.running == V1 and installer.record.failed == {} and installer.record.error is None
+    (started,) = machine.starts()
+    assert not gone(started["pid"]) and installer.server.ours(fresh=True), "left running"
+    assert "did not serve within 1s" in installer.server.waiting
+    facts = await VllmFacts(machine.settings()).describe(machine.client())
+    assert facts["models_loading"] == [CHAT] and facts["models_failed"] == {}
+
+    launches = len(machine.launches())
+    await installer.ensure_running()
+    assert len(machine.launches()) == launches, "running: not started over"
+
+
+async def test_a_start_that_could_not_begin_is_still_a_problem(machine):
+    """What keeps a start from beginning is still said as a problem: a program the launcher will
+    not run (its exit 2), or one that is not there."""
+    machine.downloaded(CHAT)
+    machine.held = [CHAT]
+    server = machine.server()
+    outside = machine.write_program(machine.root / "elsewhere" / "vllm", V1)
+    said = await server.start(outside, V1, 10)
+    assert said.startswith("its launcher did not start it") and "not inside this agent's engines directory" in said
+    assert (await server.start(machine.root / "missing" / "vllm", V1, 10)).endswith("is not there")
+    assert machine.starts() == []
+
+
+# --- every engine behind the router crashing after serving (R3) ---
+
+
+async def serving_both(machine: Machine):
+    """An agent running vLLM for two models — behind the router — once both serve."""
+    machine.downloaded(CHAT)
+    machine.downloaded(SPEECH)
+    installer = machine.installer()
+    await installer.want("latest", False)
+    await installer.finished()
+    app = create_app(machine.settings(), installer=installer)
+    await call(app, "PUT", "/agent/v1/models", {"tags": [CHAT, SPEECH], "residency": "pinned"})
+    await app.state.look()
+    return installer, app
+
+
+async def test_engines_that_crash_behind_their_router_after_serving_are_started_again(machine):
+    installer, app = await serving_both(machine)
+    assert await machine.serving() == {CHAT, SPEECH}
+    launches = len(machine.launches())
+    for start in machine.starts():
+        os.kill(start["pid"], signal.SIGKILL)  # a driver reset, a process killed for memory
+    for start in machine.starts():
+        await wait_until(lambda pid=start["pid"]: gone(pid))
+    assert installer.server.ours(fresh=True), "the router lives on"
+    failed = (await call(app, "GET", "/agent/v1/facts")).json()["engine"]["models_failed"]
+    assert set(failed) == {CHAT, SPEECH} and all("exited after serving it" in why for why in failed.values())
+
+    await app.state.look()
+    assert len(machine.launches()) == launches + 1
+    for _ in range(200):
+        if await machine.serving() == {CHAT, SPEECH}:
+            break
+        await asyncio.sleep(0.05)
+    assert await machine.serving() == {CHAT, SPEECH}
+
+
+async def test_a_start_behind_the_router_that_never_served_is_not_started_again(machine):
+    for model in (CHAT, SPEECH):
+        machine.behave(model, exit="ValueError: no room for the cache")
+    installer, app = await serving_both(machine)
+    assert installer.server.ours(fresh=True) and await machine.serving() == set(), "the router alone"
+    launches = len(machine.launches())
+    for _ in range(3):
+        await app.state.look()
+    assert len(machine.launches()) == launches, "said for each model; not started again for them"
+
+
+# --- only the models it holds (R4) ---
+
+
+async def test_only_the_models_it_holds_are_started_never_one_it_no_longer_holds(machine):
+    """The pool swaps one model for another on a card that holds one (on a 48 GB card, two 20 GB
+    models would not fit together): the new one alone is started once it lands, though the old
+    one is still on disk."""
+    machine.downloaded(CHAT)
+    installer = machine.installer()
+    await installer.want("latest", False)
+    await installer.finished()
+    app = create_app(machine.settings(), installer=installer)
+    await call(app, "PUT", "/agent/v1/models", {"tags": [CHAT], "residency": "pinned"})
+    await app.state.look()
+    assert await machine.serving() == {CHAT}
+
+    machine.downloaded(SPEECH)
+    await call(app, "PUT", "/agent/v1/models", {"tags": [SPEECH], "residency": "pinned"})
+    await app.state.look()
+    assert await machine.serving() == {SPEECH}
+    assert [start["model"] for start in machine.starts()] == [CHAT, SPEECH], "the one it no longer holds: not started"
+    assert "--proxy" not in machine.launches()[-1]
+    assert json.loads((machine.engine_dir / vllm_server.MODELS_FILE).read_text()) == [SPEECH]
+    assert modelhub.directory_for(machine.models, CHAT).is_dir(), "still on disk, for the operator to remove"
 
 
 # --- `auto` choosing again: the engine it ran before is handed over ---
@@ -893,19 +1173,83 @@ def test_the_helpers_run_the_agent_as_the_launcher_was_run(monkeypatch):
 
 
 def test_a_listed_process_that_is_no_longer_the_launchers_is_never_signalled(tmp_path):
-    """After a reboot the numbers in the launcher's list belong to the owner's own programs."""
-    state = vllm_launch.state_dir_for(tmp_path)
+    """After a reboot the numbers in the launcher's list belong to the owner's own programs. Only
+    the exact shapes the launcher starts, for this models directory, are its own (R5)."""
+    models = tmp_path / "models"
+    models.mkdir()
+    state = vllm_launch.state_dir_for(models)
     state.mkdir()
-    (state / vllm_launch.PIDS_FILE).write_text(json.dumps([4001, 4002, 4003]))
+    listed = [4001, 4002, 4003, 5001, 5002, 5003, 5004, 5005, 5006, 5007, 5008]
+    (state / vllm_launch.PIDS_FILE).write_text(json.dumps(listed))
+    upstreams = state / vllm_launch.UPSTREAMS_FILE
     lines = {
-        4001: b"/e/vllm/8000/0.31.0/venv/bin/vllm\0serve\0/m/a",
-        4002: b"/usr/bin/python3\0-m\0gpm_agent.cli\0proxy\0--upstreams\0/m.gpm-state/u.json",
-        4003: b"/usr/bin/vim\0notes.txt",
+        # What the launcher starts here: an engine, the router and the helper, by their own lines.
+        4001: f"/usr/bin/python3\0/e/vllm/8000/0.31.0/venv/bin/vllm\0serve\0{models}/acme__chat\0--port\08001\0".encode(),
+        4002: f"/usr/bin/python3\0-P\0-m\0gpm_agent.cli\0proxy\0--upstreams\0{upstreams}\0--host\0127.0.0.1\0--port\08000\0".encode(),
+        4003: f"/usr/bin/python3\0-P\0-m\0gpm_agent.cli\0vllm-in-turn\0--models-dir\0{models}\0".encode(),
+        # Everything else — numbers handed on since. The review's examples first.
+        5001: b"/home/o/venvs/mine/bin/python\0/home/o/venvs/mine/bin/vllm\0serve\0meta/llama\0--port\09000\0",
+        5002: b"/usr/bin/vim\0/home/o/notes/vllm-tuning.md\0",
+        5003: b"/usr/bin/python3\0-I\0-m\0gpm_agent.cli\0--config\0/home/o/.config/gpm/agent-vllm.json\0serve\0",
+        5004: f"/usr/bin/python3\0-P\0-m\0gpm_agent.cli\0vllm-start\0--models-dir\0{models}\0--port\08000\0".encode(),
+        5005: b"/usr/bin/tail\0-f\0/home/o/.local/share/gpm/engines/vllm/8000/logs/launcher.log\0",
+        # The owner's own vLLM of another models directory, and another agent's router and helper.
+        5006: f"/usr/bin/python3\0/opt/vllm/bin/vllm\0serve\0{tmp_path / 'other'}/acme__chat\0".encode(),
+        5007: f"/usr/bin/python3\0-m\0gpm_agent.cli\0proxy\0--upstreams\0{tmp_path}/other.gpm-state/{vllm_launch.UPSTREAMS_FILE}\0".encode(),
+        5008: f"/usr/bin/python3\0-m\0gpm_agent.cli\0vllm-in-turn\0--models-dir\0{tmp_path / 'other'}\0".encode(),
     }
     killed = []
-    vllm_launch.stop_previous(tmp_path, kill=lambda pid, sig: killed.append(pid), alive=lambda pid: pid not in killed,
+    vllm_launch.stop_previous(models, kill=lambda pid, sig: killed.append(pid), alive=lambda pid: pid not in killed,
                               cmdline=lines.get, grace_s=0)
-    assert killed == [4001, 4002]
+    assert killed == [4001, 4002, 4003]
+
+    # As `ps` prints them, joined by spaces, where there is no /proc (a test machine).
+    (state / vllm_launch.PIDS_FILE).write_text(json.dumps(listed))
+    joined = {pid: line.replace(b"\0", b" ").strip() for pid, line in lines.items()}
+    killed.clear()
+    vllm_launch.stop_previous(models, kill=lambda pid, sig: killed.append(pid), alive=lambda pid: pid not in killed,
+                              cmdline=joined.get, grace_s=0)
+    assert killed == [4001, 4002, 4003]
+
+
+def test_nothing_recorded_under_another_boot_is_signalled(tmp_path, monkeypatch):
+    """Linux says which boot this is: a number recorded under another names nothing the launcher
+    started, whatever runs with it now — even an engine of this models directory (R5)."""
+    models = tmp_path / "models"
+    chat_dir = modelhub.directory_for(models, CHAT)
+    chat_dir.mkdir(parents=True)
+    state = vllm_launch.state_dir_for(models)
+    state.mkdir()
+    (state / vllm_launch.PIDS_FILE).write_text("[4001]")
+    record = {"boot_id": "boot-before", "engines": [{"model": CHAT, "pid": 4001}], "in_turn": None, "proxy": None}
+    (state / vllm_launch.STARTED_FILE).write_text(json.dumps(record))
+    line = {4001: f"/usr/bin/python3\0/e/vllm\0serve\0{chat_dir}\0".encode()}
+    killed = []
+    vllm_launch.stop_previous(models, kill=lambda pid, sig: killed.append(pid), alive=lambda pid: True,
+                              cmdline=line.get, grace_s=0, gone_s=0, boot=lambda: "boot-now")
+    assert killed == [] and not (state / vllm_launch.PIDS_FILE).exists()
+
+    # The same boot — or a record from before boots were recorded — is judged by its command line.
+    for recorded in ("boot-now", None):
+        (state / vllm_launch.PIDS_FILE).write_text("[4001]")
+        (state / vllm_launch.STARTED_FILE).write_text(json.dumps({**record, "boot_id": recorded}))
+        vllm_launch.stop_previous(models, kill=lambda pid, sig: killed.append(pid), alive=lambda pid: pid not in killed,
+                                  cmdline=line.get, grace_s=0, gone_s=0, boot=lambda: "boot-now")
+        assert killed == [4001]
+        killed.clear()
+
+    # Nor does the agent take such a record for its vLLM running, nor its models for failed.
+    engine_dir = tmp_path / "engine"
+    engine_dir.mkdir()
+    (engine_dir / vllm_server.RECORD_FILE).write_text(json.dumps(
+        {"version": V1, "program": "/e/vllm", "models": [CHAT], "argv": [], "port": 8000}))
+    (state / vllm_launch.STARTED_FILE).write_text(json.dumps({**record, "engines": [{"model": CHAT, "pid": 4001}]}))
+    server = VllmServer(engine_dir, engine_url="http://127.0.0.1:8000", models_path=str(models),
+                        client=httpx.AsyncClient(), engines_dir=tmp_path)
+    monkeypatch.setattr(vllm_state, "boot_id", lambda path=None: "boot-now")
+    assert server._launched() == [] and vllm_state.failed_engines(models, []) == {}
+    monkeypatch.setattr(vllm_state, "boot_id", lambda path=None: "boot-before")
+    assert server._launched() == [(4001, "engine")]
 
 
 def test_vllm_stop_with_nothing_started_is_not_an_error(tmp_path, capsys):
@@ -921,14 +1265,36 @@ def test_the_pools_numbers_are_named_as_the_launcher_reads_them():
     assert set(VllmFacts().launch_environment(8, 1, 4096, cards_per_copy=2)) <= set(vllm_server.POOL_NAMES)
 
 
-def test_the_agent_that_answers_the_pool_never_imports_the_launcher():
-    """D63: the launcher starts processes; the agent runs it as a program of its own."""
-    done = subprocess.run(
-        [sys.executable, "-c", "import sys, gpm_agent.app, gpm_agent.vllm_server; "
-                               "print('gpm_agent.vllm_launch' in sys.modules)"],
-        env={**os.environ, "PYTHONPATH": AGENT_SRC}, capture_output=True, text=True, timeout=60,
+def test_the_agent_that_answers_the_pool_never_imports_the_launcher(tmp_path):
+    """D63: the launcher starts processes; the agent runs it as a program of its own. The agent is
+    served as `python -m gpm_agent.cli … serve`, the command line the launcher's verbs are on too:
+    run that way, up to the point where it would listen, nothing of the launcher is imported."""
+    config = tmp_path / "agent.json"
+    assert cli.main(["-c", str(config), "init", "--engine", "vllm", "--install-engines",
+                     "--engine-url", "http://127.0.0.1:8000", "--models-path", str(tmp_path / "models")]) == 0
+    written = load(config)
+    written.engines_path = str(tmp_path / "engines")  # nothing of the machine's own
+    save(written, config)
+    serve = (
+        "import runpy, sys, uvicorn\n"
+        "uvicorn.run = lambda app, **options: print('would serve', type(app).__name__)\n"
+        f"sys.argv = ['gpm-agent', '-c', {str(config)!r}, 'serve']\n"
+        "try:\n"
+        "    runpy.run_module('gpm_agent.cli', run_name='__main__', alter_sys=True)\n"
+        "except SystemExit as done:\n"
+        "    assert not done.code, done.code\n"
+        "print('gpm_agent.vllm_launch' in sys.modules)\n"
     )
-    assert done.stdout.strip() == "False", done.stderr
+    done = subprocess.run(
+        [sys.executable, "-c", serve], env={**os.environ, "PYTHONPATH": AGENT_SRC},
+        capture_output=True, text=True, timeout=60, cwd=tmp_path,
+    )
+    assert done.stdout.split() == ["would", "serve", "Starlette", "False"], done.stdout + done.stderr
+
+    # The launcher's verbs still reach it, their arguments read by the launcher itself.
+    assert cli.main(["vllm-stop", "--models-dir", str(tmp_path / "models")]) == 0
+    with pytest.raises(SystemExit):
+        cli.main(["vllm-start", "--models-dir", str(tmp_path / "models")])  # its --port is required
 
 
 async def test_the_audio_check_asks_the_installed_versions_own_program(machine):

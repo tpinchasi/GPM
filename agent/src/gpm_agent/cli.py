@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import prerequisites, startup, vllm_launch, whisper_cpp
+from . import prerequisites, startup, whisper_cpp
 from . import proxy as proxy_module
 from .settings import AUTO, DEFAULT_PATH, Settings, SettingsError, fingerprint, load, mint_key, save
 
@@ -125,6 +125,18 @@ DEFAULT_MODELS_PATH = {
 DEFAULT_ENGINE_URL = {"whisper-cpp": "http://127.0.0.1:8178"}
 
 
+#: The launcher's verbs (`vllm_launch.run_verb`), each with what it does.
+LAUNCHER_VERBS = {
+    # Run by the machine's own restart script, never over the agent's protocol (D97); by the agent
+    # that runs vLLM itself (D159), as a program of its own.
+    "vllm-start": "start vLLM for the models on disk here, stopping what ran before",
+    # Started by `vllm-start` alone, which hands it the plan on its input (D155).
+    "vllm-in-turn": "(started by vllm-start) start a card's further models one after another",
+    # Run by the agent that runs vLLM itself (D159), as a program of its own.
+    "vllm-stop": "stop what vllm-start last started here",
+}
+
+
 def _proxy(args: Any) -> int:
     proxy_module.serve(args.upstreams, host=args.host, port=args.port)
     return 0
@@ -183,25 +195,20 @@ def main(argv: list[str] | None = None) -> int:
     startup.add_verbs(verbs)
     prerequisites.add_verbs(verbs)
 
-    # Run by the machine's own restart script, never over the agent's protocol (D97).
-    start = verbs.add_parser(
-        "vllm-start", help="start vLLM for the models on disk here, stopping what ran before"
-    )
-    vllm_launch.add_arguments(start)
-    start.set_defaults(run=vllm_launch.main)
-    # Started by `vllm-start` alone, which hands it the plan on its input (D155).
-    in_turn = verbs.add_parser(
-        "vllm-in-turn", help="(started by vllm-start) start a card's further models one after another"
-    )
-    in_turn.add_argument("--models-dir", required=True)
-    in_turn.set_defaults(run=vllm_launch.main_in_turn)
-    # Run by the agent that runs vLLM itself (D159), as a program of its own: the agent's process
-    # never imports the launcher (D63).
-    stop = verbs.add_parser("vllm-stop", help="stop what vllm-start last started here")
-    vllm_launch.add_stop_arguments(stop)
-    stop.set_defaults(run=vllm_launch.main_stop)
+    # The launcher's verbs. Their arguments are the launcher's own, read by it: this module is
+    # what `gpm-agent serve` runs too, and the agent that answers the pool never imports the
+    # launcher, which starts processes (D63) — it is imported only once one of these is chosen.
+    for verb, about in LAUNCHER_VERBS.items():
+        launcher = verbs.add_parser(verb, help=about, add_help=False)
+        launcher.set_defaults(launcher_verb=verb)
 
-    args = parser.parse_args(argv)
+    args, rest = parser.parse_known_args(argv)
+    if getattr(args, "launcher_verb", None) is not None:
+        from . import vllm_launch
+
+        return vllm_launch.run_verb(args.launcher_verb, rest)
+    if rest:
+        parser.error(f"unrecognized arguments: {' '.join(rest)}")
     try:
         return args.run(args)
     except SettingsError as problem:
