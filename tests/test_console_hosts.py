@@ -124,5 +124,7 @@ def test_the_auto_line_reads_a_missing_or_partial_choice_and_a_silent_agents_las
         assert line({"engine_choice": {"engine": "vllm"}}) == "auto"
         assert line({"engine_choice": {"engine": "ollama", "reasons": "not a list"}}) == "auto"
         assert line({"engine_choice": {"engine": "ollama", "reasons": [7, "old card"]}}) == "auto: not vLLM — old card"
+        kept = "its cards could not be read as it started; kept vllm, chosen at its last start"
+        assert line({"engine_choice": {"engine": "vllm", "reasons": [kept]}}) == f"auto — {kept}", "never 'not vLLM'"
         assert line({"engine_choice": {"engine": "vllm", "reasons": [], "said_now": False}}) == (
             "auto: vllm, as its agent last said — it is silent now")

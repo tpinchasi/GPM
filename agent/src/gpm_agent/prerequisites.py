@@ -418,13 +418,14 @@ def run(
 AUTO = "auto"
 
 
-def auto_choice(models_path: str, probes: Any = None) -> tuple[str, list[str]]:
+def auto_choice(models_path: str, probes: Any = None, vllm: Optional[ForVllm] = None) -> tuple[str, list[str]]:
     """The engine an agent of `auto` would choose on this machine as it starts, and every reason
     against vLLM — made exactly as the agent makes it, from the machine's own facts."""
     from .app import choose_engine  # the agent's own choice; not loaded for any other engine
     from .facts import Probes, gather
 
-    choice = choose_engine(gather(probes or Probes(), models_path))
+    glibc = (vllm or ForVllm.this()).glibc
+    choice = choose_engine(gather(probes or Probes(), models_path), glibc=lambda: glibc)
     return choice["engine"], list(choice["reasons"])
 
 
@@ -433,7 +434,7 @@ def run_for(machine: Machine, settings: Any, *, admin: bool, probes: Any = None,
     first with why not vLLM — a driver to upgrade, a Python the agent carries no set for."""
     engine = settings.engine
     if engine == AUTO:
-        engine, reasons = auto_choice(settings.models_path, probes)
+        engine, reasons = auto_choice(settings.models_path, probes, vllm)
         print(f"engine: auto — on this machine the agent runs {engine}"
               + (f"; not vLLM: {'; '.join(reasons)}" if reasons else ""))
     return run(machine, engine=engine, install_engines=bool(getattr(settings, "install_engines", False)),

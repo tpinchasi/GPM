@@ -484,7 +484,10 @@ function autoEngineLine(host) {
   let text;
   if (!choice || typeof choice.engine !== "string") text = "auto: its agent has not chosen yet";
   else if (choice.said_now === false) text = `auto: ${choice.engine}, as its agent last said — it is silent now`;
-  else text = `auto${reasons.length ? ": not vLLM — " + reasons[0] : ""}`;
+  // A reason under vLLM is why the agent kept it (its cards could not be read as it started), not
+  // why it is not vLLM.
+  else if (!reasons.length) text = "auto";
+  else text = choice.engine === "ollama" ? `auto: not vLLM — ${reasons[0]}` : `auto — ${reasons[0]}`;
   return el("div", { class: "muted", title: reasons.join("\n") }, text);
 }
 
