@@ -14,6 +14,7 @@ from typing import Any, Iterable, Optional
 import httpx
 
 from ..config import AgentConfig
+from .upgrades import SWITCH_MARGIN_S, SWITCH_TIMEOUT_CAP_S, switch_bound
 
 PROTOCOL = "1"
 #: Short on purpose: an agent that does not answer must not stretch the control pass.
@@ -139,26 +140,85 @@ async def delete_model(
         return 502, {"error": "agent_unreachable", "detail": str(exc) or type(exc).__name__}
 
 
+#: How long a restart through the agent is waited on where it says no longer bound: the owner's
+#: command and then the engine answering, each within the agent's `restart_timeout_s` (120 s).
+RESTART_READ_S = 400.0
+#: The pool's own wait ran out: the agent may still be restarting the engine (`restart_engine`).
+OUTCOME_UNKNOWN = 504
+
+
+def restart_read_s(install: Any) -> float:
+    """How long to wait on one restart through this host's agent: where the agent runs its engine
+    itself, as long as it says one start of that engine may take (`switch_bound_s` in
+    `engine.install` — a vLLM loads for many minutes) and a margin, capped; else
+    `RESTART_READ_S`."""
+    bound = switch_bound(install) if isinstance(install, dict) and install.get("allowed") else None
+    if bound is None:
+        return RESTART_READ_S
+    return min(SWITCH_TIMEOUT_CAP_S, max(RESTART_READ_S, bound + SWITCH_MARGIN_S))
+
+
 async def restart_engine(
     agent: AgentConfig, settings: Optional[dict[str, int]],
-    *, transport: Optional[httpx.AsyncBaseTransport] = None,
+    *, read_s: float = RESTART_READ_S, transport: Optional[httpx.AsyncBaseTransport] = None,
 ) -> tuple[int, dict[str, Any]]:
-    """An operator's explicit act (D41). `settings` is numbers or nothing: the pool never sends
-    the engine a variable name, a value as text, or a command. Waits as long as a restart may
-    take — which is why this is never called from the control pass."""
+    """Ask the agent to restart the engine — an operator's restart (D41), or the pool starting an
+    engine its owner installed once its models are on disk (D160). `settings` is numbers or
+    nothing: the pool never sends the engine a variable name, a value as text, or a command.
+    Waits up to `read_s`, as long as a restart may take — so it is only ever awaited in a
+    background task, never in the control pass or a request's handler.
+
+    (status, the agent's answer as an object). A wait that ran out is `OUTCOME_UNKNOWN`: the
+    request reached the agent, and the restart may still be running there."""
     key = agent.key()
     if key is None:
         return 503, {"error": "agent_key_missing", "detail": f"environment variable {agent.bearer_env} is not set"}
     try:
         async with httpx.AsyncClient(
             base_url=agent.url, verify=agent.verify, transport=transport,
-            timeout=httpx.Timeout(connect=2.0, read=400.0, write=10.0, pool=2.0),
+            timeout=httpx.Timeout(connect=2.0, read=read_s, write=10.0, pool=2.0),
             headers={"Authorization": f"Bearer {key}"},
         ) as client:
             response = await client.post(f"/agent/v{PROTOCOL}/engine", json={"settings": settings})
-        return response.status_code, response.json()
+        answer = response.json()
+    except httpx.ReadTimeout:
+        return OUTCOME_UNKNOWN, {"error": "no_answer_in_time",
+                                 "detail": f"the agent did not answer in {read_s:g}s; the engine may still be restarting"}
     except (httpx.HTTPError, ValueError) as exc:
         return 502, {"error": "agent_unreachable", "detail": str(exc) or type(exc).__name__}
+    if not isinstance(answer, dict):
+        # The host is not trusted: an answer of the wrong shape is no answer, never an exception.
+        return 502, {"error": "bad_answer", "detail": "the agent's answer was not an object"}
+    return response.status_code, answer
+
+
+def printable(text: Any, limit: int = 300) -> str:
+    """What an agent said, fit for an event: printable characters only, and the end of it when
+    long — where a command's output says what went wrong."""
+    flat = "".join(ch if ch.isprintable() else " " for ch in str(text)).strip()
+    return flat if len(flat) <= limit else "…" + flat[-limit:]
+
+
+def restart_outcome(status: int, answer: dict[str, Any]) -> tuple[str, str]:
+    """How a restart through the agent ended, and the agent's words for it: "done" — it ran and
+    the engine answers; "failed" — refused, or its command failed or timed out there; "busy" —
+    another restart holds the agent (`restart_in_progress`); "unknown" — the command ran but the
+    engine did not answer yet, or the pool stopped waiting: it may still be starting."""
+    if status == 200:
+        code = answer.get("restart_exit_code")
+        words = printable(answer.get("restart_output") or "")
+        if isinstance(code, bool) or code != 0:
+            return "failed", (f"its restart command exited {code}" if code is not None
+                              else "its restart command did not finish") + (f": {words}" if words else "")
+        if answer.get("engine_answers") is True:
+            return "done", words
+        return "unknown", "the restart ran, and the engine was not answering yet" + (f": {words}" if words else "")
+    words = printable(answer.get("detail") or answer.get("error") or f"the agent answered {status}")
+    if status == 409 and answer.get("error") == "restart_in_progress":
+        return "busy", words
+    if status == OUTCOME_UNKNOWN:
+        return "unknown", words
+    return "failed", words
 
 
 async def set_engine_version(

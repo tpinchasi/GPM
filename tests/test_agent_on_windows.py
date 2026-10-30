@@ -31,7 +31,7 @@ def windows(outputs=None, memory=(64 * GIB, 40 * GIB), free_gb=300):
 
     def run(command):
         asked.append(list(command))
-        return outputs.get(command[0])
+        return outputs.get(" ".join(command), outputs.get(command[0]))
 
     probes = agent_facts.Probes(
         system=lambda: "Windows",
@@ -45,17 +45,24 @@ def windows(outputs=None, memory=(64 * GIB, 40 * GIB), free_gb=300):
 
 
 def test_a_windows_machine_with_nvidia_cards_is_described_as_linux_would_describe_them():
-    probes, asked = windows({"nvidia-smi": "NVIDIA GeForce RTX 4090, 24564\r\n"})
+    probes, asked = windows({
+        "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits": "NVIDIA GeForce RTX 4090, 24564\r\n",
+        "nvidia-smi --query-gpu=compute_cap,driver_version --format=csv,noheader": "8.9, 581.57\r\n",
+    })
     found = agent_facts.gather(probes, "C:\\Users\\owner\\.ollama\\models")
     assert found["os"] == "Windows" and found["arch"] == "AMD64"
     assert found["memory"] == {"total_bytes": 64 * GIB, "available_bytes": 40 * GIB}
-    assert found["accelerators"] == [
-        {"kind": "cuda", "name": "NVIDIA GeForce RTX 4090", "memory_bytes": 24564 * 1024 * 1024, "unified": False},
-    ]
+    assert found["accelerators"] == [{
+        "kind": "cuda", "name": "NVIDIA GeForce RTX 4090", "memory_bytes": 24564 * 1024 * 1024, "unified": False,
+        "compute_capability": "8.9", "driver": "581.57",
+    }]
     assert found["capabilities"] == ["cuda"]
     assert found["disk"]["free_bytes"] == 300 * 10**9
-    # The same query Linux asks, and nothing else: no rocm-smi, no sysctl.
-    assert asked == [["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"]]
+    # The same queries Linux asks, and nothing else: no rocm-smi, no sysctl.
+    assert asked == [
+        ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+        ["nvidia-smi", "--query-gpu=compute_cap,driver_version", "--format=csv,noheader"],
+    ]
 
 
 def test_without_nvidias_answer_windows_says_it_could_not_tell_rather_than_none():

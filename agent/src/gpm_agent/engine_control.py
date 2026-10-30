@@ -7,8 +7,10 @@ sends is numbers**: a closed set of bounded integers, turned into the engine's e
 variables *here*, and written to a file whose path the owner chose. No text from the pool is
 ever written to disk or put in a process's environment.
 
-And it only happens when an operator asks. A restart drops whatever the engine is doing, so
-it is never something the pool's control loop does on its own.
+And it happens only when an operator asks — or when the pool starts an engine that serves only
+what it was started with and serves none of what it holds yet, once its models are on disk and
+nothing is in flight there (D160). A restart drops whatever the engine is doing, so the pool's
+control loop never restarts an engine that serves its set.
 
 **An engine the agent runs itself** (D150, `install_engines`) needs no owner's command: the
 numbers are stored in the agent's own directory for that engine, and the agent stops its own
@@ -156,14 +158,21 @@ class EngineControl:
                 changed = self.installer.server.set_pool_environment(self.engine.launch_environment(**wanted))
             problem = await self.installer.restart()
         running = self.installer.record.running
+        # vLLM is started only once every model it holds is on disk (D159): until then a restart
+        # stores the numbers, stops what ran, and starts nothing yet. And a start in which no model
+        # serves is the models' failure, not the version's: the restart happened, and nothing is
+        # served. Either is said, never claimed served.
+        waiting = getattr(self.installer.server, "waiting", None) if problem is None else None
         return {
             "settings_written": changed,
             "applied": self.applied(),
             "restart_exit_code": 0 if problem is None else None,
             "restart_output": (
-                f"the agent started {self.engine.name} {running} again" if problem is None else problem
+                problem if problem is not None
+                else f"{self.engine.name} {running} is not serving: {waiting}" if waiting
+                else f"the agent started {self.engine.name} {running} again"
             ),
-            "engine_answers": problem is None,
+            "engine_answers": problem is None and not waiting,
         }
 
     async def _restart(self) -> tuple[Optional[int], str]:

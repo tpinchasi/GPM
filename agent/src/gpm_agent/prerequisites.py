@@ -10,6 +10,15 @@ they are installed once, here, at a terminal, by the person who owns the machine
 - **A compiler**, where this agent builds whisper.cpp from source (D152): on macOS Xcode's
   command-line tools — whose installer is a dialog, so it is only named; on Linux a C++ compiler,
   `make` and `cmake`, through `sudo`. Windows takes whisper.cpp's own builds and needs none.
+- **For vLLM**, where this agent installs it (D157, Linux only): Python's `venv` for the agent's
+  own interpreter, which makes each version's environment (`python3.<minor>-venv` on Debian and
+  Ubuntu, looked at again once installed); a locked set for that Python and the machine's
+  processor; a glibc as new as the newest set's wheels need; NVIDIA cards of compute capability
+  7.5 or higher; and an NVIDIA driver at the newest set's floor. All but the first are never
+  installed here — a set comes with a release of the agent, glibc with a newer release of the
+  distribution, a card is hardware, and a driver is the owner's to choose and install, with a
+  restart — only said, with what is needed: the same reasons the installer refuses a version
+  for, so the command it names says why.
 
 What is already there is found first and left alone. `sudo` runs only when the owner said
 `--admin` at a terminal, where it asks for the password itself; otherwise the exact command is
@@ -20,13 +29,22 @@ printed for the owner to run. Every command is an argument list written here, ru
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, Optional
+import platform
+import tempfile
+from pathlib import Path
+from typing import Any, Optional, Sequence
 
+from . import vllm_install
 from .startup import Machine, shown
+from .vllm_install import LockedSet
 
 #: The engine that needs ffmpeg and, when this agent installs it, a compiler.
 NEEDS_FFMPEG = frozenset({"whisper-cpp"})
 BUILT_FROM_SOURCE = frozenset({"whisper-cpp"})
+#: The engine installed into a Python environment of its own, from a locked set (D157, D158).
+IN_AN_ENVIRONMENT = frozenset({"vllm"})
+#: What only a release of the agent, or the machine's owner, can change: said, never installed.
+NEVER_INSTALLED = frozenset({"linux", "vllm set", "glibc", "nvidia card", "nvidia driver"})
 
 #: winget's name for the ffmpeg build it carries — Gyan Doshi's, the one ffmpeg's own download
 #: page points Windows users to — installed for this user, without administrator rights.
@@ -38,10 +56,18 @@ WINGET_FFMPEG = [
 #: Each Linux package manager's names for what is needed. The build (`whisper_build`) runs `c++`,
 #: `make` and `cmake` — cmake from PyPI where the machine has none, in a private environment made
 #: with Python's `venv`, which Debian and Ubuntu ship apart from Python itself (`python3-venv`).
+#: vLLM's environments are made with the agent's own interpreter, whose `venv` is the package of
+#: its own minor version (`python3.12-venv`; `python3-venv` is the default python3's, which may be
+#: another, and is named only where the agent's version is not known) — `packages`. Fedora's
+#: Python carries `venv` and the pip wheel it installs, so dnf has nothing to name for it: a
+#: Python without them there is not the system's, and is said as such.
 LINUX_PACKAGES = {
-    "apt-get": {"ffmpeg": ["ffmpeg"], "compiler": ["g++", "make", "cmake", "python3-venv"]},
+    "apt-get": {"ffmpeg": ["ffmpeg"], "compiler": ["g++", "make", "cmake", "python3-venv"], "venv": ["python3-venv"]},
     "dnf": {"ffmpeg": ["ffmpeg"], "compiler": ["gcc-c++", "make", "cmake"]},
 }
+
+#: `nvidia-smi`'s answer with the driver's version, one line a card.
+NVIDIA_DRIVER = ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"]
 
 #: The programs the build runs, each looked for by the name it runs it by.
 BUILD_PROGRAMS = ("c++", "make", "cmake")
@@ -51,7 +77,33 @@ TITLES = {
     "ffmpeg": "ffmpeg",
     "command-line tools": "Xcode's command-line tools",
     "compiler": "a C++ compiler (c++), make and cmake",
+    "venv": "Python's venv module, for the agent's own Python",
+    "vllm set": "a vLLM set for the agent's Python and this processor",
+    "glibc": "a C library (glibc) as new as vLLM's wheels need",
+    "nvidia card": f"NVIDIA cards vLLM runs on (compute capability {'.'.join(map(str, vllm_install.MIN_CAPABILITY))} or higher)",
+    "nvidia driver": "an NVIDIA driver new enough for vLLM's CUDA",
+    "linux": "Linux, for vLLM",
 }
+
+
+@dataclasses.dataclass(frozen=True)
+class ForVllm:
+    """What a vLLM set must be for: the agent's own Python minor version and the machine's
+    processor — and the sets to choose from, None for the ones the agent carries; and this
+    machine's glibc, which the newest set's wheels must run on (None: its C library is another)."""
+
+    python: str
+    processor: str
+    sets: Optional[Sequence[LockedSet]] = None
+    glibc: Optional[str] = dataclasses.field(default_factory=vllm_install.machine_glibc)
+
+    @classmethod
+    def this(cls) -> "ForVllm":
+        return cls(vllm_install.this_python(), platform.machine())
+
+    def newest(self) -> Optional[LockedSet]:
+        found = vllm_install.sets_for(self.python, self.processor, self.sets)
+        return found[0] if found else None
 
 
 @dataclasses.dataclass
@@ -74,10 +126,12 @@ def needs(engine: str, install_engines: bool, system: str) -> list[str]:
             wanted.append("command-line tools")
         elif system == "Linux":
             wanted.append("compiler")
+    if engine in IN_AN_ENVIRONMENT and install_engines:
+        wanted += ["venv", "vllm set", "glibc", "nvidia card", "nvidia driver"] if system == "Linux" else ["linux"]
     return wanted
 
 
-def found(machine: Machine, need: str) -> Optional[str]:
+def found(machine: Machine, need: str, vllm: Optional[ForVllm] = None) -> Optional[str]:
     """Where `need` is on this machine, or None."""
     if need == "ffmpeg":
         return machine.which("ffmpeg")
@@ -88,26 +142,149 @@ def found(machine: Machine, need: str) -> Optional[str]:
         # As the build looks: `c++` itself — a `g++` without it is refused there.
         programs = [machine.which(name) for name in BUILD_PROGRAMS]
         return ", ".join(str(program) for program in programs) if all(programs) else None
+    if need == "venv":
+        return _venv_works(machine)
+    if need == "linux":
+        return machine.system if machine.system == "Linux" else None
+    vllm = vllm or ForVllm.this()
+    if need == "vllm set":
+        newest = vllm.newest()
+        return f"vLLM {newest.vllm}'s, for Python {vllm.python} on {vllm.processor}" if newest else None
+    if need == "glibc":
+        # A C library other than glibc runs no manylinux wheel, whatever the set.
+        newest = vllm.newest()
+        floor = newest.glibc if newest else None
+        have = vllm_install.driver_key(vllm.glibc)
+        if have is None or (floor is not None and have < (vllm_install.driver_key(floor) or ())):
+            return None
+        return f"glibc {vllm.glibc}" + (f", at or above vLLM {newest.vllm}'s {floor}" if newest and floor else "")
+    if need == "nvidia card":
+        cards = nvidia_cards(machine)
+        if cards is None or vllm_install.card_reasons(cards, minimum=vllm_install.MIN_CAPABILITY):
+            return None
+        return ", ".join(f"{card.get('name')} ({card.get('compute_capability')})" for card in cards)
+    if need == "nvidia driver":
+        have, newest = nvidia_driver(machine), vllm.newest()
+        key = vllm_install.driver_key(have)
+        floor = vllm_install.driver_key(newest.driver_floor) if newest else None
+        if key is None or (floor is not None and key < floor):
+            return None
+        return f"{have}" + (f", at or above vLLM {newest.vllm}'s {newest.driver_floor}" if newest else "")
     raise ValueError(need)
 
 
-def linux_commands(manager: str, missing: list[str]) -> list[list[str]]:
+def _venv_works(machine: Machine) -> Optional[str]:
+    """Whether the agent's own interpreter makes an environment as the installer will — pip
+    included, which Debian and Ubuntu leave out without `python3-venv` — tried in a directory of
+    its own, removed afterwards."""
+    with tempfile.TemporaryDirectory(prefix="gpm-venv-check-") as scratch:
+        ran = machine.run(vllm_install.venv_argv(machine.executable, Path(scratch) / "venv"))
+    return f"{machine.executable} makes one" if ran.ok else None
+
+
+def nvidia_driver(machine: Machine) -> Optional[str]:
+    """The NVIDIA driver's version as `nvidia-smi` says it — None where it does not answer."""
+    ran = machine.run(NVIDIA_DRIVER)
+    if not ran.ok:
+        return None
+    versions = [line.strip() for line in ran.output.splitlines() if vllm_install.driver_key(line.strip())]
+    return versions[0] if versions else None
+
+
+def nvidia_cards(machine: Machine) -> Optional[list[dict[str, Any]]]:
+    """This machine's NVIDIA cards as the agent's facts read them, each with its compute
+    capability — through this machine's commands; None where `nvidia-smi` does not answer."""
+    from .facts import Probes
+    from .facts import nvidia_cards as read
+
+    def answer(argv: Sequence[str]) -> Optional[str]:
+        ran = machine.run(list(argv))
+        return ran.output if ran.ok else None
+
+    return read(Probes(run=answer))
+
+
+def never_installed(machine: Machine, need: str, vllm: ForVllm) -> str:
+    """What to do about something this command never installs, in words for the owner."""
+    if need == "linux":
+        return "vLLM publishes its builds for Linux only: on this machine the agent serves on Ollama"
+    if need == "vllm set":
+        if vllm.processor not in vllm_install.PLATFORMS:
+            return f"vLLM publishes no build for the {vllm.processor} processor"
+        carried = list(vllm_install.load_sets() if vllm.sets is None else vllm.sets)
+        pythons = sorted(
+            {s.python for s in carried if s.platform == vllm.processor}, key=lambda p: tuple(map(int, p.split(".")))
+        )
+        if not pythons:
+            return f"this agent carries no vLLM set for {vllm.processor}: a release of the agent brings them"
+        return (
+            f"this agent runs on {vllm_install.python_named(vllm.python)}, and carries vLLM's sets for Python "
+            f"{', '.join(pythons)} on {vllm.processor}: install it on one of those "
+            f"(`uv tool install --python {pythons[-1]} gpm-agent`)"
+        )
+    newest = vllm.newest()
+    if need == "glibc":
+        floor = newest.glibc if newest else None
+        wanted = f"vLLM {newest.vllm}'s wheels need glibc {floor} or later" if newest and floor else "vLLM's wheels need glibc"
+        where = (
+            "this machine's C library is not glibc" if vllm.glibc is None
+            else f"this machine has glibc {vllm.glibc}"
+        )
+        return (
+            f"{where}, and {wanted}: it comes only with a newer release of the distribution — the agent never "
+            "changes the C library; on this machine `engine: auto` serves on Ollama"
+        )
+    if need == "nvidia card":
+        cards = nvidia_cards(machine)
+        if cards is None:
+            return "nvidia-smi does not answer here, so no NVIDIA card can be seen: the driver below comes first"
+        return (
+            f"{'; '.join(vllm_install.card_reasons(cards, minimum=vllm_install.MIN_CAPABILITY))} — every card the "
+            "machine has counts, even one kept from vLLM (CUDA_VISIBLE_DEVICES); on this machine `engine: auto` "
+            "serves on Ollama"
+        )
+    wanted = f"{newest.driver_floor} or later, which vLLM {newest.vllm}'s CUDA needs" if newest else "a recent one"
+    have = nvidia_driver(machine)
+    where = "no NVIDIA driver answers here (nvidia-smi does not run)" if have is None else f"the NVIDIA driver here is {have}"
+    return (
+        f"{where}: install NVIDIA's driver {wanted}, from the distribution's packages or NVIDIA's own, "
+        "and restart the machine — the agent never installs a driver"
+    )
+
+
+def packages(manager: str, need: str, python: Optional[str] = None) -> list[str]:
+    """`manager`'s packages for `need`. Python's venv on apt is the package of the agent's own
+    minor version (`python` — "3.12"), not the default python3's."""
+    if manager == "apt-get" and need == "venv" and python:
+        return [f"python{python.rstrip('t')}-venv"]
+    return LINUX_PACKAGES[manager][need]
+
+
+def linux_commands(manager: str, missing: list[str], python: Optional[str] = None) -> list[list[str]]:
     """The commands that install `missing` with `manager`, through `sudo`. apt's package lists are
     refreshed first: on a machine fresh from its image they are often empty."""
-    packages = [package for need in missing for package in LINUX_PACKAGES[manager][need]]
+    names = [package for need in missing for package in packages(manager, need, python)]
     if manager == "apt-get":
-        return [["sudo", "apt-get", "update"], ["sudo", "apt-get", "install", "-y", *packages]]
-    return [["sudo", "dnf", "install", "-y", *packages]]
+        return [["sudo", "apt-get", "update"], ["sudo", "apt-get", "install", "-y", *names]]
+    return [["sudo", "dnf", "install", "-y", *names]]
 
 
-def ensure(machine: Machine, *, engine: str, install_engines: bool, admin: bool) -> Report:
-    """Find what `engine` needs here, install what can be, and say what is left."""
+def ensure(
+    machine: Machine, *, engine: str, install_engines: bool, admin: bool, vllm: Optional[ForVllm] = None,
+) -> Report:
+    """Find what `engine` needs here, install what can be, and say what is left. `vllm` is what a
+    vLLM set must be for: the agent's own Python and this processor, unless a test says."""
     report = Report()
     missing = []
-    for need in needs(engine, install_engines, machine.system):
-        where = found(machine, need)
+    wanted = needs(engine, install_engines, machine.system)
+    if vllm is None and any(need in NEVER_INSTALLED for need in wanted):
+        vllm = ForVllm.this()
+    for need in wanted:
+        where = found(machine, need, vllm)
         if where:
             report.present.append((need, where))
+        elif need in NEVER_INSTALLED and vllm is not None:
+            report.still_needed.append((need, never_installed(machine, need, vllm)))
         else:
             missing.append(need)
     if not missing:
@@ -115,7 +292,7 @@ def ensure(machine: Machine, *, engine: str, install_engines: bool, admin: bool)
     if machine.system == "Darwin":
         _darwin(machine, missing, report)
     elif machine.system == "Linux":
-        _linux(machine, missing, report, admin)
+        _linux(machine, missing, report, admin, python=vllm.python if vllm is not None else None)
     elif machine.system == "Windows":
         _windows(machine, missing, report)
     else:
@@ -142,13 +319,20 @@ def _darwin(machine: Machine, missing: list[str], report: Report) -> None:
         report.still_needed.append(("command-line tools", "xcode-select --install   (opens Apple's installer)"))
 
 
-def _linux(machine: Machine, missing: list[str], report: Report, admin: bool) -> None:
+def _linux(machine: Machine, missing: list[str], report: Report, admin: bool, *, python: Optional[str] = None) -> None:
     manager = next((name for name in LINUX_PACKAGES if machine.which(name)), None)
     if manager is None:
         for need in missing:
             report.still_needed.append((need, f"install {TITLES[need]} with this distribution's package manager"))
         return
-    commands = linux_commands(manager, missing)
+    for need in [need for need in missing if need not in LINUX_PACKAGES[manager]]:
+        report.still_needed.append((
+            need, f"install {TITLES[need]} ({machine.executable}) with this distribution's package manager",
+        ))
+    missing = [need for need in missing if need in LINUX_PACKAGES[manager]]
+    if not missing:
+        return
+    commands = linux_commands(manager, missing, python)
     how = "\n      ".join(shown(command, machine.system) for command in commands)
     if manager == "dnf" and "ffmpeg" in missing:
         how += "\n      (on Fedora and its relatives, ffmpeg comes from RPM Fusion, which must be enabled first)"
@@ -164,6 +348,17 @@ def _linux(machine: Machine, missing: list[str], report: Report, admin: bool) ->
                 report.still_needed.append((need, f"{how}\n      (`{shown(command, machine.system)}` failed with {ran.returncode})"))
             return
     for need in missing:
+        if need == "venv" and _venv_works(machine) is None:
+            # Looked at again, as the installer will: a package of that name installed is not an
+            # interpreter that makes an environment, where the agent's is not the distribution's.
+            minor = (python or "").rstrip("t")
+            uv = f" (`uv tool install --python {minor} gpm-agent` puts it on uv's own)" if minor else ""
+            report.still_needed.append((need, (
+                f"`{shown(commands[-1], machine.system)}` ran, and {machine.executable} still makes no environment "
+                f"with pip: it is not the distribution's Python {minor}, whose venv that package is — run the "
+                f"agent with a Python that has venv and pip{uv}"
+            )))
+            continue
         report.installed.append((need, shown(commands[-1], machine.system)))
 
 
@@ -210,11 +405,40 @@ def say(report: Report, *, engine: str, system: str) -> None:
                 print("      (the command above)")
 
 
-def run(machine: Machine, *, engine: str, install_engines: bool, admin: bool) -> int:
+def run(
+    machine: Machine, *, engine: str, install_engines: bool, admin: bool, vllm: Optional[ForVllm] = None,
+) -> int:
     """Install what is missing and say how it went: 0 when nothing is still needed."""
-    report = ensure(machine, engine=engine, install_engines=install_engines, admin=admin)
+    report = ensure(machine, engine=engine, install_engines=install_engines, admin=admin, vllm=vllm)
     say(report, engine=engine, system=machine.system)
     return 1 if report.still_needed else 0
+
+
+#: An engine the agent chooses itself as it starts (D161).
+AUTO = "auto"
+
+
+def auto_choice(models_path: str, probes: Any = None, vllm: Optional[ForVllm] = None) -> tuple[str, list[str]]:
+    """The engine an agent of `auto` would choose on this machine as it starts, and every reason
+    against vLLM — made exactly as the agent makes it, from the machine's own facts."""
+    from .app import choose_engine  # the agent's own choice; not loaded for any other engine
+    from .facts import Probes, gather
+
+    glibc = (vllm or ForVllm.this()).glibc
+    choice = choose_engine(gather(probes or Probes(), models_path), glibc=lambda: glibc)
+    return choice["engine"], list(choice["reasons"])
+
+
+def run_for(machine: Machine, settings: Any, *, admin: bool, probes: Any = None, vllm: Optional[ForVllm] = None) -> int:
+    """`run` for the agent's settings: under `auto`, for the engine it would choose here, said
+    first with why not vLLM — a driver to upgrade, a Python the agent carries no set for."""
+    engine = settings.engine
+    if engine == AUTO:
+        engine, reasons = auto_choice(settings.models_path, probes, vllm)
+        print(f"engine: auto — on this machine the agent runs {engine}"
+              + (f"; not vLLM: {'; '.join(reasons)}" if reasons else ""))
+    return run(machine, engine=engine, install_engines=bool(getattr(settings, "install_engines", False)),
+               admin=admin, vllm=vllm)
 
 
 # --- the command line ---
@@ -225,10 +449,7 @@ def _verb(args: Any) -> int:
     from .startup import settings_path_of
 
     settings = load(settings_path_of(args))
-    return run(
-        Machine.this(), engine=settings.engine,
-        install_engines=bool(getattr(settings, "install_engines", False)), admin=args.admin,
-    )
+    return run_for(Machine.this(), settings, admin=args.admin)
 
 
 def add_verbs(verbs: Any) -> None:
