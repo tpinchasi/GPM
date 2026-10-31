@@ -69,9 +69,15 @@ whole preparation in, and folding them into one number would hide it (D97):
 - A model is **on disk only once every file has landed**: the fetch writes a completion marker
   last and removes it when it starts. A download cut short is a failure the next attempt
   resumes, never a finished model.
-- A model on disk and not yet served is reported **`awaiting_restart`** — not a failed hold.
+- A model on disk and not yet served is reported **`awaiting_restart`** — not a failed hold —
+  unless its start is still on its way: a model whose engine process the launcher started is still
+  running, or that waits its turn on its card while the in-turn helper runs (D155), is reported in
+  **`models_loading`** and is not awaiting a restart, so a pool that lost count — a supervisor
+  restarted mid-start — does not ask for the start again (D160). A model whose process died after
+  its start served is in `models_failed` as having exited after serving it.
 - The engine is started by **`gpm-agent vllm-start`**, run by the machine's own restart script
-  (never over the protocol): one vLLM process on the engine port, or, with the router, one per
+  (never over the protocol) — or, on a machine whose agent installs vLLM, by the agent itself
+  (§2.3, D159): one vLLM process on the engine port, or, with the router, one per
   model on the ports above it with the card's memory split by weight size (floored at a tenth,
   so a small model can still start) and the router on the engine port. It stops what it started
   last time first, so starting again is a restart. **The models on one card start one after
@@ -244,8 +250,9 @@ The pool names a model, in a header. It never names a port, a path or a command.
 
 On a machine its owner gives it — `install_engines: true` in the agent's own settings, which
 `gpm-agent init --install-engines` writes and the pool cannot change — the agent installs the
-engine it manages, runs it, and keeps it at the version the pool asks for. Hosts the pool rents
-are unchanged: their engine comes with the image.
+engine it manages (Ollama, whisper.cpp, and on Linux with an NVIDIA card vLLM), runs it, and keeps
+it at the version the pool asks for. Hosts the pool rents are unchanged: their engine comes with
+the image.
 
 **It runs the engine itself**, as it runs whisper.cpp's server (D148): `ollama serve` on
 loopback at the engine URL's port, with the models directory and the pool's numbers (workers,
@@ -267,17 +274,18 @@ beside it (`ollama.log.1`, likewise `whisper-server.log.1`), its last 20 MB at m
 
 **Its environment is a list, never everything less a few.** A program the agent starts — Ollama,
 whisper.cpp's server and its `--help` check, the build's `cmake`, pip, and the build's looks at
-`xcode-select` and `nvidia-smi` — is given of the agent's own environment only `PATH`, `HOME`, `USER`, `LOGNAME`,
+`xcode-select` and `nvidia-smi`, and the check whether a vLLM version's interpreter imports its
+audio extra — is given of the agent's own environment only `PATH`, `HOME`, `USER`, `LOGNAME`,
 `SHELL`, `LANG`, `LC_*`, `TMPDIR`, `TMP`, `TEMP` and `TZ` (on Windows also `SystemRoot`,
 `SystemDrive`, `windir`, `LOCALAPPDATA`, `APPDATA`, `USERPROFILE`, `ProgramData`, `PATHEXT`,
-`COMSPEC`, `NUMBER_OF_PROCESSORS` and `PROCESSOR_ARCHITECTURE`, in any case), and the cards'
-own settings — `CUDA_*`, `NVIDIA_*`, `HIP_*`, `ROCM_*`, `HSA_*`, `GPU_*` — as the owner set them;
-then what the agent writes itself: the address, the models directory and the pool's numbers. So
-no credential the agent was started with — a provider's key, a token — reaches a program it
+`COMSPEC`, `NUMBER_OF_PROCESSORS` and `PROCESSOR_ARCHITECTURE`, in any case), and the cards' own
+settings — `CUDA_*`, `NVIDIA_*`, `HIP_*`, `ROCM_*`, `HSA_*`, `GPU_*` — as the owner set them; then
+what the agent writes itself: the address, the models directory and the pool's numbers. So no
+credential the agent was started with — a provider's key, a token — reaches a program it
 downloaded, and no `OLLAMA_*` setting reaches Ollama but the ones the agent writes. A proxy in the
-environment does not reach pip either: cmake from PyPI on a machine behind one is installed by
-its owner. On Windows the commands the agent runs to manage its engine — `taskkill`, PowerShell,
-a build or a check — open no console window: at logon it runs under `pythonw.exe`, which has none.
+environment does not reach pip either: cmake from PyPI on a machine behind one is installed by its
+owner. On Windows the commands the agent runs to manage its engine — `taskkill`, PowerShell, a
+build or a check — open no console window: at logon it runs under `pythonw.exe`, which has none.
 
 **Where from** (D152) — only the engine's official repository, through a table inside the agent:
 
@@ -285,6 +293,7 @@ a build or a check — open no console window: at logon it runs under `pythonw.e
 |---|---|---|---|
 | Ollama | `ollama-darwin.tgz`, signed by team `3MU9H2V9Y9` | `ollama-linux-<arch>.tar.zst`, with `-rocm` on AMD | `ollama-windows-<arch>.zip`, with `-rocm` on AMD |
 | whisper.cpp | Built from the tag's source: static, Metal | Built from the tag's source: static, CUDA where `nvcc` is, else CPU | The release's archive: CUDA 12.4 or 11.8 by the driver, else BLAS |
+| vLLM (D157, D158) | — (Ollama under `auto`) | PyPI's wheels from the version's locked set, NVIDIA cards of compute capability 7.5 or higher | — (Ollama under `auto`) |
 | ffmpeg | Homebrew, at `init` | apt or dnf, at `init` | winget, at `init` |
 
 Every file is checked against its release's published digest; on macOS, every Mach-O program
@@ -299,14 +308,16 @@ a certificate anyone made, and Apple's own programs all fail it. Archives unpack
 own directory (no absolute paths, `..`, links out, or control characters in a name); no install
 script runs.
 
-**Never past the owner's free-disk floor.** Before anything of a version is fetched, it must fit
-on the engines' volume and leave `min_free_disk_gb` free: an archive counts four times its size —
-itself, kept until the version is whole, and what it unpacks to, up to three times it — and a
-build from source 2 GB, an estimate (its source, its build tree, about a gigabyte for CUDA's
-kernels, and cmake from PyPI). Otherwise the version is refused, `error` saying the sizes, and
-tried again after five minutes. A source build reads the tag's commit from the
-repository and fetches the archive of that commit, with `cmake` from PyPI's official wheels where
-the machine has none, at low priority.
+**Never past the owner's free-disk floor.** Before anything of a version is fetched, it must fit on
+the engines' volume and leave `min_free_disk_gb` free: an archive counts four times its size —
+itself, kept until the version is whole, and what it unpacks to, up to three times it — and a build
+from source 2 GB, an estimate (its source, its build tree, about a gigabyte for CUDA's kernels, and
+cmake from PyPI). Otherwise the version is refused, `error` saying the sizes. A version that could
+not be fetched or staged — for room, a cut download, a check that failed — is tried again after
+five minutes, then twice as long after each failure in a row of the same version asked for, up to
+six hours; once one is staged, or another version is asked for, the wait starts again from five
+minutes. A source build reads the tag's commit from the repository and fetches the archive of that
+commit, with `cmake` from PyPI's official wheels where the machine has none, at low priority.
 
 **Versions side by side** (D153). Each version lives in its own directory under the engines
 directory — `~/Library/Application Support/gpm/engines/<engine>/<port>/<version>` on macOS,
@@ -314,16 +325,17 @@ directory — `~/Library/Application Support/gpm/engines/<engine>/<port>/<versio
 agent's record of which is running, which is staged and which came before, and of the server it
 started. By the engine URL's port, so two agents on one machine (two Ollamas, or two whisper.cpp
 servers, one build each) never share a record nor remove a version the other runs. The running
-version and the previous one are kept; older ones are removed. *Set engine version* names the
-version wanted; the agent resolves `latest` from the repository at most every six hours, stages a
-newer version in the background while the engine keeps serving, and switches only when asked to.
-One request is looked at at a time, so two at once never start two jobs. Switching stops the
-running server, starts the staged one and waits for it to answer; a server that does not answer
-is stopped and the previous started again, at once. A server that cannot be stopped — an error
-from the system — is a switch that did not happen: said in `error`, the new version left staged,
-and the one before started again if it stopped after all; a restart that cannot stop it says so
-too. A restart takes the version to start only once nothing else can start or stop the server,
-so one that waited for a switch starts what the switch left running.
+version and the previous one are kept; older ones are removed — in a thread, so the agent keeps
+answering while gigabytes go. *Set engine version* names the version wanted; the agent resolves
+`latest` from the repository at most every six hours, stages a newer version in the background
+while the engine keeps serving, and switches only when asked to. One request is looked at at a
+time, so two at once never start two jobs. Switching stops the running server, starts the staged
+one and waits for it to answer; a server that does not answer is stopped and the previous started
+again, at once. A server that cannot be stopped — an error from the system — is a switch that did
+not happen: said in `error`, the new version left staged, and the one before started again if it
+stopped after all; a restart that cannot stop it says so too. A restart takes the version to start
+only once nothing else can start or stop the server, so one that waited for a switch starts what
+the switch left running.
 
 **Forward, and back one step** (T35). A version older than the one running is refused — `409
 older_than_running`, the reason also in `error` — unless it is the previous one, which is a
@@ -342,6 +354,103 @@ serving and starts the new program with it, with the same arguments and uploads 
 (§2.1), emptied as the server stops and before it starts; with no file held yet, the check is
 `--help`.
 
+**vLLM** (Linux with an NVIDIA card, D157–D159) is a private Python environment per version, made
+with the agent's own interpreter (Python 3.11–3.14, not a free-threaded build: every set's wheels
+are built for the regular ABI, so a free-threaded `3.13t` has none) under
+`<engines>/vllm/<port>/<version>/`, filled only from that version's **locked set**: a list GPM's
+release generates and the agent carries — every wheel, `vllm`'s and each dependency's, `torch` and
+CUDA's libraries among them, with its sha256 — one wheel to a pin, the one pip takes there — for
+each supported Python minor version and processor, with the audio extra, the oldest glibc its
+wheels are published for, and the least NVIDIA driver the set's CUDA needs (`tools/vllm-lock`, run
+by GPM's release). It is installed with `pip install --require-hashes --only-binary :all: --no-deps
+--isolated --no-cache-dir` from PyPI, at low priority, with `PIP_CONFIG_FILE` naming the null
+device — `--isolated` still reads the machine's `pip.conf` and the environment's own — so no source
+distribution is built and no file differs from the one recorded; `GPM_PYPI_INDEX` names another
+index, or a directory of wheels, for tests. An address with a user name or password in it is
+refused, since pip's arguments are written to the install log. A directory must hold only the set's
+own wheels: pip chooses among a directory's files by their tags before it checks a digest (from an
+index, only among the files whose digest a pin names). `latest` is the newest vLLM the agent has a
+set for. A version is kept only if its own `vllm --version` answers with the version and its
+program's first line names the interpreter of the environment where it will live (paths taken
+absolute, with no `..`, as Python names its interpreter); every set carries the audio extra, and
+whether it imports is asked of the running version's program and said in the facts (§2.1, D146);
+its programs are pointed at the version's directory before it is renamed into place. The free-disk
+floor counts a version as four times its set's wheels: pip holds every wheel in its work directory
+while it installs them, beside the environment they make and the `.pyc` it compiles — about 3.2
+times at vLLM 0.32.0. A work directory left by an install stopped half-way is removed before the
+room is asked for. It is refused, saying why, before anything is fetched, on anything but Linux on
+x86_64 or aarch64 with the set's glibc, an NVIDIA card of compute capability 7.5 or higher and the
+set's driver. **The agent runs it** (D159): `gpm-agent vllm-start` with `--vllm` naming that
+version's program — accepted only as an absolute path to a file named `vllm` inside the agent's
+engines directory, links followed, which `--engines-dir` names — run as a program of its own
+(`python -m gpm_agent.cli`), never imported by the agent that answers the pool (D63): the agent's
+command line, which `serve` runs too, imports the launcher only for its own verbs, whose arguments
+the launcher reads itself. It is started with the models the host holds, once every one is on disk
+(§2.1's fetch) — never one on disk the pool no longer asks for, which would take its share of the
+card; until then, or until the pool has said which, with what it ran last time and still holds,
+while every one of those still is. The agent names them to the launcher in a file in its own engine
+directory, `--models-from <engines>/vllm/<port>/models.json`: a JSON list of model repository ids,
+each checked by the launcher as the fetch checks one (`owner/name` in letters, digits, dots, dashes
+and underscores), any other content refusing the start; without the option — a rented host's
+restart script — the launcher starts every complete model on disk, as before. It is started again
+whenever that set changes (a model held that has landed, one no longer held, or one deleted), and
+when every engine of a start that served has died while its router lives on; and stopped to switch
+versions, by `gpm-agent vllm-stop`. The launcher, and the agent looking at what it started, know a
+process only by the exact argument list the launcher starts it with, for this models directory — an
+engine `<vllm> serve <a model directory in it>`, the router `proxy --upstreams <its map in the
+launcher's state directory>`, the in-turn helper `vllm-in-turn --models-dir <it>` — and, on Linux,
+only within the boot of the machine the launcher recorded (`/proc/sys/kernel/random/boot_id`): a
+number recorded under another boot is never signalled, nor taken for running. Each is stopped with
+its whole process group — vLLM's own workers are in it — and, once made to end, waited for up to 15
+seconds until every process of the group has gone (one nobody reaps counting as gone), so the next
+start does not size its cache from memory still held. The pool's numbers reach it as the
+environment the launcher reads (`GPM_VLLM_*`), stored in the engine's directory as Ollama's are. A
+start that began and in which a model does not serve is that model's failure, said for it
+(`models_failed`, and in the answer to a restart), never the version's — whether the launcher
+refused the set (it does not fit the card, or cannot be split as asked), started none of it, the
+model's process exited, or the wait to serve ran out (30 minutes), after which its processes are
+left running, since they may yet serve: the version answered its own `vllm --version` when it was
+installed, and a model too large for the card and a version that cannot run on it look the same, of
+which only the first is common. Where nothing served, the same models are not started again by that
+version until they change or it is stopped or restarted. Only a start that could not begin is the
+version's: its program missing, the launcher refusing `--vllm`, a record that cannot be written,
+something else on the port. An upgrade that serves nothing is rolled back by the pool's check after
+the switch ([supervisor.md](supervisor.md) §3.1). It runs, holding its share of the card, for as
+long as the machine is in the pool; taking the machine out of service gives the card back.
+
+**Known limits of vLLM run by the agent.** A restart because a model is no longer held, or was
+deleted, stops the vLLM serving the others at once: the agent starts it again as soon as every
+model held is on disk, with none of the drain an upgrade has, so requests in flight on the models
+it keeps are cut off. Changing an agent's `engine` from `vllm` to another named engine leaves the
+vLLM it started running — only an agent of `auto` hands over the engine it ran before; its owner
+stops it with `gpm-agent vllm-stop --models-dir <models>`. A start cancelled while the launcher
+runs (the agent stopped mid-start) can leave engines it had started but not yet recorded; nothing
+stops them until the machine restarts or its owner does. Where `/proc` is mounted with `hidepid`, a
+number from the launcher's record that has gone to another user's process within the same boot
+cannot be looked at: the stop is refused, saying so, a switch is reported as not stopped, and an
+`auto` agent's hand-over waits on it until that process ends or the machine restarts. Every NVIDIA
+card the machine has must be one vLLM runs on: a card below compute capability 7.5 (8.0 under
+`auto`) refuses the machine — under `auto`, chooses Ollama — even where its owner keeps that card
+from vLLM with `CUDA_VISIBLE_DEVICES`.
+
+**An engine of `auto`** (D161) is chosen by the agent each time it starts, from the machine alone:
+vLLM on Linux on x86_64 or aarch64 with an NVIDIA card of compute capability 8.0 or higher (Ampere
+onward, where the BF16, FP8 and FP4 builds catalogs carry for vLLM run) the locked set's driver, a
+glibc at least the newest set's (RHEL 8's 2.28 is below vLLM 0.32.0's 2.31), and an interpreter the
+agent carries a set for, named as the installer names it (a free-threaded `3.13t` has none); Ollama
+anywhere else, a Turing card included. Where an NVIDIA driver is installed (`nvidia-smi` on the
+PATH, or `/proc/driver/nvidia/version`) and its cards could not be read as the agent started — none
+listed, or one without its compute capability or driver's version — it asks again, for up to 60
+seconds in all; still unread, it keeps the engine recorded in `choice.json` at its last start, and
+with none chooses Ollama, saying which and why in `engine.choice.reasons`. The facts say which, and
+each reason against vLLM, under `engine.choice` (`{engine, reasons}`); the pool takes the host's
+engine from them, and judges each model's build against the card as it does for any host. The
+choice is recorded beside the engines (`auto/<port>/choice.json`); where it differs from the last,
+the engine this agent started under the other choice is stopped by its own record before the chosen
+one starts — never one it did not start — and asked again on each look until it is. Both engines
+share the one models path, Ollama's by default: vLLM counts only directories its fetch marked
+complete, so neither reads the other's files.
+
 The **first** version is started as soon as it is staged — nothing runs to drain. A version that
 fails to start is switched away from at once and not staged again by `latest` until a newer one is
 released; one named explicitly is refused. Files come through the repository's API (`GPM_GITHUB_API`
@@ -353,9 +462,14 @@ needs a loopback engine URL with a port; `engines_path` moves the engines direct
 
 **Facts** add, under `engine.install`: `allowed`, `engine`, `running`, `staged`, `previous`,
 `latest` and `latest_checked_at`, `wanted`, `working` (`{step, version, done, total}` while
-resolving, downloading, verifying, unpacking, building or switching), `error`, and `signature`
-(`checked` or `not checked`); and `engine.foreign` when an engine the agent did not start holds
-its port.
+resolving, downloading, verifying, unpacking, building or switching), `error`, `signature`
+(`checked` or `not checked`), and `switch_bound_s`: the longest, in seconds, one switch or start of
+the engine may take from its beginning until it has an outcome, sized for a switch that fails — the
+version stopped, started and waited for, then stopped again and the one before started and waited
+for — 2 × (stop + launch + serve) for vLLM (4340 s), and the same shape from Ollama's and
+whisper.cpp's own stop grace and two-minute wait (335 s; 815 s on Windows, where `taskkill` may
+take its whole two minutes); `null` where installs are not allowed; and `engine.foreign` when an
+engine the agent did not start holds its port.
 
 **Running across reboots** (D154): `gpm-agent init --start-at-login` — or `gpm-agent startup
 add|remove|status` for an agent already set up — makes the agent start with the machine, running
@@ -391,11 +505,16 @@ ends them.
 A start from `uvx`'s cache is refused — a `CACHEDIR.TAG` *above* the agent's environment; uv tags
 every environment it makes, the lasting one `uv tool install` makes too, so the environment's own
 directory (the one with `pyvenv.cfg`) is passed over: install it with `uv tool install gpm-agent`.
-`init --prerequisites` (or `gpm-agent prerequisites`) installs what the engine needs and is
-missing — ffmpeg, and for whisper.cpp's build on Linux `c++`, `make` and `cmake` (with
-`python3-venv` on apt, for cmake from PyPI) — with administrator rights only under `--admin` at a
-terminal, and otherwise prints the exact commands; `init` then ends non-zero while anything is
-still needed. The agent never asks for elevation itself, and does not update itself.
+`init --prerequisites` (or `gpm-agent prerequisites`) installs what the engine needs and is missing
+— ffmpeg, and for whisper.cpp's build on Linux `c++`, `make` and `cmake` (with `python3-venv` on
+apt, for cmake from PyPI); for vLLM, Python's `venv` for the agent's own interpreter
+(`python3.<minor>-venv` on apt, looked at again once installed; dnf's Python carries it), and it
+says, never installs, what only the owner or a release can change: a locked set for the agent's
+Python, glibc at the newest set's floor, every NVIDIA card at compute capability 7.5 or higher, and
+the driver at the set's floor — every reason the installer refuses a version for — with
+administrator rights only under `--admin` at a terminal, and otherwise prints the exact commands;
+`init` then ends non-zero while anything is still needed. The agent never asks for elevation
+itself, and does not update itself.
 
 **On Windows** a file's permission bits mean nothing to Python and the standard library reads no
 access control list, so the agent trusts a file by where it lives: its settings file, and the
@@ -407,7 +526,8 @@ every signed-in user change what is in it, and so what the agent runs as its own
 ## 3. What it reports — facts
 
 Read-only, cheap, no privileges: operating system and architecture; accelerators (kind, name,
-memory each); total and available system memory; free disk where the engine keeps models;
+memory each, and for an NVIDIA card its compute capability and the driver's version);
+total and available system memory; free disk where the engine keeps models;
 engine name, version and whether it answers; models on disk with sizes; models loaded.
 
 From facts the pool **derives the host's capabilities** (`apple-silicon`, `cuda`, …) instead of
@@ -497,16 +617,19 @@ A tag travels in a body, never a path, and must be a plain model tag — a name,
 namespaced and versioned. Anything with a scheme, a space, `..` or a leading dash is refused
 before the engine sees it. `manage_models: false` on a host keeps its agent to `GET /facts`.
 
-**Engine settings are numbers, the command is the owner's (D41).** The pool says how many
-requests at once and how many models held; the agent's engine adapter turns those into the
-engine's own variable names, so no name or text from the pool is ever written to a file or put
-in a process's environment. Where they are written (`engine_env_file`) and what restarts the
-engine (`restart_command`, an argument list, never a shell line) live in the agent's settings on
-that machine; without them the verb is refused and the console says what the owner would add.
-A restart drops whatever the engine is doing, so it is **only ever an operator's act** — the
-host id typed again — and never the supervisor's pass. The agent reports the settings back as
-the same numbers, so the console can show *what the pool needs* beside *what is set* without
-knowing any engine's vocabulary.
+**Engine settings are numbers, the command is the owner's (D41).** The pool says how many requests
+at once and how many models held; the agent's engine adapter turns those into the engine's own
+variable names, so no name or text from the pool is ever written to a file or put in a process's
+environment. Where they are written (`engine_env_file`) and what restarts the engine
+(`restart_command`, an argument list, never a shell line) live in the agent's settings on that
+machine; without them the verb is refused and the console says what the owner would add. A restart
+drops whatever the engine is doing, so it is an operator's act — the host id typed again, answered
+at once and carried out in the background (D162) — with one exception: the supervisor's pass asks
+for one to start an engine its owner installed that serves none of the set it holds yet, once every
+model is on disk, never while the host serves its set or has requests in flight (D160), and sends
+the numbers only where the owner set `engine_env_file`. The agent reports the settings back as the
+same numbers, so the console can show *what the pool needs* beside *what is set* without knowing
+any engine's vocabulary.
 
 A pull is stopped by closing its connection, which is how the engine cancels one; nothing is
 left installed. The agent only ever releases a pin **it** set: a model the machine's owner keeps

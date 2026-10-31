@@ -70,6 +70,62 @@ def test_every_cuda_card_is_listed_with_its_own_memory():
     assert found["memory"]["total_bytes"] == 131072000 * 1024
 
 
+def nvidia_box(details=None, driver=None):
+    """A Linux machine with two NVIDIA cards, by what each of `nvidia-smi`'s queries prints: None
+    for a query its driver refuses, as an old one refuses a field it does not know."""
+    outputs = {
+        " ".join(agent_facts.NVIDIA_CARDS): "NVIDIA RTX A6000, 49140\nNVIDIA GeForce RTX 2080 Ti, 11264\n",
+        " ".join(agent_facts.NVIDIA_DETAILS): details,
+        " ".join(agent_facts.NVIDIA_DRIVER): driver,
+    }
+    asked = []
+
+    def run(command):
+        asked.append(" ".join(command))
+        return outputs.get(" ".join(command))
+
+    return agent_facts.Probes(system=lambda: "Linux", machine=lambda: "x86_64", run=run, read=lambda path: None), asked
+
+
+def test_an_nvidia_card_says_its_compute_capability_and_driver():
+    """What vLLM's floor (7.5) and `engine: auto`'s (8.0) are judged by, and the locked set's
+    driver (D157, D161)."""
+    probes, _ = nvidia_box(details="8.6, 575.51.03\n7.5, 575.51.03\n")
+    cards = agent_facts.accelerators(probes)
+    assert [(c["name"], c["compute_capability"], c["driver"]) for c in cards] == [
+        ("NVIDIA RTX A6000", "8.6", "575.51.03"), ("NVIDIA GeForce RTX 2080 Ti", "7.5", "575.51.03"),
+    ]
+    assert cards[0]["memory_bytes"] == 49140 * 1024 * 1024
+
+
+def test_a_driver_that_does_not_know_compute_cap_keeps_the_cards_name_memory_and_its_version():
+    """An old driver refuses the whole query a field it does not know is in: asked apart, so the
+    card is still listed, and its driver's version — what the owner must change — is asked alone."""
+    probes, asked = nvidia_box(details=None, driver="470.82.01\n470.82.01\n")
+    cards = agent_facts.accelerators(probes)
+    assert [c["name"] for c in cards] == ["NVIDIA RTX A6000", "NVIDIA GeForce RTX 2080 Ti"]
+    assert [c["memory_bytes"] for c in cards] == [49140 * 1024 * 1024, 11264 * 1024 * 1024]
+    assert all("compute_capability" not in c and c["driver"] == "470.82.01" for c in cards)
+    assert asked[:3] == [" ".join(q) for q in (agent_facts.NVIDIA_CARDS, agent_facts.NVIDIA_DETAILS, agent_facts.NVIDIA_DRIVER)]
+
+    probes, _ = nvidia_box(details=None, driver=None)
+    assert all(set(c) == {"kind", "name", "memory_bytes", "unified"} for c in agent_facts.accelerators(probes))
+
+
+@pytest.mark.parametrize("details", [
+    "8.6, 575.51.03\n",                      # one line for two cards: which is whose would be a guess
+    "[N/A], 575.51.03\nwhat, ever\n",       # not a capability, not a version
+])
+def test_details_that_do_not_read_as_each_cards_own_are_left_out_never_guessed(details):
+    probes, _ = nvidia_box(details=details)
+    cards = agent_facts.accelerators(probes)
+    assert all("compute_capability" not in c for c in cards)
+    if details.count("\n") == 2:
+        assert cards[0]["driver"] == "575.51.03" and "driver" not in cards[1]
+    else:
+        assert all("driver" not in c for c in cards)
+
+
 def test_no_accelerator_and_could_not_tell_are_different_answers():
     """The pool derives nothing from silence, so the agent must not turn one into the other."""
     assert agent_facts.gather(PLAIN_LINUX, "/models")["capabilities"] == []
@@ -199,18 +255,44 @@ def test_the_agent_never_runs_a_shell_or_a_command_it_was_given():
             if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "argv" for t in node.targets)
         ]
         assert len(assigned) == 1 and isinstance(assigned[0], ast.Call) and assigned[0].func.id == builder, name
-    for name in ("app.py", "models.py", "engines.py", "installs.py", "proxy.py", "engine_control.py", "whisper_build.py"):
+    for name in ("app.py", "models.py", "engines.py", "installs.py", "proxy.py", "engine_control.py", "whisper_build.py",
+                 "vllm_server.py"):
         assert "host_platform.start(" not in (root / name).read_text(), f"{name} starts a program"
 
-    # What runs through `run_command`, and from where: whisper.cpp's build and checks (D152). Each
-    # command is a literal list — a fixed program, or a path the agent found, then constants — or
-    # comes from one of the builders that write the build's argument lists; nothing else.
-    builders = {"configure_argv", "build_argv", "venv_argv", "pip_argv", "help_argv"}
+    # vLLM run by the agent (D159): only the agent's own launcher and its stop, as programs, each
+    # command built in one place — the agent's interpreter, its guard, its own module and a verb,
+    # then the agent's settings and the installed program — and run as built.
+    tree = ast.parse((root / "vllm_server.py").read_text())
+    methods = {node.name: node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    for builder, verb in (("launcher_argv", "vllm-start"), ("stop_argv", "vllm-stop")):
+        lists = [node for node in ast.walk(methods[builder]) if isinstance(node, ast.List)]
+        head = ast.unparse(lists[0])
+        assert head.startswith("[self.python, *interpreter_guard(), *AGENT_MODULE, ") and f"'{verb}'" in head, head
+    module = next(node.value for node in tree.body
+                  if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", None) == "AGENT_MODULE")
+    assert ast.unparse(module) == "('-m', 'gpm_agent.cli')"
+    runs = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "run" and getattr(node.func.value, "id", None) == "self"]
+    assert len(runs) == 2
+    for call in runs:
+        command = ast.unparse(call.args[0])
+        assert command in ("argv", "self.stop_argv()"), command
+    assigned = [ast.unparse(node.value) for node in ast.walk(methods["start"])
+                if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "argv" for t in node.targets)]
+    assert assigned == ["self.launcher_argv(program, models)"]
+
+    # What runs through `run_command`, and from where: whisper.cpp's build and checks (D152), and
+    # vLLM's environment, pip and its check (D157, D158). Each command is a literal list — a fixed
+    # program, or a path the agent found, then constants — or comes from one of the builders that
+    # write those argument lists; nothing else.
+    builders = {"configure_argv", "build_argv", "venv_argv", "pip_argv", "help_argv", "check_argv"}
     for name in sorted(path.name for path in root.glob("*.py")):
         text = (root / name).read_text()
         if "host_platform.run_command" not in text and "platform import run_command" not in text:
             continue  # startup.py has a `run_command` of its own, for the owner's commands
-        assert name in ("whisper_build.py", "whisper_cpp.py"), f"{name} runs commands"
+        if name == "vllm_server.py":
+            continue  # its launcher and stop, above
+        assert name in ("whisper_build.py", "whisper_cpp.py", "vllm_install.py"), f"{name} runs commands"
         tree = ast.parse(text)
         runs = [
             node for node in ast.walk(tree) if isinstance(node, ast.Call) and (
@@ -898,14 +980,18 @@ async def test_a_restart_command_that_fails_or_does_not_exist_is_reported_not_ra
 
 
 def test_the_pool_restarts_only_when_an_operator_says_so_with_the_host_named_twice(monkeypatch, tmp_path):
-    from gpm_server.supervisor import service
-
-    assert "restart_engine" not in pathlib.Path(service.__file__).read_text()  # never from the pass
-
+    # What this proves is the operator's restart, through the real agent and the owner's command:
+    # an Ollama host serving its set is never restarted by the pass, and a restart needs the host
+    # named twice. The pass's one restart of its own (D160) is of an engine that serves only what
+    # it was started with and serves none of its set yet; that needs an agent reporting a model
+    # waiting for a start, which this agent over Ollama never does — its guards (once per set,
+    # never a ready host, never under requests in flight) are proven in test_engine_auto.py.
     with pool_harness([EngineSpec(id="box", resident={MODEL}, workers=3)], model_set=[MODEL], host_overrides={"box": agent_block(monkeypatch)}) as pool:
         machine = restartable(tmp_path)
         pool.supervisor._agent_transport = machine.transport
         pool.reprobe()
+        pool.reprobe()
+        assert not machine.marker.exists(), "never from the pass"
         server = control(pool)
         try:
             with httpx.Client(base_url=server.base_url, headers={"Authorization": "Bearer gpmx_console"}, timeout=60) as http:
@@ -914,10 +1000,19 @@ def test_the_pool_restarts_only_when_an_operator_says_so_with_the_host_named_twi
                 url = "/pool/hosts/box/engine/restart"
                 assert http.post(url, json={"apply_settings": True}).json()["error"] == "not_confirmed"
                 assert not machine.marker.exists()
-                done = http.post(url, json={"apply_settings": True, "confirm": "box"})
-                assert done.status_code == 200 and done.json()["applied"]["OLLAMA_NUM_PARALLEL"] == "3"
+                # Answered at once; the restart runs in the background, its outcome an event.
+                asked = http.post(url, json={"apply_settings": True, "confirm": "box"})
+                assert asked.status_code == 202 and asked.json()["settings"] == {"workers": 3, "models_held": 1}
+                task = pool.supervisor.hosts["box"].restart_task
+
+                async def finished():
+                    await task
+
+                pool.loop.run(finished())
         finally:
             server.stop()
+        assert machine.marker.read_text() == "yes"
+        assert "OLLAMA_NUM_PARALLEL=3" in machine.env_file.read_text()
         event = next(e for e in pool.supervisor.events.recent(10) if e["kind"] == "agent_engine_restarted")
         assert "with the pool's settings" in event["summary"]
 

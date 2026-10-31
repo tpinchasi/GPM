@@ -8,9 +8,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import prerequisites, startup, vllm_launch, whisper_cpp
+from . import prerequisites, startup, whisper_cpp
 from . import proxy as proxy_module
-from .settings import DEFAULT_PATH, Settings, SettingsError, fingerprint, load, mint_key, save
+from .settings import AUTO, DEFAULT_PATH, Settings, SettingsError, fingerprint, load, mint_key, save
 
 
 def _init(args: argparse.Namespace) -> int:
@@ -63,8 +63,13 @@ def _init(args: argparse.Namespace) -> int:
     if settings.install_engines:
         # Said now: the agent never stops a program it did not start, so the owner's own copy
         # would keep the port and every install would be refused.
-        print(f"\nThis agent installs {settings.engine} and runs it on {settings.engine_url}. If you run")
-        print(f"{settings.engine} yourself, quit it and remove it from login items first.")
+        if settings.engine == AUTO:
+            print("\nThis agent chooses its engine each time it starts — vLLM on Linux with an NVIDIA card of")
+            print("compute capability 8.0 or higher, Ollama anywhere else — installs it and runs it on")
+            print(f"{settings.engine_url}. If you run either yourself, quit it and remove it from login items first.")
+        else:
+            print(f"\nThis agent installs {settings.engine} and runs it on {settings.engine_url}. If you run")
+            print(f"{settings.engine} yourself, quit it and remove it from login items first.")
     if (
         settings.engine == "whisper-cpp" and not settings.install_engines and not settings.engine_binary
         and shutil.which(whisper_cpp.PROGRAM) is None
@@ -78,8 +83,7 @@ def _init(args: argparse.Namespace) -> int:
     outcome = 0
     if args.prerequisites:
         print()
-        outcome |= prerequisites.run(machine, engine=settings.engine, admin=args.admin,
-                                     install_engines=bool(getattr(settings, "install_engines", False)))
+        outcome |= prerequisites.run_for(machine, settings, admin=args.admin)
     if args.start_at_login:
         print()
         outcome |= startup.add(machine, absolute, admin=args.admin, listen=(settings.host, settings.port))
@@ -121,6 +125,18 @@ DEFAULT_MODELS_PATH = {
 DEFAULT_ENGINE_URL = {"whisper-cpp": "http://127.0.0.1:8178"}
 
 
+#: The launcher's verbs (`vllm_launch.run_verb`), each with what it does.
+LAUNCHER_VERBS = {
+    # Run by the machine's own restart script, never over the agent's protocol (D97); by the agent
+    # that runs vLLM itself (D159), as a program of its own.
+    "vllm-start": "start vLLM for the models on disk here, stopping what ran before",
+    # Started by `vllm-start` alone, which hands it the plan on its input (D155).
+    "vllm-in-turn": "(started by vllm-start) start a card's further models one after another",
+    # Run by the agent that runs vLLM itself (D159), as a program of its own.
+    "vllm-stop": "stop what vllm-start last started here",
+}
+
+
 def _proxy(args: Any) -> int:
     proxy_module.serve(args.upstreams, host=args.host, port=args.port)
     return 0
@@ -134,7 +150,9 @@ def main(argv: list[str] | None = None) -> int:
     init = verbs.add_parser("init", help="mint the agent key and write this machine's settings")
     init.add_argument("--host", default="127.0.0.1")
     init.add_argument("--port", type=int, default=8095)
-    init.add_argument("--engine", default="ollama", help="which engine this machine runs")
+    init.add_argument("--engine", default="ollama",
+                      help="which engine this machine runs; `auto` lets the agent choose vLLM or Ollama "
+                           "from the machine (with --install-engines)")
     init.add_argument("--engine-url", default=None,
                       help="where the engine answers; the engine's usual address if unset")
     init.add_argument("--models-path", default=None,
@@ -177,20 +195,20 @@ def main(argv: list[str] | None = None) -> int:
     startup.add_verbs(verbs)
     prerequisites.add_verbs(verbs)
 
-    # Run by the machine's own restart script, never over the agent's protocol (D97).
-    start = verbs.add_parser(
-        "vllm-start", help="start vLLM for the models on disk here, stopping what ran before"
-    )
-    vllm_launch.add_arguments(start)
-    start.set_defaults(run=vllm_launch.main)
-    # Started by `vllm-start` alone, which hands it the plan on its input (D155).
-    in_turn = verbs.add_parser(
-        "vllm-in-turn", help="(started by vllm-start) start a card's further models one after another"
-    )
-    in_turn.add_argument("--models-dir", required=True)
-    in_turn.set_defaults(run=vllm_launch.main_in_turn)
+    # The launcher's verbs. Their arguments are the launcher's own, read by it: this module is
+    # what `gpm-agent serve` runs too, and the agent that answers the pool never imports the
+    # launcher, which starts processes (D63) — it is imported only once one of these is chosen.
+    for verb, about in LAUNCHER_VERBS.items():
+        launcher = verbs.add_parser(verb, help=about, add_help=False)
+        launcher.set_defaults(launcher_verb=verb)
 
-    args = parser.parse_args(argv)
+    args, rest = parser.parse_known_args(argv)
+    if getattr(args, "launcher_verb", None) is not None:
+        from . import vllm_launch
+
+        return vllm_launch.run_verb(args.launcher_verb, rest)
+    if rest:
+        parser.error(f"unrecognized arguments: {' '.join(rest)}")
     try:
         return args.run(args)
     except SettingsError as problem:

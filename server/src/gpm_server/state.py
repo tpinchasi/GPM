@@ -75,12 +75,14 @@ class RouterState:
         for host in config.hosts:
             if host.disabled:
                 continue
-            engine = config.engine_of(host)
+            # Under `auto` either engine's builds (D161): which one the host runs is its agent's
+            # to say, and this errs towards a host that could.
+            engines = config.engines_of(host)
             self._host_tags[host.id] = frozenset(
                 variant.tag
                 for name in config.models_held_by(host)
                 for variant in self._builds_of(name)
-                if self._engine_takes(engine, variant)
+                if any(self._engine_takes(engine, variant) for engine in engines)
             )
         self._rented_engine = config.rented_engine() if config.rented is not None else None
         # Every name a request can reach a host by — catalogued names, build tags, the model

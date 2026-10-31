@@ -99,9 +99,15 @@ def is_loopback(host: str) -> bool:
 #: Engines whose server this agent starts itself (D148), and so binds where it says.
 AGENT_STARTED_ENGINES = frozenset({"whisper-cpp"})
 
-#: Engines this agent can install and run itself, where the machine's owner allows it (D150) —
-#: those the installer's table names (`installs.RELEASES`).
-INSTALLABLE_ENGINES = frozenset({"ollama", "whisper-cpp"})
+#: Engines this agent can install and run itself, where the machine's owner allows it (D150,
+#: D157) — those the installer's table names (`installs.RELEASES`).
+INSTALLABLE_ENGINES = frozenset({"ollama", "whisper-cpp", "vllm"})
+
+#: An engine this agent chooses itself, from the machine, each time it starts (D161): vLLM where
+#: the machine runs the builds catalogs carry for it, Ollama anywhere else. Only where it installs
+#: engines — it then has to install whichever it chose, and nothing else on the machine could.
+AUTO = "auto"
+AUTO_ENGINES = ("vllm", "ollama")
 
 #: The addresses such a server is started on: 127.0.0.1, as the agent passes it, or a name for it.
 _SERVER_HOSTS = ("127.0.0.1", "localhost")
@@ -133,6 +139,8 @@ class Settings:
     key_hash: str
     host: str = "127.0.0.1"
     port: int = 8095
+    #: The engine this machine runs — or `auto`, for the agent to choose vLLM or Ollama from the
+    #: machine each time it starts (D161), where it installs engines.
     engine: str = "ollama"
     engine_url: str = "http://127.0.0.1:11434"
     #: Where the engine keeps its models; free disk is measured here.
@@ -204,11 +212,18 @@ class Settings:
                 problem = outside_profile(os.path.expanduser(value), os.environ) if value else None
                 if problem:
                     raise SettingsError(f"{name} {value!r} {problem}")
+        if self.engine == AUTO and not self.install_engines:
+            raise SettingsError(
+                "engine: auto lets this agent choose between vLLM and Ollama from the machine, and "
+                "install the one it chose; it needs install_engines: true (`gpm-agent init "
+                "--install-engines`). Without it, name the engine this machine runs (D161)"
+            )
         if self.install_engines:
-            if self.engine not in INSTALLABLE_ENGINES:
+            if self.engine not in INSTALLABLE_ENGINES and self.engine != AUTO:
                 raise SettingsError(
                     f"install_engines: this agent cannot install {self.engine}; it installs "
-                    f"{', '.join(sorted(INSTALLABLE_ENGINES))}"
+                    f"{', '.join(sorted(INSTALLABLE_ENGINES))}, or chooses between "
+                    f"{' and '.join(AUTO_ENGINES)} itself with engine: {AUTO}"
                 )
             if self.restart_command is not None or self.engine_env_file is not None:
                 raise SettingsError(
@@ -223,9 +238,10 @@ class Settings:
                 )
             problem = loopback_engine_url_problem(self.engine_url)
             if problem:
+                started = "the engine it chooses" if self.engine == AUTO else self.engine
                 raise SettingsError(
                     f"engine_url {self.engine_url!r} {problem}. With install_engines this agent "
-                    f"starts {self.engine} itself, on 127.0.0.1, and that server has no "
+                    f"starts {started} itself, on 127.0.0.1, and that server has no "
                     "authentication of its own, so it is never put on a network (D150). "
                     "Use http://127.0.0.1:<port>."
                 )

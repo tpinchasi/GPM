@@ -18,12 +18,38 @@ agent said, what the host holds and the clock, so the whole sequence is tested w
 from __future__ import annotations
 
 import dataclasses
+import math
 import time
 from typing import Any, Optional
 
 #: How long the agent has to finish a switch it started in the background before the pool
-#: stops waiting: the agent's own wait for the engine to answer is bounded below this.
+#: stops waiting, where the agent does not say how long its engine may take — an agent from
+#: before `switch_bound_s`, whose engines (Ollama, whisper.cpp) answer within this.
 SWITCH_TIMEOUT_S = 300.0
+#: Beyond the agent's own bound: its answer reaching a pass that reads it.
+SWITCH_MARGIN_S = 60.0
+#: Whatever an agent says, no switch keeps a host out of routing longer than this.
+SWITCH_TIMEOUT_CAP_S = 4 * 3600.0
+
+
+def switch_bound(install: Any) -> Optional[float]:
+    """The longest one switch or start of its engine can take, as the agent reports it in
+    `engine.install` (`switch_bound_s`) — None where it says nothing usable: absent, not a
+    positive number, or not finite."""
+    bound = install.get("switch_bound_s") if isinstance(install, dict) else None
+    if isinstance(bound, bool) or not isinstance(bound, (int, float)):
+        return None
+    return float(bound) if math.isfinite(bound) and bound > 0 else None
+
+
+def switch_timeout(install: Any) -> float:
+    """How long the pool waits on a switch, or on a rollback, of this host's engine: the agent's
+    own bound and a margin — a vLLM start is minutes, an Ollama one seconds — never less than
+    `SWITCH_TIMEOUT_S` and never more than `SWITCH_TIMEOUT_CAP_S`."""
+    bound = switch_bound(install)
+    if bound is None:
+        return SWITCH_TIMEOUT_S
+    return min(SWITCH_TIMEOUT_CAP_S, max(SWITCH_TIMEOUT_S, bound + SWITCH_MARGIN_S))
 
 #: The fields of `engine.install` the steps read, each a version string or nothing.
 _VERSION_FIELDS = ("running", "staged", "previous")
@@ -47,6 +73,8 @@ class Upgrade:
     by_operator: bool = False
     #: Going back to the previous version, on an operator's instruction.
     rollback: bool = False
+    #: How long the current switch or rollback is waited on (`switch_timeout`).
+    window_s: float = SWITCH_TIMEOUT_S
 
     def reason(self, engine: str) -> str:
         if self.phase == "rolling_back":
@@ -88,6 +116,9 @@ class EngineUpgrades:
         #: The staged version and the agent's last error seen for each host, so each change is
         #: said once as an event rather than on every pass.
         self.seen: dict[str, tuple[Optional[str], Optional[str]]] = {}
+        #: The engine each host's versions were last of. All of the above is one engine's: a host
+        #: of `auto` whose agent chose another (D161) starts again from nothing.
+        self.engines: dict[str, str] = {}
 
     def ask(self, host_id: str, what: str) -> None:
         self.asked[host_id] = what
@@ -103,16 +134,35 @@ class EngineUpgrades:
         self.seen.pop(host_id, None)
         return self.active.pop(host_id, None)
 
+    def _follow_engine(self, host_id: str, install: dict[str, Any]) -> Optional[Upgrade]:
+        """A host whose agent now runs another engine than its versions were of — an `auto` host
+        whose agent chose again (D161): the versions refused, staged, asked for and in progress
+        were the other engine's, and a number of one says nothing of the other. All forgotten.
+        Returns the upgrade that was in progress, if one was."""
+        engine = install.get("engine")
+        if not isinstance(engine, str):
+            return None
+        before = self.engines.get(host_id)
+        self.engines[host_id] = engine
+        if before is None or before == engine:
+            return None
+        self.refused.pop(host_id, None)
+        return self.forget(host_id)
+
     def news(self, host_id: str, install: Optional[dict[str, Any]]) -> list[Step]:
         """What the agent did on its own since the last pass — a version staged, an error —
-        each said once."""
+        each said once; and an upgrade given up because the host now runs another engine."""
         if not well_formed(install) or not install.get("allowed"):
             return []
+        found = []
+        dropped = self._follow_engine(host_id, install)
+        if dropped is not None:
+            found.append(Step("abandon", f"{dropped.reason('the engine')} given up: the host's agent now runs "
+                              f"{install.get('engine')}", event="engine_upgrade_abandoned"))
         staged, error = install.get("staged"), install.get("error")
         before = self.seen.get(host_id, (None, None))
         self.seen[host_id] = (staged, error)
         engine = str(install.get("engine") or "the engine")
-        found = []
         if staged and staged != before[0] and staged != install.get("running"):
             found.append(Step("wait", f"{engine} {staged} is staged beside {install.get('running') or 'nothing'}",
                               event="engine_staged", version=staged))
@@ -156,9 +206,10 @@ class EngineUpgrades:
         (None: never served); `held` what it holds now, of its own model set; `busy` its requests
         in flight; `pinned` the version its configuration holds it to, or None for `latest`."""
         now = time.time() if now is None else now
-        upgrade = self.active.get(host_id)
         if not well_formed(install) or not install.get("allowed"):
-            return self._without_an_answer(host_id, upgrade, now)
+            return self._without_an_answer(host_id, self.active.get(host_id), now)
+        self._follow_engine(host_id, install)  # said by `news`, which the pass asks first
+        upgrade = self.active.get(host_id)
         engine = str(install.get("engine") or "the engine")
 
         if upgrade is None:
@@ -169,7 +220,10 @@ class EngineUpgrades:
         if upgrade.phase == "draining":
             if busy <= 0:
                 upgrade.phase = "switching"
-                upgrade.until = now + SWITCH_TIMEOUT_S
+                # As long as the agent says its engine may take to stop and start — a vLLM loads
+                # for many minutes — so a slow switch is never given up as a failed one.
+                upgrade.window_s = switch_timeout(install)
+                upgrade.until = now + upgrade.window_s
                 return Step("switch", f"{upgrade.reason(engine)}: its requests have finished; switching",
                             event="engine_upgrade_switching", version=upgrade.to)
             if now >= upgrade.until:
@@ -196,7 +250,7 @@ class EngineUpgrades:
                 return Step("done", f"{engine} {upgrade.to} did not start, and the agent went back to "
                             f"{upgrade.came_from}: {install.get('error') or 'no answer'}", event="engine_rolled_back")
             return self._roll_back(upgrade, engine, now, f"{engine} {upgrade.to} did not start in time: "
-                                   f"{install.get('error') or 'no answer'}")
+                                   f"{install.get('error') or 'no answer'}", install)
 
         if upgrade.phase == "checking":
             if engine_answers and upgrade.held_before <= held:
@@ -217,7 +271,7 @@ class EngineUpgrades:
             self.refuse(host_id, upgrade.to)
             return self._roll_back(upgrade, engine, now, f"{engine} {upgrade.to} "
                                    + (f"did not hold {missing}" if engine_answers else "did not answer")
-                                   + f" after {check_s:g}s; not taking {upgrade.to} on this host again")
+                                   + f" after {check_s:g}s; not taking {upgrade.to} on this host again", install)
 
         if upgrade.phase == "rolling_back":
             # Kept out of routing until the old version is back: asked again each pass, as an
@@ -228,7 +282,7 @@ class EngineUpgrades:
             if now >= upgrade.until:
                 del self.active[host_id]
                 return Step("done", f"{engine} could not be brought back to {upgrade.came_from} in "
-                            f"{SWITCH_TIMEOUT_S:g}s; it runs {install.get('running') or 'nothing'} — roll it back "
+                            f"{upgrade.window_s:g}s; it runs {install.get('running') or 'nothing'} — roll it back "
                             "from the console or the machine", event="engine_rollback_failed")
             if working.get("step") == "switching":
                 return Step("wait")
@@ -266,9 +320,11 @@ class EngineUpgrades:
                         f"it has served nothing for {idle_needed_s:g}s"))
                     + f"; no new requests, and up to {drain_s:g}s for the {busy} it has", event="engine_upgrade_draining")
 
-    def _roll_back(self, upgrade: Upgrade, engine: str, now: float, why: str) -> Step:
+    def _roll_back(self, upgrade: Upgrade, engine: str, now: float, why: str, install: dict[str, Any]) -> Step:
         upgrade.phase = "rolling_back"
-        upgrade.until = now + SWITCH_TIMEOUT_S
+        # Going back is a switch too, and as slow: the same wait.
+        upgrade.window_s = switch_timeout(install)
+        upgrade.until = now + upgrade.window_s
         return Step("rollback", f"{why}; going back to {upgrade.came_from}", event="engine_rolling_back",
                     version=upgrade.came_from)
 

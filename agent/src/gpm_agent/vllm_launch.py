@@ -32,10 +32,17 @@ is started at its own, which is recorded so the agent can say so.
 
 It stops whatever it started last time before starting anything, so calling it twice is a
 restart and not a second copy fighting the first for the same memory.
+
+**On a machine whose agent installs vLLM** (D159) the agent runs this launcher itself, as a
+program — `python -m gpm_agent.cli vllm-start` — with `--vllm` naming the installed version's own
+program. That option takes only a file named `vllm` inside the agent's engines directory, so still
+nothing the pool sends becomes part of a command (D41); and the agent stops what this started with
+`gpm-agent vllm-stop`, never by importing this module (D63).
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import math
@@ -49,7 +56,7 @@ import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
+from typing import Any, Callable, Collection, Iterator, Mapping, Optional, Sequence
 
 # Written by the hub fetch when every file of a model has landed. A directory without it is a
 # download in progress, and serving half a model is worse than serving none.
@@ -58,14 +65,15 @@ from .modelhub import (  # noqa: F401 - the marker's name is part of this module
     is_complete,
 )
 
+#: The router's map of model to engine, when there is more than one model (kept where the agent
+#: reads how the router is known, `vllm_state`).
+from .vllm_state import UPSTREAMS_FILE  # noqa: E402
+
 log = logging.getLogger("gpm.vllm-start")
 
 
 #: What this launcher started, so the next start can stop it first.
 PIDS_FILE = ".gpm-vllm.pids"
-
-#: The router's map of model to engine, when there is more than one model.
-UPSTREAMS_FILE = ".gpm-upstreams.json"
 
 #: Where an older launcher kept its state, in the models directory itself. Found there now, they
 #: came with the models from another machine, or from before: removed, never acted on (D139).
@@ -94,14 +102,21 @@ CACHE_RESERVE_BYTES = 3 * 1024**3
 # (D63). The programs the agent starts itself are whisper.cpp's server (D148) and, where the
 # machine's owner lets it install engines, Ollama's (D150) — each with fixed arguments.
 from . import platform as host_platform  # noqa: E402
+from .modelhub import REPO_ID, directory_for  # noqa: E402
 from .vllm_state import (  # noqa: E402,F401
     IN_TURN_VERB,
     RUN_MARKER,
     STARTED_FILE,
+    another_boot,
+    boot_id,
     capped_lengths,
     failed_engines,
     in_turn_helper,
+    is_engine,
+    is_helper,
+    is_router,
     last_error_line,
+    loading_engines,
     read_record,
     state_dir_for,
 )
@@ -224,6 +239,8 @@ class Started:
     plan: dict[str, Any] = field(default_factory=dict)
     #: What starts the rest of a card's models, one after another (D155) — when there are any.
     in_turn: Optional[dict[str, Any]] = None
+    #: The boot of the machine it was started in (`boot_id`), where the system says.
+    boot_id: Optional[str] = None
 
     def pids(self) -> list[int]:
         found = [e["pid"] for e in self.engines if e.get("pid")]
@@ -571,46 +588,75 @@ def option_flags(options: Sequence[str], family: Optional[str]) -> tuple[list[st
 
 
 def _cmdline(pid: int) -> Optional[bytes]:
+    """A process's command line: from /proc, where vLLM runs; elsewhere as the system's `ps` says
+    it, so that what a test machine starts is recognised too (`platform.command_line`)."""
     try:
         return Path(f"/proc/{pid}/cmdline").read_bytes()
     except OSError:
-        return None
+        pass
+    return host_platform.command_line(pid)
 
 
-def _ours(pid: int, cmdline: Callable[[int], Optional[bytes]]) -> bool:
-    """Is this process one an older launcher on this machine started — an engine or the router? A
-    number from a file is only a number: it may be another machine's, brought with its models."""
-    said = cmdline(pid) or b""
-    return b"vllm" in said or (b"proxy" in said and b"--upstreams" in said)
+def _ours(pid: int, cmdline: Callable[[int], Optional[bytes]], models_dir: Path) -> bool:
+    """Is this process one a launcher on this machine started for this models directory — an
+    engine (`vllm serve <a model directory in it>`), the router (`proxy --upstreams <its map>`) or
+    the helper that starts models in turn (`vllm-in-turn --models-dir <it>`)? A number from a file
+    is only a number: it may be another machine's, brought with its models, or, after the machine
+    restarted, any program's — the owner's own `vllm`, an editor open on a file named for it."""
+    said = cmdline(pid)
+    if not said:
+        return False
+    return is_engine(said, models_dir) or is_router(said, models_dir) or is_helper(said, models_dir)
 
 
-def stop_previous(models_dir: Path, *, kill: Callable[[int, int], None] = os.kill,
+#: How long processes made to end (SIGKILL) are waited for until they are gone: the next start
+#: sizes each engine's cache from the card's free memory, which a process not yet ended still holds.
+GONE_WAIT_S = 15.0
+
+
+def stop_previous(models_dir: Path, *, kill: Optional[Callable[[int, int], None]] = None,
                   alive: Optional[Callable[[int], bool]] = None, grace_s: float = 30.0,
-                  cmdline: Callable[[int], Optional[bytes]] = _cmdline) -> list[int]:
+                  cmdline: Optional[Callable[[int], Optional[bytes]]] = None,
+                  boot: Optional[Callable[[], Optional[str]]] = None,
+                  gone_s: float = GONE_WAIT_S) -> list[int]:
     """Stop what the last call started. A process already gone is not an error.
+
+    Only a process that is still an engine, the router or the helper for this models directory by
+    its own command line is signalled (`_ours`): a number in a file is only a number. On a machine
+    its owner uses for other things too (D159), one restarted since has handed those numbers to
+    the owner's own programs, and the next start — the agent's own, as it starts — would otherwise
+    end them. Where the system says which boot this is (Linux), nothing recorded under another
+    boot is signalled at all, whatever its number runs now.
 
     What an older launcher started is listed in the models directory, where it kept its state
     then: on a host upgraded in place those engines still hold the cards and ports. They are
-    stopped too — but only processes that are an engine or the router by their own command line,
-    since that file may equally have come from another machine with the models (D139)."""
+    stopped too, by the same rule, since that file may equally have come from another machine
+    with the models (D139)."""
+    models_dir = Path(models_dir)
+    cmdline = cmdline or _cmdline
     pids_file = state_dir_for(models_dir) / PIDS_FILE
+    record = read_record(models_dir) or {}
+    elsewhere = another_boot(record, (boot or boot_id)())
+    if elsewhere:
+        log.info("what the last start began was recorded before this machine restarted; nothing of it is signalled")
+    signalled = dict(kill=kill, alive=alive, grace_s=grace_s, gone_s=gone_s)
     # What starts a card's models in turn goes first, and is waited for: until it has gone it
     # may start one more, after the list below was read — an engine nothing would then stop.
-    record = read_record(Path(models_dir)) or {}
     turns = (record.get("in_turn") or {}).get("pid")
-    stopped = (_stop([turns], kill=kill, alive=alive, grace_s=grace_s)
-               if isinstance(turns, int) and in_turn_helper(turns, cmdline) else [])
+    stopped = (_stop([turns], **signalled)
+               if isinstance(turns, int) and not elsewhere and in_turn_helper(turns, cmdline, models_dir) else [])
     try:
-        pids = [int(p) for p in json.loads(pids_file.read_text())]
+        pids = [] if elsewhere else [int(p) for p in json.loads(pids_file.read_text())]
     except (OSError, ValueError, TypeError):
         pids = []
     try:
-        older = [int(p) for p in json.loads((Path(models_dir) / PIDS_FILE).read_text())]
+        older = [int(p) for p in json.loads((models_dir / PIDS_FILE).read_text())]
     except (OSError, ValueError, TypeError):
         older = []
-    pids += [p for p in older if p not in pids and _ours(p, cmdline)]
+    pids += [p for p in older if p not in pids]
     # The helper's number is in the list too, and was dealt with above — or is no longer its.
-    stopped += _stop([p for p in pids if p not in stopped and p != turns], kill=kill, alive=alive, grace_s=grace_s)
+    listed = [p for p in pids if p not in stopped and p != turns]
+    stopped += _stop([p for p in listed if _ours(p, cmdline, models_dir)], **signalled)
     pids_file.unlink(missing_ok=True)
     return stopped
 
@@ -623,34 +669,168 @@ def _alive_by_signal(pid: int, kill: Callable[[int, int], None] = os.kill) -> bo
         return False
 
 
-def _stop(pids: Sequence[int], *, kill: Callable[[int, int], None], alive: Optional[Callable[[int], bool]],
-          grace_s: float) -> list[int]:
-    """Ask each process to end, give them `grace_s` together, then end those still there."""
+def _signal_group(pid: int, signum: int) -> None:
+    """Signal a process the launcher started, with every process it started: each leads a session
+    of its own (`start_new_session`), so its group is numbered as it is — an engine's own worker
+    processes are in it. One that does not lead its group (never so, as started here) alone. A
+    leader that has ended already leaves its group behind, still numbered as it was: that number
+    goes to no other process while any process is in the group (as `platform.stop` relies on)."""
+    try:
+        leads = os.getpgid(pid) == pid
+    except ProcessLookupError:
+        leads = True
+    except PermissionError:
+        leads = False
+    if leads:
+        os.killpg(pid, signum)
+    else:
+        os.kill(pid, signum)
+
+
+def _group_gone(pgid: int, proc: Path = Path("/proc")) -> bool:
+    """Has every process in the group `pgid` ended? From /proc where there is one, where a process
+    that has exited and that nobody reaps — in a container whose first process never does — is
+    known for what it is, and has ended too: the group still answers a signal while it is there.
+    Elsewhere, the system's own answer to a signal sent to the group."""
+    if (proc / "self" / "stat").exists():
+        try:
+            entries = [entry for entry in proc.iterdir() if entry.name.isdigit()]
+        except OSError:
+            entries = []
+        for entry in entries:
+            try:
+                # The state, the parent and the group follow the command name, in parentheses.
+                fields = (entry / "stat").read_text().rpartition(")")[2].split()
+            except OSError:
+                continue  # gone meanwhile
+            if len(fields) > 2 and fields[2] == str(pgid) and fields[0] not in ("Z", "X"):
+                return False
+        return True
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
+def _stop(pids: Sequence[int], *, kill: Optional[Callable[[int, int], None]], alive: Optional[Callable[[int], bool]],
+          grace_s: float, gone_s: float = GONE_WAIT_S) -> list[int]:
+    """Ask each process — with its whole process group (`_signal_group`) — to end, give them
+    `grace_s` together, then make those still there end, and wait up to `gone_s` until they have:
+    what starts next sizes its cache from the memory these release. `kill` replaces the signalling
+    (a test's), which then also answers whether a process is there."""
+    own = kill is None or kill is os.kill
+    signal_it = _signal_group if own else kill
+
     def is_alive(pid: int) -> bool:
         if alive is not None:
             return alive(pid)
         # The system's own answer, which knows an exited process nobody reaped is not running.
-        return host_platform.alive(pid) if kill is os.kill else _alive_by_signal(pid, kill)
+        return host_platform.alive(pid) if own else _alive_by_signal(pid, signal_it)
+
+    def gone(pid: int) -> bool:
+        return not is_alive(pid) and (not own or _group_gone(pid))
 
     stopped = []
     for pid in pids:
         if not is_alive(pid):
             continue
         try:
-            kill(pid, signal.SIGTERM)
+            signal_it(pid, signal.SIGTERM)
             stopped.append(pid)
         except OSError:
             continue
     deadline = time.monotonic() + grace_s
-    while any(is_alive(pid) for pid in stopped) and time.monotonic() < deadline:
+    while not all(gone(pid) for pid in stopped) and time.monotonic() < deadline:
         time.sleep(0.5)
+    killed = []
     for pid in stopped:
-        if is_alive(pid):
+        if not gone(pid):
             try:
-                kill(pid, signal.SIGKILL)
+                signal_it(pid, signal.SIGKILL)
+                killed.append(pid)
             except OSError:
                 pass
+    deadline = time.monotonic() + gone_s
+    while not all(gone(pid) for pid in killed) and time.monotonic() < deadline:
+        time.sleep(0.1)
     return stopped
+
+
+def agent_command() -> list[str]:
+    """How this launcher's helpers — the router, and what starts a card's models in turn — run the
+    agent again: as this process was run. From the agent's archive or its `gpm-agent` program,
+    that file; as a module (`python -m gpm_agent.cli`, as the agent that runs vLLM itself starts
+    this, D159), the module again, under the same guard on where it imports from — its file alone
+    is part of a package, and would not run."""
+    main_module = sys.modules.get("__main__")
+    spec = getattr(main_module, "__spec__", None)
+    if spec is not None and spec.name == "gpm_agent.cli":
+        guard = ["-I"] if sys.flags.isolated else ["-P"] if getattr(sys.flags, "safe_path", False) else []
+        return [*guard, "-m", "gpm_agent.cli"]
+    return [sys.argv[0]]
+
+
+#: The program `--vllm` may name: a file of this name, inside the agent's engines directory.
+VLLM_PROGRAM = "vllm"
+
+
+def vllm_refusal(vllm: str, engines_dir: Path) -> Optional[str]:
+    """Why `vllm` may not be run as vLLM here, or None. Only the program of a version the agent
+    installed (D157): an absolute path to a file named `vllm` that is, links followed, inside the
+    agent's engines directory. The pool never sends a path (D41); this holds even if something
+    else on the machine one day did."""
+    path = Path(vllm)
+    if not path.is_absolute():
+        return f"--vllm must be an absolute path, and {vllm!r} is not"
+    if path.name != VLLM_PROGRAM:
+        return f"--vllm names {path.name!r}; only a program named {VLLM_PROGRAM!r} is run as vLLM"
+    root = os.path.realpath(engines_dir)
+    real = os.path.realpath(path)
+    if os.path.commonpath([root, real]) != root:
+        return (
+            f"--vllm {vllm} is not inside this agent's engines directory ({engines_dir}): only a "
+            "version of vLLM the agent installed is run this way"
+        )
+    if not os.path.isfile(real):
+        return f"--vllm {vllm} is not a file"
+    return None
+
+
+#: The most of `--models-from` read: a list of repository ids, a few hundred bytes in practice.
+MODELS_FROM_MAX_BYTES = 1 << 20
+
+
+def models_named(path: str) -> tuple[Optional[set[str]], Optional[str]]:
+    """The model directories `--models-from` names, or why its file names none.
+
+    The file is the agent's own, in its engine's directory, which its settings place (D159): a
+    JSON list of the models the pool told it to hold, each a model repository id (`owner/name`,
+    `modelhub.REPO_ID`) — exactly what the hub's fetch accepts before it makes a directory, and
+    turned into that directory's name the same way (`modelhub.directory_for`). Anything else in it
+    refuses the start. Nothing in it becomes a flag, an option or a path of its own: it only
+    chooses among the directories the fetch already made (D41)."""
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(MODELS_FROM_MAX_BYTES + 1)
+    except OSError as exc:
+        return None, f"--models-from {path} cannot be read: {exc.strerror or exc}"
+    if len(raw) > MODELS_FROM_MAX_BYTES:
+        return None, f"--models-from {path} is larger than {MODELS_FROM_MAX_BYTES} bytes"
+    try:
+        named = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return None, f"--models-from {path} is not JSON"
+    if not isinstance(named, list):
+        return None, f"--models-from {path} is not a list of models"
+    directories: set[str] = set()
+    for repo in named:
+        if not isinstance(repo, str) or len(repo) > 200 or not REPO_ID.fullmatch(repo):
+            return None, f"--models-from {path} names {repo!r}, which is not a model repository id"
+        directories.add(directory_for(".", repo).name)
+    return directories, None
 
 
 def launch(
@@ -659,35 +839,44 @@ def launch(
     *,
     proxy: bool = False,
     options: Sequence[str] = (),
-    vllm: str = "vllm",
+    vllm: str = VLLM_PROGRAM,
     agent: Optional[str] = None,
     python: str = sys.executable,
     env: Optional[Mapping[str, str]] = None,
     popen: Callable[..., Any] = subprocess.Popen,
-    kill: Callable[[int, int], None] = os.kill,
+    kill: Optional[Callable[[int, int], None]] = None,
     alive: Optional[Callable[[int], bool]] = None,
     card_bytes: Optional[int] = None,
     probe_card: Callable[[], Optional[int]] = card_memory_bytes,
     devices: Optional[Sequence[str]] = None,
     probe_devices: Callable[[Mapping[str, str]], list[str]] = card_devices,
     cmdline: Callable[[int], Optional[bytes]] = _cmdline,
+    only: Optional[Collection[str]] = None,
+    boot: Optional[Callable[[], Optional[str]]] = None,
 ) -> Started:
-    """Stop what ran before, then start vLLM for every complete model on disk.
+    """Stop what ran before, then start vLLM for every complete model on disk — or, with `only`,
+    for those of them whose directories it names (`--models-from`, `models_named`).
 
     Nothing on disk yet is the ordinary state of a machine that has just booted, and is not an
     error: this returns having started nothing, and is called again once the fetch has finished.
+
+    `vllm` is the program each engine runs: `vllm` on the PATH, or a version the agent installed,
+    which `main` has checked (`vllm_refusal`). `agent` is how the helpers run the agent again
+    (`agent_command`, where unnamed). `boot` says which boot of the machine this is (`boot_id`),
+    recorded with the processes so that none is signalled once the machine has restarted.
     """
     models_dir = Path(models_dir).expanduser()
     state = state_dir_for(models_dir)
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     env = dict(os.environ if env is None else env)
-    stop_previous(models_dir, kill=kill, alive=alive, cmdline=cmdline)
+    this_boot = (boot or boot_id)()
+    stop_previous(models_dir, kill=kill, alive=alive, cmdline=cmdline, boot=lambda: this_boot)
     for name in LEGACY_STATE:
         (models_dir / name).unlink(missing_ok=True)
     (state / STARTED_FILE).unlink(missing_ok=True)
 
-    started = Started()
-    found = complete_models(models_dir)
+    started = Started(boot_id=this_boot)
+    found = [d for d in complete_models(models_dir) if only is None or d.name in only]
     if not found:
         return started
 
@@ -783,8 +972,9 @@ def launch(
             later["waiting"] = True
     waiting = [queue for queue in turns.values() if len(queue) > 1]
     helper = None
+    itself = [agent] if agent else agent_command()
     if waiting:
-        argv = [python, agent or sys.argv[0], "vllm-in-turn", "--models-dir", str(models_dir)]
+        argv = [python, *itself, "vllm-in-turn", "--models-dir", str(models_dir)]
         out = open(logs / "in-turn.log", "ab")
         helper = popen(argv, stdin=subprocess.PIPE, stdout=out, stderr=subprocess.STDOUT, env=env,
                        start_new_session=True)
@@ -795,7 +985,7 @@ def launch(
         draft = map_file.with_suffix(".new")
         draft.write_text(json.dumps(upstreams, indent=2, sort_keys=True))
         draft.replace(map_file)
-        argv = [python, agent or sys.argv[0], "proxy", "--upstreams", str(map_file),
+        argv = [python, *itself, "proxy", "--upstreams", str(map_file),
                 "--host", "127.0.0.1", "--port", str(port)]
         out = open(logs / "proxy.log", "ab")
         process = popen(argv, stdout=out, stderr=subprocess.STDOUT, env=env, start_new_session=True)
@@ -990,6 +1180,24 @@ def _note_finished(models_dir: Path, own_pid: int) -> None:
             _write_json(state / PIDS_FILE, [p for p in pids if p != own_pid])
 
 
+def stop(models_dir: str | Path, **kwargs: Any) -> list[int]:
+    """Stop what the launcher last started here, and forget its record of it: nothing then runs,
+    and nothing it started is a model that failed. For the agent that runs vLLM itself (D159), to
+    switch versions or hand the port to another engine — run as `gpm-agent vllm-stop`, never in
+    the agent's own process (D63)."""
+    models_dir = Path(models_dir).expanduser()
+    stopped = stop_previous(models_dir, **kwargs)
+    (state_dir_for(models_dir) / STARTED_FILE).unlink(missing_ok=True)
+    return stopped
+
+
+def main_stop(args: Any) -> int:
+    """`gpm-agent vllm-stop`: what the last `vllm-start` began, stopped."""
+    stopped = stop(args.models_dir)
+    print(f"gpm-agent vllm-stop: stopped {len(stopped)} process{'' if len(stopped) == 1 else 'es'}")
+    return 0
+
+
 def main_in_turn(args: Any) -> int:
     """`gpm-agent vllm-in-turn`: started by the launcher, which hands it the plan on its input."""
     turns = json.loads(sys.stdin.read() or "[]")
@@ -1001,6 +1209,7 @@ def _record(models_dir: Path, started: Started) -> None:
     """What was started (or why nothing was), for the agent to read back."""
     record = {
         "at": time.time(),
+        "boot_id": started.boot_id,
         "refused": started.refused,
         "plan": started.plan,
         "engines": [{k: v for k, v in e.items() if k != "argv"} for e in started.engines],
@@ -1020,12 +1229,63 @@ def add_arguments(parser: Any) -> None:
                         help="one engine per model, with the router on --port in front of them")
     parser.add_argument("--option", action="append", default=[], choices=sorted(OPTIONS),
                         help="a named option; each model gets it if its family has it (D100)")
-    # Deliberately no way to name another program: this runs `vllm` and the agent's own router,
-    # as fixed argument lists, and nothing on its command line can change which.
+    # The one way to name another program: a version of vLLM the agent installed, by its own
+    # program, inside the agent's engines directory and nowhere else (D159). The agent passes it;
+    # the pool never can, since nothing it says reaches this command line (D41).
+    parser.add_argument("--vllm", default=None,
+                        help="a version of vLLM this agent installed: its `vllm` program, inside the "
+                             "agent's engines directory (`vllm` on the PATH if unset)")
+    parser.add_argument("--engines-dir", default=None,
+                        help="the agent's engines directory, where its owner moved it (engines_path); "
+                             "the system's own place if unset")
+    # Which of the models on disk to start: those the pool told the agent to hold, written by the
+    # agent into its own engine directory (D159). Without it, every complete model on disk — a
+    # rented host's, whose models directory holds only what it was bought for.
+    parser.add_argument("--models-from", default=None,
+                        help="a file the agent wrote: a JSON list of the models to start (model repository "
+                             "ids), of those complete on disk; every complete model on disk if unset")
+
+
+def add_stop_arguments(parser: Any) -> None:
+    parser.add_argument("--models-dir", required=True, help="where the agent fetched the models")
+
+
+def run_verb(verb: str, argv: Sequence[str]) -> int:
+    """`gpm-agent vllm-start`, `vllm-in-turn` or `vllm-stop`, with its arguments read here: the
+    agent's command line hands them over unread, so that it need not import this module to build
+    itself — it is also what `gpm-agent serve` runs, and the agent that answers the pool never
+    imports this launcher (D63)."""
+    parser = argparse.ArgumentParser(prog=f"gpm-agent {verb}")
+    if verb == "vllm-start":
+        add_arguments(parser)
+        run = main
+    elif verb == "vllm-stop":
+        add_stop_arguments(parser)
+        run = main_stop
+    elif verb == "vllm-in-turn":
+        parser.add_argument("--models-dir", required=True)
+        run = main_in_turn
+    else:
+        raise ValueError(f"{verb!r} is not one of the launcher's verbs")
+    return run(parser.parse_args(list(argv)))
 
 
 def main(args: Any) -> int:
-    started = launch(args.models_dir, args.port, proxy=args.proxy, options=args.option)
+    vllm = VLLM_PROGRAM
+    if args.vllm is not None:
+        engines = Path(args.engines_dir).expanduser() if args.engines_dir else host_platform.engines_dir()
+        refused = vllm_refusal(args.vllm, engines)
+        if refused:
+            print(f"gpm-agent vllm-start: not started — {refused}")
+            return 2
+        vllm = args.vllm
+    only = None
+    if args.models_from is not None:
+        only, refused = models_named(args.models_from)
+        if refused:
+            print(f"gpm-agent vllm-start: not started — {refused}")
+            return 2
+    started = launch(args.models_dir, args.port, proxy=args.proxy, options=args.option, vllm=vllm, only=only)
     if started.refused:
         print(f"gpm-agent vllm-start: not started — {started.refused}")
         return 1

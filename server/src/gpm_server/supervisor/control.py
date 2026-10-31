@@ -28,7 +28,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..catalog import variants_for_host
-from ..config import ConfigError, PoolConfig, Variant
+from ..config import AUTO_ENGINES, ConfigError, PoolConfig, Variant
 from ..configplan import (
     CannotEdit,
     ConfigStore,
@@ -342,9 +342,36 @@ def _traits_from(item: Any) -> tuple[dict[str, Any], Optional[str]]:
     return said, None
 
 
+#: At most this many of an agent's reasons against vLLM are shown, each at most this long.
+_REASONS, _REASON_CHARS = 6, 300
+
+
+def _engine_choice(host: Any) -> Optional[dict[str, Any]]:
+    """What an `auto` host's agent chose, and why not vLLM where it did not (D161) — from its facts,
+    validated: an engine `auto` may choose, and a few short lines of reasons; anything else is no
+    choice. While the agent is silent, the choice the pool still uses, said as such
+    (`said_now: false`)."""
+    view = host.agent
+    facts = (view.facts or {}) if view is not None and view.reachable else None
+    engine = facts.get("engine") if facts is not None else None
+    choice = engine.get("choice") if isinstance(engine, dict) else None
+    if isinstance(choice, dict) and choice.get("engine") in AUTO_ENGINES:
+        reasons = choice.get("reasons")
+        reasons = [agents.printable(r, _REASON_CHARS) for r in reasons if isinstance(r, str) and r][:_REASONS] \
+            if isinstance(reasons, list) else []
+        return {"engine": choice["engine"], "reasons": reasons, "said_now": True}
+    if facts is None and getattr(host, "chosen_engine", None) is not None:
+        return {"engine": host.chosen_engine, "reasons": [], "said_now": False}
+    return None
+
+
 def _host_can_serve(config: PoolConfig, host: Any, name: str, added: list[dict[str, Any]]) -> bool:
-    """Could this configured host serve `name`, with the builds being added for it?"""
-    engine = config.engine_of(host)
+    """Could this configured host serve `name`, with the builds being added for it? Under `auto`,
+    on either engine its agent may choose (D161)."""
+    return all(_host_can_serve_on(config, host, name, added, engine) for engine in config.engines_of(host))
+
+
+def _host_can_serve_on(config: PoolConfig, host: Any, name: str, added: list[dict[str, Any]], engine: str) -> bool:
     caps = set(host.capabilities)
     entry = config.catalog.get(name)
     listed = [v.model_dump() for v in entry.variants] if entry else []
@@ -572,6 +599,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 capabilities=view.derived_capabilities,
                 on_disk=frozenset(m["tag"] for m in engine.get("models_on_disk", [])),
                 free_disk_bytes=(view.facts.get("disk") or {}).get("free_bytes"),
+                chosen_engine=host.chosen_engine,
             )
         return found
 
@@ -597,8 +625,11 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 "resident": sorted(host.resident),
                 "available": sorted(host.available),
                 "residency": host.config.residency,
-                # What this machine runs, and which of the pool's models it holds (D89, D93).
-                "engine": supervisor.config.engine_of(host.config),
+                # What this machine runs, and which of the pool's models it holds (D89, D93) —
+                # under `auto`, what its agent chose and why (D161).
+                "engine": supervisor.engine_name_of(host) or supervisor.config.engine_of(host.config),
+                "engine_configured": supervisor.config.engine_of(host.config),
+                "engine_choice": _engine_choice(host),
                 "holds": supervisor.config.models_held_by(host.config),
                 "served": served_on(host.variants, host.resident, host.available),
                 "last_error": host.last_error,
@@ -2093,8 +2124,13 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
     @app.post("/pool/hosts/{host_id}/engine/restart")
     async def restart_host_engine(host_id: str, request: Request) -> JSONResponse:
         """Restart a host's engine through its agent, optionally after writing the settings the
-        pool needs it to run with (D41). An operator's explicit act: a restart drops whatever
-        the engine is doing, so the supervisor's own pass never calls this."""
+        pool needs it to run with (D41). An operator's explicit act — a restart drops whatever the
+        engine is doing — with the host id typed again. The pool's own pass restarts an engine
+        only to start one its owner installed that serves none of its set yet (D160).
+
+        Answered at once (202): the restart runs in the background, as one through an agent that
+        runs vLLM can take many minutes, and its outcome is an event (`agent_engine_restarted`,
+        `agent_engine_restart_failed`). One at a time per host, the operator's or the pool's."""
         host = supervisor.hosts.get(host_id)
         if host is None or host.config.agent is None:
             return _error(404, "no_agent", f"no configured host {host_id!r} with an agent")
@@ -2102,23 +2138,38 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             body = await request.json()
         except ValueError:
             return _error(400, "bad_request", "the body must be JSON")
+        if not isinstance(body, dict):
+            return _error(400, "bad_request", "the body must be a JSON object")
         if body.get("confirm") != host_id:
             return _error(400, "not_confirmed", "type the host id again as `confirm`: requests in flight on that host will fail over or fail")
+        if host.restart_task is not None and not host.restart_task.done():
+            return _error(409, "restart_in_progress",
+                          f"{host_id}'s engine is already being restarted; its outcome will be in the events")
+        # What the agent last said it allows is answered at once; the agent still has the last word.
+        view = host.agent
+        if view is None or not view.reachable:
+            return _error(502, "agent_unreachable", (view.detail if view else None) or f"{host_id}'s agent has not answered yet")
+        allows = (view.facts or {}).get("allows")
+        allows = allows if isinstance(allows, dict) else {}
+        if not allows.get("restart"):
+            return _error(409, "owner_has_not_enabled_restart",
+                          f"{host_id}'s owner has set no restart_command in its agent's settings; the pool cannot supply one")
+        if body.get("apply_settings") and not allows.get("engine_settings"):
+            return _error(409, "owner_has_not_enabled_settings",
+                          f"{host_id}'s owner has set no engine_env_file in its agent's settings; restart without the settings")
         settings = (
             agents.wanted_engine_settings(host.config.workers, len(host.required_tags))
             if body.get("apply_settings") else None
         )
-        status_code, answer = await agents.restart_engine(host.agent_endpoint, settings, transport=supervisor._agent_transport)
-        if status_code == 200:
-            supervisor.events.record(
-                "agent_engine_restarted",
-                f"host {host_id}: engine restarted on the operator's instruction"
-                + (" with the pool's settings" if settings else "")
-                + ("" if answer.get("engine_answers") else " — and it is NOT answering"),
-                host_id=host_id,
-                numbers={**(settings or {}), "exit_code": answer.get("restart_exit_code"), "settings_written": answer.get("settings_written")},
-            )
-        return JSONResponse(status_code=status_code, content=answer)
+        supervisor.restart_for_operator(host, settings)
+        wait_s = agents.restart_read_s(host.install)
+        return JSONResponse(status_code=202, content={
+            "restarting": host_id,
+            "settings": settings,
+            "detail": f"the engine on {host_id} is restarting through its agent"
+                      + (" with the pool's settings" if settings else "")
+                      + f"; its outcome will be in the events, within {wait_s:g}s",
+        })
 
     @app.post("/pool/hosts/{host_id}/engine/{what}")
     async def switch_host_engine(host_id: str, what: str, request: Request) -> JSONResponse:
@@ -2212,7 +2263,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         """How many requests this host takes at once, changed while it runs (D56).
 
         Lowering is immediate and graceful. Raising relaunches the engine through the host's
-        own agent, so it costs that host about a minute and — like every restart — is an
+        own agent, so it costs that host about a minute and cuts off its requests in flight: an
         operator's explicit act, with the host id typed again (D41).
         """
         fleet = supervisor.fleet
