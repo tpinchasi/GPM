@@ -578,7 +578,7 @@ async def test_pip_holds_every_wheel_of_the_set_before_it_installs_any(tmp_path)
         def do_GET(self):
             if self.path.endswith(".whl"):
                 held = len(list(work.rglob("*.whl"))) if work.is_dir() else 0
-                installed = [p.name for p in venv.rglob("*.dist-info") if not p.name.startswith("pip-")]
+                installed = [p.name for p in venv.rglob("*.dist-info") if p.name.split("-")[0] in {m.name.split("-")[0] for m in made}]
                 seen.append((Path(self.path).name, held, bool(installed)))
             super().do_GET()
 
