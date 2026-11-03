@@ -574,9 +574,9 @@ class VllmSource:
                 f"its locked set's wheels, {installs.size_words(locked.size_bytes)}, held while they install, "
                 f"and the environment they make: up to {UNPACKED_MARGIN} times that"
             ))
-        work.mkdir(mode=0o700, parents=True)
+        host_platform.private_dir(work, parents=True)
         log = engine_dir / "logs" / INSTALL_LOG
-        log.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        host_platform.private_dir(log.parent, parents=True, exist_ok=True)
         log.write_text(f"--- gpm-agent: installing vLLM {version} for Python {self.python} on {self.processor}\n")
         venv = into / VENV
         try:

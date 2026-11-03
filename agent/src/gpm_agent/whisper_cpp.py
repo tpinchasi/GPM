@@ -295,6 +295,39 @@ def _last_error_line(log: Optional[str], offset: int) -> Optional[str]:
     return None
 
 
+#: What whisper.cpp says as it starts about where it computes (`whisper_backend_init_gpu`), and
+#: what the CUDA library says when it cannot use a card.
+_GPU_USED = re.compile(r"whisper_backend_init_gpu: using (?P<backend>[\w.-]+) backend")
+_GPU_NONE = "whisper_backend_init_gpu: no GPU found"
+_CUDA_SAID = re.compile(r"ggml_cuda_init: .*(failed|no CUDA|error)", re.IGNORECASE)
+
+
+def compute_device(log: Optional[str], offset: int) -> Optional[dict[str, Any]]:
+    """Where the server computes, as it said when it started: on a card (`gpu: true`, and which
+    backend — `CUDA0`, `Metal`, `Vulkan0`) or on the processor (`gpu: false`) — or None until it
+    has said. A build can name CUDA and still find no card it runs on: a card newer than the CUDA
+    it was built with (an RTX 50-series under CUDA before 12.8), a driver too old for it. That is
+    only seen here, and on the processor a recording takes several times as long."""
+    if not log:
+        return None
+    try:
+        with open(log, "rb") as handle:
+            handle.seek(offset)
+            lines = handle.read(_LOG_TAIL_BYTES * 4).decode(errors="replace").splitlines()
+    except OSError:
+        return None
+    cuda: Optional[str] = None
+    for line in lines:
+        if _CUDA_SAID.search(line):
+            cuda = line.strip()[:200]
+        used = _GPU_USED.search(line)
+        if used:
+            return {"gpu": True, "backend": used.group("backend"), "said": line.strip()[:200]}
+        if _GPU_NONE in line:
+            return {"gpu": False, "backend": "CPU", "said": cuda or line.strip()[:200]}
+    return None
+
+
 @contextlib.contextmanager
 def _refusing(doing: str) -> Iterator[None]:
     """An error from the system while `doing` is this engine's refusal, saying so — so it reaches
@@ -394,9 +427,9 @@ class WhisperCppFacts:
         directory may be a link the owner made; the uploads directory is never one."""
         state, uploads = self._state_dir, self._uploads_dir
         with _refusing(f"could not prepare this agent's state directory {state}"):
-            state.mkdir(mode=0o700, parents=True, exist_ok=True)
+            host_platform.private_dir(state, parents=True, exist_ok=True)
             _own_directory(state, follow=True)
-            uploads.mkdir(mode=0o700, exist_ok=True)
+            host_platform.private_dir(uploads, exist_ok=True)
             _own_directory(uploads, follow=False)
             _empty(uploads)
         return uploads
@@ -554,6 +587,11 @@ class WhisperCppFacts:
                 {record["tag"]: self._why_stopped(record)}
                 if record is not None and not alive and not record.get("stopped") else {}
             ),
+            # Whether it runs on a card, as the server said when it started: None until it has.
+            "compute": (
+                compute_device(record.get("log"), int(record.get("log_offset") or 0))
+                if record is not None and alive else None
+            ),
         }
 
     def _on_disk(self) -> list[dict[str, Any]]:
@@ -689,7 +727,7 @@ class WhisperCppFacts:
         argv = server_argv(binary, model_file, port, uploads)
         environment = _server_environment()
         with _refusing(f"could not open {PROGRAM}'s log {log_path}"):
-            logs.mkdir(mode=0o700, exist_ok=True)
+            host_platform.private_dir(logs, exist_ok=True)
         try:
             # Its own session, so it outlives an agent restart and keeps serving — and leads a
             # process group of its own, which is what is stopped. It works in the uploads

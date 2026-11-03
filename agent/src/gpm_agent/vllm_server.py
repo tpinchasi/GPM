@@ -189,7 +189,7 @@ class VllmServer:
         """Store the pool's numbers for the next start; True when they changed."""
         if self.pool_environment() == environment:
             return False
-        self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        host_platform.private_dir(self.state_dir, parents=True, exist_ok=True)
         target = self.state_dir / ENVIRONMENT_FILE
         draft = target.with_name(target.name + ".new")
         draft.write_text(json.dumps(environment, indent=2, sort_keys=True))
@@ -303,7 +303,7 @@ class VllmServer:
 
     def _write(self, name: str, value: Any) -> None:
         """A file of the engine's own directory, written whole or not at all."""
-        self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        host_platform.private_dir(self.state_dir, parents=True, exist_ok=True)
         target = self.state_dir / name
         draft = target.with_name(target.name + ".new")
         draft.write_text(json.dumps(value, indent=2))
@@ -443,7 +443,7 @@ class VllmServer:
         try:
             began = time.time()
             try:
-                logs.mkdir(mode=0o700, parents=True, exist_ok=True)
+                host_platform.private_dir(logs, parents=True, exist_ok=True)
                 # The models to start, where the launcher reads them (`--models-from`).
                 self._write(MODELS_FILE, models)
                 # Recorded before the launcher runs, so an agent that restarts meanwhile still
@@ -562,7 +562,7 @@ class VllmServer:
                 raise OSError("whether the processes it started are still vLLM could not be read now")
         else:
             logs = self.state_dir / "logs"
-            logs.mkdir(mode=0o700, parents=True, exist_ok=True)
+            host_platform.private_dir(logs, parents=True, exist_ok=True)
             ran = await self.run(self.stop_argv(), env=self.environment(), timeout_s=STOP_TIMEOUT_S,
                                  log=logs / LOG_FILE, os_name=self.os_name)
             if ran.code != 0:

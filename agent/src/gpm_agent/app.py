@@ -280,7 +280,7 @@ class HandOver:
                     log.warning("could not stop the engine this agent ran before choosing %s: %s", self.chosen, exc)
                     return False
             try:
-                self.record.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                host_platform.private_dir(self.record.parent, parents=True, exist_ok=True)
                 draft = self.record.with_name(self.record.name + ".new")
                 draft.write_text(json.dumps({"engine": self.chosen}))
                 os.replace(draft, self.record)

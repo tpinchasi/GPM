@@ -867,7 +867,7 @@ def launch(
     """
     models_dir = Path(models_dir).expanduser()
     state = state_dir_for(models_dir)
-    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    host_platform.private_dir(state, parents=True, exist_ok=True)
     env = dict(os.environ if env is None else env)
     this_boot = (boot or boot_id)()
     stop_previous(models_dir, kill=kill, alive=alive, cmdline=cmdline, boot=lambda: this_boot)

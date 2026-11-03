@@ -144,7 +144,7 @@ class OllamaServer:
         """Store the pool's numbers for the next start; True when they changed."""
         if self.pool_environment() == environment:
             return False
-        self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        host_platform.private_dir(self.state_dir, parents=True, exist_ok=True)
         target = self.state_dir / ENVIRONMENT_FILE
         draft = target.with_name(target.name + ".new")
         draft.write_text(json.dumps(environment, indent=2, sort_keys=True))
@@ -174,7 +174,7 @@ class OllamaServer:
         return self._record
 
     def _remember(self, record: dict[str, Any]) -> None:
-        self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        host_platform.private_dir(self.state_dir, parents=True, exist_ok=True)
         target = self.state_dir / RECORD_FILE
         draft = target.with_name(target.name + ".new")
         draft.write_text(json.dumps(record, indent=2))
@@ -292,7 +292,7 @@ class OllamaServer:
         log_path = logs / LOG_FILE
         argv = serve_argv(program)
         try:
-            logs.mkdir(mode=0o700, parents=True, exist_ok=True)
+            host_platform.private_dir(logs, parents=True, exist_ok=True)
         except OSError as exc:
             return f"could not prepare its log in {logs}: {exc}"
         try:
