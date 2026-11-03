@@ -527,7 +527,7 @@ pool:
   models: [my-model:7b, my-embedder]          # every host holds all of these, loaded
   context_length: 32768
   app_keys_file:   ~/.config/gpm/default.app-keys      # hashed
-  admin_keys_file: ~/.config/gpm/default.admin-keys
+  admin_keys_file: ~/.config/gpm/default.admin-keys   # owner-only; on Windows, under the profile (D163)
 
 router:
   listen: 127.0.0.1:11435
