@@ -65,6 +65,29 @@ def has_console() -> bool:
         return False
 
 
+def elevated() -> bool:
+    """Is this process running with an administrator's rights on Windows? Never asked elsewhere."""
+    if not WINDOWS:
+        return False
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        return False
+
+
+def warn_if_elevated(what: str) -> None:
+    """Say so where an operator will read it: what an elevated pool writes belongs to the
+    Administrators group, and the same user, not elevated, may not read it afterwards."""
+    if elevated():
+        import logging
+
+        logging.getLogger("gpm").warning(
+            "the %s runs with administrator rights. Run it as yourself, not elevated: what it writes "
+            "now — its database, keys and logs — may not be readable by your own account later", what)
+
+
 def _windows_alive(pid: int) -> bool:
     import ctypes
 

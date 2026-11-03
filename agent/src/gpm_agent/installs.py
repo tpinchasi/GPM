@@ -359,7 +359,7 @@ class GitHubReleases:
             raise InstallRefused(
                 f"{self.repo} publishes no digest for {asset.name}; nothing unchecked is installed"
             )
-        downloads.mkdir(mode=0o700, parents=True, exist_ok=True)
+        host_platform.private_dir(downloads, parents=True, exist_ok=True)
         final = downloads / asset.sha256
         if final.is_file():
             if await asyncio.to_thread(_sha256, final) == asset.sha256:
@@ -910,7 +910,7 @@ class InstallState:
         )
 
     def write(self, path: Path) -> None:
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        host_platform.private_dir(path.parent, parents=True, exist_ok=True)
         draft = path.with_name(path.name + ".new")
         descriptor = os.open(draft, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(descriptor, "w") as handle:
@@ -1375,7 +1375,7 @@ class Installer:
         version = release.version
         report = self._progress(version)
         # The owner's alone: it holds programs the agent runs as its owner.
-        self.engine_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        host_platform.private_dir(self.engine_dir, parents=True, exist_ok=True)
         partial = self.engine_dir / f"{version}{PARTIAL}"
         # A version's directories are removed in a thread, as `_prune` removes them: gigabytes.
         await asyncio.to_thread(_remove_if_there, partial)

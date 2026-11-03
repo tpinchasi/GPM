@@ -239,7 +239,7 @@ def unpack_source(archive: Path, commit: str, into: Path) -> Path:
             f"the source archive GitHub sent says it is of commit {named or '(none named)'}, not "
             f"{commit}; it is not built"
         )
-    into.mkdir(mode=0o700)
+    host_platform.private_dir(into)
     unpack(archive, "source.tar.gz", into)
     tops = list(into.iterdir())
     if len(tops) != 1 or tops[0].is_symlink() or not tops[0].is_dir() or not (tops[0] / "CMakeLists.txt").is_file():
@@ -356,7 +356,7 @@ class WhisperCppSource(GitHubReleases):
         cmake = await self._cmake(progress)
         work = engine_dir / WORK
         await asyncio.to_thread(shutil.rmtree, work, True)  # an earlier build stopped half-way
-        work.mkdir(mode=0o700, parents=True)
+        host_platform.private_dir(work, parents=True)
         log = engine_dir / "logs" / BUILD_LOG
         program = self.program(into)
         try:
@@ -369,7 +369,7 @@ class WhisperCppSource(GitHubReleases):
             progress("building", 0, None)
             build = work / "out"
             nvcc = self._nvcc() if self.target.os == LINUX else None
-            log.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            host_platform.private_dir(log.parent, parents=True, exist_ok=True)
             log.write_text(f"--- gpm-agent: building whisper.cpp {release.tag}, commit {commit}\n")
             # Git, if the machine has it, is asked by the build for the commit's name: it must not
             # find a repository above the work directory and take that one's.
@@ -437,7 +437,7 @@ class WhisperCppSource(GitHubReleases):
         if (venv / TOOL_COMPLETE).is_file() and cmake.is_file():
             return str(cmake)
         progress("downloading", 0, None)
-        self.tools_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        host_platform.private_dir(self.tools_dir, parents=True, exist_ok=True)
         for older in self.tools_dir.glob("cmake-*"):
             # Another pin's, or this one's left half-made.
             await asyncio.to_thread(shutil.rmtree, older, True)

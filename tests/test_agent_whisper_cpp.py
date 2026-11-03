@@ -33,6 +33,7 @@ from gpm_agent.whisper_cpp import (
     WhisperCppFacts,
     build_in,
     build_of,
+    compute_device,
     installed_version,
     server_argv,
 )
@@ -67,6 +68,7 @@ with open(starts_path, "a") as starts:
     starts.write(json.dumps({"args": args, "cwd": os.getcwd(), "pid": os.getpid(),
                              "hub_token": os.environ.get("HF_TOKEN")}) + "\\n")
 print("whisper_init_from_file_with_params_no_state: loading model from", args[args.index("-m") + 1], flush=True)
+print(control.get("compute", "whisper_backend_init_gpu: using Metal backend"), flush=True)
 if control.get("exit"):
     print(control["exit"], flush=True)
     sys.exit(control.get("code", 3))
@@ -317,6 +319,48 @@ async def test_the_hubs_fetch_takes_a_chosen_file_into_a_chosen_directory_and_no
             pass
     assert (tmp_path / "models" / "chosen" / "ggml-small-q5_0.bin").read_bytes() == FILES["ggml-small-q5_0.bin"]
     assert not (tmp_path / "outside").exists()
+
+
+# --- where it computes ---
+
+
+def a_log(tmp_path, *lines, before=()):
+    log = tmp_path / "whisper-server.log"
+    earlier = "".join(f"{line}\n" for line in before)
+    log.write_text(earlier + "".join(f"{line}\n" for line in lines))
+    return str(log), len(earlier.encode())
+
+
+def test_a_server_on_a_card_says_which_backend(tmp_path):
+    log, offset = a_log(tmp_path, "whisper_init_with_params_no_state: use gpu    = 1",
+                        "whisper_backend_init_gpu: using CUDA0 backend")
+    assert compute_device(log, offset) == {"gpu": True, "backend": "CUDA0",
+                                           "said": "whisper_backend_init_gpu: using CUDA0 backend"}
+
+
+def test_a_cuda_build_that_finds_no_card_it_runs_on_says_the_processor_and_why(tmp_path):
+    """An RTX 50-series card under a build made with CUDA 12.4 (before 12.8): found on Windows,
+    a seven-second recording took eleven seconds."""
+    log, offset = a_log(tmp_path, "ggml_cuda_init: failed to initialize CUDA: no CUDA-capable device is detected",
+                        "whisper_backend_init_gpu: no GPU found")
+    said = compute_device(log, offset)
+    assert said["gpu"] is False and said["backend"] == "CPU" and "failed to initialize CUDA" in said["said"]
+
+
+def test_only_the_servers_own_start_counts_and_nothing_is_said_before_it_says_it(tmp_path):
+    log, offset = a_log(tmp_path, "whisper_init_from_file_with_params_no_state: loading model",
+                        before=["whisper_backend_init_gpu: using CUDA0 backend"])
+    assert compute_device(log, offset) is None, "the start before this one is not this one"
+    assert compute_device(None, 0) is None and compute_device(str(tmp_path / "missing.log"), 0) is None
+
+
+async def test_the_facts_say_where_the_running_server_computes(machine):
+    await machine.fetch(TAG)
+    async with machine.client() as client:
+        await machine.engine.hold(client, TAG, pinned=True)
+        described = await machine.engine.describe(client)
+    assert described["compute"] == {"gpu": True, "backend": "Metal",
+                                    "said": "whisper_backend_init_gpu: using Metal backend"}
 
 
 # --- running the server ---
@@ -701,7 +745,7 @@ async def test_the_facts_say_what_the_program_is_and_what_it_serves(machine):
         await machine.engine.hold(client, TAG, pinned=True)
         after = await machine.engine.describe(client)
     assert set(before) == {
-        "name", "answers", "version", "binary", "ffmpeg", "models_on_disk", "models_loaded", "models_failed",
+        "name", "answers", "version", "binary", "ffmpeg", "models_on_disk", "models_loaded", "models_failed", "compute",
     }
     assert before["name"] == "whisper-cpp" and before["binary"] == machine.program
     assert before["answers"] is False and before["models_loaded"] == [] and before["models_failed"] == {}

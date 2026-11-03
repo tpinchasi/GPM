@@ -520,15 +520,24 @@ itself, and does not update itself.
 access control list, so the agent trusts a file by where it lives: its settings file, and the
 programs they name for it to run (`engine_binary`, `engines_path`), must lie under the user's
 profile (`%USERPROFILE%`, or `%LOCALAPPDATA%` where it is moved), links followed. Anything
-elsewhere is refused with the reason: a folder made at a drive's root inherits a rule letting
-every signed-in user change what is in it, and so what the agent runs as its owner.
+elsewhere is refused with the reason: a folder made at a drive's root inherits a rule letting every
+signed-in user change what is in it, and so what the agent runs as its owner. The folders the agent
+makes for itself — its engines, their versions, logs and state — are made by that same rule: under
+the profile, inheriting its permissions, never with `mode=0o700`, which since Python 3.12.4 gives a
+folder an owner-only access list whose owner, for an agent run elevated, is the Administrators
+group, leaving it unreadable to the same user afterwards (D163). An agent run with administrator
+rights says so as it starts.
 
 ## 3. What it reports — facts
 
 Read-only, cheap, no privileges: operating system and architecture; accelerators (kind, name,
-memory each, and for an NVIDIA card its compute capability and the driver's version);
-total and available system memory; free disk where the engine keeps models;
-engine name, version and whether it answers; models on disk with sizes; models loaded.
+memory each, and for an NVIDIA card its compute capability and the driver's version); total and
+available system memory; free disk where the engine keeps models; engine name, version and whether
+it answers; models on disk with sizes; models loaded. For whisper.cpp, `engine.compute` says where
+the running server computes, as it said when it started: on a card (`{gpu: true, backend:
+"CUDA0"}`, or `Metal`, `Vulkan0`) or on the processor (`{gpu: false, backend: "CPU"}`, with the
+CUDA library's own line where it gave one), and nothing until it has said — a build made with CUDA
+can find no card it runs on.
 
 From facts the pool **derives the host's capabilities** (`apple-silicon`, `cuda`, …) instead of
 trusting what someone typed, and the console can say *before* a change is applied that a model

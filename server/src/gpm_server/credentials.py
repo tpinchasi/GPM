@@ -105,7 +105,9 @@ class CredentialStore:
         self._refuse_open_parent()
         if not os.path.lexists(self.directory):
             self.directory.parent.mkdir(parents=True, exist_ok=True)
-            os.mkdir(self.directory, 0o700)
+            # 0700 on macOS and Linux; on Windows the profile's own permissions (D163), never an
+            # owner-only list that an elevated run would hand to the Administrators group.
+            os.mkdir(self.directory) if private_files.WINDOWS else os.mkdir(self.directory, 0o700)
         self._refuse_unsafe(self.directory, "credential directory")
 
     def _path(self, provider: str) -> Path:

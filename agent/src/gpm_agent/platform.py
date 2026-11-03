@@ -108,6 +108,32 @@ KEPT_ON_WINDOWS = (
 KEPT_PREFIXES = ("LC_", "CUDA_", "NVIDIA_", "HIP_", "ROCM_", "HSA_", "GPU_")
 
 
+def private_dir(path: Path, *, parents: bool = False, exist_ok: bool = False, os_name: Optional[str] = None) -> None:
+    """Make a directory this user's alone. On macOS and Linux by its mode, 0700. On Windows by
+    where it is — under the user's profile, whose permissions it inherits (D154) — and never by
+    `mode=0o700`: since Python 3.12.4 that gives the directory an owner-only access list, and
+    under an elevated agent the owner is the Administrators group, so the same user, not
+    elevated, could then no longer read what it holds — an engine version staged once would
+    never run again."""
+    if (os_name or system()) == WINDOWS:
+        Path(path).mkdir(parents=parents, exist_ok=exist_ok)
+    else:
+        Path(path).mkdir(mode=0o700, parents=parents, exist_ok=exist_ok)
+
+
+def elevated(os_name: Optional[str] = None) -> bool:
+    """Is this process running with an administrator's rights on Windows? Never asked elsewhere:
+    `sudo` there is the owner's own act, and the agent never asks for it."""
+    if (os_name or system()) != WINDOWS:
+        return False
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        return False
+
+
 def system(sys_platform: Optional[str] = None) -> str:
     """`macos`, `linux` or `windows` — or, for any other system, its own name, which nothing in
     the agent's tables knows and so is refused where it matters."""
@@ -637,7 +663,7 @@ async def run_command(
             # `nice` runs the command in its own place, so its process number is the command's.
             argv = [nice, "-n", str(LOW_PRIORITY), *argv]
     if log is not None:
-        log.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        private_dir(log.parent, parents=True, exist_ok=True)
         sink: Any = open(log, "a+b")  # noqa: SIM115 - closed below, after the command ends
         sink.write(f"--- gpm-agent: {' '.join(argv)} at {time.ctime()}\n".encode())
     else:

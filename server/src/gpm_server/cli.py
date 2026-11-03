@@ -95,6 +95,9 @@ def _serve(args: argparse.Namespace) -> int:
     from .router.app import create_app
 
     config = load_config(args.config)
+    from .processes import warn_if_elevated
+
+    warn_if_elevated("pool's router")
     child: Optional[subprocess.Popen] = None
     if not args.router_only:
         child = _supervisor_child(config, args.config, args.log_level)
@@ -120,6 +123,9 @@ def _supervise(args: argparse.Namespace) -> int:
     from .supervisor.service import ProviderCredentialMissing
 
     config = load_config(args.config)
+    from .processes import warn_if_elevated
+
+    warn_if_elevated("pool's supervisor")
     database = open_database(config)
 
     async def supervised() -> None:

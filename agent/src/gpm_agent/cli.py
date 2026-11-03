@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import shutil
 import sys
 from pathlib import Path
 from typing import Any
 
+from . import platform as host_platform
 from . import prerequisites, startup, whisper_cpp
 from . import proxy as proxy_module
 from .settings import AUTO, DEFAULT_PATH, Settings, SettingsError, fingerprint, load, mint_key, save
@@ -102,6 +104,13 @@ def _serve(args: argparse.Namespace) -> int:
         # First, so that settings that will not load say so where the owner will look.
         startup.send_output_to(args.log_file)
     settings = load(args.config)
+    if host_platform.elevated():
+        # Said, not refused: an owner may mean it. But what it makes then belongs to the
+        # Administrators group, and the same user, not elevated, may not read it afterwards.
+        logging.getLogger("gpm_agent").warning(
+            "this agent runs with administrator rights. Run it as yourself, not elevated: what it "
+            "installs and writes now may not be readable by your own account later"
+        )
     # Beside the settings, owner-only: the pins this agent set, so it can release them later.
     state_path = Path(args.config).expanduser().with_suffix(".state.json")
     uvicorn.run(
