@@ -25,6 +25,16 @@ its own stops rather than act beside the one that took it (D78). Configuration s
 configuration that references secrets, and the database are created owner-readable only, and
 the pool refuses to start if they are group- or world-readable.
 
+**On Windows** (D163) the same two processes run, under an embeddable Python as under `pythonw`.
+The router starts the supervisor, and the supervisor the forwarder, with the interpreter and import
+path it runs with itself, so a Python whose path was set as it ran — packages installed with `pip
+--target`, which `PYTHONPATH` cannot reach there — starts a child that can import the pool. With no
+console to share, the supervisor writes to `gpm-supervisor.log` beside the database, and its last
+lines are said with its exit. Whether a process is alive is asked of Windows itself, and its
+command line read from Windows' record of it; the supervisor takes no signal handlers there, the
+router ending it outright. The key files and credentials must lie under the user's profile, where
+Windows keeps them the user's alone, since their permission bits mean nothing there.
+
 ### 1.1 What is running is a release, not a tree (D79)
 
 A pool that spends money runs a **tagged release**: `deploy/gpm-deploy <tag>` builds one from

@@ -60,7 +60,10 @@ def test_without_a_profile_to_go_by_a_key_file_is_refused(windows, monkeypatch):
 def test_a_link_out_of_the_profile_counts_as_where_it_leads(windows, tmp_path):
     real = KeyStore(tmp_path / "C-root" / "app.keys")
     real.create("app")
-    os.symlink(real.path, windows / "app.keys")
+    try:
+        os.symlink(real.path, windows / "app.keys")
+    except OSError:  # Windows makes links only with Developer Mode or as an administrator
+        pytest.skip("this account cannot make a symbolic link here")
     with pytest.raises(KeyFileUnsafe, match="outside your profile"):
         KeyStore(windows / "app.keys").load()
 

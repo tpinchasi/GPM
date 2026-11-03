@@ -1273,8 +1273,22 @@ class Installer:
         self.record.write(self.engine_dir / STATE_FILE)
 
     def _progress(self, version: str) -> Progress:
+        """Each step's progress, with how fast it goes — a slow line is told from a stuck one, in
+        the facts and on the pool's Hosts screen (`bytes_per_s`, smoothed; None until measured)."""
+        speed: dict[str, Any] = {}
+
         def report(step: str, done: int, total: Optional[int]) -> None:
-            self.working = {"step": step, "version": version, "done": int(done), "total": total}
+            now = time.monotonic()
+            if speed.get("step") != step or done < speed.get("done", 0):
+                speed.clear()
+                speed.update(step=step, at=now, done=int(done), rate=None)
+            elif now - speed["at"] >= 1.0:
+                latest = (int(done) - speed["done"]) / (now - speed["at"])
+                speed["rate"] = latest if speed["rate"] is None else 0.7 * speed["rate"] + 0.3 * latest
+                speed.update(at=now, done=int(done))
+            rate = speed.get("rate")
+            self.working = {"step": step, "version": version, "done": int(done), "total": total,
+                            "bytes_per_s": int(rate) if rate is not None else None}
 
         return report
 
