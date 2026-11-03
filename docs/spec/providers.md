@@ -192,7 +192,8 @@ browser once, typed in*, and is never sent back. Found by the architecture revie
 - **Nothing echoes it**: a refused request answers without the submitted value (validation errors
   included), and a test proves it is never logged.
 - **The file** lives in an owner-only directory, written atomically without following links,
-  checked at start like the pool's other secrets (T19), and kept out of configuration versions.
+  checked at start like the pool's other secrets (T19) — on Windows, where permission bits mean
+  nothing, by being under the user's profile (D163) — and kept out of configuration versions.
 - **A plug-in is handed its credential** rather than reading the environment itself — a versioned
   change to the provider interface (plugin-interfaces.md §1), made before the second provider.
 - **Threat-model rows** for the credential in the browser's memory, an endpoint redirect through

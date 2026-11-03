@@ -24,6 +24,8 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
+from . import private_files
+
 #: A provider's entry-point name, which names its file — never a path.
 _PROVIDER = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 
@@ -63,6 +65,11 @@ class CredentialStore:
         info = os.lstat(path)
         if stat.S_ISLNK(info.st_mode):
             raise CredentialStoreUnsafe(f"{path} is a link; the provider {what} is never read through one")
+        if private_files.WINDOWS:  # no permission bits there: the place decides (D163)
+            problem = private_files.outside_profile(str(path))
+            if problem:
+                raise CredentialStoreUnsafe(f"{path} {problem}")
+            return info
         if hasattr(os, "getuid") and info.st_uid != os.getuid():
             raise CredentialStoreUnsafe(f"{path} belongs to another user; it must be this pool's own")
         if info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
@@ -74,6 +81,11 @@ class CredentialStore:
         """The directory it sits in must not let someone else swap it for their own: no parent
         others can write to, unless only an entry's owner can rename it there (the sticky bit)."""
         parent = self.directory.parent.resolve()
+        if private_files.WINDOWS:  # a folder under the profile is the user's alone (D163)
+            problem = private_files.outside_profile(str(parent))
+            if problem:
+                raise CredentialStoreUnsafe(f"{parent} {problem}; choose rented.credentials_dir under it")
+            return
         mode = os.stat(parent).st_mode
         if mode & (stat.S_IWGRP | stat.S_IWOTH) and not mode & stat.S_ISVTX:
             raise CredentialStoreUnsafe(f"{parent} can be written by others, so the credential directory in it could be "

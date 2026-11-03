@@ -21,6 +21,8 @@ import time
 from pathlib import Path
 from typing import Literal, Mapping, Optional, TypeVar
 
+from . import private_files
+
 Role = Literal["app", "admin", "workload", "provisioner"]
 
 #: Keys are 32 random bytes. That is far beyond what a dictionary attack can reach, so a plain
@@ -58,6 +60,11 @@ class KeyStore:
         self.path = Path(path).expanduser()
 
     def _check_permissions(self) -> None:
+        if private_files.WINDOWS:  # no permission bits there: the place decides (D163)
+            problem = private_files.outside_profile(str(self.path))
+            if problem:
+                raise KeyFileUnsafe(f"{self.path} {problem}")
+            return
         mode = self.path.stat().st_mode
         if mode & (stat.S_IRGRP | stat.S_IROTH | stat.S_IWGRP | stat.S_IWOTH):
             raise KeyFileUnsafe(

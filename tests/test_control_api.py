@@ -4,6 +4,8 @@ docs/spec/console-and-control-api.md §1 and threat model T1/T3. The rule with t
 app key is refused here — an app that can request a completion must not be able to open a lease.
 """
 
+import os
+
 import httpx
 import pytest
 from fakes.harness import BackgroundLoop, ServerHandle
@@ -81,6 +83,7 @@ def test_two_keys_of_a_role_are_valid_at_once_so_rotation_needs_no_downtime(tmp_
     assert verify(second, store.hashes("app"))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="permission bits: on Windows the place decides, test_server_on_windows.py (D163)")
 def test_a_key_file_others_can_read_is_refused(tmp_path):
     path = tmp_path / "app.keys"
     store = KeyStore(path)

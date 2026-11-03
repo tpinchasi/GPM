@@ -4,7 +4,8 @@ name: CI
 # 90% of its allowance in one evening of small fixes, at ~21 minutes a run, twice a change):
 #
 # - every pull request: the default suite on one Python, lint, the version check, the secret
-#   scan, the dependency audit, and the no-spending guard — about five minutes;
+#   scan, the dependency audit, and the no-spending guard — about five minutes — and on Windows,
+#   the tests written to hold on every system;
 # - a pull request labelled `simulation`: the whole-pool simulation as well — the gate for a
 #   change to the supervisor's renting, allocation or recovery, which is where a long run finds
 #   what a unit test cannot;
@@ -48,6 +49,21 @@ jobs:
       - run: uv python install ${{ matrix.python }}
       - run: uv sync --python ${{ matrix.python }}
       - run: uv run pytest -q
+
+  windows:
+    # The pool, the client and the agent run on Windows too: the router and supervisor under an
+    # embeddable Python, with no console under pythonw, and the agent on the owner's own PC
+    # (D154, D163). Windows minutes cost twice Linux's, so this runs the tests written to hold on
+    # every system — processes, the pool's secrets, the agent on Windows — not the whole suite.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --python 3.12
+      - run: uv run pytest -q tests/test_processes.py tests/test_server_on_windows.py
 
   simulation:
     # A whole pool — real router, real supervisor — against a market that moves under it, for

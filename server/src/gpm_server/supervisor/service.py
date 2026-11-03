@@ -53,6 +53,23 @@ log = logging.getLogger("gpm.supervisor")
 REQUESTS_PER_LOOK = 4
 
 
+def _size_words(size: int) -> str:
+    """A size in words: gigabytes, or megabytes or kilobytes under one."""
+    if size >= 10**9:
+        return f"{size / 1e9:.1f} GB"
+    if size >= 10**6:
+        return f"{size / 1e6:.1f} MB"
+    return f"{size / 1e3:.0f} kB"
+
+
+def _duration_words(seconds: float) -> str:
+    """A time still to go, roughly."""
+    if seconds >= 5400:
+        return f"{seconds / 3600:.1f} hours"
+    if seconds >= 90:
+        return f"{seconds / 60:.0f} minutes"
+    return f"{max(seconds, 1):.0f} seconds"
+
 class ProviderCredentialMissing(Exception):
     """Rented capacity is configured and the provider will not accept this process's credential.
     Raised at start, before anything is adopted, swept or published."""
@@ -295,13 +312,14 @@ class Supervisor:
             log.warning("the forwarder is on, but this pool was not started from a file to start it with")
             return
         import subprocess
-        import sys
+
+        from ..processes import detached, pool_command
 
         state_dir = Path(self.config.request_log).expanduser().resolve().parent
         out = open(state_dir / "gpm-forwarder.log", "ab")
         child = subprocess.Popen(
-            [sys.executable, "-m", "gpm_server.cli", "forwarder", "-c", str(self.config_path)],
-            stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
+            pool_command("forwarder", "-c", str(self.config_path)),
+            stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, **detached(),
         )
         out.close()
         self.events.record("forwarder_started", f"the forwarder was not running; started it (pid {child.pid})",
@@ -1587,7 +1605,7 @@ class Supervisor:
             # An engine that went away may come back another version, taking other inputs: its
             # builds are asked again on the first probe that finds it (D143).
             host.observed_for = frozenset()
-            starting = self._agent_is_starting_it(host) if from_agent else None
+            starting = self._agent_is_installing(host) or (self._agent_is_starting_it(host) if from_agent else None)
             if starting:
                 # Its agent fetches the model and starts the server with it (D148): a server not
                 # answering yet is one being brought up, not a host that went away.
@@ -1658,6 +1676,35 @@ class Supervisor:
             frozenset(m["tag"] for m in models if m.get("loaded")),
             frozenset(m["tag"] for m in models if m.get("on_disk")),
         )
+
+    def _agent_is_installing(self, host: SupervisedHost) -> Optional[str]:
+        """Why the engine is not answering, where its agent is installing it (S9): what it is
+        doing, how far, how fast — a download of an engine can take an hour on a slow line, and
+        "unreachable" would read as a failure. None where the agent says nothing of the kind."""
+        if host.agent is None or not host.agent.reachable:
+            return None
+        engine = (host.agent.facts or {}).get("engine") or {}
+        install = engine.get("install") if isinstance(engine, dict) else None
+        if not isinstance(install, dict) or not install.get("allowed"):
+            return None
+        name = str(install.get("engine") or "its engine")[:40]
+        working = install.get("working")
+        if isinstance(working, dict):
+            step, version = str(working.get("step") or "working")[:40], str(working.get("version") or "")[:40]
+            done, total, rate = working.get("done"), working.get("total"), working.get("bytes_per_s")
+            said = f"its agent is installing {agents.printable(name, 40)} {agents.printable(version, 40)}: {agents.printable(step, 40)}"
+            if isinstance(done, int) and isinstance(total, int) and total > 0:
+                said += f" {_size_words(done)} of {_size_words(total)} ({min(done * 100 // total, 100)}%)"
+            elif isinstance(done, int) and done > 0:
+                said += f" {_size_words(done)}"
+            if isinstance(rate, int) and rate > 0:
+                said += f" at {_size_words(rate)}/s"
+                if isinstance(done, int) and isinstance(total, int) and total > done:
+                    said += f", about {_duration_words((total - done) / rate)} left"
+            return said
+        if install.get("running") is None and install.get("error"):
+            return f"its agent has not installed {name} yet: {agents.printable(install['error'])}"
+        return None
 
     def _agent_is_starting_it(self, host: SupervisedHost) -> Optional[str]:
         """Why the server is not answering, as its agent tells it — or None when the agent says

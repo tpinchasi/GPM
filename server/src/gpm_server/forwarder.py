@@ -36,6 +36,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from . import processes
 from .config import TransportConfig
 from .db import Database, SupervisorLock
 from .transports.tunnel import build_ssh_command
@@ -63,23 +64,14 @@ def listening(port: int, timeout: float = 0.2) -> bool:
 
 
 def pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # alive, and not ours — which the command-line check then settles
+    """Alive, whoever's it is — which the command-line check then settles (`processes.alive`:
+    asked of Windows itself there, where `os.kill` would end or interrupt the process)."""
+    return processes.alive(pid)
 
 
 def command_line(pid: int) -> Optional[str]:
     """A process's command line as the system reports it, or None where it cannot be read."""
-    try:
-        out = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    line = out.stdout.strip()
-    return line or None
+    return processes.command_line(pid)
 
 
 @dataclasses.dataclass
@@ -171,8 +163,9 @@ class Forwarder:
         out = open(self._log_path(name), "ab")
         child = subprocess.Popen(
             argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=out,
-            # Its own session is what lets it outlive this process; `close` keeps it in ours.
-            start_new_session=self.on_restart == "reattach",
+            # Its own session is what lets it outlive this process; `close` keeps it in ours. No
+            # console window on Windows either way.
+            **(processes.detached() if self.on_restart == "reattach" else processes.windowless()),
         )
         out.close()
         log.info("forward %s started (pid %d)", name, child.pid)

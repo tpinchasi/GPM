@@ -10,6 +10,7 @@ Nothing here spends money.
 import asyncio
 import datetime
 import hashlib
+import os
 import secrets
 import ssl
 import time
@@ -411,6 +412,7 @@ def test_the_pool_signs_only_the_public_key_it_is_sent(tmp_path):
         ca.sign("not a request", "w-1", 1)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="permission bits: on Windows the place decides, test_server_on_windows.py (D163)")
 def test_a_client_ca_is_refused_when_others_can_read_its_key_or_the_router_trusts_another(tmp_path):
     import os
 

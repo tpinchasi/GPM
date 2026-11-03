@@ -693,13 +693,10 @@ class SupervisorBusy(Exception):
 
 
 def _process_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # exists, owned by someone else
-    return True
+    """Exists, whoever owns it — asked of Windows itself there (`processes.alive`)."""
+    from .processes import alive
+
+    return alive(pid)
 
 
 class SupervisorLock:

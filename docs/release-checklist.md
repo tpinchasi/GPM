@@ -142,6 +142,12 @@ Each line was re-checked against the code on 2026-09-19; the test that holds it 
       longer supported. The sets ship inside the agent: the release carries them, and a machine's
       `latest` is the newest of them.
 
+- [ ] **Wheels with each GitHub release:** `uv build --package gpm-server --wheel`, and the same for
+      `gpm-client` and `gpm-agent`, into an empty `dist/`; attach the three wheels to the release with
+      a `SHA256SUMS` file. An installer that cannot build from source — an embeddable Python, whose
+      isolated build cannot find `hatchling` — installs them as they are. Check each wheel holds
+      what the package needs at run time: the console's static files, the agent's `vllm_sets/`.
+
 ## 4. Deliberately not promised at first release
 
 Stated up front so expectations are set: more than one provider or engine; multi-pool

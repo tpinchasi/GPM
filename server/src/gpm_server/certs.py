@@ -22,6 +22,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
+from . import private_files
+
 
 class CertRefused(Exception):
     """A signing request that will not be signed — said in words."""
@@ -68,7 +70,11 @@ def make_ca(directory: str | Path, name: str = "GPM pool client CA", years: int 
 class ClientCA:
     def __init__(self, certfile: str | Path, keyfile: str | Path):
         keyfile = Path(keyfile).expanduser()
-        if keyfile.stat().st_mode & (stat.S_IRGRP | stat.S_IROTH | stat.S_IWGRP | stat.S_IWOTH):
+        if private_files.WINDOWS:  # no permission bits there: the place decides (D163)
+            problem = private_files.outside_profile(str(keyfile))
+            if problem:
+                raise CertRefused(f"{keyfile} {problem}")
+        elif keyfile.stat().st_mode & (stat.S_IRGRP | stat.S_IROTH | stat.S_IWGRP | stat.S_IWOTH):
             # Whoever reads it can sign a certificate for any workload (threat model T19).
             raise CertRefused(f"{keyfile} is readable by others; run `chmod 600 {keyfile}` before starting the pool")
         self.cert = x509.load_pem_x509_certificate(Path(certfile).expanduser().read_bytes())

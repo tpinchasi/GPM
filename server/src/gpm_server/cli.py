@@ -20,10 +20,27 @@ from typing import Any, Optional
 from .config import ConfigError, load_config
 
 
-def _supervisor_child(config_path: str, log_level: str) -> subprocess.Popen:
+def _supervisor_child(config: Any, config_path: str, log_level: str) -> subprocess.Popen:
+    """The supervisor, as a program of its own: this interpreter and this import path, so a
+    Python whose path was set as it ran starts one that can import the pool (`pool_command`).
+    What it says goes where this process's own output does — or, with none to share (under
+    `pythonw`, or a service), to `gpm-supervisor.log` beside the pool's database, where its last
+    words are read back if it stops."""
+    from .processes import has_console, pool_command, windowless
+
+    log_path: Optional[pathlib.Path] = None
+    output: dict[str, Any] = {}
+    if not has_console():
+        log_path = pathlib.Path(config.request_log).expanduser().resolve().parent / "gpm-supervisor.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(log_path, "ab")
+        output = {"stdout": handle, "stderr": subprocess.STDOUT}
     child = subprocess.Popen(
-        [sys.executable, "-m", "gpm_server.cli", "supervise", "-c", config_path, "--log-level", log_level]
+        pool_command("supervise", "-c", config_path, "--log-level", log_level),
+        stdin=subprocess.DEVNULL, **output, **windowless(),
     )
+    if output:
+        output["stdout"].close()
 
     def watch() -> None:
         # Reap it, and say so plainly. Routing carries on either way, which is the point of
@@ -32,12 +49,26 @@ def _supervisor_child(config_path: str, log_level: str) -> subprocess.Popen:
         if code != 0:
             logging.getLogger("gpm").error(
                 "the supervisor exited (code %s). Routing continues on the last published "
-                "host table; nothing will be rented, recovered or released until it is back.",
-                code,
+                "host table; nothing will be rented, recovered or released until it is back.%s",
+                code, _last_words(log_path),
             )
 
     threading.Thread(target=watch, daemon=True).start()
     return child
+
+
+def _last_words(log_path: Optional[pathlib.Path], lines: int = 20) -> str:
+    """The end of what a stopped supervisor wrote to its own log, to say with its exit."""
+    if log_path is None:
+        return ""
+    try:
+        with open(log_path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - 16384))
+            tail = handle.read().decode("utf-8", "replace").splitlines()[-lines:]
+    except OSError:
+        return f" Its output is in {log_path}."
+    return f" Its last words, from {log_path}:\n" + "\n".join(tail) if tail else f" It wrote nothing to {log_path}."
 
 
 def listener_options(config: Any) -> dict[str, Any]:
@@ -66,7 +97,7 @@ def _serve(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     child: Optional[subprocess.Popen] = None
     if not args.router_only:
-        child = _supervisor_child(args.config, args.log_level)
+        child = _supervisor_child(config, args.config, args.log_level)
 
     try:
         app = create_app(config, config_path=args.config)
@@ -101,7 +132,13 @@ def _supervise(args: argparse.Namespace) -> int:
         task = asyncio.current_task()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, lambda: task.cancel() if task else None)
+            try:
+                loop.add_signal_handler(sig, lambda: task.cancel() if task else None)
+            except NotImplementedError:
+                # Windows' event loop takes no signal handlers. Nothing is lost there: the router
+                # stops this process outright (TerminateProcess), and Ctrl-C still raises
+                # KeyboardInterrupt, which ends `asyncio.run` with its cleanup.
+                break
         await run(config, database, config_path=args.config)
 
     try:

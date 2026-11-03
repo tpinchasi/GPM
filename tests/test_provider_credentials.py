@@ -107,6 +107,7 @@ def hold_a_host(supervisor, market):
 # --- the store ---
 
 
+@pytest.mark.skipif(os.name == "nt", reason="permission bits: on Windows the place decides, test_server_on_windows.py (D163)")
 def test_the_store_is_owner_only_written_whole_and_never_followed_through_a_link(tmp_path):
     store = CredentialStore(tmp_path / "creds")
     record = store.put("fake", GOOD, {"endpoint": None})
@@ -568,6 +569,7 @@ def test_a_credential_that_is_not_plain_text_is_refused_without_a_trace(pool):
     assert answer.status_code == 400 and GOOD not in answer.text
 
 
+@pytest.mark.skipif(os.name == "nt", reason="permission bits: on Windows the place decides, test_server_on_windows.py (D163)")
 def test_a_credential_directory_others_could_replace_is_refused(tmp_path):
     shared = tmp_path / "shared"
     shared.mkdir()
