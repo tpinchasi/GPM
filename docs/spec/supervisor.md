@@ -42,6 +42,12 @@ begins or what it says changes, again at its 5th, 10th, 20th, 30th and 50th atte
 after (`agent_model_still_failing`), and once when it works again (`agent_model_recovered`). The
 pool asks the agent on every pass; the agent's own backoff decides when an attempt is made.
 
+**A supervisor that stops** on its own is started again by the router that started it (`gpm
+serve`): after 5 seconds, then twice as long after each stop in a row, up to 5 minutes, and back to
+5 seconds once one has run 10 minutes; each stop is logged with its exit code and, without a
+console, its last words (D163). `GET /pool/status` says whether a supervisor is there — from the
+heartbeat it writes to its lock — however it was started.
+
 ### 1.1 What is running is a release, not a tree (D79)
 
 A pool that spends money runs a **tagged release**: `deploy/gpm-deploy <tag>` builds one from

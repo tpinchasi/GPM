@@ -13,6 +13,7 @@ import sys
 import time
 import types
 
+import pytest
 from gpm_server import cli, processes
 from gpm_server.supervisor.service import Supervisor
 
@@ -79,19 +80,50 @@ def test_a_supervisor_with_no_console_writes_its_own_log_and_its_last_words_are_
     """Under `pythonw` the supervisor's traceback had nowhere to go: the router said only "the
     supervisor exited (code 1)"."""
     monkeypatch.setattr(processes, "has_console", lambda: False)
+    monkeypatch.setattr(cli, "RESTART_FIRST_S", 3600.0)  # said, and not started again within the test
     monkeypatch.setattr(processes, "pool_command", lambda *args: [
         sys.executable, "-c", "import sys; print('ModuleNotFoundError: No module named gpm_server'); sys.exit(1)"])
     config = types.SimpleNamespace(request_log=str(tmp_path / "state" / "requests.sqlite3"))
     with caplog.at_level(logging.ERROR, logger="gpm"):
-        child = cli._supervisor_child(config, str(tmp_path / "pool.yaml"), "info")
-        child.wait(timeout=60)
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and not caplog.records:
-            time.sleep(0.05)
+        supervised = cli._supervisor_child(config, str(tmp_path / "pool.yaml"), "info")
+        try:
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline and not caplog.records:
+                time.sleep(0.05)
+        finally:
+            supervised.stop()
     said = caplog.records[0].getMessage()
-    assert "the supervisor exited (code 1)" in said
+    assert "the supervisor exited (code 1)" in said and "Starting it again in 3600s" in said
     assert "ModuleNotFoundError: No module named gpm_server" in said
     assert (tmp_path / "state" / "gpm-supervisor.log").exists()
+
+
+def test_a_supervisor_that_stops_is_started_again_and_never_once_the_router_goes(tmp_path, monkeypatch):
+    """Found on a quick restart at a shop: the supervisor stopped, and nothing started it again
+    until the whole pool was restarted — routing carried on, recovery did not."""
+    runs = tmp_path / "runs"
+    script = (
+        "import pathlib, sys, time\n"
+        f"runs = pathlib.Path({str(runs)!r})\n"
+        "n = len(runs.read_text()) if runs.exists() else 0\n"
+        "runs.write_text('x' * (n + 1))\n"
+        "sys.exit(1) if n == 0 else time.sleep(60)\n"
+    )
+    monkeypatch.setattr(processes, "pool_command", lambda *args: [sys.executable, "-c", script])
+    monkeypatch.setattr(cli, "RESTART_FIRST_S", 0.2)
+    config = types.SimpleNamespace(request_log=str(tmp_path / "requests.sqlite3"))
+    supervised = cli._supervisor_child(config, str(tmp_path / "pool.yaml"), "info")
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and supervised.restarts < 1:
+            time.sleep(0.05)
+        assert supervised.restarts == 1 and supervised.child.poll() is None, "started again, and running"
+        second = supervised.child
+    finally:
+        supervised.stop()
+    assert second.poll() is not None
+    time.sleep(0.5)
+    assert supervised.restarts == 1 and runs.read_text() == "xx", "never started again once stopped for good"
 
 
 def test_the_supervisor_starts_where_the_event_loop_takes_no_signal_handlers(monkeypatch):
@@ -160,3 +192,98 @@ def test_the_agent_says_how_fast_a_download_goes(monkeypatch):
     assert installer.working["bytes_per_s"] == 200_000
     report("unpacking", 0, None)
     assert installer.working["bytes_per_s"] is None, "a new step is measured afresh"
+
+
+# --- whether a process lives, on every system (found on a quick restart on Windows) ---
+
+
+def test_a_live_process_checked_is_still_running_afterwards():
+    """On Windows `os.kill(pid, 0)` ended the process it was asked about."""
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        assert processes.alive(child.pid)
+        time.sleep(0.2)
+        assert child.poll() is None, "asked about, never ended"
+    finally:
+        child.kill()
+        child.wait()
+    assert not processes.alive(child.pid), "gone, and no exception for it"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows' System process")
+def test_a_process_not_ours_to_open_is_alive():
+    assert processes.alive(4)
+
+
+def test_the_agent_and_the_pool_agree_on_whether_a_process_lives():
+    """The two packages depend on neither, so each has its copy of the check (D163): held equal here."""
+    from gpm_agent import platform as host_platform
+    from gpm_server import forwarder
+    from gpm_server.db import _process_alive
+
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    for pid, expected in ((os.getpid(), True), (child.pid, False)):
+        assert processes.alive(pid) is expected
+        assert _process_alive(pid) is expected and forwarder.pid_alive(pid) is expected
+        assert host_platform.alive(pid) is expected
+
+
+def a_lock_held_by(tmp_path, pid):
+    import socket
+
+    from gpm_server.db import Database, SupervisorLock
+
+    database = Database(tmp_path / "gpm.sqlite3")
+    database.execute(
+        "INSERT INTO supervisor_lock (pool, owner, pid, heartbeat) VALUES (?, ?, ?, ?)",
+        ("shop", f"{socket.gethostname()}:{pid}:old", pid, time.time() - 5),
+    )
+    return database, SupervisorLock(database, "shop", f"{socket.gethostname()}:{os.getpid()}:new")
+
+
+def test_a_supervisor_restarted_quickly_takes_the_lock_its_ended_predecessor_left(tmp_path):
+    """The heartbeat is five seconds old, so whether its holder lives decides: on Windows, before
+    0.37.1, asking raised OSError for an ended process, and the new supervisor crashed."""
+    ended = subprocess.Popen([sys.executable, "-c", "pass"])
+    ended.wait()
+    database, lock = a_lock_held_by(tmp_path, ended.pid)
+    try:
+        lock.acquire()
+        assert database.query("SELECT owner FROM supervisor_lock")[0]["owner"] == lock.owner
+    finally:
+        database.close()
+
+
+def test_a_supervisor_still_running_keeps_the_lock_and_is_not_touched(tmp_path):
+    from gpm_server.db import SupervisorBusy
+
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        database, lock = a_lock_held_by(tmp_path, holder.pid)
+        try:
+            with pytest.raises(SupervisorBusy):
+                lock.acquire()
+        finally:
+            database.close()
+        assert holder.poll() is None, "its holder still running"
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_the_status_says_whether_a_supervisor_is_there(tmp_path):
+    from gpm_server.db import Database
+    from gpm_server.router.app import _supervisor_now
+
+    database = Database(tmp_path / "gpm.sqlite3")
+    try:
+        assert _supervisor_now(database, "shop") == {"running": False, "heartbeat_age_s": None}
+        database.execute("INSERT INTO supervisor_lock (pool, owner, pid, heartbeat) VALUES (?, ?, ?, ?)",
+                         ("shop", "here:1:x", 1, time.time() - 3))
+        now = _supervisor_now(database, "shop")
+        assert now["running"] is True and 2 <= now["heartbeat_age_s"] <= 10
+        database.execute("UPDATE supervisor_lock SET heartbeat = ?", (time.time() - 120,))
+        assert _supervisor_now(database, "shop")["running"] is False
+    finally:
+        database.close()
