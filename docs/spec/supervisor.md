@@ -35,6 +35,13 @@ command line read from Windows' record of it; the supervisor takes no signal han
 router ending it outright. The key files and credentials must lie under the user's profile, where
 Windows keeps them the user's alone, since their permission bits mean nothing there.
 
+**A host whose agent fails** (D163) says why for as long as it fails: its `last_error` is the
+agent's own reason, with how often it has tried and when it tries next, until the host is ready,
+when it is cleared — the same in `GET /pool/status`. The decision log says the failure once when it
+begins or what it says changes, again at its 5th, 10th, 20th, 30th and 50th attempt and every 25th
+after (`agent_model_still_failing`), and once when it works again (`agent_model_recovered`). The
+pool asks the agent on every pass; the agent's own backoff decides when an attempt is made.
+
 ### 1.1 What is running is a release, not a tree (D79)
 
 A pool that spends money runs a **tagged release**: `deploy/gpm-deploy <tag>` builds one from

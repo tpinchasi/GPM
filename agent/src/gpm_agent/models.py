@@ -29,8 +29,22 @@ from .engines import EngineRefused, OllamaFacts
 #: dots leading out of anywhere, or anything with a scheme — those are refused before the
 #: engine ever sees them.
 _TAG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*(:[A-Za-z0-9][A-Za-z0-9._-]*)?$")
-#: How long a tag that failed to pull is left alone before another attempt.
-RETRY_AFTER_S = 60.0
+#: How long a model that failed — to be fetched, held, or started — is left before another
+#: attempt: half a minute, then twice as long after each failure in a row, up to ten minutes, for
+#: as long as the pool asks for it. A cause put right meanwhile — a folder's permissions repaired,
+#: disk freed, the network back — is found at the next attempt, with no restart of anything.
+RETRY_FIRST_S = 30.0
+RETRY_MOST_S = 600.0
+
+
+@dataclasses.dataclass
+class Failure:
+    """A model's failures in a row: when the last was, what it said, how many, and the wait."""
+
+    at: float
+    why: str
+    attempts: int
+    wait_s: float
 
 
 class Refused(Exception):
@@ -60,8 +74,11 @@ class ModelWork:
         allow_delete: bool,
         state_path: Optional[Path] = None,
         before_pass: Optional[Callable[[], Awaitable[None]]] = None,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self.engine, self.client = engine, client
+        #: When failures happened and their waits end — a test's own clock, never the loop's.
+        self.clock = clock
         #: Run at the start of every pass: for an engine this agent runs itself (D150), starting
         #: its server again if it has stopped, so the pass finds an engine to work with.
         self.before_pass = before_pass
@@ -70,7 +87,7 @@ class ModelWork:
         self.allow_delete = allow_delete
         self.desired = Desired()
         self.pulling: Optional[dict[str, Any]] = None
-        self.errors: dict[str, tuple[float, str]] = {}
+        self.errors: dict[str, Failure] = {}
         #: Tags this process pinned. Only these are ever released: a model the machine's owner
         #: pinned for their own reasons is not the pool's to unpin.
         #: Remembered across the agent's own restarts, in a file beside its settings — or the
@@ -175,7 +192,11 @@ class ModelWork:
                     "awaiting_restart": (
                         restarts and tag in on_disk and tag not in loaded and tag not in failed and tag not in loading
                     ),
-                    "error": self.errors[tag][1] if tag in self.errors else failed.get(tag),
+                    "error": self.errors[tag].why if tag in self.errors else failed.get(tag),
+                    # How many attempts in a row have failed, and when the next is — so a failure
+                    # being tried again is told from one given up on.
+                    "attempts": self.errors[tag].attempts if tag in self.errors else 0,
+                    "retry_in_s": self._retry_in(tag),
                 }
                 for tag in self.desired.tags
             ],
@@ -279,10 +300,19 @@ class ModelWork:
 
     def _may_retry(self, tag: str) -> bool:
         failed = self.errors.get(tag)
-        return failed is None or time.monotonic() - failed[0] >= RETRY_AFTER_S
+        return failed is None or self.clock() - failed.at >= failed.wait_s
+
+    def _retry_in(self, tag: str) -> Optional[int]:
+        failed = self.errors.get(tag)
+        if failed is None:
+            return None
+        return max(0, int(failed.at + failed.wait_s - self.clock()))
 
     def _fail(self, tag: str, why: str) -> None:
-        self.errors[tag] = (time.monotonic(), why)
+        before = self.errors.get(tag)
+        attempts = (before.attempts if before else 0) + 1
+        wait_s = min(RETRY_FIRST_S * 2 ** (attempts - 1), RETRY_MOST_S)
+        self.errors[tag] = Failure(at=self.clock(), why=why, attempts=attempts, wait_s=wait_s)
 
     async def _pull(self, tag: str) -> bool:
         free = self.free_disk_bytes()

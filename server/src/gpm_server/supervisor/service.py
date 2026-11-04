@@ -1641,7 +1641,10 @@ class Supervisor:
                     what = "not resident"
                 if missing:
                     host.state = HostState.PREPARING
-                    host.last_error = f"model set {what}: missing {sorted(missing)}"
+                    # The agent's own words, while it fails to fetch or hold one — and how often it
+                    # has tried — rather than only that something is missing.
+                    host.last_error = agents.model_trouble(host.agent.models if host.agent else None, missing) or (
+                        f"model set {what}: missing {sorted(missing)}")
                 else:
                     host.state = HostState.READY
                     host.last_error = None
@@ -1709,9 +1712,10 @@ class Supervisor:
     def _agent_is_starting_it(self, host: SupervisedHost) -> Optional[str]:
         """Why the server is not answering, as its agent tells it — or None when the agent says
         nothing that explains it, and the host is unreachable like any other."""
+        trouble = agents.model_trouble(host.agent.models if host.agent else None, host.required_tags)
+        if trouble:
+            return trouble
         for model in self._agent_models(host):
-            if model.get("error"):
-                return f"{model['tag']}: {str(model['error'])[:300]}"
             pulling = model.get("pulling")
             if isinstance(pulling, dict):
                 done, total = pulling.get("completed_bytes"), pulling.get("total_bytes")
