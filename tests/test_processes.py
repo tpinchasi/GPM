@@ -115,7 +115,8 @@ def test_a_supervisor_that_stops_is_started_again_and_never_once_the_router_goes
     supervised = cli._supervisor_child(config, str(tmp_path / "pool.yaml"), "info")
     try:
         deadline = time.monotonic() + 60
-        while time.monotonic() < deadline and supervised.restarts < 1:
+        # Until the second run has begun — Python starts slowly on Windows.
+        while time.monotonic() < deadline and not (runs.exists() and runs.read_text() == "xx"):
             time.sleep(0.05)
         assert supervised.restarts == 1 and supervised.child.poll() is None, "started again, and running"
         second = supervised.child
