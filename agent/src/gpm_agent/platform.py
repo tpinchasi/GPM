@@ -121,6 +121,21 @@ def private_dir(path: Path, *, parents: bool = False, exist_ok: bool = False, os
         Path(path).mkdir(mode=0o700, parents=parents, exist_ok=exist_ok)
 
 
+def access_hint(error: BaseException, folder: Optional[Path] = None, os_name: Optional[str] = None) -> str:
+    """What to do about a folder this user may not open, on Windows — where it is nearly always a
+    folder an earlier run as administrator made, left to the Administrators group alone (D163).
+    Said after the error; nothing elsewhere, where the error says enough. `folder` is the one to
+    repair, everything in it included; else the one the error names."""
+    if (os_name or system()) != WINDOWS or not isinstance(error, PermissionError):
+        return ""
+    folder = folder or getattr(error, "filename", None) or "the folder"
+    return (
+        f". An earlier run as administrator may have left {folder} to administrators only: from a "
+        f'command prompt run as administrator, `icacls "{folder}" /reset /T` gives it back to you, or '
+        "remove the folder. This agent tries again by itself"
+    )
+
+
 def elevated(os_name: Optional[str] = None) -> bool:
     """Is this process running with an administrator's rights on Windows? Never asked elsewhere:
     `sudo` there is the owner's own act, and the agent never asks for it."""

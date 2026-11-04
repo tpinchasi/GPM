@@ -270,8 +270,58 @@ def model_events(before: Optional[dict[str, Any]], after: Optional[dict[str, Any
         if model.get("on_disk") and old and not old.get("on_disk"):
             events.append(("agent_model_on_disk", f"{tag} is on disk", {"size_gb": round((model.get('size_bytes') or 0) / 1e9, 2)}))
         if model.get("error") and model.get("error") != old.get("error"):
-            events.append(("agent_model_failed", f"{tag}: {model['error']}", {}))
+            # Once when a failure begins or what it says changes — never once per attempt.
+            events.append(("agent_model_failed", f"{tag}: {model['error']}", {"attempts": model.get("attempts")}))
+        elif model.get("error") and _still_failing(model.get("attempts"), old.get("attempts")):
+            events.append(("agent_model_still_failing",
+                           f"{tag}: still failing after {model['attempts']} attempts{_next_try(model)}: {model['error']}",
+                           {"attempts": model["attempts"]}))
+        if old.get("error") and not model.get("error") and model.get("tag") == tag:
+            tried = old.get("attempts")
+            events.append(("agent_model_recovered",
+                           f"{tag} works again" + (f", after {tried} failed attempts" if isinstance(tried, int) and tried > 1 else ""),
+                           {"attempts": tried}))
     return events
+
+
+#: The attempts at which a failure still going on is said again: often enough to show it is being
+#: tried, rarely enough to keep the log readable (about every 10, then every hour or so, minutes apart).
+STILL_FAILING_AT = (5, 10, 20, 30, 50)
+
+
+def _still_failing(now: Any, before: Any) -> bool:
+    if not isinstance(now, int) or now == before:
+        return False
+    return now in STILL_FAILING_AT or (now > STILL_FAILING_AT[-1] and now % 25 == 0)
+
+
+def _next_try(model: dict[str, Any]) -> str:
+    wait = model.get("retry_in_s")
+    return f" (next in {duration_words(wait)})" if isinstance(wait, (int, float)) and wait > 0 else ""
+
+
+def duration_words(seconds: float) -> str:
+    """A wait, roughly: seconds, minutes, or hours."""
+    if seconds >= 5400:
+        return f"{seconds / 3600:.1f} hours"
+    if seconds >= 90:
+        return f"{seconds / 60:.0f} minutes"
+    return f"{max(seconds, 1):.0f} seconds"
+
+
+def model_trouble(models: Optional[dict[str, Any]], tags: Iterable[str]) -> Optional[str]:
+    """Why the models of `tags` are not there, in the agent's words, with how often it has tried
+    and when it tries next — what a host's `last_error` says while it fails. None where the agent
+    reports no failure for any of them."""
+    wanted = set(tags)
+    for model in (models or {}).get("models", []):
+        if model.get("tag") in wanted and model.get("error"):
+            tried = model.get("attempts")
+            count = f"tried {tried} times" if isinstance(tried, int) and tried > 1 else ""
+            when = _next_try(model).strip(" ()")
+            said = "; ".join(part for part in (count, when) if part)
+            return f"{model['tag']}: {printable(model['error'])}" + (f" ({said})" if said else "")
+    return None
 
 
 def effective_capabilities(typed: Iterable[str], view: Optional[AgentView]) -> frozenset[str]:

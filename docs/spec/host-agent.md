@@ -119,6 +119,14 @@ whole preparation in, and folding them into one number would hide it (D97):
   make whole groups of N (or none listed), and a model whose attention heads — `num_attention_heads`
   in its `config.json`, or under `text_config` — do not divide by N. A dead copy names its cards.
 
+A model that fails — to be fetched, held, or started — is tried again ever less often: 30 seconds,
+then twice as long after each failure in a row, up to 10 minutes, for as long as the pool asks for
+it (D163). Its entry says how many attempts in a row have failed (`attempts`) and when the next is
+(`retry_in_s`), beside the error; a success forgets them. A cause put right meanwhile is found at
+the next attempt, with nothing restarted. On Windows, a folder this user may not open adds how to
+give it back: `icacls "<folder>" /reset /T` from a prompt run as administrator, or removing the
+folder.
+
 **A model volume** (D139), on a host the pool created with one, is mounted at one of two paths
 that are the agent's own constants — one to *read*, one to *fill* — never named by the pool. The
 engine never runs from it:

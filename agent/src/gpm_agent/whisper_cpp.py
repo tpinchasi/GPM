@@ -329,13 +329,13 @@ def compute_device(log: Optional[str], offset: int) -> Optional[dict[str, Any]]:
 
 
 @contextlib.contextmanager
-def _refusing(doing: str) -> Iterator[None]:
+def _refusing(doing: str, folder: Optional[Path] = None) -> Iterator[None]:
     """An error from the system while `doing` is this engine's refusal, saying so — so it reaches
     the pool as the build's error, and the pause before the next attempt applies."""
     try:
         yield
     except OSError as exc:
-        raise _refused(f"{doing}: {exc}") from exc
+        raise _refused(f"{doing}: {exc}{host_platform.access_hint(exc, folder)}") from exc
 
 
 def _own_directory(path: Path, *, follow: bool) -> None:
@@ -426,7 +426,7 @@ class WhisperCppFacts:
         directory of this user's, readable by it alone (0700), and the uploads emptied. The state
         directory may be a link the owner made; the uploads directory is never one."""
         state, uploads = self._state_dir, self._uploads_dir
-        with _refusing(f"could not prepare this agent's state directory {state}"):
+        with _refusing(f"could not prepare this agent's state directory {state}", state):
             host_platform.private_dir(state, parents=True, exist_ok=True)
             _own_directory(state, follow=True)
             host_platform.private_dir(uploads, exist_ok=True)
@@ -499,11 +499,18 @@ class WhisperCppFacts:
         """What this agent last started here — from memory, or after the agent's own restart from
         its record, so a server that outlived the agent is still known as its own."""
         if not self._record_read:
-            self._record_read = True
             try:
                 record = json.loads((self._state_dir / RECORD_FILE).read_text())
-            except (OSError, ValueError):
+            except FileNotFoundError:
                 record = None
+            except ValueError:
+                record = None
+            except OSError:
+                # Not readable now — a folder an elevated run left to administrators: read again
+                # next time, not remembered as "nothing was started", which would outlive the
+                # repair until the agent itself was restarted.
+                return None
+            self._record_read = True
             if isinstance(record, dict) and isinstance(record.get("pid"), int):
                 self._record = record
         return self._record

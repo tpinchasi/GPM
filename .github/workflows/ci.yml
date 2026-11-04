@@ -63,7 +63,7 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --python 3.12
-      - run: uv run pytest -q tests/test_processes.py tests/test_server_on_windows.py tests/test_windows_folders.py
+      - run: uv run pytest -q tests/test_processes.py tests/test_server_on_windows.py tests/test_windows_folders.py tests/test_agent_failure_backoff.py tests/test_agent_failure_recovery.py
 
   simulation:
     # A whole pool — real router, real supervisor — against a market that moves under it, for
