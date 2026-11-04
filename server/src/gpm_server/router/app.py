@@ -362,6 +362,20 @@ async def follow_config_file(state: RouterState, path: Path) -> None:
         log.info("configuration reloaded from %s", path)
 
 
+#: A supervisor refreshes its lock's heartbeat at the top of every pass; one older than this is
+#: taken to be gone — the lock's own `stale_after`.
+SUPERVISOR_STALE_S = 60.0
+
+
+def _supervisor_now(database: Database, pool: str) -> dict[str, Any]:
+    """`running`, and how long ago it last said so — None where no supervisor has held this pool."""
+    rows = database.query("SELECT heartbeat FROM supervisor_lock WHERE pool = ?", (pool,))
+    if not rows:
+        return {"running": False, "heartbeat_age_s": None}
+    age = max(0.0, time.time() - float(rows[0]["heartbeat"]))
+    return {"running": age < SUPERVISOR_STALE_S, "heartbeat_age_s": round(age, 1)}
+
+
 def create_app(
     config: PoolConfig,
     database: Optional[Database] = None,
@@ -453,6 +467,9 @@ def create_app(
                     "workers_busy": sum(h.busy for h in state.hosts if h.workload is None),
                 },
                 "hosts": hosts,
+                # Whether the supervisor is there: routing carries on without it, but nothing is
+                # probed, recovered, rented or released (D163). From its lock's heartbeat.
+                "supervisor": await asyncio.to_thread(_supervisor_now, database, state.config.pool.name),
             },
             headers={"X-GPM-Contract": CONTRACT_VERSION},
         )

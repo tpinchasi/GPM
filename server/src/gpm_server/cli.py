@@ -15,46 +15,102 @@ import pathlib
 import subprocess
 import sys
 import threading
+import time
 from typing import Any, Optional
 
 from .config import ConfigError, load_config
 
+#: How long the router waits before starting a supervisor that stopped again: five seconds, then
+#: twice as long after each stop in a row, up to five minutes. One that ran ten minutes is taken
+#: to have recovered, and the next stop waits five seconds again.
+RESTART_FIRST_S = 5.0
+RESTART_MOST_S = 300.0
+RESTART_RESET_AFTER_S = 600.0
 
-def _supervisor_child(config: Any, config_path: str, log_level: str) -> subprocess.Popen:
-    """The supervisor, as a program of its own: this interpreter and this import path, so a
-    Python whose path was set as it ran starts one that can import the pool (`pool_command`).
-    What it says goes where this process's own output does — or, with none to share (under
-    `pythonw`, or a service), to `gpm-supervisor.log` beside the pool's database, where its last
-    words are read back if it stops."""
-    from .processes import has_console, pool_command, windowless
 
-    log_path: Optional[pathlib.Path] = None
-    output: dict[str, Any] = {}
-    if not has_console():
-        log_path = pathlib.Path(config.request_log).expanduser().resolve().parent / "gpm-supervisor.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        handle = open(log_path, "ab")
-        output = {"stdout": handle, "stderr": subprocess.STDOUT}
-    child = subprocess.Popen(
-        pool_command("supervise", "-c", config_path, "--log-level", log_level),
-        stdin=subprocess.DEVNULL, **output, **windowless(),
-    )
-    if output:
-        output["stdout"].close()
+class SupervisorChild:
+    """The supervisor as a program of its own, beside the router, and started again when it stops.
 
-    def watch() -> None:
-        # Reap it, and say so plainly. Routing carries on either way, which is the point of
-        # the split — but an operator should not have to discover this from a stale host table.
-        code = child.wait()
-        if code != 0:
-            logging.getLogger("gpm").error(
-                "the supervisor exited (code %s). Routing continues on the last published "
-                "host table; nothing will be rented, recovered or released until it is back.%s",
-                code, _last_words(log_path),
+    It runs this interpreter and this import path, so a Python whose path was set as it ran starts
+    one that can import the pool (`pool_command`). What it says goes where this process's own
+    output does — or, with none to share (under `pythonw`, or a service), to `gpm-supervisor.log`
+    beside the pool's database, where its last words are read back when it stops.
+
+    A supervisor that stops on its own is started again, ever less often: routing carries on
+    without it, but nothing is probed, recovered, rented or released until it is back — and a
+    stop on a quick restart of the pool, or one cause put right, should not need an operator."""
+
+    def __init__(self, config: Any, config_path: str, log_level: str) -> None:
+        self.config, self.config_path, self.log_level = config, config_path, log_level
+        self.child: Optional[subprocess.Popen] = None
+        self.restarts = 0
+        self._stopping = threading.Event()
+        self._log_path: Optional[pathlib.Path] = None
+        self._thread = threading.Thread(target=self._keep, name="gpm:supervisor-child", daemon=True)
+
+    def start(self) -> "SupervisorChild":
+        self.child = self._spawn()
+        self._thread.start()
+        return self
+
+    def _spawn(self) -> subprocess.Popen:
+        from .processes import has_console, pool_command, windowless
+
+        output: dict[str, Any] = {}
+        if not has_console():
+            self._log_path = pathlib.Path(self.config.request_log).expanduser().resolve().parent / "gpm-supervisor.log"
+            self._log_path.parent.mkdir(parents=True, exist_ok=True)
+            output = {"stdout": open(self._log_path, "ab"), "stderr": subprocess.STDOUT}
+        try:
+            return subprocess.Popen(
+                pool_command("supervise", "-c", self.config_path, "--log-level", self.log_level),
+                stdin=subprocess.DEVNULL, **output, **windowless(),
             )
+        finally:
+            if output:
+                output["stdout"].close()
 
-    threading.Thread(target=watch, daemon=True).start()
-    return child
+    def _keep(self) -> None:
+        delay = RESTART_FIRST_S
+        log = logging.getLogger("gpm")
+        while True:
+            child = self.child
+            started = time.monotonic()
+            code = child.wait() if child is not None else None
+            if self._stopping.is_set():
+                return
+            if time.monotonic() - started >= RESTART_RESET_AFTER_S:
+                delay = RESTART_FIRST_S
+            log.error(
+                "the supervisor exited (code %s). Routing continues on the last published host table; "
+                "nothing will be rented, recovered or released until it is back. Starting it again in %.0fs.%s",
+                code, delay, _last_words(self._log_path),
+            )
+            if self._stopping.wait(delay):
+                return
+            delay = min(delay * 2, RESTART_MOST_S)
+            try:
+                self.child = self._spawn()
+                self.restarts += 1
+            except OSError as exc:
+                log.error("the supervisor could not be started again: %s", exc)
+                self.child = None
+
+    def stop(self, timeout: float = 10.0) -> None:
+        """Stop it for good — the router is going — and never start it again."""
+        self._stopping.set()
+        child = self.child
+        if child is None or child.poll() is not None:
+            return
+        child.terminate()
+        try:
+            child.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            child.kill()
+
+
+def _supervisor_child(config: Any, config_path: str, log_level: str) -> SupervisorChild:
+    return SupervisorChild(config, config_path, log_level).start()
 
 
 def _last_words(log_path: Optional[pathlib.Path], lines: int = 20) -> str:
@@ -98,7 +154,7 @@ def _serve(args: argparse.Namespace) -> int:
     from .processes import warn_if_elevated
 
     warn_if_elevated("pool's router")
-    child: Optional[subprocess.Popen] = None
+    child: Optional[SupervisorChild] = None
     if not args.router_only:
         child = _supervisor_child(config, args.config, args.log_level)
 
@@ -107,11 +163,7 @@ def _serve(args: argparse.Namespace) -> int:
         uvicorn.run(app, **listener_options(config), log_level=args.log_level)
     finally:
         if child is not None:
-            child.terminate()
-            try:
-                child.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                child.kill()
+            child.stop()
     return 0
 
 

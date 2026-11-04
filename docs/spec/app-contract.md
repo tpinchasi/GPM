@@ -136,6 +136,11 @@ It is served from a cached copy, never by asking a third party while the app wai
 ## 3. Keys
 
 - **App key** — permits inference and `GET /pool/status`. Nothing else.
+  `GET /pool/status` lists each shared host by `host_id` with its `state` and `last_error` — while
+  a host's agent fails to prepare a model, its own reason with how often it has tried and when it
+  tries next, cleared when the host is ready — and `supervisor: {running, heartbeat_age_s}`:
+  routing carries on without a supervisor, but nothing is probed, recovered, rented or released
+  until it is back (D163).
 - **Workload key** (`gpmw_`) — permits inference on one workload's hosts and `GET /pool/status`
   for that workload's view; nothing else ([workloads.md](workloads.md) §3, D115). Minted when the
   workload is created, expires with its lease. `/w/<name>/v1/…` means the same as `/v1/…` and is
