@@ -35,6 +35,36 @@ AUTO_ENGINE = "auto"
 AUTO_ENGINES = ("vllm", "ollama")
 
 
+class Price(BaseModel):
+    """What a hosted build costs (S11, D164): dollars per million tokens — input, the cached part
+    of it where the provider prices it apart, and output — or per minute of audio for
+    transcription. The operator keeps them: no provider here publishes prices the pool can rely
+    on. A provider with peak and off-peak rates is priced at its peak."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    input: Optional[float] = Field(default=None, ge=0)
+    cached_input: Optional[float] = Field(default=None, ge=0)
+    output: Optional[float] = Field(default=None, ge=0)
+    per_minute: Optional[float] = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _says_something(self) -> "Price":
+        if self.per_minute is None and (self.input is None or self.output is None):
+            raise ValueError("a price names `input` and `output` (dollars per million tokens), or `per_minute`")
+        return self
+
+    def of(self, prompt: int, cached: int, completion: int) -> float:
+        """Dollars for these counts; cached input at its own price where one is given."""
+        fresh = max(0, prompt - cached)
+        cached_price = self.cached_input if self.cached_input is not None else (self.input or 0.0)
+        return (fresh * (self.input or 0.0) + cached * cached_price + completion * (self.output or 0.0)) / 1e6
+
+
+#: The engine of a hosted model API (S11, D164).
+HOSTED_ENGINE = "openai-api"
+
+
 class Variant(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -60,6 +90,13 @@ class Variant(BaseModel):
     #: nothing, and the build may still be sent a picture when none that lists one is free; a
     #: list refuses what it leaves out. A build that transcribes takes audio without saying so.
     inputs: Optional[list[Literal["image", "audio"]]] = None
+    #: What a hosted build costs (D164): required for one, meaningless elsewhere. Which provider
+    #: serves it is said with `requires`, matched against a hosted host's `capabilities`.
+    price: Optional[Price] = None
+
+    @property
+    def hosted(self) -> bool:
+        return self.engine == HOSTED_ENGINE
 
     def kinds(self) -> frozenset[str]:
         return frozenset(self.serves) if self.serves is not None else _CHAT_AND_EMBEDDINGS
@@ -209,7 +246,9 @@ class AgentConfig(BaseModel):
         return os.environ.get(self.bearer_env) or None
 
 
-_DEFAULT_PRIORITY = {"local": 0, "fixed-remote": 10, "rented-interruptible": 20, "rented-on-demand": 20}
+_DEFAULT_PRIORITY = {"local": 0, "fixed-remote": 10, "rented-interruptible": 20, "rented-on-demand": 20,
+                     # Last: after every machine, and only after a request has waited (D165).
+                     "hosted": 30}
 
 
 #: A version as engines publish them: digits and dots, and an optional pre-release suffix (D151).
@@ -220,7 +259,10 @@ class HostConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    kind: Literal["local", "fixed-remote"]
+    #: `hosted`: a hosted model API reached with a key (S11, D164) — its transport is the
+    #: provider's whole OpenAI base URL with `bearer_env`, its workers are how many requests it
+    #: may have in flight, and its engine is `openai-api`.
+    kind: Literal["local", "fixed-remote", "hosted"]
     transport: TransportConfig
     workers: int = Field(default=1, ge=1)
     capabilities: list[str] = Field(default_factory=list)
@@ -271,6 +313,29 @@ class HostConfig(BaseModel):
                 f"{self.engine_version!r} would be a version of whichever engine its agent chooses. "
                 "Name the engine to pin its version."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _hosted_is_an_api(self) -> "HostConfig":
+        """A hosted API is reached over HTTP with a key, runs nothing the pool installs, and is
+        the only kind of host that speaks to a provider (D164)."""
+        if self.kind != "hosted":
+            if self.engine == HOSTED_ENGINE:
+                raise ValueError(
+                    f"host {self.id!r}: `engine: {HOSTED_ENGINE}` is a hosted model API; give the host "
+                    "`kind: hosted`, or name the engine its machine runs"
+                )
+            return self
+        if self.engine is None:
+            self.engine = HOSTED_ENGINE
+        if self.engine != HOSTED_ENGINE:
+            raise ValueError(f"host {self.id!r}: a hosted API's engine is `{HOSTED_ENGINE}`, not {self.engine!r}")
+        if self.agent is not None:
+            raise ValueError(f"host {self.id!r}: a hosted API has no machine for an agent to run on; remove `agent`")
+        if self.transport.type == "tunnel":
+            raise ValueError(f"host {self.id!r}: a hosted API is reached over https, not a tunnel")
+        if self.residency != "pinned":
+            raise ValueError(f"host {self.id!r}: a hosted API loads nothing; remove `residency`")
         return self
 
     @model_validator(mode="after")
@@ -417,6 +482,40 @@ class DeliveryConfig(BaseModel):
         }.get(kind, "stream")
 
 
+class Budget(BaseModel):
+    """Dollars a burst may spend: per request, per day and per month — any of them; at least one."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    per_request: Optional[float] = Field(default=None, gt=0)
+    per_day: Optional[float] = Field(default=None, gt=0)
+    per_month: Optional[float] = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _says_something(self) -> "Budget":
+        if self.per_request is None and self.per_day is None and self.per_month is None:
+            raise ValueError("a budget names at least one of per_request, per_day, per_month (dollars)")
+        return self
+
+
+class HostedBurst(BaseModel):
+    """A burst met by hosted APIs (D165): after a request has waited `after_s` for a machine's
+    worker, within `budget`. `reserve_max_tokens` is the output a request that names no
+    `max_tokens` is reserved for before it is sent (D166)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    after_s: float = Field(default=5.0, ge=0)
+    budget: Budget
+    reserve_max_tokens: int = Field(default=4096, ge=1)
+
+
+class Bursts(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    hosted: Optional[HostedBurst] = None
+
+
 class PoolSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -441,6 +540,9 @@ class PoolSettings(BaseModel):
     #: What the SDK allows for time-to-first-byte. Only used to enforce the invariant below.
     client_time_to_first_byte_s: float = 300.0
     delivery: DeliveryConfig = Field(default_factory=DeliveryConfig)
+    #: How the shared workload meets a burst its machines cannot (S11, D165): to hosted APIs,
+    #: within a budget. A workload's own policy is its own; this is the shared workload's.
+    bursts: "Bursts" = Field(default_factory=lambda: Bursts())
     #: The most one request body may be, in megabytes (D144): over it is `413
     #: request_too_large`, refused before the body is read. Under the 25 MB the engines take
     #: for an upload, so nothing is queued only for an engine to refuse it.
@@ -1251,6 +1353,7 @@ class PoolConfig(BaseModel):
                 "shared hosts' or workloads' only — remove it from one"
             )
         self._auto_is_a_hosts_alone()
+        self._hosted_builds_are_priced()
         self._rented_engine_is_said_where_the_default_moved()
         self._rented_engine_is_one_a_rented_host_can_run()
         self._engine_can_hold_what_the_pool_asks()
@@ -1288,12 +1391,22 @@ class PoolConfig(BaseModel):
         the answer is stable across restarts and explainable in one sentence; a pool that wants
         a different split says so per host.
         """
+        if host.kind == "hosted":
+            # A hosted API holds what it has builds of: every such model, unless it says (D164).
+            return list(host.models) if host.models else self._servable_by(host)
         if self.pool.models_per_host == "all":
-            return list(self.pool.model_set)
+            # A model only a hosted API serves is never asked of a machine (D165).
+            return [name for name in self.pool.model_set if not self.hosted_only(name)]
         if host.models:
             return list(host.models)
         servable = self._servable_by(host)
         return servable[:1]
+
+    def hosted_only(self, name: str) -> bool:
+        """A model whose every build is a hosted API's — Claude, GPT — which no machine can run:
+        never placed on, rented for or planned onto a machine (D165)."""
+        entry = self.catalog.get(name)
+        return entry is not None and all(variant.hosted for variant in entry.variants)
 
     def image_needs(self, tags: Iterable[str]) -> frozenset[str]:
         """What the image a rented host starts from must carry to serve these builds (D146) —
@@ -1565,7 +1678,8 @@ class PoolConfig(BaseModel):
         if self.rented is not None and self.rented.rent_profiles:
             return rented_profile_models(self.rented)
         if self.pool.models_per_host == "all" or self.rented is None or self.rented.models is None:
-            return list(self.pool.model_set)
+            # Never one only a hosted API serves (D165).
+            return [name for name in self.pool.model_set if not self.hosted_only(name)]
         return list(self.rented.models)
 
     def _engines_and_where(self) -> list[tuple[str, str]]:
@@ -1802,7 +1916,9 @@ class PoolConfig(BaseModel):
             caps = set(host.capabilities)
             servable_here = set(self._servable_by(host))
             servable = []
-            for name in self.pool.model_set:
+            # What this host is asked to hold: under `all` the set, less what only a hosted API
+            # serves on a machine, and only what it has builds of on a hosted API (D164, D165).
+            for name in (self.models_held_by(host) if whole_set else self.pool.model_set):
                 if name in servable_here:
                     servable.append(name)
                 elif whole_set:
@@ -1860,8 +1976,29 @@ class PoolConfig(BaseModel):
     def _models_rented_hosts_may_hold(self) -> list[str]:
         """Every model a rented host may be asked to hold: what the pool rents for, and what a
         workload may rent for — the models only workloads hold (D115) included."""
-        workloads_only = [name for name, entry in self.catalog.items() if entry.workloads_only]
+        workloads_only = [name for name, entry in self.catalog.items()
+                          if entry.workloads_only and not self.hosted_only(name)]
         return list(dict.fromkeys([*self._rented_models(), *workloads_only]))
+
+    def _hosted_builds_are_priced(self) -> None:
+        """A hosted build is paid for from a budget, so it needs its price; a machine's build has
+        none, and one given a price would read as charged (D164, D166)."""
+        unpriced, priced = [], []
+        for name, entry in self.catalog.items():
+            for variant in entry.variants:
+                if variant.hosted and variant.price is None:
+                    unpriced.append(f"{name} ({variant.tag})")
+                elif not variant.hosted and variant.price is not None:
+                    priced.append(f"{name} ({variant.tag})")
+        if unpriced:
+            raise ValueError(
+                f"hosted builds without a price: {unpriced}. Give each `price: {{input, output}}` in dollars "
+                "per million tokens (or `per_minute` for transcription), as the provider's price page says: "
+                "the pool reads no price from a provider, and a build it cannot price it cannot charge to a budget"
+            )
+        if priced:
+            raise ValueError(f"{priced} have a price but are not hosted builds (`engine: {HOSTED_ENGINE}`); "
+                             "a machine's build costs nothing per token — remove `price`")
 
     def _auto_is_a_hosts_alone(self) -> None:
         """`auto` is chosen by a configured host's own agent, from the machine it runs on (D161):

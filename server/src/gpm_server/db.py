@@ -326,6 +326,10 @@ _ADDED_COLUMNS = {
         # size (D145): measures built on output tokens read only the kinds that produce them.
         ("kind", "TEXT"),
         ("request_bytes", "INTEGER"),
+        # A hosted API's answer (S11, D166): the input it was charged for, and what it cost the
+        # budget it counted towards — read back at start, so a restart forgets nothing spent.
+        ("tokens_in", "INTEGER"),
+        ("cost_usd", "REAL"),
     ],
     "hosts": [
         ("available", "TEXT NOT NULL DEFAULT '[]'"),
@@ -449,6 +453,9 @@ class RequestRecord:
     #: What it asked for, and the size of its body (D145).
     kind: Optional[str] = None
     request_bytes: Optional[int] = None
+    #: A hosted API's answer (D166): the input charged for, and its cost in dollars.
+    tokens_in: Optional[int] = None
+    cost_usd: Optional[float] = None
 
 
 class RequestLog:
@@ -462,8 +469,8 @@ class RequestLog:
                 ts, request_id, session_id, host_id, worker_id, model_requested,
                 model_served, runtime_class, queue_wait_ms, latency_ms, status_code,
                 outcome, reason, tokens_out, generate_ms, workload, borrowed, concurrency, model_concurrency,
-                kind, request_bytes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                kind, request_bytes, tokens_in, cost_usd
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.ts,
@@ -487,6 +494,8 @@ class RequestLog:
                 record.model_concurrency,
                 record.kind,
                 record.request_bytes,
+                record.tokens_in,
+                record.cost_usd,
             ),
         )
 
@@ -496,6 +505,12 @@ class RequestLog:
 
     def rows(self, limit: int = 100) -> list[sqlite3.Row]:
         return self.db.query("SELECT * FROM request_log ORDER BY id DESC LIMIT ?", (limit,))
+
+    def hosted_spend_since(self, since: float) -> list[sqlite3.Row]:
+        """Every hosted answer's cost since a moment, by workload (D166)."""
+        return self.db.query(
+            "SELECT workload, ts, cost_usd FROM request_log WHERE cost_usd IS NOT NULL AND ts >= ?", (since,)
+        )
 
 
 # --- the host table (supervisor writes, router reads) ---

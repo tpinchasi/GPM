@@ -45,22 +45,30 @@ gone, outbid, or no longer passing — nothing is rented instead.
 
 **A hosted model API is a host of kind `hosted`** (D164): OpenAI, Anthropic's OpenAI-compatible
 endpoint, Together, Ollama's cloud, or any other that serves the OpenAI-shaped `/v1` paths, reached
-with an API key. It has a `base_url`, a `credential` (the credential store's, D134, or an
-environment variable's) and `max_concurrent` — its rate limit, as requests in flight, and its
-workers. Its engine is `openai-api`, the same for every provider. Nothing is pulled, loaded, rented
-or released on it; the supervisor asks its `/v1/models` for health and its models, which spends
-nothing. Each catalog variant for it names the provider's name for the model, the kinds it serves
-there, and its price (§4.1).
+with an API key. It is written with the fields every host has: an `https` transport whose
+`base_url` is the provider's whole OpenAI base (`…/v1`, or Groq's `…/openai/v1`) and whose
+`bearer_env` names the variable holding its key, and `workers` — its rate limit, as requests in
+flight. Its engine is `openai-api`, the same for every provider; it has no agent, no tunnel and no
+`residency`. Nothing is pulled, loaded, rented or released on it; the supervisor asks its
+`/v1/models` for health and its models, which spends nothing. Each catalog variant for it names the
+provider's name for the model, the kinds it serves there, and its price (§4.1). Where several
+providers serve one model, each variant names its provider in `requires` and each hosted host
+says which it is in `capabilities` (§4.4).
 
 ```yaml
   - id: together
     kind: hosted
-    engine: openai-api
-    base_url: https://api.together.ai/v1
-    credential: together
-    max_concurrent: 8
+    workers: 8
+    capabilities: [together]
+    transport: {type: https, base_url: https://api.together.ai/v1, bearer_env: TOGETHER_API_KEY}
     models: [llama-3.3-70b]
 ```
+
+What the router does with a provider's refusal, request by request: **busy** (429, 502, 503, 529)
+cools that host until its `retry-after` (5 s where it gives none) and the request waits for it or
+takes another worker; **out of money** takes the host out of routing in that router until it is
+restarted; anything else is the request's own, returned to the app as the provider said it and
+charged nothing.
 
 ### 1.3 Transports
 

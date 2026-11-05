@@ -48,7 +48,8 @@ Two differences between the surfaces matter to an app:
 | `Authorization: Bearer <app key>` | **Required**, loopback included | Admits the app to this pool (§3) |
 | Logical model names | Opt-in per model, by the operator | A name listed in the pool's catalog resolves to the build suited to the serving host. The same request can therefore return a different build through the pool than against a bare engine — by design, only for catalogued names. Unlisted names pass through literally |
 | Model actually served | Always reported | The response body's own model field (left untouched), and `X-GPM-Served-Model`, with `X-GPM-Host` and `X-GPM-Runtime-Class` |
-| `X-GPM-Cost-USD` | On an answer from a hosted API | What the answer cost the app's budget, in dollars (D165) — the app spends its own budget, so it is told |
+| `X-GPM-Cost-USD` | On a whole (not streamed) answer from a hosted API | What the answer cost the app's budget, in dollars (D165) — the app spends its own budget, so it is told |
+| `X-GPM-Cost-Max-USD` | On a streamed answer from a hosted API | The most it can cost: headers are sent before the usage that prices it arrives. The exact cost is charged to the budget and written to the request log when the stream ends |
 | `X-GPM-Wait-S` | Always reported | Seconds this request spent waiting for a worker, so queue wait is never mistaken for generation time |
 | Machine-readable `503` | Always | Body carries `reason` and `retry_after_s`; header carries `Retry-After`. A client that ignores the body still behaves correctly |
 | `X-GPM-Session` | Optional | Groups calls in the pool's request log. Affects routing only if the operator switched on an affinity or build-consistency option |

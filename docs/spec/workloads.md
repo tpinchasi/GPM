@@ -403,8 +403,14 @@ pool.workloads.create(
   allocation does from measured pressure, up to `max_hosts`, within its own budget; the hosted API
   covers the minutes a machine takes to start, and the rented machines are given up after their
   idle cutoff once the burst ends.
-- **A budget spent** stops that kind of burst for the rest of its period; the other kind, or the
-  queue, takes over. No request is sent beyond a budget (D166).
+- **A budget spent** stops that kind of burst for the rest of its period — UTC days and months —
+  and the request is answered 503 `hosted_budget_spent` where no machine frees in time; the other
+  kind, or the queue, takes over. No request is sent beyond a budget (D166). What is left is in
+  `GET /pool/status` under `budgets`.
+- **The shared workload** — requests made with the app key alone — takes its hosted burst from
+  the configuration's `pool.bursts.hosted` (`after_s`, `budget`, and `reserve_max_tokens`: the
+  output a request naming no `max_tokens` is reserved for, default 4096). Without it, the shared
+  workload never reaches a hosted API.
 - **Who sets it:** the app, through the SDK with its provisioning key (§11, D117), and it may change
   it while the workload runs; or the operator, for a workload in the configuration. Every budget is
   at most what the provisioning grant allows: the grant gains `hosted_per_day` and

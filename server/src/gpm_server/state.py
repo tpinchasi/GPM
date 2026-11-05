@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import dataclasses
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from .catalog import for_engine
 from .config import PoolConfig, Variant
 from .db import Database, HostCounters, HostTable, RequestLog
 from .engines import Engine, get_engine, kinds_of
 from .models import Host, HostState
+from .router.budgets import HostedBudgets
 from .router.dispatch import Dispatcher, Need
 from .router.registry import HostRegistry
 
@@ -56,6 +57,20 @@ class RouterState:
         #: Request bytes held right now — being read, queued, in flight, kept for a resend (D144).
         self.held_bytes = 0
         self._learn_builds(config)
+        #: What each workload has spent on hosted APIs and holds for requests in flight (D166);
+        #: loaded from the request log when the router starts.
+        self.budgets = HostedBudgets()
+
+    def hosted_burst_for(self, workload: Optional[str]) -> Any:
+        """The hosted burst a request's workload may spill to (D165), or None: the shared
+        workload's from the pool's configuration. A workload's own policy comes with S11's next
+        stage; until then, a workload never reaches a hosted API."""
+        return self.config.pool.bursts.hosted if workload is None else None
+
+    def price_of(self, tag: str) -> Any:
+        """A catalogued build's price, where it is a hosted build (D164)."""
+        variant = self._by_tag.get(tag)
+        return variant.price if variant is not None else None
 
     def _learn_builds(self, config: PoolConfig) -> None:
         """What each build does and takes, which builds of each name some host could hold, and

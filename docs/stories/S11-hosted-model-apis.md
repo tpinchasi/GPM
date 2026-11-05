@@ -234,6 +234,15 @@ to reserve its worst case.
    that set it, the grant's hosted ceilings, the rent-after-a-lasting-burst rule beside S1's
    allocation, the cost header; spend per app, burst kind and provider on the console.
 4. The `:cloud` hole closed on agent-run Ollama.
+
+**Stage 2 built (gpm-server 0.38.0):** the `openai-api` engine and the `hosted` host kind; prices
+on hosted builds, required; hosted-only models kept off machines and out of renting; the router's
+spill after `after_s`, the worst case held before sending, usage asked of streams and its chunk
+removed again, the cost settled from the answer's counts (the whole hold for a stream cut short),
+`X-GPM-Cost-USD` and, on streams, `X-GPM-Cost-Max-USD`; busy, out-of-money and the request's own
+refusals told apart; spend in the request log, read back at start; what is left in
+`GET /pool/status`. Covered only for the shared workload, from `pool.bursts.hosted` — a
+workload's own policy is stage 3. Not yet run against a real provider (stage 5).
 5. **Live, asked first:** one small chat request to each provider the owner holds a key for, a few
    cents each, with a budget of $1.
 
