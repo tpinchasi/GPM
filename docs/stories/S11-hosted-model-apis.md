@@ -1,7 +1,7 @@
 # S11 — Hosted model APIs, paid per token from each app's budget
 
-> Status: **planning** (2026-11-06) — the owner's answers taken, the spending policy described by
-> the owner; ready to be recorded as decisions. Part of the [feature list](README.md).
+> Status: **decided** (2026-11-06) — D164–D168, specified; the build next. Part of the
+> [feature list](README.md).
 
 ## The story
 
@@ -124,6 +124,12 @@ What the pool does with it, as demand rises and falls:
    hosted API simply stops being used.
 5. **A budget spent** stops that kind of burst for the rest of its period: the other kind, or the
    queue, takes over — never a request beyond a budget.
+
+**Some models can only be hosted** — the owner (2026-11-06): *"some LLMs cannot be rented, only
+hosted."* Claude, GPT and other closed models have no build a machine runs. A model whose catalog
+lists hosted builds only is hosted-only: the pool never rents, prepares or plans a machine for it,
+a workload serving it must carry a hosted budget, and `steady` or `rented` for it is refused with
+that reason. A workload of several models may mix both kinds.
 
 **Every part is optional, and any mix is allowed** — the owner's words: *"I can also say, no
 rented, just hosted, so we need full flexibility for the app to describe its needs."*

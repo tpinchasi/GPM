@@ -379,3 +379,49 @@ gpm workload create research --hours 6 --max-spend 25 \
   The idle cutoff (§11) counts from then: a workload whose groups do not all come up is bounded by
   its lease.
 
+## 13. The app's spending policy: steady, and bursts to hosted APIs or rented machines (D165)
+
+A workload may say how it is to be served as its demand rises and falls — the app knows its
+pattern; the pool carries it out. Every part is optional, and any mix is allowed.
+
+```python
+pool.workloads.create(
+    "orders", model="llama-3.3-70b", latency_s=4,
+    steady={"hosts": 2, "workers": 24},
+    bursts={
+        "hosted": {"after_s": 5, "budget": {"per_day": 20, "per_month": 300}},
+        "rented": {"after_min": 10, "max_hosts": 4, "budget": {"per_day": 60}},
+    },
+)
+```
+
+- **`steady`** is kept on machines — the operator's, or rented under the workload's lease — as today.
+- **`bursts.hosted`**: a request that finds no free worker waits `after_s` (default 5) for one, then
+  goes to a hosted API (hosts-routing-capacity §5, tier 30) if its budget has room — in dollars per
+  request, per day and/or per month, any of them. A model no machine serves goes at once.
+- **`bursts.rented`**: once a burst has lasted `after_min` (default 10), the pool rents, as S1's
+  allocation does from measured pressure, up to `max_hosts`, within its own budget; the hosted API
+  covers the minutes a machine takes to start, and the rented machines are given up after their
+  idle cutoff once the burst ends.
+- **A budget spent** stops that kind of burst for the rest of its period; the other kind, or the
+  queue, takes over. No request is sent beyond a budget (D166).
+- **Who sets it:** the app, through the SDK with its provisioning key (§11, D117), and it may change
+  it while the workload runs; or the operator, for a workload in the configuration. Every budget is
+  at most what the provisioning grant allows: the grant gains `hosted_per_day` and
+  `hosted_per_month` beside its renting ceilings, and the pool-wide daily cap bounds every app
+  together. A workload whose grant allows no hosted dollars never reaches a hosted API.
+
+**A hosted-only model** (D165) — one whose catalog lists hosted builds only, as for Claude or GPT,
+which no machine can run — goes to hosted APIs from the first request. The pool never rents,
+prepares or plans a machine for it; a workload serving it must carry a hosted budget, and `steady`
+or `rented` for it is refused, saying the model has no build a machine runs. A workload of several
+models (§12) may mix machine-run and hosted-only models: each follows the part of the policy that
+can serve it.
+
+| The app says | What happens |
+|---|---|
+| `steady` + `hosted` + `rented` | base on machines; short bursts to tokens; long bursts rent |
+| `steady` + `hosted` | every burst to tokens; nothing rented |
+| `steady` + `rented` | bursts wait for rented machines, as before; no tokens |
+| `hosted` alone | everything to hosted APIs; no machine |
+| `steady` alone | the base, then the queue |
