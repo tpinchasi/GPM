@@ -1,7 +1,7 @@
 # S11 — Hosted model APIs, paid per token from each app's budget
 
-> Status: **planning** (2026-11-06) — eight answers taken; the reading of answers 5 and 7 below to
-> be confirmed; no decision recorded yet. Part of the [feature list](README.md).
+> Status: **planning** (2026-11-06) — the owner's answers taken, the spending policy described by
+> the owner; ready to be recorded as decisions. Part of the [feature list](README.md).
 
 ## The story
 
@@ -45,13 +45,12 @@ app's budget. The app knows none of it: one URL, one key, the same calls.
    maximum and leans on hosted APIs; a steady one rents, and uses hosted APIs for bursts.
 8. **Tell the app what a hosted answer cost**, with `X-GPM-Cost-USD`.
 
-**How answers 1, 5 and 7 are read together** (to confirm): the app sets its own spending policy —
-its hosted budget, in whatever periods it chooses, and how much it may rent — **within a ceiling
-the operator grants it**. That is the provisioning key's model (D117), extended: today an operator
-grants an app a provisioning key bounded by its grant and a pool-wide daily cap, and the app
-creates its own workloads, rentals included, within them. The grant gains hosted dollars (per day
-and per month at most); the app, with that key, sets its budget and its renting maximum inside it.
-An app the operator granted nothing never reaches a hosted API or rents — safe by default.
+**The owner's own example, which the design follows** (2026-11-06): *"I expect that my app will
+need 2 hosts with 24 workers each steady state, but for short term bursts I would like to use
+hosted and long term bursts rented. I should be able to define budget spend policies, as I know my
+app's usage patterns best."* The app, not the pool, knows its pattern; so the app states its
+**spending policy** — its steady capacity, how it meets a short burst and a long one, and a budget
+for each — and the pool carries it out.
 
 ## Design
 
@@ -89,25 +88,71 @@ catalog:
 - **The supervisor** asks a hosted host's `/v1/models` (with its key; no tokens spent) for health
   and which models it has. Nothing is pulled, loaded, rented or released.
 
-### Hardware first (answer 2)
+### The app's spending policy (answers 1, 2, 5–8, and the owner's example)
 
-The router tries the pool's machines first, as today. A request that finds no free worker on a
-machine serving its model **waits a short while** (`hosted.spill_after_s`, default 5 s; answer 6)
-and then goes to a hosted API, if the app has budget left; a model no machine serves goes to a
-hosted API at once. Among hosted hosts, priority decides, as among machines. A hosted host's
-workers are its `max_concurrent`.
+An app states, for its workload (D115), how it is to be served:
 
-**Renting or spilling is the app's choice** (answer 7): the renting maximum it sets for its own
-workloads (D117) decides how much of a lasting peak becomes machines, and its hosted budget how
-much becomes tokens. The shared pool's own renting stays under the operator's leases, as today.
+```python
+pool.workloads.create(
+    "orders", model="llama-3.3-70b", latency_s=4,
+    steady={"hosts": 2, "workers": 24},                  # the base, on machines, always
+    bursts={
+        "hosted": {                                      # a short burst: tokens, at once
+            "after_s": 5,                                # waited for a machine's worker first
+            "budget": {"per_day": 20, "per_month": 300}, # dollars; any of per_request / day / month
+        },
+        "rented": {                                      # a long burst: machines
+            "after_min": 10,                             # once the burst has lasted this long
+            "max_hosts": 4,
+            "budget": {"per_day": 60},
+        },
+    },
+)
+```
 
-### Each app's budget (answer 1)
+What the pool does with it, as demand rises and falls:
 
-- **Set by the app, within the operator's grant** (answers 1, 5): through the SDK, with its
-  provisioning key, as any of — dollars per day, per month, per request — each at most what the
-  grant allows; the grant's own per-day and per-month ceilings bound it whatever the app sets, and
-  the pool-wide daily cap bounds every app together (D117). An app key with no grant never reaches
-  a hosted API — safe by default.
+1. **Steady:** the base is served on machines — the operator's own, or rented under the workload's
+   lease (D115) — as today.
+2. **A burst begins:** a request that finds no free worker waits `after_s` for one; then it goes
+   to a hosted API, within the hosted budget. Hardware first (answer 2), but no request waits long
+   for it.
+3. **The burst lasts:** once the pressure has held for `rented.after_min`, the pool rents, as S1's
+   allocation does from measured pressure — up to `max_hosts`, within the rented budget. The hosted
+   API covers the minutes a machine takes to come up; once it serves, the spill falls away.
+4. **The burst ends:** the rented machines are given up after their idle cutoff, as today; the
+   hosted API simply stops being used.
+5. **A budget spent** stops that kind of burst for the rest of its period: the other kind, or the
+   queue, takes over — never a request beyond a budget.
+
+**Every part is optional, and any mix is allowed** — the owner's words: *"I can also say, no
+rented, just hosted, so we need full flexibility for the app to describe its needs."*
+
+| The app says | What happens |
+|---|---|
+| `steady` + `hosted` + `rented` (the owner's example) | base on machines; short bursts to tokens; long bursts rent |
+| `steady` + `hosted` | base on machines; every burst, short or long, to tokens; nothing rented |
+| `steady` + `rented` | base on machines; bursts wait for rented machines, as today; no tokens |
+| `hosted` alone (`steady` of 0 hosts) | everything to hosted APIs, within the budget; no machine at all — and the way to a model no machine serves (Claude) |
+| `steady` alone | today's behaviour: the base, then the queue |
+
+An app may change its policy while its workload runs: a new budget or a burst added or removed
+takes effect at once, within its grant. Among hosted hosts, priority decides, as among machines; a
+hosted host's workers are its `max_concurrent`.
+
+**Who sets it:** the app, through the SDK, with its provisioning key (D117) — the key an operator
+grants an application to create and end its own workloads. The grant already bounds what the app
+may rent; it gains a ceiling on hosted dollars (per day and per month), and the pool-wide daily cap
+bounds every app together. The policy is the app's; the grant is only the outer edge, set as wide
+as the operator likes. This keeps the framework's rule that **nothing spends without a dollar cap**
+— every policy carries one, and none can exceed what was granted. An app without a grant never
+rents or reaches a hosted API: safe by default. The same policy can be written in the pool's
+configuration, for a workload the operator runs.
+
+### Metering a hosted budget
+
+- **Set by the app in its spending policy** (above): any of per request, per day and per month,
+  within its grant.
 - **Metered by the router from the answer itself:** the token counts every provider returns
   (`usage`), times the catalog's price for that build. Providers' own spend limits cannot be the
   cap: OpenAI's are "not instantaneous", Groq's lag 10–15 minutes, Together and Ollama have none
@@ -169,9 +214,9 @@ and an app may read its own budget and what is left of it.
 
 ## Open questions for the owner
 
-1. **Confirm the reading above:** the app sets its own budget and renting maximum, within a ceiling
-   the operator grants (the provisioning key's grant, extended) — not an app free to set any
-   amount.
+None of substance. Defaults to be confirmed when the decisions are written: `hosted.after_s` 5,
+`rented.after_min` 10, and a default `max_tokens` ceiling for a request that names none, used only
+to reserve its worst case.
 
 ## Build stages
 
@@ -179,8 +224,9 @@ and an app may read its own budget and what is left of it.
 2. The `openai-api` engine, the `hosted` host kind, the catalog's prices, the credential, the
    router's metering, reservation and spill — against a fake hosted API that speaks each
    provider's usage and error shapes.
-3. The provisioning grant's hosted ceilings, the SDK call by which an app sets its budget and
-   renting maximum within them, the cost header; spend per app and provider on the console.
+3. The spending policy: the workload's `steady` and `bursts`, the SDK call and the configuration
+   that set it, the grant's hosted ceilings, the rent-after-a-lasting-burst rule beside S1's
+   allocation, the cost header; spend per app, burst kind and provider on the console.
 4. The `:cloud` hole closed on agent-run Ollama.
 5. **Live, asked first:** one small chat request to each provider the owner holds a key for, a few
    cents each, with a budget of $1.
