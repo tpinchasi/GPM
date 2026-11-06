@@ -43,6 +43,33 @@ hosts and bid hosts together, and each reports which it is (`interruptible`). A 
 goes through every filter, ceiling and cap any other offer does, and if it cannot be rented —
 gone, outbid, or no longer passing — nothing is rented instead.
 
+**A hosted model API is a host of kind `hosted`** (D164): OpenAI, Anthropic's OpenAI-compatible
+endpoint, Together, Ollama's cloud, or any other that serves the OpenAI-shaped `/v1` paths, reached
+with an API key. It is written with the fields every host has: an `https` transport whose
+`base_url` is the provider's whole OpenAI base (`…/v1`, or Groq's `…/openai/v1`) and whose
+`bearer_env` names the variable holding its key, and `workers` — its rate limit, as requests in
+flight. Its engine is `openai-api`, the same for every provider; it has no agent, no tunnel and no
+`residency`. Nothing is pulled, loaded, rented or released on it; the supervisor asks its
+`/v1/models` for health and its models, which spends nothing. Each catalog variant for it names the
+provider's name for the model, the kinds it serves there, and its price (§4.1). Where several
+providers serve one model, each variant names its provider in `requires` and each hosted host
+says which it is in `capabilities` (§4.4).
+
+```yaml
+  - id: together
+    kind: hosted
+    workers: 8
+    capabilities: [together]
+    transport: {type: https, base_url: https://api.together.ai/v1, bearer_env: TOGETHER_API_KEY}
+    models: [llama-3.3-70b]
+```
+
+What the router does with a provider's refusal, request by request: **busy** (429, 502, 503, 529)
+cools that host until its `retry-after` (5 s where it gives none) and the request waits for it or
+takes another worker; **out of money** takes the host out of routing in that router until it is
+restarted; anything else is the request's own, returned to the app as the provider said it and
+charged nothing.
+
 ### 1.3 Transports
 
 Transport is a property of the host, independent of its kind. The router only ever sees a URL
@@ -427,6 +454,13 @@ left untouched — it names the tag that really ran — and the router adds `X-G
   Holding both builds costs memory; where they do not both fit, that host simply does not take
   schema-constrained requests.
 
+**A hosted build carries its price** (D164): `price: {input, cached_input, output}` in dollars per
+million tokens, or `per_minute` for transcription. A hosted variant without one is refused, since
+the budget that pays for it could not be counted (D166); a provider with peak and off-peak rates is
+priced at its peak. The pool reads no price from a provider: the operator keeps them. A model whose
+variants are all hosted is **hosted-only** (D165): never placed on, rented for or planned onto a
+machine, and never in a machine's model set.
+
 ### 4.2 Learning a host's capabilities
 
 Capabilities are settled by the cheapest available evidence, in order, and the source recorded:
@@ -541,7 +575,8 @@ Strict tiers. A lower tier is touched only when every eligible worker above it i
 |---|---|---|
 | 0 — first | `local` | Free, and treated as always up (still probed; an unreachable local engine is skipped, not fed) |
 | 10 | `fixed-remote` | Steady capacity that exists whether or not it is used |
-| 20 — last | `rented-interruptible`, `rented-on-demand` | Brought up and down on demand, and may vanish mid-run |
+| 20 | `rented-interruptible`, `rented-on-demand` | Brought up and down on demand, and may vanish mid-run |
+| 30 — last | `hosted` | Paid per token from the app's own budget, and only after a request has waited `bursts.hosted.after_s` for a worker above it — or at once for a model no machine serves (D165) |
 
 Per request:
 

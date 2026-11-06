@@ -15,12 +15,13 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from ..certs import load_ca
 from ..provisioning_store import KEY_HASH, NAME, Grant, ProvisioningStore
-from .workloads import KINDS, WorkloadRefused, WorkloadRequest, parse_targets
+from .workloads import KINDS, WorkloadRefused, WorkloadRequest, parse_policy, parse_targets
 
 if TYPE_CHECKING:
     from .service import Supervisor
 
 DAY_S = 24 * 3600
+MONTH_S = 30 * DAY_S
 
 
 def _number(body: dict, name: str, *, minimum: float = 0.0, integer: bool = False, required: bool = True) -> Any:
@@ -81,6 +82,10 @@ class Provisioning:
             raise WorkloadRefused("certificates need provisioning.client_ca_certfile/keyfile and listen.client_ca_certfile")
         if grant.max_spend > grant.max_spend_per_day:
             raise WorkloadRefused("one workload's budget cannot be above the day's")
+        for field, value in (("hosted_per_day", grant.hosted_per_day), ("hosted_per_month", grant.hosted_per_month)):
+            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
+                                      or not math.isfinite(value) or value < 0):
+                raise WorkloadRefused(f"{field} is a number of dollars, 0 or more")
         fleet = self.supervisor.workloads.fleet
         longest = fleet.max_lease_hours() if fleet is not None else None
         if longest is not None and grant.max_hours > longest:
@@ -137,6 +142,8 @@ class Provisioning:
             raise WorkloadRefused("this pool does not take workloads from programs")
         if request.kind == "end":
             return self._end(provisioner, request)
+        if request.kind == "policy":
+            return self._policy(provisioner, request)
         body = request.body if isinstance(request.body, dict) else {}
         if request.kind == "plan":
             return "done", {"plan": await self._plan(provisioner, body)}, None
@@ -150,6 +157,78 @@ class Provisioning:
             raise WorkloadRefused("no such workload of this key")
         self.supervisor.workloads.end(workload.name, "ended by the program that made it")
         return "done", {"state": self.supervisor.workloads.get(workload.name).state}, workload.name
+
+    def _policy(self, provisioner: Any, request: Any) -> tuple[str, dict, Optional[str]]:
+        """A program changing its own workload's spending policy (D165), within its grant."""
+        workloads = self.supervisor.workloads
+        workload = workloads.store.get(request.workload or "")
+        if workload is None or workload.provisioner != provisioner.name:
+            raise WorkloadRefused("no such workload of this key")
+        policy = parse_policy(request.body if isinstance(request.body, dict) else {})
+        refusal = self._hosted_refusal(provisioner, policy, replacing=workload.name)
+        if refusal:
+            raise WorkloadRefused(refusal)
+        changed = workloads.set_policy(workload.name, policy, by=f"provisioning key {provisioner.name}")
+        return "done", {"workload": changed.name, "policy": changed.policy}, changed.name
+
+    # --- hosted dollars, committed (D165) ---
+
+    def _hosted_committed(self, provisioner: Optional[str], replacing: Optional[str] = None) -> tuple[float, float]:
+        """Hosted dollars programs' workloads have committed, for a day and for a month: an open
+        one its budget's most in a day and in a month, an ending or ended one what it really spent
+        in the last day and month — so a workload ended and made again starts no fresh budget (D125's
+        rule, for hosted APIs). `replacing` is left out: its new policy is what is being judged."""
+        from ..config import Budget
+        from ..db import RequestLog
+
+        now = time.time()
+        day = month = 0.0
+        ended: list[str] = []
+        for workload in self.supervisor.workloads.store.all():
+            if workload.provisioner is None or workload.name == replacing:
+                continue
+            if provisioner is not None and workload.provisioner != provisioner:
+                continue
+            # From `ending` on its key is refused (workloads.md §3): what it spent is final.
+            if workload.state in ("ending", "ended"):
+                if workload.ended_at is None or workload.ended_at >= now - MONTH_S:
+                    ended.append(workload.name)
+                continue
+            hosted = workload.policy.get("hosted")
+            if hosted:
+                budget = Budget.model_validate(hosted["budget"])
+                day += budget.most_in_a_day
+                month += budget.most_in_a_month
+        if ended:
+            log = RequestLog(self.supervisor.db)
+            day += log.hosted_spend_of(ended, now - DAY_S)
+            month += log.hosted_spend_of(ended, now - MONTH_S)
+        return day, month
+
+    def _hosted_refusal(self, provisioner: Any, policy: dict, replacing: Optional[str] = None) -> Optional[str]:
+        """Why this policy's hosted budget does not fit the key's grant or the pool's cap — or None."""
+        from ..config import Budget
+
+        hosted = policy.get("hosted")
+        if not hosted:
+            return None
+        grant: Grant = provisioner.grant
+        if not grant.hosted_per_day:
+            return "this key's grant allows no hosted-API spending (hosted_per_day)"
+        budget = Budget.model_validate(hosted["budget"])
+        day, month = self._hosted_committed(provisioner.name, replacing)
+        if day + budget.most_in_a_day > grant.hosted_per_day + 1e-9:
+            return (f"this key's workloads committed ${day:.2f} a day to hosted APIs; ${budget.most_in_a_day:.2f} more "
+                    f"would pass its ${grant.hosted_per_day:.2f}")
+        if grant.hosted_per_month is not None and month + budget.most_in_a_month > grant.hosted_per_month + 1e-9:
+            return (f"this key's workloads committed ${month:.2f} a month to hosted APIs; ${budget.most_in_a_month:.2f} "
+                    f"more would pass its ${grant.hosted_per_month:.2f}")
+        everyone, _ = self._hosted_committed(None, replacing)
+        cap = self.config.provisioning.max_hosted_per_day
+        if everyone + budget.most_in_a_day > cap + 1e-9:
+            return (f"programs committed ${everyone:.2f} a day to hosted APIs; ${budget.most_in_a_day:.2f} more would "
+                    f"pass the pool's ${cap:.2f} (provisioning.max_hosted_per_day)")
+        return None
 
     def _request(self, provisioner: Any, body: dict, name: str) -> tuple[WorkloadRequest, float, bool]:
         """The request, checked against the grant: every field is untrusted until here."""
@@ -213,7 +292,9 @@ class Provisioning:
         against its grant."""
         open_now = [w for w in self.supervisor.workloads.store.active()
                     if w.provisioner == name and w.state in ("preparing", "serving", "ending")]
-        return {"open_now": len(open_now), "committed_today": round(self._committed(name, time.time() - DAY_S), 2)}
+        hosted_day, hosted_month = self._hosted_committed(name)
+        return {"open_now": len(open_now), "committed_today": round(self._committed(name, time.time() - DAY_S), 2),
+                "hosted_committed_day": round(hosted_day, 2), "hosted_committed_month": round(hosted_month, 2)}
 
     def _budget_refusal(self, provisioner: Any, spend: float) -> Optional[str]:
         since = time.time() - DAY_S
@@ -252,6 +333,10 @@ class Provisioning:
         refusal = self._budget_refusal(provisioner, req.max_spend)
         if refusal:
             raise WorkloadRefused(refusal)
+        policy = parse_policy(body)
+        refusal = self._hosted_refusal(provisioner, policy)
+        if refusal:
+            raise WorkloadRefused(refusal)
         csr = body.get("csr")
         if provisioner.grant.certs == "required" and not csr:
             raise WorkloadRefused("this key's workloads are reached with a client certificate: send csr")
@@ -263,7 +348,7 @@ class Provisioning:
                                   "(listen.client_ca_certfile); create without certs")
         workload, _, _, certificate = await workloads.create(
             req, key_hash=key_hash, provisioner=provisioner.name, idle_end_minutes=idle,
-            may_borrow=may_borrow, csr=csr, ca=self.ca if csr else None,
+            may_borrow=may_borrow, csr=csr, ca=self.ca if csr else None, policy=policy,
         )
         return "done", self._made(workload, certificate), workload.name
 
@@ -273,5 +358,6 @@ class Provisioning:
             "workload": workload.name, "state": workload.state, "model": workload.model, "models": list(workload.models),
             "ends_at": workload.ends_at, "max_spend": lease.max_spend if lease else None,
             "idle_end_minutes": workload.idle_end_minutes, "path_prefix": f"/w/{workload.name}/v1",
+            "policy": workload.policy,
             "certificate": certificate, "ca": self.ca.pem if (certificate and self.ca) else None,
         }

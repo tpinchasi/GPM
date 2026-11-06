@@ -189,6 +189,14 @@ class Engine(Protocol):
     def looks_corrupt(self, text: str) -> bool: ...
 ```
 
+**`openai-api`, the engine of a hosted API** (D164, D166). It reads requests as the shared
+OpenAI-shaped module does, and the router changes three things only: the model field (to the
+provider's name for the build), the key (the app's stripped, the provider's added, D167), and — for
+a streamed request — `stream_options: {include_usage: true}`, whose extra usage chunk is removed
+from the stream where the app did not ask for it. Its supervisor side asks `/v1/models`; it has no
+pull, load or launch settings. It reads a provider's refusals into *busy*, *out of money* and *the
+request's own*.
+
 ### Guarantees the pool requires
 
 | Operation | Guarantee |

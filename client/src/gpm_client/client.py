@@ -36,6 +36,9 @@ class Reply:
     host: Optional[str] = None
     runtime_class: Optional[str] = None
     wait_s: Optional[float] = None
+    #: What a hosted API's answer cost the app's budget, in dollars (`X-GPM-Cost-USD`); None
+    #: for an answer from a machine, which is paid for by the hour.
+    cost_usd: Optional[float] = None
     raw: dict = dataclasses.field(default_factory=dict, repr=False)
 
 
@@ -48,6 +51,7 @@ class Transcript:
     host: Optional[str] = None
     runtime_class: Optional[str] = None
     wait_s: Optional[float] = None
+    cost_usd: Optional[float] = None
     raw: Union[dict, str] = dataclasses.field(default_factory=dict, repr=False)
 
 
@@ -73,6 +77,7 @@ class Ranking(list):
         host: Optional[str] = None,
         runtime_class: Optional[str] = None,
         wait_s: Optional[float] = None,
+        cost_usd: Optional[float] = None,
         raw: Optional[dict] = None,
     ):
         super().__init__(ranked)
@@ -80,6 +85,7 @@ class Ranking(list):
         self.host = host
         self.runtime_class = runtime_class
         self.wait_s = wait_s
+        self.cost_usd = cost_usd
         self.raw = raw if raw is not None else {}
 
 
@@ -154,6 +160,7 @@ def _facts(response: httpx.Response, model: Optional[str] = None) -> dict[str, A
         "host": response.headers.get("X-GPM-Host"),
         "runtime_class": response.headers.get("X-GPM-Runtime-Class"),
         "wait_s": _float_or_none(response.headers.get("X-GPM-Wait-S")),
+        "cost_usd": _float_or_none(response.headers.get("X-GPM-Cost-USD")),
     }
 
 

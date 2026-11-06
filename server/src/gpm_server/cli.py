@@ -398,8 +398,32 @@ def _say_connection(connection: dict) -> None:
     print("  Any OpenAI-compatible client takes these two; the pool's own SDK too.", file=sys.stderr)
 
 
+def _hosted_policy(args: argparse.Namespace) -> Optional[dict]:
+    """`bursts` from the --hosted-… flags (D165), or None where none was given."""
+    budget = {k: v for k, v in (("per_request", args.hosted_per_request), ("per_day", args.hosted_per_day),
+                                ("per_month", args.hosted_per_month)) if v is not None}
+    if not budget and args.hosted_after is None:
+        return None
+    hosted: dict = {"budget": budget}
+    if args.hosted_after is not None:
+        hosted["after_s"] = args.hosted_after
+    return {"hosted": hosted}
+
+
 def _workload(args: argparse.Namespace) -> int:
     name = args.name
+    if args.action == "policy":
+        if not name:
+            print("name the workload", file=sys.stderr)
+            return 2
+        if args.no_hosted:
+            return _control(args, "POST", f"/pool/workloads/{name}/policy", {"bursts": {}})
+        bursts = _hosted_policy(args)
+        if bursts is None:
+            print("give --hosted-per-day and/or --hosted-per-month (and --hosted-after, --hosted-per-request), "
+                  "or --no-hosted", file=sys.stderr)
+            return 2
+        return _control(args, "POST", f"/pool/workloads/{name}/policy", {"bursts": bursts})
     if args.action in ("plan", "create"):
         models, latencies, parallels = args.model or [], args.latency or [], args.parallel or []
         if not name or not models or args.hours is None or not (len(models) == len(latencies) == len(parallels)):
@@ -408,6 +432,9 @@ def _workload(args: argparse.Namespace) -> int:
             return 2
         body = {"name": name, "hours": args.hours, "max_spend": args.max_spend, "profile": args.profile,
                 "kind": args.kind, "placement": args.placement}
+        bursts = _hosted_policy(args)
+        if bursts is not None:
+            body["bursts"] = bursts
         if len(models) == 1:
             body.update({"model": models[0], "latency_s": latencies[0], "parallel": parallels[0]})
         else:
@@ -473,7 +500,8 @@ def _provisioner(args: argparse.Namespace) -> int:
                 "max_spend": args.max_spend, "max_spend_per_day": args.max_spend_per_day, "max_hours": args.max_hours,
                 "kinds": args.kinds.split(","), "may_borrow": not args.no_borrow,
                 "idle_end_minutes": args.idle_end_minutes, "max_idle_end_minutes": args.max_idle_end_minutes,
-                "certs": args.certs, "expires_hours": args.expires_hours}
+                "certs": args.certs, "expires_hours": args.expires_hours,
+                "hosted_per_day": args.hosted_per_day, "hosted_per_month": args.hosted_per_month}
         status, answer = _control_json(args, "POST", "/pool/provisioners", body)
         if status != 201:
             print(answer.get("detail") or json.dumps(answer), file=sys.stderr)
@@ -673,7 +701,7 @@ def main(argv: list[str] | None = None) -> int:
     workload = subparsers.add_parser(
         "workload", help="create, watch and end a workload: a model, a latency, a parallelism and a duration (D115)"
     )
-    workload.add_argument("action", choices=["plan", "create", "list", "show", "extend", "end", "rotate-key"])
+    workload.add_argument("action", choices=["plan", "create", "list", "show", "extend", "end", "rotate-key", "policy"])
     workload.add_argument("name", nargs="?", default=None)
     # Repeated in step for several models (D118): --model a --latency 20 --parallel 8 --model b ...
     workload.add_argument("--model", action="append", default=None, help="a model it serves; repeat for several")
@@ -690,6 +718,13 @@ def main(argv: list[str] | None = None) -> int:
     workload.add_argument("--kind", choices=["roi", "on_demand", "interruptible"], default="roi")
     workload.add_argument("--confirm", type=float, default=None, help="for extend: the raised budget typed again")
     workload.add_argument("--confirm-hours", type=float, default=None, help="for extend: the hours added, typed again")
+    # Its hosted burst (D165): requests that wait this long for a machine go to a hosted API.
+    workload.add_argument("--hosted-after", type=float, default=None,
+                          help="seconds a request waits for a machine before a hosted API (default 5)")
+    workload.add_argument("--hosted-per-day", type=float, default=None, help="hosted dollars a UTC day")
+    workload.add_argument("--hosted-per-month", type=float, default=None, help="hosted dollars a UTC month")
+    workload.add_argument("--hosted-per-request", type=float, default=None, help="the most one hosted answer may cost")
+    workload.add_argument("--no-hosted", action="store_true", help="for policy: take its hosted burst away")
     workload.add_argument("--url", default=None)
     workload.set_defaults(func=_workload)
 
@@ -709,6 +744,10 @@ def main(argv: list[str] | None = None) -> int:
     provisioner.add_argument("--max-idle-end-minutes", type=float, default=120.0)
     provisioner.add_argument("--certs", choices=["optional", "required"], default="optional")
     provisioner.add_argument("--expires-hours", type=float, default=None)
+    provisioner.add_argument("--hosted-per-day", type=float, default=0.0,
+                             help="hosted-API dollars its workloads may commit a day, together (0: none)")
+    provisioner.add_argument("--hosted-per-month", type=float, default=None,
+                             help="hosted-API dollars its workloads may commit a month, together")
     provisioner.add_argument("--end-workloads", action="store_true", help="for revoke: end the workloads it made")
     provisioner.add_argument("--url", default=None)
     provisioner.set_defaults(func=_provisioner)

@@ -42,7 +42,8 @@ from ..keys import match, verify
 from ..models import HostState
 from ..provisioning_store import HashTaken
 from ..state import RouterState, open_database
-from .dispatch import Assignment, Need, NoEligibleHost, NoReadyHost, QueueTimeout
+from .budgets import period_starts
+from .dispatch import Assignment, BudgetSpent, Need, NoEligibleHost, NoReadyHost, QueueTimeout
 
 #: How much of a response's end is held to read the engine's own counts out of it (D67).
 _USAGE_TAIL_BYTES = 4096
@@ -208,12 +209,86 @@ def _upstream_headers(request: Request) -> dict[str, str]:
     return headers
 
 
+def _max_tokens(content_type: str, body: bytes) -> Optional[int]:
+    """The most a request asks to generate (`max_tokens`, or `max_completion_tokens`), where it
+    says — what its worst case is reserved for (D166)."""
+    if "json" not in (content_type or "application/json").lower():
+        return None
+    try:
+        request = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(request, dict):
+        return None
+    for key in ("max_completion_tokens", "max_tokens"):
+        value = request.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return None
+
+
+#: Bytes of a request taken for a token, at most — counted generously, so the worst case held
+#: is never less than what the provider charges for the prompt (D166).
+_BYTES_PER_TOKEN = 3
+#: Audio bytes a second, at least, for a recording's length where its build is priced per minute.
+_AUDIO_BYTES_PER_S = 16_000
+
+
+def _worst_case(price: Any, request_bytes: int, most_out: int) -> float:
+    """What a hosted request could cost at most: its whole body as input, and all it may generate."""
+    if price.per_minute is not None:
+        return price.per_minute * max(1.0, request_bytes / _AUDIO_BYTES_PER_S / 60)
+    return price.of(request_bytes // _BYTES_PER_TOKEN + 1, 0, most_out)
+
+
+def _charge(state: RouterState, assignment: Assignment, tail: bytes) -> dict[str, Any]:
+    """What a hosted answer cost, from its own counts at its build's price — or its whole hold
+    where it said none (D166): `tokens_in` and `cost_usd` for the request log."""
+    engine = state.engine_of(assignment.host)
+    counts = engine.counts(tail) if hasattr(engine, "counts") else None
+    price = state.price_of(assignment.variant.tag)
+    if counts is None or price is None or price.per_minute is not None:
+        return {"cost_usd": assignment.hold.amount, "tokens_in": counts[0] if counts else None}
+    prompt, cached, completion = counts
+    return {"cost_usd": price.of(prompt, cached, completion), "tokens_in": prompt}
+
+
+def _retry_after(headers: Any, default: float = 5.0) -> float:
+    try:
+        return min(300.0, max(0.5, float(headers.get("retry-after") or default)))
+    except ValueError:
+        return default
+
+
+class _UsageFrameFilter:
+    """Removes from a stream the usage chunk the pool asked for and the app did not (D166):
+    frames are passed on whole, as they complete, and nothing else changes."""
+
+    def __init__(self, is_usage: Any) -> None:
+        self.is_usage = is_usage
+        self.pending = b""
+
+    def feed(self, chunk: bytes) -> bytes:
+        self.pending += chunk
+        out = bytearray()
+        while b"\n\n" in self.pending:
+            frame, self.pending = self.pending.split(b"\n\n", 1)
+            if not self.is_usage(frame):
+                out += frame + b"\n\n"
+        return bytes(out)
+
+    def flush(self) -> bytes:
+        rest, self.pending = self.pending, b""
+        return rest
+
+
 def _downstream_headers(
     upstream: httpx.Response,
     assignment: Assignment,
     wait_s: float,
     delivery: str = "stream",
     attempts: int = 1,
+    cost: Optional[str] = None,
 ) -> dict[str, str]:
     headers = {
         key: value for key, value in upstream.headers.items() if key.lower() not in _DROP_DOWNSTREAM
@@ -225,6 +300,10 @@ def _downstream_headers(
     headers["X-GPM-Contract"] = CONTRACT_VERSION
     headers["X-GPM-Delivery"] = delivery
     headers["X-GPM-Attempts"] = str(attempts)
+    if cost is not None:
+        # What a hosted answer cost the app's budget — or, ahead of a stream, the most it may (D165).
+        name, value = cost.split("=", 1)
+        headers[name] = value
     return headers
 
 
@@ -390,6 +469,8 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Pick up whatever the supervisor has already published before taking requests.
         await state.registry.refresh()
+        # What hosted APIs were paid this month, so a restart forgets nothing spent (D166).
+        state.budgets.load(await asyncio.to_thread(state.log.hosted_spend_since, period_starts()[1]))
         tasks = [asyncio.create_task(state.registry.run_forever(state.config.pool.host_table_poll_s))]
         if config_path is not None:
             tasks.append(asyncio.create_task(follow_config_file(state, Path(config_path))))
@@ -467,6 +548,8 @@ def create_app(
                     "workers_busy": sum(h.busy for h in state.hosts if h.workload is None),
                 },
                 "hosts": hosts,
+                # The shared workload's hosted budget and what is left of it (D165).
+                "budgets": {"hosted": state.budgets.left(None, getattr(state.hosted_burst_for(None), "budget", None))},
                 # Whether the supervisor is there: routing carries on without it, but nothing is
                 # probed, recovered, rented or released (D163). From its lock's heartbeat.
                 "supervisor": await asyncio.to_thread(_supervisor_now, database, state.config.pool.name),
@@ -576,7 +659,35 @@ def create_app(
             "workload": name, "state": workload_state, "model": workload.model, "models": list(models),
             "ends_at": workload.ends_at,
             "hosts_ready": sum(1 for h in mine if h.state is HostState.READY), "hosts": len(mine),
+            "policy": workload.policy,
+            "budgets": {"hosted": state.budgets.left(name, getattr(state.hosted_burst_for(name), "budget", None))},
         }, headers={"X-GPM-Contract": CONTRACT_VERSION})
+
+    @app.post("/pool/provisioning/workloads/{name}/policy")
+    async def provisioning_policy(request: Request, name: str) -> Response:
+        """A program changing its workload's spending policy (D165): recorded here, checked
+        against its grant and answered by the supervisor, as every provisioning request is."""
+        provisioner, refused = _provisioner_of(request)
+        if refused is not None:
+            return refused
+        workload = state.registry.workloads.get(name)
+        if workload is None or workload.provisioner != provisioner:
+            return _error(404, "not_found", "no_such_workload", "no workload of this key by that name")
+        raw = await request.body()
+        if len(raw) > 4096:
+            return _error(413, "too_large", "request_too_large", "a policy is a few fields")
+        try:
+            body = json.loads(raw or b"{}")
+        except ValueError:
+            return _error(400, "bad_request", "not_json", "the body is JSON")
+        if not isinstance(body, dict) or not isinstance(body.get("bursts"), dict):
+            return _error(400, "bad_request", "bursts", "send bursts: {\"hosted\": {...}}, or {} for none")
+        if await asyncio.to_thread(provisioning.pending_of, provisioner):
+            return _error(429, "busy", "request_pending", "this key has a request waiting; ask again when it is answered")
+        if await asyncio.to_thread(provisioning.asked_since, provisioner, time.time() - 60) >= REQUESTS_PER_MINUTE:
+            return _error(429, "busy", "too_many_requests", f"at most {REQUESTS_PER_MINUTE} requests a minute per provisioning key")
+        request_id, _ = await asyncio.to_thread(provisioning.ask, provisioner, "policy", {"bursts": body["bursts"]}, None, name)
+        return JSONResponse({"request_id": request_id}, status_code=202, headers={"X-GPM-Contract": CONTRACT_VERSION})
 
     @app.post("/pool/provisioning/workloads/{name}/end")
     async def provisioning_end(request: Request, name: str) -> Response:
@@ -632,6 +743,8 @@ def create_app(
                     "client_time_to_first_byte_s": state.config.pool.client_time_to_first_byte_s,
                 },
                 "delivery": _delivery(),
+                # Its hosted budget and what is left of it (D165).
+                "budgets": {"hosted": state.budgets.left(name, getattr(state.hosted_burst_for(name), "budget", None))},
                 "capacity": {
                     "hosts_ready": len(ready),
                     "workers_total": sum(h.total_workers for h in mine),
@@ -830,6 +943,14 @@ def create_app(
                 )
             )
 
+        async def free(assignment: Assignment, *, cost: Optional[float] = 0.0) -> Optional[float]:
+            """Give the worker back, and settle what was held for a hosted answer (D166): `cost`
+            None charges the whole hold — the provider may have charged what it began."""
+            await state.dispatcher.release(assignment)
+            if assignment.hold is not None:
+                return state.budgets.settle(assignment.hold, cost)
+            return None
+
         if refused is not None:
             await record("rejected", status_code=400, reason=refused[0])
             return _error(400, "bad_request", refused[0], refused[1])
@@ -865,8 +986,30 @@ def create_app(
             await record("rejected", status_code=400, reason=refusal[0])
             return _error(400, "bad_request", refusal[0], refusal[1])
 
+        # A burst its machines cannot meet may spill to a hosted API, within its budget (D165):
+        # after `after_s`, holding its worst case before it is sent (D166).
+        burst = state.hosted_burst_for(who.workload)
+        hosted_after: Optional[float] = None
+        reserve: Any = None
+        if burst is not None:
+            hosted_after = started + burst.after_s
+            if len(body) > _READ_OFF_LOOP_BYTES:
+                most_out = await asyncio.to_thread(_max_tokens, content_type, body)
+            else:
+                most_out = _max_tokens(content_type, body)
+            most_out = most_out or burst.reserve_max_tokens
+            body_size, budget, spender = len(body), burst.budget, who.workload
+
+            def reserve(host: Any, variant: Any) -> Any:
+                price = state.price_of(variant.tag)
+                if price is None:
+                    return None
+                return state.budgets.hold(spender, budget, _worst_case(price, body_size, most_out))
+
         need = Need(
             model=requested,
+            hosted_after=hosted_after,
+            reserve=reserve,
             wants_schema=facts.wants_schema,
             kind=facts.kind,
             inputs=facts.inputs,
@@ -943,6 +1086,13 @@ def create_app(
                         {name: candidate.inference_paths() for name, candidate in state.engines.items()},
                     ),
                 )
+            except BudgetSpent:
+                await record("rejected", status_code=503, reason="hosted_budget_spent",
+                             queue_wait_ms=(time.monotonic() - started) * 1000)
+                return _no_capacity(
+                    "hosted_budget_spent",
+                    f"only a hosted API serves {requested!r} now, and this budget has no room left for the request",
+                )
             except QueueTimeout:
                 if request_deadline is not None and time.monotonic() >= request_deadline:
                     await record("rejected", status_code=504, reason="deadline_exceeded")
@@ -959,14 +1109,25 @@ def create_app(
                 forwarded_type, forwarded = await asyncio.to_thread(rewrite_of, *rewrite)
             else:
                 forwarded_type, forwarded = rewrite_of(*rewrite)
+            hosted = assignment.host.hosted
+            app_asked_usage = True
+            upstream_path = path
+            if hosted:
+                # The provider's path under its own base URL; a stream asked for its usage, which
+                # the budget is settled from (D164, D166).
+                upstream_path = host_engine.upstream_path(path)
+                if engine.is_streaming(path, body):
+                    forwarded, app_asked_usage = host_engine.ask_for_usage(forwarded_type or content_type, forwarded)
             headers = _upstream_headers(request)
             if forwarded_type:
                 headers["content-type"] = forwarded_type
-            # The build chosen, named for the machine's router in front of several engine
-            # processes, so it routes an upload without reading it (D144). An app's own X-GPM-*
-            # headers never reach a host, so this one is always the pool's.
-            headers["x-gpm-model"] = assignment.variant.tag
-            upstream_request = assignment.host.client.build_request("POST", path, content=forwarded, headers=headers)
+            if not hosted:
+                # The build chosen, named for the machine's router in front of several engine
+                # processes, so it routes an upload without reading it (D144). An app's own
+                # X-GPM-* headers never reach a host, so this one is always the pool's — and it
+                # never goes to a provider.
+                headers["x-gpm-model"] = assignment.variant.tag
+            upstream_request = assignment.host.client.build_request("POST", upstream_path, content=forwarded, headers=headers)
             # Latency runs from the moment the engine is asked. For a non-streaming call the
             # headers arrive only after the whole generation, so measuring from after `send`
             # would report a 46-second answer as under a millisecond (seen live).
@@ -978,7 +1139,7 @@ def create_app(
                 # Gone while the engine worked on a whole answer: closing the upstream request
                 # stops the generation, and the worker is free now rather than when it ends.
                 with anyio.CancelScope(shield=True):
-                    await state.dispatcher.release(assignment)
+                    await free(assignment, cost=None)
                     await record("cancelled", reason="client_disconnected", host_id=assignment.host.host_id,
                                  queue_wait_ms=wait_s * 1000)
                 return Response(status_code=499)
@@ -987,7 +1148,7 @@ def create_app(
                 # ran out — long work, not a dead host (D144). Running it again elsewhere would
                 # take as long again, so it is answered, not re-run, and not counted as a failure.
                 with anyio.CancelScope(shield=True):
-                    await state.dispatcher.release(assignment)
+                    await free(assignment, cost=None)
                     await record("failed", status_code=504, reason="generation_timeout", host_id=assignment.host.host_id,
                                  queue_wait_ms=wait_s * 1000, latency_ms=(time.monotonic() - dispatched_at) * 1000)
                 return _error(
@@ -1000,7 +1161,7 @@ def create_app(
                 # in priority order. Never for "no capacity" (docs/spec/app-contract.md §5).
                 host_id = assignment.host.host_id
                 assignment.host.failures += 1
-                await state.dispatcher.release(assignment)
+                await free(assignment, cost=0.0)
                 log.warning("host %s failed before first byte: %s", host_id, exc)
                 excluded.add(host_id)
                 if len(excluded) > 1:
@@ -1008,7 +1169,40 @@ def create_app(
                     return _no_capacity("hosts_unreachable", f"two hosts failed before answering: {exc}")
                 continue
 
+            if hosted and upstream.status_code >= 400:
+                # What the provider's refusal means (D164): busy — another host, after its
+                # `retry-after`; out of money — never this host again in this router, never
+                # retried as busy; otherwise the request's own, returned as the provider said it.
+                said = await upstream.aread()
+                await upstream.aclose()
+                meaning = host_engine.refusal(upstream.status_code, said)
+                if meaning in ("busy", "out_of_funds"):
+                    host = assignment.host
+                    if meaning == "busy":
+                        host.cooling_until = time.monotonic() + _retry_after(upstream.headers)
+                    else:
+                        host.out_of_funds = said[:300].decode("utf-8", "replace")
+                        log.warning("hosted API %s is out of money: %s", host.host_id, host.out_of_funds)
+                    await free(assignment, cost=0.0)
+                    if meaning == "out_of_funds":
+                        excluded.add(host.host_id)
+                    await record("redispatched", host_id=host.host_id, model_served=assignment.variant.tag,
+                                 status_code=upstream.status_code, reason=f"provider_{meaning}",
+                                 queue_wait_ms=wait_s * 1000, cost_usd=0.0)
+                    continue
+                await free(assignment, cost=0.0)
+                await record("failed", host_id=assignment.host.host_id, model_served=assignment.variant.tag,
+                             status_code=upstream.status_code, reason="provider_refused",
+                             queue_wait_ms=wait_s * 1000, latency_ms=(time.monotonic() - dispatched_at) * 1000,
+                             cost_usd=0.0)
+                return Response(content=said, status_code=upstream.status_code,
+                                headers=_downstream_headers(upstream, assignment, wait_s, "stream", attempts))
+
             delivery = _delivery_for(state, assignment.host.kind, request)
+            if hosted:
+                # A whole answer is held, so its cost is said with it; a stream goes as it comes,
+                # its cost settled when it ends (D165).
+                delivery = "stream" if engine.is_streaming(path, body) else "buffered"
             if delivery != "buffered" or upstream.status_code >= 400:
                 # Streamed as the engine generates it, which is also how an error answer goes
                 # back: there is nothing to gain by holding a 4xx the engine already decided.
@@ -1036,7 +1230,7 @@ def create_app(
             except (asyncio.CancelledError, ClientGone) as gone:
                 with anyio.CancelScope(shield=True):
                     await upstream.aclose()
-                    await state.dispatcher.release(assignment)
+                    await free(assignment, cost=None)
                     await record("cancelled", reason="client_disconnected", host_id=assignment.host.host_id,
                                  queue_wait_ms=wait_s * 1000)
                 if isinstance(gone, ClientGone):
@@ -1047,7 +1241,7 @@ def create_app(
                 assignment.host.failures += 1
                 with anyio.CancelScope(shield=True):
                     await upstream.aclose()
-                    await state.dispatcher.release(assignment)
+                    await free(assignment, cost=None)
                 log.warning("host %s failed while buffering: %s", host_id, exc)
                 excluded.add(host_id)
                 await record(
@@ -1085,10 +1279,15 @@ def create_app(
             # Whole, and byte-identical to what the engine sent: the frames are the engine's
             # own, in order, so a client that asked for a stream still parses a stream.
             held.host.requests_served += 1
+            cost_header: Optional[str] = None
+            charged: dict[str, Any] = {}
             with anyio.CancelScope(shield=True):
                 await upstream.aclose()
-                await state.dispatcher.release(held)
                 tokens_out, generate_ms = engine.usage(path, prefix[-_USAGE_TAIL_BYTES:])
+                if held.hold is not None:
+                    charged = _charge(state, held, prefix[-_USAGE_TAIL_BYTES:])
+                    cost_header = f"X-GPM-Cost-USD={charged['cost_usd']:.6f}"
+                await free(held, cost=charged.get("cost_usd") if held.hold is not None else 0.0)
                 await record(
                     "ok",
                     host_id=held.host.host_id,
@@ -1103,12 +1302,16 @@ def create_app(
                     borrowed=held.borrowed,
                     concurrency=concurrency,
                     model_concurrency=model_concurrency,
+                    **charged,
                 )
             return Response(
                 content=prefix,
                 status_code=upstream.status_code,
-                headers=_downstream_headers(upstream, assignment, wait_s, delivery, attempts),
+                headers=_downstream_headers(upstream, assignment, wait_s, delivery, attempts, cost_header),
             )
+
+        strip = _UsageFrameFilter(state.engine_of(held.host).is_usage_frame) if (
+            held.host.hosted and not app_asked_usage) else None
 
         async def stream() -> AsyncIterator[bytes]:
             outcome = "ok"
@@ -1123,7 +1326,18 @@ def create_app(
                 async for chunk in rest:
                     tail.extend(chunk)
                     del tail[:-_USAGE_TAIL_BYTES]
-                    yield chunk
+                    if strip is None:
+                        yield chunk
+                    else:
+                        # The usage chunk the pool asked a provider for, removed where the app
+                        # did not ask for it itself (D166); every other frame passes as it was.
+                        passed = strip.feed(chunk)
+                        if passed:
+                            yield passed
+                if strip is not None:
+                    left = strip.flush()
+                    if left:
+                        yield left
             except asyncio.CancelledError:
                 outcome = "cancelled"
                 raise
@@ -1139,8 +1353,12 @@ def create_app(
                 # worker and stops work nobody is listening to.
                 with anyio.CancelScope(shield=True):
                     await upstream.aclose()
-                    await state.dispatcher.release(held)
                     tokens_out, generate_ms = engine.usage(path, bytes(tail))
+                    charged: dict[str, Any] = {}
+                    if held.hold is not None:
+                        # A stream cut before its usage came is charged what was held for it.
+                        charged = _charge(state, held, bytes(tail))
+                    await free(held, cost=charged.get("cost_usd") if held.hold is not None else 0.0)
                     await record(
                         outcome,
                         host_id=held.host.host_id,
@@ -1155,12 +1373,16 @@ def create_app(
                         borrowed=held.borrowed,
                         concurrency=concurrency,
                         model_concurrency=model_concurrency,
+                        **charged,
                     )
 
+        # Ahead of a stream only the most it may cost can be said; what it cost is in the request
+        # log and the budget once it ends (D165).
+        most = f"X-GPM-Cost-Max-USD={held.hold.amount:.6f}" if held.hold is not None else None
         return StreamingResponse(
             stream(),
             status_code=upstream.status_code,
-            headers=_downstream_headers(upstream, assignment, wait_s, delivery, attempts),
+            headers=_downstream_headers(upstream, assignment, wait_s, delivery, attempts, most),
         )
 
     return app

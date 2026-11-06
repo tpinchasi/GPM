@@ -16,7 +16,7 @@ import asyncio
 import dataclasses
 import math
 import time
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from ..catalog import ResolvedVariant, Traits, select_variant
 from ..models import Host, HostState, Worker, WorkerState
@@ -45,6 +45,12 @@ class Need:
     #: What the request asks for, and what it carries besides text (D142, D143).
     kind: str = "chat"
     inputs: frozenset[str] = frozenset()
+    #: When this request may go to a hosted API (S11, D165): a monotonic moment — after it has
+    #: waited its burst's `after_s` for a machine — or None, never (no hosted burst, no budget).
+    hosted_after: Optional[float] = None
+    #: Holds the request's worst case against its budget for a hosted build, or returns None
+    #: where it does not fit (D166). Called under the dispatch lock.
+    reserve: Optional[Callable[[Host, ResolvedVariant], Optional[Any]]] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -59,6 +65,8 @@ class Assignment:
     concurrency: int = 1
     #: Of those, how many were of the same model (D118).
     model_concurrency: int = 1
+    #: What is held against a budget for a hosted answer (D166), settled when it ends.
+    hold: Optional[Any] = None
 
 
 class NoReadyHost(Exception):
@@ -71,6 +79,10 @@ class NoEligibleHost(Exception):
 
 class QueueTimeout(Exception):
     """Eligible workers exist but stayed busy past the queue limit."""
+
+
+class BudgetSpent(Exception):
+    """Only a hosted API could serve this request now, and its budget has no room for it."""
 
 
 class Dispatcher:
@@ -111,14 +123,18 @@ class Dispatcher:
         for host in self.hosts:
             if host.state is not HostState.READY or host.host_id in exclude:
                 continue
+            if host.hosted and (need.hosted_after is None or need.reserve is None or host.out_of_funds is not None):
+                continue  # only within a hosted burst, and never a provider out of money
             if need.engines and host.engine not in need.engines:
                 continue
-            if host.workload != need.workload and not (need.workload is not None and host.workload is None):
+            # A hosted API is the pool's, and every workload with a hosted burst reaches it on its
+            # own budget — never as borrowing (D165).
+            if not host.hosted and host.workload != need.workload and not (need.workload is not None and host.workload is None):
                 continue  # another workload's host: never
             variant = self.variant_for(host, need)
             if variant is None:
                 continue
-            (own if host.workload == need.workload else shared).append((host, variant))
+            (own if host.workload == need.workload or host.hosted else shared).append((host, variant))
         if need.workload is not None and need.may_borrow and not self.ready_for(need):
             return own + shared
         return own
@@ -149,14 +165,15 @@ class Dispatcher:
     def lent_workers(self) -> int:
         """Shared workers serving a borrower right now."""
         return sum(
-            1 for h in self.hosts if h.workload is None
+            1 for h in self.hosts if h.workload is None and not h.hosted
             for w in h.workers if w.borrowed and w.state is WorkerState.BUSY
         )
 
     def borrow_limit(self, share: float) -> int:
         """How many shared workers borrowers may hold at once: the share of the shared ready
         workers, rounded down — at least one, where there is any."""
-        ready = sum(h.total_workers for h in self.hosts if h.workload is None and h.state is HostState.READY)
+        ready = sum(h.total_workers for h in self.hosts
+                    if h.workload is None and not h.hosted and h.state is HostState.READY)
         return max(1, math.floor(share * ready)) if ready and share > 0 else 0
 
     def _shared_request_wants(self, host: Host) -> bool:
@@ -171,7 +188,7 @@ class Dispatcher:
         return False
 
     def _may_take(self, host: Host, need: Need) -> bool:
-        if host.workload == need.workload:
+        if host.workload == need.workload or host.hosted:
             return True
         # Borrowing: after the shared workload's own requests, and within the share — which is
         # for every borrower together, not each workload's own (D115).
@@ -212,16 +229,30 @@ class Dispatcher:
                     assignment = self._take_idle(candidates, request_id, need)
                     if assignment is not None:
                         return assignment
+                    if self._only_hosted_and_unaffordable(candidates, need):
+                        raise BudgetSpent()
 
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise QueueTimeout()
+                    # A request that may spill to a hosted API wakes when it may (D165), not only
+                    # when a machine's worker frees.
+                    wait = remaining
+                    if need.hosted_after is not None and any(h.hosted for h, _ in candidates):
+                        now = time.monotonic()
+                        # ... and when a busy provider's `retry-after` is over.
+                        moments = [need.hosted_after] + [h.cooling_until for h, _ in candidates if h.hosted]
+                        later = [moment - now for moment in moments if moment > now]
+                        if later:
+                            wait = min(wait, min(later) + 0.01)
                     self._waiting[request_id] = (need, exclude)
                     try:
                         # Waiters re-acquire the condition lock in the order they began waiting,
                         # so the oldest eligible request takes the freed worker.
-                        await asyncio.wait_for(self._condition.wait(), timeout=remaining)
+                        await asyncio.wait_for(self._condition.wait(), timeout=wait)
                     except asyncio.TimeoutError:
+                        if wait < remaining:
+                            continue  # the moment to spill: look again
                         raise QueueTimeout() from None
             finally:
                 # Leaving — served, refused, timed out or cancelled with its client. A shared
@@ -234,6 +265,13 @@ class Dispatcher:
         self, candidates: list[tuple[Host, ResolvedVariant]], request_id: str, need: Optional[Need] = None
     ) -> Optional[Assignment]:
         need = need or Need(model="")
+        # Hardware first (D165): a hosted API only once the request has waited its burst's
+        # `after_s` — or at once where no machine could serve it at all.
+        machines = any(not h.hosted for h, _ in candidates)
+        now = time.monotonic()
+        spill = need.hosted_after is not None and (not machines or now >= need.hosted_after)
+        # A provider that answered busy is not free until its `retry-after` is over.
+        candidates = [(h, v) for h, v in candidates if not (h.hosted and h.cooling_until > now)]
         for priority in sorted({host.priority for host, _ in candidates}):
             tier = [
                 (h, v) for h, v in candidates
@@ -243,6 +281,20 @@ class Dispatcher:
                 and not (need.cap is not None and h.workload == need.workload
                          and self.busy_with(h, need.model) >= need.cap)
             ]
+            # Machines first within a tier too; a hosted API only when spilling, and only one
+            # whose budget holds the request's worst case (D166).
+            hold = None
+            machines_here = [(h, v) for h, v in tier if not h.hosted]
+            if machines_here:
+                tier = machines_here
+            else:
+                affordable = []
+                for host, variant in (sorted(tier, key=lambda pair: (pair[0].load, pair[0].host_id)) if spill else []):
+                    hold = need.reserve(host, variant) if need.reserve is not None else None
+                    if hold is not None:
+                        affordable = [(host, variant)]
+                        break
+                tier = affordable
             if not tier:
                 continue
             host, variant = min(tier, key=lambda pair: (pair[0].load, pair[0].host_id))
@@ -250,13 +302,23 @@ class Dispatcher:
             assert worker is not None
             worker.state = WorkerState.BUSY
             worker.request_id = request_id
-            worker.borrowed = host.workload != need.workload
+            worker.borrowed = host.workload != need.workload and not host.hosted
             worker.model = need.model
             return Assignment(
                 host=host, worker=worker, variant=variant, borrowed=worker.borrowed, concurrency=host.busy,
-                model_concurrency=self.busy_with(host, need.model),
+                model_concurrency=self.busy_with(host, need.model), hold=hold,
             )
         return None
+
+    @staticmethod
+    def _only_hosted_and_unaffordable(candidates: list[tuple[Host, ResolvedVariant]], need: Need) -> bool:
+        """No machine could serve this request, a hosted API has a free worker, and none of them
+        fits its budget: waiting would not help, so it is said now."""
+        if any(not h.hosted for h, _ in candidates) or need.reserve is None:
+            return False
+        now = time.monotonic()
+        idle = [(h, v) for h, v in candidates if h.idle_worker() is not None and h.cooling_until <= now]
+        return bool(idle)
 
     async def release(self, assignment: Assignment) -> None:
         async with self._condition:

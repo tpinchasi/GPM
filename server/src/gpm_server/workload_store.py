@@ -118,6 +118,9 @@ class Workload:
     targets: tuple[ModelTarget, ...] = ()
     placement: str = "together"
     groups: tuple[Group, ...] = ()
+    #: Its spending policy (D165): `{"hosted": {after_s, budget, reserve_max_tokens}}`. Empty:
+    #: it never reaches a hosted API.
+    policy: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.targets:
@@ -169,6 +172,7 @@ def _to_workload(row: Any) -> Workload:
         targets=tuple(ModelTarget(**t) for t in json.loads(row["targets"])) if row["targets"] else (),
         placement=row["placement"] or "together",
         groups=tuple(Group.from_dict(g) for g in json.loads(row["groups"])) if row["groups"] else (),
+        policy=json.loads(row["policy"]) if row["policy"] else {},
     )
 
 
@@ -215,8 +219,8 @@ class WorkloadStore:
             INSERT INTO workloads (
                 name, model, builds, latency_s, parallel, kind, lease_id, state,
                 workers_per_host, hosts_at_start, plan, created_at, updated_at, ended_at, ends_at,
-                provisioner, idle_end_minutes, cert_fingerprint, targets, placement, groups
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                provisioner, idle_end_minutes, cert_fingerprint, targets, placement, groups, policy
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 workload.name, workload.model, json.dumps(workload.builds), workload.latency_s,
@@ -226,8 +230,14 @@ class WorkloadStore:
                 workload.provisioner, workload.idle_end_minutes, workload.cert_fingerprint,
                 json.dumps([t.as_dict() for t in workload.targets]), workload.placement,
                 json.dumps([g.as_dict() for g in workload.groups]),
+                json.dumps(workload.policy) if workload.policy else None,
             ),
         )
+
+    def set_policy(self, name: str, policy: dict[str, Any]) -> None:
+        """Its spending policy, replaced whole (D165); read by the router with the workload."""
+        self.db.execute("UPDATE workloads SET policy = ?, updated_at = ? WHERE name = ?",
+                        (json.dumps(policy) if policy else None, time.time(), name))
 
     def set_cert_fingerprint(self, name: str, fingerprint: str) -> None:
         self.db.execute("UPDATE workloads SET cert_fingerprint = ?, updated_at = ? WHERE name = ?",
