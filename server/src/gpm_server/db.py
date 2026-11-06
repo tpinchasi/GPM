@@ -362,6 +362,9 @@ _ADDED_COLUMNS = {
         ("targets", "TEXT"),
         ("placement", "TEXT"),
         ("groups", "TEXT"),
+        # Its spending policy (D165): `{"hosted": {...}}`, as the app or its operator stated it.
+        # NULL: none — it never reaches a hosted API.
+        ("policy", "TEXT"),
     ],
     "workload_volumes": [
         # The group's builds the volume holds (D118); NULL for one made before: the workload's.
@@ -505,6 +508,17 @@ class RequestLog:
 
     def rows(self, limit: int = 100) -> list[sqlite3.Row]:
         return self.db.query("SELECT * FROM request_log ORDER BY id DESC LIMIT ?", (limit,))
+
+    def hosted_spend_of(self, workloads: list[str], since: float) -> float:
+        """What these workloads spent on hosted APIs since a moment, in dollars (D165)."""
+        if not workloads:
+            return 0.0
+        marks = ",".join("?" for _ in workloads)
+        row = self.db.query(
+            f"SELECT SUM(cost_usd) AS spent FROM request_log WHERE workload IN ({marks}) AND ts >= ?",
+            (*workloads, since),
+        )[0]
+        return float(row["spent"] or 0.0)
 
     def hosted_spend_since(self, since: float) -> list[sqlite3.Row]:
         """Every hosted answer's cost since a moment, by workload (D166)."""

@@ -1795,7 +1795,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         try:
             fields = {k: body[k] for k in (
                 "max_open", "max_spend", "max_spend_per_day", "max_hours", "models", "kinds", "may_borrow",
-                "idle_end_minutes", "max_idle_end_minutes", "certs") if k in body}
+                "idle_end_minutes", "max_idle_end_minutes", "certs", "hosted_per_day", "hosted_per_month") if k in body}
             grant = Grant.from_dict(fields)
             key = supervisor.provisioning.grant(str(body.get("name") or ""), grant, body.get("expires_hours"))
         except WorkloadRefused as exc:
@@ -1811,6 +1811,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         return JSONResponse({
             "provisioners": [{**p.view(), **provisioning.usage(p.name)} for p in provisioning.store.all()],
             "max_spend_per_day": supervisor.config.provisioning.max_spend_per_day,
+            "max_hosted_per_day": supervisor.config.provisioning.max_hosted_per_day,
             "pool_url": _connection("-", None)["base_url"].removesuffix("/v1"),
         })
 
@@ -1842,9 +1843,12 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         body = await request.json()
 
         async def run():
+            from .workloads import parse_policy
+
             confirm = body.get("confirm_max_spend")
             workload, key, plan, _ = await supervisor.workloads.create(
-                _workload_request(body), confirm_max_spend=float(confirm) if confirm is not None else None
+                _workload_request(body), confirm_max_spend=float(confirm) if confirm is not None else None,
+                policy=parse_policy(body),
             )
             return JSONResponse(
                 {"workload": supervisor.workloads.view(workload), "plan": plan,
@@ -1884,6 +1888,22 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 confirm=confirm is not None and spend is not None and float(confirm) == float(spend),
                 confirm_hours=confirm_hours is not None and hours is not None and float(confirm_hours) == float(hours),
             )
+            return JSONResponse({"workload": supervisor.workloads.view(workload)})
+
+        return await _workload_call(run)
+
+    @app.post("/pool/workloads/{name}/policy")
+    async def workload_policy(name: str, request: Request) -> JSONResponse:
+        """Replace a running workload's spending policy (D165): `{"bursts": {"hosted": {...}}}`,
+        or `{"bursts": {}}` for none."""
+        body = await request.json()
+
+        async def run():
+            from .workloads import parse_policy
+
+            if not isinstance(body, dict) or "bursts" not in body:
+                return _error(400, "bad_request", "send bursts: {\"hosted\": {...}}, or {} for none")
+            workload = supervisor.workloads.set_policy(name, parse_policy(body))
             return JSONResponse({"workload": supervisor.workloads.view(workload)})
 
         return await _workload_call(run)

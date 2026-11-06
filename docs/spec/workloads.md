@@ -305,7 +305,8 @@ with WorkloadProvisioner(url, os.environ["GPM_PROVISIONING_KEY"]) as pool:
 - **Bounded twice**: by the key's grant — workloads at once (ending ones count), dollars per
   workload, dollars committed in any 24 hours (the budgets of the workloads it made in that time or
   still has open, not what has been recorded; one that has ended counts what it spent — D125), hours, models, kinds of machine, whether it may borrow, its idle cutoff's maximum,
-  an expiry — and by `provisioning.max_spend_per_day` across every key. A budget is always typed.
+  an expiry, and hosted-API dollars a day and a month (§13) — and by `provisioning.max_spend_per_day`
+  (and `max_hosted_per_day`) across every key. A budget is always typed.
 - **A host the budget cannot carry is never rented** (D124), and a workload whose budget carries none of
   the offers a round found stops searching until a host leaves or its lease is raised (D126). The rule:
   what the workload's hosts burn, with the new
@@ -411,11 +412,32 @@ pool.workloads.create(
   the configuration's `pool.bursts.hosted` (`after_s`, `budget`, and `reserve_max_tokens`: the
   output a request naming no `max_tokens` is reserved for, default 4096). Without it, the shared
   workload never reaches a hosted API.
-- **Who sets it:** the app, through the SDK with its provisioning key (§11, D117), and it may change
-  it while the workload runs; or the operator, for a workload in the configuration. Every budget is
-  at most what the provisioning grant allows: the grant gains `hosted_per_day` and
-  `hosted_per_month` beside its renting ceilings, and the pool-wide daily cap bounds every app
-  together. A workload whose grant allows no hosted dollars never reaches a hosted API.
+- **A budget bounds time**: `per_day` or `per_month`, or both; `per_request` is an extra limit on
+  one answer, never a budget alone. A hosted burst is refused where no hosted API in the pool
+  serves any of the workload's models.
+- **A hosted API is the pool's, reached on the workload's own budget — never borrowing** (§4): its
+  workers are not the shared workload's to lend and do not count in `borrow_share`. A workload
+  still starting that may borrow takes a shared machine first; one that may not, or finds none,
+  goes to its hosted burst at once, there being no machine of its own to wait for.
+- **Who sets it:** the app, through the SDK with its provisioning key (§11, D117) —
+  `pool.workload(..., bursts={"hosted": {...}})`, and `w.set_bursts({...})` while it runs
+  (`POST /pool/provisioning/workloads/{name}/policy`, a request the supervisor answers like a
+  create) — or its operator: `bursts` in `POST /pool/workloads`, `POST /pool/workloads/{name}/policy`,
+  or `gpm workload create|policy <name> --hosted-per-day … [--hosted-per-month …]
+  [--hosted-per-request …] [--hosted-after …]` (`--no-hosted` takes it away). A change takes
+  effect at the router's next look at the workload table; what was spent today and this month
+  still counts against the new budget. `GET /pool/status` with the workload's key, and the
+  program's `GET /pool/provisioning/workloads/{name}` (`w.hosted_budget()`), say what is left.
+- **A program's budget is bounded twice**, as its renting is: by its key's grant —
+  `hosted_per_day` (0, the default: none of its workloads reaches a hosted API) and
+  `hosted_per_month` — and by `provisioning.max_hosted_per_day` across every program (0 by
+  default). What is counted is **committed**, as for renting (D125): a running workload its
+  budget's most in a day (its day's limit, or its month's where lower) and in a month (its month's,
+  else 31 of its days); one ending or ended — its key refused from then — what it really spent in
+  the last day and 30 days, so ending a workload and making another buys no fresh budget. An
+  operator's own workload is bounded by the budget the operator typed.
+- **Not built yet**: `steady` and `bursts.rented` are refused in words. Until they are, a
+  workload's machines are sized by its `latency_s` and `parallel` (§2, §5) as before.
 
 **A hosted-only model** (D165) — one whose catalog lists hosted builds only, as for Claude or GPT,
 which no machine can run — goes to hosted APIs from the first request. The pool never rents,

@@ -33,6 +33,38 @@ class WorkloadRefused(Exception):
     """A workload that cannot be created, extended or ended as asked — said in words."""
 
 
+def parse_policy(body: dict) -> dict[str, Any]:
+    """The spending policy a create or a change carries (D165), checked — `{}` where it carries
+    none. Only `bursts.hosted` is taken so far: `bursts.rented` and `steady` are refused in words
+    rather than accepted and ignored."""
+    from pydantic import ValidationError
+
+    from ..config import HostedBurst
+
+    bursts = body.get("bursts")
+    if bursts is None:
+        return {}
+    if not isinstance(bursts, dict):
+        raise WorkloadRefused("bursts is an object: {\"hosted\": {...}}")
+    unknown = sorted(set(bursts) - {"hosted", "rented"})
+    if unknown:
+        raise WorkloadRefused(f"bursts are hosted (and later rented), not {unknown}")
+    if bursts.get("rented") is not None:
+        raise WorkloadRefused("bursts.rented is not built yet: a workload rents as it always has, up to its parallel")
+    if "steady" in body:
+        raise WorkloadRefused("steady is not built yet: a workload's machines are sized by its latency and parallel")
+    hosted = bursts.get("hosted")
+    if hosted is None:
+        return {}
+    try:
+        burst = HostedBurst.model_validate(hosted)
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        where = ".".join(str(part) for part in first.get("loc", ()))
+        raise WorkloadRefused(f"bursts.hosted{'.' + where if where else ''}: {first.get('msg')}") from None
+    return {"hosted": burst.model_dump(exclude_none=True)}
+
+
 @dataclasses.dataclass(frozen=True)
 class WorkloadRequest:
     name: str
@@ -537,7 +569,7 @@ class Workloads:
         self, req: WorkloadRequest, confirm_max_spend: Optional[float] = None, *,
         key_hash: Optional[str] = None, provisioner: Optional[str] = None,
         idle_end_minutes: Optional[float] = None, may_borrow: bool = True,
-        csr: Optional[str] = None, ca: Any = None,
+        csr: Optional[str] = None, ca: Any = None, policy: Optional[dict[str, Any]] = None,
     ) -> tuple[Workload, Optional[str], dict, Optional[str]]:
         """Create it: (the workload, its key — None where the program made its own and sent only
         the hash —, the plan, a signed client certificate where a signing request came)."""
@@ -547,6 +579,7 @@ class Workloads:
             plan = await self.plan(req)
             if plan["refused"]:
                 raise WorkloadRefused(plan["refused"])
+            self.check_policy(req.models, policy or {})
             budget = plan["max_spend"]
             if provisioner is not None and plan["budget_derived"]:
                 raise WorkloadRefused("a program must say what it will spend: send max_spend")
@@ -578,7 +611,7 @@ class Workloads:
                 workers_per_host=plan["workers_per_host"], hosts_at_start=plan["hosts_at_start"], plan=plan,
                 created_at=now, updated_at=now, ends_at=now + req.hours * 3600,
                 provisioner=provisioner, idle_end_minutes=idle_end_minutes,
-                targets=targets, placement=plan["placement"], groups=groups,
+                targets=targets, placement=plan["placement"], groups=groups, policy=dict(policy or {}),
             )
             # The row first: a name taken meanwhile fails here, before any spending authority
             # exists. The lease second, under the id the row already names.
@@ -686,6 +719,48 @@ class Workloads:
             self.supervisor.leases.close(lease.lease_id, f"workload {name} {reason}")
         self._ending(workload, reason)
         return self.get(name)
+
+    # --- its spending policy (D165) ---
+
+    def check_policy(self, models: Sequence[str], policy: dict[str, Any]) -> None:
+        """A hosted burst is refused where no hosted API this pool has serves any of the
+        workload's models: it would be a budget nothing could spend, and the app would wait for
+        a spill that never comes."""
+        if not policy.get("hosted"):
+            return
+        hosted = [h for h in self.config.hosts if h.kind == "hosted" and not h.disabled]
+        if not any(m in self.config.models_held_by(h) for h in hosted for m in models):
+            raise WorkloadRefused(
+                "no hosted API in this pool serves " + ", ".join(repr(m) for m in models)
+                + "; a hosted burst would have nothing to spend on"
+            )
+
+    def set_policy(self, name: str, policy: dict[str, Any], by: str = "the operator") -> Workload:
+        """Replace a running workload's spending policy. Takes effect at the router's next look at
+        the workload table; what it already spent today and this month still counts."""
+        workload = self.get(name)
+        if workload.state not in ("preparing", "serving"):
+            raise WorkloadRefused(f"workload {name!r} is {workload.state}; its policy can no longer change")
+        self.check_policy(workload.models, policy)
+        self.store.set_policy(name, policy)
+        hosted = policy.get("hosted")
+        self.supervisor.events.record(
+            "workload_policy",
+            f"workload {name}: " + (f"hosted APIs after {hosted['after_s']:g}s, within {hosted['budget']}"
+                                    if hosted else "no hosted APIs") + f" (set by {by})",
+            numbers={"workload": name, "policy": policy, "by": by}, lease_id=workload.lease_id,
+        )
+        return self.get(name)
+
+    def hosted_spend(self, name: str) -> dict[str, float]:
+        """What the workload spent on hosted APIs today and this month (UTC)."""
+        from ..db import RequestLog
+        from ..router.budgets import period_starts
+
+        day, month = period_starts()
+        log = RequestLog(self.supervisor.db)
+        return {"today": round(log.hosted_spend_of([name], day), 6),
+                "this_month": round(log.hosted_spend_of([name], month), 6)}
 
     def rotate_key(self, name: str) -> tuple[str, str]:
         workload = self.get(name)
@@ -818,6 +893,8 @@ class Workloads:
         return {
             **{k: v for k, v in workload.as_dict().items() if k != "plan"},
             "plan": workload.plan,
+            # What its hosted burst has spent, against its policy's budget (D165).
+            "hosted_spend": self.hosted_spend(workload.name) if workload.policy.get("hosted") else None,
             # While it starts: are its requests served on shared hosts, or refused until then?
             # Per model (D118): borrowing while none of its own hosts holding it is ready.
             "borrowing_models": borrowing_models,

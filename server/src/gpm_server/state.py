@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .catalog import for_engine
-from .config import PoolConfig, Variant
+from .config import HostedBurst, PoolConfig, Variant
 from .db import Database, HostCounters, HostTable, RequestLog
 from .engines import Engine, get_engine, kinds_of
 from .models import Host, HostState
@@ -60,12 +60,28 @@ class RouterState:
         #: What each workload has spent on hosted APIs and holds for requests in flight (D166);
         #: loaded from the request log when the router starts.
         self.budgets = HostedBudgets()
+        #: Each workload's hosted burst, parsed from the policy it was read with.
+        self._bursts: dict[str, tuple[Any, Any]] = {}
 
     def hosted_burst_for(self, workload: Optional[str]) -> Any:
         """The hosted burst a request's workload may spill to (D165), or None: the shared
-        workload's from the pool's configuration. A workload's own policy comes with S11's next
-        stage; until then, a workload never reaches a hosted API."""
-        return self.config.pool.bursts.hosted if workload is None else None
+        workload's from the pool's configuration, a workload's from its own policy — read with
+        the workload table, in the background, and parsed once per version of it."""
+        if workload is None:
+            return self.config.pool.bursts.hosted
+        spec = self.registry.workloads.get(workload)
+        raw = (spec.policy or {}).get("hosted") if spec is not None else None
+        if not raw:
+            return None
+        cached = self._bursts.get(workload)
+        if cached is not None and cached[0] is raw:
+            return cached[1]
+        try:
+            burst = HostedBurst.model_validate(raw)
+        except ValueError:
+            burst = None  # written by a newer supervisor, or damaged: no spill rather than a guess
+        self._bursts[workload] = (raw, burst)
+        return burst
 
     def price_of(self, tag: str) -> Any:
         """A catalogued build's price, where it is a hosted build (D164)."""

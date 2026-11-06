@@ -85,6 +85,20 @@ class Workload:
     def state(self) -> dict:
         return self._provisioner._get(f"/pool/provisioning/workloads/{self.name}")
 
+    def hosted_budget(self) -> Optional[dict]:
+        """Its hosted budget and what is left of it today and this month (UTC), or None where it
+        has no hosted burst (D165)."""
+        return (self.state().get("budgets") or {}).get("hosted")
+
+    def set_bursts(self, bursts: Mapping[str, Any], timeout_s: float = 120.0) -> dict:
+        """Change its spending policy while it runs (D165): `{"hosted": {"after_s": 5,
+        "budget": {"per_day": 20}}}`, or `{}` to stop spilling to hosted APIs. Checked against
+        the provisioning key's grant; what it already spent today and this month still counts."""
+        answer = self._provisioner._ask({"bursts": dict(bursts)}, timeout_s,
+                                        path=f"/pool/provisioning/workloads/{self.name}/policy")
+        self.answer = {**self.answer, "policy": answer.get("policy")}
+        return answer.get("policy") or {}
+
     def wait_until_serving(self, timeout_s: float = 1800.0, poll_s: float = 5.0) -> None:
         """Until it is serving: a host of its own ready for every model it serves (D118).
         Meanwhile a model may already be served on shared hosts, where the pool lets it borrow."""
@@ -169,9 +183,9 @@ class WorkloadProvisioner:
                 raise PoolError(f"the pool could not be asked within the time allowed ({self.base_url})")
             time.sleep(self._poll_s)
 
-    def _ask(self, body: dict, timeout_s: float) -> dict:
+    def _ask(self, body: dict, timeout_s: float, path: str = "/pool/provisioning/requests") -> dict:
         deadline = time.monotonic() + timeout_s
-        request_id = self._until(deadline, lambda: self._post("/pool/provisioning/requests", body))["request_id"]
+        request_id = self._until(deadline, lambda: self._post(path, body))["request_id"]
         while True:
             answered = self._until(deadline, lambda: self._get(f"/pool/provisioning/requests/{request_id}"))
             if answered["state"] == "refused":
@@ -186,7 +200,8 @@ class WorkloadProvisioner:
     @staticmethod
     def _body(model: Optional[str], latency_s: Optional[float], parallel: Optional[int], hours: float,
               max_spend: float, machines: str, idle_end_minutes: Optional[float],
-              models: Optional[Mapping[str, Mapping[str, Any]]] = None, placement: str = "auto") -> dict:
+              models: Optional[Mapping[str, Mapping[str, Any]]] = None, placement: str = "auto",
+              bursts: Optional[Mapping[str, Any]] = None) -> dict:
         """One model — `model`, `latency_s`, `parallel` — or several, each with its own target:
         `models={"chat": {"latency_s": 20, "parallel": 16}, "embed": {...}}` (D118)."""
         if (model is None) == (models is None):
@@ -205,6 +220,8 @@ class WorkloadProvisioner:
         body.update({"hours": hours, "max_spend": max_spend, "machines": machines})
         if idle_end_minutes is not None:
             body["idle_end_minutes"] = idle_end_minutes
+        if bursts is not None:
+            body["bursts"] = dict(bursts)
         return body
 
     def plan_workload(self, model: Optional[str] = None, *, latency_s: Optional[float] = None,
@@ -220,18 +237,24 @@ class WorkloadProvisioner:
                  parallel: Optional[int] = None, hours: float, max_spend: float,
                  models: Optional[Mapping[str, Mapping[str, Any]]] = None, placement: str = "auto",
                  machines: str = "roi", idle_end_minutes: Optional[float] = None, certs: bool = False,
+                 bursts: Optional[Mapping[str, Any]] = None,
                  wait_until: str = "created", timeout_s: float = 1800.0) -> Workload:
         """Create a workload and hand back a `Workload` bound to it — a context manager that ends
         it on leaving. One model, or several with `models=` — each with its own latency target and
         answers at once, placed on the pool's hosts as it prices cheaper (D118). `wait_until` is
         "created" (return at once; it may be served on shared hosts while its own come up) or
-        "serving" (wait until every model has hosts of its own)."""
+        "serving" (wait until every model has hosts of its own).
+
+        `bursts={"hosted": {"after_s": 5, "budget": {"per_day": 20, "per_month": 300}}}` lets a
+        request that waited `after_s` for one of its machines go to a hosted API the pool has,
+        paid per token from that budget, within the key's grant (D165). Each such answer says
+        what it cost: `reply.cost_usd`."""
         if wait_until not in ("created", "serving"):
             raise ValueError("wait_until is 'created' or 'serving'")
         key = "gpmw_" + secrets.token_hex(32)
         body = {"kind": "create", "key_hash": hashlib.sha256(key.encode()).hexdigest(),
                 **self._body(model, latency_s, parallel, hours, max_spend, machines, idle_end_minutes,
-                             models, placement)}
+                             models, placement, bursts)}
         private_pem = None
         if certs:
             private_pem, body["csr"] = _certificate_request()

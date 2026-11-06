@@ -141,7 +141,7 @@ def test_a_stream_that_asked_for_its_own_usage_keeps_it(monkeypatch, provider):
 
 def test_a_request_whose_worst_case_the_budget_cannot_hold_is_never_sent(monkeypatch, provider):
     fake, url = provider
-    with hosted_pool(monkeypatch, url, budget={"per_request": 0.01}) as pool:
+    with hosted_pool(monkeypatch, url, budget={"per_request": 0.01, "per_day": 1.0}) as pool:
         pool.reprobe()
         refused = ask(pool, "claude")  # up to 4 096 tokens out at $15 a million: more than a cent
         assert refused.status_code == 503 and refused.json()["reason"] == "hosted_budget_spent"
@@ -257,3 +257,15 @@ def test_a_price_counts_cached_input_apart_and_a_budget_holds_before_it_spends()
     budgets.settle(first, 0.1)
     assert budgets.hold(None, limit, 0.6) is not None, "settled for less: room again"
     assert budgets.hold(None, None, 0.0) is None, "no budget: never"
+
+
+def test_the_sdk_says_what_a_hosted_answer_cost(monkeypatch, provider):
+    from gpm_client import PoolClient
+
+    _, url = provider
+    with hosted_pool(monkeypatch, url) as pool:
+        pool.reprobe()
+        with PoolClient(pool.url, api_key=APP_KEY) as client:
+            reply = client.chat("claude", [{"role": "user", "content": "hi"}])
+            assert reply.cost_usd == pytest.approx(CLAUDE_COST) and reply.host == "provider"
+            assert client.chat("llama", [{"role": "user", "content": "hi"}]).cost_usd is None, "a machine's: no cost"

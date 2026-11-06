@@ -659,7 +659,35 @@ def create_app(
             "workload": name, "state": workload_state, "model": workload.model, "models": list(models),
             "ends_at": workload.ends_at,
             "hosts_ready": sum(1 for h in mine if h.state is HostState.READY), "hosts": len(mine),
+            "policy": workload.policy,
+            "budgets": {"hosted": state.budgets.left(name, getattr(state.hosted_burst_for(name), "budget", None))},
         }, headers={"X-GPM-Contract": CONTRACT_VERSION})
+
+    @app.post("/pool/provisioning/workloads/{name}/policy")
+    async def provisioning_policy(request: Request, name: str) -> Response:
+        """A program changing its workload's spending policy (D165): recorded here, checked
+        against its grant and answered by the supervisor, as every provisioning request is."""
+        provisioner, refused = _provisioner_of(request)
+        if refused is not None:
+            return refused
+        workload = state.registry.workloads.get(name)
+        if workload is None or workload.provisioner != provisioner:
+            return _error(404, "not_found", "no_such_workload", "no workload of this key by that name")
+        raw = await request.body()
+        if len(raw) > 4096:
+            return _error(413, "too_large", "request_too_large", "a policy is a few fields")
+        try:
+            body = json.loads(raw or b"{}")
+        except ValueError:
+            return _error(400, "bad_request", "not_json", "the body is JSON")
+        if not isinstance(body, dict) or not isinstance(body.get("bursts"), dict):
+            return _error(400, "bad_request", "bursts", "send bursts: {\"hosted\": {...}}, or {} for none")
+        if await asyncio.to_thread(provisioning.pending_of, provisioner):
+            return _error(429, "busy", "request_pending", "this key has a request waiting; ask again when it is answered")
+        if await asyncio.to_thread(provisioning.asked_since, provisioner, time.time() - 60) >= REQUESTS_PER_MINUTE:
+            return _error(429, "busy", "too_many_requests", f"at most {REQUESTS_PER_MINUTE} requests a minute per provisioning key")
+        request_id, _ = await asyncio.to_thread(provisioning.ask, provisioner, "policy", {"bursts": body["bursts"]}, None, name)
+        return JSONResponse({"request_id": request_id}, status_code=202, headers={"X-GPM-Contract": CONTRACT_VERSION})
 
     @app.post("/pool/provisioning/workloads/{name}/end")
     async def provisioning_end(request: Request, name: str) -> Response:
@@ -715,6 +743,8 @@ def create_app(
                     "client_time_to_first_byte_s": state.config.pool.client_time_to_first_byte_s,
                 },
                 "delivery": _delivery(),
+                # Its hosted budget and what is left of it (D165).
+                "budgets": {"hosted": state.budgets.left(name, getattr(state.hosted_burst_for(name), "budget", None))},
                 "capacity": {
                     "hosts_ready": len(ready),
                     "workers_total": sum(h.total_workers for h in mine),

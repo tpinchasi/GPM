@@ -223,7 +223,7 @@ full conversation travels with each request, and tools are executed by the app, 
 - **Typed errors**: `PoolUnavailable`, `PoolStreamInterrupted`, `PoolRequestError`, `PoolAuthError`.
 - **The facts of each call**: `served_model`, and — where the calling library exposes response
   headers — serving host, runtime class and `pool_wait_s`, so time spent waiting for capacity is
-  never mistaken for generation time. Where headers are not reachable through the app's client
+  never mistaken for generation time — and, for a hosted API's whole answer, `cost_usd`. Where headers are not reachable through the app's client
   library, the same facts are in the pool's request log, keyed by session id, for an offline
   join. (A context-local capture hook is a post-v1 item.)
 - Sync and async variants of everything.

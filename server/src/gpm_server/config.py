@@ -483,7 +483,9 @@ class DeliveryConfig(BaseModel):
 
 
 class Budget(BaseModel):
-    """Dollars a burst may spend: per request, per day and per month — any of them; at least one."""
+    """Dollars a burst may spend: per day and/or per month, and optionally per request. A
+    limit per request alone bounds nothing over time, so a day's or a month's is required —
+    nothing spends without a dollar cap."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -492,10 +494,21 @@ class Budget(BaseModel):
     per_month: Optional[float] = Field(default=None, gt=0)
 
     @model_validator(mode="after")
-    def _says_something(self) -> "Budget":
-        if self.per_request is None and self.per_day is None and self.per_month is None:
-            raise ValueError("a budget names at least one of per_request, per_day, per_month (dollars)")
+    def _bounds_time(self) -> "Budget":
+        if self.per_day is None and self.per_month is None:
+            raise ValueError("a budget names per_day or per_month (dollars), or both; per_request alone "
+                             "bounds nothing over time")
         return self
+
+    @property
+    def most_in_a_day(self) -> float:
+        """The most it can spend in one day: its day's limit, or its month's where that is lower."""
+        return min(v for v in (self.per_day, self.per_month) if v is not None)
+
+    @property
+    def most_in_a_month(self) -> float:
+        """The most it can spend in one month: its month's limit, else 31 of its days."""
+        return self.per_month if self.per_month is not None else 31 * float(self.per_day or 0)
 
 
 class HostedBurst(BaseModel):
@@ -596,6 +609,9 @@ class ProvisioningConfig(BaseModel):
     enabled: bool = False
     #: Dollars all provisioned workloads together may commit in any 24 hours.
     max_spend_per_day: Optional[float] = Field(default=None, gt=0)
+    #: Dollars all provisioned workloads together may commit to hosted APIs in a day (D165): the
+    #: sum of their hosted budgets' days. 0, the default: no program's workload reaches one.
+    max_hosted_per_day: float = Field(default=0.0, ge=0)
     #: The client CA's certificate and private key, for signing workloads' client certificates.
     #: The key is read by the supervisor only; it is never in the database or the router.
     client_ca_certfile: Optional[str] = None

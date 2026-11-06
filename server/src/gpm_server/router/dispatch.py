@@ -127,12 +127,14 @@ class Dispatcher:
                 continue  # only within a hosted burst, and never a provider out of money
             if need.engines and host.engine not in need.engines:
                 continue
-            if host.workload != need.workload and not (need.workload is not None and host.workload is None):
+            # A hosted API is the pool's, and every workload with a hosted burst reaches it on its
+            # own budget — never as borrowing (D165).
+            if not host.hosted and host.workload != need.workload and not (need.workload is not None and host.workload is None):
                 continue  # another workload's host: never
             variant = self.variant_for(host, need)
             if variant is None:
                 continue
-            (own if host.workload == need.workload else shared).append((host, variant))
+            (own if host.workload == need.workload or host.hosted else shared).append((host, variant))
         if need.workload is not None and need.may_borrow and not self.ready_for(need):
             return own + shared
         return own
@@ -163,14 +165,15 @@ class Dispatcher:
     def lent_workers(self) -> int:
         """Shared workers serving a borrower right now."""
         return sum(
-            1 for h in self.hosts if h.workload is None
+            1 for h in self.hosts if h.workload is None and not h.hosted
             for w in h.workers if w.borrowed and w.state is WorkerState.BUSY
         )
 
     def borrow_limit(self, share: float) -> int:
         """How many shared workers borrowers may hold at once: the share of the shared ready
         workers, rounded down — at least one, where there is any."""
-        ready = sum(h.total_workers for h in self.hosts if h.workload is None and h.state is HostState.READY)
+        ready = sum(h.total_workers for h in self.hosts
+                    if h.workload is None and not h.hosted and h.state is HostState.READY)
         return max(1, math.floor(share * ready)) if ready and share > 0 else 0
 
     def _shared_request_wants(self, host: Host) -> bool:
@@ -185,7 +188,7 @@ class Dispatcher:
         return False
 
     def _may_take(self, host: Host, need: Need) -> bool:
-        if host.workload == need.workload:
+        if host.workload == need.workload or host.hosted:
             return True
         # Borrowing: after the shared workload's own requests, and within the share — which is
         # for every borrower together, not each workload's own (D115).
@@ -299,7 +302,7 @@ class Dispatcher:
             assert worker is not None
             worker.state = WorkerState.BUSY
             worker.request_id = request_id
-            worker.borrowed = host.workload != need.workload
+            worker.borrowed = host.workload != need.workload and not host.hosted
             worker.model = need.model
             return Assignment(
                 host=host, worker=worker, variant=variant, borrowed=worker.borrowed, concurrency=host.busy,
