@@ -275,7 +275,13 @@ rented machine's; the configuration refuses a `:cloud`/`-cloud` tag on a machine
 agent refuses one in a desired set; and a cloud model any Ollama lists is never taken for one on its
 disk (D168).
 5. **Live, asked first:** one small chat request to each provider the owner holds a key for, a few
-   cents each, with a budget of $1.
+   cents each, with a budget of $1. **Not run:** no hosted-provider key is in `env`; the owner merged
+   S11 without it (2026-11-07), to be run with S12's.
+
+**Known limit at merge:** Claude through Anthropic's OpenAI-compatible endpoint is never cached —
+that endpoint does not support prompt caching — so a repeated prompt pays the full input price
+each time. S12 reaches Claude through Anthropic's own Messages API, caching on by default, and
+accepts Anthropic-SDK apps beside OpenAI-format ones.
 
 ## Research (2026-11-06)
 

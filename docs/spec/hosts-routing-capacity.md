@@ -54,6 +54,12 @@ flight. Its engine is `openai-api`, the same for every provider; it has no agent
 provider's name for the model, the kinds it serves there, and its price (§4.1); it holds only such
 variants (`engine: openai-api`) — one that names no engine is a machine's, never a provider's.
 
+**Claude through Anthropic's OpenAI-compatible endpoint is never cached** (found 2026-11-07): that
+endpoint does not support prompt caching and reports no cached tokens ("Prompt caching is not
+supported"), so every request pays the full input price — many times what Anthropic's own API
+charges a repeated prompt with caching on. Reaching Claude through Anthropic's own Messages API,
+with caching on by default, is S12.
+
 **Ollama's cloud is reached only this way** (D168): a host at `https://ollama.com/v1`, priced like
 any other. A machine's build, or a model in the set with no catalog entry, naming a `:cloud` or
 `-cloud` tag is refused by the configuration — a signed-in Ollama would bill it to its account
