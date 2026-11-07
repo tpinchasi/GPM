@@ -52,7 +52,14 @@ flight. Its engine is `openai-api`, the same for every provider; it has no agent
 `residency`. Nothing is pulled, loaded, rented or released on it; the supervisor asks its
 `/v1/models` for health and its models, which spends nothing. Each catalog variant for it names the
 provider's name for the model, the kinds it serves there, and its price (§4.1); it holds only such
-variants (`engine: openai-api`) — one that names no engine is a machine's, never a provider's. Where several
+variants (`engine: openai-api`) — one that names no engine is a machine's, never a provider's.
+
+**Ollama's cloud is reached only this way** (D168): a host at `https://ollama.com/v1`, priced like
+any other. A machine's build, or a model in the set with no catalog entry, naming a `:cloud` or
+`-cloud` tag is refused by the configuration — a signed-in Ollama would bill it to its account
+with no budget counting it. Every Ollama the pool starts runs with `OLLAMA_NO_CLOUD=1` (the agent's,
+and a rented machine's), and from any Ollama — one an owner runs signed in too — a cloud model it
+lists is never taken for one on its disk, so no request is routed to it. Where several
 providers serve one model, each variant names its provider in `requires` and each hosted host
 says which it is in `capabilities` (§4.4).
 

@@ -269,6 +269,11 @@ spending`) — hosted spend today and this month per workload and provider, ever
 burst budget against its limits; a provider out of money marked on the Hosts and Spending screens
 with what it said, and **Money is back** (`gpm host funds-restored`) to route to it again (D164
 amended). Stage 3 is done.
+
+**Stage 4 built (same PR, gpm-agent 0.16.0):** `OLLAMA_NO_CLOUD=1` on the agent's Ollama and a
+rented machine's; the configuration refuses a `:cloud`/`-cloud` tag on a machine's build; the
+agent refuses one in a desired set; and a cloud model any Ollama lists is never taken for one on its
+disk (D168).
 5. **Live, asked first:** one small chat request to each provider the owner holds a key for, a few
    cents each, with a budget of $1.
 

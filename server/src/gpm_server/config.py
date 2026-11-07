@@ -66,6 +66,16 @@ class Price(BaseModel):
 HOSTED_ENGINE = "openai-api"
 
 
+def cloud_tag(tag: str) -> bool:
+    """An Ollama tag served by Ollama's cloud rather than the machine — `glm-4.6:cloud`,
+    `gpt-oss:120b-cloud` — billed to the account the machine's Ollama is signed in to, with no
+    key the pool sees (D168). A model-hub repository has no tag part, and is never one."""
+    if ":" not in tag:
+        return False
+    part = tag.rsplit(":", 1)[1].strip().lower()
+    return part == "cloud" or part.endswith("-cloud")
+
+
 def _for_engine(variant: "Variant", engine: Optional[str]) -> bool:
     """`catalog.for_engine`'s rule, here for the configuration's own checks: a build naming no
     engine is any machine engine's; a hosted API takes only builds named for it (D164)."""
@@ -2058,6 +2068,16 @@ class PoolConfig(BaseModel):
         if priced:
             raise ValueError(f"{priced} have a price but are not hosted builds (`engine: {HOSTED_ENGINE}`); "
                              "a machine's build costs nothing per token — remove `price`")
+        # Ollama's cloud through a machine's Ollama spends money no budget or lease counts (D168):
+        # reached only as a hosted API, metered like any other.
+        cloud = [f"{name} ({variant.tag})" for name, entry in self.catalog.items() for variant in entry.variants
+                 if not variant.hosted and cloud_tag(variant.tag)]
+        cloud += [name for name in self.pool.model_set if name not in self.catalog and cloud_tag(name)]
+        if cloud:
+            raise ValueError(
+                f"{cloud} name Ollama's cloud, which a machine's Ollama would bill to the account it is signed in "
+                "to, with no budget counting it. Reach Ollama's cloud as a hosted API instead: a host of kind "
+                f"`hosted` at https://ollama.com/v1, and a build with `engine: {HOSTED_ENGINE}` and its price")
 
     def _auto_is_a_hosts_alone(self) -> None:
         """`auto` is chosen by a configured host's own agent, from the machine it runs on (D161):

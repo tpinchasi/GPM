@@ -526,8 +526,10 @@ itself, and does not update itself.
 
 **The Ollama the agent runs never reaches Ollama's cloud** (D168): it is started with
 `OLLAMA_NO_CLOUD=1`, so a model the pool asks for is always one on this machine's disk, never a
-`:cloud` tag billed to an account the pool cannot see. Ollama's cloud is a hosted API
-(hosts-routing-capacity §1.2).
+`:cloud` tag billed to an account the pool cannot see. A desired set naming a `:cloud` or `-cloud`
+tag is refused (`400 cloud_tag`), and the facts never list one — an Ollama the owner runs signed in
+lists them beside its own (with Ollama's `remote_host` / `remote_model` mark), and none is on this
+machine. Ollama's cloud is a hosted API (hosts-routing-capacity §1.2).
 
 **On Windows** a file's permission bits mean nothing to Python and the standard library reads no
 access control list, so the agent trusts a file by where it lives: its settings file, and the

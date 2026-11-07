@@ -23,7 +23,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 
-from .engines import EngineRefused, OllamaFacts
+from .engines import EngineRefused, OllamaFacts, cloud_tag
 
 #: A model tag: a name, optionally namespaced, optionally versioned. Never a URL, a path with
 #: dots leading out of anywhere, or anything with a scheme — those are refused before the
@@ -125,6 +125,12 @@ class ModelWork:
         tags, residency = body.get("tags"), body.get("residency")
         if not isinstance(tags, list) or not all(valid_tag(tag) for tag in tags):
             raise Refused(400, "bad_tag", "every tag must be a plain model tag: no URL, no path, no scheme")
+        cloud = sorted({tag for tag in tags if cloud_tag(tag)})
+        if cloud:
+            # Ollama's cloud bills the account this machine's Ollama may be signed in to, which no
+            # budget of the pool's counts; the pool reaches it as a hosted API instead (D168).
+            raise Refused(400, "cloud_tag", f"{', '.join(cloud)} would be served by Ollama's cloud, not this "
+                          "machine; this agent holds only models on its own disk")
         if residency not in ("pinned", "on_demand"):
             raise Refused(400, "bad_residency", "residency must be pinned or on_demand")
         if getattr(self.engine, "serves_one_model", False) and len(set(tags)) > 1:

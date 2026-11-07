@@ -27,6 +27,25 @@ def _sources_fact(sources: dict[str, tuple[Any, float]]) -> dict[str, dict[str, 
     return {tag: {**report.as_fact(), "seconds": seconds} for tag, (report, seconds) in sources.items()}
 
 
+
+def cloud_tag(tag: Any) -> bool:
+    """A tag Ollama serves from its cloud, not this machine — `glm-4.6:cloud`, `gpt-oss:120b-cloud`
+    — billed to the account it is signed in to (D168). A model-hub repository has no tag part."""
+    if not isinstance(tag, str) or ":" not in tag:
+        return False
+    part = tag.rsplit(":", 1)[1].strip().lower()
+    return part == "cloud" or part.endswith("-cloud")
+
+
+def _from_the_cloud(entry: Any) -> bool:
+    """An entry Ollama serves from its cloud, not this machine (D168): its own mark
+    (`remote_host`, `remote_model`), or a cloud tag."""
+    if not isinstance(entry, dict):
+        return True
+    if entry.get("remote_host") or entry.get("remote_model"):
+        return True
+    return cloud_tag(entry.get("name") or entry.get("model"))
+
 class OllamaFacts:
     name = "ollama"
     #: This engine fetches through its own API, so there is nothing to fetch with until it runs.
@@ -52,6 +71,10 @@ class OllamaFacts:
             loaded = (await client.get("/api/ps")).raise_for_status().json().get("models", [])
         except (httpx.HTTPError, ValueError) as exc:
             return {"name": self.name, "answers": False, "detail": str(exc) or type(exc).__name__}
+        # Never one of Ollama's cloud (D168): an Ollama the owner runs signed in lists them beside
+        # its own, and none is on this machine.
+        on_disk = [m for m in on_disk if not _from_the_cloud(m)]
+        loaded = [m for m in loaded if not _from_the_cloud(m)]
         return {
             "name": self.name,
             "answers": True,
