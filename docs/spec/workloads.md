@@ -459,7 +459,8 @@ pool.workload(
   operator's own workload is bounded by the budget the operator typed.
 - **Changed while it runs**: the policy sent replaces the one it had (the command line keeps a
   burst its flags do not name: `gpm workload policy <name> --rent-max-hosts 2 --rent-per-day 30
-  [--rent-per-month …] [--rent-after …]`, `--no-rented`). A rented burst draws on what the lease
+  [--rent-per-month …] [--rent-after …]`, `--no-rented`). A raised hosted budget is not typed
+  twice: it is a cap in itself, not a lease's spending authority (D165). A rented burst draws on what the lease
   has left; more money is the lease's to give (`gpm workload extend`, typed twice, D49).
 - **Served by hosted APIs alone: `parallel` 0.** A model asked for with `parallel: 0` (and no
   `latency_s`, which would say nothing) gets no machine: none is planned, rented or borrowed for
