@@ -48,6 +48,8 @@ Two differences between the surfaces matter to an app:
 | `Authorization: Bearer <app key>` | **Required**, loopback included | Admits the app to this pool (§3) |
 | Logical model names | Opt-in per model, by the operator | A name listed in the pool's catalog resolves to the build suited to the serving host. The same request can therefore return a different build through the pool than against a bare engine — by design, only for catalogued names. Unlisted names pass through literally |
 | Model actually served | Always reported | The response body's own model field (left untouched), and `X-GPM-Served-Model`, with `X-GPM-Host` and `X-GPM-Runtime-Class` |
+| `X-GPM-Cost-USD` | On a whole (not streamed) answer from a hosted API | What the answer cost the app's budget, in dollars (D165) — the app spends its own budget, so it is told |
+| `X-GPM-Cost-Max-USD` | On a streamed answer from a hosted API | The most it can cost: headers are sent before the usage that prices it arrives. The exact cost is charged to the budget and written to the request log when the stream ends |
 | `X-GPM-Wait-S` | Always reported | Seconds this request spent waiting for a worker, so queue wait is never mistaken for generation time |
 | Machine-readable `503` | Always | Body carries `reason` and `retry_after_s`; header carries `Retry-After`. A client that ignores the body still behaves correctly |
 | `X-GPM-Session` | Optional | Groups calls in the pool's request log. Affects routing only if the operator switched on an affinity or build-consistency option |
@@ -141,6 +143,10 @@ It is served from a cached copy, never by asking a third party while the app wai
   tries next, cleared when the host is ready — and `supervisor: {running, heartbeat_age_s}`:
   routing carries on without a supervisor, but nothing is probed, recovered, rented or released
   until it is back (D163).
+  **Hosted APIs** (D164–D167): an answer may come from a hosted model API the operator configured,
+  after the pool's machines, within the app's spending policy (workloads.md §13). The request and
+  the answer pass through untouched as ever; what the app sends then reaches that provider. `GET
+  /pool/status` shows a workload's budgets and what is left of each.
 - **Workload key** (`gpmw_`) — permits inference on one workload's hosts and `GET /pool/status`
   for that workload's view; nothing else ([workloads.md](workloads.md) §3, D115). Minted when the
   workload is created, expires with its lease. `/w/<name>/v1/…` means the same as `/v1/…` and is
@@ -217,7 +223,7 @@ full conversation travels with each request, and tools are executed by the app, 
 - **Typed errors**: `PoolUnavailable`, `PoolStreamInterrupted`, `PoolRequestError`, `PoolAuthError`.
 - **The facts of each call**: `served_model`, and — where the calling library exposes response
   headers — serving host, runtime class and `pool_wait_s`, so time spent waiting for capacity is
-  never mistaken for generation time. Where headers are not reachable through the app's client
+  never mistaken for generation time — and, for a hosted API's whole answer, `cost_usd`. Where headers are not reachable through the app's client
   library, the same facts are in the pool's request log, keyed by session id, for an offline
   join. (A context-local capture hook is a post-v1 item.)
 - Sync and async variants of everything.

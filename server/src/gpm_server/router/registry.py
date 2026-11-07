@@ -189,6 +189,10 @@ class HostRegistry:
         host.variants = variants
         host.literal_variants = _literal_variants(variants)
         host.observed_inputs = {tag: frozenset(found) for tag, found in row.observed.items()}
+        if (host.out_of_funds is not None and row.funds_reset_at is not None
+                and row.funds_reset_at >= (host.out_of_funds_at or 0.0)):
+            # An operator said its money is back, after its provider said it was gone (D164).
+            host.out_of_funds = host.out_of_funds_at = None
 
         if str(host.client.base_url).rstrip("/") != row.dial_url.rstrip("/"):
             self._retired.append(host.client)
@@ -226,6 +230,8 @@ class HostRegistry:
                     failures=host.failures,
                     last_request_at=host.last_request_at,
                     borrowed=sum(1 for w in host.workers if w.borrowed and w.state is WorkerState.BUSY),
+                    out_of_funds=host.out_of_funds,
+                    out_of_funds_at=host.out_of_funds_at,
                 )
                 for host in self.by_id.values()
             ]

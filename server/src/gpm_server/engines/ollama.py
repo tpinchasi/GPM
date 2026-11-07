@@ -7,6 +7,7 @@ from typing import Any, ClassVar, Optional
 
 import httpx
 
+from ..config import cloud_tag
 from . import openai_api
 from .base import (
     CHAT,
@@ -251,6 +252,8 @@ class OllamaEngine:
             "OLLAMA_CONTEXT_LENGTH": str(context),
             # Nothing is loaded on demand and nothing is ever swapped out.
             "OLLAMA_KEEP_ALIVE": "-1",
+            # Never Ollama's cloud, which bills an account no budget or lease counts (D168).
+            "OLLAMA_NO_CLOUD": "1",
         }
         if listen:
             # Left to itself this engine binds every interface, and a provider whose image
@@ -326,10 +329,15 @@ _INPUT_OF = {"vision": "image", "audio": "audio"}
 
 
 def _tags_in(entries: list[dict]) -> frozenset[str]:
+    """The tags an Ollama lists — never one of Ollama's cloud (D168): an Ollama the pool did not
+    start may be signed in, and lists those beside its own; the pool takes none of them as on
+    this machine, so no request is ever routed to one."""
     tags: set[str] = set()
     for entry in entries:
+        if entry.get("remote_host") or entry.get("remote_model"):
+            continue  # Ollama's own mark of a model it serves from its cloud
         for key in ("name", "model"):
             value = entry.get(key)
-            if isinstance(value, str):
+            if isinstance(value, str) and not cloud_tag(value):
                 tags.add(value)
     return frozenset(tags)

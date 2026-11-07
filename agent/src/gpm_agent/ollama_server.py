@@ -153,11 +153,13 @@ class OllamaServer:
 
     def environment(self) -> dict[str, str]:
         """The server's whole environment: what `platform.program_environment` keeps of the
-        agent's own, with the pool's numbers and — last, so nothing overrides them — the address
-        and the models directory. Every `OLLAMA_*` name in it is one written here."""
+        agent's own, with the pool's numbers and — last, so nothing overrides them — the address,
+        the models directory and `OLLAMA_NO_CLOUD`: this Ollama never reaches Ollama's cloud, which
+        bills an account the pool cannot see (D168). Every `OLLAMA_*` name in it is one written here."""
         own = dict(self.pool_environment() or {})
         own["OLLAMA_HOST"] = f"127.0.0.1:{self.port}"
         own["OLLAMA_MODELS"] = str(Path(self.models_path).expanduser())
+        own["OLLAMA_NO_CLOUD"] = "1"
         return host_platform.program_environment(own, os_name=self.os_name)
 
     # --- what was started ---

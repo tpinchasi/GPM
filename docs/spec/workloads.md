@@ -138,7 +138,8 @@ for workloads; the shared workload is unchanged.
 
 **Scale-up** is dynamic allocation (supervisor.md §5.1) inside the workload's lease: measured
 load — its own hosts' busy workers and its own requests that waited — above the floor, then the
-ramp, up to `parallel` workers and the lease's dollars and hours. A workload host's workers are
+ramp, up to `parallel` workers and the lease's dollars and hours — beyond `parallel` only through
+a rented burst (§13). A workload host's workers are
 fixed at what meets the latency on its class of machine: automatic adjustment (D67) does not
 climb past it. The number is worked out per offer when a host is rented; the one the plan shows
 is for the first host's class.
@@ -305,7 +306,8 @@ with WorkloadProvisioner(url, os.environ["GPM_PROVISIONING_KEY"]) as pool:
 - **Bounded twice**: by the key's grant — workloads at once (ending ones count), dollars per
   workload, dollars committed in any 24 hours (the budgets of the workloads it made in that time or
   still has open, not what has been recorded; one that has ended counts what it spent — D125), hours, models, kinds of machine, whether it may borrow, its idle cutoff's maximum,
-  an expiry — and by `provisioning.max_spend_per_day` across every key. A budget is always typed.
+  an expiry, and hosted-API dollars a day and a month (§13) — and by `provisioning.max_spend_per_day`
+  (and `max_hosted_per_day`) across every key. A budget is always typed.
 - **A host the budget cannot carry is never rented** (D124), and a workload whose budget carries none of
   the offers a round found stops searching until a host leaves or its lease is raised (D126). The rule:
   what the workload's hosts burn, with the new
@@ -379,3 +381,114 @@ gpm workload create research --hours 6 --max-spend 25 \
   The idle cutoff (§11) counts from then: a workload whose groups do not all come up is bounded by
   its lease.
 
+## 13. The app's spending policy: steady, and bursts to hosted APIs or rented machines (D165)
+
+A workload may say how it is to be served as its demand rises and falls — the app knows its
+pattern; the pool carries it out. Every part is optional, and any mix is allowed.
+
+```python
+pool.workload(
+    "llama-3.3-70b", latency_s=4, parallel=48, hours=24, max_spend=400,   # steady: 48 at once
+    bursts={
+        "hosted": {"after_s": 5, "budget": {"per_day": 20, "per_month": 300}},
+        "rented": {"after_min": 10, "max_hosts": 4, "budget": {"per_day": 60}},
+    },
+)
+```
+
+- **Steady** is the workload's `parallel` at its `latency_s`, as it always was (§2, §5): the pool
+  works out the hosts that meet it — two of 24 each, where the card serves 24 within 4 s — and
+  keeps them for the lease. There is no separate `steady` field; one sent is refused in words.
+- **`bursts.hosted`**: a request that finds no free worker waits `after_s` (default 5) for one, then
+  goes to a hosted API (hosts-routing-capacity §5, tier 30) if its budget has room — in dollars per
+  request, per day and/or per month, any of them. A model no machine serves goes at once.
+- **`bursts.rented`** — `after_min` (default 10), `max_hosts` (required), `budget` (`per_day`
+  and/or `per_month`; `per_request` is refused, a machine being paid by the hour):
+  - **When.** Only once every base host is serving and its load — busy workers and requests that
+    waited, a request spilled to a hosted API among them — has stayed above them for `after_min`
+    minutes, measured from the moment the whole base served and still fell short. Before then,
+    more load is the base's to meet. Then the ramp (§5, D66) adds hosts, at most `max_hosts`
+    beyond the base for each group of its hosts (one, unless its models are placed apart, §12).
+  - **Burst hosts are not the base.** They never count towards the hosts it keeps: a base host
+    lost is rented again at once, beside them. When the load falls they are the surplus, given up
+    first, after the scale-down window and idle cutoff; while one is held, what the load wants —
+    never less than the base — is what decides surplus.
+  - **Paid from the lease**, the only spending authority: its `budget` is a limit inside it. A
+    derived budget (§2 step 4) carries the burst — the less of `max_hosts` hosts at the first
+    host's price for every hour, and the budget over every UTC day and month the hours touch, shown
+    as `rented_burst.in_the_budget` in the plan; a typed one must hold it. D124's rule counts a
+    burst host only to what its budget lets it cost, and the base to the lease's end.
+  - **Within its budget.** A burst host is rented only where the budget has an hour left of every
+    burst host with it — else said once (`workload_burst_bound`) and not searched for again until
+    the day, its burst hosts, its policy or its lease change. What burst hosts cost (the ledger's
+    running totals, released hosts too) reaching the day's or the month's limit less the safety
+    margin a lease's cap is enforced with drains them all (`workload_burst_ended`); the base is
+    untouched. A policy that no longer has a rented burst drains them at once. The workload's
+    view shows `rented_burst`: spent today and this month, and burst hosts held.
+- **A budget spent** stops that kind of burst for the rest of its period — UTC days and months —
+  and the request is answered 503 `hosted_budget_spent` where no machine frees in time; the other
+  kind, or the queue, takes over. No request is sent beyond a budget (D166). What is left is in
+  `GET /pool/status` under `budgets`.
+- **The shared workload** — requests made with the app key alone — takes its hosted burst from
+  the configuration's `pool.bursts.hosted` (`after_s`, `budget`, and `reserve_max_tokens`: the
+  output a request naming no `max_tokens` is reserved for, default 4096). Without it, the shared
+  workload never reaches a hosted API.
+- **A budget bounds time**: `per_day` or `per_month`, or both; `per_request` is an extra limit on
+  one answer, never a budget alone. A hosted burst is refused where no hosted API in the pool
+  serves any of the workload's models.
+- **A hosted API is the pool's, reached on the workload's own budget — never borrowing** (§4): its
+  workers are not the shared workload's to lend and do not count in `borrow_share`. A workload
+  still starting that may borrow takes a shared machine first; one that may not, or finds none,
+  goes to its hosted burst at once, there being no machine of its own to wait for.
+- **Who sets it:** the app, through the SDK with its provisioning key (§11, D117) —
+  `pool.workload(..., bursts={"hosted": {...}})`, and `w.set_bursts({...})` while it runs
+  (`POST /pool/provisioning/workloads/{name}/policy`, a request the supervisor answers like a
+  create) — or its operator: `bursts` in `POST /pool/workloads`, `POST /pool/workloads/{name}/policy`,
+  or `gpm workload create|policy <name> --hosted-per-day … [--hosted-per-month …]
+  [--hosted-per-request …] [--hosted-after …]` (`--no-hosted` takes it away). A change takes
+  effect at the router's next look at the workload table; what was spent today and this month
+  still counts against the new budget. `GET /pool/status` with the workload's key, and the
+  program's `GET /pool/provisioning/workloads/{name}` (`w.hosted_budget()`), say what is left.
+- **A program's budget is bounded twice**, as its renting is: by its key's grant —
+  `hosted_per_day` (0, the default: none of its workloads reaches a hosted API) and
+  `hosted_per_month` — and by `provisioning.max_hosted_per_day` across every program (0 by
+  default). What is counted is **committed**, as for renting (D125): a running workload its
+  budget's most in a day (its day's limit, or its month's where lower) and in a month (its month's,
+  else 31 of its days); one ending or ended — its key refused from then — what it really spent in
+  the last day and 30 days, so ending a workload and making another buys no fresh budget. An
+  operator's own workload is bounded by the budget the operator typed.
+- **Changed while it runs**: the policy sent replaces the one it had (the command line keeps a
+  burst its flags do not name: `gpm workload policy <name> --rent-max-hosts 2 --rent-per-day 30
+  [--rent-per-month …] [--rent-after …]`, `--no-rented`). A raised hosted budget is not typed
+  twice: it is a cap in itself, not a lease's spending authority (D165). A rented burst draws on what the lease
+  has left; more money is the lease's to give (`gpm workload extend`, typed twice, D49).
+- **Served by hosted APIs alone: `parallel` 0.** A model asked for with `parallel: 0` (and no
+  `latency_s`, which would say nothing) gets no machine: none is planned, rented or borrowed for
+  it — not even while its workload prepares and may borrow — and its requests go to the pool's
+  hosted APIs on the workload's hosted budget from the first. It needs a hosted burst, and a
+  hosted API serving it; the burst cannot then be taken away while it runs. Its waiting is no
+  machine's to meet: it never counts towards a group's load.
+- **A workload whose every model is so rents nothing**: no market search, no hosts, no
+  `max_spend` (refused, and a program sends none) — its hosted burst's budget, within the grant's
+  `hosted_per_day`, is what it spends. Its lease cannot rent and carries only its hours; it serves
+  from creation; its hours end it though no fleet looks at a lease that rents nothing (a pool
+  without rented capacity may make one). A rented burst is refused for it.
+- **Mixed**: machine-run models are planned, grouped and rented as §12 says; the plan names the
+  others in `hosted_alone`.
+
+**A hosted-only model** (D165) — one whose catalog lists hosted builds only, as for Claude or GPT,
+which no machine can run — goes to hosted APIs from the first request. The pool never rents,
+prepares or plans a machine for it; a workload asks for it with `parallel: 0` and a hosted burst,
+and `parallel` above 0 for it is refused, saying the model has no build a machine runs. A hosted
+API holds only builds named for its engine (`engine: openai-api`, priced): a build naming no
+engine is a machine's. A workload of several
+models (§12) may mix machine-run and hosted-only models: each follows the part of the policy that
+can serve it.
+
+| The app says | What happens |
+|---|---|
+| `steady` + `hosted` + `rented` | base on machines; short bursts to tokens; long bursts rent |
+| `steady` + `hosted` | every burst to tokens; nothing rented |
+| `steady` + `rented` | bursts wait for rented machines, as before; no tokens |
+| `hosted` alone (`parallel` 0) | everything to hosted APIs; no machine |
+| `steady` alone | the base, then the queue |

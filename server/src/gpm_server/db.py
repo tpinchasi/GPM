@@ -326,6 +326,10 @@ _ADDED_COLUMNS = {
         # size (D145): measures built on output tokens read only the kinds that produce them.
         ("kind", "TEXT"),
         ("request_bytes", "INTEGER"),
+        # A hosted API's answer (S11, D166): the input it was charged for, and what it cost the
+        # budget it counted towards — read back at start, so a restart forgets nothing spent.
+        ("tokens_in", "INTEGER"),
+        ("cost_usd", "REAL"),
     ],
     "hosts": [
         ("available", "TEXT NOT NULL DEFAULT '[]'"),
@@ -338,6 +342,10 @@ _ADDED_COLUMNS = {
         ("engine", "TEXT NOT NULL DEFAULT 'ollama'"),
         # The workload a rented host was bought for (D115); NULL is the shared workload.
         ("workload", "TEXT"),
+        # When an operator said a hosted API's money is back (D164): the router routes to it
+        # again if its provider said otherwise before then. Written by the supervisor alone,
+        # and never by the routine publish, which leaves it as it is.
+        ("funds_reset_at", "REAL"),
     ],
     "leases": [
         # The workload a lease belongs to (D115); NULL is the shared workload.
@@ -358,6 +366,9 @@ _ADDED_COLUMNS = {
         ("targets", "TEXT"),
         ("placement", "TEXT"),
         ("groups", "TEXT"),
+        # Its spending policy (D165): `{"hosted": {...}}`, as the app or its operator stated it.
+        # NULL: none — it never reaches a hosted API.
+        ("policy", "TEXT"),
     ],
     "workload_volumes": [
         # The group's builds the volume holds (D118); NULL for one made before: the workload's.
@@ -378,6 +389,10 @@ _ADDED_COLUMNS = {
         # Of `busy`, how many serve a workload's request on a lent host (D115): load the shared
         # workload did not ask for, and must not scale up for.
         ("borrowed", "INTEGER NOT NULL DEFAULT 0"),
+        # A hosted API whose provider said its money had run out (D164), as the router saw it:
+        # what it said, and when. NULL: routed to as usual.
+        ("out_of_funds", "TEXT"),
+        ("out_of_funds_at", "REAL"),
     ],
 }
 
@@ -449,6 +464,9 @@ class RequestRecord:
     #: What it asked for, and the size of its body (D145).
     kind: Optional[str] = None
     request_bytes: Optional[int] = None
+    #: A hosted API's answer (D166): the input charged for, and its cost in dollars.
+    tokens_in: Optional[int] = None
+    cost_usd: Optional[float] = None
 
 
 class RequestLog:
@@ -462,8 +480,8 @@ class RequestLog:
                 ts, request_id, session_id, host_id, worker_id, model_requested,
                 model_served, runtime_class, queue_wait_ms, latency_ms, status_code,
                 outcome, reason, tokens_out, generate_ms, workload, borrowed, concurrency, model_concurrency,
-                kind, request_bytes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                kind, request_bytes, tokens_in, cost_usd
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.ts,
@@ -487,6 +505,8 @@ class RequestLog:
                 record.model_concurrency,
                 record.kind,
                 record.request_bytes,
+                record.tokens_in,
+                record.cost_usd,
             ),
         )
 
@@ -496,6 +516,23 @@ class RequestLog:
 
     def rows(self, limit: int = 100) -> list[sqlite3.Row]:
         return self.db.query("SELECT * FROM request_log ORDER BY id DESC LIMIT ?", (limit,))
+
+    def hosted_spend_of(self, workloads: list[str], since: float) -> float:
+        """What these workloads spent on hosted APIs since a moment, in dollars (D165)."""
+        if not workloads:
+            return 0.0
+        marks = ",".join("?" for _ in workloads)
+        row = self.db.query(
+            f"SELECT SUM(cost_usd) AS spent FROM request_log WHERE workload IN ({marks}) AND ts >= ?",
+            (*workloads, since),
+        )[0]
+        return float(row["spent"] or 0.0)
+
+    def hosted_spend_since(self, since: float) -> list[sqlite3.Row]:
+        """Every hosted answer's cost since a moment, by workload (D166)."""
+        return self.db.query(
+            "SELECT workload, ts, cost_usd FROM request_log WHERE cost_usd IS NOT NULL AND ts >= ?", (since,)
+        )
 
 
 # --- the host table (supervisor writes, router reads) ---
@@ -528,6 +565,8 @@ class HostRow:
     updated_at: float = 0.0
     #: The workload this host serves (D115); None is the shared workload.
     workload: Optional[str] = None
+    #: When an operator last said this hosted API's money is back (D164).
+    funds_reset_at: Optional[float] = None
 
 
 def _row_to_host(row: sqlite3.Row) -> HostRow:
@@ -555,6 +594,7 @@ def _row_to_host(row: sqlite3.Row) -> HostRow:
         last_error=row["last_error"],
         updated_at=row["updated_at"],
         workload=row["workload"],
+        funds_reset_at=row["funds_reset_at"],
     )
 
 
@@ -612,6 +652,15 @@ class HostTable:
     def all(self) -> list[HostRow]:
         return [_row_to_host(row) for row in self.db.query("SELECT * FROM hosts")]
 
+    def reset_funds(self, host_id: str) -> bool:
+        """An operator says a hosted API's money is back (D164): the router reads it with the
+        table and routes to the host again. False where no such host is published."""
+        now = time.time()
+        if not self.db.query("SELECT 1 FROM hosts WHERE host_id = ?", (host_id,)):
+            return False
+        self.db.execute("UPDATE hosts SET funds_reset_at = ?, updated_at = ? WHERE host_id = ?", (now, now, host_id))
+        return True
+
     def revision(self) -> float:
         """The newest publish time — a cheap "has anything changed?" for the router."""
         rows = self.db.query("SELECT COUNT(*) AS n, MAX(updated_at) AS newest FROM hosts")
@@ -632,6 +681,9 @@ class CounterRow:
     last_request_at: Optional[float]
     #: Of `busy`, how many serve a borrowing workload (D115).
     borrowed: int = 0
+    #: A hosted API its provider said is out of money (D164): what it said, and when.
+    out_of_funds: Optional[str] = None
+    out_of_funds_at: Optional[float] = None
 
 
 class HostCounters:
@@ -642,13 +694,15 @@ class HostCounters:
         self.db.execute(
             """
             INSERT INTO host_counters (
-                host_id, busy, total, requests_served, failures, last_request_at, updated_at, borrowed
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                host_id, busy, total, requests_served, failures, last_request_at, updated_at, borrowed,
+                out_of_funds, out_of_funds_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(host_id) DO UPDATE SET
                 busy=excluded.busy, total=excluded.total,
                 requests_served=excluded.requests_served, failures=excluded.failures,
                 last_request_at=excluded.last_request_at, updated_at=excluded.updated_at,
-                borrowed=excluded.borrowed
+                borrowed=excluded.borrowed, out_of_funds=excluded.out_of_funds,
+                out_of_funds_at=excluded.out_of_funds_at
             """,
             (
                 counter.host_id,
@@ -659,6 +713,8 @@ class HostCounters:
                 counter.last_request_at,
                 time.time(),
                 counter.borrowed,
+                counter.out_of_funds,
+                counter.out_of_funds_at,
             ),
         )
 
@@ -680,6 +736,8 @@ class HostCounters:
                 failures=row["failures"],
                 last_request_at=row["last_request_at"],
                 borrowed=row["borrowed"],
+                out_of_funds=row["out_of_funds"],
+                out_of_funds_at=row["out_of_funds_at"],
             )
             for row in rows
         }

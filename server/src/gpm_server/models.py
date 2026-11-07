@@ -94,6 +94,16 @@ class Host:
     failures: int = 0
     #: The workload this host serves (D115); None is the shared workload.
     workload: Optional[str] = None
+    #: A hosted API's provider said its money has run out (D164): never retried as busy, kept
+    #: out of routing until an operator says the money is back. What it said, and when.
+    out_of_funds: Optional[str] = None
+    out_of_funds_at: Optional[float] = None
+    #: A hosted API answered busy: not tried again before this moment (its `retry-after`).
+    cooling_until: float = 0.0
+
+    @property
+    def hosted(self) -> bool:
+        return self.kind == "hosted"
 
     @property
     def servable(self) -> frozenset[str]:

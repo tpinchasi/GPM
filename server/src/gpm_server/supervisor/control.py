@@ -633,6 +633,9 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 "holds": supervisor.config.models_held_by(host.config),
                 "served": served_on(host.variants, host.resident, host.available),
                 "last_error": host.last_error,
+                # A hosted API its provider said is out of money, as the router saw it (D164).
+                "out_of_funds": counter.out_of_funds if counter else None,
+                "out_of_funds_at": counter.out_of_funds_at if counter else None,
             }
             tunnel = supervisor.tunnel_status(host.host_id)
             if tunnel is not None:
@@ -1742,7 +1745,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
     # --- workloads (D115, docs/spec/workloads.md) ---
 
     def _workload_request(body: dict) -> Any:
-        from .workloads import WorkloadRefused, WorkloadRequest, parse_targets
+        from .workloads import WorkloadRefused, WorkloadRequest, parse_policy, parse_targets
 
         for required in ("name", "hours"):
             if body.get(required) in (None, ""):
@@ -1756,7 +1759,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             str(body.get("name") or "").strip(), targets, float(hours),
             max_spend=float(spend) if spend is not None else None,
             profile=(str(body["profile"]).strip() or None) if body.get("profile") else None,
-            kind=str(body.get("kind") or "roi"), placement=placement,
+            kind=str(body.get("kind") or "roi"), placement=placement, policy=parse_policy(body),
         )
 
     async def _workload_call(fn):
@@ -1795,7 +1798,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         try:
             fields = {k: body[k] for k in (
                 "max_open", "max_spend", "max_spend_per_day", "max_hours", "models", "kinds", "may_borrow",
-                "idle_end_minutes", "max_idle_end_minutes", "certs") if k in body}
+                "idle_end_minutes", "max_idle_end_minutes", "certs", "hosted_per_day", "hosted_per_month") if k in body}
             grant = Grant.from_dict(fields)
             key = supervisor.provisioning.grant(str(body.get("name") or ""), grant, body.get("expires_hours"))
         except WorkloadRefused as exc:
@@ -1811,6 +1814,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         return JSONResponse({
             "provisioners": [{**p.view(), **provisioning.usage(p.name)} for p in provisioning.store.all()],
             "max_spend_per_day": supervisor.config.provisioning.max_spend_per_day,
+            "max_hosted_per_day": supervisor.config.provisioning.max_hosted_per_day,
             "pool_url": _connection("-", None)["base_url"].removesuffix("/v1"),
         })
 
@@ -1842,9 +1846,12 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         body = await request.json()
 
         async def run():
+            from .workloads import parse_policy
+
             confirm = body.get("confirm_max_spend")
             workload, key, plan, _ = await supervisor.workloads.create(
-                _workload_request(body), confirm_max_spend=float(confirm) if confirm is not None else None
+                _workload_request(body), confirm_max_spend=float(confirm) if confirm is not None else None,
+                policy=parse_policy(body),
             )
             return JSONResponse(
                 {"workload": supervisor.workloads.view(workload), "plan": plan,
@@ -1884,6 +1891,22 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 confirm=confirm is not None and spend is not None and float(confirm) == float(spend),
                 confirm_hours=confirm_hours is not None and hours is not None and float(confirm_hours) == float(hours),
             )
+            return JSONResponse({"workload": supervisor.workloads.view(workload)})
+
+        return await _workload_call(run)
+
+    @app.post("/pool/workloads/{name}/policy")
+    async def workload_policy(name: str, request: Request) -> JSONResponse:
+        """Replace a running workload's spending policy (D165): `{"bursts": {"hosted": {...}}}`,
+        or `{"bursts": {}}` for none."""
+        body = await request.json()
+
+        async def run():
+            from .workloads import parse_policy
+
+            if not isinstance(body, dict) or "bursts" not in body:
+                return _error(400, "bad_request", "send bursts: {\"hosted\": {...}}, or {} for none")
+            workload = supervisor.workloads.set_policy(name, parse_policy(body))
             return JSONResponse({"workload": supervisor.workloads.view(workload)})
 
         return await _workload_call(run)
@@ -2289,6 +2312,93 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             return _error(400, "cannot_resize", why)
         supervisor._publish_rented()
         return JSONResponse({"host_id": host_id, "workers": host.workers, "detail": why})
+
+    @app.post("/pool/hosts/{host_id}/funds-restored")
+    async def funds_restored(host_id: str) -> JSONResponse:
+        """The operator says a hosted API's money is back (D164): the router, which took it out of
+        routing when its provider said otherwise, routes to it again at its next look at the table."""
+        host = supervisor.hosts.get(host_id)
+        if host is None or host.config.kind != "hosted":
+            return _error(404, "unknown_host", f"no hosted API {host_id!r}")
+        counter = supervisor.counters.all().get(host_id)
+        said = counter.out_of_funds if counter else None
+        if not supervisor.table.reset_funds(host_id):
+            return _error(409, "not_published", f"{host_id} is not in the host table yet; the supervisor publishes it first")
+        supervisor.events.record(
+            "hosted_funds_restored",
+            f"{host_id}: the operator says its money is back; the router routes to it again"
+            + (f" (its provider had said: {said})" if said else " (the router had not seen it out of money)"),
+            host_id=host_id,
+        )
+        return JSONResponse({"host_id": host_id, "was_out_of_funds": said is not None, "provider_said": said})
+
+    @app.get("/pool/spending")
+    async def spending() -> JSONResponse:
+        """What hosted APIs and rented bursts have cost, today and this month (UTC): per workload
+        and provider, against each budget (D165, D166)."""
+        return JSONResponse(await asyncio.to_thread(spending_payload))
+
+    def spending_payload() -> dict[str, Any]:
+        from ..router.budgets import period_starts
+
+        day, month = period_starts()
+        rows = supervisor.db.query(
+            "SELECT workload, host_id, SUM(CASE WHEN ts >= ? THEN cost_usd ELSE 0 END) AS today, "
+            "SUM(cost_usd) AS this_month, SUM(CASE WHEN ts >= ? THEN 1 ELSE 0 END) AS answers_today, "
+            "COUNT(*) AS answers_this_month FROM request_log "
+            "WHERE ts >= ? AND cost_usd IS NOT NULL AND cost_usd > 0 GROUP BY workload, host_id "
+            "ORDER BY this_month DESC",
+            (day, day, month),
+        )
+        by = [{"workload": r["workload"], "provider": r["host_id"], "today": round(r["today"] or 0.0, 6),
+               "this_month": round(r["this_month"] or 0.0, 6), "answers_today": int(r["answers_today"] or 0),
+               "answers_this_month": int(r["answers_this_month"] or 0)} for r in rows]
+        spent: dict[Optional[str], list[float]] = {}
+        for row in by:
+            totals = spent.setdefault(row["workload"], [0.0, 0.0])
+            totals[0] += row["today"]
+            totals[1] += row["this_month"]
+
+        def budget(name: Optional[str], raw: Any) -> dict[str, Any]:
+            today, this_month = spent.get(name, [0.0, 0.0])
+            return {"workload": name, "per_request": raw.get("per_request"), "per_day": raw.get("per_day"),
+                    "per_month": raw.get("per_month"), "today": round(today, 6), "this_month": round(this_month, 6)}
+
+        budgets = []
+        shared = supervisor.config.pool.bursts.hosted
+        if shared is not None:
+            budgets.append(budget(None, shared.budget.model_dump()))
+        bursts = []
+        for workload in supervisor.workloads.store.active():
+            if workload.state not in ("preparing", "serving"):
+                continue
+            hosted, rented = workload.policy.get("hosted"), workload.policy.get("rented")
+            if hosted:
+                budgets.append(budget(workload.name, hosted["budget"]))
+            if rented and supervisor.fleet is not None:
+                cost = supervisor.fleet.burst_spent(workload.lease_id)
+                bursts.append({
+                    "workload": workload.name, "per_day": rented["budget"].get("per_day"),
+                    "per_month": rented["budget"].get("per_month"), "max_hosts": rented["max_hosts"],
+                    "today": round(cost["today"], 6), "this_month": round(cost["this_month"], 6),
+                    "hosts": len([h for h in supervisor.fleet.hosts_of(workload.name) if h.burst]),
+                })
+        counters = supervisor.counters.all()
+        providers = []
+        for h in supervisor.hosts.values():
+            if h.config.kind != "hosted":
+                continue
+            counter = counters.get(h.host_id)
+            providers.append({"host_id": h.host_id, "state": h.state.value,
+                              "out_of_funds": counter.out_of_funds if counter else None,
+                              "out_of_funds_at": counter.out_of_funds_at if counter else None})
+        return {
+            "day_starts": day, "month_starts": month,
+            "hosted": {"today": round(sum(r["today"] for r in by), 6),
+                       "this_month": round(sum(r["this_month"] for r in by), 6), "by": by, "budgets": budgets},
+            "rented_bursts": bursts,
+            "providers": providers,
+        }
 
     @app.post("/pool/hosts/{host_id}/{action}")
     async def host_action(host_id: str, action: str) -> JSONResponse:

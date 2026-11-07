@@ -398,8 +398,47 @@ def _say_connection(connection: dict) -> None:
     print("  Any OpenAI-compatible client takes these two; the pool's own SDK too.", file=sys.stderr)
 
 
+def _hosted_policy(args: argparse.Namespace) -> Optional[dict]:
+    """`bursts` from the --hosted-… and --rent-… flags (D165), or None where none was given."""
+    bursts: dict = {}
+    budget = {k: v for k, v in (("per_request", args.hosted_per_request), ("per_day", args.hosted_per_day),
+                                ("per_month", args.hosted_per_month)) if v is not None}
+    if budget or args.hosted_after is not None:
+        bursts["hosted"] = {"budget": budget}
+        if args.hosted_after is not None:
+            bursts["hosted"]["after_s"] = args.hosted_after
+    budget = {k: v for k, v in (("per_day", args.rent_per_day), ("per_month", args.rent_per_month)) if v is not None}
+    if budget or args.rent_after is not None or args.rent_max_hosts is not None:
+        bursts["rented"] = {"budget": budget}
+        if args.rent_max_hosts is not None:
+            bursts["rented"]["max_hosts"] = args.rent_max_hosts
+        if args.rent_after is not None:
+            bursts["rented"]["after_min"] = args.rent_after
+    return bursts or None
+
+
 def _workload(args: argparse.Namespace) -> int:
     name = args.name
+    if args.action == "policy":
+        if not name:
+            print("name the workload", file=sys.stderr)
+            return 2
+        given = _hosted_policy(args) or {}
+        if not given and not args.no_hosted and not args.no_rented:
+            print("give --hosted-per-day/--hosted-per-month (and --hosted-after, --hosted-per-request), "
+                  "--rent-max-hosts with --rent-per-day/--rent-per-month (and --rent-after), "
+                  "--no-hosted or --no-rented", file=sys.stderr)
+            return 2
+        # The policy sent replaces the one it has: a burst the flags do not name is kept as it is.
+        status, current = _control_json(args, "GET", f"/pool/workloads/{name}")
+        if status != 200:
+            print(current.get("detail") or json.dumps(current), file=sys.stderr)
+            return 1
+        bursts = {**((current.get("workload") or {}).get("policy") or {}), **given}
+        for kind, dropped in (("hosted", args.no_hosted), ("rented", args.no_rented)):
+            if dropped:
+                bursts.pop(kind, None)
+        return _control(args, "POST", f"/pool/workloads/{name}/policy", {"bursts": bursts})
     if args.action in ("plan", "create"):
         models, latencies, parallels = args.model or [], args.latency or [], args.parallel or []
         if not name or not models or args.hours is None or not (len(models) == len(latencies) == len(parallels)):
@@ -408,6 +447,9 @@ def _workload(args: argparse.Namespace) -> int:
             return 2
         body = {"name": name, "hours": args.hours, "max_spend": args.max_spend, "profile": args.profile,
                 "kind": args.kind, "placement": args.placement}
+        bursts = _hosted_policy(args)
+        if bursts is not None:
+            body["bursts"] = bursts
         if len(models) == 1:
             body.update({"model": models[0], "latency_s": latencies[0], "parallel": parallels[0]})
         else:
@@ -473,7 +515,8 @@ def _provisioner(args: argparse.Namespace) -> int:
                 "max_spend": args.max_spend, "max_spend_per_day": args.max_spend_per_day, "max_hours": args.max_hours,
                 "kinds": args.kinds.split(","), "may_borrow": not args.no_borrow,
                 "idle_end_minutes": args.idle_end_minutes, "max_idle_end_minutes": args.max_idle_end_minutes,
-                "certs": args.certs, "expires_hours": args.expires_hours}
+                "certs": args.certs, "expires_hours": args.expires_hours,
+                "hosted_per_day": args.hosted_per_day, "hosted_per_month": args.hosted_per_month}
         status, answer = _control_json(args, "POST", "/pool/provisioners", body)
         if status != 201:
             print(answer.get("detail") or json.dumps(answer), file=sys.stderr)
@@ -673,7 +716,7 @@ def main(argv: list[str] | None = None) -> int:
     workload = subparsers.add_parser(
         "workload", help="create, watch and end a workload: a model, a latency, a parallelism and a duration (D115)"
     )
-    workload.add_argument("action", choices=["plan", "create", "list", "show", "extend", "end", "rotate-key"])
+    workload.add_argument("action", choices=["plan", "create", "list", "show", "extend", "end", "rotate-key", "policy"])
     workload.add_argument("name", nargs="?", default=None)
     # Repeated in step for several models (D118): --model a --latency 20 --parallel 8 --model b ...
     workload.add_argument("--model", action="append", default=None, help="a model it serves; repeat for several")
@@ -690,6 +733,20 @@ def main(argv: list[str] | None = None) -> int:
     workload.add_argument("--kind", choices=["roi", "on_demand", "interruptible"], default="roi")
     workload.add_argument("--confirm", type=float, default=None, help="for extend: the raised budget typed again")
     workload.add_argument("--confirm-hours", type=float, default=None, help="for extend: the hours added, typed again")
+    # Its hosted burst (D165): requests that wait this long for a machine go to a hosted API.
+    workload.add_argument("--hosted-after", type=float, default=None,
+                          help="seconds a request waits for a machine before a hosted API (default 5)")
+    workload.add_argument("--hosted-per-day", type=float, default=None, help="hosted dollars a UTC day")
+    workload.add_argument("--hosted-per-month", type=float, default=None, help="hosted dollars a UTC month")
+    workload.add_argument("--hosted-per-request", type=float, default=None, help="the most one hosted answer may cost")
+    workload.add_argument("--no-hosted", action="store_true", help="for policy: take its hosted burst away")
+    # Its rented burst (D165): hosts beyond its base once a burst has lasted, paid from its lease.
+    workload.add_argument("--rent-after", type=float, default=None,
+                          help="minutes a burst lasts before hosts beyond the base are rented (default 10)")
+    workload.add_argument("--rent-max-hosts", type=int, default=None, help="the most hosts beyond its base, per group")
+    workload.add_argument("--rent-per-day", type=float, default=None, help="dollars its burst hosts may cost a UTC day")
+    workload.add_argument("--rent-per-month", type=float, default=None, help="dollars its burst hosts may cost a UTC month")
+    workload.add_argument("--no-rented", action="store_true", help="for policy: take its rented burst away")
     workload.add_argument("--url", default=None)
     workload.set_defaults(func=_workload)
 
@@ -709,6 +766,10 @@ def main(argv: list[str] | None = None) -> int:
     provisioner.add_argument("--max-idle-end-minutes", type=float, default=120.0)
     provisioner.add_argument("--certs", choices=["optional", "required"], default="optional")
     provisioner.add_argument("--expires-hours", type=float, default=None)
+    provisioner.add_argument("--hosted-per-day", type=float, default=0.0,
+                             help="hosted-API dollars its workloads may commit a day, together (0: none)")
+    provisioner.add_argument("--hosted-per-month", type=float, default=None,
+                             help="hosted-API dollars its workloads may commit a month, together")
     provisioner.add_argument("--end-workloads", action="store_true", help="for revoke: end the workloads it made")
     provisioner.add_argument("--url", default=None)
     provisioner.set_defaults(func=_provisioner)
@@ -734,7 +795,8 @@ def main(argv: list[str] | None = None) -> int:
     host_test.set_defaults(func=_host_test)
 
     host = subparsers.add_parser("host", help="prepare, drain, release or park a rented host")
-    host.add_argument("action", choices=["prepare", "drain", "release", "park", "delete-model", "restart-engine", "resize", "show"])
+    host.add_argument("action", choices=["prepare", "drain", "release", "park", "delete-model", "restart-engine", "resize",
+                                         "show", "funds-restored"])
     host.add_argument("--apply-settings", action="store_true",
                       help="restart-engine: first write the parallelism and models-held the pool needs")
     host.add_argument("--tag", default=None, help="delete-model: the model tag to delete from the host's disk")
@@ -771,6 +833,10 @@ def main(argv: list[str] | None = None) -> int:
     market.add_argument("--hours", type=float, default=4.0)
     market.add_argument("--url", default=None)
     market.set_defaults(func=lambda a: _control(a, "GET", f"/pool/market/preview?hours={a.hours}&search=true"))
+
+    spending = subparsers.add_parser("spending", help="what hosted APIs and rented bursts cost, today and this month")
+    spending.add_argument("--url", default=None)
+    spending.set_defaults(func=lambda a: _control(a, "GET", "/pool/spending"))
 
     account = subparsers.add_parser("account", help="is the provider credential valid; spends nothing")
     account.add_argument("--url", default=None)

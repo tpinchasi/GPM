@@ -38,6 +38,10 @@ class Grant:
     max_idle_end_minutes: float = 120.0
     #: "optional" or "required": whether its workloads must be reached with a client certificate.
     certs: str = "optional"
+    #: Hosted-API dollars its workloads may commit together (D165): the sum of their hosted
+    #: budgets' days, and of their months. 0 a day: none of its workloads reaches a hosted API.
+    hosted_per_day: float = 0.0
+    hosted_per_month: Optional[float] = None
 
     def as_dict(self) -> dict[str, Any]:
         record = dataclasses.asdict(self)

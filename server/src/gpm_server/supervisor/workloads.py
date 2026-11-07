@@ -33,6 +33,54 @@ class WorkloadRefused(Exception):
     """A workload that cannot be created, extended or ended as asked — said in words."""
 
 
+def parse_policy(body: dict) -> dict[str, Any]:
+    """The spending policy a create or a change carries (D165), checked — `{}` where it carries
+    none: `bursts.hosted` and `bursts.rented`. A workload's steady capacity is its `parallel` at
+    its `latency_s`, as it always was, so `steady` is refused in words rather than accepted and
+    ignored."""
+    from pydantic import ValidationError
+
+    from ..config import HostedBurst, RentedBurst
+
+    if "steady" in body:
+        raise WorkloadRefused("a workload's steady capacity is its parallel at its latency_s: send those, and "
+                              "the pool works out the hosts that meet them")
+    bursts = body.get("bursts")
+    if bursts is None:
+        return {}
+    if not isinstance(bursts, dict):
+        raise WorkloadRefused("bursts is an object: {\"hosted\": {...}, \"rented\": {...}}")
+    unknown = sorted(set(bursts) - {"hosted", "rented"})
+    if unknown:
+        raise WorkloadRefused(f"bursts are hosted and rented, not {unknown}")
+    policy: dict[str, Any] = {}
+    for name, model in (("hosted", HostedBurst), ("rented", RentedBurst)):
+        raw = bursts.get(name)
+        if raw is None:
+            continue
+        try:
+            burst = model.model_validate(raw)
+        except ValidationError as exc:
+            first = exc.errors()[0]
+            where = ".".join(str(part) for part in first.get("loc", ()))
+            message = str(first.get("msg")).removeprefix("Value error, ")
+            raise WorkloadRefused(f"bursts.{name}{'.' + where if where else ''}: {message}") from None
+        policy[name] = burst.model_dump(exclude_none=True)
+    return policy
+
+
+def describe_policy(policy: dict[str, Any]) -> str:
+    """A policy in words, for the event log."""
+    said = []
+    hosted, rented = policy.get("hosted"), policy.get("rented")
+    if hosted:
+        said.append(f"hosted APIs after {hosted['after_s']:g}s, within {hosted['budget']}")
+    if rented:
+        said.append(f"up to {rented['max_hosts']} more host(s) once a burst has lasted {rented['after_min']:g} min, "
+                    f"within {rented['budget']}")
+    return "; ".join(said) or "no bursts"
+
+
 @dataclasses.dataclass(frozen=True)
 class WorkloadRequest:
     name: str
@@ -48,6 +96,9 @@ class WorkloadRequest:
     targets: tuple[ModelTarget, ...] = ()
     #: auto (the cheaper), together (every host holds every model) or apart (a group per model).
     placement: str = "auto"
+    #: Its spending policy (D165), as `parse_policy` returns it: a rented burst is paid from the
+    #: same lease, so the budget a plan derives carries it.
+    policy: Optional[dict] = None
 
     @classmethod
     def of(cls, name: str, targets: Sequence[ModelTarget], hours: float, **rest: Any) -> "WorkloadRequest":
@@ -69,6 +120,15 @@ class WorkloadRequest:
     @property
     def total_parallel(self) -> int:
         return sum(t.parallel for t in self.all_targets)
+
+    @property
+    def on_machines(self) -> tuple[ModelTarget, ...]:
+        """Its models that run on machines; the rest are served by hosted APIs alone (D165)."""
+        return tuple(t for t in self.all_targets if t.on_machines)
+
+    @property
+    def hosted_alone(self) -> tuple[str, ...]:
+        return tuple(t.model for t in self.all_targets if not t.on_machines)
 
 
 KINDS = ("roi", "on_demand", "interruptible")
@@ -113,8 +173,17 @@ def parse_targets(body: dict) -> tuple[list[ModelTarget], str]:
         model = entry.get("model")
         if not isinstance(model, str) or not model.strip():
             raise WorkloadRefused("each model is named: model is required")
-        if entry.get("latency_s") is None or entry.get("parallel") is None:
-            raise WorkloadRefused(f"{model}: latency_s and parallel are required")
+        if entry.get("parallel") is None:
+            raise WorkloadRefused(f"{model}: parallel is required — 0 for a model served by hosted APIs alone")
+        if entry["parallel"] == 0 and not isinstance(entry["parallel"], bool):
+            # Served by hosted APIs alone (D165): no machine, so no latency a machine is sized for.
+            latency = entry.get("latency_s")
+            if latency not in (None, 0):
+                _finite(latency, f"{model}: latency_s")
+            targets.append(ModelTarget(model.strip(), float(latency or 0.0), 0))
+            continue
+        if entry.get("latency_s") is None:
+            raise WorkloadRefused(f"{model}: latency_s is required where parallel is above 0")
         targets.append(ModelTarget(model.strip(), _finite(entry["latency_s"], f"{model}: latency_s"),
                                    _whole(entry["parallel"], f"{model}: parallel")))
     return targets, placement
@@ -182,8 +251,9 @@ class Workloads:
         return builds, 1
 
     def _check_request(self, req: WorkloadRequest) -> None:
-        if self.fleet is None or self.config.rented is None:
-            raise WorkloadRefused("this pool has no rented capacity: a workload rents its own hosts")
+        if req.on_machines and (self.fleet is None or self.config.rented is None):
+            raise WorkloadRefused("this pool has no rented capacity: a workload rents its own hosts — "
+                                  "parallel 0 serves a model by hosted APIs alone")
         if not math_.valid_name(req.name):
             raise WorkloadRefused("a workload's name is lower-case letters, digits and '-', up to 40, starting with a letter or digit")
         existing = self.store.get(req.name)
@@ -202,16 +272,24 @@ class Workloads:
         if len({t.model for t in targets}) != len(targets):
             raise WorkloadRefused("each model is named once")
         for t in targets:
-            if not isinstance(t.parallel, int) or isinstance(t.parallel, bool) or t.parallel < 1:
-                raise WorkloadRefused(f"{t.model}: parallel is how many answers at once: at least 1")
+            if not isinstance(t.parallel, int) or isinstance(t.parallel, bool) or t.parallel < 0:
+                raise WorkloadRefused(f"{t.model}: parallel is how many answers at once on machines: 0 or more")
             if t.parallel > MAX_PARALLEL:
                 raise WorkloadRefused(f"{t.model}: parallel is at most {MAX_PARALLEL}")
-            if not (isinstance(t.latency_s, (int, float)) and math.isfinite(t.latency_s) and t.latency_s > 0):
+            if t.parallel and self.config.hosted_only(t.model):
+                raise WorkloadRefused(
+                    f"{t.model!r} has no build a machine runs: it is served by hosted APIs alone — send parallel 0, "
+                    "with a hosted burst")
+            if t.parallel and not (isinstance(t.latency_s, (int, float)) and math.isfinite(t.latency_s)
+                                   and t.latency_s > 0):
                 raise WorkloadRefused(f"{t.model}: the latency target must be above zero seconds")
         if not (math.isfinite(req.hours) and req.hours > 0):
             raise WorkloadRefused("hours must be above zero")
         if req.max_spend is not None and not (math.isfinite(req.max_spend) and req.max_spend > 0):
             raise WorkloadRefused("a dollar cap must be above zero")
+        if not req.on_machines and req.max_spend is not None:
+            raise WorkloadRefused("it rents no machine — every model is served by hosted APIs alone — so it has "
+                                  "no max_spend: its hosted burst's budget is what it spends")
 
     def _reserved_hosts(self) -> int:
         """Hosts other workloads still mean to rent: their start, less what they have — per group
@@ -230,7 +308,45 @@ class Workloads:
         """Everything creating it would do, and nothing else: nothing is opened or rented.
 
         With several models, both placements are priced from one market search — every host
-        holding every model, and a group of hosts per model — and the cheaper kept (D118)."""
+        holding every model, and a group of hosts per model — and the cheaper kept (D118). Its
+        models served by hosted APIs alone (D165) take no part in that: they have no hosts."""
+        self._check_request(req)
+        # What creating it would refuse, the plan says: a policy its models cannot be served under.
+        self.check_policy(req.all_targets, req.policy or {})
+        if not req.on_machines:
+            return self._plan_without_machines(req)
+        if req.hosted_alone:
+            machines = WorkloadRequest.of(
+                req.name, req.on_machines, req.hours, max_spend=req.max_spend, profile=req.profile, kind=req.kind,
+                placement=req.placement, policy=req.policy)
+            plan = await self._plan_machines(machines)
+            plan["models"] = [t.as_dict() for t in req.all_targets]
+            plan["hosted_alone"] = list(req.hosted_alone)
+            plan["reasons"].append(f"served by hosted APIs alone, no machine: {', '.join(req.hosted_alone)}")
+            return plan
+        return await self._plan_machines(req)
+
+    def _plan_without_machines(self, req: WorkloadRequest) -> dict[str, Any]:
+        """A workload whose every model is served by hosted APIs alone (D165): nothing to search
+        for, size or rent, no budget but its hosted burst's, and serving from the start."""
+        first = req.all_targets[0]
+        open_now = [w for w in self.store.active() if w.state in ("preparing", "serving")]
+        most = self.config.workloads.max_open
+        return {
+            "name": req.name, "model": first.model, "build": None, "cards_per_copy": 1,
+            "latency_s": first.latency_s, "parallel": 0, "hours": req.hours, "kind": req.kind,
+            "models": [t.as_dict() for t in req.all_targets], "builds": {}, "placement": "none", "groups": [],
+            "hosted_alone": list(req.hosted_alone), "offers_seen": 0, "offers_passed": 0,
+            "workers_per_host": 0, "workers_measured": False, "sizing": [], "hosts_at_start": 0,
+            "first_host": None, "minutes_to_serve": 0, "max_spend": 0.0, "budget_derived": False,
+            "derived_budget": 0.0, "hourly_total": 0.0, "borrow_while_starting": False, "borrow_by_model": {},
+            "reasons": ["served by hosted APIs alone: nothing is rented, and it serves from the start, "
+                        "paid from its hosted burst's budget"],
+            "refused": (f"{len(open_now)} workloads are running, at the pool's limit of {most}"
+                        if len(open_now) >= most else None),
+        }
+
+    async def _plan_machines(self, req: WorkloadRequest) -> dict[str, Any]:
         self._check_request(req)
         targets = req.all_targets
         builds, cards = self._build(req)
@@ -278,9 +394,18 @@ class Workloads:
             options["apart"] = self._price(req, sketch, [(m,) for m in models], offers, builds, cards)
         # The pool's caps are judged per placement, before one is chosen: `auto` must not pick the
         # cheaper and then be refused, when the other would have passed (the review's finding).
+        burst = self._rented_burst(req)
         for option in options.values():
             if option.get("refused") is None:
                 option["derived"] = math_.derived_budget(1, req.hours, option["hourly"])
+                if burst is not None:
+                    # A rented burst is paid from the same lease (D165): the most its hosts could
+                    # cost over the hours — each group's at its first host's price, the whole
+                    # time — or its budget over every day and month the hours touch, if less.
+                    most_hourly = sum(burst.max_hosts * g["first_host"]["hourly"] for g in option["groups"])
+                    option["burst_money"] = min(math_.derived_budget(1, req.hours, most_hourly),
+                                                math.ceil(burst.budget.most_over(now, req.hours) * 100) / 100)
+                    option["derived"] = round(option["derived"] + option["burst_money"], 2)
                 budget_here = req.max_spend if req.max_spend is not None else option["derived"]
                 option["cap_refused"] = self._cap_refusal(option["hosts"], option["hourly"] / max(1, option["hosts"]),
                                                           budget_here, req.hours)
@@ -338,6 +463,12 @@ class Workloads:
             "budget_derived": req.max_spend is None,
             "derived_budget": derived,
         })
+        if burst is not None:
+            plan["rented_burst"] = {**burst.model_dump(exclude_none=True), "in_the_budget": option["burst_money"]}
+            plan["reasons"].append(
+                f"a rented burst: up to {burst.max_hosts} more host(s) per group once a burst has lasted "
+                f"{burst.after_min:g} min, within {burst.budget.model_dump(exclude_none=True)}; "
+                f"${option['burst_money']:.2f} of it is in the derived budget, paid from the same lease")
         for model in models:
             entry = self.config.catalog.get(model)
             if (self.config.pool.models_per_host == "all" and not self.config.rented.rent_profiles
@@ -471,6 +602,13 @@ class Workloads:
             "offers_passed": min(g["offers_passed"] for g in groups),
         }
 
+    @staticmethod
+    def _rented_burst(req: WorkloadRequest) -> Any:
+        from ..config import RentedBurst
+
+        raw = (req.policy or {}).get("rented")
+        return RentedBurst.model_validate(raw) if raw else None
+
     def _shared_serves(self, model: str) -> bool:
         """Can a starting workload borrow for this model: does a ready shared host serve it?"""
         if self.config.workloads.borrow_share <= 0:
@@ -537,16 +675,20 @@ class Workloads:
         self, req: WorkloadRequest, confirm_max_spend: Optional[float] = None, *,
         key_hash: Optional[str] = None, provisioner: Optional[str] = None,
         idle_end_minutes: Optional[float] = None, may_borrow: bool = True,
-        csr: Optional[str] = None, ca: Any = None,
+        csr: Optional[str] = None, ca: Any = None, policy: Optional[dict[str, Any]] = None,
     ) -> tuple[Workload, Optional[str], dict, Optional[str]]:
         """Create it: (the workload, its key — None where the program made its own and sent only
         the hash —, the plan, a signed client certificate where a signing request came)."""
+        if policy is None:
+            policy = req.policy
+        req = dataclasses.replace(req, policy=policy)
         async with self._creating:
             # Planned inside the lock, so its name check and its caps see every workload created
             # before it — including one whose plan was awaiting the market a moment ago.
             plan = await self.plan(req)
             if plan["refused"]:
                 raise WorkloadRefused(plan["refused"])
+            self.check_policy(req.all_targets, policy or {})
             budget = plan["max_spend"]
             if provisioner is not None and plan["budget_derived"]:
                 raise WorkloadRefused("a program must say what it will spend: send max_spend")
@@ -572,13 +714,17 @@ class Workloads:
                 models=tuple(g["models"]), builds=dict(g["builds"]), hosts_at_start=int(g["hosts_at_start"]),
                 workers_per_host=int(g["workers_per_host"]), caps=dict(g["caps"]), cards_per_copy=int(g["cards_per_copy"]),
             ) for g in plan["groups"])
+            machines = req.on_machines
             workload = Workload(
-                name=req.name, model=targets[0].model, builds=dict(plan["builds"]), latency_s=min(t.latency_s for t in targets),
-                parallel=req.total_parallel, kind=req.kind, lease_id=lease_id, state="preparing",
+                name=req.name, model=targets[0].model, builds=dict(plan["builds"]),
+                latency_s=min(t.latency_s for t in (machines or targets)),
+                # With no machine there is nothing to prepare: it serves from the start (D165).
+                parallel=req.total_parallel, kind=req.kind, lease_id=lease_id,
+                state="preparing" if machines else "serving",
                 workers_per_host=plan["workers_per_host"], hosts_at_start=plan["hosts_at_start"], plan=plan,
                 created_at=now, updated_at=now, ends_at=now + req.hours * 3600,
                 provisioner=provisioner, idle_end_minutes=idle_end_minutes,
-                targets=targets, placement=plan["placement"], groups=groups,
+                targets=targets, placement=plan["placement"], groups=groups, policy=dict(policy or {}),
             )
             # The row first: a name taken meanwhile fails here, before any spending authority
             # exists. The lease second, under the id the row already names.
@@ -587,12 +733,20 @@ class Workloads:
             except Exception as exc:  # noqa: BLE001 - a unique name, lost to another creation
                 raise WorkloadRefused(f"workload {req.name!r} could not be recorded: {exc}") from exc
             try:
-                # Through the fleet: a lease longer than the dead-man timer covers is refused there.
-                # Its workers are every model's answers at once: the lease bounds its groups together.
-                lease = self.fleet.open_lease(
-                    workers=req.total_parallel, max_hours=req.hours, max_spend=budget, allow_rent=True,
-                    workload=req.name, lease_id=lease_id,
-                )
+                if machines:
+                    # Through the fleet: a lease longer than the dead-man timer covers is refused there.
+                    # Its workers are every model's answers at once: the lease bounds its groups together.
+                    lease = self.fleet.open_lease(
+                        workers=req.total_parallel, max_hours=req.hours, max_spend=budget, allow_rent=True,
+                        workload=req.name, lease_id=lease_id,
+                    )
+                else:
+                    # Nothing to rent: a lease that cannot rent, for its hours alone — its key's life,
+                    # its end. Its spending is its hosted burst's budget (D165).
+                    lease = self.supervisor.leases.open(
+                        workers=0, max_hours=req.hours, max_spend=None, allow_rent=False,
+                        workload=req.name, lease_id=lease_id,
+                    )
             except LeaseRefused as exc:
                 self.store.set_state(req.name, "ended")
                 raise WorkloadRefused(str(exc)) from exc
@@ -616,10 +770,11 @@ class Workloads:
         self.supervisor.events.record(
             "workload_created",
             f"workload {req.name}: "
-            + "; ".join(f"{t.model} at {t.parallel} at once, {t.latency_s:g}s p95" for t in req.all_targets)
-            + f", for {req.hours:g}h — {plan['hosts_at_start']} host(s)"
-            + (f" placed {plan['placement']}" if len(req.all_targets) > 1 else f" at {plan['workers_per_host']} each")
-            + f", up to ${budget:.2f}",
+            + "; ".join([f"{t.model} at {t.parallel} at once, {t.latency_s:g}s p95" for t in req.on_machines]
+                        + ([f"{', '.join(req.hosted_alone)} by hosted APIs alone"] if req.hosted_alone else []))
+            + (f", for {req.hours:g}h — {plan['hosts_at_start']} host(s)"
+               + (f" placed {plan['placement']}" if len(req.on_machines) > 1 else f" at {plan['workers_per_host']} each")
+               + f", up to ${budget:.2f}" if req.on_machines else f", for {req.hours:g}h — no machine"),
             numbers={"workload": req.name, "key_id": key_id, "plan": plan, "provisioner": provisioner},
             lease_id=lease.lease_id,
         )
@@ -687,6 +842,63 @@ class Workloads:
         self._ending(workload, reason)
         return self.get(name)
 
+    # --- its spending policy (D165) ---
+
+    def check_policy(self, targets: Sequence[ModelTarget], policy: dict[str, Any]) -> None:
+        """A policy the workload's models can be served under (D165):
+
+        - a hosted burst, where some hosted API this pool has serves one of its models — else
+          it would be a budget nothing could spend, and the app would wait for a spill that never
+          comes;
+        - a model served by hosted APIs alone needs a hosted burst, and a hosted API serving it:
+          it has nothing else;
+        - a rented burst needs a model that runs on machines: it adds hosts beyond their base."""
+        models = [t.model for t in targets]
+        alone = [t.model for t in targets if not t.on_machines]
+        hosted = [h for h in self.config.hosts if h.kind == "hosted" and not h.disabled]
+        served = {m for h in hosted for m in self.config.models_held_by(h)}
+        if alone and not policy.get("hosted"):
+            raise WorkloadRefused(
+                ", ".join(repr(m) for m in alone) + " is served by hosted APIs alone (parallel 0), so it needs a "
+                "hosted burst: bursts.hosted with a budget")
+        unserved = [m for m in alone if m not in served]
+        if unserved:
+            raise WorkloadRefused("no hosted API in this pool serves " + ", ".join(repr(m) for m in unserved)
+                                  + ", and parallel 0 has nothing else to serve it")
+        if policy.get("rented") and not any(t.on_machines for t in targets):
+            raise WorkloadRefused("a rented burst adds hosts beyond a base on machines, and none of its models runs "
+                                  "on one (every parallel is 0)")
+        if policy.get("hosted") and not any(m in served for m in models):
+            raise WorkloadRefused(
+                "no hosted API in this pool serves " + ", ".join(repr(m) for m in models)
+                + "; a hosted burst would have nothing to spend on"
+            )
+
+    def set_policy(self, name: str, policy: dict[str, Any], by: str = "the operator") -> Workload:
+        """Replace a running workload's spending policy. Takes effect at the router's next look at
+        the workload table; what it already spent today and this month still counts."""
+        workload = self.get(name)
+        if workload.state not in ("preparing", "serving"):
+            raise WorkloadRefused(f"workload {name!r} is {workload.state}; its policy can no longer change")
+        self.check_policy(workload.targets, policy)
+        self.store.set_policy(name, policy)
+        self.supervisor.events.record(
+            "workload_policy",
+            f"workload {name}: {describe_policy(policy)} (set by {by})",
+            numbers={"workload": name, "policy": policy, "by": by}, lease_id=workload.lease_id,
+        )
+        return self.get(name)
+
+    def hosted_spend(self, name: str) -> dict[str, float]:
+        """What the workload spent on hosted APIs today and this month (UTC)."""
+        from ..db import RequestLog
+        from ..router.budgets import period_starts
+
+        day, month = period_starts()
+        log = RequestLog(self.supervisor.db)
+        return {"today": round(log.hosted_spend_of([name], day), 6),
+                "this_month": round(log.hosted_spend_of([name], month), 6)}
+
     def rotate_key(self, name: str) -> tuple[str, str]:
         workload = self.get(name)
         if workload.state not in ("preparing", "serving"):
@@ -751,6 +963,12 @@ class Workloads:
         for workload in self.store.active():
             lease = self.supervisor.leases.get(workload.lease_id)
             hosts = self.fleet.hosts_of(workload.name) if self.fleet is not None else []
+            if (not workload.on_machines and workload.state in ("preparing", "serving") and lease is not None
+                    and lease.is_open and lease.expired()):
+                # Its lease rents nothing, so the fleet's pass never looks at it — and a pool
+                # serving by hosted APIs alone may have no fleet at all. Its hours end here.
+                self.supervisor.leases.close(lease.lease_id, "time limit reached")
+                lease = self.supervisor.leases.get(workload.lease_id)
             if workload.state in ("preparing", "serving") and (lease is None or not lease.is_open):
                 self._ending(workload, f"its lease closed ({lease.closed_reason if lease else 'gone'})")
                 continue
@@ -799,6 +1017,11 @@ class Workloads:
         by_model = {}
         for target in workload.targets:
             # Each model's own window: a busy model must not crowd a quiet one out of the answers.
+            if not target.on_machines:
+                # Served by hosted APIs alone (D165): no latency target to meet.
+                by_model[target.model] = {"count": None, "latency_s": None, "parallel": 0, "p95_s": None,
+                                          "meets_target": None, "cap_per_host": None, "hosted_alone": True}
+                continue
             mine = [r["latency_ms"] / 1000 for r in self.supervisor.db.query(
                 "SELECT latency_ms FROM request_log WHERE workload = ? AND model_requested = ? AND outcome = 'ok' "
                 "AND latency_ms IS NOT NULL ORDER BY id DESC LIMIT 2000", (workload.name, target.model))] if several \
@@ -813,11 +1036,18 @@ class Workloads:
         borrowing_models = [
             m for m in workload.models
             if workload.state == "preparing" and (workload.plan or {}).get("may_borrow", True)
+            and not workload.hosted_alone(m)
             and m not in ready_models and self._shared_serves(m)
         ]
         return {
             **{k: v for k, v in workload.as_dict().items() if k != "plan"},
             "plan": workload.plan,
+            # What its hosted burst has spent, against its policy's budget (D165).
+            "hosted_spend": self.hosted_spend(workload.name) if workload.policy.get("hosted") else None,
+            # What its rented burst's hosts cost, today and this month, and how many it holds (D165).
+            "rented_burst": ({**{k: round(v, 4) for k, v in self.fleet.burst_spent(workload.lease_id).items()},
+                              "hosts": len([h for h in hosts if h.burst])}
+                             if workload.policy.get("rented") and self.fleet is not None else None),
             # While it starts: are its requests served on shared hosts, or refused until then?
             # Per model (D118): borrowing while none of its own hosts holding it is ready.
             "borrowing_models": borrowing_models,
@@ -828,6 +1058,7 @@ class Workloads:
                  "priced": ("bid" if h.offer.bidding else "spot") if h.interruptible else "on_demand",
                  "connection": h.connection_name,
                  "models": list(h.models),
+                 "burst": h.burst,
                  # Where its models came from: its workload's model volume, a sibling, the hub (D139).
                  "models_source": h.models_source}
                 for h in hosts
@@ -854,7 +1085,8 @@ class Workloads:
                 "meets_target": (
                     all(m["meets_target"] for m in by_model.values() if m["meets_target"] is not None)
                     if any(m["meets_target"] is not None for m in by_model.values()) else None
-                ) if several else ((math_.p95(latencies) <= workload.latency_s) if latencies else None),
+                ) if several else ((math_.p95(latencies) <= workload.latency_s)
+                                   if latencies and workload.on_machines else None),
                 "refused": int(refused),
                 "borrowed": int(borrowed),
                 "by_model": by_model,

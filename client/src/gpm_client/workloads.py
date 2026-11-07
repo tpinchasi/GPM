@@ -85,6 +85,22 @@ class Workload:
     def state(self) -> dict:
         return self._provisioner._get(f"/pool/provisioning/workloads/{self.name}")
 
+    def hosted_budget(self) -> Optional[dict]:
+        """Its hosted budget and what is left of it today and this month (UTC), or None where it
+        has no hosted burst (D165)."""
+        return (self.state().get("budgets") or {}).get("hosted")
+
+    def set_bursts(self, bursts: Mapping[str, Any], timeout_s: float = 120.0) -> dict:
+        """Change its spending policy while it runs (D165): `{"hosted": {"after_s": 5,
+        "budget": {"per_day": 20}}, "rented": {...}}`, or `{}` for no bursts at all. The policy
+        sent replaces the one it had: name every burst it should keep. Checked against the
+        provisioning key's grant; what it already spent today and this month still counts. A
+        rented burst is paid from the workload's own `max_spend`, which this does not raise."""
+        answer = self._provisioner._ask({"bursts": dict(bursts)}, timeout_s,
+                                        path=f"/pool/provisioning/workloads/{self.name}/policy")
+        self.answer = {**self.answer, "policy": answer.get("policy")}
+        return answer.get("policy") or {}
+
     def wait_until_serving(self, timeout_s: float = 1800.0, poll_s: float = 5.0) -> None:
         """Until it is serving: a host of its own ready for every model it serves (D118).
         Meanwhile a model may already be served on shared hosts, where the pool lets it borrow."""
@@ -169,9 +185,9 @@ class WorkloadProvisioner:
                 raise PoolError(f"the pool could not be asked within the time allowed ({self.base_url})")
             time.sleep(self._poll_s)
 
-    def _ask(self, body: dict, timeout_s: float) -> dict:
+    def _ask(self, body: dict, timeout_s: float, path: str = "/pool/provisioning/requests") -> dict:
         deadline = time.monotonic() + timeout_s
-        request_id = self._until(deadline, lambda: self._post("/pool/provisioning/requests", body))["request_id"]
+        request_id = self._until(deadline, lambda: self._post(path, body))["request_id"]
         while True:
             answered = self._until(deadline, lambda: self._get(f"/pool/provisioning/requests/{request_id}"))
             if answered["state"] == "refused":
@@ -185,30 +201,43 @@ class WorkloadProvisioner:
 
     @staticmethod
     def _body(model: Optional[str], latency_s: Optional[float], parallel: Optional[int], hours: float,
-              max_spend: float, machines: str, idle_end_minutes: Optional[float],
-              models: Optional[Mapping[str, Mapping[str, Any]]] = None, placement: str = "auto") -> dict:
+              max_spend: Optional[float], machines: str, idle_end_minutes: Optional[float],
+              models: Optional[Mapping[str, Mapping[str, Any]]] = None, placement: str = "auto",
+              bursts: Optional[Mapping[str, Any]] = None) -> dict:
         """One model — `model`, `latency_s`, `parallel` — or several, each with its own target:
-        `models={"chat": {"latency_s": 20, "parallel": 16}, "embed": {...}}` (D118)."""
+        `models={"chat": {"latency_s": 20, "parallel": 16}, "embed": {...}}` (D118). `parallel`
+        0 is a model served by hosted APIs alone, which needs no `latency_s` (D165)."""
         if (model is None) == (models is None):
             raise ValueError("name one model, or several with models= — not both, not neither")
+
+        def target(name: str, latency: Any, answers: Any) -> dict[str, Any]:
+            if answers is None or (latency is None and answers != 0):
+                raise ValueError(f"{name!r} needs parallel, and latency_s unless parallel is 0 (hosted APIs alone)")
+            entry: dict[str, Any] = {"model": name, "parallel": answers}
+            if latency is not None:
+                entry["latency_s"] = latency
+            return entry
+
         if models is not None:
             listed = []
-            for name, target in models.items():
-                if not isinstance(target, Mapping) or "latency_s" not in target or "parallel" not in target:
-                    raise ValueError(f"models[{name!r}] needs latency_s and parallel")
-                listed.append({"model": name, "latency_s": target["latency_s"], "parallel": target["parallel"]})
+            for name, wanted in models.items():
+                if not isinstance(wanted, Mapping):
+                    raise ValueError(f"models[{name!r}] is {{latency_s, parallel}}")
+                listed.append(target(name, wanted.get("latency_s"), wanted.get("parallel")))
             body: dict[str, Any] = {"models": listed, "placement": placement}
         else:
-            if latency_s is None or parallel is None:
-                raise ValueError("a model needs latency_s and parallel")
-            body = {"model": model, "latency_s": latency_s, "parallel": parallel}
-        body.update({"hours": hours, "max_spend": max_spend, "machines": machines})
+            body = target(model, latency_s, parallel)
+        body.update({"hours": hours, "machines": machines})
+        if max_spend is not None:
+            body["max_spend"] = max_spend
         if idle_end_minutes is not None:
             body["idle_end_minutes"] = idle_end_minutes
+        if bursts is not None:
+            body["bursts"] = dict(bursts)
         return body
 
     def plan_workload(self, model: Optional[str] = None, *, latency_s: Optional[float] = None,
-                      parallel: Optional[int] = None, hours: float, max_spend: float,
+                      parallel: Optional[int] = None, hours: float, max_spend: Optional[float] = None,
                       models: Optional[Mapping[str, Mapping[str, Any]]] = None, placement: str = "auto",
                       machines: str = "roi", timeout_s: float = 120.0) -> dict:
         """What creating it would do — its start, its first host, its price. Spends nothing."""
@@ -217,21 +246,35 @@ class WorkloadProvisioner:
         return self._ask(body, timeout_s)["plan"]
 
     def workload(self, model: Optional[str] = None, *, latency_s: Optional[float] = None,
-                 parallel: Optional[int] = None, hours: float, max_spend: float,
+                 parallel: Optional[int] = None, hours: float, max_spend: Optional[float] = None,
                  models: Optional[Mapping[str, Mapping[str, Any]]] = None, placement: str = "auto",
                  machines: str = "roi", idle_end_minutes: Optional[float] = None, certs: bool = False,
+                 bursts: Optional[Mapping[str, Any]] = None,
                  wait_until: str = "created", timeout_s: float = 1800.0) -> Workload:
         """Create a workload and hand back a `Workload` bound to it — a context manager that ends
         it on leaving. One model, or several with `models=` — each with its own latency target and
         answers at once, placed on the pool's hosts as it prices cheaper (D118). `wait_until` is
         "created" (return at once; it may be served on shared hosts while its own come up) or
-        "serving" (wait until every model has hosts of its own)."""
+        "serving" (wait until every model has hosts of its own).
+
+        `bursts={"hosted": {"after_s": 5, "budget": {"per_day": 20, "per_month": 300}}}` lets a
+        request that waited `after_s` for one of its machines go to a hosted API the pool has,
+        paid per token from that budget, within the key's grant (D165). Each such answer says
+        what it cost: `reply.cost_usd`. `"rented": {"after_min": 10, "max_hosts": 2, "budget":
+        {"per_day": 30}}` rents up to that many hosts beyond the ones `parallel` sizes, once its
+        load has stayed above them for `after_min` minutes, paid from `max_spend` — which must
+        hold it — within that budget; they are given up first when the load falls.
+
+        `parallel=0` serves a model by hosted APIs alone — no machine is rented or borrowed for
+        it, and it needs a hosted burst; a model no machine can run (a closed model) is always
+        asked for this way. A workload whose every model is so rents nothing: it takes no
+        `max_spend`, and serves from the start."""
         if wait_until not in ("created", "serving"):
             raise ValueError("wait_until is 'created' or 'serving'")
         key = "gpmw_" + secrets.token_hex(32)
         body = {"kind": "create", "key_hash": hashlib.sha256(key.encode()).hexdigest(),
                 **self._body(model, latency_s, parallel, hours, max_spend, machines, idle_end_minutes,
-                             models, placement)}
+                             models, placement, bursts)}
         private_pem = None
         if certs:
             private_pem, body["csr"] = _certificate_request()
