@@ -67,9 +67,14 @@ says which it is in `capabilities` (§4.4).
 
 What the router does with a provider's refusal, request by request: **busy** (429, 502, 503, 529)
 cools that host until its `retry-after` (5 s where it gives none) and the request waits for it or
-takes another worker; **out of money** takes the host out of routing in that router until it is
-restarted; anything else is the request's own, returned to the app as the provider said it and
-charged nothing.
+takes another worker; **out of money** takes the host out of routing — never retried as busy —
+until the operator says its money is back (**Money is back** on the console, `gpm host
+funds-restored <id>`, `POST /pool/hosts/{id}/funds-restored`): the router publishes what the
+provider said with its counters, the supervisor publishes the operator's word in the host table,
+and the router routes to the host again on reading a word newer than the refusal. A refusal after
+that takes it out again; a refusal is charged nothing. A router restarted forgets the mark, and
+tries the provider once more. Anything else is the request's own, returned to the app as the
+provider said it and charged nothing.
 
 ### 1.3 Transports
 

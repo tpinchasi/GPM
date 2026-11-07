@@ -79,6 +79,8 @@ const api = {
   switchEngine: (hostId, what) => call("POST", `/pool/hosts/${hostId}/engine/${what}`, { confirm: hostId }),
   deleteModel: (hostId, tag) => call("POST", `/pool/hosts/${hostId}/models/delete`, { tag, confirm: tag }),
   workloads: () => call("GET", "/pool/workloads"),
+  spending: () => call("GET", "/pool/spending"),
+  fundsRestored: (id) => call("POST", `/pool/hosts/${encodeURIComponent(id)}/funds-restored`),
   planWorkload: (body) => call("POST", "/pool/workloads/plan", body),
   createWorkload: (body) => call("POST", "/pool/workloads", body),
   extendWorkload: (name, body) => call("POST", `/pool/workloads/${encodeURIComponent(name)}/extend`, body),
@@ -507,7 +509,8 @@ screens.hosts = (status) => [
         host.engine_configured === "auto" ? autoEngineLine(host) : null,
         (host.holds || []).length ? el("div", { class: "muted" }, `holds ${host.holds.join(", ")}`) : null),
       el("td", {}, host.transport),
-      el("td", {}, pill(host.state), host.last_error ? el("div", { class: "muted" }, host.last_error) : null),
+      el("td", {}, pill(host.state), host.last_error ? el("div", { class: "muted" }, host.last_error) : null,
+        host.out_of_funds ? outOfFundsLine(host) : null),
       el("td", { class: "num" }, host.workers),
       el("td", { class: "muted" }, (host.capabilities || []).join(", ") || "—"),
       el("td", { class: "muted", title: host.residency === "on_demand"
@@ -2427,7 +2430,27 @@ function hostControls(host) {
       if (ok) await api.removeHost(host.host_id, retype.value);
     }
   }) }, "Remove…");
-  return el("div", { class: "row" }, service, remove);
+  return el("div", { class: "row" }, host.out_of_funds ? fundsRestoredButton(host.host_id) : null, service, remove);
+}
+
+// A hosted API whose provider said its money ran out is out of routing until the operator says
+// it is back (D164) — never retried as busy, which would spend every request on a refusal.
+function outOfFundsLine(host) {
+  return el("div", {}, pill("out of money", "bad"),
+    el("div", { class: "muted" }, `since ${clock(host.out_of_funds_at)} — its provider said: ${host.out_of_funds}`));
+}
+
+function fundsRestoredButton(hostId) {
+  return el("button", { class: "small", onclick: async (e) => {
+    const ok = await confirmAction({
+      title: `Route to ${hostId} again?`,
+      body: el("div", {},
+        el("p", {}, "Say this once the provider account has money again — topped up, or its limit raised at the provider."),
+        el("p", { class: "muted" }, "Requests go to it at the router's next look. If the provider still refuses for money, it is taken out again on the first such answer; nothing is charged for a refusal.")),
+      okLabel: "Its money is back",
+    });
+    if (ok) run(e.target, () => api.fundsRestored(hostId));
+  } }, "Money is back");
 }
 
 function teardownSection(market) {
@@ -4022,6 +4045,57 @@ screens.workloads = (status) => {
   programDraft.holder = el("div", { class: "programs" });
   setTimeout(() => { drawWorkloadTables(); drawWorkloadForm(); drawPrograms(); }, 0);
   return [el("h1", {}, "Workloads"), keyPanel(), holder, workloadDraft.formHolder, programDraft.holder];
+};
+
+// What hosted APIs and rented bursts have cost (D165, D166): today and this month, in UTC days
+// and months — the periods every budget is counted in — per workload and provider, against each
+// budget. Read from the request log and the spend ledger: what was charged, not an estimate.
+const spendingName = (workload) => workload === null || workload === undefined ? "shared (app keys)" : workload;
+
+function budgetCell(spent, limit) {
+  if (limit === null || limit === undefined) return el("td", { class: "num" }, money(spent));
+  const share = limit > 0 ? Math.min(1, spent / limit) : 1;
+  return el("td", { class: "num" }, `${money(spent)} of ${money(limit)}`,
+    el("div", { class: `burn ${share >= 1 ? "bad" : share >= 0.8 ? "warn" : ""}` },
+      el("div", { style: `width:${(share * 100).toFixed(1)}%` })));
+}
+
+screens.spending = async () => {
+  const s = await api.spending();
+  const out = s.providers.filter((p) => p.out_of_funds);
+  const budgetRows = [
+    ...s.hosted.budgets.map((b) => ({ ...b, kind: "hosted APIs" })),
+    ...s.rented_bursts.map((b) => ({ ...b, kind: `rented burst · ${b.hosts} of ${b.max_hosts} host(s)` })),
+  ];
+  return [
+    el("h1", {}, "Spending"),
+    el("p", { class: "muted" }, "What hosted APIs and rented bursts have cost, today and this month (UTC days and months, as every budget is counted). Hosted answers are charged from each answer's own token counts at the catalog's prices; rented bursts from the spend ledger. Rented hosts' leases are on the Leases screen."),
+    out.length ? el("div", { class: "panel" }, el("h2", {}, "Out of money"),
+      el("p", { class: "muted" }, "Their providers refused for money, so the router stopped sending to them. Top up the account at the provider, then say so here."),
+      out.map((p) => el("div", { class: "row" }, el("span", { class: "mono" }, p.host_id), pill("out of money", "bad"),
+        el("span", { class: "muted" }, `since ${clock(p.out_of_funds_at)}: ${p.out_of_funds}`), fundsRestoredButton(p.host_id)))) : null,
+    el("div", { class: "row" },
+      el("div", { class: "panel" }, el("div", { class: "muted" }, "Hosted APIs today"), el("h2", {}, money(s.hosted.today))),
+      el("div", { class: "panel" }, el("div", { class: "muted" }, "Hosted APIs this month"), el("h2", {}, money(s.hosted.this_month)))),
+    el("h2", {}, "Budgets"),
+    budgetRows.length ? el("table", {},
+      el("thead", {}, el("tr", {}, el("th", {}, "Workload"), el("th", {}, "Burst"), el("th", { class: "num" }, "Today"),
+        el("th", { class: "num" }, "This month"), el("th", { class: "num" }, "Per answer"))),
+      el("tbody", {}, budgetRows.map((b) => el("tr", {},
+        el("td", { class: "mono" }, spendingName(b.workload)), el("td", {}, b.kind),
+        budgetCell(b.today, b.per_day), budgetCell(b.this_month, b.per_month),
+        el("td", { class: "num" }, b.per_request ? money(b.per_request) : "—")))))
+      : el("p", { class: "muted" }, "No workload has a hosted or rented burst, and the shared workload has no pool.bursts.hosted."),
+    el("h2", {}, "Hosted answers by workload and provider"),
+    s.hosted.by.length ? el("table", {},
+      el("thead", {}, el("tr", {}, el("th", {}, "Workload"), el("th", {}, "Provider"), el("th", { class: "num" }, "Answers today"),
+        el("th", { class: "num" }, "Today"), el("th", { class: "num" }, "Answers this month"), el("th", { class: "num" }, "This month"))),
+      el("tbody", {}, s.hosted.by.map((r) => el("tr", {},
+        el("td", { class: "mono" }, spendingName(r.workload)), el("td", { class: "mono" }, r.provider || "—"),
+        el("td", { class: "num" }, r.answers_today), el("td", { class: "num" }, money(r.today)),
+        el("td", { class: "num" }, r.answers_this_month), el("td", { class: "num" }, money(r.this_month))))))
+      : el("p", { class: "muted" }, "No hosted API has answered this month."),
+  ];
 };
 
 screens.decisions = async () => {

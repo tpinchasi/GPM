@@ -262,8 +262,13 @@ its `latency_s` (D165 amended).
 always so for a hosted-only model — never planned, rented or borrowed for; a workload whose every
 model is so rents nothing (no `max_spend`, a lease of hours alone, serving from creation), and a
 program makes one through the SDK with no `max_spend`. Found on the way: a hosted API was counted
-as holding every build that names no engine. **Still to build in stage 3:** spend on the console,
-and an operator's reset for a provider out of money.
+as holding every build that names no engine.
+
+**Stage 3, last part built (same PR):** a **Spending** screen and `GET /pool/spending` (`gpm
+spending`) — hosted spend today and this month per workload and provider, every hosted and rented
+burst budget against its limits; a provider out of money marked on the Hosts and Spending screens
+with what it said, and **Money is back** (`gpm host funds-restored`) to route to it again (D164
+amended). Stage 3 is done.
 5. **Live, asked first:** one small chat request to each provider the owner holds a key for, a few
    cents each, with a budget of $1.
 

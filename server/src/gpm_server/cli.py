@@ -795,7 +795,8 @@ def main(argv: list[str] | None = None) -> int:
     host_test.set_defaults(func=_host_test)
 
     host = subparsers.add_parser("host", help="prepare, drain, release or park a rented host")
-    host.add_argument("action", choices=["prepare", "drain", "release", "park", "delete-model", "restart-engine", "resize", "show"])
+    host.add_argument("action", choices=["prepare", "drain", "release", "park", "delete-model", "restart-engine", "resize",
+                                         "show", "funds-restored"])
     host.add_argument("--apply-settings", action="store_true",
                       help="restart-engine: first write the parallelism and models-held the pool needs")
     host.add_argument("--tag", default=None, help="delete-model: the model tag to delete from the host's disk")
@@ -832,6 +833,10 @@ def main(argv: list[str] | None = None) -> int:
     market.add_argument("--hours", type=float, default=4.0)
     market.add_argument("--url", default=None)
     market.set_defaults(func=lambda a: _control(a, "GET", f"/pool/market/preview?hours={a.hours}&search=true"))
+
+    spending = subparsers.add_parser("spending", help="what hosted APIs and rented bursts cost, today and this month")
+    spending.add_argument("--url", default=None)
+    spending.set_defaults(func=lambda a: _control(a, "GET", "/pool/spending"))
 
     account = subparsers.add_parser("account", help="is the provider credential valid; spends nothing")
     account.add_argument("--url", default=None)

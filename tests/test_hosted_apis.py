@@ -200,6 +200,32 @@ def test_a_provider_out_of_money_is_never_retried_as_busy(monkeypatch, provider)
         assert ask(pool, "llama").headers["x-gpm-host"] == "box", "the machines carry on"
 
 
+def test_a_provider_out_of_money_is_said_and_routed_to_again_once_the_operator_says_so(monkeypatch, provider):
+    from gpm_server.db import HostCounters, HostTable
+
+    fake, url = provider
+    fake.behaviour = ["out_of_funds"]
+    with hosted_pool(monkeypatch, url) as pool:
+        pool.reprobe()
+        assert ask(pool, "claude").status_code == 503
+        pool.loop.run(pool.state.registry.publish_counters())
+        counter = HostCounters(pool.database).all()["provider"]
+        assert counter.out_of_funds and counter.out_of_funds_at, "the router says it, for the console"
+        # A reset older than the refusal changes nothing: the money ran out after it.
+        pool.database.execute("UPDATE hosts SET funds_reset_at = ?, updated_at = updated_at + 1 WHERE host_id = 'provider'",
+                              (counter.out_of_funds_at - 60,))
+        pool.loop.run(pool.state.registry.refresh())
+        assert ask(pool, "claude").status_code == 503 and len(fake.seen) == 1
+        fake.behaviour = ["ok"]
+        assert HostTable(pool.database).reset_funds("provider")
+        pool.loop.run(pool.state.registry.refresh())
+        answered = ask(pool, "claude")
+        assert answered.status_code == 200 and answered.headers["x-gpm-host"] == "provider"
+        pool.loop.run(pool.state.registry.publish_counters())
+        assert HostCounters(pool.database).all()["provider"].out_of_funds is None
+        assert not HostTable(pool.database).reset_funds("nobody")
+
+
 def test_a_request_the_provider_refuses_is_returned_as_said_and_costs_nothing(monkeypatch, provider):
     fake, url = provider
     fake.behaviour = ["refused"]

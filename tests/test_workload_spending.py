@@ -359,3 +359,58 @@ def test_the_command_line_changes_one_burst_and_keeps_the_other(programs, capsys
     assert "max_hosts" in said.out + said.err
     events = programs.supervisor.events.recent(10, kind="workload_policy")
     assert any("up to 2 more host(s) once a burst has lasted 10 min" in e["summary"] for e in events)
+
+
+# --- what the operator sees: spending, and a provider out of money ---
+
+
+def test_the_operator_reads_spending_per_workload_provider_and_burst(programs, capsys, monkeypatch):
+    from gpm_server.cli import main
+    from gpm_server.router.budgets import period_starts
+
+    policy = {**bursts(9.0), "rented": {"max_hosts": 1, "budget": {"per_day": 2.0}}}
+    created = httpx.post(f"{programs.control_url}/pool/workloads", headers={"Authorization": f"Bearer {ADMIN}"},
+                         json={"name": "night", "model": BIG, **SPEC, "bursts": policy}, timeout=60)
+    assert created.status_code == 201, created.text
+    log = RequestLog(programs.database)
+    day, _ = period_starts()
+    log._insert(RequestRecord(request_id="r-1", outcome="ok", workload="night", host_id="provider", cost_usd=0.5))
+    log._insert(RequestRecord(request_id="r-2", outcome="ok", workload="night", host_id="provider", cost_usd=0.25))
+    log._insert(RequestRecord(request_id="r-3", outcome="ok", workload=None, host_id="provider", cost_usd=0.1))
+    if day > period_starts()[1]:  # not the month's first day: an answer from earlier this month
+        log._insert(RequestRecord(request_id="r-4", outcome="ok", workload="night", host_id="provider",
+                                  cost_usd=1.0, ts=day - 60))
+    spending = httpx.get(f"{programs.control_url}/pool/spending", headers={"Authorization": f"Bearer {ADMIN}"}).json()
+    assert spending["hosted"]["today"] == pytest.approx(0.85)
+    rows = {(r["workload"], r["provider"]): r for r in spending["hosted"]["by"]}
+    assert rows[("night", "provider")]["today"] == pytest.approx(0.75) and rows[("night", "provider")]["answers_today"] == 2
+    assert rows[(None, "provider")]["today"] == pytest.approx(0.1)
+    (night,) = [b for b in spending["hosted"]["budgets"] if b["workload"] == "night"]
+    assert night["per_day"] == 9.0 and night["today"] == pytest.approx(0.75)
+    assert spending["rented_bursts"] == [{"workload": "night", "per_day": 2.0, "per_month": None, "max_hosts": 1,
+                                          "today": 0.0, "this_month": 0.0, "hosts": 0}]
+    assert spending["providers"] == [{"host_id": "provider", "state": spending["providers"][0]["state"],
+                                      "out_of_funds": None, "out_of_funds_at": None}]
+    monkeypatch.setenv("GPM_ADMIN_KEY", ADMIN)
+    monkeypatch.setenv("GPM_CONTROL_URL", programs.control_url)
+    capsys.readouterr()
+    assert main(["spending"]) == 0 and '"rented_bursts"' in capsys.readouterr().out
+
+
+def test_the_operator_says_a_providers_money_is_back(programs):
+    headers = {"Authorization": f"Bearer {ADMIN}"}
+    # As the router marks it on its provider's answer, and publishes it with its counters.
+    host = programs.state.registry.by_id["provider"]
+    host.out_of_funds, host.out_of_funds_at = '{"error": {"code": "insufficient_quota"}}', time.time() - 30
+    programs.loop.run(programs.state.registry.publish_counters())
+    status = httpx.get(f"{programs.control_url}/pool/status", headers=headers).json()
+    (shown,) = [h for h in status["hosts"] if h["host_id"] == "provider"]
+    assert "insufficient_quota" in shown["out_of_funds"], "the console's Hosts screen reads it here"
+    answer = httpx.post(f"{programs.control_url}/pool/hosts/provider/funds-restored", headers=headers)
+    assert answer.status_code == 200 and answer.json()["was_out_of_funds"], answer.text
+    programs.loop.run(programs.state.registry.refresh())
+    assert host.out_of_funds is None, "the router reads it with the host table, and routes to it again"
+    said = programs.supervisor.events.recent(5, kind="hosted_funds_restored")[0]["summary"]
+    assert "its money is back" in said and "insufficient_quota" in said
+    refused = httpx.post(f"{programs.control_url}/pool/hosts/laptop/funds-restored", headers=headers)
+    assert refused.status_code == 404 and "no hosted API" in refused.text
