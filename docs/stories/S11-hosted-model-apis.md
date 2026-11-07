@@ -249,10 +249,15 @@ it runs, by its operator (API, `gpm workload create|policy --hosted-…`) or by 
 the SDK (`bursts=`, `set_bursts()`, `hosted_budget()`), within the grant's `hosted_per_day` /
 `hosted_per_month` and the pool's `provisioning.max_hosted_per_day`, counted as committed (D125's
 rule); the router serves a workload's burst from the pool's hosted hosts on the workload's own
-budget, never as borrowing; replies carry `cost_usd` in the SDK. **Still to build in stage 3:**
-`steady`, `bursts.rented` (rent once a burst has lasted `after_min`, up to `max_hosts`, within its
-own budget), a workload with no machine at all (hosted alone, and hosted-only models in a
-workload), and spend on the console.
+budget, never as borrowing; replies carry `cost_usd` in the SDK.
+
+**Stage 3, second part built (same PR):** `bursts.rented` — once the whole base serves and the
+load has stayed above it for `after_min`, up to `max_hosts` hosts beyond it per group, within its
+day/month budget, paid from the workload's lease (a derived budget carries it); burst hosts never
+count as the base, go first when the load falls, and are drained when the budget is reached or the
+burst taken away; `gpm workload create|policy --rent-…`. `steady` is the workload's `parallel` at
+its `latency_s` (D165 amended). **Still to build in stage 3:** a workload with no machine at all
+(hosted alone, and hosted-only models in a workload), and spend on the console.
 5. **Live, asked first:** one small chat request to each provider the owner holds a key for, a few
    cents each, with a budget of $1.
 

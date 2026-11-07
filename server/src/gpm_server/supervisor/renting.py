@@ -122,6 +122,9 @@ class RentedHost:
     cards_per_copy: int = 1
     #: The workload it was bought for (D115); None is the shared workload.
     workload: Optional[str] = None
+    #: Bought beyond its workload's base, for a burst (D165): paid within the burst's own budget,
+    #: given up first, and never counted towards the hosts the workload keeps.
+    burst: bool = False
     #: The volume it was created with, and where its models came from: "volume" (copied from its
     #: workload's model volume, D139), "sibling" (copied from a ready host of its workload), or
     #: "hub" (D116).
@@ -297,6 +300,11 @@ class Unit:
     #: A workload whose budget could not carry any offer: the hosts and lease it was found with.
     #: No search is made for it again until one of them changes (D126).
     budget_bound: Optional[tuple] = None
+    #: Since when its base has been serving in full and its load still above it: how long a
+    #: burst has lasted (D165). And, as `budget_bound`, the situation a burst's budget was found
+    #: unable to carry another host in — no search for one again until it changes.
+    burst_since: Optional[float] = None
+    burst_bound: Optional[tuple] = None
 
 
 @dataclasses.dataclass
@@ -479,6 +487,8 @@ class Fleet:
         #: What the request log says a class of machine serves at a latency, read at most every
         #: thirty seconds; and the last rental-kind choice said, per workload (D82's rule).
         self._sizing_cache: dict[tuple, tuple[float, Any]] = {}
+        #: Each workload's rented burst, parsed from the policy it was read with (D165).
+        self._bursts: dict[str, tuple[Any, Any]] = {}
         self._hardware_cache: Optional[tuple[float, dict[str, str]]] = None
         self._said_kind: dict[tuple, tuple] = {}
         #: The last "no offer holds this group's split" said, per group (D118).
@@ -784,6 +794,7 @@ class Fleet:
             await self.enforce_lease_limits(lease)
         # Read again: a lease the limits just closed must not rent anything below.
         open_leases = self.leases.open_leases()
+        await self.enforce_burst_budgets(open_leases)
         await self.release_unleased(open_leases, busy or {})
 
         await self.handle_evictions()
@@ -799,7 +810,7 @@ class Fleet:
         for workload, group in units:
             await self.tear_down(
                 open_leases, idle_seconds, ready_workers_higher_tiers if workload is None else 0,
-                workload=workload, group=group,
+                workload=workload, group=group, load=None if workload is None else per_unit(loads, workload, group),
             )
         for workload, group in units:
             await self.acquire(
@@ -2797,6 +2808,7 @@ class Fleet:
             "builds": dict(host.builds),
             "cards_per_copy": host.cards_per_copy,
             "workload": host.workload,
+            "burst": host.burst,
             "disk_gb": host.disk_gb,
             # Beside the offer, not in it: a release from before connections builds the offer from
             # this dict and refuses a field it does not know — rolling back must still adopt (D129).
@@ -2912,6 +2924,7 @@ class Fleet:
                 # A row from before splitting existed ran a copy on every card.
                 cards_per_copy=int(ref.get("cards_per_copy") or 1),
                 workload=ref.get("workload"),
+                burst=bool(ref.get("burst")),
                 disk_gb=ref.get("disk_gb"),
                 when_ready=ref.get("when_ready") or "join",
                 download_cost=float(ref.get("download_cost") or 0.0),
@@ -3316,6 +3329,7 @@ class Fleet:
                 lease, 0, load or Load(busy_workers=0, ready_workers=0, waiting=0), unit=unit,
                 floor=chosen.hosts_at_start, per_host=chosen.workers_per_host,
                 ceiling=self.group_ceiling(lease, workload, unit.group),
+                burst=self.rented_burst_of(workload),
             )
             return
         if self.rented.allocation == "dynamic" and lease is not None:
@@ -3377,13 +3391,18 @@ class Fleet:
     async def _acquire_dynamically(
         self, lease: Lease, ready_workers_higher_tiers: int, load: Optional[Load],
         unit: Optional[Unit] = None, floor: Optional[int] = None, per_host: Optional[int] = None,
-        ceiling: Optional[int] = None,
+        ceiling: Optional[int] = None, burst: Any = None,
     ) -> None:
         """Hosts added from measured load, in rounds that grow while it lasts (D66).
 
         The lease is still the only spending authority, and still the ceiling: its `workers` is
         the most this pool may reach, its dollars and hours the most it may spend. What it is
         no longer is the *demand* — that is what the traffic asks for.
+
+        A workload's rented burst (D165) adds hosts beyond its base: only once every base host
+        is serving, the load has stayed above them for the burst's `after_min`, and within its
+        `max_hosts` and budget. Burst hosts are not the base: they never count towards the hosts
+        it keeps, and a base host lost is rented again at once, beside them.
         """
         now = time.time()
         if load is None:
@@ -3393,12 +3412,24 @@ class Fleet:
         ready = [h for h in live if h.state == "ready"]
         pending = [h for h in live if h.state in ("scheduling", "preparing")]
         rented_workers = sum(h.workers for h in ready)
+        base = [h for h in live if not h.burst]
+        in_burst = [h for h in live if h.burst]
 
-        wanted = min(lease.workers if ceiling is None else ceiling, load.wanted(self.rented.dynamic.target_utilisation))
+        base_ceiling = lease.workers if ceiling is None else ceiling
+        # Bursting only from a base that is all there and serving: before then, more load is the
+        # base's to meet, and a burst host would be bought in place of the base it waits for.
+        bursting = burst is not None and all(h.state == "ready" for h in base) and \
+            sum(h.workers for h in base) >= base_ceiling
+        room = burst.max_hosts * max(1, per_host or self.rented.workers) if bursting else 0
+        wanted = min(base_ceiling + room, load.wanted(self.rented.dynamic.target_utilisation))
         least = self.rented.dynamic.min_hosts if floor is None else floor
-        below_floor = len(live) < least
+        below_floor = len(base) < least
         overflow = max(0, wanted - ready_workers_higher_tiers - rented_workers)
 
+        if bursting and overflow > 0:
+            unit.burst_since = unit.burst_since or now
+        else:
+            unit.burst_since = None
         if overflow > 0 and unit.overflow_since is None:
             unit.overflow_since = now
         elif overflow <= 0 and not below_floor:
@@ -3415,7 +3446,18 @@ class Fleet:
             return
 
         held = (now - unit.overflow_since) if unit.overflow_since else 0.0
-        if not below_floor and held < self.rented.dynamic.window_s:
+        if not below_floor and bursting:
+            # A burst is measured from the moment the whole base served and still fell short, and
+            # waits the app's own minutes rather than the pool's window (D165).
+            if now - (unit.burst_since or now) < burst.after_min * 60:
+                return
+            if len(in_burst) >= burst.max_hosts:
+                return
+            if unit.burst_bound is not None:
+                if unit.burst_bound == self._burst_situation(lease, unit):
+                    return  # its budget carried no further host, and nothing has changed since
+                unit.burst_bound = None
+        elif not below_floor and held < self.rented.dynamic.window_s:
             return  # a burst shorter than the window is not worth a model download
 
         if not live and unit.ramp_round:
@@ -3448,7 +3490,7 @@ class Fleet:
             # A workload below the hosts it starts with: exactly the gap, each host re-checked on
             # its own, whatever the ramp would say — the ramp is for load above the floor (D115).
             await self._rent_round(
-                lease, unit, least - len(live), [f"workload {unit.workload}: {len(live)} of the "
+                lease, unit, least - len(base), [f"workload {unit.workload}: {len(base)} of the "
                                                    f"{least} host(s) it runs on at least"],
                 wanted=wanted, rented_workers=rented_workers,
                 ready_workers_higher_tiers=ready_workers_higher_tiers, held=held, load=load, ramp=False,
@@ -3469,15 +3511,32 @@ class Fleet:
         # Never more than the gap itself asks for: a ramp is a rate, not a target.
         by_overflow = max(1, math.ceil(overflow / max(1, per_host or self.rented.workers)))
         asked = max(1, min(ramp.hosts, by_overflow)) if not below_floor else ramp.hosts
+        if bursting:
+            asked = min(asked, burst.max_hosts - len(in_burst))
+            reasons = [f"rented burst: the load has stayed above the base for "
+                       f"{(now - (unit.burst_since or now)) / 60:.0f} min; {ramp.reasons[0]}"]
+        else:
+            reasons = [f"dynamic allocation: {ramp.reasons[0]}"]
         await self._rent_round(
-            lease, unit, asked, [f"dynamic allocation: {ramp.reasons[0]}"],
+            lease, unit, asked, reasons,
             wanted=wanted, rented_workers=rented_workers,
             ready_workers_higher_tiers=ready_workers_higher_tiers, held=held, load=load, ramp=True,
+            burst=bursting,
         )
+
+    def _burst_situation(self, lease: Lease, unit: Unit) -> tuple:
+        """What a rented burst's room depends on: the day and month it is counted in, the burst
+        hosts it holds, its policy and its lease's cap. Any change, and it is looked at again."""
+        from ..router.budgets import day_and_month
+
+        hosts = tuple(sorted(h.host_id for h in self.hosts_of(unit.workload, unit.group) if h.burst and not h.released))
+        spec = self.workloads.get(unit.workload) if unit.workload is not None else None
+        rented = (spec.policy or {}).get("rented") if spec is not None else None
+        return (day_and_month(), hosts, json.dumps(rented, sort_keys=True), lease.max_spend, lease.max_hours)
 
     async def _rent_round(
         self, lease: Lease, unit: Unit, asked: int, reasons: list[str], *, wanted: int, rented_workers: int,
-        ready_workers_higher_tiers: int, held: float, load: Load, ramp: bool,
+        ready_workers_higher_tiers: int, held: float, load: Load, ramp: bool, burst: bool = False,
     ) -> None:
         rented_now = 0
         for _ in range(asked):
@@ -3499,9 +3558,20 @@ class Fleet:
                     lease_id=lease.lease_id,
                 )
                 break
-            host = await self.rent_one(lease, list(reasons), workload=unit.workload, group=unit.group)
+            host = await self.rent_one(lease, list(reasons), workload=unit.workload, group=unit.group, burst=burst)
             if host is None:
-                if self.last_budget_bound and unit.workload is not None:
+                if self.last_budget_bound and burst:
+                    # Its burst's budget, or its lease, carries no further burst host: its base is
+                    # untouched, and the burst is looked at again when either changes (D165, D126).
+                    unit.burst_bound = self._burst_situation(lease, unit)
+                    self.events.record(
+                        "workload_burst_bound",
+                        f"workload {unit.workload}: no further burst host fits its budget ({self.last_refusal}); "
+                        "looked at again tomorrow, when one leaves, or when its policy or lease changes",
+                        numbers={"workload": unit.workload, "last_refusal": self.last_refusal},
+                        lease_id=lease.lease_id,
+                    )
+                elif self.last_budget_bound and unit.workload is not None:
                     # Searching again finds the same offers beyond the same budget, and every
                     # search spends the provider's daily quota: seen live, ten a minute for a
                     # host no offer could be afforded for (D126).
@@ -3522,7 +3592,8 @@ class Fleet:
             # decides to rent and is then refused by a cap has already said so.
             self.events.record(
                 "ramp_round",
-                f"{reasons[0].removeprefix('dynamic allocation: ')}; rented {rented_now} of {asked}",
+                f"{reasons[0].removeprefix('dynamic allocation: ')}; rented {rented_now} of {asked}"
+                + (" beyond the base" if burst else ""),
                 numbers={
                     "round": asked,
                     "rented": rented_now,
@@ -3531,6 +3602,7 @@ class Fleet:
                     "waiting": load.waiting,
                     "busy": load.busy_workers,
                     "workload": unit.workload,
+                    "burst": burst,
                 },
                 lease_id=lease.lease_id,
             )
@@ -3723,22 +3795,127 @@ class Fleet:
         return bound if total is None else min(bound, total)
 
     def _refuse_for_workload_budget(self, offer: Offer, bid: float, lease: Lease, workload: Optional[str],
-                                    also_hourly: float = 0.0) -> Optional[str]:
+                                    also_hourly: float = 0.0, burst: bool = False) -> Optional[str]:
         """A workload's host it cannot pay for to the end of its hours (D124): what the
         workload's hosts already burn, with this one at its price, over the hours the lease has
         left, beyond what the budget has left. Seen live: a $5, 1.75-hour workload fell back to a
         $7.17/h on-demand host, which would have spent the budget in forty minutes. A model volume
         this host would make bills too, to the end, and is counted with it (D139)."""
         hourly = ((bid + offer.storage_hourly) if offer.interruptible else offer.all_in_hourly) + also_hourly
-        burning = sum(h.bid_hourly for h in self.hosts_of(workload) if h.state != "draining")
+        live = [h for h in self.hosts_of(workload) if h.state != "draining"]
+        burning = sum(h.bid_hourly for h in live)
         hours = lease.hours_left()
         # The dollars left, not the margin-reduced figure the cap is enforced on: the margin
         # stops a lease early, it says nothing about whether a host fits the budget.
         left = lease.max_spend - self.lease_spend(lease)[0]
-        if (burning + hourly) * hours > left:
+        cost = (burning + hourly) * hours
+        rented = self.rented_burst_of(workload)
+        if rented is not None:
+            # Burst hosts cost no more over the hours than the burst's budget lets them (D165):
+            # the base to the end, the burst to its budget.
+            in_burst = sum(h.bid_hourly for h in live if h.burst) + (hourly if burst else 0.0)
+            cost = (burning + hourly - in_burst) * hours + min(
+                in_burst * hours, rented.budget.most_over(time.time(), hours))
+        if cost > left:
             return (f"{offer.machine_id} at ${hourly:.3f}/h: with its hosts' ${burning:.3f}/h, "
-                    f"${(burning + hourly) * hours:.2f} over the {hours:.2f}h left, more than the ${left:.2f} its budget has left")
+                    f"${cost:.2f} over the {hours:.2f}h left, more than the ${left:.2f} its budget has left")
+        if burst and rented is not None:
+            # A burst host is rented only where the burst's budget holds an hour of every burst
+            # host with it: one it would give up within minutes is a download paid for nothing.
+            in_burst = sum(h.bid_hourly for h in live if h.burst) + hourly
+            room = self.burst_left(lease, rented)
+            if in_burst > room:
+                return (f"{offer.machine_id} at ${hourly:.3f}/h: its burst hosts would burn ${in_burst:.3f}/h, "
+                        f"more than the ${max(0.0, room):.2f} its rented burst's budget has left for an hour of them")
         return None
+
+    # --- a workload's rented burst (D165) ---
+
+    def rented_burst_of(self, workload: Optional[str]) -> Any:
+        """The rented burst a workload's policy carries, or None — parsed once per version of it."""
+        spec = self.workloads.get(workload) if workload is not None else None
+        raw = (spec.policy or {}).get("rented") if spec is not None else None
+        if not raw:
+            return None
+        cached = self._bursts.get(workload)
+        if cached is not None and cached[0] is raw:
+            return cached[1]
+        from ..config import RentedBurst
+
+        try:
+            burst = RentedBurst.model_validate(raw)
+        except ValueError:
+            burst = None  # written by a newer supervisor, or damaged: no burst rather than a guess
+        self._bursts[workload] = (raw, burst)
+        return burst
+
+    def burst_spend(self, lease_id: str, since: float) -> float:
+        """What a workload's burst hosts have cost since a moment — those still running and those
+        given up — from the ledger's running totals: each host's latest, less its last before
+        then, the higher of the pool's estimate and the provider's figure (spec §4)."""
+        db = self.events.db
+        ids = [r["host_id"] for r in db.query(
+            "SELECT host_id FROM events WHERE kind = 'rented' AND lease_id = ? AND host_id IS NOT NULL "
+            "AND json_extract(numbers, '$.burst') = 1", (lease_id,))]
+        if not ids:
+            return 0.0
+        marks = ",".join("?" * len(ids))
+        per_host: dict[str, float] = {}
+        for row in db.query(
+            f"SELECT host_id, source, MAX(amount) AS total, MAX(CASE WHEN ts < ? THEN amount END) AS before "
+            f"FROM spend WHERE lease_id = ? AND host_id IN ({marks}) GROUP BY host_id, source",
+            (since, lease_id, *ids),
+        ):
+            spent = max(0.0, float(row["total"] or 0.0) - float(row["before"] or 0.0))
+            per_host[row["host_id"]] = max(per_host.get(row["host_id"], 0.0), spent)
+        return sum(per_host.values())
+
+    def burst_spent(self, lease_id: str) -> dict[str, float]:
+        """What a workload's burst hosts cost today and this month (UTC)."""
+        from ..router.budgets import period_starts
+
+        day, month = period_starts()
+        return {"today": self.burst_spend(lease_id, day), "this_month": self.burst_spend(lease_id, month)}
+
+    def burst_left(self, lease: Lease, burst: Any) -> float:
+        """What the rented burst's budget has left — the less of the day's and the month's."""
+        spent = self.burst_spent(lease.lease_id)
+        left = [limit - spent[period] for limit, period in ((burst.budget.per_day, "today"),
+                                                           (burst.budget.per_month, "this_month"))
+                if limit is not None]
+        return min(left)
+
+    async def enforce_burst_budgets(self, open_leases: Sequence[Lease]) -> None:
+        """A workload's burst hosts are drained once its rented burst's budget is reached, less
+        the safety margin a lease's cap is enforced with — or at once, when its policy no longer
+        has a rented burst (D165). Its base is untouched."""
+        for name in list(self.workloads):
+            hosts = [h for h in self.hosts_of(name) if h.burst and h.state != "draining"]
+            if not hosts:
+                continue
+            lease = self.lease_of(open_leases, name)
+            if lease is None:
+                continue  # its lease closed: everything it holds is released already
+            burst = self.rented_burst_of(name)
+            why = None
+            if burst is None:
+                why = "its policy no longer has a rented burst"
+            else:
+                spent = self.burst_spent(lease.lease_id)
+                for limit, period, words in ((burst.budget.per_day, "today", "a day"),
+                                             (burst.budget.per_month, "this_month", "a month")):
+                    if limit is not None and spent[period] >= limit * (1 - self.margin()):
+                        why = (f"its rented burst has spent ${spent[period]:.4f} of its ${limit:.2f} {words}, "
+                               f"less a {self.margin() * 100:.0f}% margin")
+                        break
+            if why is None:
+                continue
+            self.events.record(
+                "workload_burst_ended", f"workload {name}: {why}; its {len(hosts)} burst host(s) are given up",
+                numbers={"workload": name, "hosts": [h.host_id for h in hosts]}, lease_id=lease.lease_id,
+            )
+            for host in hosts:
+                await self.drain(host, f"workload {name}: {why}")
 
     def _refuse_bid_for_burn(self, bid: float, also_hourly: float = 0.0) -> Optional[str]:
         """The cap applies to the burn this bid *would* create, not only to today's. With no
@@ -3776,7 +3953,7 @@ class Fleet:
         self, lease: Lease, reasons: list[str],
         offer_id: Optional[str] = None, kind: Optional[str] = None,
         workload: Optional[str] = None, group: Optional[tuple[str, ...]] = None,
-        connection: Optional[str] = None,
+        connection: Optional[str] = None, burst: bool = False,
     ) -> Optional[RentedHost]:
         """Rent the best offer — or, when an operator named one, exactly that one.
 
@@ -3943,7 +4120,8 @@ class Fleet:
                 continue
             if spec is not None:
                 unaffordable = self._refuse_for_workload_budget(
-                    offer, capped, lease, workload, also_hourly=self._new_volume_hourly(spec, offer, here, for_this_host, builds))
+                    offer, capped, lease, workload, also_hourly=self._new_volume_hourly(spec, offer, here, for_this_host, builds),
+                    burst=burst)
                 if unaffordable is not None:
                     unaffordable_offers += 1
                     self.last_refusal = unaffordable
@@ -4045,6 +4223,7 @@ class Fleet:
                 builds=builds,
                 cards_per_copy=cards_per_copy,
                 workload=workload,
+                burst=burst,
                 disk_gb=policy.min_disk_gb,
                 engine=self.config.rented_engine(),
                 engine_port=self.engine_port,
@@ -4076,6 +4255,10 @@ class Fleet:
                     "score": offer_score,
                     "reasons": reasons + bid.reasons,
                     "rejected": rejected,
+                    # Which workload, and whether beyond its base: a burst's budget is counted
+                    # from the hosts this names, released ones too (D165).
+                    "workload": workload,
+                    "burst": burst,
                 },
                 host_id=host_id,
                 lease_id=lease.lease_id,
@@ -4617,6 +4800,7 @@ class Fleet:
         ready_workers_higher_tiers: int = 0,
         workload: Optional[str] = None,
         group: Optional[tuple[str, ...]] = None,
+        load: Optional[Load] = None,
     ) -> None:
         unit = self.unit(workload, group)
         live = [h for h in self.hosts_of(workload, unit.group) if h.state != "parked"]
@@ -4661,6 +4845,11 @@ class Fleet:
                 )
 
         wanted = self.group_ceiling(lease, workload, unit.group) if lease else 0
+        if any(h.burst for h in ready) and load is not None:
+            # While it holds burst hosts, what its load wants decides what is surplus — never
+            # less than its base (D165). Measured against the base alone, every burst host
+            # would be surplus while the burst it was bought for still runs.
+            wanted = max(wanted, load.wanted(self.rented.dynamic.target_utilisation))
         covered = ready_workers_higher_tiers + sum(h.workers for h in ready)
         if lease is not None and covered >= wanted and wanted > 0:
             unit.overflow_gone_since = unit.overflow_gone_since or now
@@ -4679,7 +4868,8 @@ class Fleet:
                 machine_id=h.offer.machine_id,
                 hours_held=h.hours_held,
             )
-            for h in ready
+            # Burst hosts go first: while it holds one, no base host is surplus (D165).
+            for h in ([b for b in ready if b.burst] or ready)
         ]
         # "Overflow gone" is only surplus if demand stays covered *without* the host being
         # reaped, and only once it has stayed gone for the scale-down window.
@@ -4704,7 +4894,8 @@ class Fleet:
             host = self.hosts.get(action.host_id)
             if host is None or host.released:
                 continue
-            if spec is not None and lease is not None and len(ready) <= spec.hosts_at_start:
+            if (spec is not None and lease is not None and not host.burst
+                    and len([h for h in ready if not h.burst]) <= spec.hosts_at_start):
                 # A workload keeps the hosts it starts with for its whole lease: they were
                 # reserved for the run, and reaping one only rents it again next pass (D115).
                 continue

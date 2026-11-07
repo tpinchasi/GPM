@@ -138,7 +138,8 @@ for workloads; the shared workload is unchanged.
 
 **Scale-up** is dynamic allocation (supervisor.md §5.1) inside the workload's lease: measured
 load — its own hosts' busy workers and its own requests that waited — above the floor, then the
-ramp, up to `parallel` workers and the lease's dollars and hours. A workload host's workers are
+ramp, up to `parallel` workers and the lease's dollars and hours — beyond `parallel` only through
+a rented burst (§13). A workload host's workers are
 fixed at what meets the latency on its class of machine: automatic adjustment (D67) does not
 climb past it. The number is worked out per offer when a host is rented; the one the plan shows
 is for the first host's class.
@@ -386,9 +387,8 @@ A workload may say how it is to be served as its demand rises and falls — the 
 pattern; the pool carries it out. Every part is optional, and any mix is allowed.
 
 ```python
-pool.workloads.create(
-    "orders", model="llama-3.3-70b", latency_s=4,
-    steady={"hosts": 2, "workers": 24},
+pool.workload(
+    "llama-3.3-70b", latency_s=4, parallel=48, hours=24, max_spend=400,   # steady: 48 at once
     bursts={
         "hosted": {"after_s": 5, "budget": {"per_day": 20, "per_month": 300}},
         "rented": {"after_min": 10, "max_hosts": 4, "budget": {"per_day": 60}},
@@ -396,14 +396,35 @@ pool.workloads.create(
 )
 ```
 
-- **`steady`** is kept on machines — the operator's, or rented under the workload's lease — as today.
+- **Steady** is the workload's `parallel` at its `latency_s`, as it always was (§2, §5): the pool
+  works out the hosts that meet it — two of 24 each, where the card serves 24 within 4 s — and
+  keeps them for the lease. There is no separate `steady` field; one sent is refused in words.
 - **`bursts.hosted`**: a request that finds no free worker waits `after_s` (default 5) for one, then
   goes to a hosted API (hosts-routing-capacity §5, tier 30) if its budget has room — in dollars per
   request, per day and/or per month, any of them. A model no machine serves goes at once.
-- **`bursts.rented`**: once a burst has lasted `after_min` (default 10), the pool rents, as S1's
-  allocation does from measured pressure, up to `max_hosts`, within its own budget; the hosted API
-  covers the minutes a machine takes to start, and the rented machines are given up after their
-  idle cutoff once the burst ends.
+- **`bursts.rented`** — `after_min` (default 10), `max_hosts` (required), `budget` (`per_day`
+  and/or `per_month`; `per_request` is refused, a machine being paid by the hour):
+  - **When.** Only once every base host is serving and its load — busy workers and requests that
+    waited, a request spilled to a hosted API among them — has stayed above them for `after_min`
+    minutes, measured from the moment the whole base served and still fell short. Before then,
+    more load is the base's to meet. Then the ramp (§5, D66) adds hosts, at most `max_hosts`
+    beyond the base for each group of its hosts (one, unless its models are placed apart, §12).
+  - **Burst hosts are not the base.** They never count towards the hosts it keeps: a base host
+    lost is rented again at once, beside them. When the load falls they are the surplus, given up
+    first, after the scale-down window and idle cutoff; while one is held, what the load wants —
+    never less than the base — is what decides surplus.
+  - **Paid from the lease**, the only spending authority: its `budget` is a limit inside it. A
+    derived budget (§2 step 4) carries the burst — the less of `max_hosts` hosts at the first
+    host's price for every hour, and the budget over every UTC day and month the hours touch, shown
+    as `rented_burst.in_the_budget` in the plan; a typed one must hold it. D124's rule counts a
+    burst host only to what its budget lets it cost, and the base to the lease's end.
+  - **Within its budget.** A burst host is rented only where the budget has an hour left of every
+    burst host with it — else said once (`workload_burst_bound`) and not searched for again until
+    the day, its burst hosts, its policy or its lease change. What burst hosts cost (the ledger's
+    running totals, released hosts too) reaching the day's or the month's limit less the safety
+    margin a lease's cap is enforced with drains them all (`workload_burst_ended`); the base is
+    untouched. A policy that no longer has a rented burst drains them at once. The workload's
+    view shows `rented_burst`: spent today and this month, and burst hosts held.
 - **A budget spent** stops that kind of burst for the rest of its period — UTC days and months —
   and the request is answered 503 `hosted_budget_spent` where no machine frees in time; the other
   kind, or the queue, takes over. No request is sent beyond a budget (D166). What is left is in
@@ -436,8 +457,12 @@ pool.workloads.create(
   else 31 of its days); one ending or ended — its key refused from then — what it really spent in
   the last day and 30 days, so ending a workload and making another buys no fresh budget. An
   operator's own workload is bounded by the budget the operator typed.
-- **Not built yet**: `steady` and `bursts.rented` are refused in words. Until they are, a
-  workload's machines are sized by its `latency_s` and `parallel` (§2, §5) as before.
+- **Changed while it runs**: the policy sent replaces the one it had (the command line keeps a
+  burst its flags do not name: `gpm workload policy <name> --rent-max-hosts 2 --rent-per-day 30
+  [--rent-per-month …] [--rent-after …]`, `--no-rented`). A rented burst draws on what the lease
+  has left; more money is the lease's to give (`gpm workload extend`, typed twice, D49).
+- **Not built yet**: a workload with no machine at all (hosted alone), and a hosted-only model in
+  a workload.
 
 **A hosted-only model** (D165) — one whose catalog lists hosted builds only, as for Claude or GPT,
 which no machine can run — goes to hosted APIs from the first request. The pool never rents,
@@ -451,5 +476,5 @@ can serve it.
 | `steady` + `hosted` + `rented` | base on machines; short bursts to tokens; long bursts rent |
 | `steady` + `hosted` | every burst to tokens; nothing rented |
 | `steady` + `rented` | bursts wait for rented machines, as before; no tokens |
-| `hosted` alone | everything to hosted APIs; no machine |
+| `hosted` alone | everything to hosted APIs; no machine (not built yet) |
 | `steady` alone | the base, then the queue |

@@ -399,15 +399,22 @@ def _say_connection(connection: dict) -> None:
 
 
 def _hosted_policy(args: argparse.Namespace) -> Optional[dict]:
-    """`bursts` from the --hosted-… flags (D165), or None where none was given."""
+    """`bursts` from the --hosted-… and --rent-… flags (D165), or None where none was given."""
+    bursts: dict = {}
     budget = {k: v for k, v in (("per_request", args.hosted_per_request), ("per_day", args.hosted_per_day),
                                 ("per_month", args.hosted_per_month)) if v is not None}
-    if not budget and args.hosted_after is None:
-        return None
-    hosted: dict = {"budget": budget}
-    if args.hosted_after is not None:
-        hosted["after_s"] = args.hosted_after
-    return {"hosted": hosted}
+    if budget or args.hosted_after is not None:
+        bursts["hosted"] = {"budget": budget}
+        if args.hosted_after is not None:
+            bursts["hosted"]["after_s"] = args.hosted_after
+    budget = {k: v for k, v in (("per_day", args.rent_per_day), ("per_month", args.rent_per_month)) if v is not None}
+    if budget or args.rent_after is not None or args.rent_max_hosts is not None:
+        bursts["rented"] = {"budget": budget}
+        if args.rent_max_hosts is not None:
+            bursts["rented"]["max_hosts"] = args.rent_max_hosts
+        if args.rent_after is not None:
+            bursts["rented"]["after_min"] = args.rent_after
+    return bursts or None
 
 
 def _workload(args: argparse.Namespace) -> int:
@@ -416,13 +423,21 @@ def _workload(args: argparse.Namespace) -> int:
         if not name:
             print("name the workload", file=sys.stderr)
             return 2
-        if args.no_hosted:
-            return _control(args, "POST", f"/pool/workloads/{name}/policy", {"bursts": {}})
-        bursts = _hosted_policy(args)
-        if bursts is None:
-            print("give --hosted-per-day and/or --hosted-per-month (and --hosted-after, --hosted-per-request), "
-                  "or --no-hosted", file=sys.stderr)
+        given = _hosted_policy(args) or {}
+        if not given and not args.no_hosted and not args.no_rented:
+            print("give --hosted-per-day/--hosted-per-month (and --hosted-after, --hosted-per-request), "
+                  "--rent-max-hosts with --rent-per-day/--rent-per-month (and --rent-after), "
+                  "--no-hosted or --no-rented", file=sys.stderr)
             return 2
+        # The policy sent replaces the one it has: a burst the flags do not name is kept as it is.
+        status, current = _control_json(args, "GET", f"/pool/workloads/{name}")
+        if status != 200:
+            print(current.get("detail") or json.dumps(current), file=sys.stderr)
+            return 1
+        bursts = {**((current.get("workload") or {}).get("policy") or {}), **given}
+        for kind, dropped in (("hosted", args.no_hosted), ("rented", args.no_rented)):
+            if dropped:
+                bursts.pop(kind, None)
         return _control(args, "POST", f"/pool/workloads/{name}/policy", {"bursts": bursts})
     if args.action in ("plan", "create"):
         models, latencies, parallels = args.model or [], args.latency or [], args.parallel or []
@@ -725,6 +740,13 @@ def main(argv: list[str] | None = None) -> int:
     workload.add_argument("--hosted-per-month", type=float, default=None, help="hosted dollars a UTC month")
     workload.add_argument("--hosted-per-request", type=float, default=None, help="the most one hosted answer may cost")
     workload.add_argument("--no-hosted", action="store_true", help="for policy: take its hosted burst away")
+    # Its rented burst (D165): hosts beyond its base once a burst has lasted, paid from its lease.
+    workload.add_argument("--rent-after", type=float, default=None,
+                          help="minutes a burst lasts before hosts beyond the base are rented (default 10)")
+    workload.add_argument("--rent-max-hosts", type=int, default=None, help="the most hosts beyond its base, per group")
+    workload.add_argument("--rent-per-day", type=float, default=None, help="dollars its burst hosts may cost a UTC day")
+    workload.add_argument("--rent-per-month", type=float, default=None, help="dollars its burst hosts may cost a UTC month")
+    workload.add_argument("--no-rented", action="store_true", help="for policy: take its rented burst away")
     workload.add_argument("--url", default=None)
     workload.set_defaults(func=_workload)
 

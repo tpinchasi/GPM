@@ -172,9 +172,12 @@ def test_a_policy_is_read_and_checked_in_words():
     for body, words in (
         ({"bursts": {"hosted": {"budget": {"per_request": 0.1}}}}, "per_request alone"),
         ({"bursts": {"hosted": {"after_s": -1, "budget": {"per_day": 1}}}}, "bursts.hosted.after_s"),
-        ({"bursts": {"rented": {"after_min": 10}}}, "not built yet"),
+        ({"bursts": {"rented": {"after_min": 10, "budget": {"per_day": 5}}}}, "bursts.rented.max_hosts: Field required"),
+        ({"bursts": {"rented": {"max_hosts": 2, "budget": {"per_day": 5, "per_request": 1}}}},
+         "a rented machine is paid by the hour"),
+        ({"bursts": {"rented": {"max_hosts": 0, "budget": {"per_day": 5}}}}, "bursts.rented.max_hosts"),
         ({"bursts": {"spot": {}}}, r"not \['spot'\]"),
-        ({"bursts": {"hosted": HOSTED}, "steady": {"hosts": 2}}, "steady is not built yet"),
+        ({"bursts": {"hosted": HOSTED}, "steady": {"hosts": 2}}, "steady capacity is its parallel at its latency_s"),
     ):
         with pytest.raises(Refused, match=words):
             parse_policy(body)
@@ -316,3 +319,43 @@ def test_the_operator_sets_a_policy_and_one_nothing_could_spend_is_refused(progr
                          json={"bursts": {}})
     assert changed.status_code == 200 and changed.json()["workload"]["policy"] == {}
     assert changed.json()["workload"]["hosted_spend"] is None
+
+
+def test_a_plan_with_a_rented_burst_derives_a_budget_that_pays_for_it(programs):
+    """A rented burst is paid from the workload's lease (D165): the budget a plan derives carries
+    the least of its hosts at their price the whole time and its budget over the hours."""
+    headers = {"Authorization": f"Bearer {ADMIN}"}
+    body = {"name": "night", "model": BIG, "latency_s": 30, "parallel": 2, "hours": 1}
+    plain = httpx.post(f"{programs.control_url}/pool/workloads/plan", headers=headers, json=body, timeout=60).json()["plan"]
+    burst = {"rented": {"after_min": 5, "max_hosts": 1, "budget": {"per_day": 0.05}}}
+    planned = httpx.post(f"{programs.control_url}/pool/workloads/plan", headers=headers,
+                         json={**body, "bursts": burst}, timeout=60).json()["plan"]
+    assert planned["rented_burst"]["max_hosts"] == 1 and planned["rented_burst"]["in_the_budget"] > 0
+    assert planned["derived_budget"] == pytest.approx(plain["derived_budget"] + planned["rented_burst"]["in_the_budget"])
+    assert planned["rented_burst"]["in_the_budget"] <= 0.10, "never more than its budget over the days it touches"
+    refused = httpx.post(f"{programs.control_url}/pool/workloads/plan", headers=headers,
+                         json={**body, "bursts": {"rented": {"max_hosts": 1, "budget": {}}}}, timeout=60)
+    assert refused.status_code == 400 and "per_day or per_month" in refused.text
+
+
+def test_the_command_line_changes_one_burst_and_keeps_the_other(programs, capsys, monkeypatch):
+    from gpm_server.cli import main
+
+    monkeypatch.setenv("GPM_ADMIN_KEY", ADMIN)
+    monkeypatch.setenv("GPM_CONTROL_URL", programs.control_url)
+    created = httpx.post(f"{programs.control_url}/pool/workloads", headers={"Authorization": f"Bearer {ADMIN}"},
+                         json={"name": "night", "model": BIG, **SPEC, "bursts": bursts(9.0)}, timeout=60)
+    assert created.status_code == 201, created.text
+    workloads = programs.supervisor.workloads
+    assert main(["workload", "policy", "night", "--rent-max-hosts", "2", "--rent-per-day", "1.5"]) == 0
+    policy = workloads.get("night").policy
+    assert policy["rented"] == {"after_min": 10.0, "max_hosts": 2, "budget": {"per_day": 1.5}}
+    assert policy["hosted"]["budget"]["per_day"] == 9.0, "the burst its flags did not name is kept"
+    assert main(["workload", "policy", "night", "--no-hosted"]) == 0
+    assert set(workloads.get("night").policy) == {"rented"}
+    capsys.readouterr()
+    assert main(["workload", "policy", "night", "--rent-per-day", "1"]) == 1, "max_hosts is required"
+    said = capsys.readouterr()
+    assert "max_hosts" in said.out + said.err
+    events = programs.supervisor.events.recent(10, kind="workload_policy")
+    assert any("up to 2 more host(s) once a burst has lasted 10 min" in e["summary"] for e in events)

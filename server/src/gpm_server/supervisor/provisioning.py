@@ -250,7 +250,8 @@ class Provisioning:
         idle = grant.idle_end_minutes if idle is None else idle
         if idle > grant.max_idle_end_minutes:
             raise WorkloadRefused(f"an idle cutoff of at most {grant.max_idle_end_minutes:g} minutes")
-        req = WorkloadRequest.of(name, targets, hours, max_spend=spend, kind=kind, placement=placement)
+        req = WorkloadRequest.of(name, targets, hours, max_spend=spend, kind=kind, placement=placement,
+                                 policy=parse_policy(body))
         return req, idle, grant.may_borrow
 
     async def _plan(self, provisioner: Any, body: dict) -> dict:

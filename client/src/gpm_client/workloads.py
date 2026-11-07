@@ -92,8 +92,10 @@ class Workload:
 
     def set_bursts(self, bursts: Mapping[str, Any], timeout_s: float = 120.0) -> dict:
         """Change its spending policy while it runs (D165): `{"hosted": {"after_s": 5,
-        "budget": {"per_day": 20}}}`, or `{}` to stop spilling to hosted APIs. Checked against
-        the provisioning key's grant; what it already spent today and this month still counts."""
+        "budget": {"per_day": 20}}, "rented": {...}}`, or `{}` for no bursts at all. The policy
+        sent replaces the one it had: name every burst it should keep. Checked against the
+        provisioning key's grant; what it already spent today and this month still counts. A
+        rented burst is paid from the workload's own `max_spend`, which this does not raise."""
         answer = self._provisioner._ask({"bursts": dict(bursts)}, timeout_s,
                                         path=f"/pool/provisioning/workloads/{self.name}/policy")
         self.answer = {**self.answer, "policy": answer.get("policy")}
@@ -248,7 +250,10 @@ class WorkloadProvisioner:
         `bursts={"hosted": {"after_s": 5, "budget": {"per_day": 20, "per_month": 300}}}` lets a
         request that waited `after_s` for one of its machines go to a hosted API the pool has,
         paid per token from that budget, within the key's grant (D165). Each such answer says
-        what it cost: `reply.cost_usd`."""
+        what it cost: `reply.cost_usd`. `"rented": {"after_min": 10, "max_hosts": 2, "budget":
+        {"per_day": 30}}` rents up to that many hosts beyond the ones `parallel` sizes, once its
+        load has stayed above them for `after_min` minutes, paid from `max_spend` — which must
+        hold it — within that budget; they are given up first when the load falls."""
         if wait_until not in ("created", "serving"):
             raise ValueError("wait_until is 'created' or 'serving'")
         key = "gpmw_" + secrets.token_hex(32)

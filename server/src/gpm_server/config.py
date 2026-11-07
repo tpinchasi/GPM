@@ -7,6 +7,7 @@ network calls: validation here is about the file, readiness is the probe's job.
 
 from __future__ import annotations
 
+import datetime
 import ipaddress
 import os
 import re
@@ -510,6 +511,17 @@ class Budget(BaseModel):
         """The most it can spend in one month: its month's limit, else 31 of its days."""
         return self.per_month if self.per_month is not None else 31 * float(self.per_day or 0)
 
+    def most_over(self, start: float, hours: float) -> float:
+        """The most it can spend from `start` for `hours`: every UTC day and month the span
+        touches may be spent in full."""
+        utc = datetime.timezone.utc
+        first = datetime.datetime.fromtimestamp(start, utc)
+        last = datetime.datetime.fromtimestamp(start + max(0.0, hours) * 3600, utc)
+        days = (last.date() - first.date()).days + 1
+        months = (last.year - first.year) * 12 + last.month - first.month + 1
+        return min(limit * count for limit, count in ((self.per_day, days), (self.per_month, months))
+                   if limit is not None)
+
 
 class HostedBurst(BaseModel):
     """A burst met by hosted APIs (D165): after a request has waited `after_s` for a machine's
@@ -523,7 +535,30 @@ class HostedBurst(BaseModel):
     reserve_max_tokens: int = Field(default=4096, ge=1)
 
 
+class RentedBurst(BaseModel):
+    """A burst met by renting (D165): once a workload's base is serving and its load has stayed
+    above it for `after_min` minutes, hosts beyond the base — at most `max_hosts` for each group
+    of its hosts — while what they cost stays within `budget`. Paid from the workload's lease,
+    the only spending authority: the budget is a limit inside it, never money beside it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    after_min: float = Field(default=10.0, ge=0, le=24 * 60)
+    max_hosts: int = Field(ge=1, le=100)
+    budget: Budget
+
+    @model_validator(mode="after")
+    def _by_the_hour(self) -> "RentedBurst":
+        if self.budget.per_request is not None:
+            raise ValueError("budget.per_request limits one hosted answer; a rented machine is paid by the "
+                             "hour — name per_day or per_month")
+        return self
+
+
 class Bursts(BaseModel):
+    """The shared workload's bursts. Only `hosted`: its renting is its lease's dynamic
+    allocation, as before (D66); a rented burst is a workload's (D165)."""
+
     model_config = ConfigDict(extra="forbid")
 
     hosted: Optional[HostedBurst] = None

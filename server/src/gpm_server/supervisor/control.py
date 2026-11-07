@@ -1742,7 +1742,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
     # --- workloads (D115, docs/spec/workloads.md) ---
 
     def _workload_request(body: dict) -> Any:
-        from .workloads import WorkloadRefused, WorkloadRequest, parse_targets
+        from .workloads import WorkloadRefused, WorkloadRequest, parse_policy, parse_targets
 
         for required in ("name", "hours"):
             if body.get(required) in (None, ""):
@@ -1756,7 +1756,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             str(body.get("name") or "").strip(), targets, float(hours),
             max_spend=float(spend) if spend is not None else None,
             profile=(str(body["profile"]).strip() or None) if body.get("profile") else None,
-            kind=str(body.get("kind") or "roi"), placement=placement,
+            kind=str(body.get("kind") or "roi"), placement=placement, policy=parse_policy(body),
         )
 
     async def _workload_call(fn):
