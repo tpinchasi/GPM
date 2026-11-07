@@ -461,13 +461,26 @@ pool.workload(
   burst its flags do not name: `gpm workload policy <name> --rent-max-hosts 2 --rent-per-day 30
   [--rent-per-month …] [--rent-after …]`, `--no-rented`). A rented burst draws on what the lease
   has left; more money is the lease's to give (`gpm workload extend`, typed twice, D49).
-- **Not built yet**: a workload with no machine at all (hosted alone), and a hosted-only model in
-  a workload.
+- **Served by hosted APIs alone: `parallel` 0.** A model asked for with `parallel: 0` (and no
+  `latency_s`, which would say nothing) gets no machine: none is planned, rented or borrowed for
+  it — not even while its workload prepares and may borrow — and its requests go to the pool's
+  hosted APIs on the workload's hosted budget from the first. It needs a hosted burst, and a
+  hosted API serving it; the burst cannot then be taken away while it runs. Its waiting is no
+  machine's to meet: it never counts towards a group's load.
+- **A workload whose every model is so rents nothing**: no market search, no hosts, no
+  `max_spend` (refused, and a program sends none) — its hosted burst's budget, within the grant's
+  `hosted_per_day`, is what it spends. Its lease cannot rent and carries only its hours; it serves
+  from creation; its hours end it though no fleet looks at a lease that rents nothing (a pool
+  without rented capacity may make one). A rented burst is refused for it.
+- **Mixed**: machine-run models are planned, grouped and rented as §12 says; the plan names the
+  others in `hosted_alone`.
 
 **A hosted-only model** (D165) — one whose catalog lists hosted builds only, as for Claude or GPT,
 which no machine can run — goes to hosted APIs from the first request. The pool never rents,
-prepares or plans a machine for it; a workload serving it must carry a hosted budget, and `steady`
-or `rented` for it is refused, saying the model has no build a machine runs. A workload of several
+prepares or plans a machine for it; a workload asks for it with `parallel: 0` and a hosted burst,
+and `parallel` above 0 for it is refused, saying the model has no build a machine runs. A hosted
+API holds only builds named for its engine (`engine: openai-api`, priced): a build naming no
+engine is a machine's. A workload of several
 models (§12) may mix machine-run and hosted-only models: each follows the part of the policy that
 can serve it.
 
@@ -476,5 +489,5 @@ can serve it.
 | `steady` + `hosted` + `rented` | base on machines; short bursts to tokens; long bursts rent |
 | `steady` + `hosted` | every burst to tokens; nothing rented |
 | `steady` + `rented` | bursts wait for rented machines, as before; no tokens |
-| `hosted` alone | everything to hosted APIs; no machine (not built yet) |
+| `hosted` alone (`parallel` 0) | everything to hosted APIs; no machine |
 | `steady` alone | the base, then the queue |

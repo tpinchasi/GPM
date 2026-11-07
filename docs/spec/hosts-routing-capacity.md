@@ -51,7 +51,8 @@ with an API key. It is written with the fields every host has: an `https` transp
 flight. Its engine is `openai-api`, the same for every provider; it has no agent, no tunnel and no
 `residency`. Nothing is pulled, loaded, rented or released on it; the supervisor asks its
 `/v1/models` for health and its models, which spends nothing. Each catalog variant for it names the
-provider's name for the model, the kinds it serves there, and its price (§4.1). Where several
+provider's name for the model, the kinds it serves there, and its price (§4.1); it holds only such
+variants (`engine: openai-api`) — one that names no engine is a machine's, never a provider's. Where several
 providers serve one model, each variant names its provider in `requires` and each hosted host
 says which it is in `capabilities` (§4.4).
 

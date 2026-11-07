@@ -550,10 +550,14 @@ class Supervisor:
                 load=self._load() if self.config.rented.allocation == "dynamic" else None,
                 waiting_by_model=self._waiting_by_model(),
                 workloads=active,
-                # Per group of each workload's hosts (D118); a one-group workload's is its own.
-                loads={(w.name, g.key): self._load(w.name, g.key if len(w.groups) > 1 else None)
+                # Per group of each workload's hosts (D118); a one-group workload's is its own —
+                # unless it also serves models by hosted APIs alone, whose waiting is no machine's
+                # to meet (D165).
+                loads={(w.name, g.key): self._load(w.name, g.key if len(w.groups) > 1 or len(w.targets) > len(g.models)
+                                                   else None)
                        for w in active for g in w.groups},
-                pressures={(w.name, g.key): self._pressure(w.name, g.key if len(w.groups) > 1 else None)
+                pressures={(w.name, g.key): self._pressure(w.name, g.key if len(w.groups) > 1
+                                                           or len(w.targets) > len(g.models) else None)
                            for w in active for g in w.groups},
             )
             if self.config.rented and self.config.rented.workers_auto.enabled:

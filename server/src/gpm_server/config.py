@@ -66,6 +66,14 @@ class Price(BaseModel):
 HOSTED_ENGINE = "openai-api"
 
 
+def _for_engine(variant: "Variant", engine: Optional[str]) -> bool:
+    """`catalog.for_engine`'s rule, here for the configuration's own checks: a build naming no
+    engine is any machine engine's; a hosted API takes only builds named for it (D164)."""
+    if engine == HOSTED_ENGINE:
+        return variant.engine == HOSTED_ENGINE
+    return variant.engine is None or variant.engine == engine
+
+
 class Variant(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1502,7 +1510,7 @@ class PoolConfig(BaseModel):
         return [
             engine for engine in self.engines_of(host)
             if not any(
-                set(v.requires) <= caps and (v.engine is None or v.engine == engine)
+                set(v.requires) <= caps and _for_engine(v, engine)
                 and v.kinds() & self.engine_kinds(engine)
                 for v in variants
             )
@@ -1790,7 +1798,7 @@ class PoolConfig(BaseModel):
         reachable = []
         for variant in variants:
             for engine in engines:
-                if (variant.engine is None or variant.engine == engine) and variant.kinds() & self.engine_kinds(engine):
+                if _for_engine(variant, engine) and variant.kinds() & self.engine_kinds(engine):
                     reachable.append(variant)
                     break
         return reachable

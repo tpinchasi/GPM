@@ -22,7 +22,7 @@ from gpm_server.providers import default_offer
 from gpm_server.supervisor.control import create_control_app
 from gpm_server.supervisor.workloads import WorkloadRefused as Refused
 from gpm_server.supervisor.workloads import parse_policy
-from gpm_server.workload_store import Workload, WorkloadStore
+from gpm_server.workload_store import ModelTarget, Workload, WorkloadStore
 
 MODEL = "m1"
 PRICE = {"input": 3.0, "output": 15.0}
@@ -310,7 +310,7 @@ def test_an_ended_workload_counts_what_it_spent_so_ending_it_buys_no_fresh_day(p
 def test_the_operator_sets_a_policy_and_one_nothing_could_spend_is_refused(programs):
     workloads = programs.supervisor.workloads
     with pytest.raises(Refused, match="no hosted API in this pool serves 'nothing'"):
-        workloads.check_policy(["nothing"], {"hosted": HOSTED})
+        workloads.check_policy([ModelTarget("nothing", 30, 2)], {"hosted": HOSTED})
     created = httpx.post(f"{programs.control_url}/pool/workloads", headers={"Authorization": f"Bearer {ADMIN}"},
                          json={"name": "night", "model": BIG, **SPEC, "bursts": bursts(9.0)}, timeout=60)
     assert created.status_code == 201, created.text

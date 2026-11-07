@@ -573,6 +573,11 @@ def create_app(
         workload = state.registry.workloads.get(name) if name is not None else None
         return workload.cap(model) if workload is not None and model is not None else None
 
+    def _hosted_alone(name: Optional[str], model: Optional[str]) -> bool:
+        """Whether a workload serves this model by hosted APIs alone (D165)."""
+        workload = state.registry.workloads.get(name) if name is not None else None
+        return workload is not None and model is not None and workload.hosted_alone(model)
+
     def _ready_models(name: str) -> set[str]:
         """The workload's models one of its own ready hosts holds."""
         return {
@@ -724,7 +729,7 @@ def create_app(
         ready = [h for h in mine if h.state is HostState.READY]
         plan = getattr(state.registry.workloads.get(name), "plan", None) or {}
         # Per model (D118): a model borrows while none of the workload's ready hosts holds it.
-        waiting_for = [m for m in models if m not in _ready_models(name)]
+        waiting_for = [m for m in models if m not in _ready_models(name) and not _hosted_alone(name, m)]
         borrowing = (
             workload_state == "preparing" and bool(waiting_for) and state.config.workloads.borrow_share > 0
             and bool(plan.get("may_borrow", True))
@@ -1023,7 +1028,9 @@ def create_app(
             # Only while the workload prepares: one that could always borrow would never need
             # sizing (D115).
             may_borrow=(workload_state == "preparing" and state.config.workloads.borrow_share > 0
-                        and bool((getattr(state.registry.workloads.get(who.workload), "plan", None) or {}).get("may_borrow", True))),
+                        and bool((getattr(state.registry.workloads.get(who.workload), "plan", None) or {}).get("may_borrow", True))
+                        # A model served by hosted APIs alone never reaches a machine (D165).
+                        and not _hosted_alone(who.workload, requested)),
             borrow_share=state.config.workloads.borrow_share,
             cap=_cap_of(who.workload, requested),
         )

@@ -256,8 +256,14 @@ load has stayed above it for `after_min`, up to `max_hosts` hosts beyond it per 
 day/month budget, paid from the workload's lease (a derived budget carries it); burst hosts never
 count as the base, go first when the load falls, and are drained when the budget is reached or the
 burst taken away; `gpm workload create|policy --rent-…`. `steady` is the workload's `parallel` at
-its `latency_s` (D165 amended). **Still to build in stage 3:** a workload with no machine at all
-(hosted alone, and hosted-only models in a workload), and spend on the console.
+its `latency_s` (D165 amended).
+
+**Stage 3, third part built (same PR):** a model served by hosted APIs alone — `parallel: 0`, and
+always so for a hosted-only model — never planned, rented or borrowed for; a workload whose every
+model is so rents nothing (no `max_spend`, a lease of hours alone, serving from creation), and a
+program makes one through the SDK with no `max_spend`. Found on the way: a hosted API was counted
+as holding every build that names no engine. **Still to build in stage 3:** spend on the console,
+and an operator's reset for a provider out of money.
 5. **Live, asked first:** one small chat request to each provider the owner holds a key for, a few
    cents each, with a budget of $1.
 

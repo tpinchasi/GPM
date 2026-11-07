@@ -182,7 +182,8 @@ def test_two_groups_short_of_their_start_never_hold_each_other_back(pool):
 @pytest.mark.parametrize("body, words", [
     ({"models": [{"model": CHAT, "latency_s": 5, "parallel": 1}] * 2}, "each model is named once"),
     ({"models": [{"model": CHAT, "latency_s": 5, "parallel": 1}], "model": CHAT}, "not both"),
-    ({"models": [{"model": CHAT, "latency_s": 5, "parallel": 0}]}, "parallel must be a number above zero"),
+    ({"models": [{"model": CHAT, "latency_s": 5, "parallel": -1}]}, "parallel must be a number above zero"),
+    ({"models": [{"model": CHAT, "latency_s": 5, "parallel": 0}]}, "so it has no max_spend"),
     ({"models": [{"model": CHAT, "latency_s": 5, "parallel": 7.9}]}, "must be a whole number"),
     ({"models": [{"model": CHAT, "latency_s": 5, "parallel": 10**9}]}, "at most 100000"),
     ({"models": [{"model": CHAT, "latency_s": -1, "parallel": 1}]}, "above zero"),

@@ -29,11 +29,16 @@ ENDED_KEYS_KEPT_S = 7 * 24 * 3600
 @dataclasses.dataclass(frozen=True)
 class ModelTarget:
     """One model a workload serves, with its own target (D118): the whole answer's p95 within
-    `latency_s`, `parallel` answers at once."""
+    `latency_s`, `parallel` answers at once. `parallel` 0 is a model served by hosted APIs alone
+    (D165): no machine is rented or borrowed for it, and `latency_s` (then 0) says nothing."""
 
     model: str
     latency_s: float
     parallel: int
+
+    @property
+    def on_machines(self) -> bool:
+        return self.parallel > 0
 
     def as_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -125,7 +130,9 @@ class Workload:
     def __post_init__(self) -> None:
         if not self.targets:
             object.__setattr__(self, "targets", (ModelTarget(self.model, self.latency_s, self.parallel),))
-        if not self.groups:
+        if not self.groups and any(t.on_machines for t in self.targets):
+            # A workload made before D118 is one group of its one model. One whose models are all
+            # served by hosted APIs alone has none: nothing of it runs on a machine (D165).
             object.__setattr__(self, "groups", (Group(
                 models=(self.model,), builds={self.model: self.builds.get(self.model, self.model)},
                 hosts_at_start=self.hosts_at_start, workers_per_host=self.workers_per_host,
@@ -140,6 +147,16 @@ class Workload:
 
     def group_serving(self, model: str) -> Optional[Group]:
         return next((g for g in self.groups if model in g.models), None)
+
+    def hosted_alone(self, model: str) -> bool:
+        """Whether this model of it is served by hosted APIs alone (D165)."""
+        target = self.target(model)
+        return target is not None and not target.on_machines
+
+    @property
+    def on_machines(self) -> bool:
+        """Whether any of its models runs on a machine: one that does not rents nothing."""
+        return any(t.on_machines for t in self.targets)
 
     def cap(self, model: str) -> Optional[int]:
         """The most answers of `model` one host of its group takes at once, where it shares the

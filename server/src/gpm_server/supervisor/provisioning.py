@@ -243,8 +243,10 @@ class Provisioning:
         hours = _number(body, "hours")
         if hours > grant.max_hours:
             raise WorkloadRefused(f"at most {grant.max_hours:g} hours")
-        spend = _number(body, "max_spend")
-        if spend > grant.max_spend:
+        # A workload whose every model is served by hosted APIs alone rents nothing, and has no
+        # renting budget to say (D165): its hosted burst's budget, within the grant, is its spending.
+        spend = _number(body, "max_spend", required=any(t.on_machines for t in targets))
+        if spend is not None and spend > grant.max_spend:
             raise WorkloadRefused(f"at most ${grant.max_spend:.2f} per workload")
         idle = _number(body, "idle_end_minutes", required=False)
         idle = grant.idle_end_minutes if idle is None else idle
@@ -262,7 +264,7 @@ class Provisioning:
         req, _, _ = self._request(provisioner, body, f"{provisioner.name}-plan")
         plan = await self.supervisor.workloads.plan(req)
         plan.pop("name", None)
-        plan["within_grant"] = self._budget_refusal(provisioner, req.max_spend) is None
+        plan["within_grant"] = self._budget_refusal(provisioner, req.max_spend or 0.0) is None
         self._plans[key] = (time.monotonic(), plan)
         return plan
 
@@ -331,7 +333,7 @@ class Provisioning:
             raise WorkloadRefused(full)
         name = f"{provisioner.name}-{secrets.token_hex(3)}"
         req, idle, may_borrow = self._request(provisioner, body, name)
-        refusal = self._budget_refusal(provisioner, req.max_spend)
+        refusal = self._budget_refusal(provisioner, req.max_spend or 0.0)
         if refusal:
             raise WorkloadRefused(refusal)
         policy = parse_policy(body)

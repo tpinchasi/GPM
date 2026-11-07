@@ -9,7 +9,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 
-from .config import CatalogEntry, Variant
+from .config import HOSTED_ENGINE, CatalogEntry, Variant
 
 
 @dataclasses.dataclass(frozen=True)
@@ -39,8 +39,11 @@ def for_engine(variant: "Variant", engine_name: str) -> bool:
     written before pools could run more than one engine means, and what a plain tag means. A
     variant that names one is offered only to hosts running it: the same model is `gemma4:26b`
     to one engine and a model-hub repository to another, and handing either to the wrong engine
-    produces a host that looks ready and cannot serve.
+    produces a host that looks ready and cannot serve. A hosted API takes only builds named for
+    it (D164): they carry its price, and a plain tag is a machine's.
     """
+    if engine_name == HOSTED_ENGINE:
+        return variant.engine == HOSTED_ENGINE
     return variant.engine is None or variant.engine == engine_name
 
 
