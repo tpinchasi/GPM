@@ -1,7 +1,7 @@
 # S12 — Both API formats: OpenAI's and Anthropic's, to any model
 
-> Status: **built against fakes** (2026-11-07, D169–D170; gpm-server 0.39.0) — the owner's answers
-> below; the live check waits on provider keys.
+> Status: **built** (2026-11-07, D169–D170; gpm-server 0.39.0) and **checked live against Anthropic**
+> (2026-11-08) — the owner's answers below; other providers' live checks wait on their keys.
 > Part of the [feature list](README.md).
 
 ## The story
@@ -130,6 +130,18 @@ metering of cache reads and writes, with `price.cache_write`; the pool's refusal
 error shape; `x-api-key` read as the key and never forwarded (it would have been, before). A
 provider speaking both formats is configured as two hosts, one per engine — the simpler mechanism;
 what it gives up is one worker count shared between the two.
+
+## The live check (2026-11-08)
+
+Against Anthropic's own API, Claude Haiku 5.5, through a temporary loopback pool — nine requests,
+$0.0006 by the pool's own count. Passed: an Anthropic-format request untouched, its prompt written
+to the cache (3,328 tokens) and read back on the next; a stream; `count_tokens`, free; `x-api-key`
+as the pool's key; an OpenAI-format request translated to Claude, reading the same cache; an
+OpenAI-format stream and tool call translated; `n` refused before anything was sent. The pool's
+cost agreed with Anthropic's counts at the catalog's prices (`X-GPM-Cost-USD` is rounded to a
+millionth of a dollar; the request log keeps the exact figure). **Not yet live:** an
+Anthropic-format app reaching an OpenAI-format provider (no such key in `env`), and Ollama's and
+vLLM's own `/v1/messages`.
 
 ## Build stages
 
