@@ -24,16 +24,20 @@ how do I define hosted providers? I expect it to be like VastAI, etc." Two gaps:
 
 ## What was built
 
-- **A Providers screen** (`#providers`) with two halves: **Hosted model APIs** and **Rented
-  machines** (the existing accounts view). Rented capacity → Providers stays as it was.
-- **Add hosted API**, a five-step dialog: *Provider* (a list of known APIs, or another of either
+- **A Providers screen** (`#providers`): every provider in one list — rented accounts and hosted
+  APIs, a card each — under one summary and one **Add provider**. Rented capacity's own Providers
+  tab is gone (`#rented/providers` leads here): the owner found a screen in two halves, with the
+  accounts listed again on another screen, confusing.
+- **Add provider** begins with one list of both kinds, *Rent GPU machines* and *Hosted model APIs*.
+  A hosted API then takes five steps: *Provider* (a list of known APIs, or another of either
   format with its own address) → *Key* (a name, the address, the key, requests at once) → *Test*
   (the provider's `/models`, which spends nothing) → *Models* (tick each id the provider offers, the
   name apps ask for, its price per million tokens — the cache-write price required for Anthropic's
   format) → *Save* (the plan first, then the usual validate → plan → apply).
 - **A card per hosted API**: status (serving, needs a key, key refused, out of money, cannot be
   reached, out of service), address, where its key comes from, spend today and this month, its
-  models and prices; **Test**, **Type in / Replace key**, **Models and prices**, **Take out of
+  models and prices; **Test**, **Type in / Replace key**, **Models and prices**, **Settings** (requests
+  at once — the owner could see "at most 4" and not change it — and prompt caching), **Take out of
   service**, **Remove** (typed again; removes the models only it served).
 - **The hosted budget** — the shared workload's `pool.bursts.hosted` — set from the same screen.
 - **The key, typed once.** Kept by the supervisor in the credential store's `hosted/` directory,
@@ -52,6 +56,11 @@ how do I define hosted providers? I expect it to be like VastAI, etc." Two gaps:
 - **A router serving a hosted API added while it ran raced the file** only in tests — but a real
   gap was nearby: no endpoint could add a host at all, and the file editor had no way to append to
   a list. `append_list_item` writes a new host as a block, key by key, so it can be edited later.
+- **The console's provider dialog cleared its fields after `close()` returned**, so one dialog
+  opening right after another could have its own fields emptied. Each opening now drops what the
+  last one held as it opens, and a late close of a dialog already open again does nothing.
+- **The "Add" button on an empty list was a copy** that lost its click handler; it is now built
+  afresh.
 
 ## What it gives up
 

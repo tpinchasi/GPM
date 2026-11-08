@@ -750,7 +750,6 @@ function hostTestForm() {
 // what. Each tab answers one question an operator comes here with, and has its own address so
 // Back works and a tab can be linked to.
 const RENTED_TABS = [
-  { id: "providers", label: "Providers", about: "The provider accounts this pool rents from: each one's credential, what it can do, what it holds, and adding another." },
   { id: "hosts", label: "Hosts", about: "What this pool is renting now, what it costs, and renting one more by hand." },
   { id: "engine", label: "Profiles", about: "What each machine this pool rents holds — its models, each with the variant it fetches — and the engine, image and start they run with." },
   { id: "finding", label: "Finding machines", about: "What the pool looks for on the market, and the live market those settings let through — try values here before saving them." },
@@ -769,15 +768,18 @@ function rentedTabs(current) {
 }
 
 screens.rented = async (status) => {
-  // A pool that rents nothing yet is shown how to begin — its first provider — never a dead end (S13).
+  // Provider accounts are on the Providers screen, beside hosted APIs: one place to add any
+  // provider. An old link to the tab that held them goes there.
+  if (state.sub === "providers") { location.hash = "#providers"; return []; }
+  // A pool that rents nothing yet is shown how to begin, never a dead end (S13).
   if (!status.provider) return [el("h1", {}, "Rented capacity"),
-    el("p", { class: "muted" }, "This pool rents no machines yet. Add the provider account it would rent from; nothing is rented until a lease with a dollar cap asks for it."),
-    ...await providersTab()];
+    el("div", { class: "panel" },
+      el("p", {}, "This pool rents no machines yet. Add the provider account it would rent from on Providers; nothing is rented until a lease with a dollar cap asks for it."),
+      el("button", { class: "primary", onclick: () => { location.hash = "#providers"; } }, "Go to Providers"))];
   // With no tab named it opens on Hosts — what is being paid for now.
-  const tab = RENTED_TABS.find((t) => t.id === (state.sub || "hosts")) || RENTED_TABS[1];
+  const tab = RENTED_TABS.find((t) => t.id === (state.sub || "hosts")) || RENTED_TABS[0];
   const market = RENTED_TABS_WITH_MARKET.has(tab.id) ? await api.market(1, null, false).catch((e) => ({ error: e.message })) : null;
   const head = [el("h1", {}, "Rented capacity"), rentedTabs(tab.id), el("p", { class: "muted tab-about" }, tab.about)];
-  if (tab.id === "providers") return [...head, ...await providersTab()];
   if (tab.id === "engine") return [...head, ...engineSection(status)];
   if (tab.id === "finding") return [...head, ...searchSection(market), ...marketSection(market)];
   if (tab.id === "scaling") return [...head, limitsPanel(status), ...allocationSection(market)];
@@ -814,7 +816,7 @@ function providerPanel(status, account) {
         el("span", { class: "muted" }, status.provider.capabilities.reports_charges ? " — narrows once a charge is reported" : " — wider: this provider reports no charges"))),
     el("p", { class: "muted" }, (status.providers || []).length > 1
       ? `The first of ${status.providers.length} provider accounts. `
-      : "", el("a", { href: "#rented/providers" }, "Provider accounts →")));
+      : "", el("a", { href: "#providers" }, "Provider accounts →")));
 }
 
 // --- Provider accounts (D130, D134-D136; providers.md §7.1) ---
@@ -994,7 +996,7 @@ function providerCard(p, data) {
     el("header", { class: "provider-head" }, providerIcon(p),
       el("div", { class: "provider-title" },
         el("h2", { id: `provider-${p.connection}` }, p.display_name || p.type),
-        el("div", { class: "muted mono" }, p.connection === p.type ? p.type : `${p.connection} · ${p.type}`)),
+        el("div", { class: "muted mono" }, `${p.connection === p.type ? p.type : `${p.connection} · ${p.type}`} · rents machines`)),
       el("span", { class: `pill status ${health.tone}`, role: "status" }, health.label)),
     el("div", { class: "kv provider-facts" },
       el("div", { class: "k" }, "credential"), credentialLine(p),
@@ -1015,58 +1017,6 @@ function providerCard(p, data) {
         ? el("span", { class: "error" }, "failed") : tested.steps.some((s) => s.status === "warning")
           ? el("span", { class: "warn-text" }, "passed with a warning") : el("span", { class: "ok-text" }, "passed")),
       testResults(tested.steps)) : null);
-}
-
-async function providersTab() {
-  let data;
-  try {
-    data = await api.providers();
-  } catch (error) {
-    return [el("p", { class: "error" }, error.message), el("button", { onclick: () => render() }, "Try again")];
-  }
-  providersView.data = data;
-  if (data.renting === false) {
-    const first = el("button", { class: "primary", disabled: !data.plugins.some((p) => p.offered) || undefined,
-      onclick: () => addProviderDialog(data) }, "Add a provider account");
-    return [el("div", { class: "panel" },
-      data.restart_needed
-        ? el("p", { class: "warn-text" }, "A provider account was added to this pool's configuration. Renting starts when the pool is restarted.")
-        : el("p", {}, "No provider account yet. The first one also sets the two ceilings every rented machine is bound by: its disk, and the most it may cost an hour."),
-      data.restart_needed ? null : first)];
-  }
-  const live = data.connections.filter((p) => p.configured);
-  const searching = live.filter((p) => providerHealth(p).key === "searching").length;
-  const hosts = data.connections.reduce((n, p) => n + p.rented + p.parked, 0);
-  const burn = data.connections.reduce((n, p) => n + (p.hourly || 0), 0);
-  const offered = data.plugins.filter((p) => p.offered && !data.connections.some((c) => c.type === p.type));
-  const add = el("button", { class: "primary", disabled: !offered.length || undefined, onclick: () => addProviderDialog(data) }, "Add provider");
-  const focusAfter = providersView.focus, focusOn = providersView.focusSelector;
-  providersView.focus = null;
-  providersView.focusSelector = null;
-  if (focusAfter) {
-    // Back to the control that was used, or the card that was acted on, rather than the top.
-    setTimeout(() => (focusOn && document.querySelector(focusOn))?.focus()
-      || document.querySelector(`.provider-card[data-connection="${CSS.escape(focusAfter)}"] button`)?.focus(), 0);
-  }
-  return [
-    el("div", { class: "providers-summary panel" },
-      el("div", { class: "summary-stats" },
-        el("div", {}, el("div", { class: "stat" }, live.length), el("div", { class: "muted" }, `account${live.length === 1 ? "" : "s"}`)),
-        el("div", {}, el("div", { class: "stat" }, searching), el("div", { class: "muted" }, "searching")),
-        el("div", {}, el("div", { class: "stat" }, hosts), el("div", { class: "muted" }, "hosts held")),
-        el("div", {}, el("div", { class: "stat" }, rate(burn)), el("div", { class: "muted" }, "burning"))),
-      el("div", { class: "summary-actions" },
-        el("div", { class: "row" },
-          el("button", { onclick: (e) => run(e.target, async () => { providersView.tests = {}; await api.providers(true); }) }, "Check every account"),
-          add),
-        offered.length ? null : el("div", { class: "muted small-text" }, "Every installed provider is connected: a pool has one account per provider."))),
-    data.secure_transport ? null : el("p", { class: "warn-text" },
-      "This page is not on HTTPS or the pool's own machine, so a credential cannot be typed in here. Open the console over HTTPS, or from the pool's machine."),
-    live.length || data.connections.length ? el("div", { class: "provider-grid" }, data.connections.map((p) => providerCard(p, data)))
-      : el("div", { class: "panel" }, el("p", {}, "No provider account yet."), add.cloneNode(true)),
-    el("p", { class: "muted" }, "A pool has one account per provider. Limits — hosts, hourly burn, leases — are the pool's, across every account. "
-      + "Every search asks each account that is on, and every rental takes what is expected to cost least per worker-hour across them."),
-  ];
 }
 
 async function testSaved(button, p) {
@@ -1190,13 +1140,19 @@ function providerDialog() {
     document.body.append(dialog);
     // Whatever was typed is dropped as the dialog closes, however it closes — the fields of
     // steps no longer on screen included.
+    // The close event comes after close() returns: a dialog opened again meanwhile (one Add
+    // dialog handing over to the other) has already dropped what the earlier opening held.
     dialog.addEventListener("close", () => {
+      if (dialog.open) return;
       for (const input of providersView.secrets) input.value = "";
       providersView.secrets = [];
       providersView.opened += 1;  // anything still in flight for this opening draws nothing
       dialog.replaceChildren();
     });
   }
+  // What an earlier opening was typed into is dropped as this one opens; its fields come after.
+  for (const input of providersView.secrets) input.value = "";
+  providersView.secrets = [];
   // Whatever an earlier opening still has in flight must not draw into this one.
   providersView.opened += 1;
   return { dialog, opening: providersView.opened };
@@ -1329,8 +1285,46 @@ function editProviderDialog(p) {
   dialog.showModal();
 }
 
+// The first step of adding any provider: one list of every provider this pool can add, rented
+// and hosted alike, so an operator chooses a provider rather than which dialog to open. Each Add
+// dialog draws it with its own tiles for its own kind, and tiles that hand the other kind over.
+function providerChoices({ rented, hosted }) {
+  const r = providersView.data, h = hostedView.data;
+  const offered = r ? r.plugins.filter((p) => p.offered) : [];
+  const connected = new Set((r?.connections || []).map((c) => c.type));
+  const free = offered.filter((p) => !connected.has(p.type));
+  const taken = offered.filter((p) => connected.has(p.type));
+  return [
+    el("h3", { class: "choice-group" }, "Rent GPU machines", el("span", { class: "muted" }, " — paid by the hour")),
+    el("p", { class: "muted small-text" }, "The pool rents machines with your account at a market, starts the engine on them and serves from them. One account per provider."),
+    !r ? el("p", { class: "muted" }, "Rented accounts cannot be listed right now.")
+      : r.restart_needed ? el("p", { class: "warn-text" }, "A provider account was just added: another can be added once the pool has restarted.")
+        : el("div", { class: "plugin-tiles" }, free.length ? free.map(rented) : el("p", { class: "muted" }, "No other provider plug-in is installed.")),
+    r && !r.restart_needed && taken.length ? el("p", { class: "muted small-text" }, `Already connected: ${taken.map((p) => p.display_name).join(", ")}.`) : null,
+    el("h3", { class: "choice-group" }, "Hosted model APIs", el("span", { class: "muted" }, " — paid per token")),
+    el("p", { class: "muted small-text" }, "Requests go to the provider's API with your key, paid from the hosted budget. One not listed is added as another API of the format it speaks."),
+    h ? el("div", { class: "plugin-tiles" }, h.presets.map(hosted)) : el("p", { class: "muted" }, "Hosted APIs cannot be listed right now."),
+  ];
+}
+
+function pluginTile(p, { chosen = false, busy = false, onclick }) {
+  return el("button", { type: "button", class: `plugin-tile${chosen ? " chosen" : ""}`, disabled: busy || undefined, onclick },
+    providerIcon(p, 36),
+    el("div", {}, el("strong", {}, p.display_name),
+      el("div", { class: "muted small-text" }, busy === p.type ? "Loading…"
+        : p.loaded ? p.type : `Separate package ${p.package}${p.version ? ` ${p.version}` : ""}. Choosing it loads its code into the pool.`),
+      p.loaded ? capabilityRows(p.capabilities, { compact: true }) : null));
+}
+
+function presetTile(p, { chosen = false, onclick }) {
+  return el("button", { type: "button", class: `plugin-tile${chosen ? " chosen" : ""}`, onclick },
+    providerIcon({ display_name: p.name }, 36),
+    el("div", {}, el("strong", {}, p.name),
+      el("div", { class: "muted small-text" }, p.custom ? p.note : `${p.engine === "anthropic-api" ? "Anthropic" : "OpenAI"} format${p.note ? ` — ${p.note}` : ""}`)));
+}
+
 // Add provider: choose → name and credential → test → save, one step on screen at a time.
-function addProviderDialog(data) {
+function addProviderDialog(data, plugin = null) {
   const { dialog, opening } = providerDialog();
   const current = () => providersView.opened === opening && dialog.open;
   const draft = { step: 1, plugin: null, name: "", nameEdited: false, enabled: true, tested: null, problem: null, plan: null, busy: false,
@@ -1373,42 +1367,30 @@ function addProviderDialog(data) {
     ...buttons);
   const problem = () => (draft.problem ? el("p", { class: "error", role: "alert" }, draft.problem) : null);
 
+  async function pick(p) {
+    if (draft.busy) return;
+    let chosen = p;
+    if (!p.loaded) {
+      draft.busy = p.type; draw();
+      try { chosen = await api.plugin(p.type); } catch (error) { draft.problem = error.message; }
+      draft.busy = false;
+      if (!current()) return;
+      if (draft.problem) { draw(); return; }
+    }
+    if (!draft.plugin || draft.plugin.type !== chosen.type) {
+      // Another provider: nothing typed for the last one goes to this one.
+      secret.input.value = "";
+      if (!draft.nameEdited) draft.name = chosen.type;
+      draft.tested = null; draft.plan = null;
+    }
+    draft.plugin = chosen; draft.problem = null; draft.step = 2; secret.format(chosen.credential_format); draw();
+  }
+
   function choose() {
-    const connected = new Set(data.connections.map((c) => c.type));
-    const offered = data.plugins.filter((p) => p.offered);
-    const tile = (p) => {
-      const pick = async () => {
-        if (draft.busy) return;
-        let chosen = p;
-        if (!p.loaded) {
-          draft.busy = p.type; draw();
-          try { chosen = await api.plugin(p.type); } catch (error) { draft.problem = error.message; }
-          draft.busy = false;
-          if (!current()) return;
-          if (draft.problem) { draw(); return; }
-        }
-        if (!draft.plugin || draft.plugin.type !== chosen.type) {
-          // Another provider: nothing typed for the last one goes to this one.
-          secret.input.value = "";
-          if (!draft.nameEdited) draft.name = chosen.type;
-          draft.tested = null; draft.plan = null;
-        }
-        draft.plugin = chosen; draft.problem = null; draft.step = 2; secret.format(chosen.credential_format); draw();
-      };
-      return el("button", { type: "button", class: `plugin-tile${draft.plugin && draft.plugin.type === p.type ? " chosen" : ""}`,
-        disabled: draft.busy || undefined, onclick: pick },
-        providerIcon(p, 36),
-        el("div", {}, el("strong", {}, p.display_name),
-          el("div", { class: "muted small-text" }, draft.busy === p.type ? "Loading…"
-            : p.loaded ? p.type : `Separate package ${p.package}${p.version ? ` ${p.version}` : ""}. Choosing it loads its code into the pool.`),
-          p.loaded ? capabilityRows(p.capabilities, { compact: true }) : null));
-    };
-    const free = offered.filter((p) => !connected.has(p.type));
-    const taken = offered.filter((p) => connected.has(p.type));
-    return [el("p", { class: "muted" }, "The installed provider plug-ins. A pool has one account per provider."),
-      el("div", { class: "plugin-tiles" }, free.length ? free.map(tile) : el("p", { class: "muted" }, "No other provider plug-in is installed.")),
-      taken.length ? el("p", { class: "muted small-text" }, `Already connected: ${taken.map((p) => p.display_name).join(", ")}.`) : null,
-      problem(), nav()];
+    return [...providerChoices({
+      rented: (p) => pluginTile(p, { chosen: draft.plugin?.type === p.type, busy: draft.busy, onclick: () => pick(p) }),
+      hosted: (p) => presetTile(p, { onclick: () => { dialog.close(); addHostedDialog(hostedView.data, p); } }),
+    }), problem(), nav()];
   }
 
   function account() {
@@ -1492,7 +1474,7 @@ function addProviderDialog(data) {
           providersView.tests[draft.name] = { at: Date.now() / 1000, steps: draft.tested.steps };
           providersView.focus = draft.name;
           dialog.close();
-          if (location.hash !== "#rented/providers" && !location.hash.startsWith("#providers") && !draft.first) location.hash = "#rented/providers";
+          if (!location.hash.startsWith("#providers")) location.hash = "#providers";
           else await refresh();
           return;
         }
@@ -1520,11 +1502,12 @@ function addProviderDialog(data) {
   function draw() {
     if (!current() && draft.step !== 1) return;
     const body = draft.step === 1 ? choose() : draft.step === 2 ? account() : draft.step === 3 ? testing() : saving();
-    dialog.replaceChildren(dialogTitle("Add a provider account"), stepper(), ...body.filter(Boolean));
+    dialog.replaceChildren(dialogTitle(draft.step === 1 ? "Add a provider" : `Add a provider — ${draft.plugin.display_name}`), stepper(), ...body.filter(Boolean));
     if (draft.step === 2) (dialog.querySelector("input[data-secret]") || dialog.querySelector("#provider-name"))?.focus();
   }
   dialog.showModal();
   draw();
+  if (plugin) pick(plugin);
 }
 
 // --- hosted model APIs (S13, D171): added like a rented provider, on the Providers screen ---
@@ -1589,13 +1572,14 @@ function hostedCard(h, data) {
     el("button", { class: "small", onclick: (e) => run(e.target, () => api.changeHosted(h.id, { disabled: !h.disabled })) },
       h.disabled ? "Return to service" : "Take out of service"),
   ];
-  const aside = [el("button", { class: "small danger", onclick: (e) => removeHosted(e.target, h) }, "Remove")];
+  const aside = [el("button", { class: "small", onclick: () => hostedSettingsDialog(h) }, "Settings"),
+    el("button", { class: "small danger", onclick: (e) => removeHosted(e.target, h) }, "Remove")];
   return el("article", { class: `panel provider-card hosted-card${h.disabled ? " is-off" : ""}`, "data-hosted": h.id,
     "aria-labelledby": `hosted-${h.id}` },
     el("header", { class: "provider-head" }, providerIcon({ display_name: name }),
       el("div", { class: "provider-title" },
         el("h2", { id: `hosted-${h.id}` }, name),
-        el("div", { class: "muted mono" }, h.provider ? `${h.id} · ${h.format} format` : `${h.format} format`)),
+        el("div", { class: "muted mono" }, `${h.provider ? `${h.id} · ` : ""}hosted API, ${h.format} format`)),
       el("span", { class: `pill status ${health.tone}`, role: "status" }, health.label)),
     el("div", { class: "kv provider-facts" },
       el("div", { class: "k" }, "address"), el("div", { class: "mono" }, h.base_url),
@@ -1640,6 +1624,46 @@ async function removeHosted(button, h) {
       if (ok) await api.removeHosted(h.id, h.id);
     }
   });
+}
+
+// A hosted API's settings: how many requests it is sent at once and, in Anthropic's format,
+// whether prompts are cached. Saved through the same plan as any change, and in effect at once.
+function hostedSettingsDialog(h) {
+  const { dialog } = providerDialog();
+  const name = h.provider || h.id;
+  const workers = el("input", { id: "hosted-settings-workers", type: "number", min: "1", max: "1000", step: "1",
+    value: h.workers, required: true, "aria-describedby": "hosted-settings-workers-hint" });
+  const cache = h.format === "Anthropic" ? el("input", { id: "hosted-settings-cache", type: "checkbox", checked: h.cache_prompts || undefined }) : null;
+  const problem = el("p", { class: "error", role: "alert", hidden: true });
+  const form = el("form", { method: "dialog" });
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    const n = Number(workers.value);
+    if (!Number.isInteger(n) || n < 1 || n > 1000) { problem.textContent = "A whole number from 1 to 1000."; problem.hidden = false; return; }
+    const body = {};
+    if (n !== h.workers) body.workers = n;
+    if (cache && cache.checked !== h.cache_prompts) body.cache_prompts = cache.checked;
+    if (!Object.keys(body).length) { dialog.close(); return; }
+    try {
+      const done = await withRetype((confirm) => api.changeHosted(h.id, { ...body, ...(confirm ? { confirm } : {}) }), `Change ${name}?`);
+      if (done) { dialog.close(); await refresh(); }
+    } catch (error) {
+      problem.textContent = error.message; problem.hidden = false;
+    }
+  };
+  form.append(
+    el("header", { class: "provider-head" }, providerIcon({ display_name: name }, 32), dialogTitle(`Settings for ${name}`)),
+    el("div", { class: "field" }, el("label", { for: "hosted-settings-workers" }, "Requests at once"), workers,
+      el("small", { id: "hosted-settings-workers-hint", class: "muted" },
+        "The most this pool sends it at the same time; more wait their turn. The provider's own rate limits still apply. Takes effect at once.")),
+    cache ? el("label", { class: "pick option", for: "hosted-settings-cache" }, cache,
+      "Cache prompts — Anthropic charges less for a repeated prompt; a request can still say otherwise") : null,
+    problem,
+    el("div", { class: "row wizard-nav" }, el("button", { type: "button", onclick: () => dialog.close() }, "Cancel"),
+      el("button", { class: "primary", type: "submit" }, "Save")));
+  dialog.replaceChildren(form);
+  dialog.showModal();
+  workers.focus();
 }
 
 function hostedKeyDialog(h) {
@@ -1760,7 +1784,7 @@ function hostedModelsDialog(h) {
   dialog.showModal();
 }
 
-function addHostedDialog(data) {
+function addHostedDialog(data, preset = null) {
   const { dialog, opening } = providerDialog();
   const current = () => providersView.opened === opening && dialog.open;
   const draft = { step: 1, preset: null, id: "", idEdited: false, base_url: "", workers: 4, tested: null, models: [], plan: null, problem: null };
@@ -1778,21 +1802,20 @@ function addHostedDialog(data) {
   const problem = () => (draft.problem ? el("p", { class: "error", role: "alert" }, draft.problem) : null);
   const freeId = (base) => { let id = base, n = 2; while (taken.has(id)) id = `${base}-${n++}`; return id; };
 
+  function pickPreset(p) {
+    if (!draft.preset || draft.preset.id !== p.id) {
+      secret.input.value = ""; draft.tested = null; draft.plan = null; picker = null;
+      draft.base_url = p.base_url;
+      if (!draft.idEdited) draft.id = freeId(p.custom ? "" : p.id);
+    }
+    draft.preset = p; draft.problem = null; draft.step = 2;
+  }
+
   function choose() {
-    const tile = (p) => el("button", { type: "button", class: `plugin-tile${draft.preset && draft.preset.id === p.id ? " chosen" : ""}`,
-      onclick: () => {
-        if (!draft.preset || draft.preset.id !== p.id) {
-          secret.input.value = ""; draft.tested = null; draft.plan = null; picker = null;
-          draft.base_url = p.base_url;
-          if (!draft.idEdited) draft.id = freeId(p.custom ? "" : p.id);
-        }
-        draft.preset = p; draft.problem = null; draft.step = 2; draw();
-      } },
-      providerIcon({ display_name: p.name }, 36),
-      el("div", {}, el("strong", {}, p.name),
-        el("div", { class: "muted small-text" }, p.custom ? p.note : `${p.engine === "anthropic-api" ? "Anthropic" : "OpenAI"} format${p.note ? ` — ${p.note}` : ""}`)));
-    return [el("p", { class: "muted" }, "A hosted model API, reached with its key and paid per token from the budget below. Any provider not listed is added as another API of the format it speaks."),
-      el("div", { class: "plugin-tiles" }, data.presets.map(tile)), problem(), nav()];
+    return [...providerChoices({
+      rented: (p) => pluginTile(p, { onclick: () => { dialog.close(); addProviderDialog(providersView.data, p); } }),
+      hosted: (p) => presetTile(p, { chosen: draft.preset?.id === p.id, onclick: () => { pickPreset(p); draw(); } }),
+    }), problem(), nav()];
   }
 
   function key() {
@@ -1910,9 +1933,10 @@ function addHostedDialog(data) {
   function draw() {
     if (!current() && draft.step !== 1) return;
     const parts = [choose, key, testing, models, saving][draft.step - 1]();
-    dialog.replaceChildren(dialogTitle("Add a hosted model API"), stepper(), ...parts.filter(Boolean));
+    dialog.replaceChildren(dialogTitle(draft.step === 1 ? "Add a provider" : `Add a provider — ${draft.preset.name}`), stepper(), ...parts.filter(Boolean));
     if (draft.step === 2) (dialog.querySelector("input[data-secret]") || dialog.querySelector("#hosted-id"))?.focus();
   }
+  if (preset) pickPreset(preset);
   dialog.showModal();
   draw();
 }
@@ -1948,46 +1972,64 @@ function hostedBudgetDialog(budget) {
   dialog.showModal();
 }
 
-async function hostedSection() {
-  let data;
-  try {
-    data = await api.hosted();
-  } catch (error) {
-    return [el("p", { class: "error" }, error.message)];
-  }
-  hostedView.data = data;
-  const b = data.budget;
-  const today = data.hosts.reduce((n, h) => n + h.spend.today, 0);
-  const month = data.hosts.reduce((n, h) => n + h.spend.this_month, 0);
-  const serving = data.hosts.filter((h) => hostedHealth(h).tone === "ok").length;
-  const add = el("button", { class: "primary", onclick: () => addHostedDialog(data) }, "Add hosted API");
+// The Providers screen: every provider this pool gets capacity from, in one list with one Add
+// provider — accounts it rents machines from, paid by the hour, and hosted model APIs, paid per
+// token. Found by the owner: a screen in two halves, and a second list of accounts on Rented
+// capacity, read as two different things to set up in two places.
+screens.providers = async () => {
+  const [rented, hosted] = await Promise.all([
+    api.providers().catch((error) => ({ error: error.message })),
+    api.hosted().catch((error) => ({ error: error.message })),
+  ]);
+  providersView.data = rented.error ? null : rented;
+  hostedView.data = hosted.error ? null : hosted;
+  const accounts = rented.error ? [] : rented.connections;
+  const apis = hosted.error ? [] : hosted.hosts;
+  const b = hosted.error ? null : hosted.budget;
+  const count = accounts.filter((p) => p.configured).length + apis.length;
+  const working = accounts.filter((p) => providerHealth(p).key === "searching").length
+    + apis.filter((h) => hostedHealth(h).tone === "ok").length;
+  const burn = accounts.reduce((n, p) => n + (p.hourly || 0), 0);
+  const today = apis.reduce((n, h) => n + h.spend.today, 0);
+  const secure = (providersView.data || hostedView.data || {}).secure_transport;
+  const addButton = () => el("button", { class: "primary", disabled: (!providersView.data && !hostedView.data) || undefined,
+    onclick: () => (providersView.data ? addProviderDialog(providersView.data) : addHostedDialog(hostedView.data)) }, "Add provider");
   const limit = b ? [b.per_day ? `${money(b.per_day)} a day` : null, b.per_month ? `${money(b.per_month)} a month` : null,
     b.per_request ? `${money(b.per_request)} a request` : null].filter(Boolean).join(" · ") : "none — hosted APIs serve no shared request";
+  const focusAfter = providersView.focus, focusOn = providersView.focusSelector;
+  providersView.focus = null;
+  providersView.focusSelector = null;
+  if (focusAfter) {
+    // Back to the control that was used, or the card that was acted on, rather than the top.
+    setTimeout(() => (focusOn && document.querySelector(focusOn))?.focus()
+      || document.querySelector(`.provider-card[data-connection="${CSS.escape(focusAfter)}"] button`)?.focus(), 0);
+  }
   return [
+    el("h1", {}, "Providers"),
+    el("p", { class: "muted" }, "Where this pool gets capacity beyond its own machines: accounts it rents GPU machines from, paid by the hour, and hosted model APIs, paid per token."),
     el("div", { class: "providers-summary panel" },
       el("div", { class: "summary-stats" },
-        el("div", {}, el("div", { class: "stat" }, data.hosts.length), el("div", { class: "muted" }, `API${data.hosts.length === 1 ? "" : "s"}`)),
-        el("div", {}, el("div", { class: "stat" }, serving), el("div", { class: "muted" }, "serving")),
-        el("div", {}, el("div", { class: "stat" }, money(today)), el("div", { class: "muted" }, b?.per_day ? `of ${money(b.per_day)} today` : "today")),
-        el("div", {}, el("div", { class: "stat" }, money(month)), el("div", { class: "muted" }, b?.per_month ? `of ${money(b.per_month)} this month` : "this month"))),
+        el("div", {}, el("div", { class: "stat" }, count), el("div", { class: "muted" }, `provider${count === 1 ? "" : "s"}`)),
+        el("div", {}, el("div", { class: "stat" }, working), el("div", { class: "muted" }, "working")),
+        el("div", {}, el("div", { class: "stat" }, rate(burn)), el("div", { class: "muted" }, "renting now")),
+        el("div", {}, el("div", { class: "stat" }, money(today)), el("div", { class: "muted" }, b?.per_day ? `hosted, of ${money(b.per_day)} today` : "hosted today"))),
       el("div", { class: "summary-actions" },
-        el("div", { class: "row" }, el("button", { onclick: () => hostedBudgetDialog(b) }, "Budget"), add),
-        el("div", { class: "muted small-text" }, `Budget: ${limit}.`))),
-    data.secure_transport ? null : el("p", { class: "warn-text" },
-      "This page is not on HTTPS or the pool's own machine, so a key cannot be typed in here."),
-    data.hosts.length ? el("div", { class: "provider-grid" }, data.hosts.map((h) => hostedCard(h, data)))
-      : el("div", { class: "panel" }, el("p", {}, "No hosted API yet: Claude, GPT and open models at providers like Groq or Together, paid per token."), add.cloneNode(true)),
+        el("div", { class: "row" },
+          accounts.length ? el("button", { onclick: (e) => run(e.target, async () => { providersView.tests = {}; await api.providers(true); }) }, "Check every account") : null,
+          hostedView.data ? el("button", { onclick: () => hostedBudgetDialog(b) }, "Hosted budget") : null,
+          addButton()))),
+    rented.error ? el("p", { class: "error" }, `Rented accounts: ${rented.error}`) : null,
+    hosted.error ? el("p", { class: "error" }, `Hosted APIs: ${hosted.error}`) : null,
+    rented.restart_needed ? el("p", { class: "warn-text" }, "A provider account was added to this pool's configuration. Renting starts when the pool is restarted.") : null,
+    secure === false ? el("p", { class: "warn-text" },
+      "This page is not on HTTPS or the pool's own machine, so a credential or key cannot be typed in here. Open the console over HTTPS, or from the pool's machine.") : null,
+    count || accounts.length ? el("div", { class: "provider-grid" },
+      accounts.map((p) => providerCard(p, rented)), apis.map((h) => hostedCard(h, hosted)))
+      : el("div", { class: "panel" }, el("p", {}, "No provider yet: rent GPU machines from a market by the hour, or reach a hosted model API paid per token."), addButton()),
+    el("p", { class: "muted" }, "Rented accounts: one per provider; every rental takes what is expected to cost least per worker-hour across them, "
+      + "within the pool's limits on Rented capacity → Scaling. ", `Hosted APIs: within the hosted budget — ${limit}.`),
   ];
-}
-
-screens.providers = async (status) => [
-  el("h1", {}, "Providers"),
-  el("p", { class: "muted" }, "Where this pool gets capacity beyond its own machines: hosted model APIs, paid per token, and accounts it rents machines from, paid by the hour."),
-  el("h2", { class: "section" }, "Hosted model APIs"),
-  ...await hostedSection(),
-  el("h2", { class: "section" }, "Rented machines"),
-  ...await providersTab(),
-];
+};
 
 function limitsPanel(status) {
   return el("div", { class: "panel" }, el("h2", {}, "Limits"),
@@ -4841,7 +4883,7 @@ function handleFrame(chunk) {
     checkRelease(payload);
     document.getElementById("pool-name").textContent = payload.pool;
     if (["overview", "hosts", "models"].includes(state.screen)) render();
-    else if (state.screen === "rented" && state.sub === "providers" && !operatorIsBusy()) render();
+    else if (state.screen === "providers" && !operatorIsBusy()) render();
   }
 }
 

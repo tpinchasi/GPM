@@ -24,7 +24,6 @@ pytestmark = pytest.mark.skipif(a_browser() is None, reason="no browser here")
 
 #: Each tab, and the section headings that belong on it — and only on it.
 TABS = {
-    "providers": ["Fake market"],
     "hosts": ["Provider", "Now", "Prepare a host", "Rented and parked hosts"],
     "engine": ["Engine", "Profiles — what each rented machine holds"],
     "finding": ["What the pool looks for", "Live market — the real offer pipeline, read-only"],
@@ -71,6 +70,12 @@ def test_each_section_is_on_one_tab_and_only_the_market_tabs_ask_the_market(serv
 
         # With no tab named, it opens on Hosts — what is being paid for now.
         assert [t["text"] for t in page.js("__tabs()") if t["active"]] == ["Hosts"]
+        # Provider accounts are on the Providers screen, beside hosted APIs — not a tab here too;
+        # an old link to the tab that held them goes there.
+        assert "Providers" not in [t["text"] for t in page.js("__tabs()")]
+        page.js("location.hash = '#rented/providers'; true")
+        page.until("location.hash === '#providers' && !!document.querySelector('.provider-card')", within=30, what="the Providers screen")
+        assert "Fake market" in page.js("document.querySelector('.provider-card').textContent")
 
         everywhere = {heading for headings in TABS.values() for heading in headings}
         for tab, expected in TABS.items():
