@@ -191,7 +191,8 @@ def test_a_second_number_for_the_same_thing_is_refused_saying_where_it_went(old,
     {"min_disk_gb": 50},
 ])
 def test_every_search_names_its_disk_and_its_ceiling(policy):
-    with pytest.raises(ValueError, match="must be set"):
-        config(offer_policy=policy)
+    # The default policy may lack one while renting is not set up — and then nothing is rented
+    # (D172, tests/test_renting_setup.py); a search profile always names both.
+    assert not config(offer_policy=policy).rented.set_up
     with pytest.raises(ValueError, match="search_profiles.cheap"):
         config(search_profiles={"cheap": policy})

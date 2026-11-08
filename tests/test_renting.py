@@ -961,7 +961,8 @@ def test_driver_versions_compare_by_number_and_not_as_text():
 
 
 def _all_offers_refused(fleet):
-    fleet.rented.offer_policy = OfferPolicy(min_gpu_memory_gb=10_000)  # nothing can pass
+    # Nothing can pass — the ceilings kept, or renting is not set up and nothing is searched (D172).
+    fleet.rented.offer_policy = fleet.rented.offer_policy.model_copy(update={"min_gpu_memory_gb": 10_000})
 
 
 async def test_a_market_that_refuses_everything_is_recorded_once_not_once_a_pass(fleet):
@@ -985,7 +986,8 @@ async def test_a_market_that_changes_its_mind_is_recorded_again(fleet):
     open_lease(fleet, workers=2)
     await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
 
-    fleet.rented.offer_policy = OfferPolicy(min_disk_gb=10_000)  # refused, for another reason
+    fleet.rented.offer_policy = fleet.rented.offer_policy.model_copy(  # refused, for another reason
+        update={"min_gpu_memory_gb": 0, "min_disk_gb": 10_000})
     await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
 
     said = [e for e in fleet.events.recent(50) if e["kind"] == "no_offer"]

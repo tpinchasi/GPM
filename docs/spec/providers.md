@@ -233,11 +233,17 @@ rental's event names what was assumed. RunPod's are `assumed_download_mbps` (100
 The accounts are listed on the **Providers** screen, in one list with the hosted model APIs (§10),
 under one **Add provider** whose first step offers both kinds; Rented capacity no longer has a tab
 of its own for them (S13). **A pool that rents nothing yet** is no dead end (S13, D171): Rented
-capacity points to Providers, where the first account is added. The first account also asks for the two ceilings no
-machine is rented without — `offer_policy.min_disk_gb` and `max_all_in_hourly` — the engine rented
-machines run, and optionally which models they hold, and writes the `rented:` section with them.
-Renting starts when the pool next starts: the supervisor builds its renting machinery at start,
-and the plan says so. Until then the screen says a restart is waiting.
+capacity points to Providers, where the first account is added. **The account is only an
+account** (D172): it writes a `rented:` section with `providers` alone, and the pool rents nothing
+until renting is set up — on Rented capacity, which until then shows only a **Set up renting**
+panel: the disk each machine is rented with and the most one may cost an hour, all-in
+(`offer_policy.min_disk_gb`, `max_all_in_hourly`, D108), the engine rented machines run, and the
+models they are rented for — only models that engine has a build of are offered, and each other is
+listed with why (no build for it, or something the engine cannot serve). Saving it is a loosening,
+typed again. Until both ceilings are set no lease that may rent opens. The renting machinery is
+built when the pool starts, so the first account is in use after a restart; the plan says so, and
+the screens say a restart is waiting. `POST /pool/providers` still takes `first` (both ceilings,
+the engine, the models) to do both in one request.
 
 A summary across accounts (how many, how many searching, hosts held, burn) with **Add provider**
 and **Check every account**, then a card per connection, every card laid out alike so two read
@@ -308,6 +314,8 @@ of the decision log.
 |---|---|
 | `GET /pool/providers` | Every connection: type, enabled, capabilities, icon, credential state (never its value), credit, quota use, hosts and burn; and the installed plug-ins (`fresh=true` asks each account now) |
 | `GET /pool/providers/plugins/{type}` | Load the plug-in an operator chose on Add provider, and how it presents itself |
+| `GET /pool/renting` | Whether renting is set up and what it lacks; the current ceilings, engine and models; for each rented engine, which of the pool's models it has a build of and why each other is left out (D172) |
+| `POST /pool/renting/setup` | Set up renting: `min_disk_gb`, `max_all_in_hourly`, `engine` (vllm, ollama), `models` (where hosts declare their models); `plan_only`; typed again (D172) |
 | `POST /pool/providers/test` | Test an unsaved connection, credential included; saves nothing |
 | `POST /pool/providers`, `PATCH /pool/providers/{name}` | Add or change a connection through validate → plan → apply; enabling is retyped like any loosening |
 | `PUT /pool/providers/{name}/credential`, `DELETE …/credential` | Set or replace, or remove, the credential; answers with its state only |

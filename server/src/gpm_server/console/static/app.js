@@ -107,6 +107,9 @@ const api = {
   setHostedKey: (id, credential) => call("PUT", `/pool/hosted/${encodeURIComponent(id)}/credential`, { credential }),
   removeHostedKey: (id) => call("DELETE", `/pool/hosted/${encodeURIComponent(id)}/credential`),
   setHostedBudget: (body) => call("PATCH", "/pool/hosted-budget", body),
+  // Renting, set up once an account is in (S14, D172).
+  renting: () => call("GET", "/pool/renting"),
+  setUpRenting: (body) => call("POST", "/pool/renting/setup", body),
 };
 
 // --- small helpers ---
@@ -120,12 +123,17 @@ const el = (tag, attrs = {}, ...children) => {
     else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
     else node.setAttribute(key, value === true ? "" : value);
   }
+  return fill(node, ...children);
+};
+// Appends what is there and skips null, undefined and false — a node's own append() would write
+// "null" on the page for a part left out.
+function fill(node, ...children) {
   for (const child of children.flat()) {
     if (child === null || child === undefined || child === false) continue;
     node.append(child.nodeType ? child : document.createTextNode(String(child)));
   }
   return node;
-};
+}
 const money = (n) => (n === null || n === undefined ? "—" : `$${Number(n).toFixed(4)}`);
 const rate = (n) => (n === null || n === undefined ? "—" : `$${Number(n).toFixed(3)}/h`);
 const clock = (ts) => (ts ? new Date(ts * 1000).toLocaleTimeString() : "—");
@@ -771,11 +779,22 @@ screens.rented = async (status) => {
   // Provider accounts are on the Providers screen, beside hosted APIs: one place to add any
   // provider. An old link to the tab that held them goes there.
   if (state.sub === "providers") { location.hash = "#providers"; return []; }
-  // A pool that rents nothing yet is shown how to begin, never a dead end (S13).
-  if (!status.provider) return [el("h1", {}, "Rented capacity"),
-    el("div", { class: "panel" },
-      el("p", {}, "This pool rents no machines yet. Add the provider account it would rent from on Providers; nothing is rented until a lease with a dollar cap asks for it."),
-      el("button", { class: "primary", onclick: () => { location.hash = "#providers"; } }, "Go to Providers"))];
+  // A pool that rents nothing yet is shown how to begin, never a dead end (S13): an account
+  // on Providers first, then renting set up here (S14, D172). Until both ceilings are set the
+  // pool rents nothing, and this screen is only that.
+  if (!status.provider || (status.renting && !status.renting.set_up)) {
+    let view;
+    try {
+      view = await api.renting();
+    } catch (error) {
+      return [el("h1", {}, "Rented capacity"), el("p", { class: "error" }, error.message)];
+    }
+    if (!view.account) return [el("h1", {}, "Rented capacity"),
+      el("div", { class: "panel" },
+        el("p", {}, "This pool rents no machines yet. Add the provider account it would rent from on Providers, then set up renting here; nothing is rented until a lease with a dollar cap asks for it."),
+        el("button", { class: "primary", onclick: () => { location.hash = "#providers"; } }, "Go to Providers"))];
+    return [el("h1", {}, "Rented capacity"), ...rentingSetup(view)];
+  }
   // With no tab named it opens on Hosts — what is being paid for now.
   const tab = RENTED_TABS.find((t) => t.id === (state.sub || "hosts")) || RENTED_TABS[0];
   const market = RENTED_TABS_WITH_MARKET.has(tab.id) ? await api.market(1, null, false).catch((e) => ({ error: e.message })) : null;
@@ -786,6 +805,87 @@ screens.rented = async (status) => {
   if (tab.id === "teardown") return [...head, ...teardownSection(market)];
   return [...head, ...await rentedHostsTab(status)];
 };
+
+// Setting up renting, once a provider account is in (S14, D172): the two ceilings no machine
+// is rented without, the engine rented machines run, and the models they are rented for —
+// offering only models that engine has a build of, and saying why each other is left out.
+function rentingSetup(view) {
+  const restart = view.restart_needed
+    ? el("p", { class: "warn-text" }, "The provider account is in this pool's configuration, and the pool uses it once restarted.")
+    : null;
+  if (view.set_up) return [restart, el("div", { class: "panel" }, el("p", {}, "Renting is set up. It starts when the pool is restarted."))];
+  const cur = view.current || {};
+  const reach = (engine) => view.engines[engine].can.length;
+  const f = { disk: cur.min_disk_gb ?? "", hourly: cur.max_all_in_hourly ?? "",
+    engine: cur.engine && view.engines[cur.engine] ? cur.engine : (reach("ollama") > reach("vllm") ? "ollama" : "vllm"),
+    models: [...(cur.models || [])] };
+  const choose = view.models_per_host === "declared" && !view.profiles;
+  const panel = el("div", { class: "panel renting-setup" });
+  const problem = el("p", { class: "error", role: "alert", hidden: true });
+  const say = (text) => { problem.textContent = text; problem.hidden = !text; };
+
+  function modelsField() {
+    const { can, cannot } = view.engines[f.engine];
+    const named = f.engine === "vllm" ? "vLLM" : "Ollama";
+    f.models = f.models.filter((m) => can.includes(m));
+    const left = Object.entries(cannot).map(([name, why]) => el("li", {}, el("span", { class: "mono" }, name), ` — ${why}`));
+    const leftOut = left.length ? el("div", { class: "muted small-text" }, `Not offered on ${named}:`, el("ul", {}, left)) : null;
+    if (!choose) {
+      return el("div", { class: "field" }, el("span", {}, view.profiles ? "The pool's model profiles say what each rented machine holds." : "Every rented machine holds the pool's whole set."),
+        left.length ? el("p", { class: "warn-text" }, `Some of the set cannot be rented on ${named}: choose the other engine, or add a ${named} build on Models.`) : null, leftOut);
+    }
+    if (!can.length) {
+      return el("div", { class: "field" }, el("p", { class: "warn-text" }, `No model of this pool has a build for ${named}. Choose the other engine, or add a ${named} build on Models.`), leftOut);
+    }
+    const boxes = can.map((name) => {
+      const box = el("input", { type: "checkbox", value: name, checked: f.models.includes(name) || undefined });
+      box.onchange = () => { f.models = box.checked ? [...f.models, name] : f.models.filter((m) => m !== name); };
+      return el("label", { class: "pick" }, box, el("span", { class: "mono" }, name));
+    });
+    return el("div", { class: "field" }, el("span", {}, "Models machines are rented for"), el("div", { class: "row" }, boxes),
+      el("small", { class: "muted" }, "A machine is rented for one of these when its requests wait; the rest stay on your own machines."), leftOut);
+  }
+
+  function draw() {
+    const disk = el("input", { id: "setup-disk", type: "number", min: "1", step: "1", value: f.disk, required: true });
+    disk.oninput = () => { f.disk = disk.value; };
+    const hourly = el("input", { id: "setup-hourly", type: "number", min: "0", step: "0.01", value: f.hourly, required: true });
+    hourly.oninput = () => { f.hourly = hourly.value; };
+    const engine = el("select", { id: "setup-engine" }, ["vllm", "ollama"].map((e) => el("option", { value: e, selected: f.engine === e || undefined },
+      `${e === "vllm" ? "vLLM" : "Ollama"} — ${reach(e)} of the pool's models`)));
+    engine.onchange = () => { f.engine = engine.value; say(""); draw(); };
+    const save = el("button", { class: "primary", type: "button" }, "Set up renting");
+    save.onclick = async () => {
+      say("");
+      if (!(Number(f.disk) >= 1)) return say("Say the disk each machine is rented with, in GB.");
+      if (!(Number(f.hourly) > 0)) return say("Say the most one machine may cost an hour, all-in, in dollars.");
+      if (choose && !f.models.length) return say("Tick at least one model machines are rented for.");
+      const body = { min_disk_gb: Number(f.disk), max_all_in_hourly: Number(f.hourly), engine: f.engine, ...(choose ? { models: f.models } : {}) };
+      save.disabled = true;
+      try {
+        const done = await withRetype((confirm) => api.setUpRenting({ ...body, ...(confirm ? { confirm } : {}) }), "Set up renting?");
+        if (done) { await refresh(); return; }
+      } catch (error) {
+        say(error.message);
+      }
+      save.disabled = false;
+    };
+    panel.replaceChildren(
+      el("h2", {}, "Set up renting"),
+      el("p", { class: "muted" }, "The provider account is in. Before any machine is rented, say what one may be: no lease that rents opens until both numbers below are set, and every rental is still under a lease with a dollar cap."),
+      el("div", { class: "field" }, el("label", { for: "setup-disk" }, "Disk each machine is rented with (GB)"), disk,
+        el("small", { class: "muted" }, "Enough for the models a machine holds; only machines offering this much are considered.")),
+      el("div", { class: "field" }, el("label", { for: "setup-hourly" }, "The most one machine may cost an hour, all-in ($)"), hourly,
+        el("small", { class: "muted" }, "No bid or rental goes above it.")),
+      el("div", { class: "field" }, el("label", { for: "setup-engine" }, "Engine on rented machines"), engine),
+      modelsField(),
+      problem,
+      el("div", { class: "row" }, save),
+      el("p", { class: "muted small-text" }, "Everything else — where to search, scaling, tear-down — appears here once renting is set up."));
+  }
+  draw();
+  return [restart, panel];
+}
 
 // Today's use of the provider's daily search quota (D121): counted from the pool's own searches,
 // and the provider's own figure once it has refused.
@@ -1222,7 +1322,7 @@ function credentialDialog(p, data) {
       await refresh();
     } catch (error) { result.replaceChildren(el("p", { class: "error" }, error.message)); }
   };
-  form.append(
+  fill(form,
     el("header", { class: "provider-head" }, providerIcon(p, 32), dialogTitle(`${stored ? "Replace" : "Type in"} the credential for ${providerLabel(p)}`)),
     p.holds ? el("p", { class: "muted" }, `The pool holds ${p.holds} host(s) or volume(s) here, so the new credential must see them — a key to another account is refused.`) : null,
     secret.node,
@@ -1270,7 +1370,7 @@ function editProviderDialog(p) {
       note.replaceChildren(el("p", { class: "error" }, error.message));
     }
   };
-  form.append(
+  fill(form,
     el("header", { class: "provider-head" }, providerIcon(p, 32), dialogTitle(`Settings for ${providerLabel(p)}`)),
     el("div", { class: "field" }, el("label", { for: "provider-prior" }, "Interruptions expected per hour"), prior,
       el("small", { id: "provider-prior-hint", class: "muted" }, "For a machine with no history here, how often an interruptible host is taken away. Empty uses the pool's default.")),
@@ -1327,35 +1427,9 @@ function presetTile(p, { chosen = false, onclick }) {
 function addProviderDialog(data, plugin = null) {
   const { dialog, opening } = providerDialog();
   const current = () => providersView.opened === opening && dialog.open;
-  const draft = { step: 1, plugin: null, name: "", nameEdited: false, enabled: true, tested: null, problem: null, plan: null, busy: false,
-    first: data.renting === false ? { min_disk_gb: "", max_all_in_hourly: "", engine: "vllm", models: [] } : null };
+  // An account is only an account: renting is set up on its own, on Rented capacity (D172).
+  const draft = { step: 1, plugin: null, name: "", nameEdited: false, enabled: true, tested: null, problem: null, plan: null, busy: false };
   const secret = secretField("Credential", SECRET_HINT);
-  // The first account also starts the pool's renting: the two ceilings no machine is rented
-  // without, which engine rented machines run, and which models they hold (S13).
-  const firstBody = () => (draft.first ? { first: { min_disk_gb: Number(draft.first.min_disk_gb), max_all_in_hourly: Number(draft.first.max_all_in_hourly),
-    engine: draft.first.engine, ...(draft.first.models.length ? { models: draft.first.models } : {}) } } : {});
-  function firstFields() {
-    if (!draft.first) return null;
-    const f = draft.first;
-    const disk = el("input", { id: "first-disk", type: "number", min: "1", step: "1", value: f.min_disk_gb, required: true });
-    disk.oninput = () => { f.min_disk_gb = disk.value; };
-    const hourly = el("input", { id: "first-hourly", type: "number", min: "0", step: "0.01", value: f.max_all_in_hourly, required: true });
-    hourly.oninput = () => { f.max_all_in_hourly = hourly.value; };
-    const engine = el("select", { id: "first-engine" }, ["vllm", "ollama"].map((e) => el("option", { value: e, selected: f.engine === e || undefined }, e === "vllm" ? "vLLM" : "Ollama")));
-    engine.onchange = () => { f.engine = engine.value; };
-    const names = (state.status?.model_set || []);
-    const boxes = names.map((name) => {
-      const box = el("input", { type: "checkbox", checked: f.models.includes(name) || undefined });
-      box.onchange = () => { f.models = box.checked ? [...f.models, name] : f.models.filter((m) => m !== name); };
-      return el("label", { class: "pick" }, box, el("span", { class: "mono" }, name));
-    });
-    return el("fieldset", { class: "first-renting" }, el("legend", {}, "This pool's first rented machines"),
-      el("div", { class: "field" }, el("label", { for: "first-disk" }, "Disk each machine is rented with (GB)"), disk),
-      el("div", { class: "field" }, el("label", { for: "first-hourly" }, "The most one machine may cost an hour, all-in ($)"), hourly,
-        el("small", { class: "muted" }, "No bid goes above it. Change both later on Rented capacity → Finding machines.")),
-      el("div", { class: "field" }, el("label", { for: "first-engine" }, "Engine on rented machines"), engine),
-      names.length ? el("div", { class: "field" }, el("span", {}, "Models they hold (none ticked: any the pool needs)"), el("div", { class: "row" }, boxes)) : null);
-  }
   const STEPS = ["Provider", "Account", "Test", "Save"];
 
   const stepper = () => el("ol", { class: "stepper", "aria-label": "Steps" }, STEPS.map((label, i) =>
@@ -1403,19 +1477,15 @@ function addProviderDialog(data, plugin = null) {
       event.preventDefault();
       if (!/^[a-z][a-z0-9_-]{0,31}$/.test(draft.name)) { draft.problem = "A lower-case name: letters, digits, - and _, starting with a letter."; draw(); return; }
       if (p.takes_credential && data.secure_transport && !secret.input.value.trim()) { draft.problem = "Paste the account's credential."; draw(); return; }
-      if (draft.first && !(Number(draft.first.min_disk_gb) >= 1 && Number(draft.first.max_all_in_hourly) > 0)) {
-        draft.problem = "Say the disk each machine is rented with and the most one may cost an hour: no machine is rented without both."; draw(); return;
-      }
       draft.problem = null; draft.step = 3; draft.tested = null; draw(); test();
     };
-    form.append(
+    fill(form,
       el("header", { class: "provider-head" }, providerIcon(p, 32), el("div", {}, el("strong", {}, p.display_name), capabilityRows(p.capabilities, { compact: true }))),
       el("div", { class: "field" }, el("label", { for: "provider-name" }, "Name in this pool"), name,
         el("small", { id: "provider-name-hint", class: "muted" }, "How hosts, spend and decisions name this account. It cannot be reused for another provider later.")),
       p.takes_credential
         ? (data.secure_transport ? secret.node : el("p", { class: "error" }, "Not on HTTPS or the pool's own machine: a credential cannot be sent from here. It can be set in the supervisor's environment instead."))
         : el("p", { class: "muted" }, "This plug-in reads its own credential from its settings or environment."),
-      firstFields(),
       problem(), nav(el("button", { type: "submit", class: "primary" }, "Test it")));
     return [form];
   }
@@ -1450,7 +1520,7 @@ function addProviderDialog(data, plugin = null) {
   async function savePlan() {
     let plan;
     try {
-      plan = (await api.addProvider({ name: draft.name, type: draft.plugin.type, enabled: draft.enabled, plan_only: true, ...firstBody() })).changes;
+      plan = (await api.addProvider({ name: draft.name, type: draft.plugin.type, enabled: draft.enabled, plan_only: true })).changes;
     } catch (error) {
       plan = [{ detail: error.message, refused: error.message }];
     }
@@ -1466,7 +1536,7 @@ function addProviderDialog(data, plugin = null) {
     save.onclick = async () => {
       save.disabled = true;
       const value = secret.input.value.trim();
-      const body = { name: draft.name, type: draft.plugin.type, enabled: draft.enabled, ...(value ? { credential: value } : {}), ...firstBody() };
+      const body = { name: draft.name, type: draft.plugin.type, enabled: draft.enabled, ...(value ? { credential: value } : {}) };
       try {
         const done = await withRetype((confirm) => api.addProvider({ ...body, ...(confirm ? { confirm } : {}) }),
           `Add ${draft.plugin.display_name} (${draft.name}) and rent from it?`);
@@ -1651,7 +1721,7 @@ function hostedSettingsDialog(h) {
       problem.textContent = error.message; problem.hidden = false;
     }
   };
-  form.append(
+  fill(form,
     el("header", { class: "provider-head" }, providerIcon({ display_name: name }, 32), dialogTitle(`Settings for ${name}`)),
     el("div", { class: "field" }, el("label", { for: "hosted-settings-workers" }, "Requests at once"), workers,
       el("small", { id: "hosted-settings-workers-hint", class: "muted" },
@@ -1688,7 +1758,7 @@ function hostedKeyDialog(h) {
     }
   };
   const c = h.credential || {};
-  form.append(dialogTitle(`${c.source === "stored" ? "Replace" : "Type in"} the key for ${h.provider || h.id}`),
+  fill(form, dialogTitle(`${c.source === "stored" ? "Replace" : "Type in"} the key for ${h.provider || h.id}`),
     el("p", { class: "muted" }, "Tested against the provider's list of models, which costs nothing, before it is kept. ",
       "It is sent only to ", el("span", { class: "mono" }, h.base_url), "."),
     secret.node, problem,
@@ -1837,7 +1907,7 @@ function addHostedDialog(data, preset = null) {
       if (!secret.input.value.trim()) { draft.problem = "Paste the provider's key."; draw(); return; }
       draft.problem = null; draft.step = 3; draft.tested = null; draw(); test();
     };
-    form.append(
+    fill(form,
       el("header", { class: "provider-head" }, providerIcon({ display_name: p.name }, 32), el("div", {}, el("strong", {}, p.name),
         el("div", { class: "muted small-text" }, `${p.engine === "anthropic-api" ? "Anthropic" : "OpenAI"} format`))),
       el("div", { class: "field" }, el("label", { for: "hosted-id" }, "Name in this pool"), id,
@@ -2020,7 +2090,9 @@ screens.providers = async () => {
           addButton()))),
     rented.error ? el("p", { class: "error" }, `Rented accounts: ${rented.error}`) : null,
     hosted.error ? el("p", { class: "error" }, `Hosted APIs: ${hosted.error}`) : null,
-    rented.restart_needed ? el("p", { class: "warn-text" }, "A provider account was added to this pool's configuration. Renting starts when the pool is restarted.") : null,
+    rented.restart_needed ? el("p", { class: "warn-text" }, "A provider account was added to this pool's configuration. The pool uses it once restarted.") : null,
+    state.status?.renting && !state.status.renting.set_up ? el("p", { class: "warn-text" },
+      "Renting is not set up yet, so nothing is rented. ", el("a", { href: "#rented" }, "Set it up on Rented capacity →")) : null,
     secure === false ? el("p", { class: "warn-text" },
       "This page is not on HTTPS or the pool's own machine, so a credential or key cannot be typed in here. Open the console over HTTPS, or from the pool's machine.") : null,
     count || accounts.length ? el("div", { class: "provider-grid" },

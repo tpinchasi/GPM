@@ -330,7 +330,7 @@ def test_the_hosted_budget_is_set_from_the_console(pool):
 # --- the first rented provider, from a pool that rents nothing (the Rented capacity dead end) ---
 
 
-def test_a_pool_that_rents_nothing_adds_its_first_provider_with_its_two_ceilings(pool, monkeypatch):
+def test_a_pool_that_rents_nothing_may_add_its_first_provider_with_renting_set_up_at_once(pool, monkeypatch):
     from gpm_server.providers import FakeProvider, presentation
 
     market = FakeProvider()
@@ -345,10 +345,9 @@ def test_a_pool_that_rents_nothing_adds_its_first_provider_with_its_two_ceilings
     assert listed.json()["connections"] == [] and listed.json()["renting"] is False
     assert [p["type"] for p in listed.json()["plugins"]] == ["fake"]
 
+    # The account alone is accepted and rents nothing until renting is set up (D172,
+    # tests/test_renting_setup.py); `first` still sets renting up in the same request.
     body = {"name": "market", "type": "fake", "credential": "fake-rented-credential-0001"}
-    unbounded = api(pool, "POST", "/pool/providers", json=body)
-    assert unbounded.status_code == 400 and unbounded.json()["error"] == "first_provider", "no ceiling is assumed"
-
     body["first"] = {"min_disk_gb": 60, "max_all_in_hourly": 0.8, "engine": "ollama", "models": ["llama"]}
     answer = api(pool, "POST", "/pool/providers", json=body)
     if answer.status_code == 400 and answer.json().get("error") == "not_confirmed":

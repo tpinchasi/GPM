@@ -224,13 +224,16 @@ def plan_changes(
         changes.append(Change(
             "providers",
             "the provider accounts change" + (f": {'; '.join(said)}" if said else "")
-            + (". Renting is new to this pool: it starts when the supervisor restarts" if fresh
+            + ((". Renting is new to this pool: it starts when the supervisor restarts" if candidate.rented.set_up
+                else ". The account is in use when the supervisor restarts; nothing is rented until renting is set up")
+               if fresh
                else "" if waits and not (added or removed or turned_on or turned_off) else ". The rest takes effect at once (D135)"
                if waits else ". It takes effect at once (D135)"),
             needs_restart=fresh or bool(waits),
             restarts="supervisor",
             # Renting somewhere new is a loosening: typed again, like any (D129).
-            requires_retype=turned_on[0] if turned_on else None,
+            # An account in a pool not set up to rent spends nothing (D172).
+            requires_retype=turned_on[0] if turned_on and candidate.rented is not None and candidate.rented.set_up else None,
             refused=refusal,
         ))
 
@@ -407,7 +410,7 @@ def _limit_changes(current: PoolConfig, candidate: PoolConfig, rented: Sequence[
         loosened = new_burn is None or (old_burn is not None and new_burn > old_burn)
         if loosened:
             detail = f"the overall hourly burn cap goes from {says(old_burn)} to {says(new_burn)}"
-            if new_burn is None and candidate.rented is not None:
+            if new_burn is None and candidate.rented is not None and candidate.rented.set_up:
                 ceiling = candidate.rented.max_all_in_hourly
                 bound = new_limits.max_rented_hosts * ceiling
                 detail += (f"; spending is then bounded per host — {new_limits.max_rented_hosts} host(s) × "
@@ -425,16 +428,40 @@ def _limit_changes(current: PoolConfig, candidate: PoolConfig, rented: Sequence[
 
     old_rented, new_rented = current.rented, candidate.rented
     if (old_rented is None) != (new_rented is None):
+        # An account added before renting is set up spends nothing, so nothing to type again (D172).
         changes.append(Change(
             "rented_section",
-            "rented capacity is switched on; a lease will be able to spend" if new_rented
+            "rented capacity is switched on; a lease will be able to spend" if new_rented and new_rented.set_up
+            else ("a provider account is added; nothing is rented until renting is set up — "
+                  + " and ".join(new_rented.setup_missing())) if new_rented
             else "rented capacity is removed; the pool will not be able to rent at all",
-            requires_retype="rented" if new_rented else None,
+            requires_retype="rented" if new_rented and new_rented.set_up else None,
         ))
     elif old_rented is not None and new_rented is not None:
+        if old_rented.set_up and not new_rented.set_up:
+            # Once set, the ceilings are changed, never taken away: a pool holding machines would
+            # have nothing to re-bid them under (D172).
+            changes.append(Change(
+                "renting_unset",
+                "renting would no longer be set up: " + " and ".join(new_rented.setup_missing()) + " would be missing",
+                refused="the disk a machine is rented with and the most one may cost an hour can be changed, not "
+                        "removed; to stop renting, turn the provider account off or remove it",
+            ))
+        elif not old_rented.set_up and new_rented.set_up:
+            policy = new_rented.policy_in_force
+            models = candidate._rented_models()
+            changes.append(Change(
+                "renting_set_up",
+                f"renting is set up: machines with {policy.min_disk_gb:g} GB of disk, at most "
+                f"${policy.max_all_in_hourly:.2f}/h each all-in, running {candidate.rented_engine()}"
+                + (f", for {', '.join(models)}" if models else "")
+                + " — a lease with a dollar cap is still what rents one",
+                requires_retype=f"{policy.max_all_in_hourly:.2f}",
+            ))
         # The search in force is what the pool rents with (D108) — the file's own policy, or the
         # profile it names — so switching profile can raise the price as surely as editing it.
         old_policy, new_policy = old_rented.policy_in_force, new_rented.policy_in_force
+        both_set_up = old_rented.set_up and new_rented.set_up
         # Raising or removing a price ceiling lets the pool pay more, so it is loosening, and
         # loosening is typed again.
         for field, what, unit in (
@@ -443,8 +470,8 @@ def _limit_changes(current: PoolConfig, candidate: PoolConfig, rented: Sequence[
             ("max_download_per_gb", "the download price the pool will accept", "/GB"),
         ):
             old_cap, new_cap = getattr(old_policy, field), getattr(new_policy, field)
-            if old_cap == new_cap:
-                continue
+            if old_cap == new_cap or (field == "max_all_in_hourly" and not both_set_up):
+                continue  # renting set up, or refused unset, is said above
             loosened = new_cap is None or (old_cap is not None and new_cap > old_cap)
             detail = f"{what} goes from {_price(old_cap, unit)} to {_price(new_cap, unit)}"
             if not loosened:
@@ -460,7 +487,7 @@ def _limit_changes(current: PoolConfig, candidate: PoolConfig, rented: Sequence[
                 f"{field}_{'raised' if loosened else 'lowered'}", detail,
                 requires_retype=("none" if new_cap is None else f"{new_cap:.3f}") if loosened else None,
             ))
-        if old_policy.min_disk_gb != new_policy.min_disk_gb:
+        if both_set_up and old_policy.min_disk_gb != new_policy.min_disk_gb:
             changes.append(Change(
                 "disk",
                 f"hosts are rented with {new_policy.min_disk_gb:g} GB of disk, from "

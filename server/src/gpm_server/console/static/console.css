@@ -220,5 +220,5 @@ h2.section { margin: 26px 0 10px; font-size: 18px; }
 .model-row input.mono { width: 14em; }
 .hosted-card table.compact { width: 100%; font-size: 13px; }
 .hosted-card table.compact caption { caption-side: bottom; text-align: left; padding-top: 4px; }
-fieldset.first-renting { border: 1px solid var(--line, rgba(127,127,127,.3)); border-radius: 8px; padding: 10px 12px; margin: 10px 0; }
-fieldset.first-renting legend { padding: 0 6px; font-weight: 600; }
+.renting-setup { max-width: 640px; }
+.renting-setup ul { margin: 4px 0 0 18px; padding: 0; }

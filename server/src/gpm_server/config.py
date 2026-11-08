@@ -1263,11 +1263,11 @@ class RentedConfig(BaseModel):
 
     @model_validator(mode="after")
     def _every_search_says_what_it_rents(self) -> "RentedConfig":
-        """Every policy the pool may search with names the disk it rents and the most it pays
-        (D108): a profile switched on later is as able to spend as the default one."""
-        policies = {"offer_policy": self.offer_policy} | {
-            f"search_profiles.{name}": policy for name, policy in self.search_profiles.items()
-        }
+        """Every search profile names the disk it rents and the most it pays (D108): a profile
+        switched on later is as able to spend as the default one. The default policy may name
+        neither yet: a provider account is added before renting is set up, and until both are
+        named the pool rents nothing (D172)."""
+        policies = {f"search_profiles.{name}": policy for name, policy in self.search_profiles.items()}
         for where, policy in policies.items():
             if policy.min_disk_gb <= 0:
                 raise ValueError(
@@ -1305,11 +1305,27 @@ class RentedConfig(BaseModel):
         return self.policy_in_force.min_disk_gb
 
     @property
-    def max_all_in_hourly(self) -> float:
-        """The most the pool pays per host per hour, all-in: the search in force's (D108)."""
-        ceiling = self.policy_in_force.max_all_in_hourly
-        assert ceiling is not None, "refused at load"
-        return ceiling
+    def max_all_in_hourly(self) -> Optional[float]:
+        """The most the pool pays per host per hour, all-in: the search in force's (D108). None
+        while renting is not set up, and then nothing is rented (D172)."""
+        return self.policy_in_force.max_all_in_hourly
+
+    @property
+    def set_up(self) -> bool:
+        """Whether the pool may rent at all: the search in force names both the disk a host is
+        rented with and the most one may cost an hour (D108, D172). A provider account can be
+        added before; until then no lease opens and nothing is rented."""
+        return not self.setup_missing()
+
+    def setup_missing(self) -> list[str]:
+        """What renting still needs before anything is rented, in an operator's words."""
+        policy = self.policy_in_force
+        missing = []
+        if policy.min_disk_gb <= 0:
+            missing.append("the disk each machine is rented with (offer_policy.min_disk_gb)")
+        if policy.max_all_in_hourly is None:
+            missing.append("the most one machine may cost an hour (offer_policy.max_all_in_hourly)")
+        return missing
 
     #: The provider connections, by name (D129). The single-provider shape — `provider` and
     #: `provider_settings` — still loads, as one connection named after its type.
@@ -1480,7 +1496,7 @@ class PoolConfig(BaseModel):
         for host in self.hosts:
             if not host.disabled:
                 covered.update(self.models_held_by(host))
-        if self.rented is not None:
+        if self.rented is not None and self.rented.set_up:
             covered.update(self._rented_models())
         return [name for name in self.pool.model_set if name not in covered]
 
@@ -1643,7 +1659,7 @@ class PoolConfig(BaseModel):
         covered: set[str] = set()
         for host in self.hosts:
             covered.update(self.models_held_by(host))
-        if self.rented is not None:
+        if self.rented is not None and self.rented.set_up:
             covered.update(self._rented_models())
         missing = [name for name in self.pool.model_set if name not in covered]
         if missing:
@@ -1699,7 +1715,8 @@ class PoolConfig(BaseModel):
         # several models always runs the machine's router where the engine needs one (D111).
         if self.rented is not None and self.rented.rent_profiles:
             return
-        if self.rented is not None and self.pool.models_per_host == "all":
+        # What a pool that is not set up to rent would rent is judged when it is (D172).
+        if self.rented is not None and self.rented.set_up and self.pool.models_per_host == "all":
             asked = list(self.pool.model_set)
             engine = self.rented_engine()
             if len(asked) > 1 and holds_one(engine, behind_proxy=self.rented.engine_proxy):
@@ -1720,8 +1737,9 @@ class PoolConfig(BaseModel):
         no event, just a model that is never served however many machines are bought for it.
         The same model is a plain tag to one engine and a model-hub repository to another, so a
         pool that changes its rented engine has to say what the new one should fetch (D98).
+        Judged once renting is set up (D172): an account added first rents nothing.
         """
-        if self.rented is None:
+        if self.rented is None or not self.rented.set_up:
             return
         engine = self.rented_engine()
         caps = set(self.rented.capabilities)
@@ -1772,6 +1790,27 @@ class PoolConfig(BaseModel):
                 f"(with capabilities {sorted(caps)}). Add a variant with `engine: {engine}` — for "
                 f"vLLM, the model's repository on the hub — or stop renting for those models.{default}"
             )
+
+    def models_rentable_with(self, engine: str) -> tuple[list[str], dict[str, str]]:
+        """Of the pool's models a machine can run, which a rented host running `engine` has a
+        build of, and why each other has none — what setting up renting may offer (D172)."""
+        caps = set(self.rented.capabilities) if self.rented is not None else set()
+        kinds = self.engine_kinds(engine)
+        can: list[str] = []
+        cannot: dict[str, str] = {}
+        for name in self.pool.model_set:
+            if self.hosted_only(name):
+                continue
+            entry = self.catalog.get(name)
+            variants = entry.variants if entry else [Variant(tag=name)]
+            if any(set(v.requires) <= caps and (v.engine is None or v.engine == engine) and v.kinds() & kinds
+                   for v in variants):
+                can.append(name)
+            elif all(not (v.kinds() & kinds) for v in variants):
+                cannot[name] = f"{engine} cannot serve what it does ({', '.join(sorted(set().union(*(v.kinds() for v in variants))))})"
+            else:
+                cannot[name] = f"no build of it for {engine} in the catalog"
+        return can, cannot
 
     def _rented_models(self) -> list[str]:
         """What a rented host is asked to hold: the pool's whole set, or what `rented.models`
@@ -2142,7 +2181,7 @@ class PoolConfig(BaseModel):
         without saying so, would now rent vLLM machines that fetch its Ollama tags from the hub,
         fail, and be replaced until the lease's cap. So where the default moved and nothing
         names a vLLM build, the configuration is refused, saying how to keep what it meant."""
-        if self.rented is None or self.rented.engine is not None or self.engine == "vllm":
+        if self.rented is None or not self.rented.set_up or self.rented.engine is not None or self.engine == "vllm":
             return
         def marked_for_vllm(name: str) -> bool:
             entry = self.catalog.get(name)
