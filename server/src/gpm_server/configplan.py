@@ -786,6 +786,48 @@ def set_in_list_item(
     return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
 
 
+def append_list_item(text: str, list_key: str, item: Mapping[str, Any]) -> str:
+    """Add one item at the end of a top-level list — a new host — and change nothing else.
+
+    The item is written as a block — one key to a line, a nested mapping on its key's line — at the
+    indent the list's items already use (two spaces where it has none), so it reads like the items
+    an operator wrote and can be edited key by key afterwards. A list written `[]` becomes a block;
+    a file with no such list gains one at its end."""
+    lines = text.splitlines()
+
+    def block(indent: int) -> list[str]:
+        pairs = list(dict(item).items())
+        first = f"{' ' * indent}- {pairs[0][0]}: {_as_yaml(pairs[0][1])}"
+        return [first] + [f"{' ' * (indent + 2)}{key}: {_as_yaml(value)}" for key, value in pairs[1:]]
+    try:
+        at, first, last = _block_of(lines, list_key, 0, len(lines), 0)
+    except CannotEdit:
+        at = None
+    if at is None:
+        while lines and not lines[-1].strip():
+            lines.pop()
+        lines += ["", f"{list_key}:", *block(2)]
+        return "\n".join(lines) + "\n"
+    head, _, comment = lines[at].partition(" #")
+    inline = head.split(":", 1)[1].strip()
+    if inline.startswith("[") and inline.rstrip().endswith("]"):
+        if yaml.safe_load(inline) not in ([], None):
+            raise CannotEdit(f"{list_key!r} is written on one line; add the item there")
+        lines[at] = f"{list_key}:" + (f" #{comment}" if comment else "")
+        lines[at + 1:at + 1] = block(2)
+        return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+    if inline:
+        raise CannotEdit(f"{list_key!r} is not a list written as a block")
+    starts = [n for n in range(first, last) if lines[n].lstrip().startswith("- ")]
+    indent = len(lines[starts[0]]) - len(lines[starts[0]].lstrip()) if starts else 2
+    # After the list's last item, before any blank lines and comments that belong to what follows.
+    end = last
+    while end > first and (not lines[end - 1].strip() or lines[end - 1].strip().startswith("#")):
+        end -= 1
+    lines[end:end] = block(indent)
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+
+
 def remove_list_item(text: str, list_key: str, match_key: str, match_value: str) -> str:
     """Delete one item of a top-level list — the host whose `id` is `laptop` — and nothing else.
 

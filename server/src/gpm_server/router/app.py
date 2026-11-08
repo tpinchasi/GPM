@@ -24,7 +24,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import ClientDisconnect
 
-from .. import translate
+from .. import hosted_credentials, translate
 from ..config import ConfigError, PoolConfig, load_config
 from ..contract import CONTRACT_VERSION
 from ..db import Database, RequestRecord
@@ -446,7 +446,9 @@ async def follow_config_file(state: RouterState, path: Path) -> None:
                 keys.append(key_file.stat().st_mtime_ns)
             except OSError:
                 keys.append(None)
-        return (own, tuple(keys))
+        # And a hosted API's key typed into the console (D171): written by the supervisor, sent by
+        # the router — a new one is used from the next request, without a restart.
+        return (own, tuple(keys), hosted_credentials.stamps(state.config))
 
     seen = stamp()
     while True:

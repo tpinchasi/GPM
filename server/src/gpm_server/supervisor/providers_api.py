@@ -62,11 +62,18 @@ def register(
 ) -> None:
     accounts = supervisor.accounts
 
-    def fleet_or_refusal() -> Optional[JSONResponse]:
-        if supervisor.fleet is None or supervisor.config.rented is None:
-            return error(400, "cannot_rent", "this pool has no rented capacity configured")
+    def fleet_or_refusal(first: bool = False) -> Optional[JSONResponse]:
+        """A running fleet — or, with `first`, a pool that rents nothing yet and may add its first
+        provider (S13): the console's Providers tab is never a dead end."""
         if supervisor.store is None:
             return error(400, "no_config_file", "this pool was not started from a file")
+        if first and supervisor.fleet is None and supervisor.config.rented is None:
+            return None
+        if supervisor.fleet is None and supervisor.config.rented is not None:
+            return error(409, "restart_needed", "renting was added to this pool's configuration; it starts when the "
+                         "pool is restarted")
+        if supervisor.fleet is None or supervisor.config.rented is None:
+            return error(400, "cannot_rent", "this pool has no rented capacity configured")
         return None
 
     def credential_text(body: dict) -> tuple[Optional[str], Optional[JSONResponse]]:
@@ -139,6 +146,13 @@ def register(
     async def list_providers(request: Request) -> JSONResponse:
         """Every connection and every installed plug-in. Never a credential: only where it comes
         from and when it was set. `fresh=true` asks each enabled provider's account now."""
+        if supervisor.fleet is None:
+            # Nothing rented yet (S13): the installed plug-ins, for adding the first provider, and
+            # whether renting waits for a restart that a first one saved needs.
+            return JSONResponse({
+                "connections": [], "plugins": accounts.plugins(), "secure_transport": _safe_transport(request),
+                "label_prefix": None, "renting": False, "restart_needed": supervisor.config.rented is not None,
+            })
         refused = fleet_or_refusal()
         if refused is not None:
             return refused
@@ -153,6 +167,7 @@ def register(
             "plugins": accounts.plugins(),
             "secure_transport": _safe_transport(request),
             "label_prefix": fleet.label_prefix,
+            "renting": True, "restart_needed": False,
         })
 
     @app.get("/pool/providers/plugins/{type_name}")
@@ -174,18 +189,20 @@ def register(
         """Test a connection — saved, saved with a new credential, or not saved at all. Saves
         nothing, rents nothing. A stored credential is only ever sent where it was saved for:
         a saved connection is tested with its own settings, never with settings sent here."""
-        refused = fleet_or_refusal()
-        if refused is not None:
-            return refused
         body = await _body(request)
         if body is None:
             return error(400, "bad_request", "send a JSON object")
+        # An unsaved account may be tested before a pool rents anything: its first provider (S13).
+        refused = fleet_or_refusal(first=body.get("connection") is None)
+        if refused is not None:
+            return refused
         credential, bad = credential_text(body)
         if bad is not None:
             return bad
         if credential is not None and not _safe_transport(request):
             return error(403, "insecure_transport", "a credential is accepted only over HTTPS, or from this machine")
         fleet = supervisor.fleet
+        label_prefix = fleet.label_prefix if fleet is not None else f"gpm/{supervisor.config.pool.name}/"
         name = body.get("connection")
         fresh = None
         if name is not None:
@@ -232,7 +249,7 @@ def register(
 
                 provider.set_credential(accounts.resolve_environment(ProviderConnection(type=type_name), provider))
         try:
-            steps = await _steps(provider, fleet.label_prefix, credential, unsaved=name is None)
+            steps = await _steps(provider, label_prefix, credential, unsaved=name is None)
         finally:
             if fresh is not None and hasattr(fresh, "aclose"):
                 await fresh.aclose()
@@ -240,9 +257,10 @@ def register(
 
     @app.post("/pool/providers")
     async def add_provider(request: Request) -> JSONResponse:
-        refused = fleet_or_refusal()
+        refused = fleet_or_refusal(first=True)
         if refused is not None:
             return refused
+        starting = supervisor.config.rented is None
         body = await _body(request)
         if body is None:
             return error(400, "bad_request", "send a JSON object")
@@ -254,11 +272,12 @@ def register(
         name, type_name = str(body.get("name") or ""), str(body.get("type") or "")
         if not CONNECTION_NAME.match(name):
             return error(400, "bad_name", "a lower-case name of letters, digits, '-' and '_', starting with a letter, at most 32 characters")
-        if name in supervisor.config.rented.providers:
+        if not starting and name in supervisor.config.rented.providers:
             return error(409, "exists", f"there is already a provider connection named {name!r}")
         if type_name not in installed_plugins():
             return error(400, "unknown_provider", "choose an installed provider")
-        kept = [n for n, conn in accounts.built.items() if conn.type == type_name and n in supervisor.fleet.providers]
+        kept = [] if starting else [n for n, conn in accounts.built.items()
+                                    if conn.type == type_name and n in supervisor.fleet.providers]
         if kept:
             # Still releasing what it holds: a new account for the provider now could be another
             # account, whose listing would make the pool lose those hosts (D133, D136).
@@ -281,7 +300,13 @@ def register(
             entry["credential_env"] = body["credential_env"]
         text, version = supervisor.store.read()
         try:
-            text = set_values(with_connections(text, supervisor.config), ("rented", "providers"), {name: entry})
+            if starting:
+                section, problem = first_rented_section(body.get("first"), name, entry)
+                if problem is not None:
+                    return error(400, "first_provider", problem)
+                text = text.rstrip("\n") + "\n\n" + section
+            else:
+                text = set_values(with_connections(text, supervisor.config), ("rented", "providers"), {name: entry})
         except CannotEdit as exc:
             return error(409, "cannot_edit", str(exc))
         return await _apply_with_credential(text, version, body, name, type_name, settings, credential)
@@ -524,6 +549,41 @@ def register(
                                      + (", with a credential typed in" if credential is not None else ""),
                                      numbers={"connection": name})
         return response
+
+
+def first_rented_section(first: Any, name: str, entry: dict) -> tuple[str, Optional[str]]:
+    """The `rented:` section a pool's first provider starts (S13): the connection, and the two
+    ceilings no machine is rented without — the disk each is rented with, and the most it may
+    cost an hour, all-in (D108). Asked of the operator, never assumed. Written as a block, so
+    every later save from the console edits it in place."""
+    from ..configplan import _as_yaml
+
+    if not isinstance(first, dict):
+        return "", ("this pool rents nothing yet: say the disk each machine is rented with (GB) and the most one "
+                    "may cost an hour, all-in ($) — no machine is rented without both")
+    try:
+        disk, hourly = float(first.get("min_disk_gb")), float(first.get("max_all_in_hourly"))
+    except (TypeError, ValueError):
+        return "", "the disk is a number of GB and the hourly ceiling a number of dollars"
+    if not 1 <= disk <= 100_000 or not 0 < hourly <= 1000:
+        return "", "the disk is between 1 and 100000 GB, and the hourly ceiling between $0 and $1000"
+    engine = str(first.get("engine") or "vllm")
+    if engine not in ("vllm", "ollama"):
+        return "", "rented machines run vLLM or Ollama"
+    models = first.get("models")
+    if models is not None and (not isinstance(models, list) or not all(isinstance(m, str) and m for m in models)):
+        return "", "models is a list of the pool's model names"
+    lines = [
+        "# Rented machines, started from the console's Providers tab. Nothing rents without a lease, and a",
+        "# lease that may rent needs a dollar cap; the two numbers below bound every machine it rents.",
+        "rented:",
+        f"  engine: {engine}",
+        *([f"  models: {_as_yaml(models)}"] if models else []),
+        "  providers:",
+        f"    {name}: {_as_yaml(entry)}",
+        f"  offer_policy: {_as_yaml({'min_disk_gb': disk, 'max_all_in_hourly': hourly})}",
+    ]
+    return "\n".join(lines) + "\n", None
 
 
 def _unredacted(sent: Any, kept: Any) -> Any:

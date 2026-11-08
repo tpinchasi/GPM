@@ -46,9 +46,10 @@ gone, outbid, or no longer passing — nothing is rented instead.
 **A hosted model API is a host of kind `hosted`** (D164): OpenAI, Anthropic's OpenAI-compatible
 endpoint, Together, Ollama's cloud, or any other that serves the OpenAI-shaped `/v1` paths, reached
 with an API key. It is written with the fields every host has: an `https` transport whose
-`base_url` is the provider's whole OpenAI base (`…/v1`, or Groq's `…/openai/v1`) and whose
-`bearer_env` names the variable holding its key, and `workers` — its rate limit, as requests in
-flight. Its engine is `openai-api`, the same for every provider; it has no agent, no tunnel and no
+`base_url` is the provider's whole OpenAI base (`…/v1`, or Groq's `…/openai/v1`), and `workers` —
+its rate limit, as requests in flight. Its key is typed into the console's Providers screen and
+kept in the credential store, bound to that `base_url` (providers.md §10, D171) — or, where the
+transport names `bearer_env`, read from that variable instead. Its engine is `openai-api`, the same for every provider; it has no agent, no tunnel and no
 `residency`. Nothing is pulled, loaded, rented or released on it; the supervisor asks its
 `/v1/models` for health and its models, which spends nothing. Each catalog variant for it names the
 provider's name for the model, the kinds it serves there, and its price (§4.1); it holds only such

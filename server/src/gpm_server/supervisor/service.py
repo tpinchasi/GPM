@@ -24,7 +24,7 @@ from typing import Any, Optional
 
 import httpx
 
-from .. import strategies
+from .. import hosted_credentials, strategies
 from ..catalog import ResolvedVariant, literal_variants_for_host, variants_for_host
 from ..config import (
     AUTO_ENGINE,
@@ -43,7 +43,7 @@ from ..engines import Engine, get_engine
 from ..ledger import EventLog, LeaseStore, SpendLedger
 from ..models import RENTED_KINDS, HostState
 from ..providers.base import ProviderAuthError, ProviderError, get_provider
-from ..transports import SshTunnel, build_client, tunnel_maker
+from ..transports import SshTunnel, tunnel_maker
 from . import agents
 from .renting import Fleet
 from .upgrades import EngineUpgrades
@@ -252,7 +252,7 @@ class Supervisor:
         dial_url = tunnel.local_url if tunnel else (host_config.transport.base_url or "")
         return SupervisedHost(
             config=host_config,
-            client=build_client(host_config.transport, self.config.pool, dial_url),
+            client=hosted_credentials.client(self.config, host_config, dial_url),
             variants=self._variants_of(self.config, host_config, capabilities, self._configured_engine(host_config)),
             dial_url=dial_url,
             tunnel=tunnel,
@@ -337,6 +337,7 @@ class Supervisor:
             if forward is not None:
                 await forward.start()
         self.accounts.store.check()  # owner-only, like the pool's key files (T19)
+        hosted_credentials.HostedKeys(self.config).check()  # and the hosted APIs' keys in it (D171)
         await self._refuse_without_a_credential()
         if self.config.provisioning.enabled:
             _ = self.provisioning.ca  # a bad client CA stops the start, not a program's first create
@@ -622,6 +623,8 @@ class Supervisor:
                 existing is None
                 or existing.config.transport != host_config.transport
                 or existing.config.capabilities != host_config.capabilities
+                # a hosted API's typed key (D171) is no longer sent where the host now points
+                or hosted_credentials.stamp(old, existing.config) != hosted_credentials.stamp(new, host_config)
             )
             if rebuild:
                 if existing is not None:
@@ -656,6 +659,18 @@ class Supervisor:
             numbers={"hosts": sorted(after)},
         )
         log.info("configuration reloaded")
+
+    def rekey_hosted(self, host_id: str) -> None:
+        """A hosted API's key was typed in, replaced or removed (D171): its client is built again
+        with the key as it is now, and the host is asked again on the next pass."""
+        host = self.hosts.get(host_id)
+        if host is None:
+            return
+        retired = host.client
+        host.client = hosted_credentials.client(self.config, host.config, host.dial_url)
+        if not host.config.disabled:
+            host.state = HostState.UNREACHABLE
+        asyncio.create_task(retired.aclose())
 
     def _retire_host(self, host_id: str, remove_row: bool = True) -> None:
         host = self.hosts.pop(host_id, None)

@@ -98,6 +98,15 @@ const api = {
   removeProvider: (name, confirm) => call("DELETE", `/pool/providers/${encodeURIComponent(name)}`, confirm === undefined ? {} : { confirm }),
   setCredential: (name, credential) => call("PUT", `/pool/providers/${encodeURIComponent(name)}/credential`, { credential }),
   removeCredential: (name) => call("DELETE", `/pool/providers/${encodeURIComponent(name)}/credential`),
+  // Hosted model APIs (S13, D171). A key goes out once, in a body, and never comes back.
+  hosted: () => call("GET", "/pool/hosted"),
+  testHosted: (body) => call("POST", "/pool/hosted/test", body),
+  addHosted: (body) => call("POST", "/pool/hosted", body),
+  changeHosted: (id, body) => call("PATCH", `/pool/hosted/${encodeURIComponent(id)}`, body),
+  removeHosted: (id, confirm) => call("DELETE", `/pool/hosted/${encodeURIComponent(id)}`, confirm === undefined ? {} : { confirm }),
+  setHostedKey: (id, credential) => call("PUT", `/pool/hosted/${encodeURIComponent(id)}/credential`, { credential }),
+  removeHostedKey: (id) => call("DELETE", `/pool/hosted/${encodeURIComponent(id)}/credential`),
+  setHostedBudget: (body) => call("PATCH", "/pool/hosted-budget", body),
 };
 
 // --- small helpers ---
@@ -495,7 +504,7 @@ function autoEngineLine(host) {
 
 screens.hosts = (status) => [
   el("h1", {}, "Hosts"),
-  el("p", { class: "muted" }, "Hosts you configured, rather than rented. Take one out of service or remove it here; adding and editing one are on the Configuration screen. Rented hosts are released from Rented capacity."),
+  el("p", { class: "muted" }, "Hosts you configured, rather than rented. Take one out of service or remove it here; hosted model APIs are added on Providers, and other hosts on the Configuration screen. Rented hosts are released from Rented capacity."),
   el("table", {},
     el("thead", {}, el("tr", {},
       el("th", {}, "Host"), el("th", {}, "Kind"), el("th", {}, "Engine"), el("th", {}, "Transport"), el("th", {}, "State"),
@@ -760,7 +769,10 @@ function rentedTabs(current) {
 }
 
 screens.rented = async (status) => {
-  if (!status.provider) return [el("h1", {}, "Rented capacity"), el("p", { class: "muted" }, "This pool has no rented capacity configured, so it cannot spend.")];
+  // A pool that rents nothing yet is shown how to begin — its first provider — never a dead end (S13).
+  if (!status.provider) return [el("h1", {}, "Rented capacity"),
+    el("p", { class: "muted" }, "This pool rents no machines yet. Add the provider account it would rent from; nothing is rented until a lease with a dollar cap asks for it."),
+    ...await providersTab()];
   // With no tab named it opens on Hosts — what is being paid for now.
   const tab = RENTED_TABS.find((t) => t.id === (state.sub || "hosts")) || RENTED_TABS[1];
   const market = RENTED_TABS_WITH_MARKET.has(tab.id) ? await api.market(1, null, false).catch((e) => ({ error: e.message })) : null;
@@ -1013,6 +1025,15 @@ async function providersTab() {
     return [el("p", { class: "error" }, error.message), el("button", { onclick: () => render() }, "Try again")];
   }
   providersView.data = data;
+  if (data.renting === false) {
+    const first = el("button", { class: "primary", disabled: !data.plugins.some((p) => p.offered) || undefined,
+      onclick: () => addProviderDialog(data) }, "Add a provider account");
+    return [el("div", { class: "panel" },
+      data.restart_needed
+        ? el("p", { class: "warn-text" }, "A provider account was added to this pool's configuration. Renting starts when the pool is restarted.")
+        : el("p", {}, "No provider account yet. The first one also sets the two ceilings every rented machine is bound by: its disk, and the most it may cost an hour."),
+      data.restart_needed ? null : first)];
+  }
   const live = data.connections.filter((p) => p.configured);
   const searching = live.filter((p) => providerHealth(p).key === "searching").length;
   const hosts = data.connections.reduce((n, p) => n + p.rented + p.parked, 0);
@@ -1312,8 +1333,35 @@ function editProviderDialog(p) {
 function addProviderDialog(data) {
   const { dialog, opening } = providerDialog();
   const current = () => providersView.opened === opening && dialog.open;
-  const draft = { step: 1, plugin: null, name: "", nameEdited: false, enabled: true, tested: null, problem: null, plan: null, busy: false };
+  const draft = { step: 1, plugin: null, name: "", nameEdited: false, enabled: true, tested: null, problem: null, plan: null, busy: false,
+    first: data.renting === false ? { min_disk_gb: "", max_all_in_hourly: "", engine: "vllm", models: [] } : null };
   const secret = secretField("Credential", SECRET_HINT);
+  // The first account also starts the pool's renting: the two ceilings no machine is rented
+  // without, which engine rented machines run, and which models they hold (S13).
+  const firstBody = () => (draft.first ? { first: { min_disk_gb: Number(draft.first.min_disk_gb), max_all_in_hourly: Number(draft.first.max_all_in_hourly),
+    engine: draft.first.engine, ...(draft.first.models.length ? { models: draft.first.models } : {}) } } : {});
+  function firstFields() {
+    if (!draft.first) return null;
+    const f = draft.first;
+    const disk = el("input", { id: "first-disk", type: "number", min: "1", step: "1", value: f.min_disk_gb, required: true });
+    disk.oninput = () => { f.min_disk_gb = disk.value; };
+    const hourly = el("input", { id: "first-hourly", type: "number", min: "0", step: "0.01", value: f.max_all_in_hourly, required: true });
+    hourly.oninput = () => { f.max_all_in_hourly = hourly.value; };
+    const engine = el("select", { id: "first-engine" }, ["vllm", "ollama"].map((e) => el("option", { value: e, selected: f.engine === e || undefined }, e === "vllm" ? "vLLM" : "Ollama")));
+    engine.onchange = () => { f.engine = engine.value; };
+    const names = (state.status?.model_set || []);
+    const boxes = names.map((name) => {
+      const box = el("input", { type: "checkbox", checked: f.models.includes(name) || undefined });
+      box.onchange = () => { f.models = box.checked ? [...f.models, name] : f.models.filter((m) => m !== name); };
+      return el("label", { class: "pick" }, box, el("span", { class: "mono" }, name));
+    });
+    return el("fieldset", { class: "first-renting" }, el("legend", {}, "This pool's first rented machines"),
+      el("div", { class: "field" }, el("label", { for: "first-disk" }, "Disk each machine is rented with (GB)"), disk),
+      el("div", { class: "field" }, el("label", { for: "first-hourly" }, "The most one machine may cost an hour, all-in ($)"), hourly,
+        el("small", { class: "muted" }, "No bid goes above it. Change both later on Rented capacity → Finding machines.")),
+      el("div", { class: "field" }, el("label", { for: "first-engine" }, "Engine on rented machines"), engine),
+      names.length ? el("div", { class: "field" }, el("span", {}, "Models they hold (none ticked: any the pool needs)"), el("div", { class: "row" }, boxes)) : null);
+  }
   const STEPS = ["Provider", "Account", "Test", "Save"];
 
   const stepper = () => el("ol", { class: "stepper", "aria-label": "Steps" }, STEPS.map((label, i) =>
@@ -1373,6 +1421,9 @@ function addProviderDialog(data) {
       event.preventDefault();
       if (!/^[a-z][a-z0-9_-]{0,31}$/.test(draft.name)) { draft.problem = "A lower-case name: letters, digits, - and _, starting with a letter."; draw(); return; }
       if (p.takes_credential && data.secure_transport && !secret.input.value.trim()) { draft.problem = "Paste the account's credential."; draw(); return; }
+      if (draft.first && !(Number(draft.first.min_disk_gb) >= 1 && Number(draft.first.max_all_in_hourly) > 0)) {
+        draft.problem = "Say the disk each machine is rented with and the most one may cost an hour: no machine is rented without both."; draw(); return;
+      }
       draft.problem = null; draft.step = 3; draft.tested = null; draw(); test();
     };
     form.append(
@@ -1382,6 +1433,7 @@ function addProviderDialog(data) {
       p.takes_credential
         ? (data.secure_transport ? secret.node : el("p", { class: "error" }, "Not on HTTPS or the pool's own machine: a credential cannot be sent from here. It can be set in the supervisor's environment instead."))
         : el("p", { class: "muted" }, "This plug-in reads its own credential from its settings or environment."),
+      firstFields(),
       problem(), nav(el("button", { type: "submit", class: "primary" }, "Test it")));
     return [form];
   }
@@ -1416,7 +1468,7 @@ function addProviderDialog(data) {
   async function savePlan() {
     let plan;
     try {
-      plan = (await api.addProvider({ name: draft.name, type: draft.plugin.type, enabled: draft.enabled, plan_only: true })).changes;
+      plan = (await api.addProvider({ name: draft.name, type: draft.plugin.type, enabled: draft.enabled, plan_only: true, ...firstBody() })).changes;
     } catch (error) {
       plan = [{ detail: error.message, refused: error.message }];
     }
@@ -1432,7 +1484,7 @@ function addProviderDialog(data) {
     save.onclick = async () => {
       save.disabled = true;
       const value = secret.input.value.trim();
-      const body = { name: draft.name, type: draft.plugin.type, enabled: draft.enabled, ...(value ? { credential: value } : {}) };
+      const body = { name: draft.name, type: draft.plugin.type, enabled: draft.enabled, ...(value ? { credential: value } : {}), ...firstBody() };
       try {
         const done = await withRetype((confirm) => api.addProvider({ ...body, ...(confirm ? { confirm } : {}) }),
           `Add ${draft.plugin.display_name} (${draft.name}) and rent from it?`);
@@ -1440,7 +1492,7 @@ function addProviderDialog(data) {
           providersView.tests[draft.name] = { at: Date.now() / 1000, steps: draft.tested.steps };
           providersView.focus = draft.name;
           dialog.close();
-          if (location.hash !== "#rented/providers") location.hash = "#rented/providers";
+          if (location.hash !== "#rented/providers" && !location.hash.startsWith("#providers") && !draft.first) location.hash = "#rented/providers";
           else await refresh();
           return;
         }
@@ -1474,6 +1526,468 @@ function addProviderDialog(data) {
   dialog.showModal();
   draw();
 }
+
+// --- hosted model APIs (S13, D171): added like a rented provider, on the Providers screen ---
+//
+// A card per hosted API: who it is, whether it is serving, its key's state, the models it offers
+// under the names apps ask for and what each costs, and what it has cost. Its key is typed into
+// a dialog, sent once, and dropped from the page as the dialog closes — as a rented account's is.
+
+const hostedView = { tests: {}, data: null };
+
+const PRICE_FIELDS = [
+  { key: "input", label: "input", hint: "$ per million input tokens" },
+  { key: "cached_input", label: "cached", hint: "$ per million input tokens read from the provider's cache" },
+  { key: "cache_write", label: "cache write", hint: "$ per million input tokens written to the cache (Anthropic's format needs it)" },
+  { key: "output", label: "output", hint: "$ per million output tokens" },
+];
+
+function hostedHealth(h) {
+  const c = h.credential || {};
+  if (h.disabled) return { label: "out of service", tone: "disabled" };
+  if (h.out_of_funds) return { label: "out of money", tone: "bad" };
+  if (c.source === "missing") return { label: "needs a key", tone: "warn" };
+  if (c.source === "withheld") return { label: "key saved for another address", tone: "warn" };
+  if (h.state === "ready") return { label: "serving", tone: "ok" };
+  if (h.last_error && /refused the key/.test(h.last_error)) return { label: "key refused", tone: "bad" };
+  return { label: h.state === "unknown" ? "starting" : "cannot be reached", tone: h.state === "unknown" ? "warn" : "bad" };
+}
+
+function hostedKeyLine(h) {
+  const c = h.credential || {};
+  if (c.source === "environment") return el("div", {}, `from ${c.variable} in the pool's environment`);
+  if (c.source === "stored") return el("div", {}, `typed in ${c.set_at ? clock(c.set_at) : ""} — kept by the supervisor, never shown again`);
+  if (c.source === "withheld") return el("div", { class: "warn-text" }, c.detail || "saved for another address");
+  if (c.variable) return el("div", { class: "error" }, `${c.variable} is not set in the pool's environment`);
+  return el("div", { class: "warn-text" }, c.detail || "none yet: type one in");
+}
+
+const perMillion = (n) => (n === null || n === undefined ? "—" : `$${Number(n).toLocaleString(undefined, { maximumFractionDigits: 4 })}`);
+
+function hostedModels(h) {
+  if (!h.models.length) return el("p", { class: "muted" }, "No model offered yet: choose which of its models apps may ask for.");
+  return el("table", { class: "compact" },
+    el("thead", {}, el("tr", {}, el("th", {}, "apps ask for"), el("th", {}, "provider's id"),
+      ...PRICE_FIELDS.map((f) => el("th", { title: f.hint }, f.label)))),
+    el("tbody", {}, h.models.map((m) => el("tr", {},
+      el("td", { class: "mono" }, m.name, m.in_model_set ? null : el("span", { class: "muted" }, " (not in the model set)")),
+      el("td", { class: "mono muted" }, m.tag),
+      ...PRICE_FIELDS.map((f) => el("td", {}, m.price ? perMillion(m.price[f.key]) : "—"))))),
+    el("caption", { class: "muted small-text" }, "Prices per million tokens, as typed here — from the provider's own price list."));
+}
+
+function hostedCard(h, data) {
+  const health = hostedHealth(h);
+  const c = h.credential || {};
+  const tested = hostedView.tests[h.id];
+  const name = h.provider || h.id;
+  const actions = [
+    el("button", { class: "small", onclick: (e) => testHosted(e.target, h) }, "Test"),
+    c.can_type ? el("button", { class: `small${c.source === "stored" ? "" : " primary"}`, disabled: !data.secure_transport || undefined,
+      onclick: () => hostedKeyDialog(h) }, c.source === "stored" ? "Replace key" : "Type in a key") : null,
+    el("button", { class: "small", onclick: () => hostedModelsDialog(h) }, "Models and prices"),
+    el("button", { class: "small", onclick: (e) => run(e.target, () => api.changeHosted(h.id, { disabled: !h.disabled })) },
+      h.disabled ? "Return to service" : "Take out of service"),
+  ];
+  const aside = [el("button", { class: "small danger", onclick: (e) => removeHosted(e.target, h) }, "Remove")];
+  return el("article", { class: `panel provider-card hosted-card${h.disabled ? " is-off" : ""}`, "data-hosted": h.id,
+    "aria-labelledby": `hosted-${h.id}` },
+    el("header", { class: "provider-head" }, providerIcon({ display_name: name }),
+      el("div", { class: "provider-title" },
+        el("h2", { id: `hosted-${h.id}` }, name),
+        el("div", { class: "muted mono" }, h.provider ? `${h.id} · ${h.format} format` : `${h.format} format`)),
+      el("span", { class: `pill status ${health.tone}`, role: "status" }, health.label)),
+    el("div", { class: "kv provider-facts" },
+      el("div", { class: "k" }, "address"), el("div", { class: "mono" }, h.base_url),
+      el("div", { class: "k" }, "key"), hostedKeyLine(h),
+      el("div", { class: "k" }, "in flight"), el("div", {}, `at most ${h.workers} request${h.workers === 1 ? "" : "s"} at once`),
+      el("div", { class: "k" }, "spent"), el("div", {}, `${money(h.spend.today)} today · ${money(h.spend.this_month)} this month`),
+      h.format === "Anthropic" ? el("div", { class: "k" }, "caching") : null,
+      h.format === "Anthropic" ? el("div", {}, h.cache_prompts ? "prompts cached for 5 minutes unless a request says otherwise" : "requests sent as they came") : null,
+      h.out_of_funds ? el("div", { class: "k" }, "provider said") : null,
+      h.out_of_funds ? el("div", { class: "error" }, h.out_of_funds, " ", fundsRestoredButton(h.id)) : null,
+      h.last_error && health.tone === "bad" && !h.out_of_funds ? el("div", { class: "k" }, "last error") : null,
+      h.last_error && health.tone === "bad" && !h.out_of_funds ? el("div", { class: "error" }, h.last_error) : null),
+    hostedModels(h),
+    el("div", { class: "provider-actions" }, el("div", { class: "row" }, actions), el("div", { class: "row" }, aside)),
+    c.can_type && !data.secure_transport ? el("div", { class: "muted small-text" },
+      "A key can be typed in only over HTTPS or on the pool's own machine.") : null,
+    tested ? el("details", { class: "provider-test", open: true },
+      el("summary", {}, `Test at ${clock(tested.at)}: `, tested.ok ? el("span", { class: "ok-text" }, "passed") : el("span", { class: "error" }, "failed")),
+      hostedSteps(tested.steps)) : null);
+}
+
+function hostedSteps(steps) {
+  return testResults(steps.map((s) => ({ step: { address: "The address", key: "The key", models: "Its models" }[s.step] || s.step,
+    status: s.ok ? "passed" : "failed", detail: s.detail })));
+}
+
+async function testHosted(button, h) {
+  await run(button, async () => {
+    const answer = await api.testHosted({ host: h.id });
+    hostedView.tests[h.id] = { at: Date.now() / 1000, ok: answer.ok, steps: answer.steps };
+  });
+}
+
+async function removeHosted(button, h) {
+  await run(button, async () => {
+    try {
+      await api.removeHosted(h.id);
+    } catch (error) {
+      if (!error.changes) throw error;
+      const ok = await confirmAction({ title: `Remove ${h.provider || h.id}?`, retype: h.id, retypeLabel: `Type ${h.id} to confirm`,
+        body: el("ul", {}, error.changes.map((c) => el("li", {}, c.detail))), okLabel: "Remove" });
+      if (ok) await api.removeHosted(h.id, h.id);
+    }
+  });
+}
+
+function hostedKeyDialog(h) {
+  const { dialog } = providerDialog();
+  const secret = secretField(`${h.provider || h.id} key`, SECRET_HINT);
+  const problem = el("p", { class: "error", role: "alert", hidden: true });
+  const save = el("button", { type: "submit", class: "primary" }, "Test and save");
+  const form = el("form", { method: "dialog" });
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    const value = secret.input.value.trim();
+    if (!value) { problem.textContent = "Paste the key."; problem.hidden = false; return; }
+    save.disabled = true; save.textContent = "Asking the provider…";
+    try {
+      const answer = await api.setHostedKey(h.id, value);
+      hostedView.tests[h.id] = { at: Date.now() / 1000, ok: true, steps: answer.steps };
+      dialog.close();
+      await refresh();
+    } catch (error) {
+      problem.textContent = error.message; problem.hidden = false;
+      save.disabled = false; save.textContent = "Test and save";
+    }
+  };
+  const c = h.credential || {};
+  form.append(dialogTitle(`${c.source === "stored" ? "Replace" : "Type in"} the key for ${h.provider || h.id}`),
+    el("p", { class: "muted" }, "Tested against the provider's list of models, which costs nothing, before it is kept. ",
+      "It is sent only to ", el("span", { class: "mono" }, h.base_url), "."),
+    secret.node, problem,
+    el("div", { class: "row wizard-nav" },
+      el("button", { type: "button", onclick: () => dialog.close() }, "Cancel"),
+      c.source === "stored" ? el("button", { type: "button", class: "danger", onclick: async () => {
+        if (!await confirmAction({ title: `Remove the key for ${h.provider || h.id}?`, body: "Requests stop reaching it until a key is typed in again.", okLabel: "Remove key" })) return;
+        await api.removeHostedKey(h.id);
+        dialog.close();
+        await refresh();
+      } }, "Remove key") : null,
+      save));
+  dialog.replaceChildren(form);
+  dialog.showModal();
+  secret.input.focus();
+}
+
+// The models step, shared by Add and by Models and prices: each id the provider offers, the name
+// apps ask for it by, and its price — typed by the operator from the provider's own page.
+function modelsPicker(offered, current, format) {
+  const rows = new Map();
+  const ids = [...new Set([...current.map((m) => m.tag), ...offered])].sort();
+  const byTag = new Map();
+  for (const m of current) { if (!byTag.has(m.tag)) byTag.set(m.tag, []); byTag.get(m.tag).push(m); }
+  const filter = el("input", { type: "search", placeholder: `Filter ${ids.length} model${ids.length === 1 ? "" : "s"}…`, autocomplete: "off" });
+  const list = el("div", { class: "models-picker" });
+  const fieldsFor = (m) => PRICE_FIELDS.filter((f) => f.key !== "cache_write" || format === "Anthropic").map((f) => {
+    const input = el("input", { type: "number", min: "0", step: "any", inputmode: "decimal", value: m?.price?.[f.key] ?? "",
+      "aria-label": `${f.label} price`, title: f.hint, placeholder: f.label, class: "price" });
+    return { key: f.key, input };
+  });
+  for (const tag of ids) {
+    const kept = (byTag.get(tag) || [])[0];
+    const on = el("input", { type: "checkbox", checked: kept ? true : undefined, "aria-label": `Offer ${tag}` });
+    const name = el("input", { type: "text", value: kept ? kept.name : tag, autocomplete: "off", spellcheck: "false",
+      "aria-label": `Name apps ask for ${tag} by`, class: "mono" });
+    const prices = fieldsFor(kept);
+    const detail = el("div", { class: "row tight model-prices", hidden: !kept || undefined },
+      el("label", { class: "muted small-text" }, "apps ask for"), name, ...prices.map((p) => p.input));
+    on.onchange = () => { detail.hidden = !on.checked; if (on.checked) prices[0].input.focus(); };
+    const row = el("div", { class: "model-row", "data-tag": tag }, el("label", { class: "pick" }, on, el("span", { class: "mono" }, tag)), detail);
+    rows.set(tag, { on, name, prices, row });
+    list.append(row);
+  }
+  filter.oninput = () => {
+    const q = filter.value.trim().toLowerCase();
+    for (const [tag, r] of rows) r.row.hidden = Boolean(q) && !tag.toLowerCase().includes(q) && !r.on.checked;
+  };
+  const read = () => {
+    const out = [];
+    for (const [tag, r] of rows) {
+      if (!r.on.checked) continue;
+      const price = {};
+      for (const p of r.prices) if (p.input.value !== "") price[p.key] = Number(p.input.value);
+      out.push({ name: r.name.value.trim() || tag, tag, price });
+    }
+    return out;
+  };
+  const node = el("div", {},
+    ids.length > 8 ? filter : null,
+    ids.length ? list : el("p", { class: "muted" }, "The provider listed no models for this key."),
+    el("p", { class: "muted small-text" }, format === "Anthropic"
+      ? "Prices per million tokens from the provider's own page. The cache-write price is needed: the pool asks for every prompt to be cached, which the provider charges for once."
+      : "Prices per million tokens from the provider's own page. The cached price is optional; without it a cached token is charged as input."));
+  return { node, read };
+}
+
+function hostedModelsDialog(h) {
+  const { dialog } = providerDialog();
+  const pinned = h.models.filter((m) => m.pinned);
+  const picker = modelsPicker(h.offered || [], pinned, h.format);
+  const problem = el("p", { class: "error", role: "alert", hidden: true });
+  const save = el("button", { type: "button", class: "primary" }, "Save");
+  save.onclick = async () => {
+    save.disabled = true;
+    try {
+      const done = await withRetype((confirm) => api.changeHosted(h.id, { models: picker.read(), ...(confirm ? { confirm } : {}) }),
+        `Change what ${h.provider || h.id} offers?`);
+      if (done) { dialog.close(); await refresh(); return; }
+    } catch (error) {
+      problem.textContent = error.message; problem.hidden = false;
+    }
+    save.disabled = false;
+  };
+  const handWritten = h.models.filter((m) => !m.pinned);
+  dialog.replaceChildren(dialogTitle(`Models and prices — ${h.provider || h.id}`),
+    el("p", { class: "muted" }, "Tick the models apps may ask for, the name they ask by, and what each costs. A model unticked here is no longer served by this API."),
+    (h.offered || []).length ? null : el("p", { class: "warn-text" }, "The provider's list of models is not known yet: test it first, or wait for its next check."),
+    picker.node,
+    handWritten.length ? el("p", { class: "muted small-text" }, `Also served here, from builds written by hand on the Configuration screen: ${handWritten.map((m) => m.name).join(", ")}.`) : null,
+    problem,
+    el("div", { class: "row wizard-nav" }, el("button", { type: "button", onclick: () => dialog.close() }, "Cancel"), save));
+  dialog.showModal();
+}
+
+function addHostedDialog(data) {
+  const { dialog, opening } = providerDialog();
+  const current = () => providersView.opened === opening && dialog.open;
+  const draft = { step: 1, preset: null, id: "", idEdited: false, base_url: "", workers: 4, tested: null, models: [], plan: null, problem: null };
+  const secret = secretField("API key", SECRET_HINT);
+  const STEPS = ["Provider", "Key", "Test", "Models", "Save"];
+  let picker = null;
+  const taken = new Set((state.status?.hosts || []).map((h) => h.host_id));
+  const stepper = () => el("ol", { class: "stepper", "aria-label": "Steps" }, STEPS.map((label, i) =>
+    el("li", { class: i + 1 === draft.step ? "current" : i + 1 < draft.step ? "done" : "",
+      "aria-current": i + 1 === draft.step ? "step" : undefined }, el("span", { "aria-hidden": "true" }, i + 1), label)));
+  const nav = (...buttons) => el("div", { class: "row wizard-nav" },
+    el("button", { type: "button", onclick: () => dialog.close() }, "Cancel"),
+    draft.step > 1 ? el("button", { type: "button", onclick: () => { draft.step -= 1; draft.problem = null; draw(); } }, "Back") : null,
+    ...buttons);
+  const problem = () => (draft.problem ? el("p", { class: "error", role: "alert" }, draft.problem) : null);
+  const freeId = (base) => { let id = base, n = 2; while (taken.has(id)) id = `${base}-${n++}`; return id; };
+
+  function choose() {
+    const tile = (p) => el("button", { type: "button", class: `plugin-tile${draft.preset && draft.preset.id === p.id ? " chosen" : ""}`,
+      onclick: () => {
+        if (!draft.preset || draft.preset.id !== p.id) {
+          secret.input.value = ""; draft.tested = null; draft.plan = null; picker = null;
+          draft.base_url = p.base_url;
+          if (!draft.idEdited) draft.id = freeId(p.custom ? "" : p.id);
+        }
+        draft.preset = p; draft.problem = null; draft.step = 2; draw();
+      } },
+      providerIcon({ display_name: p.name }, 36),
+      el("div", {}, el("strong", {}, p.name),
+        el("div", { class: "muted small-text" }, p.custom ? p.note : `${p.engine === "anthropic-api" ? "Anthropic" : "OpenAI"} format${p.note ? ` — ${p.note}` : ""}`)));
+    return [el("p", { class: "muted" }, "A hosted model API, reached with its key and paid per token from the budget below. Any provider not listed is added as another API of the format it speaks."),
+      el("div", { class: "plugin-tiles" }, data.presets.map(tile)), problem(), nav()];
+  }
+
+  function key() {
+    const p = draft.preset;
+    const id = el("input", { id: "hosted-id", value: draft.id, autocomplete: "off", spellcheck: "false", "aria-describedby": "hosted-id-hint" });
+    id.oninput = () => { draft.id = id.value.trim(); draft.idEdited = true; };
+    const url = el("input", { id: "hosted-url", value: draft.base_url, autocomplete: "off", spellcheck: "false", type: "url",
+      placeholder: "https://…/v1", readonly: p.custom ? undefined : true, "aria-describedby": "hosted-url-hint" });
+    url.oninput = () => { draft.base_url = url.value.trim(); };
+    const workers = el("input", { id: "hosted-workers", type: "number", min: "1", max: "1000", value: draft.workers });
+    workers.oninput = () => { draft.workers = Number(workers.value) || 4; };
+    if (p.key_hint) secret.format(p.key_hint);
+    const form = el("form", { method: "dialog" });
+    form.onsubmit = (event) => {
+      event.preventDefault();
+      if (!/^[a-z0-9][a-z0-9_-]{0,39}$/.test(draft.id)) { draft.problem = "A lower-case name: letters, digits, - and _."; draw(); return; }
+      if (taken.has(draft.id)) { draft.problem = `There is already a host named ${draft.id}.`; draw(); return; }
+      if (!/^https:\/\/|^http:\/\/(127\.0\.0\.1|localhost|\[::1\])[:/]/.test(draft.base_url)) { draft.problem = "The provider's address is an https:// URL: its API base, ending where /models follows."; draw(); return; }
+      if (!secret.input.value.trim()) { draft.problem = "Paste the provider's key."; draw(); return; }
+      draft.problem = null; draft.step = 3; draft.tested = null; draw(); test();
+    };
+    form.append(
+      el("header", { class: "provider-head" }, providerIcon({ display_name: p.name }, 32), el("div", {}, el("strong", {}, p.name),
+        el("div", { class: "muted small-text" }, `${p.engine === "anthropic-api" ? "Anthropic" : "OpenAI"} format`))),
+      el("div", { class: "field" }, el("label", { for: "hosted-id" }, "Name in this pool"), id,
+        el("small", { id: "hosted-id-hint", class: "muted" }, "How hosts, spend and decisions name this API.")),
+      el("div", { class: "field" }, el("label", { for: "hosted-url" }, "Address"), url,
+        el("small", { id: "hosted-url-hint", class: "muted" }, p.custom ? "The provider's API base: where /models and the chat path follow." : "The provider's own API address.")),
+      data.secure_transport ? secret.node : el("p", { class: "error" }, "Not on HTTPS or the pool's own machine: a key cannot be sent from here."),
+      el("div", { class: "field" }, el("label", { for: "hosted-workers" }, "Requests at once"), workers,
+        el("small", { class: "muted" }, "The most this pool sends it at the same time; the provider's own rate limits still apply.")),
+      problem(), nav(el("button", { type: "submit", class: "primary", disabled: !data.secure_transport || undefined }, "Test it")));
+    return [form];
+  }
+
+  async function test() {
+    let answer;
+    try {
+      answer = await api.testHosted({ engine: draft.preset.engine, base_url: draft.base_url, credential: secret.input.value.trim() });
+    } catch (error) {
+      answer = { ok: false, steps: [{ step: "address", ok: false, detail: error.message }], models: [] };
+    }
+    if (!current() || draft.step !== 3) return;
+    draft.tested = answer; picker = null;
+    draw();
+  }
+
+  function testing() {
+    if (!draft.tested) return [el("p", { class: "muted", role: "status" }, "Asking the provider for its models…"), nav()];
+    return [hostedSteps(draft.tested.steps),
+      draft.tested.ok ? null : el("p", { class: "error", role: "alert" }, "Fix what failed, then go back and test again."),
+      nav(el("button", { type: "button", onclick: () => { draft.tested = null; draw(); test(); } }, "Test again"),
+        el("button", { type: "button", class: "primary", disabled: !draft.tested.ok || undefined,
+          onclick: () => { draft.step = 4; draw(); } }, "Choose models"))];
+  }
+
+  function models() {
+    const format = draft.preset.engine === "anthropic-api" ? "Anthropic" : "OpenAI";
+    picker = picker || modelsPicker(draft.tested.models, draft.models, format);
+    return [el("p", { class: "muted" }, "Tick the models apps may ask for, the name they ask by, and what each costs."),
+      picker.node, problem(),
+      nav(el("button", { type: "button", class: "primary", onclick: () => {
+        draft.models = picker.read();
+        const unpriced = draft.models.filter((m) => m.price.input === undefined && m.price.output === undefined);
+        if (unpriced.length) { draft.problem = `Give ${unpriced.map((m) => m.name).join(", ")} a price: the pool counts every answer against the budget.`; draw(); return; }
+        draft.problem = null; draft.step = 5; draft.plan = null; draw(); savePlan();
+      } }, "Continue"))];
+  }
+
+  const body = () => ({ id: draft.id, engine: draft.preset.engine, base_url: draft.base_url, workers: draft.workers, models: draft.models });
+
+  async function savePlan() {
+    let plan;
+    try {
+      plan = (await api.addHosted({ ...body(), plan_only: true })).changes;
+    } catch (error) {
+      plan = [{ detail: error.message, refused: error.message }];
+    }
+    if (!current() || draft.step !== 5) return;
+    draft.plan = plan;
+    draw();
+  }
+
+  function saving() {
+    const save = el("button", { type: "button", class: "primary", disabled: !draft.plan || draft.plan.some((c) => c.refused) || undefined }, "Add it");
+    save.onclick = async () => {
+      save.disabled = true;
+      try {
+        const done = await withRetype((confirm) => api.addHosted({ ...body(), credential: secret.input.value.trim(), ...(confirm ? { confirm } : {}) }),
+          `Add ${draft.preset.name} (${draft.id})?`);
+        if (done) {
+          hostedView.tests[draft.id] = { at: Date.now() / 1000, ok: true, steps: draft.tested.steps };
+          dialog.close();
+          await refresh();
+          return;
+        }
+      } catch (error) {
+        draft.problem = error.message; draw(); return;
+      }
+      save.disabled = false;
+    };
+    return [
+      el("div", { class: "kv" },
+        el("div", { class: "k" }, "provider"), el("div", {}, draft.preset.name),
+        el("div", { class: "k" }, "name"), el("div", { class: "mono" }, draft.id),
+        el("div", { class: "k" }, "address"), el("div", { class: "mono" }, draft.base_url),
+        el("div", { class: "k" }, "key"), el("div", {}, "typed in — kept by the supervisor, never shown again"),
+        el("div", { class: "k" }, "models"), el("div", {}, draft.models.length ? draft.models.map((m) => m.name).join(", ") : "none yet")),
+      el("div", { class: "plan" }, el("strong", {}, "Saving it will:"),
+        draft.plan ? el("ul", {}, draft.plan.map((c) => el("li", { class: c.refused ? "error" : "" }, c.refused || c.detail)))
+          : el("p", { class: "muted", role: "status" }, "Working out what it changes…")),
+      problem(), nav(save)];
+  }
+
+  function draw() {
+    if (!current() && draft.step !== 1) return;
+    const parts = [choose, key, testing, models, saving][draft.step - 1]();
+    dialog.replaceChildren(dialogTitle("Add a hosted model API"), stepper(), ...parts.filter(Boolean));
+    if (draft.step === 2) (dialog.querySelector("input[data-secret]") || dialog.querySelector("#hosted-id"))?.focus();
+  }
+  dialog.showModal();
+  draw();
+}
+
+function hostedBudgetDialog(budget) {
+  const { dialog } = providerDialog();
+  const field = (id, label, value, hint) => {
+    const input = el("input", { id, type: "number", min: "0", step: "any", value: value ?? "" });
+    return { input, node: el("div", { class: "field" }, el("label", { for: id }, label), input, el("small", { class: "muted" }, hint)) };
+  };
+  const day = field("budget-day", "Per day ($)", budget?.per_day, "The most hosted APIs may cost in a UTC day.");
+  const month = field("budget-month", "Per month ($)", budget?.per_month, "The most in a UTC month. A day or a month is needed, or both.");
+  const each = field("budget-request", "Per request ($)", budget?.per_request, "Optional: the most one answer may cost.");
+  const wait = field("budget-wait", "Wait for a machine (seconds)", budget?.after_s ?? 5, "How long a request waits for one of the pool's machines before a hosted API takes it. A model no machine serves goes at once.");
+  const problem = el("p", { class: "error", role: "alert", hidden: true });
+  const save = el("button", { type: "button", class: "primary" }, "Save");
+  save.onclick = async () => {
+    const read = (f) => (f.input.value === "" ? null : Number(f.input.value));
+    save.disabled = true;
+    try {
+      const done = await withRetype((confirm) => api.setHostedBudget({ per_day: read(day), per_month: read(month), per_request: read(each),
+        after_s: read(wait) ?? 5, ...(confirm ? { confirm } : {}) }), "Change the hosted budget?");
+      if (done) { dialog.close(); await refresh(); return; }
+    } catch (error) {
+      problem.textContent = error.message; problem.hidden = false;
+    }
+    save.disabled = false;
+  };
+  dialog.replaceChildren(dialogTitle("Hosted budget"),
+    el("p", { class: "muted" }, "What the pool's shared hosted APIs may spend. A request is never sent beyond it: the worst it could cost is held before it goes. A workload's own hosted budget is set on its page."),
+    day.node, month.node, each.node, wait.node, problem,
+    el("div", { class: "row wizard-nav" }, el("button", { type: "button", onclick: () => dialog.close() }, "Cancel"), save));
+  dialog.showModal();
+}
+
+async function hostedSection() {
+  let data;
+  try {
+    data = await api.hosted();
+  } catch (error) {
+    return [el("p", { class: "error" }, error.message)];
+  }
+  hostedView.data = data;
+  const b = data.budget;
+  const today = data.hosts.reduce((n, h) => n + h.spend.today, 0);
+  const month = data.hosts.reduce((n, h) => n + h.spend.this_month, 0);
+  const serving = data.hosts.filter((h) => hostedHealth(h).tone === "ok").length;
+  const add = el("button", { class: "primary", onclick: () => addHostedDialog(data) }, "Add hosted API");
+  const limit = b ? [b.per_day ? `${money(b.per_day)} a day` : null, b.per_month ? `${money(b.per_month)} a month` : null,
+    b.per_request ? `${money(b.per_request)} a request` : null].filter(Boolean).join(" · ") : "none — hosted APIs serve no shared request";
+  return [
+    el("div", { class: "providers-summary panel" },
+      el("div", { class: "summary-stats" },
+        el("div", {}, el("div", { class: "stat" }, data.hosts.length), el("div", { class: "muted" }, `API${data.hosts.length === 1 ? "" : "s"}`)),
+        el("div", {}, el("div", { class: "stat" }, serving), el("div", { class: "muted" }, "serving")),
+        el("div", {}, el("div", { class: "stat" }, money(today)), el("div", { class: "muted" }, b?.per_day ? `of ${money(b.per_day)} today` : "today")),
+        el("div", {}, el("div", { class: "stat" }, money(month)), el("div", { class: "muted" }, b?.per_month ? `of ${money(b.per_month)} this month` : "this month"))),
+      el("div", { class: "summary-actions" },
+        el("div", { class: "row" }, el("button", { onclick: () => hostedBudgetDialog(b) }, "Budget"), add),
+        el("div", { class: "muted small-text" }, `Budget: ${limit}.`))),
+    data.secure_transport ? null : el("p", { class: "warn-text" },
+      "This page is not on HTTPS or the pool's own machine, so a key cannot be typed in here."),
+    data.hosts.length ? el("div", { class: "provider-grid" }, data.hosts.map((h) => hostedCard(h, data)))
+      : el("div", { class: "panel" }, el("p", {}, "No hosted API yet: Claude, GPT and open models at providers like Groq or Together, paid per token."), add.cloneNode(true)),
+  ];
+}
+
+screens.providers = async (status) => [
+  el("h1", {}, "Providers"),
+  el("p", { class: "muted" }, "Where this pool gets capacity beyond its own machines: hosted model APIs, paid per token, and accounts it rents machines from, paid by the hour."),
+  el("h2", { class: "section" }, "Hosted model APIs"),
+  ...await hostedSection(),
+  el("h2", { class: "section" }, "Rented machines"),
+  ...await providersTab(),
+];
 
 function limitsPanel(status) {
   return el("div", { class: "panel" }, el("h2", {}, "Limits"),
