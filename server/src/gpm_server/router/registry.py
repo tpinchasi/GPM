@@ -13,12 +13,12 @@ from typing import Any, Optional
 
 import httpx
 
+from .. import hosted_credentials
 from ..catalog import ResolvedVariant
 from ..config import PoolConfig
 from ..db import CounterRow, HostCounters, HostRow, HostTable
 from ..models import Host, HostState, Worker, WorkerState
 from ..provisioning_store import KeyReach, ProvisioningStore
-from ..transports import build_client
 from ..workload_store import KeyGrant, Workload, WorkloadStore
 from .dispatch import Dispatcher
 
@@ -50,6 +50,8 @@ class HostRegistry:
         self.last_seen_at: Optional[float] = None
         self._host_config = {host.id: host for host in config.hosts}
         self._retired: list[httpx.AsyncClient] = []
+        #: When each configured host's typed key was saved, as its client was built (D171).
+        self._key_stamps: dict[str, Optional[float]] = {}
         #: Workloads as the supervisor published them (D115): each one's state and model, and
         #: what each workload key's hash reaches. Read in the background, never on a request.
         self.workload_store = WorkloadStore(table.db)
@@ -70,9 +72,15 @@ class HostRegistry:
         self._host_config = {host.id: host for host in config.hosts}
         for host_id, host in self.by_id.items():
             old, new = before.get(host_id), self._host_config.get(host_id)
-            if old is not None and new is not None and old.transport != new.transport:
+            if old is None or new is None:
+                continue
+            # A hosted API's key typed into the console (D171) is read here too: a new one, or one
+            # no longer sent because the host now points elsewhere, needs a new client.
+            key = hosted_credentials.stamp(config, new)
+            if old.transport != new.transport or key != self._key_stamps.get(host_id):
                 self._retired.append(host.client)
-                host.client = build_client(new.transport, config.pool, str(host.client.base_url))
+                host.client = hosted_credentials.client(config, new, str(host.client.base_url))
+                self._key_stamps[host_id] = key
 
     # --- reading the table ---
 
@@ -160,7 +168,8 @@ class HostRegistry:
         needs none."""
         host_config = self._host_config.get(row.host_id)
         if host_config is not None:
-            return build_client(host_config.transport, self.config.pool, row.dial_url)
+            self._key_stamps[row.host_id] = hosted_credentials.stamp(self.config, host_config)
+            return hosted_credentials.client(self.config, host_config, row.dial_url)
         return httpx.AsyncClient(
             base_url=row.dial_url,
             timeout=httpx.Timeout(

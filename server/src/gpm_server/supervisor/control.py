@@ -1627,6 +1627,15 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                                           known_connections()),
     )
 
+    # --- hosted model APIs (S13, D171) ---
+    from .hosted_api import register as register_hosted
+
+    register_hosted(
+        app, supervisor, error=_error, validate_plan_apply=_validate_plan_apply,
+        plan_of=lambda text: plan_changes(supervisor.config, store().parse(text), rented_now(), machines_now(),
+                                          known_connections()),
+    )
+
     def _has_section(text: str, name: str) -> bool:
         """Is this block already in the file? A missing one is written whole, once."""
         import re as _re

@@ -14,12 +14,18 @@ from ..config import PoolSettings, TransportConfig
 
 
 def build_client(
-    transport: TransportConfig, settings: PoolSettings, base_url: Optional[str] = None
+    transport: TransportConfig, settings: PoolSettings, base_url: Optional[str] = None,
+    bearer: Optional[str] = None,
 ) -> httpx.AsyncClient:
-    """`base_url` overrides the configured one — a tunnel host is dialled on its local port."""
+    """`base_url` overrides the configured one — a tunnel host is dialled on its local port.
+    `bearer` is a hosted API's key typed into the console (D171), used only where the transport
+    names no variable of its own."""
+    headers = transport.auth_headers()
+    if bearer and not headers:
+        headers = {"Authorization": f"Bearer {bearer}"}
     return httpx.AsyncClient(
         base_url=base_url or transport.base_url or "",
-        headers=transport.auth_headers(),
+        headers=headers,
         verify=transport.verify,
         cert=transport.client_cert,
         timeout=httpx.Timeout(

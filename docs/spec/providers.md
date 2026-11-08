@@ -137,7 +137,7 @@ use counted before is carried into the per-connection counter once, under that n
 - **Stored by the supervisor** in an owner-only file per connection, in a secrets directory
   beside the pool's state. It is never in the configuration file, its versions or its plan; never
   in a response, an event, a log or the database; and never sent to a rented host. The router
-  never reads it.
+  never reads a rented account's credential — only a hosted API's key, which it sends (§10).
 - **Shown only as a state**: *set on <date>, valid, credit $X*, *set, refused by the provider*,
   or *missing*. It is never shown again, in whole or in part. **Replace** and **Remove** are the
   only actions.
@@ -230,6 +230,13 @@ rental's event names what was assumed. RunPod's are `assumed_download_mbps` (100
 
 ### 7.1 Providers (Rented capacity → Providers, the first tab) — built
 
+**A pool that rents nothing yet** shows, here and on the Providers screen (§10), **Add a provider
+account** rather than a dead end (S13, D171). The first account also asks for the two ceilings no
+machine is rented without — `offer_policy.min_disk_gb` and `max_all_in_hourly` — the engine rented
+machines run, and optionally which models they hold, and writes the `rented:` section with them.
+Renting starts when the pool next starts: the supervisor builds its renting machinery at start,
+and the plan says so. Until then the tab says a restart is waiting.
+
 A summary across accounts (how many, how many searching, hosts held, burn) with **Add provider**
 and **Check every account**, then a card per connection, every card laid out alike so two read
 side by side — the provider's **icon** (its plug-in's own SVG, or the provider's logo loaded from its own site
@@ -303,7 +310,45 @@ of the decision log.
 | `POST /pool/providers`, `PATCH /pool/providers/{name}` | Add or change a connection through validate → plan → apply; enabling is retyped like any loosening |
 | `PUT /pool/providers/{name}/credential`, `DELETE …/credential` | Set or replace, or remove, the credential; answers with its state only |
 | `DELETE /pool/providers/{name}` | Remove; refused while it holds a host, a parked disk or a volume |
+| `GET /pool/hosted`, `POST /pool/hosted/test`, `POST /pool/hosted`, `PATCH`/`DELETE /pool/hosted/{id}`, `PUT`/`DELETE /pool/hosted/{id}/credential`, `PATCH /pool/hosted-budget` | Hosted model APIs (§10) |
 | `GET /pool/market/preview` | Gains `providers=` to narrow the search; each row carries its connection |
+
+## 10. Hosted model APIs on the console (S13, D171)
+
+A hosted model API (D164) is added, changed and removed on the **Providers** screen, beside the
+rented accounts, and what is saved is what an operator would write by hand: a `kind: hosted` host
+and catalog builds.
+
+- **Choosing one.** A short list of known APIs — each only an address and a format
+  (`hosted_presets.py`) — and *another OpenAI-format API* and *another Anthropic-format API* with
+  an address of the operator's. The address is https, or http on the pool's own machine only.
+- **The key.** Typed into a dialog, sent once (§5's transport rules), **tested against the
+  provider's `/models`** — which spends nothing — and kept by the supervisor in
+  `<credentials_dir>/hosted/<host id>.json`, owner-only, with the `base_url` it was saved for.
+  It is used in one order: the host's `bearer_env` (or `basic_env`) when the file names one; else
+  the typed key, **only while the host's `base_url` is the one it was saved for**; else none, and
+  the host waits for one ("needs a key"). The supervisor writes it; **both processes read it** —
+  the router sends the requests — and each builds the host's client again when the file changes,
+  so a new or removed key takes effect without a restart. Never in the file, an answer, a log, an
+  event or the database. An unsaved address is tested only with a key typed for it.
+- **Its models.** After the test, each id the provider offers can be ticked, given the name apps
+  ask for (the id by default) and its price per million tokens — `input`, `cached_input`,
+  `output`, and for Anthropic's format `cache_write` (D170). Each becomes a catalog build
+  `{tag, engine, requires: [hosted:<id>], price}` and the host gains the capability
+  `hosted:<id>`, so a model id two providers offer is sent and priced as each says; the name
+  joins the model set. A name offered by two APIs is one catalog entry with a build for each.
+- **Its card**: status (*serving*, *needs a key*, *key saved for another address*, *key refused*,
+  *out of money* with **Money is back**, *cannot be reached*, *out of service*), address, the
+  key's source and when it was set, requests at once, spend today and this month, its models and
+  prices. **Test**, **Type in / Replace key** (and **Remove key**), **Models and prices** (the same
+  picker; unticking removes the build, and an entry left with none leaves the catalog and the
+  model set), **Take out of service / Return**, **Remove** (typed again; removes its builds and its
+  key).
+- **The hosted budget** — `pool.bursts.hosted`: wait for a machine, dollars per request, day and
+  month — is set from the same screen.
+- **What it does not do**: ship prices (they change, and the operator answers for them, D164);
+  change a host's address (a different address is another host, added anew); edit a build written
+  by hand without a pin (shown, left alone).
 
 ## 9. Build order
 
