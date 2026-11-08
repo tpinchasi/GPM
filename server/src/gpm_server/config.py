@@ -46,6 +46,10 @@ class Price(BaseModel):
 
     input: Optional[float] = Field(default=None, ge=0)
     cached_input: Optional[float] = Field(default=None, ge=0)
+    #: Input written to the provider's prompt cache, where it charges for that apart (S12): 1.25×
+    #: input for Anthropic's 5-minute cache. Absent, a write is charged at `CACHE_WRITE_UNSAID`
+    #: times input — the dearest any provider documents — so a budget is never under-charged.
+    cache_write: Optional[float] = Field(default=None, ge=0)
     output: Optional[float] = Field(default=None, ge=0)
     per_minute: Optional[float] = Field(default=None, ge=0)
 
@@ -55,15 +59,35 @@ class Price(BaseModel):
             raise ValueError("a price names `input` and `output` (dollars per million tokens), or `per_minute`")
         return self
 
-    def of(self, prompt: int, cached: int, completion: int) -> float:
-        """Dollars for these counts; cached input at its own price where one is given."""
-        fresh = max(0, prompt - cached)
+    @property
+    def write_price(self) -> float:
+        return self.cache_write if self.cache_write is not None else CACHE_WRITE_UNSAID * (self.input or 0.0)
+
+    def of(self, prompt: int, cached: int, completion: int, written: int = 0) -> float:
+        """Dollars for these counts: `prompt` is the whole input, of which `cached` was read from
+        the provider's cache and `written` written to it, each at its own price."""
+        fresh = max(0, prompt - cached - written)
         cached_price = self.cached_input if self.cached_input is not None else (self.input or 0.0)
-        return (fresh * (self.input or 0.0) + cached * cached_price + completion * (self.output or 0.0)) / 1e6
+        return (fresh * (self.input or 0.0) + cached * cached_price + written * self.write_price
+                + completion * (self.output or 0.0)) / 1e6
+
+    def most_for_input(self, tokens: int) -> float:
+        """The most `tokens` of input can cost — every one written to the cache, where that is
+        dearer than reading it fresh (D166's worst case)."""
+        return tokens * max(self.input or 0.0, self.write_price if self.cache_write is not None else 0.0) / 1e6
 
 
-#: The engine of a hosted model API (S11, D164).
+#: What an unpriced cache write is charged, times input: OpenAI's 12-hour write, the dearest any
+#: provider documents (2026-11-07).
+CACHE_WRITE_UNSAID = 2.5
+
+
+#: The engine of a hosted model API speaking OpenAI's format (S11, D164).
 HOSTED_ENGINE = "openai-api"
+#: The engine of a hosted model API speaking Anthropic's Messages format (S12).
+ANTHROPIC_ENGINE = "anthropic-api"
+#: Every hosted engine: never pulled, loaded or rented; builds named for it carry a price.
+HOSTED_ENGINES = frozenset({HOSTED_ENGINE, ANTHROPIC_ENGINE})
 
 
 def cloud_tag(tag: str) -> bool:
@@ -79,8 +103,8 @@ def cloud_tag(tag: str) -> bool:
 def _for_engine(variant: "Variant", engine: Optional[str]) -> bool:
     """`catalog.for_engine`'s rule, here for the configuration's own checks: a build naming no
     engine is any machine engine's; a hosted API takes only builds named for it (D164)."""
-    if engine == HOSTED_ENGINE:
-        return variant.engine == HOSTED_ENGINE
+    if engine in HOSTED_ENGINES:
+        return variant.engine == engine
     return variant.engine is None or variant.engine == engine
 
 
@@ -115,10 +139,13 @@ class Variant(BaseModel):
 
     @property
     def hosted(self) -> bool:
-        return self.engine == HOSTED_ENGINE
+        return self.engine in HOSTED_ENGINES
 
     def kinds(self) -> frozenset[str]:
-        return frozenset(self.serves) if self.serves is not None else _CHAT_AND_EMBEDDINGS
+        if self.serves is not None:
+            return frozenset(self.serves)
+        # Anthropic's Messages format is chat alone (S12); every other build, chat and embeddings.
+        return frozenset({"chat"}) if self.engine == ANTHROPIC_ENGINE else _CHAT_AND_EMBEDDINGS
 
     def accepts(self) -> Optional[frozenset[str]]:
         """What it takes besides text, or None where nobody has said."""
@@ -287,6 +314,10 @@ class HostConfig(BaseModel):
     capabilities: list[str] = Field(default_factory=list)
     priority: Optional[int] = None
     disabled: bool = False
+    #: For a hosted API whose provider caches a prompt only when asked (Anthropic's Messages API):
+    #: the pool asks — its 5-minute cache, renewed free on every use — wherever the request does
+    #: not say itself (S12). `false` sends requests as they came.
+    cache_prompts: bool = True
     #: `pinned`: the host is routable only while the whole model set is loaded, and a model
     #: found evicted takes it out of routing — for a machine dedicated to serving. `on_demand`:
     #: routable once the set is *on disk*; the engine loads a model on first use and may evict
@@ -339,16 +370,17 @@ class HostConfig(BaseModel):
         """A hosted API is reached over HTTP with a key, runs nothing the pool installs, and is
         the only kind of host that speaks to a provider (D164)."""
         if self.kind != "hosted":
-            if self.engine == HOSTED_ENGINE:
+            if self.engine in HOSTED_ENGINES:
                 raise ValueError(
-                    f"host {self.id!r}: `engine: {HOSTED_ENGINE}` is a hosted model API; give the host "
+                    f"host {self.id!r}: `engine: {self.engine}` is a hosted model API; give the host "
                     "`kind: hosted`, or name the engine its machine runs"
                 )
             return self
         if self.engine is None:
             self.engine = HOSTED_ENGINE
-        if self.engine != HOSTED_ENGINE:
-            raise ValueError(f"host {self.id!r}: a hosted API's engine is `{HOSTED_ENGINE}`, not {self.engine!r}")
+        if self.engine not in HOSTED_ENGINES:
+            raise ValueError(f"host {self.id!r}: a hosted API's engine is `{HOSTED_ENGINE}` (OpenAI's format) or "
+                             f"`{ANTHROPIC_ENGINE}` (Anthropic's Messages format), not {self.engine!r}")
         if self.agent is not None:
             raise ValueError(f"host {self.id!r}: a hosted API has no machine for an agent to run on; remove `agent`")
         if self.transport.type == "tunnel":
@@ -2066,8 +2098,18 @@ class PoolConfig(BaseModel):
                 "the pool reads no price from a provider, and a build it cannot price it cannot charge to a budget"
             )
         if priced:
-            raise ValueError(f"{priced} have a price but are not hosted builds (`engine: {HOSTED_ENGINE}`); "
-                             "a machine's build costs nothing per token — remove `price`")
+            raise ValueError(f"{priced} have a price but are not hosted builds (`engine: {HOSTED_ENGINE}` or "
+                             f"`{ANTHROPIC_ENGINE}`); a machine's build costs nothing per token — remove `price`")
+        # The pool asks Anthropic's API to cache every prompt by default (S12), so each new prompt
+        # is a cache write: unpriced, the budget would be charged the dearest rate on every one.
+        unwritten = [f"{name} ({variant.tag})" for name, entry in self.catalog.items() for variant in entry.variants
+                     if variant.engine == ANTHROPIC_ENGINE and variant.price is not None
+                     and variant.price.per_minute is None and variant.price.cache_write is None]
+        if unwritten:
+            raise ValueError(
+                f"{unwritten} are reached through `{ANTHROPIC_ENGINE}`, whose prompts the pool caches by default: "
+                "give each `price.cache_write` (Anthropic charges 1.25× input for its 5-minute cache) and "
+                "`price.cached_input` (a cache read)")
         # Ollama's cloud through a machine's Ollama spends money no budget or lease counts (D168):
         # reached only as a hosted API, metered like any other.
         cloud = [f"{name} ({variant.tag})" for name, entry in self.catalog.items() for variant in entry.variants

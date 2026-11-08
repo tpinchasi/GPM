@@ -24,6 +24,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import ClientDisconnect
 
+from .. import translate
 from ..config import ConfigError, PoolConfig, load_config
 from ..contract import CONTRACT_VERSION
 from ..db import Database, RequestRecord
@@ -33,11 +34,13 @@ from ..engines import (
     BadUpload,
     MediaNotInline,
     RequestFacts,
+    anthropic_api,
     facts_of,
     kind_of_path,
     openai_api,
     rewrite_of,
 )
+from ..engines.anthropic import AnthropicHostedEngine
 from ..keys import match, verify
 from ..models import HostState
 from ..provisioning_store import HashTaken
@@ -68,6 +71,8 @@ _DROP_UPSTREAM = frozenset(
         "upgrade",
         "proxy-authorization",
         "proxy-authenticate",
+        # The pool's key, as Anthropic's SDK may send it: it never leaves the pool (S12).
+        "x-api-key",
     }
 )
 
@@ -116,7 +121,11 @@ def _identity(state: RouterState, request: Request) -> Optional[Identity]:
     the shared workload's; a workload key is its workload's while it has not passed its time."""
     scheme, _, token = request.headers.get("authorization", "").partition(" ")
     if scheme.lower() != "bearer" or not token:
-        return None
+        # Anthropic's SDK sends its key as a bearer; an older client of that format sends it as
+        # `x-api-key`, which reaches the same keys and never leaves the pool (S12).
+        token = (request.headers.get("x-api-key") or "").strip()
+        if not token:
+            return None
     if verify(token, state.app_hashes):
         return Identity()
     now = time.time()
@@ -151,6 +160,11 @@ def _workload_prefix(path: str) -> tuple[Optional[str], str]:
 
 class ClientGone(Exception):
     """The client disconnected while its request was still queued."""
+
+
+#: Reads a request in Anthropic's format where no engine of this pool serves it natively — it is
+#: then translated for every host (S12). The engines that do serve it read it the same way.
+_ANTHROPIC_READER = AnthropicHostedEngine()
 
 
 def _authorised(state: RouterState, request: Request) -> bool:
@@ -238,19 +252,22 @@ def _worst_case(price: Any, request_bytes: int, most_out: int) -> float:
     """What a hosted request could cost at most: its whole body as input, and all it may generate."""
     if price.per_minute is not None:
         return price.per_minute * max(1.0, request_bytes / _AUDIO_BYTES_PER_S / 60)
-    return price.of(request_bytes // _BYTES_PER_TOKEN + 1, 0, most_out)
+    return price.most_for_input(request_bytes // _BYTES_PER_TOKEN + 1) + price.of(0, 0, most_out)
 
 
-def _charge(state: RouterState, assignment: Assignment, tail: bytes) -> dict[str, Any]:
+def _charge(state: RouterState, assignment: Assignment, tail: bytes, path: str = "") -> dict[str, Any]:
     """What a hosted answer cost, from its own counts at its build's price — or its whole hold
-    where it said none (D166): `tokens_in` and `cost_usd` for the request log."""
+    where it said none (D166): `tokens_in` and `cost_usd` for the request log. Counting a
+    prompt's tokens costs nothing anywhere."""
+    if path in anthropic_api.FREE_PATHS:
+        return {"cost_usd": 0.0, "tokens_in": None}
     engine = state.engine_of(assignment.host)
     counts = engine.counts(tail) if hasattr(engine, "counts") else None
     price = state.price_of(assignment.variant.tag)
     if counts is None or price is None or price.per_minute is not None:
         return {"cost_usd": assignment.hold.amount, "tokens_in": counts[0] if counts else None}
-    prompt, cached, completion = counts
-    return {"cost_usd": price.of(prompt, cached, completion), "tokens_in": prompt}
+    prompt, cached, completion, *written = counts
+    return {"cost_usd": price.of(prompt, cached, completion, written[0] if written else 0), "tokens_in": prompt}
 
 
 def _retry_after(headers: Any, default: float = 5.0) -> float:
@@ -289,10 +306,18 @@ def _downstream_headers(
     delivery: str = "stream",
     attempts: int = 1,
     cost: Optional[str] = None,
+    translation: Any = None,
 ) -> dict[str, str]:
     headers = {
         key: value for key, value in upstream.headers.items() if key.lower() not in _DROP_DOWNSTREAM
+        # A translated answer is not the bytes the host sent: its length is its own (S12).
+        and not (translation is not None and key.lower() in ("content-length", "content-encoding"))
     }
+    if translation is not None:
+        headers["X-GPM-Translated"] = f"{translation.target_path} -> {translation.source_path}"
+        if translation.dropped:
+            # Dropped only because the app asked for it (`X-GPM-Unsupported: drop`), and said here.
+            headers["X-GPM-Dropped"] = "; ".join(translation.dropped)[:1000]
     headers["X-GPM-Served-Model"] = assignment.variant.tag
     headers["X-GPM-Host"] = assignment.host.host_id
     headers["X-GPM-Runtime-Class"] = assignment.variant.runtime_class
@@ -791,6 +816,23 @@ def create_app(
 
     @app.post("/{full_path:path}")
     async def inference(request: Request, full_path: str) -> Response:
+        """A request on Anthropic's format is answered in it: the pool's own refusals take that
+        format's error shape, so its SDK reads them, with the pool's fields beside (S12)."""
+        response = await _bounded(request, full_path)
+        path = _workload_prefix("/" + full_path)[1]
+        if (path in anthropic_api.INFERENCE_PATHS and isinstance(response, JSONResponse)
+                and response.status_code >= 400):
+            try:
+                content = json.loads(response.body)
+            except ValueError:
+                return response
+            if isinstance(content, dict) and not isinstance(content.get("error"), dict):
+                headers = {k: v for k, v in response.headers.items() if k.lower() not in ("content-length", "content-type")}
+                return JSONResponse(anthropic_api.pool_error(response.status_code, content),
+                                    status_code=response.status_code, headers=headers)
+        return response
+
+    async def _bounded(request: Request, full_path: str) -> Response:
         """Bound the body before anything reads it (D144): the caller's key first, so an
         unknown caller never makes the router hold an upload; then its size, declared and
         actual; then the router's budget for bytes held at once — counted from the moment the
@@ -864,7 +906,8 @@ def create_app(
         # The **path** chooses how the request is read, not the host: it has to be understood
         # before the pool knows where it will go (D93). Engines that serve the same path read it
         # identically, by construction — they share one module for it.
-        engine = state.parser_for(path) or state.engine
+        engine = state.parser_for(path) or (_ANTHROPIC_READER if path in anthropic_api.INFERENCE_PATHS else None) \
+            or state.engine
         request_id = uuid.uuid4().hex
         session_id = request.headers.get("x-gpm-session")
         started = time.monotonic()
@@ -894,7 +937,7 @@ def create_app(
                     f"workload {who.workload!r} has ended; its key no longer reaches anything. "
                     "Ask its operator for a new workload.",
                 )
-        if path not in state.paths():
+        if path not in state.paths() and translate.peer(path) not in state.paths():
             asked = openai_api.kind_of(path)
             if asked is not None:
                 # A path some engine serves, but none this pool runs (D147): what it asks for
@@ -1011,6 +1054,33 @@ def create_app(
                     return None
                 return state.budgets.hold(spender, budget, _worst_case(price, body_size, most_out))
 
+        # Untouched wherever a host speaks the request's format; translated to one that does not
+        # only where everything the request carries can be carried (S12) — or the app asked for
+        # what cannot be to be dropped. Which host takes it is decided by load alone.
+        lenient = (request.headers.get("x-gpm-unsupported") or "").strip().lower() == "drop"
+        native = frozenset(name for name, candidate in state.engines.items() if path in candidate.inference_paths())
+        translated: frozenset[str] = frozenset()
+        other = translate.peer(path)
+        if other is not None:
+            reachable = frozenset(name for name, candidate in state.engines.items()
+                                  if other in candidate.inference_paths()) - native
+            if reachable:
+                missing: list[str] = []
+                if not lenient:
+                    missing = (await asyncio.to_thread(translate.unsupported, path, body)
+                               if len(body) > _READ_OFF_LOOP_BYTES else translate.unsupported(path, body))
+                if not missing:
+                    translated = reachable
+                elif not state.reachable_through(requested, facts.kind, native):
+                    await record("rejected", status_code=400, reason="unsupported_feature")
+                    return _error(
+                        400, "bad_request", "unsupported_feature",
+                        f"{requested!r} is served here only by hosts that speak the other API format, and this "
+                        f"request carries what that format cannot say: {'; '.join(missing)}. Remove it, or send "
+                        "`X-GPM-Unsupported: drop` to have it dropped (the answer names what was)",
+                    )
+        default_max = burst.reserve_max_tokens if burst is not None else translate.DEFAULT_MAX_TOKENS
+
         need = Need(
             model=requested,
             hosted_after=hosted_after,
@@ -1021,9 +1091,7 @@ def create_app(
             runtime_class_pin=request.headers.get("x-gpm-runtime-class"),
             # Only hosts whose engine serves this path (D93): a request on one engine's own API
             # would be a 404 on a host running the other, after the pool had called it eligible.
-            engines=frozenset(
-                name for name, candidate in state.engines.items() if path in candidate.inference_paths()
-            ),
+            engines=native | translated,
             workload=who.workload,
             # Only while the workload prepares: one that could always borrow would never need
             # sizing (D115).
@@ -1111,21 +1179,47 @@ def create_app(
             concurrency = assignment.concurrency
             model_concurrency = assignment.model_concurrency
             host_engine = state.engine_of(assignment.host)
-            rewrite = (host_engine, path, content_type, body, assignment.variant.tag)
-            if len(body) > _READ_OFF_LOOP_BYTES:
+            translation = None
+            send_path, send_body, send_type = path, body, content_type
+            if path not in host_engine.inference_paths():
+                # A host that does not speak the request's format: translated on the way in, and
+                # its answer on the way out (S12). Checked before the host was chosen.
+                translation = translate.Translation(path, lenient=lenient, default_max_tokens=default_max)
+                try:
+                    send_body = translation.request(body)
+                except (translate.Unsupported, ValueError, TypeError, AttributeError) as exc:
+                    await free(assignment, cost=0.0)
+                    await record("rejected", status_code=400, reason="unsupported_feature")
+                    return _error(400, "bad_request", "unsupported_feature",
+                                  f"the request could not be carried to the other API format: {exc}")
+                send_path, send_type = translation.target_path, "application/json"
+            rewrite = (host_engine, send_path, send_type, send_body, assignment.variant.tag)
+            if len(send_body) > _READ_OFF_LOOP_BYTES:
                 forwarded_type, forwarded = await asyncio.to_thread(rewrite_of, *rewrite)
             else:
                 forwarded_type, forwarded = rewrite_of(*rewrite)
             hosted = assignment.host.hosted
             app_asked_usage = True
-            upstream_path = path
+            upstream_path = send_path
             if hosted:
                 # The provider's path under its own base URL; a stream asked for its usage, which
                 # the budget is settled from (D164, D166).
-                upstream_path = host_engine.upstream_path(path)
-                if engine.is_streaming(path, body):
-                    forwarded, app_asked_usage = host_engine.ask_for_usage(forwarded_type or content_type, forwarded)
+                upstream_path = host_engine.upstream_path(send_path)
+                if host_engine.is_streaming(send_path, forwarded):
+                    forwarded, app_asked_usage = host_engine.ask_for_usage(forwarded_type or send_type, forwarded)
+                if translation is not None:
+                    app_asked_usage = True  # the translation reads the usage, and says it in the app's format
+                prepare = getattr(host_engine, "prepare", None)
+                if prepare is not None:
+                    # The prompt cache asked for, where the provider caches only when asked (S12).
+                    forwarded = prepare(send_path, forwarded, state.registry.host_config(assignment.host.host_id))
             headers = _upstream_headers(request)
+            if translation is not None:
+                # Headers of the app's format mean nothing to a host of the other.
+                headers = {k: v for k, v in headers.items() if not k.lower().startswith("anthropic-")}
+            add_headers = getattr(host_engine, "request_headers", None)
+            if add_headers is not None:
+                headers = add_headers(headers)
             if forwarded_type:
                 headers["content-type"] = forwarded_type
             if not hosted:
@@ -1203,8 +1297,10 @@ def create_app(
                              status_code=upstream.status_code, reason="provider_refused",
                              queue_wait_ms=wait_s * 1000, latency_ms=(time.monotonic() - dispatched_at) * 1000,
                              cost_usd=0.0)
-                return Response(content=said, status_code=upstream.status_code,
-                                headers=_downstream_headers(upstream, assignment, wait_s, "stream", attempts))
+                return Response(content=translation.error(said) if translation is not None else said,
+                                status_code=upstream.status_code,
+                                headers=_downstream_headers(upstream, assignment, wait_s, "stream", attempts,
+                                                            translation=translation))
 
             delivery = _delivery_for(state, assignment.host.kind, request)
             if hosted:
@@ -1291,9 +1387,11 @@ def create_app(
             charged: dict[str, Any] = {}
             with anyio.CancelScope(shield=True):
                 await upstream.aclose()
-                tokens_out, generate_ms = engine.usage(path, prefix[-_USAGE_TAIL_BYTES:])
+                # Counted from what the host sent, before any translation back (S12).
+                reader, read_path = (host_engine, send_path) if translation is not None else (engine, path)
+                tokens_out, generate_ms = reader.usage(read_path, prefix[-_USAGE_TAIL_BYTES:])
                 if held.hold is not None:
-                    charged = _charge(state, held, prefix[-_USAGE_TAIL_BYTES:])
+                    charged = _charge(state, held, prefix, send_path)
                     cost_header = f"X-GPM-Cost-USD={charged['cost_usd']:.6f}"
                 await free(held, cost=charged.get("cost_usd") if held.hold is not None else 0.0)
                 await record(
@@ -1312,29 +1410,57 @@ def create_app(
                     model_concurrency=model_concurrency,
                     **charged,
                 )
+            content = prefix
+            if translation is not None:
+                content = translation.response(prefix) if upstream.status_code < 400 else translation.error(prefix)
             return Response(
-                content=prefix,
+                content=content,
                 status_code=upstream.status_code,
-                headers=_downstream_headers(upstream, assignment, wait_s, delivery, attempts, cost_header),
+                headers=_downstream_headers(upstream, assignment, wait_s, delivery, attempts, cost_header,
+                                            translation=translation),
             )
 
         strip = _UsageFrameFilter(state.engine_of(held.host).is_usage_frame) if (
             held.host.hosted and not app_asked_usage) else None
 
+        # A translated stream is rewritten frame by frame as it comes; a translated whole answer
+        # (one that outgrew the buffer, or an error) is translated once it is whole (S12).
+        rewriter = translation.stream() if (translation is not None and upstream.status_code < 400
+                                            and engine.is_streaming(path, body)) else None
+        whole: Optional[bytearray] = bytearray() if (translation is not None and rewriter is None) else None
+
         async def stream() -> AsyncIterator[bytes]:
             outcome = "ok"
             # The counts live in the final frame, so a few kilobytes of tail is all it takes —
-            # and nothing of what was generated is kept beyond the moment it is read (D67).
+            # and nothing of what was generated is kept beyond the moment it is read (D67). The
+            # head too: a stream of Anthropic's format says its input counts first.
             tail = bytearray()
+            head = bytearray()
             try:
-                if prefix:
+                for chunk in ([prefix] if prefix else []):
                     # What was buffered before the response outgrew the pool's limit; the rest
                     # continues from the same iterator, never a second pass over the stream.
-                    yield prefix
-                async for chunk in rest:
+                    head.extend(chunk[:_USAGE_TAIL_BYTES])
                     tail.extend(chunk)
                     del tail[:-_USAGE_TAIL_BYTES]
-                    if strip is None:
+                    if whole is not None:
+                        whole.extend(chunk)
+                    elif rewriter is not None:
+                        yield rewriter.feed(chunk)
+                    else:
+                        yield chunk
+                async for chunk in rest:
+                    if len(head) < _USAGE_TAIL_BYTES:
+                        head.extend(chunk[:_USAGE_TAIL_BYTES - len(head)])
+                    tail.extend(chunk)
+                    del tail[:-_USAGE_TAIL_BYTES]
+                    if whole is not None:
+                        whole.extend(chunk)
+                    elif rewriter is not None:
+                        rewritten = rewriter.feed(chunk)
+                        if rewritten:
+                            yield rewritten
+                    elif strip is None:
                         yield chunk
                     else:
                         # The usage chunk the pool asked a provider for, removed where the app
@@ -1346,6 +1472,13 @@ def create_app(
                     left = strip.flush()
                     if left:
                         yield left
+                if rewriter is not None:
+                    left = rewriter.finish_stream()
+                    if left:
+                        yield left
+                if whole is not None and translation is not None:
+                    yield (translation.response(bytes(whole)) if upstream.status_code < 400
+                           else translation.error(bytes(whole)))
             except asyncio.CancelledError:
                 outcome = "cancelled"
                 raise
@@ -1361,11 +1494,14 @@ def create_app(
                 # worker and stops work nobody is listening to.
                 with anyio.CancelScope(shield=True):
                     await upstream.aclose()
-                    tokens_out, generate_ms = engine.usage(path, bytes(tail))
+                    # Head and tail may overlap on a short answer; counts read each field once.
+                    counted = bytes(head) + b"\n\n" + bytes(tail)
+                    reader, read_path = (host_engine, send_path) if translation is not None else (engine, path)
+                    tokens_out, generate_ms = reader.usage(read_path, counted)
                     charged: dict[str, Any] = {}
                     if held.hold is not None:
                         # A stream cut before its usage came is charged what was held for it.
-                        charged = _charge(state, held, bytes(tail))
+                        charged = _charge(state, held, counted, send_path)
                     await free(held, cost=charged.get("cost_usd") if held.hold is not None else 0.0)
                     await record(
                         outcome,
@@ -1390,7 +1526,8 @@ def create_app(
         return StreamingResponse(
             stream(),
             status_code=upstream.status_code,
-            headers=_downstream_headers(upstream, assignment, wait_s, delivery, attempts, most),
+            headers=_downstream_headers(upstream, assignment, wait_s, delivery, attempts, most,
+                                        translation=translation),
         )
 
     return app

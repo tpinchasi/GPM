@@ -165,6 +165,14 @@ class RouterState:
             ]
         return tuple(found)
 
+    def reachable_through(self, model: str, kind: str, engines: frozenset[str]) -> bool:
+        """Whether a build of the model that these engines could serve does this kind: whether a
+        request can be served without translation, by hosts that speak its format (S12)."""
+        return any(
+            kind in variant.kinds() and any(self._engine_takes(engine, variant) for engine in engines)
+            for variant in self._builds_of(model)
+        )
+
     def refusal_for(self, model: str, kind: str, inputs: frozenset[str]) -> Optional[tuple[str, str]]:
         """Why no host this pool has or rents could ever serve this, or None (D143). Waiting cannot
         help such a request, so it is refused at once rather than queued into a `503`."""

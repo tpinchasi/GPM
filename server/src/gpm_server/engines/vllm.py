@@ -21,7 +21,7 @@ from typing import ClassVar, Optional
 
 import httpx
 
-from . import openai_api
+from . import anthropic_api, openai_api
 from .base import (
     CHAT,
     EMBED,
@@ -122,15 +122,24 @@ class VllmEngine:
     # --- request path: the shared protocol, not this engine's invention ---
 
     def inference_paths(self) -> set[str]:
-        return set(openai_api.INFERENCE_PATHS | openai_api.TRANSCRIBE_PATHS | openai_api.RERANK_PATHS)
+        # And Anthropic's Messages format, which it serves itself — `/v1/messages` from 0.11.1,
+        # `count_tokens` from 0.17.0 (S12) — passed through as it came.
+        return set(openai_api.INFERENCE_PATHS | openai_api.TRANSCRIBE_PATHS | openai_api.RERANK_PATHS
+                   | anthropic_api.INFERENCE_PATHS)
 
     def kind_of(self, path: str) -> Optional[str]:
+        if path in anthropic_api.INFERENCE_PATHS:
+            return anthropic_api.kind_of(path)
         return openai_api.kind_of(path) if path in self.inference_paths() else None
 
     def request_facts(self, path: str, content_type: str, body: bytes) -> RequestFacts:
+        if path in anthropic_api.INFERENCE_PATHS:
+            return anthropic_api.facts(path, content_type, body)
         return openai_api.facts(path, content_type, body)
 
     def rewrite_model(self, path: str, content_type: str, body: bytes, tag: str) -> tuple[str, bytes]:
+        if path in anthropic_api.INFERENCE_PATHS:
+            return anthropic_api.rewrite_model(path, content_type, body, tag)
         return openai_api.rewrite_model(path, content_type, body, tag)
 
     def requested_model(self, path: str, body: bytes) -> Optional[str]:
@@ -142,15 +151,23 @@ class VllmEngine:
         return openai_api.with_model(body, tag)
 
     def wants_schema(self, path: str, body: bytes) -> bool:
+        if path in anthropic_api.INFERENCE_PATHS:
+            return anthropic_api.wants_schema(path, body)
         return openai_api.wants_schema(path, body)
 
     def is_streaming(self, path: str, body: bytes) -> bool:
+        if path in anthropic_api.INFERENCE_PATHS:
+            return anthropic_api.is_streaming(path, body)
         return openai_api.is_streaming(path, body)
 
     def usage(self, path: str, tail: bytes) -> tuple[Optional[int], Optional[float]]:
+        if path in anthropic_api.INFERENCE_PATHS:
+            return anthropic_api.usage(path, tail)
         return openai_api.usage(path, tail)
 
     def keepalive_frame(self, path: str) -> Optional[bytes]:
+        if path in anthropic_api.INFERENCE_PATHS:
+            return anthropic_api.keepalive_frame(path)
         return openai_api.keepalive_frame(path)
 
     # --- probe path ---
