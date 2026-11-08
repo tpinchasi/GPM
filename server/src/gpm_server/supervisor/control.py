@@ -794,6 +794,10 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     "worst_case_hourly": supervisor.fleet.worst_case_hourly() if supervisor.fleet else 0.0,
                     "per_host_ceiling": supervisor.config.rented.max_all_in_hourly if supervisor.config.rented else None,
                 },
+                # A provider account can be in before renting is set up; until it is, nothing is
+                # rented (D172). None where the pool has no rented section at all.
+                "renting": ({"set_up": supervisor.config.rented.set_up, "missing": supervisor.config.rented.setup_missing()}
+                            if supervisor.config.rented else None),
                 "provider": (
                     {
                         "name": fleet.provider.name,
@@ -1622,6 +1626,15 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
     from .providers_api import register as register_providers
 
     register_providers(
+        app, supervisor, error=_error, validate_plan_apply=_validate_plan_apply,
+        plan_of=lambda text: plan_changes(supervisor.config, store().parse(text), rented_now(), machines_now(),
+                                          known_connections()),
+    )
+
+    # --- setting up renting, once an account is in (S14, D172) ---
+    from .renting_setup_api import register as register_renting_setup
+
+    register_renting_setup(
         app, supervisor, error=_error, validate_plan_apply=_validate_plan_apply,
         plan_of=lambda text: plan_changes(supervisor.config, store().parse(text), rented_now(), machines_now(),
                                           known_connections()),

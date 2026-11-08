@@ -1010,7 +1010,16 @@ class Fleet:
                 f"{self._without_deadman()} (it has no instance-scoped credential), so leases are "
                 f"limited to {limit}h, not {requested}h"
             )
+        if kwargs.get("allow_rent") and not self.rented.set_up:
+            # A provider account added before renting was set up rents nothing (D172); a lease
+            # that may not rent spends nothing and opens as ever.
+            raise LeaseRefused(self.not_set_up())
         return self.leases.open(pool_max_all_in_hourly=self.rented.max_all_in_hourly, **kwargs)
+
+    def not_set_up(self) -> str:
+        """Why nothing is rented yet, and where that is put right."""
+        return ("renting is not set up: this pool still needs " + " and ".join(self.rented.setup_missing())
+                + " — set them on the console's Rented capacity, or in the file")
 
     # --- the dead-man timer ---
 
@@ -3790,6 +3799,8 @@ class Fleet:
     def worst_case_hourly(self) -> float:
         """The most the rented hosts can burn per hour: every host at the all-in maximum, as
         many hosts as the pool may hold — or the overall cap, if one is set below that (D46)."""
+        if not self.rented.set_up:
+            return 0.0  # nothing is rented until it is (D172)
         bound = self.config.limits.max_rented_hosts * self.rented.max_all_in_hourly
         total = self.config.limits.max_hourly_burn
         return bound if total is None else min(bound, total)
@@ -3964,6 +3975,12 @@ class Fleet:
         """
         self.last_refusal = None
         self.last_budget_bound = False
+        if not self.rented.set_up:
+            # Every rental is under a lease, and none opens while renting is not set up; this
+            # holds even for one opened before the ceilings were taken out of the file (D172).
+            self.last_refusal = self.not_set_up()
+            reasons.append(self.last_refusal)
+            return None
         spec = self.workloads.get(workload) if workload is not None else None
         chosen_group = self.group_spec(workload, group) if spec is not None else None
         if spec is not None and chosen_group is None:

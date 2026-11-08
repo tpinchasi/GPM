@@ -552,15 +552,24 @@ def register(
 
 
 def first_rented_section(first: Any, name: str, entry: dict) -> tuple[str, Optional[str]]:
-    """The `rented:` section a pool's first provider starts (S13): the connection, and the two
-    ceilings no machine is rented without — the disk each is rented with, and the most it may
-    cost an hour, all-in (D108). Asked of the operator, never assumed. Written as a block, so
-    every later save from the console edits it in place."""
+    """The `rented:` section a pool's first provider starts (S13): the connection alone, and
+    renting set up later on Rented capacity (D172) — or, where the request says them, the two
+    ceilings no machine is rented without (the disk each is rented with, the most it may cost an
+    hour, all-in, D108), the engine and the models, never assumed. Written as a block, so every
+    later save from the console edits it in place."""
     from ..configplan import _as_yaml
 
+    if first is None:
+        return "\n".join([
+            "# Rented machines. This provider account was added on the console's Providers screen; nothing is",
+            "# rented until renting is set up (the disk each machine is rented with and the most one may cost",
+            "# an hour), and then only under a lease with a dollar cap.",
+            "rented:",
+            "  providers:",
+            f"    {name}: {_as_yaml(entry)}",
+        ]) + "\n", None
     if not isinstance(first, dict):
-        return "", ("this pool rents nothing yet: say the disk each machine is rented with (GB) and the most one "
-                    "may cost an hour, all-in ($) — no machine is rented without both")
+        return "", "first is an object: min_disk_gb, max_all_in_hourly, engine and models"
     try:
         disk, hourly = float(first.get("min_disk_gb")), float(first.get("max_all_in_hourly"))
     except (TypeError, ValueError):

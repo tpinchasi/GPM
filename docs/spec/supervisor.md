@@ -583,6 +583,8 @@ rented:
     providers: { <connection name>: { type: <provider plug-in name> } }   # D129
     transport: { type: tunnel }
     image: <pinned engine image>               # never a floating tag
+    # Until both min_disk_gb and max_all_in_hourly are named, renting is not set up and nothing
+    # is rented (D172); search_profiles always name both.
     offer_policy: { min_vram_gb: 64, min_disk_gb: 60,          # the disk each host is rented with
                     max_all_in_hourly: 0.60,                   # the most per host-hour, all-in; bids stop here
                     max_download_per_gb: 0.01 }
