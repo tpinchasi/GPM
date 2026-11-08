@@ -195,7 +195,7 @@ Vast, RunPod and Verda ship with the framework; another provider is a plug-in (s
   and later hosts copy from it in about a minute instead of downloading them; the volume is billed
   to the workload's lease and deleted when it ends. Hosts that start together never wait for it.
 
-- **A credential can be typed into the console** — Rented capacity → Providers → Add provider, or
+- **A credential can be typed into the console** — Providers → Add provider, or
   *Type in a credential* on an account's card. It is tested, kept by the supervisor in an
   owner-only file, and never shown again. The supervisor's environment still works
   (`VAST_API_KEY`, or a connection's own `credential_env`), and a `credential_env` always wins.

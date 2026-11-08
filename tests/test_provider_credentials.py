@@ -345,7 +345,7 @@ from fakes.browser import a_browser, open_page  # noqa: E402
 @pytest.mark.timeout(180)
 def test_the_providers_screen_takes_a_credential_and_keeps_nothing_of_it(pool):
     supervisor, market, base, path, database = pool
-    with open_page(f"{base}/ui/#rented/providers") as page:
+    with open_page(f"{base}/ui/#providers") as page:
         page.until("(document.getElementById('key-dialog') || {}).open === true", within=60, what="the page")
         page.js(f"document.getElementById('key-input').value = {json.dumps(ADMIN_KEY)};"
                 "document.getElementById('key-form').requestSubmit(); true")
@@ -651,7 +651,7 @@ def test_the_page_stays_where_the_operator_scrolled_while_it_updates(pool):
     """Found by the owner: scrolled down, the page jumped back to the top every few seconds — each
     status update redrew the screen through a "Loading…" that collapsed it."""
     supervisor, market, base, path, database = pool
-    with open_page(f"{base}/ui/#rented/providers") as page:
+    with open_page(f"{base}/ui/#providers") as page:
         page.call("Emulation.setDeviceMetricsOverride", width=900, height=400, deviceScaleFactor=1, mobile=False)
         page.until("(document.getElementById('key-dialog') || {}).open === true", within=60, what="the page")
         page.js(f"document.getElementById('key-input').value = {json.dumps(ADMIN_KEY)};"

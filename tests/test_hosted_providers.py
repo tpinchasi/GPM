@@ -383,12 +383,15 @@ def test_the_providers_screen_adds_a_hosted_api_like_a_rented_account(pool):
         page.until("(document.getElementById('key-dialog') || {}).open === true", within=60, what="the page")
         page.js(f"document.getElementById('key-input').value = {json.dumps(ADMIN_KEY)};"
                 "document.getElementById('key-form').requestSubmit(); true")
-        page.until("document.body.textContent.includes('No hosted API yet')", within=30, what="the hosted section")
-        assert "No provider account yet" in page.js("document.body.textContent"), "the rented half is no dead end"
+        page.until("document.body.textContent.includes('No provider yet')", within=30, what="the screen")
 
-        _click(page, "Add hosted API")
+        # One Add provider, one list: machines to rent and hosted APIs side by side (the owner
+        # found two halves and a second list on Rented capacity confusing).
+        _click(page, "Add provider")
         page.until("[...document.querySelectorAll('.plugin-tile')].some(t => t.textContent.includes('Another Anthropic-format API'))",
                    within=10, what="the choices")
+        groups = page.js("[...document.querySelectorAll('#provider-dialog h3.choice-group')].map(h => h.textContent)")
+        assert [g.split(" —")[0] for g in groups] == ["Rent GPU machines", "Hosted model APIs"]
         page.js("[...document.querySelectorAll('.plugin-tile')].find(t => t.textContent.includes('Another Anthropic-format API')).click(); true")
         page.until("!!document.querySelector('#hosted-url')", within=10, what="the key step")
         page.js(f"""
@@ -415,6 +418,15 @@ def test_the_providers_screen_adds_a_hosted_api_like_a_rented_account(pool):
         card = page.js("document.querySelector('.hosted-card').textContent")
         assert "claude" in card and "provider-claude" in card and "$3.75" in card
         assert KEY not in page.js("document.documentElement.outerHTML")
+
+        # Requests at once, changed from the card (the owner could see "at most 4" and not change it).
+        page.js("[...document.querySelectorAll('.hosted-card button')].find(b => b.textContent === 'Settings').click(); true")
+        page.until("!!document.querySelector('#hosted-settings-workers')", within=10, what="the settings")
+        page.js("document.querySelector('#hosted-settings-workers').value = 9;"
+                "document.querySelector('#provider-dialog form').requestSubmit(); true")
+        page.until("!document.getElementById('provider-dialog').open", within=20, what="the settings saved")
+        page.until("document.querySelector('.hosted-card').textContent.includes('at most 9 requests')", within=20, what="the new limit")
     config = yaml.safe_load(pool.path.read_text())
+    assert next(h for h in config["hosts"] if h["id"] == "claude-api")["workers"] == 9
     assert config["catalog"]["claude"]["variants"][0]["requires"] == ["hosted:claude-api"]
     assert (pool.tmp / "provider-credentials" / "hosted" / "claude-api.json").exists()

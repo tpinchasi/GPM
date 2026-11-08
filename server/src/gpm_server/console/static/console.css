@@ -181,6 +181,10 @@ ol.stepper li.current { color: var(--ink); font-weight: 600; }
 ol.stepper li.current span { background: var(--accent); border-color: var(--accent); color: #fff; }
 ol.stepper li.done span { background: var(--tag); color: var(--ok); }
 .plugin-tiles { display: grid; gap: 10px; }
+.provider-dialog .plugin-tiles { grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); }
+.provider-dialog h3.choice-group { margin: 18px 0 2px; font-size: 1rem; }
+.provider-dialog h3.choice-group:first-of-type { margin-top: 6px; }
+.provider-dialog h3.choice-group + p { margin-top: 0; }
 .plugin-tile { display: flex; gap: 12px; align-items: flex-start; text-align: left; padding: 10px 12px; }
 .plugin-tile.chosen { border-color: var(--accent); }
 .plugin-tile .cap-chips { margin-top: 6px; }

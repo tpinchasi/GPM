@@ -228,14 +228,16 @@ rental's event names what was assumed. RunPod's are `assumed_download_mbps` (100
 
 ## 7. Console
 
-### 7.1 Providers (Rented capacity → Providers, the first tab) — built
+### 7.1 Provider accounts (on the Providers screen, beside hosted APIs) — built
 
-**A pool that rents nothing yet** shows, here and on the Providers screen (§10), **Add a provider
-account** rather than a dead end (S13, D171). The first account also asks for the two ceilings no
+The accounts are listed on the **Providers** screen, in one list with the hosted model APIs (§10),
+under one **Add provider** whose first step offers both kinds; Rented capacity no longer has a tab
+of its own for them (S13). **A pool that rents nothing yet** is no dead end (S13, D171): Rented
+capacity points to Providers, where the first account is added. The first account also asks for the two ceilings no
 machine is rented without — `offer_policy.min_disk_gb` and `max_all_in_hourly` — the engine rented
 machines run, and optionally which models they hold, and writes the `rented:` section with them.
 Renting starts when the pool next starts: the supervisor builds its renting machinery at start,
-and the plan says so. Until then the tab says a restart is waiting.
+and the plan says so. Until then the screen says a restart is waiting.
 
 A summary across accounts (how many, how many searching, hosts held, burn) with **Add provider**
 and **Check every account**, then a card per connection, every card laid out alike so two read
@@ -315,11 +317,13 @@ of the decision log.
 
 ## 10. Hosted model APIs on the console (S13, D171)
 
-A hosted model API (D164) is added, changed and removed on the **Providers** screen, beside the
-rented accounts, and what is saved is what an operator would write by hand: a `kind: hosted` host
-and catalog builds.
+A hosted model API (D164) is added, changed and removed on the **Providers** screen, in one list
+with the rented accounts, and what is saved is what an operator would write by hand: a `kind:
+hosted` host and catalog builds.
 
-- **Choosing one.** A short list of known APIs — each only an address and a format
+- **Choosing one.** **Add provider** lists both kinds on its first step — *Rent GPU machines*,
+  paid by the hour, and *Hosted model APIs*, paid per token; choosing one of either goes on with
+  that kind's steps. Among the hosted: a short list of known APIs — each only an address and a format
   (`hosted_presets.py`) — and *another OpenAI-format API* and *another Anthropic-format API* with
   an address of the operator's. The address is https, or http on the pool's own machine only.
 - **The key.** Typed into a dialog, sent once (§5's transport rules), **tested against the
@@ -340,7 +344,8 @@ and catalog builds.
 - **Its card**: status (*serving*, *needs a key*, *key saved for another address*, *key refused*,
   *out of money* with **Money is back**, *cannot be reached*, *out of service*), address, the
   key's source and when it was set, requests at once, spend today and this month, its models and
-  prices. **Test**, **Type in / Replace key** (and **Remove key**), **Models and prices** (the same
+  prices. **Test**, **Type in / Replace key** (and **Remove key**), **Settings** (requests at once,
+  1–1000, in effect at once; for Anthropic's format whether prompts are cached), **Models and prices** (the same
   picker; unticking removes the build, and an entry left with none leaves the catalog and the
   model set), **Take out of service / Return**, **Remove** (typed again; removes its builds and its
   key).
