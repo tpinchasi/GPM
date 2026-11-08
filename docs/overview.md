@@ -20,7 +20,10 @@ An application sees one URL and one API key. Everything else is the pool's busin
 ## What it is not
 
 - Not an inference engine. It sits in front of one (Ollama first; others by plug-in).
-- Not a model-format translator. Requests pass through to the engine in the engine's own API.
+- Not a model-format translator, by default. Requests pass through to the engine in the engine's
+  own API wherever the host speaks it; only between OpenAI's and Anthropic's chat formats, where
+  a model is served only in the other, does the pool translate — and it refuses what it cannot
+  carry (D169).
 - Not a general cloud orchestrator. It manages hosts for one purpose: serving a declared set of
   models to the apps holding the pool's key.
 

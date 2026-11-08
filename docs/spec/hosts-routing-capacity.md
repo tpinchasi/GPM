@@ -54,11 +54,26 @@ flight. Its engine is `openai-api`, the same for every provider; it has no agent
 provider's name for the model, the kinds it serves there, and its price (§4.1); it holds only such
 variants (`engine: openai-api`) — one that names no engine is a machine's, never a provider's.
 
-**Claude through Anthropic's OpenAI-compatible endpoint is never cached** (found 2026-11-07): that
-endpoint does not support prompt caching and reports no cached tokens ("Prompt caching is not
-supported"), so every request pays the full input price — many times what Anthropic's own API
-charges a repeated prompt with caching on. Reaching Claude through Anthropic's own Messages API,
-with caching on by default, is S12.
+**A hosted API speaking Anthropic's Messages format is `engine: anthropic-api`** (D169, D170) —
+Claude, at `https://api.anthropic.com/v1`, and any provider serving `/v1/messages` the same way. A
+provider that speaks both formats is two hosts, one per engine. Claude is reached only so:
+Anthropic's OpenAI-compatible layer does not cache at all, and is retired. The pool asks for
+Anthropic's 5-minute prompt cache on every request that carries no cache mark of its own — one
+top-level `cache_control`, renewed free on each use — unless the host says `cache_prompts: false`;
+its builds carry `price.cache_write` (and `cached_input`, a cache read).
+
+```yaml
+  - id: anthropic
+    kind: hosted
+    engine: anthropic-api
+    workers: 8
+    transport: {type: https, base_url: https://api.anthropic.com/v1, bearer_env: ANTHROPIC_API_KEY}
+# catalog: the provider's name for the model, and its prices per million tokens, from its price page
+  chat-large:
+    variants:
+      - {tag: <provider model id>, engine: anthropic-api,
+         price: {input: <in>, cached_input: <cache read>, cache_write: <5-minute write>, output: <out>}}
+```
 
 **Ollama's cloud is reached only this way** (D168): a host at `https://ollama.com/v1`, priced like
 any other. A machine's build, or a model in the set with no catalog entry, naming a `:cloud` or

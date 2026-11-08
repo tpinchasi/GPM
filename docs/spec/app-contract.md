@@ -36,6 +36,17 @@ On top of it the pool adds a short, named dialect. Nothing else is added silentl
 reaches a pool of either unchanged. Ollama also serves its own native `/api/*` paths, and apps
 written against them keep working; a request is passed through on whichever surface it arrived.
 
+**Anthropic's Messages format is served too** (D169): `/v1/messages` and `/v1/messages/count_tokens`,
+for apps written with Anthropic's SDK — `Anthropic(base_url=<pool>, api_key=<pool key>)`. Every
+model the pool serves is reached in either format: a request goes untouched to a host that speaks
+its format, and is translated — answer, stream and errors back in the app's format — only where
+the model is served by hosts that speak the other. What a translation cannot carry (thinking, PDF
+documents, citations, server tools to an OpenAI-format host; `logprobs`, `n`, `response_format`
+to an Anthropic-format one) is refused `400 unsupported_feature`, naming it, unless the request
+sends `X-GPM-Unsupported: drop`. On Anthropic's paths the pool's own refusals take that format's
+error shape — `{"type": "error", "error": {"type", "message"}}` — with `reason`, `detail` and
+`retry_after_s` beside it.
+
 Two differences between the surfaces matter to an app:
 
 | | `/v1/*` | Ollama's `/api/*` |
@@ -45,11 +56,13 @@ Two differences between the surfaces matter to an app:
 
 | Dialect item | Required? | Meaning |
 |---|---|---|
-| `Authorization: Bearer <app key>` | **Required**, loopback included | Admits the app to this pool (§3) |
+| `Authorization: Bearer <app key>` | **Required**, loopback included | Admits the app to this pool (§3). `x-api-key: <app key>` is read the same, for clients of Anthropic's format; neither ever reaches a host |
 | Logical model names | Opt-in per model, by the operator | A name listed in the pool's catalog resolves to the build suited to the serving host. The same request can therefore return a different build through the pool than against a bare engine — by design, only for catalogued names. Unlisted names pass through literally |
 | Model actually served | Always reported | The response body's own model field (left untouched), and `X-GPM-Served-Model`, with `X-GPM-Host` and `X-GPM-Runtime-Class` |
 | `X-GPM-Cost-USD` | On a whole (not streamed) answer from a hosted API | What the answer cost the app's budget, in dollars (D165) — the app spends its own budget, so it is told |
 | `X-GPM-Cost-Max-USD` | On a streamed answer from a hosted API | The most it can cost: headers are sent before the usage that prices it arrives. The exact cost is charged to the budget and written to the request log when the stream ends |
+| `X-GPM-Unsupported: drop` | Optional | Where the request must be translated (D169): what the other format cannot carry is dropped rather than refused |
+| `X-GPM-Translated`, `X-GPM-Dropped` | On a translated answer | Which formats it was translated between, and what was dropped at the app's asking |
 | `X-GPM-Wait-S` | Always reported | Seconds this request spent waiting for a worker, so queue wait is never mistaken for generation time |
 | Machine-readable `503` | Always | Body carries `reason` and `retry_after_s`; header carries `Retry-After`. A client that ignores the body still behaves correctly |
 | `X-GPM-Session` | Optional | Groups calls in the pool's request log. Affects routing only if the operator switched on an affinity or build-consistency option |

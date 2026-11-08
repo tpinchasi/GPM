@@ -1,8 +1,9 @@
 """`openai-api`: a hosted model API reached with a key (S11, D164).
 
-OpenAI, Anthropic's compatibility endpoint, Together, Ollama's cloud, Groq, Fireworks, DeepInfra,
-OpenRouter — every provider that serves the OpenAI-shaped `/v1` paths is this one engine: a
-provider is a base URL, a key and a price list, never an adapter of its own.
+OpenAI, Together, Ollama's cloud, Groq, Fireworks, DeepInfra, OpenRouter — every provider that
+serves the OpenAI-shaped `/v1` paths is this one engine: a provider is a base URL, a key and a
+price list, never an adapter of its own. Claude is reached through `anthropic-api` instead
+(D170): Anthropic's OpenAI-compatible layer does not cache, and is retired.
 
 What is different about such a host, and why the adapter looks the way it does:
 
@@ -43,6 +44,7 @@ OUT_OF_FUNDS_CODES = frozenset({
     "blocked_api_access",             # Groq, 400
     "billing_hard_limit_reached",     # OpenAI
     "credit_balance_too_low",
+    "billing_error",                  # Anthropic's Messages API
 })
 #: Words in a provider's refusal that mean the same, where it gives no code.
 OUT_OF_FUNDS_WORDS = ("spend limit", "credit balance", "insufficient credit", "insufficient balance",
@@ -148,10 +150,11 @@ class HostedOpenAIEngine:
         return False
 
     @staticmethod
-    def counts(tail: bytes) -> Optional[tuple[int, int, int]]:
-        """(input, cached input, output) tokens, as the answer reports them — None where it does
-        not. OpenAI-shaped `usage`: `prompt_tokens` includes the cached ones, said apart in
-        `prompt_tokens_details.cached_tokens` (some providers put them at the top level)."""
+    def counts(tail: bytes) -> Optional[tuple[int, int, int, int]]:
+        """(input, read from cache, output, written to cache) tokens, as the answer reports them
+        — None where it does not. OpenAI-shaped `usage`: `prompt_tokens` includes the cached ones,
+        said apart in `prompt_tokens_details.cached_tokens` (some providers put them at the top
+        level), and — on the newest OpenAI models — the ones written, `cache_write_tokens`."""
         for frame in openai_api._frames_from_tail(tail):
             usage = frame.get("usage")
             if not isinstance(usage, dict):
@@ -160,10 +163,14 @@ class HostedOpenAIEngine:
             if not isinstance(prompt, (int, float)):
                 continue
             details = usage.get("prompt_tokens_details")
-            cached = (details.get("cached_tokens") if isinstance(details, dict) else None) or usage.get("cached_tokens") or 0
+            details = details if isinstance(details, dict) else {}
+            cached = details.get("cached_tokens") or usage.get("cached_tokens") or 0
+            written = details.get("cache_write_tokens") or usage.get("cache_write_tokens") or 0
             completion = completion if isinstance(completion, (int, float)) else 0
             cached = cached if isinstance(cached, (int, float)) else 0
-            return int(prompt), int(min(cached, prompt)), int(completion)
+            written = written if isinstance(written, (int, float)) else 0
+            cached = min(cached, prompt)
+            return int(prompt), int(cached), int(completion), int(min(written, prompt - cached))
         return None
 
     @staticmethod

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 
@@ -149,6 +149,10 @@ class HostRegistry:
             last_error=row.last_error,
             workload=row.workload,
         )
+
+    def host_config(self, host_id: str) -> Any:
+        """A configured host's settings, or None for one the pool rented."""
+        return self._host_config.get(host_id)
 
     def _client_for(self, row: HostRow) -> httpx.AsyncClient:
         """Credentials come from configuration, never from the database — no secret crosses

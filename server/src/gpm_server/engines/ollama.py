@@ -8,7 +8,7 @@ from typing import Any, ClassVar, Optional
 import httpx
 
 from ..config import cloud_tag
-from . import openai_api
+from . import anthropic_api, openai_api
 from .base import (
     CHAT,
     EMBED,
@@ -64,11 +64,14 @@ class OllamaEngine:
         against them keep working, and nothing here translates between the two — each is passed
         through to the engine as it arrived.
         """
-        return {"/api/chat", "/api/generate", "/api/embed", "/api/embeddings"} | set(
-            openai_api.INFERENCE_PATHS
-        )
+        # And Anthropic's Messages format, which it serves itself from 0.14.0 (S12) — passed
+        # through as it came, as the others are. Not `count_tokens`: it has none.
+        return {"/api/chat", "/api/generate", "/api/embed", "/api/embeddings",
+                anthropic_api.MESSAGES_PATH} | set(openai_api.INFERENCE_PATHS)
 
     def kind_of(self, path: str) -> Optional[str]:
+        if path == anthropic_api.MESSAGES_PATH:
+            return CHAT
         if path in _STREAMING_PATHS:
             return CHAT
         if path in ("/api/embed", "/api/embeddings"):
@@ -78,6 +81,8 @@ class OllamaEngine:
     def request_facts(self, path: str, content_type: str, body: bytes) -> RequestFacts:
         if path in openai_api.INFERENCE_PATHS:
             return openai_api.json_facts(path, body)
+        if path == anthropic_api.MESSAGES_PATH:
+            return anthropic_api.facts(path, content_type, body)
         # Its own API: the same top-level fields, a picture as base64 in `images` — beside a
         # message's text in chat, beside the prompt in generate — and streaming on by default.
         kind = self.kind_of(path) or CHAT
@@ -123,11 +128,15 @@ class OllamaEngine:
     def wants_schema(self, path: str, body: bytes) -> bool:
         if path in openai_api.INFERENCE_PATHS:
             return openai_api.wants_schema(path, body)
+        if path == anthropic_api.MESSAGES_PATH:
+            return anthropic_api.wants_schema(path, body)
         # A JSON schema object enforces structure; the bare string "json" is loose JSON mode,
         # which guarantees nothing about shape.
         return isinstance(_decode(body).get("format"), dict)
 
     def is_streaming(self, path: str, body: bytes) -> bool:
+        if path == anthropic_api.MESSAGES_PATH:
+            return anthropic_api.is_streaming(path, body)
         if path in openai_api.INFERENCE_PATHS:
             # Note the opposite default: whole unless asked to stream, where this engine's own
             # API streams unless asked not to.
@@ -145,6 +154,8 @@ class OllamaEngine:
         """
         if path in openai_api.INFERENCE_PATHS:
             return openai_api.usage(path, tail)
+        if path == anthropic_api.MESSAGES_PATH:
+            return anthropic_api.usage(path, tail)
         for line in reversed(tail.splitlines()):
             line = line.strip()
             if not line.startswith(b"{"):
@@ -170,7 +181,7 @@ class OllamaEngine:
         ignorable frame (D62)."""
         if path in openai_api.INFERENCE_PATHS:
             return openai_api.keepalive_frame(path)
-        return None
+        return anthropic_api.keepalive_frame(path)
 
     async def health(self, client: httpx.AsyncClient) -> Health:
         try:

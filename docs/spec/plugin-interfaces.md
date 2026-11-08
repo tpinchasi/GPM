@@ -139,9 +139,13 @@ cloud account.**
 ## 2. Engine interface (v1)
 
 An engine adapter tells the pool how to talk to one kind of inference server. The router
-**passes requests through in the engine's own API and never translates between APIs** — an app
-written for engine X talks to a pool of engine-X hosts. (Translation is where tool-calling and
-structured-output fidelity get lost; the pool does not take that risk on.)
+**passes requests through in the engine's own API wherever the chosen host speaks the request's
+format** — an app written for engine X talks to a pool of engine-X hosts untouched. Only between
+OpenAI's Chat Completions and Anthropic's Messages (D169), and only where the model is served by
+hosts that speak the other, does it translate — by two closed mappings that refuse what they
+cannot carry rather than lose it, since translation is where tool-calling and structured-output
+fidelity get lost. Each engine's `inference_paths` is what it speaks natively; Anthropic's paths
+are read by one shared module (`anthropic_api`), as OpenAI's are.
 
 **A pool may run a different engine on each host** (D93) — `engine:` on a host, the pool's own
 where a host says nothing, and `rented.engine` for the machines it buys, which is `vllm` unless

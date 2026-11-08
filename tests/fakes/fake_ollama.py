@@ -94,6 +94,8 @@ class FakeOllama:
                 # a pool ship that could not answer the SDK's default call.
                 Route("/v1/models", self._v1_models, methods=["GET"]),
                 Route("/v1/chat/completions", self._v1_chat, methods=["POST"]),
+                # Anthropic's Messages format, which Ollama serves itself from 0.14.0 (S12).
+                Route("/v1/messages", self._v1_messages, methods=["POST"]),
                 Route("/v1/embeddings", self._v1_embeddings, methods=["POST"]),
             ]
         )
@@ -275,6 +277,23 @@ class FakeOllama:
                 raise
 
         return StreamingResponse(frames(), media_type="text/event-stream")
+
+    async def _v1_messages(self, request: Request) -> Response:
+        """Anthropic's Messages format, whole: the same echo, in that format's shape."""
+        _, parsed = await self._record(request)
+        model = parsed.get("model", "")
+        refused = self._use(model)
+        if refused is not None:
+            return refused
+        messages = parsed.get("messages") or []
+        last = messages[-1].get("content", "") if messages else ""
+        if isinstance(last, list):
+            last = "".join(b.get("text", "") for b in last if isinstance(b, dict))
+        self.started += 1
+        self.completed += 1
+        return JSONResponse({"id": "msg_fake", "type": "message", "role": "assistant", "model": model,
+                             "content": [{"type": "text", "text": f"echo:{last}"}], "stop_reason": "end_turn",
+                             "stop_sequence": None, "usage": {"input_tokens": 3, "output_tokens": 7}})
 
     async def _v1_embeddings(self, request: Request) -> Response:
         _, parsed = await self._record(request)
