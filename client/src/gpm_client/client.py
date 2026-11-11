@@ -19,7 +19,7 @@ from typing import Any, BinaryIO, Iterable, Optional, Union
 
 import httpx
 
-from .config import env_api_key, env_url
+from .config import env_api_key, env_url, pool_root
 from .errors import PoolUnavailable
 from .retry import RetryPolicy
 from .transport import async_pool_transport, pool_transport
@@ -352,7 +352,7 @@ class PoolClient:
     ):
         if api not in DIALECTS:
             raise ValueError(f"api must be one of {sorted(DIALECTS)}, not {api!r}")
-        self.base_url = base_url or env_url()
+        self.base_url = pool_root(base_url or env_url())
         self.api_key = api_key or env_api_key()
         self._paths = DIALECTS[api]
         self._api = api
@@ -475,7 +475,7 @@ class AsyncPoolClient:
     ):
         if api not in DIALECTS:
             raise ValueError(f"api must be one of {sorted(DIALECTS)}, not {api!r}")
-        self.base_url = base_url or env_url()
+        self.base_url = pool_root(base_url or env_url())
         self.api_key = api_key or env_api_key()
         self._paths = DIALECTS[api]
         self._api = api

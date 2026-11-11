@@ -7,6 +7,8 @@ one small host, and only then leaving it unattended.
 
 Everything below can be done from the console at `/ui` as well as the command line. Nothing is
 console-only.
+The commands are written as run from a clone (`uv run gpm …`); with the pool installed from a
+release, drop the `uv run`.
 
 ## The one rule worth learning first
 
@@ -28,16 +30,28 @@ And two more inside the rented section:
 | `offer_policy.max_all_in_hourly` | required, no default | A single host costing more than you meant — machines above it are not considered, and bids stop at it |
 | `on_demand_crossover` | 0.8 | Paying near the on-demand price for a host that can still be evicted |
 
-## 1. Give the provider its credential
+## 1. Add the provider account, with its credential
 
-The account credential is read from the environment and **never from configuration**, so it
-cannot end up in a file you commit:
+The account credential is **never written in configuration**, so it cannot end up in a file you
+commit. Give it in one of two ways:
 
-```sh
-export VAST_API_KEY=...        # or whatever your provider's plug-in names
-```
+- **On the console**: *Providers → Add provider*, choose the provider, and paste the credential.
+  It is tested against the provider (which spends nothing) and kept by the supervisor in an
+  owner-only file. The account is listed at once, with no restart.
+- **In the supervisor's environment**, before it starts:
 
-It never leaves the supervisor's process. What goes onto a rented host is the per-instance
+  ```sh
+  export VAST_API_KEY=...        # RunPod: RUNPOD_API_KEY; Verda: VERDA_CREDENTIAL=CLIENT_ID:CLIENT_SECRET
+  ```
+
+  If both are given, the one typed into the console is used. A variable you name yourself on
+  the account (`credential_env`) always wins.
+
+Adding the account rents nothing. Until the search below names both a disk floor and an hourly
+ceiling, the pool rents nothing and no lease that may rent can be opened. Until then, *Rented
+capacity* shows **Set up renting**, which asks for exactly those, the engine and the models.
+
+The credential never leaves the supervisor's process. What goes onto a rented host is the per-instance
 credential the provider itself injects there, which can only stop or destroy that one instance.
 
 ## 2. Describe what you are willing to rent
@@ -52,7 +66,8 @@ limits:
 rented:
   providers:
     vast: { type: vast }       # a connection: a name, and the provider plug-in it uses
-  # image: left out — new hosts start from the engine's newest release, checked (D177); name one to pin it
+  engine: ollama               # or vllm, the default for rented hosts: whichever your models have builds for
+  # image: left out — new hosts start from the engine's newest stable release, kept current (below)
   workers: 2                   # per card: a two-card machine runs twice this
   capabilities: [cuda]
   ssh_key: ~/.ssh/id_ed25519   # the pool installs its public half on each host it rents
@@ -204,12 +219,37 @@ Vast, RunPod and Verda ship with the framework; another provider is a plug-in (s
   taken away would cost.
 - **A provider without a dead-man timer** serves only short leases
   (`teardown.max_hours_without_deadman`): a longer lease rents elsewhere.
-- **Adding, turning on or off, and removing a provider take effect at once** — no restart; a change
-  to an existing one's settings, or a rename, at the supervisor's next restart. The configuration plan asks
-  you to type the name of a provider you turn on, and refuses to remove one the pool still holds
-  hosts at — release them first.
+- **Every change to a provider account takes effect at once**, with no restart: adding one,
+  turning it on or off, renaming it, changing its settings, removing it. A rename keeps its
+  credential and the day's search use. The configuration plan asks you to type the name of a
+  provider you turn on, and refuses to remove one the pool still holds hosts at — release them
+  first. (A third-party plug-in written to the first plug-in interface still needs a restart for
+  new settings.)
+- **An account's address is fixed once it is added.** To point at a different API address,
+  remove the account and add it again.
 - `enabled: false` stops searching and renting there; its hosts stay until released, and are
   still watched and charged.
+
+## Which engine image a rented host runs
+
+With no `rented.image`, a new host starts from the **newest stable release** of its engine's
+official image: `ollama/ollama`, or `vllm/vllm-openai`. vLLM has two builds, one for NVIDIA
+drivers 580 and newer and its `-cu129` build for drivers 550 and newer, and each machine gets
+the one its driver can run.
+
+- The supervisor checks Docker Hub every six hours, in the background. It takes only release
+  versions: never `latest`, a nightly, a release candidate, or another accelerator's build.
+- **A new release is on trial** until a host started from it serves. If two hosts started from
+  it never answer, it is dropped: new hosts go back to the release before, and the pool does not
+  take the dropped one again by itself.
+- Hosts already running keep their image.
+- The console's *Rented capacity → Engine* tab shows the image in use, whether it is on trial,
+  and any release dropped.
+- **To pin an image**, name it: `rented.image: ollama/ollama:0.40.15`, or `rented.images` for one
+  per driver. `rented.image: latest` means the newest release, as when it is left out.
+
+The pool starts the engine itself on the host, so any image works on providers that skip an
+image's own start command (Vast's SSH mode, RunPod).
 
 ## What protects you if everything goes wrong
 

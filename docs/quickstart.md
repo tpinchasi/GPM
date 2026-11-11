@@ -5,18 +5,29 @@ nothing rented and nothing able to spend money. That is deliberate: the framewor
 useful before it is trusted with a credit card. Renting comes next, in
 [quickstart-renting.md](quickstart-renting.md).
 
-You need Python 3.11 or newer, [uv](https://docs.astral.sh/uv/), and an
-[Ollama](https://ollama.com) running somewhere you can reach.
+You need Python 3.11 or newer and an [Ollama](https://ollama.com) running somewhere you can
+reach.
 
 ## 1. Install
 
+The packages are attached to each [GitHub release](https://github.com/tpinchasi/GPM/releases)
+(not PyPI). Install the server and the agent from the newest one, into an environment of their
+own:
+
 ```sh
-git clone <this repository> gpm && cd gpm
-uv sync
+python3 -m venv ~/gpm && ~/gpm/bin/pip install \
+  https://github.com/tpinchasi/GPM/releases/download/v0.42.0/gpm_server-0.42.0-py3-none-any.whl \
+  https://github.com/tpinchasi/GPM/releases/download/v0.42.0/gpm_agent-0.16.0-py3-none-any.whl
+export PATH="$HOME/gpm/bin:$PATH"
+gpm --version
 ```
 
-Two packages get installed: `gpm-server` (the router, the supervisor and the `gpm` command) and
-`gpm-client` (the SDK your application will depend on, whose only dependency is `httpx`).
+`gpm-server` is the router, the supervisor, the console and the `gpm` command; `gpm-agent` is the
+optional host agent, which the server also installs on hosts it rents. Your application depends
+only on `gpm-client` (step 7).
+
+From a clone instead (`git clone https://github.com/tpinchasi/GPM.git && cd GPM && uv sync`, with
+[uv](https://docs.astral.sh/uv/)), put `uv run` before each `gpm` command below.
 
 ## 2. Load the models on every host
 
@@ -102,8 +113,8 @@ There is no `rented:` section, so **this pool has no way to spend money at all.*
 ## 4. Make two keys
 
 ```sh
-uv run gpm key create --role app -c pool.yaml      # for your applications
-uv run gpm key create --role admin -c pool.yaml    # for the console and the control API
+gpm key create --role app -c pool.yaml      # for your applications
+gpm key create --role admin -c pool.yaml    # for the console and the control API
 ```
 
 Each key is printed once and stored only as a hash. The two roles are never interchangeable: an
@@ -113,7 +124,7 @@ required even on loopback, because any web page open in your browser can post to
 ## 5. Start it
 
 ```sh
-uv run gpm serve -c pool.yaml
+gpm serve -c pool.yaml
 ```
 
 That runs the router in this process and the supervisor beside it in its own. They share a
@@ -121,11 +132,11 @@ SQLite file and never call each other, so if the supervisor stops, routing carri
 
 ```sh
 export GPM_ADMIN_KEY=<the admin key>
-uv run gpm status
+gpm status
 ```
 
 Each host should reach `ready`. If one says `preparing`, it is reachable but does not hold the
-whole model set yet — `uv run gpm host-test http://host:11434 --workers 4` will tell you exactly
+whole model set yet — `gpm host-test http://host:11434 --workers 4` will tell you exactly
 which step fails, including whether the engine is really serving requests in parallel.
 
 ## 6. Open the console
@@ -136,6 +147,12 @@ and sent as a header; nothing is written to storage or a cookie.
 Everything the console does is also a CLI verb, so anything you can click you can script.
 
 ## 7. Point an application at it
+
+The application installs the client, whose only dependency is `httpx`:
+
+```sh
+pip install "gpm-client @ https://github.com/tpinchasi/GPM/releases/download/v0.42.0/gpm_client-0.8.0-py3-none-any.whl"
+```
 
 ```python
 from gpm_client import PoolClient
@@ -150,17 +167,24 @@ export GPM_URL=http://127.0.0.1:8080
 export GPM_API_KEY=<the app key>
 ```
 
-If your application already uses an HTTP client, inject the transport instead and change no
-call sites at all — it will then wait and retry for capacity by default:
+`GPM_URL` is the pool's root. The `/v1` address works too, from gpm-client 0.8.1.
+
+An application already written with OpenAI's or Anthropic's client keeps it: point it at the
+pool and give it the pool's transport, and it waits and retries for capacity like the SDK does:
 
 ```python
+import httpx
+from openai import OpenAI
 from gpm_client import pool_transport
-client = SomeEngineClient(base_url=GPM_URL, http_client_kwargs={"transport": pool_transport()})
+
+client = OpenAI(base_url=f"{GPM_URL}/v1", api_key=GPM_API_KEY, max_retries=0,
+                http_client=httpx.Client(transport=pool_transport()))
 ```
 
-Requests and responses are your engine's own API, passed through untouched. The pool adds only
-a few headers: which build actually served the request, which host, and how long it waited for
-a worker.
+The pool speaks OpenAI's API and Anthropic's (`/v1/messages`), and passes requests through
+untouched wherever the host speaks the same format. It adds only a few headers: which build
+actually served the request, which host, how long it waited for a worker and, from a hosted
+API, what it cost. [client/README.md](../client/README.md) has the rest.
 
 ## What you have now
 
@@ -173,6 +197,8 @@ a worker.
 
 ## Next
 
+- [hosted-apis.md](hosted-apis.md) — adding hosted model APIs (Anthropic, OpenAI, Ollama's cloud
+  and others) for models you do not run, or as overflow, each paid from a budget you set.
 - [quickstart-renting.md](quickstart-renting.md) — adding a marketplace provider, written
   around leases and caps first.
 - [spec/app-contract.md](spec/app-contract.md) — everything an application can rely on.

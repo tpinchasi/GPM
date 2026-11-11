@@ -33,13 +33,14 @@ An application sees one URL and one API key. Everything else is the pool's busin
 routing policy, one budget, and one API key that admits apps to it. Workloads that must be kept
 apart use different pools.
 
-**Host.** A machine running an inference engine. Three kinds:
+**Host.** A machine running an inference engine, or a hosted model API. Four kinds:
 
 | Kind | Example | Lifetime controlled by | Cost |
 |---|---|---|---|
 | `local` | The engine on the machine the pool runs on | nobody — it is just there | none |
 | `fixed-remote` | A machine you own or lease at a known address | nobody by default; optional start/stop commands | flat |
-| `rented-interruptible` | An instance on a bidding marketplace | the pool: bid, recover, replace, park, destroy | hourly + storage + download |
+| `rented-interruptible` | An instance on a GPU marketplace (bid, spot or on demand) | the pool: bid, recover, replace, park, destroy | hourly + storage + download |
+| `hosted` | A hosted model API — Anthropic, OpenAI, Ollama's cloud, … ([hosted-apis.md](hosted-apis.md)) | the provider | per token, from a budget the operator sets |
 
 Any remote host is reached over one of three **transports** — a supervised SSH `tunnel`, plain
 `http`, or `https` — chosen per host, independently of its kind.
@@ -58,8 +59,10 @@ build elsewhere — but only for names an operator listed in the catalog. The bu
 served is always reported back.
 
 **Routing priority.** Strict tiers: `local` first, `fixed-remote` next, `rented-interruptible`
-last. A lower tier is used only when every eligible worker above it is busy. Rented hosts
-therefore carry only the overflow, go idle first, and are released first. Within a tier the
+after them, and `hosted` last. A lower tier is used only when every eligible worker above it is
+busy. Rented hosts therefore carry only the overflow, go idle first, and are released first; a
+hosted API takes a request only after it has waited a set time for a machine (or at once for a
+model no machine runs), and only within its budget. Within a tier the
 least-loaded host wins; across the pool the queue is first come, first served.
 
 **Lease.** The only thing that can spend money. A lease says how many workers are wanted, for

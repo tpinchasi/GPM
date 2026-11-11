@@ -1,36 +1,51 @@
 # GPM — GPU Hosts Pool Management
 
-A layer that **serves GPU inference to applications without the applications knowing where the
+A layer that **serves inference to applications without the applications knowing where the
 GPU is**. It keeps a pool of model-serving hosts — the local machine, fixed remote machines,
-and instances rented on a bidding marketplace — routes each request to a free worker on the
-best available host, and does the renting, bidding, recovery and tear-down itself, inside
-spending limits an operator sets.
+instances rented on GPU marketplaces (Vast.ai, RunPod, Verda), and hosted model APIs paid per
+token — routes each request to a free worker on the best available host, and does the renting,
+bidding, recovery and tear-down itself, inside spending limits an operator sets.
 
-**Status: phases 1–4 are built** — the router and client SDK, the supervisor with leases,
-renting and the dead-man timer, and the operator console. It has run against a real marketplace:
-a capped live run bid, prepared a host, served a request through the router, recovered from a
-real eviction unattended and tore everything down, for $0.008. Two release-checklist items remain.
-See [STATUS.md](STATUS.md) for exactly where things stand.
-
-**Intent: to be released publicly as a reusable framework.** This repository is private until
-the items in [docs/release-checklist.md](docs/release-checklist.md) are done.
+**Status:** released as a reusable framework under Apache-2.0; the newest release is on the
+[Releases page](https://github.com/tpinchasi/GPM/releases). It has run against real marketplaces
+and hosted APIs: capped live runs have rented hosts, served through the router, recovered from
+real evictions unattended, spilled a burst to a hosted API and torn everything down. See
+[STATUS.md](STATUS.md) for exactly where things stand and what has not been checked live.
 
 ## Install
 
-Needs Python 3.11 or newer and [uv](https://docs.astral.sh/uv/). One workspace, three packages:
-the server, the client SDK, and the optional host agent.
+Needs Python 3.11 or newer. Three packages: the server (`gpm-server`: the router, the
+supervisor, the console and the `gpm` command), the client SDK (`gpm-client`), and the host
+agent (`gpm-agent`, which the server also installs on rented hosts). They are attached to each
+[GitHub release](https://github.com/tpinchasi/GPM/releases) with a `SHA256SUMS` file, and are not
+on PyPI.
+
+**To run a pool**, install the server and the agent from the newest release into a virtual
+environment of their own:
 
 ```sh
-git clone <this repository> && cd GPM
+python3 -m venv ~/gpm && ~/gpm/bin/pip install \
+  https://github.com/tpinchasi/GPM/releases/download/v0.42.0/gpm_server-0.42.0-py3-none-any.whl \
+  https://github.com/tpinchasi/GPM/releases/download/v0.42.0/gpm_agent-0.16.0-py3-none-any.whl
+~/gpm/bin/gpm --version
+```
+
+Or from a clone, with [uv](https://docs.astral.sh/uv/) — the way to work on GPM itself, and what
+[`deploy/gpm-deploy`](#deploy) builds a spending pool's release from:
+
+```sh
+git clone https://github.com/tpinchasi/GPM.git && cd GPM
 uv sync                                        # everything, including the dev tools
 uv run gpm --help
 ```
 
-An app only needs the client, which depends on `httpx` and nothing else:
+**An app only needs the client**, which depends on `httpx` and nothing else:
 
 ```sh
-uv pip install ./client                        # or: pip install gpm-client, once published
+pip install "gpm-client @ https://github.com/tpinchasi/GPM/releases/download/v0.42.0/gpm_client-0.8.0-py3-none-any.whl"
 ```
+
+Step by step, from nothing to a working pool: [docs/quickstart.md](docs/quickstart.md).
 
 ## Configure
 
@@ -46,14 +61,16 @@ The parts that matter, and what each decides:
 |---|---|
 | `pool.model_set` | The models **every** host must hold before it is used. A request for anything else is refused, never loaded on demand |
 | `catalog` | Logical names (`my-model:7b`) and the per-capability builds they resolve to, so one request serves an Apple-silicon build on the laptop and a CUDA build on a rented host |
-| `hosts` | The machines you already have — local, or remote over `http`, `https` or an SSH `tunnel` |
+| `hosts` | The machines you already have — local, or remote over `http`, `https` or an SSH `tunnel` — and hosted model APIs (`kind: hosted`) |
+| `pool.bursts.hosted` | When requests may go to a hosted API, and the budget they are paid from: per request, per day, per month ([docs/hosted-apis.md](docs/hosted-apis.md)) |
 | `listen` / `control` | Where the app-facing router and the operator control API listen. Loopback unless you give TLS |
 | `auth` | Where the hashed key files live (below) |
-| `rented` | Everything about renting: provider, image, offer policy, bidding ceilings, teardown timings, and the opt-in features — `allocation: dynamic`, `workers_auto`, `agent_on_rented_hosts` |
+| `rented` | Everything about renting: the provider accounts, the engine (and an image, to pin one), the offer policy, bidding ceilings, teardown timings, and the opt-in features — `allocation: dynamic`, `workers_auto`, `agent_on_rented_hosts` |
 | `limits` | Pool-wide ceilings: how many rented hosts at once, and optionally an overall hourly burn |
 
-Check a change before it takes effect — `plan` says what would differ, and loosening a ceiling
-has to be typed again:
+Most of it can be set from the console instead — Providers, Rented capacity, Configuration —
+which writes the same file through the same check. Check a change before it takes effect —
+`plan` says what would differ, and loosening a ceiling has to be typed again:
 
 ```sh
 uv run gpm config validate -f pool.yaml
@@ -79,15 +96,16 @@ uv run gpm key list                              # fingerprints and when each wa
 uv run gpm key revoke <fingerprint>
 ```
 
-The provider's account credential is **never** written in configuration and never placed on a
-rented machine: it is read from the environment of the supervisor's own process
-(`VAST_API_KEY` for the first provider). What a rented host carries is the provider's
+A provider account's credential, and a hosted API's key, are **never** written in configuration
+and never placed on a rented machine. Type them into the console (*Providers → Add provider*),
+where the supervisor keeps them in an owner-only file and sends each only to the address it was
+saved for, or put them in the supervisor's environment: `VAST_API_KEY`, `RUNPOD_API_KEY`,
+`VERDA_CREDENTIAL` (as `CLIENT_ID:CLIENT_SECRET`). What a rented host carries is the provider's
 instance-scoped credential, which can only end that one instance.
 
 ## Run it
 
 ```sh
-export VAST_API_KEY=…                          # only if the pool may rent
 uv run gpm serve -c pool.yaml                  # the router, and the supervisor beside it
 uv run gpm status                              # what the pool sees
 ```
@@ -96,10 +114,11 @@ uv run gpm status                              # what the pool sees
 file. They never call each other: if the supervisor stops, the router keeps serving from the
 last table it published.
 
-Then open **http://127.0.0.1:8081/ui** for the console: hosts by tier, leases with their
-burn-down, the live market through your own offer policy, and every decision with the numbers
-behind it. Everything it does is also a CLI verb — `gpm lease`, `gpm host`, `gpm config`,
-`gpm market`, `gpm plan`, `gpm down --all`.
+Then open **http://127.0.0.1:8081/ui** for the console: hosts by tier, the provider accounts
+and hosted APIs, leases with their burn-down, hosted spending against each budget, the live
+market through your own offer policy, and every decision with the numbers behind it. Nearly
+everything it does is also a CLI verb — `gpm lease`, `gpm host`, `gpm workload`, `gpm config`,
+`gpm market`, `gpm spending`, `gpm plan`, `gpm down --all`.
 
 ### Deploy
 
@@ -107,8 +126,8 @@ behind it. Everything it does is also a CLI verb — `gpm lease`, `gpm host`, `g
 then point `current` at it:
 
 ```sh
-deploy/gpm-deploy v0.6.1               # build it: git archive of the tag, its own venv
-deploy/gpm-deploy v0.6.1 --activate    # and make it current
+deploy/gpm-deploy v0.42.0               # build it: git archive of the tag, its own venv
+deploy/gpm-deploy v0.42.0 --activate    # and make it current
 ~/.local/share/gpm/releases/current/venv/bin/gpm --version
 ```
 
@@ -142,7 +161,9 @@ and it will tell you that is what it is doing.
 - **The listeners are loopback by default.** Off loopback, the router needs TLS; a plain-HTTP
   listener with a key travelling over it is refused at load.
 - **Restart when nothing is rented** where you can: a restart takes back its hosts, but the
-  SSH tunnels to them are re-opened as it starts.
+  SSH tunnels to them are re-opened as it starts. Changes to the configuration, provider
+  accounts and keys need no restart: the supervisor and the router follow the file. The
+  listen addresses and TLS are the exception.
 
 **Nothing rents until you say so.** A lease is the only thing that can spend, and one that may
 rent cannot be opened without a dollar cap:
@@ -170,9 +191,14 @@ reply = pool.chat("my-model:7b", [{"role": "user", "content": "hello"}])
 reply.content, reply.served_model              # what came back, and which build served it
 ```
 
+The pool speaks OpenAI's API (`/v1/chat/completions` and the rest) and Anthropic's
+(`/v1/messages`), so OpenAI's and Anthropic's own clients work against it too, with any model in
+the pool. An answer from a hosted API says what it cost (`reply.cost_usd`).
+
 The SDK waits and retries for capacity by default, and raises rather than waiting where waiting
 cannot help. [client/README.md](client/README.md) covers the transport, the retry policy, the
-errors, streaming, and what each answer tells you.
+errors, streaming, the other clients, workloads and their budgets, and what each answer tells
+you.
 
 Every model in the pool's set must already be loaded on a host before that host is used: the
 pool verifies a host's engine, it never configures it, and no request ever triggers a pull.
@@ -210,10 +236,15 @@ Security reports go through [SECURITY.md](SECURITY.md), never a public issue.
 
 ## Docs
 
-Start with the overview. The specification is generic and names no adopter.
+Start with the overview, then the quick start. The specification is generic and names no
+adopter.
 
 | Doc | What it is |
 |---|---|
+| [docs/quickstart.md](docs/quickstart.md) | Install, configure and start a pool over machines you already have — nothing able to spend |
+| [docs/quickstart-renting.md](docs/quickstart-renting.md) | Adding rented capacity: provider accounts, limits first, the market, one host, then unattended |
+| [docs/hosted-apis.md](docs/hosted-apis.md) | Adding hosted model APIs, their prices and the budgets they are paid from |
+| [client/README.md](client/README.md) | The client SDK, for application developers |
 | [STATUS.md](STATUS.md) | Where the project stands, what is decided, what is open, what to do next, session log |
 | [docs/overview.md](docs/overview.md) | The concepts in one read: pool, hosts, workers, model set, routing priority, leases, the two processes, the SDK, the console |
 | [docs/models-beyond-chat.md](docs/models-beyond-chat.md) | Speech to text, pictures in chat and ranking: which engine serves what, setting each up — whisper.cpp on a Mac included — and what an operator is told when a configuration cannot work |
@@ -226,8 +257,8 @@ Start with the overview. The specification is generic and names no adopter.
 | [docs/stories/README.md](docs/stories/README.md) | The planned features, one story each: the evidence behind them, the design, what each gives up |
 | [docs/roadmap.md](docs/roadmap.md) | v1 scope, the four build phases and their exit criteria, deferred requirements, open questions |
 | [docs/decisions.md](docs/decisions.md) | Every decision, numbered: what, why, what was rejected; verified facts and unverified assumptions |
-| [docs/threat-model.md](docs/threat-model.md) | Assets, actors, 19 threats with mitigations and residual risk, deliberate non-goals |
-| [docs/release-checklist.md](docs/release-checklist.md) | What must be true before the first public commit and the first release |
+| [docs/threat-model.md](docs/threat-model.md) | Assets, actors, threats with mitigations and residual risk, deliberate non-goals |
+| [docs/release-checklist.md](docs/release-checklist.md) | What must be true before the first public commit, and at every release |
 | [docs/architecture-review.md](docs/architecture-review.md) | The critical review of the original single-file design; every finding carries its decision |
 | [docs/adopters/aletheia/](docs/adopters/aletheia/README.md) | First adopter guide — **adopter-internal, see the note in STATUS.md before publishing** |
 | [docs/archive/](docs/archive/design-2026-09-17-pre-split.md) | The pre-split single-file design, kept only so the review's section references resolve — **adopter-internal** |
