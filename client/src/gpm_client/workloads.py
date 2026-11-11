@@ -30,7 +30,7 @@ from typing import Any, Mapping, Optional
 import httpx
 
 from .client import PoolClient
-from .config import env_url
+from .config import env_url, pool_root
 from .errors import PoolAuthError, PoolError, PoolRequestError
 from .transport import pool_transport
 
@@ -138,7 +138,7 @@ class WorkloadProvisioner:
 
     def __init__(self, base_url: Optional[str] = None, provisioning_key: Optional[str] = None, *,
                  verify: Any = True, timeout: float = 30.0, poll_s: float = 1.0):
-        self.base_url = (base_url or env_url()).rstrip("/")
+        self.base_url = pool_root(base_url or env_url())
         self._key = provisioning_key or os.environ.get("GPM_PROVISIONING_KEY")
         if not self._key:
             raise PoolAuthError("a provisioning key is needed: pass it, or set GPM_PROVISIONING_KEY")

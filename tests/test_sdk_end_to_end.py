@@ -38,6 +38,25 @@ def test_a_script_gets_its_reply_and_the_facts_of_the_call():
         assert reply.wait_s >= 0
 
 
+@pytest.mark.parametrize("suffix", ["/v1", "/v1/", "/"])
+def test_the_address_a_pool_hands_out_works_as_given(suffix):
+    """A pool hands out its OpenAI-style address, `…/v1`, for any OpenAI-compatible client, and
+    says the SDK takes it too. Found live: the SDK added its own `/v1`, and every call went to
+    `…/v1/v1/…`. The root and the `/v1` address now reach the same pool."""
+    from gpm_client import WorkloadProvisioner
+    from gpm_client.config import pool_root
+
+    with one_host() as pool:
+        with PoolClient(base_url=pool.url + suffix, api_key=APP_KEY, retry_policy=BOUNDED) as client:
+            assert client.base_url == pool.url.rstrip("/")
+            assert client.chat(MODEL, MESSAGES).content == "echo:hello there"
+            assert len(client.embed(MODEL, ["one"])) == 1
+    with WorkloadProvisioner(pool.url + suffix, "gpmp_not_used") as provisioner:
+        assert provisioner.base_url == pool.url.rstrip("/")
+    assert pool_root("https://pool.example/w/batch/v1") == "https://pool.example/w/batch"
+    assert pool_root("https://pool.example/v10") == "https://pool.example/v10", "only a whole /v1 is taken off"
+
+
 def test_embeddings():
     with one_host() as pool:
         with PoolClient(base_url=pool.url, api_key=APP_KEY, retry_policy=BOUNDED) as client:

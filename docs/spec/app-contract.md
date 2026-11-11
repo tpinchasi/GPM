@@ -128,6 +128,7 @@ It is served from a cached copy, never by asking a third party while the app wai
 | `400` | `media_not_inline` | A picture or sound was given by link, or as a part type the pool does not accept | raise `PoolRequestError` |
 | `400` | `bad_upload` | An upload the pool could not read as one clean form, one naming the model twice, or a request with more than one `Content-Type` header | raise `PoolRequestError` |
 | `400` | `content_encoding` | The request has a `Content-Encoding` other than identity; the pool reads only uncompressed bodies (D144) | raise `PoolRequestError` |
+| `400` | `unsupported_feature` | The request must be translated to the other API format (D169) and carries what that format cannot — named in `detail`; on Anthropic's paths in that format's error shape | raise `PoolRequestError`; send `X-GPM-Unsupported: drop` to have it dropped instead |
 | `413` | `request_too_large` | The body is over `pool.max_request_mb`; refused before it is read | raise `PoolRequestError` |
 | `404` | `unknown_path` | The path is not an inference path of any engine this pool runs (§2: only those exact paths are forwarded). A path some engine serves, but none this pool runs, is `400 kind_not_served` instead | raise `PoolRequestError` |
 | `404` | `model_not_in_pool` | The model is not in this pool's declared set; it will not be loaded on demand | raise `PoolRequestError` |
@@ -140,6 +141,7 @@ It is served from a cached copy, never by asking a third party while the app wai
 | `503` | `no_eligible_host` | Hosts are ready, but none may take this request. `detail` says which: the request arrived on one engine's own path (`/api/chat`, say) and every ready host runs an engine that does not serve it — the detail names both and the paths that reach every engine — or none holds a build of this model that satisfies the request's schema requirement or pinned runtime class, or takes what it carries — while a host that would is not ready, or after one that would failed this request | for a path no ready host serves, call the `/v1` paths; otherwise wait and retry |
 | `503` | `host_lost` | The host serving this was taken away before any of the response reached you; nothing partial was sent (§5.1) | wait and retry |
 | `503` | `uploads_full` | The pool is holding as many request bytes as it allows (`pool.max_held_request_mb`) | wait and retry |
+| `503` | `hosted_budget_spent` | Only a hosted API could take the request now, and the budget it is paid from — the pool's shared one, or the workload's — has no room left for its worst case (D166); a machine freeing serves it | wait and retry |
 | `504` | `deadline_exceeded` | The request's `X-GPM-Deadline` passed before it could be served | **fail fast** — the app already said the answer would be useless |
 | `504` | `generation_timeout` | The whole request was sent, and the engine did not answer within the pool's read time (`pool.upstream_read_timeout_s`) — a long recording, say. Not a host failure: it is not re-run on another host | **fail fast** — sending it again would take as long again |
 

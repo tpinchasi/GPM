@@ -1,15 +1,27 @@
 # gpm-client
 
-The client SDK for a **GPM pool** — a single endpoint that serves GPU inference from whatever
-hosts the operator has: their laptop, a fixed remote box, or an instance rented on a bidding
-marketplace for the next twenty minutes. Your application never learns which.
+The client SDK for a **GPM pool** — a single endpoint that serves inference from whatever
+the operator has: their laptop, a fixed remote box, an instance rented on a bidding
+marketplace for the next twenty minutes, or a hosted model API (Anthropic, OpenAI, Ollama's
+cloud, …) paid per token. Your application never learns which.
 
 You need three things from whoever runs the pool: **a URL, an app key, and the names of the
 models it serves.** Nothing else — not host lists, not provider names, not bids.
 
+The package is attached to each [GitHub release](https://github.com/tpinchasi/GPM/releases), not
+published on PyPI. Install the wheel from the newest release (its only dependency is `httpx`):
+
 ```sh
-pip install gpm-client        # one dependency: httpx
+pip install "gpm-client @ https://github.com/tpinchasi/GPM/releases/download/v0.42.0/gpm_client-0.8.0-py3-none-any.whl"
 ```
+
+Each release lists its wheels with a `SHA256SUMS` file. Inside a clone of the repository,
+`uv pip install ./client` does the same.
+
+**The URL is the pool's root**, `http://127.0.0.1:8080`; the SDK adds the paths itself. From
+gpm-client 0.8.1 the address a pool hands out, ending in `/v1`, works as given too: the SDK takes
+the `/v1` off. With 0.8.0, drop it yourself. OpenAI's client wants the `/v1` address and
+Anthropic's the root (below).
 
 ## The thing worth knowing first
 
@@ -40,22 +52,31 @@ http = httpx.Client(
     transport=pool_transport(),
 )
 
-# From here on this is the inference engine's own API, passed through untouched.
-reply = http.post("/api/chat", json={
+# From here on this is OpenAI's chat API, passed through untouched.
+reply = http.post("/v1/chat/completions", json={
     "model": "gemma4:26b",
     "messages": [{"role": "user", "content": "hello"}],
-    "stream": False,
 })
-print(reply.json()["message"]["content"])
+print(reply.json()["choices"][0]["message"]["content"])
 print(reply.headers["X-GPM-Served-Model"])   # e.g. gemma4:26b-mlx
 ```
 
 Use `async_pool_transport()` with `httpx.AsyncClient`. Both take an optional `RetryPolicy`.
 
-**The request and response bodies are the engine's own API.** GPM does not translate between
-API shapes — that is where tool calls and structured output get quietly lost — so whatever you
-would send to the engine directly, you send here. Ask the operator which engine is behind the
-pool; today that is Ollama, so `/api/chat`, `/api/generate` and `/api/embed`.
+**Two API formats, passed through untouched.** The pool serves OpenAI's paths —
+`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/audio/transcriptions` — and
+Anthropic's — `/v1/messages` and `/v1/messages/count_tokens`. Write your app in either; every
+model in the pool is reached in both. A request goes unchanged to a host that speaks its format.
+It is translated only when the model is served in the other one, as with Claude asked for in
+OpenAI's format or an open model asked for in Anthropic's.
+
+What a translation cannot carry is refused by name, `400 unsupported_feature`, rather than
+quietly lost. Into OpenAI's format that is thinking, PDF documents, citations and server tools;
+into Anthropic's it is `logprobs`, `n` and `response_format`. Send `X-GPM-Unsupported: drop` to
+have them dropped instead. The answer then names what was dropped in `X-GPM-Dropped`.
+
+A pool of Ollama hosts also answers Ollama's own `/api/chat`, `/api/generate` and `/api/embed`,
+for apps already written against them.
 
 ### 2. `PoolClient`, for scripts
 
@@ -71,11 +92,16 @@ reply.content         # the text
 reply.served_model    # "gemma4:26b-mlx" — the build that actually ran
 reply.host            # "laptop"
 reply.wait_s          # 0.042 — seconds queued, not generation time
-reply.raw             # the engine's whole response body, untouched
+reply.cost_usd        # what a hosted API's answer cost your budget; None from a machine
+reply.raw             # the whole response body, untouched
 
 vectors = pool.embed("nomic-embed-text:latest", ["some text"])
 pool.close()          # or use it as a context manager
 ```
+
+`chat()` posts to OpenAI's `/v1/chat/completions`. Any field of that API goes through as a
+keyword: `max_tokens=`, `temperature=`, `tools=`, `format=` (sent as `response_format`).
+`PoolClient(api="ollama")` uses Ollama's own `/api/*` paths instead.
 
 `AsyncPoolClient` is the same with `await`, `aclose()` and `async with`.
 
@@ -97,7 +123,8 @@ makes it with:
 
 ```sh
 gpm provisioner create my-app --models gemma4:26b,gemma4:e4b \
-    --max-spend 5 --max-spend-per-day 10 --max-hours 4 --max-open 1
+    --max-spend 5 --max-spend-per-day 10 --max-hours 4 --max-open 1 \
+    --hosted-per-day 2 --hosted-per-month 20      # only if its workloads may use hosted APIs
 ```
 
 The key can create workloads only for those models, up to those limits. It cannot request a
@@ -133,6 +160,47 @@ with WorkloadProvisioner() as provisioner:            # reads GPM_URL and GPM_PR
 
 A plan searches every provider the pool rents from, and providers limit searches by a daily
 quota, so plan once rather than in a loop.
+
+**Bursts: what happens when your hosts are all busy.** By default a request waits for one of
+your workload's own workers. `bursts` lets it go further, each kind within a budget you set:
+
+```python
+w = provisioner.workload(
+    "gemma4:26b", latency_s=30, parallel=30, hours=4, max_spend=10,
+    bursts={
+        # After waiting 5 s for a machine, go to a hosted API the pool has, paid per token.
+        "hosted": {"after_s": 5, "budget": {"per_day": 2, "per_month": 20}},
+        # If the load stays above your hosts for 10 minutes, rent up to 2 more, paid from max_spend.
+        "rented": {"after_min": 10, "max_hosts": 2, "budget": {"per_day": 5}},
+    },
+)
+```
+
+- **A budget bounds time:** `per_day` and/or `per_month`, in UTC. A hosted burst may also set
+  `per_request`, a limit on any one answer. Nothing is ever sent past a budget.
+- **Each hosted answer says what it cost:** `reply.cost_usd`, and the `X-GPM-Cost-USD` header.
+  `w.hosted_budget()` returns the budget and what is left of it today and this month.
+- **Change it while it runs:** `w.set_bursts({...})`. The policy you send replaces the old one,
+  so name every burst to keep; `{}` turns them all off. What was already spent today still
+  counts.
+- **Everything stays within the provisioning key's grant.** The grant sets how much a key's
+  workloads may spend on hosted APIs per day and per month. Past that, the create or the change
+  is refused with `WorkloadRefused`.
+- **A budget spent** stops that kind of burst until its day or month ends. A request that then
+  finds no free machine is answered `503 hosted_budget_spent`, and the SDK waits for a machine
+  as for any other `503`.
+
+**A model served only by hosted APIs** — a closed model such as Claude, or one you never want
+on a machine — takes `parallel=0`. Nothing is rented or borrowed for it, so it needs a hosted
+burst. A workload whose every model is like this rents nothing: it takes no `max_spend` and
+serves from the start.
+
+```python
+with provisioner.workload("claude", parallel=0, hours=8,
+                          bursts={"hosted": {"after_s": 0, "budget": {"per_day": 5}}}) as w:
+    reply = w.client.chat("claude", [{"role": "user", "content": "hello"}], max_tokens=200)
+    print(reply.content, reply.cost_usd)
+```
 
 **Several models in one workload.** Each model gets its own target. Send requests for any of
 them through the same `w.client`:
@@ -293,6 +361,49 @@ those releases a refusal reaches you as the client's `APIConnectionError`, whose
 the `PoolRequestError` with the pool's reason; later releases raise the `PoolRequestError`
 itself. The 900 s read timeout is there for transcriptions, as `transcribe()` uses (above).
 
+### With Anthropic's client
+
+Apps written with Anthropic's SDK point it at the pool the same way. The pool reads the app key
+from `x-api-key`, as that client sends it, and never passes it on to a host:
+
+```python
+import httpx
+from anthropic import Anthropic
+from gpm_client import pool_transport
+
+client = Anthropic(base_url=POOL_URL, api_key=APP_KEY, max_retries=0,
+                   http_client=httpx.Client(transport=pool_transport()))
+
+message = client.messages.create(model="gemma4:26b", max_tokens=300,
+                                 messages=[{"role": "user", "content": "hello"}])
+print(message.content[0].text)
+```
+
+Anthropic's client adds `/v1/messages` itself, so `base_url` is the pool's root. Any model works
+here, open models included: where the model is served in OpenAI's format, the pool translates
+the request, the answer and the stream. The answer's `X-GPM-Translated` header says so. The
+pool's own refusals on these paths come in Anthropic's error shape,
+`{"type": "error", "error": {...}}`, with `reason` and `detail` beside it.
+
+## Hosted model APIs: answers paid per token
+
+An operator can add hosted model APIs to the pool: Anthropic, OpenAI, Groq, Together, Ollama's
+cloud and others. Your app asks for a model by name as always. Two things change when a hosted
+API answers:
+
+- **The pool's own machines come first.** A request goes to a hosted API only after it has
+  waited the operator's set time for a machine, or at once for a model no machine runs, such as
+  Claude. It goes only if its worst-case cost fits the budget it is paid from: the pool's
+  shared budget for requests made with an app key, or your workload's own (section 3).
+- **Every hosted answer carries its cost.** A whole answer carries `X-GPM-Cost-USD`, which is
+  `reply.cost_usd` in the SDK. A streamed answer carries `X-GPM-Cost-Max-USD`, the most it can
+  cost, since the headers go out before the usage that prices it. The exact figure is charged
+  when the stream ends.
+
+What you send reaches that provider, so ask the operator which models are served by a hosted
+API if that matters to your data. When a provider refuses a request, as when it is too long
+for the model, the refusal comes back as the provider said it and costs nothing.
+
 ### When the pool cannot do what you asked
 
 | Answer | Meaning |
@@ -302,20 +413,22 @@ itself. The 900 s read timeout is there for transcriptions, as `transcribe()` us
 | `400 media_not_inline` | A picture or sound was given as a link, or as a part type the pool does not accept |
 | `400 bad_upload` | The upload could not be read as one clean form, or named the model twice |
 | `400 content_encoding` | The body was sent compressed (a `Content-Encoding` other than identity). Send it uncompressed |
+| `400 unsupported_feature` | The request had to be translated to the other API format, and carries something that format cannot (named in `detail`). Send `X-GPM-Unsupported: drop` to have it dropped instead |
 | `404 unknown_path` | The path is not one any engine this pool runs answers — a typing error, or an engine's own path the pool does not forward |
 | `413 request_too_large` | Over the pool's size limit |
 | `504 generation_timeout` | The work outlasted the pool's read time; not retried |
 | `504 read_timeout` | The SDK's own: no answer within its read timeout after the request was sent. Not sent again — the pool may still be working on it |
 
 Each is a `PoolRequestError` with `.reason` and `.detail`, raised at once. A `503` that only
-means "busy" — including `uploads_full`, when the pool is holding as many uploads as it allows —
+means "busy" — including `uploads_full`, when the pool is holding as many uploads as it allows,
+and `hosted_budget_spent`, when only a hosted API could answer and its budget has no room left —
 is waited out as usual.
 
 ## Configuration
 
 | Variable | Default | What it sets |
 |---|---|---|
-| `GPM_URL` | `http://127.0.0.1:8080` | The pool's app-facing endpoint |
+| `GPM_URL` | `http://127.0.0.1:8080` | The pool's app-facing endpoint: its root, or its `/v1` address (from 0.8.1) |
 | `GPM_API_KEY` | — | Your app key. **Required**, loopback included |
 | `GPM_MAX_WAIT_S` | `1800` | Total seconds the SDK will spend waiting for capacity |
 | `GPM_PROVISIONING_KEY` | — | A provisioning key, for `WorkloadProvisioner` only (section 3) |
@@ -400,15 +513,16 @@ you want in a log line, rather than a stack trace.
 
 ## Streaming
 
-Stream through the transport path with `httpx` directly; `PoolClient.chat` is non-streaming.
+Stream through the transport path with `httpx` directly, or through OpenAI's or Anthropic's
+client with the pool's transport; `PoolClient.chat` is non-streaming.
 
 ```python
-with http.stream("POST", "/api/chat", json={
+with http.stream("POST", "/v1/chat/completions", json={
     "model": "gemma4:26b",
     "messages": [{"role": "user", "content": "count to five"}],
     "stream": True,
 }) as response:
-    for line in response.iter_lines():
+    for line in response.iter_lines():      # server-sent events: "data: {...}"
         ...
 ```
 
@@ -429,6 +543,9 @@ Response headers, on every call:
 | `X-GPM-Host` | Which host served it |
 | `X-GPM-Runtime-Class` | e.g. `apple-mlx`, `cuda-gguf` |
 | `X-GPM-Wait-S` | Seconds spent queued — so queue time is never mistaken for generation time |
+| `X-GPM-Cost-USD` | On a whole answer from a hosted API: what it cost your budget, in dollars |
+| `X-GPM-Cost-Max-USD` | On a streamed answer from a hosted API: the most it can cost |
+| `X-GPM-Translated`, `X-GPM-Dropped` | On an answer translated between API formats: between which, and what was dropped at your asking |
 | `X-GPM-Contract` | The contract version this pool speaks |
 
 `X-GPM-Served-Model` differing from your request is **by design**. If the operator has
@@ -446,6 +563,7 @@ Send these yourself on the transport path; `PoolClient` exposes `session_id` onl
 | `X-GPM-Session` | Groups your calls in the pool's request log, for an offline join later |
 | `X-GPM-Deadline` | Epoch seconds or ISO-8601. After this instant the answer is useless to you; the pool drops the work rather than paying to finish it. You get `504 deadline_exceeded`, and it is never retried |
 | `X-GPM-Runtime-Class` | Pins the request to hosts serving that class of build — for a run that must not mix builds mid-way |
+| `X-GPM-Unsupported: drop` | Where the request must be translated to the other API format: what that format cannot carry is dropped rather than refused |
 
 ## Timeouts
 
@@ -463,7 +581,7 @@ queue timeout.
 
 ## What this package deliberately does not have
 
-No host lists, no provider names, no bids, no leases, no tear-down. Those belong to the
+No host lists, no provider names, no bids, no leases, no tear-down, no prices. Those belong to the
 operator and the admin key. The one exception is section 3: a program the operator has given a
 provisioning key may create and end its own workloads, within the limits the operator set. If you find yourself wanting one of them in application code, the
 thing you actually want is for the operator to change the pool's configuration.

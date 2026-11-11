@@ -1,8 +1,10 @@
-# A pool over hosts you already have. Start it with:  gpm serve -c pool.yaml
+# A pool over hosts you already have, with rented capacity and a hosted model API as options.
+# Start it with:  gpm serve -c pool.yaml
 #
-# Phase 1 serves static hosts only — nothing here rents anything, and nothing here spends
-# money. The pool verifies a host's engine, it never configures it: every model in `model_set`
-# must already be loaded on every host before that host is used.
+# Nothing here spends money by itself: renting needs a lease with a dollar cap, and a hosted API
+# is used only within the budget under `pool.bursts.hosted`. The pool verifies a host's engine,
+# it never configures it: every model in `model_set` must already be loaded on every host before
+# that host is used (or, with `agent:` on a host, is fetched by its agent after a plan).
 
 pool:
   name: default
@@ -14,6 +16,12 @@ pool:
   queue_timeout_s: 30         # must stay below client_time_to_first_byte_s
   client_time_to_first_byte_s: 300
   probe_interval_s: 10
+  # Requests may go to a hosted model API (a `kind: hosted` host, below) only within this budget,
+  # after waiting `after_s` for a machine. Without it, no request made with an app key reaches one.
+  # bursts:
+  #   hosted:
+  #     after_s: 5
+  #     budget: { per_day: 2.00, per_month: 20.00 }   # USD, per UTC day and month
 
 listen:
   host: 127.0.0.1
@@ -79,6 +87,22 @@ hosts:
   # A tunnel keeps the engine off the public network entirely: the pool holds an SSH local
   # forward and dials its own loopback port. No base_url — the pool derives one. The host's
   # key is recorded on first connection and checked on every later one.
+  # A hosted model API: added most easily from the console (Providers → Add provider), which
+  # tests its key, proposes each model's price from the provider and writes this for you. The key
+  # is typed in there and kept by the supervisor, never written here. See docs/hosted-apis.md.
+  # - id: anthropic
+  #   kind: hosted
+  #   engine: anthropic-api         # openai-api for an OpenAI-format provider
+  #   workers: 8                    # the provider's rate limit, as requests in flight
+  #   capabilities: ["hosted:anthropic"]
+  #   transport: { type: https, base_url: "https://api.anthropic.com/v1" }
+  # ...and under catalog, each model it serves, pinned to it, with the provider's prices (and
+  # the model's name added to model_set; no machine is asked to hold a model only an API serves):
+  #   claude:
+  #     variants:
+  #       - { tag: "<provider's model id>", engine: anthropic-api, requires: ["hosted:anthropic"],
+  #           price: { input: 3.00, cached_input: 0.30, cache_write: 3.75, output: 15.00 } }  # example figures
+
   - id: datacentre
     kind: fixed-remote
     capabilities: [cuda, fp8]
@@ -98,9 +122,13 @@ limits:
 
 rented:
   providers:                   # one connection per provider account, by name (D129)
-    vast: { type: vast }       # the account credential is read from VAST_API_KEY, never from here
+    vast: { type: vast }       # its credential: typed into the console, or VAST_API_KEY — never here
+    # runpod: { type: runpod }   # RUNPOD_API_KEY, or typed in
+    # verda:  { type: verda }    # VERDA_CREDENTIAL=CLIENT_ID:CLIENT_SECRET, or typed in
   engine: ollama               # rented hosts run vLLM unless this says otherwise (D147); this example rents Ollama
-  image: ollama/ollama:0.34.2  # pinned, never a floating tag
+  # image: left out, new hosts start from the engine's newest stable release, checked every six
+  # hours and dropped by itself if hosts from it never answer (D177). Name one to pin it:
+  # image: ollama/ollama:0.40.15
   workers: 2                   # per card: a two-card machine runs twice this
   capabilities: [cuda]
   ssh_key: ~/.ssh/pool_key
