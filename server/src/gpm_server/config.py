@@ -18,6 +18,8 @@ from urllib.parse import urlparse
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .hosted_prices import PRICE_LIST_URL
+
 
 class ConfigError(Exception):
     """The configuration file is not usable. Raised at load, never mid-request."""
@@ -39,8 +41,10 @@ AUTO_ENGINES = ("vllm", "ollama")
 class Price(BaseModel):
     """What a hosted build costs (S11, D164): dollars per million tokens — input, the cached part
     of it where the provider prices it apart, and output — or per minute of audio for
-    transcription. The operator keeps them: no provider here publishes prices the pool can rely
-    on. A provider with peak and off-peak rates is priced at its peak."""
+    transcription; or `plan: true`, paid by the provider's plan, with no charge per token (D176):
+    the plan's own limit is the cap, and its answers count nothing against a budget. The operator
+    confirms them; the console fills them from the provider's API, or a public price list, where
+    either has them. A provider with peak and off-peak rates is priced at its peak."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -52,11 +56,18 @@ class Price(BaseModel):
     cache_write: Optional[float] = Field(default=None, ge=0)
     output: Optional[float] = Field(default=None, ge=0)
     per_minute: Optional[float] = Field(default=None, ge=0)
+    #: Paid by the provider's plan — a subscription with its own limit — not per token (D176).
+    plan: bool = False
 
     @model_validator(mode="after")
     def _says_something(self) -> "Price":
+        if self.plan:
+            if any(v is not None for v in (self.input, self.cached_input, self.cache_write, self.output, self.per_minute)):
+                raise ValueError("a price paid by `plan` names no per-token or per-minute price")
+            return self
         if self.per_minute is None and (self.input is None or self.output is None):
-            raise ValueError("a price names `input` and `output` (dollars per million tokens), or `per_minute`")
+            raise ValueError("a price names `input` and `output` (dollars per million tokens), `per_minute`, "
+                             "or `plan: true`")
         return self
 
     @property
@@ -66,6 +77,8 @@ class Price(BaseModel):
     def of(self, prompt: int, cached: int, completion: int, written: int = 0) -> float:
         """Dollars for these counts: `prompt` is the whole input, of which `cached` was read from
         the provider's cache and `written` written to it, each at its own price."""
+        if self.plan:
+            return 0.0
         fresh = max(0, prompt - cached - written)
         cached_price = self.cached_input if self.cached_input is not None else (self.input or 0.0)
         return (fresh * (self.input or 0.0) + cached * cached_price + written * self.write_price
@@ -74,6 +87,8 @@ class Price(BaseModel):
     def most_for_input(self, tokens: int) -> float:
         """The most `tokens` of input can cost — every one written to the cache, where that is
         dearer than reading it fresh (D166's worst case)."""
+        if self.plan:
+            return 0.0
         return tokens * max(self.input or 0.0, self.write_price if self.cache_write is not None else 0.0) / 1e6
 
 
@@ -641,6 +656,17 @@ class PoolSettings(BaseModel):
     #: How the shared workload meets a burst its machines cannot (S11, D165): to hosted APIs,
     #: within a budget. A workload's own policy is its own; this is the shared workload's.
     bursts: "Bursts" = Field(default_factory=lambda: Bursts())
+    #: Where the console proposes a hosted model's price from when the provider's own API says
+    #: none (D176): a public price list, by default LiteLLM's community-kept one. Only proposed —
+    #: nothing is priced until the operator saves it. Empty: never fetched.
+    price_list_url: Optional[str] = PRICE_LIST_URL
+
+    @field_validator("price_list_url")
+    @classmethod
+    def _price_list_over_https(cls, value: Optional[str]) -> Optional[str]:
+        if value and (not value.startswith("https://") or len(value) > 500 or not value.isprintable()):
+            raise ValueError("pool.price_list_url is an https:// address, or empty to fetch no price list")
+        return value or None
     #: The most one request body may be, in megabytes (D144): over it is `413
     #: request_too_large`, refused before the body is read. Under the 25 MB the engines take
     #: for an upload, so nothing is queued only for an engine to refuse it.
@@ -1334,8 +1360,10 @@ class RentedConfig(BaseModel):
     #: `on_demand`: pay the listed price, and nobody can take the host away. `cheaper`: look at
     #: both and let ranking decide, which weighs the price against the download it would waste.
     mode: Literal["interruptible", "on_demand", "cheaper"] = "interruptible"
-    #: Pinned, never a floating tag (threat model T10). Unset: the rented engine's own default
-    #: image (`engine_image`), so changing engine never leaves the other engine's image behind.
+    #: Pinned, never a floating tag (threat model T10). Unset, or `latest`: the newest stable
+    #: release of the rented engine's official image, found and checked by the supervisor
+    #: (D177, `engine_images.py`) — so changing engine never leaves the other engine's image
+    #: behind, and an engine is never years old. Named: held to it.
     image: Optional[str] = None
     #: Builds of the same engine for different accelerator generations, **chosen per machine**
     #: (D92). An engine is commonly published once per CUDA line — a newer one is smaller and
@@ -1347,6 +1375,13 @@ class RentedConfig(BaseModel):
     #: This replaces `image` when present. `offer_policy.min_driver_version` still applies and
     #: is the floor below which no machine is wanted at all, whatever image would run on it.
     images: list["EngineImage"] = Field(default_factory=list)
+
+    @property
+    def tracks_latest(self) -> bool:
+        """Rented hosts start from the engine's newest release, kept current (D177): no image
+        named, or `image: latest`. A named image, or `images`, pins."""
+        return not self.images and self.image in (None, "latest")
+
     #: Workers **per card** for a machine no capacity profile matches (D107): two cards run
     #: twice the work, as under a profile that names the card (D88), held at 64 per host.
     workers: int = Field(default=1, ge=1)
@@ -1543,15 +1578,16 @@ class PoolConfig(BaseModel):
 
     def rented_image(self) -> str:
         """The image rented hosts start from when `rented.images` names none: `rented.image`, or
-        the rented engine's own default (D147)."""
-        if self.rented is not None and self.rented.image:
+        the rented engine's shipped default (D147) — which, where the pool tracks its engine's
+        releases (D177), is used only until the registry has answered once."""
+        if self.rented is not None and self.rented.image and self.rented.image != "latest":
             return self.rented.image
         from .engines import EngineNotFound, get_engine
 
         try:
-            return getattr(get_engine(self.rented_engine()), "default_image", None) or "ollama/ollama:0.34.2"
+            return getattr(get_engine(self.rented_engine()), "default_image", None) or "ollama/ollama:0.40.15"
         except EngineNotFound:
-            return "ollama/ollama:0.34.2"
+            return "ollama/ollama:0.40.15"
 
     def _servable_by(self, host: "HostConfig") -> list[str]:
         """Models this host could serve: a build its platform can run **and its engine can
@@ -2143,7 +2179,7 @@ class PoolConfig(BaseModel):
         # is a cache write: unpriced, the budget would be charged the dearest rate on every one.
         unwritten = [f"{name} ({variant.tag})" for name, entry in self.catalog.items() for variant in entry.variants
                      if variant.engine == ANTHROPIC_ENGINE and variant.price is not None
-                     and variant.price.per_minute is None and variant.price.cache_write is None]
+                     and variant.price.per_minute is None and not variant.price.plan and variant.price.cache_write is None]
         if unwritten:
             raise ValueError(
                 f"{unwritten} are reached through `{ANTHROPIC_ENGINE}`, whose prompts the pool caches by default: "

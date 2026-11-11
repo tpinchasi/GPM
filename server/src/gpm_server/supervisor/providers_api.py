@@ -70,8 +70,9 @@ def register(
         if first and supervisor.fleet is None and supervisor.config.rented is None:
             return None
         if supervisor.fleet is None and supervisor.config.rented is not None:
-            return error(409, "restart_needed", "renting was added to this pool's configuration; it starts when the "
-                         "pool is restarted")
+            # Renting starts as the file gains it (D173); this is one that could not.
+            return error(409, "restart_needed", f"{supervisor.renting_problem or 'renting is in the file but not running'}"
+                         " — put it right in the file, or restart the pool")
         if supervisor.fleet is None or supervisor.config.rented is None:
             return error(400, "cannot_rent", "this pool has no rented capacity configured")
         return None
@@ -152,6 +153,7 @@ def register(
             return JSONResponse({
                 "connections": [], "plugins": accounts.plugins(), "secure_transport": _safe_transport(request),
                 "label_prefix": None, "renting": False, "restart_needed": supervisor.config.rented is not None,
+                "problem": supervisor.renting_problem,
             })
         refused = fleet_or_refusal()
         if refused is not None:

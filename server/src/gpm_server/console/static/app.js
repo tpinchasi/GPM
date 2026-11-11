@@ -125,14 +125,19 @@ const el = (tag, attrs = {}, ...children) => {
   }
   return fill(node, ...children);
 };
-// Appends what is there and skips null, undefined and false — a node's own append() would write
-// "null" on the page for a part left out.
+// Appends what is there and skips null, undefined and false — a node's own append() and
+// replaceChildren() would write "null" on the page for a part left out.
 function fill(node, ...children) {
   for (const child of children.flat()) {
     if (child === null || child === undefined || child === false) continue;
     node.append(child.nodeType ? child : document.createTextNode(String(child)));
   }
   return node;
+}
+// What a node holds, replaced: as replaceChildren(), but a part left out is skipped, as in el().
+function refill(node, ...children) {
+  node.replaceChildren();
+  return fill(node, ...children);
 }
 const money = (n) => (n === null || n === undefined ? "—" : `$${Number(n).toFixed(4)}`);
 const rate = (n) => (n === null || n === undefined ? "—" : `$${Number(n).toFixed(3)}/h`);
@@ -151,7 +156,7 @@ function openHost(id) {
   const dialog = document.getElementById("host-dialog");
   hostWatch.id = id;
   document.getElementById("host-dialog-title").textContent = id;
-  document.getElementById("host-dialog-body").replaceChildren(el("p", { class: "muted" }, "Loading…"));
+  refill(document.getElementById("host-dialog-body"), el("p", { class: "muted" }, "Loading…"));
   if (!dialog.open) dialog.showModal();
   document.getElementById("host-dialog-close").onclick = () => closeHost();
   dialog.addEventListener("close", closeHost, { once: true });
@@ -182,7 +187,7 @@ async function drawHost() {
     // A host released while its window was open answers "unknown_host": it is gone, not the
     // view. Only a route the supervisor does not have says it is older than this console.
     const gone = error.code === "unknown_host";
-    document.getElementById("host-dialog-body").replaceChildren(...[
+    refill(document.getElementById("host-dialog-body"), ...[
       gone
         ? el("p", {}, `${id} is not in the pool's host table any more — most often released, or its workload ended. `,
           "What happened to it is on the ", el("a", { href: "#decisions", onclick: () => closeHost() }, "Decisions"), " screen.")
@@ -195,7 +200,7 @@ async function drawHost() {
   }
   if (hostWatch.id !== id) return;  // closed or switched while we were asking
   // Filtered: replaceChildren turns a null argument into the text "null".
-  document.getElementById("host-dialog-body").replaceChildren(...hostPanel(detail).filter(Boolean));
+  refill(document.getElementById("host-dialog-body"), ...hostPanel(detail).filter(Boolean));
 }
 
 function hostPanel(d) {
@@ -272,7 +277,7 @@ function confirmAction({ title, body, retype, retypeLabel, okLabel }) {
   const dialog = document.getElementById("confirm-dialog");
   document.getElementById("confirm-title").textContent = title;
   const holder = document.getElementById("confirm-body");
-  holder.replaceChildren(typeof body === "string" ? el("p", {}, body) : body);
+  refill(holder, typeof body === "string" ? el("p", {}, body) : body);
   const retypeBox = document.getElementById("confirm-retype");
   const input = document.getElementById("confirm-input");
   const ok = document.getElementById("confirm-ok");
@@ -740,7 +745,7 @@ function hostTestForm() {
         button.disabled = true; button.textContent = "testing…";
         try {
           const result = await api.testHost({ base_url: url.value.trim(), workers: Number(workers.value) });
-          output.replaceChildren(el("table", {},
+          refill(output, el("table", {},
             el("tbody", {}, result.steps.map((step) => el("tr", {},
               el("td", {}, pill(step.ok ? "pass" : "fail", step.ok ? "ok" : "bad")),
               el("td", {}, step.name),
@@ -748,7 +753,7 @@ function hostTestForm() {
             el("p", {}, `Workers that would apply: ${result.workers}`),
             result.steps.some((step) => step.fix === "engine_settings") ? engineSettingsHint() : null);
         } catch (error) {
-          output.replaceChildren(el("p", { class: "error" }, error.message));
+          refill(output, el("p", { class: "error" }, error.message));
         } finally { button.disabled = false; button.textContent = label; }
       } }, "Test connection")),
     output);
@@ -810,10 +815,11 @@ screens.rented = async (status) => {
 // is rented without, the engine rented machines run, and the models they are rented for —
 // offering only models that engine has a build of, and saying why each other is left out.
 function rentingSetup(view) {
+  // Renting starts as the account is saved (D173): this says only why it could not.
   const restart = view.restart_needed
-    ? el("p", { class: "warn-text" }, "The provider account is in this pool's configuration, and the pool uses it once restarted.")
+    ? el("p", { class: "error" }, `${view.problem || "Renting is in this pool's file but not running"}. Put it right, or restart the pool.`)
     : null;
-  if (view.set_up) return [restart, el("div", { class: "panel" }, el("p", {}, "Renting is set up. It starts when the pool is restarted."))];
+  if (view.set_up) return [restart, el("div", { class: "panel" }, el("p", {}, "Renting is set up."))];
   const cur = view.current || {};
   const reach = (engine) => view.engines[engine].can.length;
   const f = { disk: cur.min_disk_gb ?? "", hourly: cur.max_all_in_hourly ?? "",
@@ -870,7 +876,7 @@ function rentingSetup(view) {
       }
       save.disabled = false;
     };
-    panel.replaceChildren(
+    refill(panel, 
       el("h2", {}, "Set up renting"),
       el("p", { class: "muted" }, "The provider account is in. Before any machine is rented, say what one may be: no lease that rents opens until both numbers below are set, and every rental is still under a lease with a dollar cap."),
       el("div", { class: "field" }, el("label", { for: "setup-disk" }, "Disk each machine is rented with (GB)"), disk,
@@ -899,24 +905,35 @@ function searchQuotaText(quota) {
       : `search quota: ${quota.used.toLocaleString()} of ${quota.limit.toLocaleString()} offers used today (${Math.round(share * 100)}%) · resets at ${resets}`);
 }
 
-function providerPanel(status, account) {
-  const capabilities = Object.entries(status.provider.capabilities).filter(([, on]) => on).map(([name]) => name);
-  return el("div", { class: "panel" }, el("h2", {}, "Provider"),
-    el("div", { class: "kv" },
-      el("div", { class: "k" }, "name"), el("div", {}, status.provider.name),
-      el("div", { class: "k" }, "credential"), el("div", {}, account.error ? pill("error", "bad") : pill(account.credential_valid ? "valid ✓" : "invalid ✗", account.credential_valid ? "ok" : "bad")),
-      el("div", { class: "k" }, "credit left"), el("div", {}, account.error ? account.error : money(account.credit_remaining)),
-      el("div", { class: "k" }, "can"), el("div", { class: "muted" }, capabilities.join(", ")),
-      ...(status.provider.search_quota ? [
-        el("div", { class: "k" }, "search quota"),
-        el("div", {}, searchQuotaText(status.provider.search_quota),
-          el("div", { class: "muted" }, "Offers returned by this pool's searches today. Renting and replacing hosts need it; other tools using the same account key are counted only once the provider refuses.")),
-      ] : []),
-      el("div", { class: "k" }, "cap margin"), el("div", {}, `${(status.provider.cap_safety_margin * 100).toFixed(0)}%`,
-        el("span", { class: "muted" }, status.provider.capabilities.reports_charges ? " — narrows once a charge is reported" : " — wider: this provider reports no charges"))),
-    el("p", { class: "muted" }, (status.providers || []).length > 1
-      ? `The first of ${status.providers.length} provider accounts. `
-      : "", el("a", { href: "#providers" }, "Provider accounts →")));
+// Every provider account the pool rents through, one row each (found by the owner: with three
+// accounts this panel showed the first alone). Details and changes are on the Providers screen.
+function providerPanel(status, view) {
+  const rows = view?.connections || [];
+  const credential = (c) => {
+    const a = c.account;
+    if (!c.enabled) return el("span", { class: "muted" }, "off");
+    if (!a || !a.state) return el("span", { class: "muted" }, "not asked yet");
+    if (a.state === "valid") return pill("valid ✓", "ok");
+    return pill(a.state === "refused" ? "refused ✗" : "unreachable", "bad");
+  };
+  return el("div", { class: "panel" }, el("h2", {}, rows.length === 1 ? "Provider account" : `Provider accounts (${rows.length})`),
+    view?.error ? el("p", { class: "error" }, view.error) : null,
+    rows.length ? el("table", { class: "compact" },
+      el("thead", {}, el("tr", {}, el("th", {}, "account"), el("th", {}, "credential"), el("th", { class: "num" }, "credit"),
+        el("th", { class: "num" }, "hosts"), el("th", { class: "num" }, "$/h"))),
+      el("tbody", {}, rows.map((c) => el("tr", {},
+        el("td", {}, el("strong", {}, c.connection),
+          (c.display_name || c.type) && (c.display_name || c.type).toLowerCase() !== c.connection
+            ? el("span", { class: "muted" }, ` ${c.display_name || c.type}`) : null,
+          c.search_error ? el("div", { class: "warn-text small-text" }, c.search_error)
+            : c.search_quota ? el("div", { class: "small-text" }, searchQuotaText(c.search_quota)) : null),
+        el("td", {}, credential(c)),
+        el("td", { class: "num" }, c.account?.credit != null ? money(c.account.credit) : "—"),
+        el("td", { class: "num" }, String((c.rented || 0) + (c.parked ? ` +${c.parked} parked` : ""))),
+        el("td", { class: "num" }, c.hourly ? rate(c.hourly) : "—"))))) : el("p", { class: "muted" }, "No provider account yet."),
+    status.provider ? el("p", { class: "muted small-text" }, `Cap margin ${(status.provider.cap_safety_margin * 100).toFixed(0)}%`,
+      status.provider.capabilities.reports_charges ? " — narrows once a charge is reported." : " — wider: this provider reports no charges.") : null,
+    el("p", { class: "muted" }, el("a", { href: "#providers" }, "Provider accounts →")));
 }
 
 // --- Provider accounts (D130, D134-D136; providers.md §7.1) ---
@@ -1013,11 +1030,11 @@ function providerHealth(p) {
   const credential = p.credential || {};
   if (!p.configured) return { key: "removed", tone: "parked", label: `Removed — still releasing${holds}` };
   if (credential.source === "missing") return { key: "credential", tone: "bad", label: `Needs a credential${holds}` };
-  if (credential.source === "withheld") return { key: "credential", tone: "warn", label: `Credential waits for a restart${holds}` };
+  if (credential.source === "withheld") return { key: "credential", tone: "warn", label: `Credential not sent to this endpoint${holds}` };
   if (account.state === "refused") return { key: "credential", tone: "bad", label: `Credential refused${holds}` };
   if (account.state === "unreachable") return { key: "unreachable", tone: "warn", label: "Cannot be reached" };
   if (!p.enabled) return { key: "off", tone: "disabled", label: `Off${holds}` };
-  if (p.pending) return { key: "pending", tone: "warn", label: "Not renting — a change waits for a restart" };
+  if (p.pending) return { key: "pending", tone: "warn", label: "Not renting — a change could not be applied" };
   if (!account.state || account.state === "unknown") return { key: "unchecked", tone: "warn", label: "Not checked yet" };
   if (p.search_quota && p.search_quota.exhausted) return { key: "quota", tone: "warn", label: "Search quota used up" };
   if (p.search_error) return { key: "failing", tone: "warn", label: "Searches failing" };
@@ -1031,7 +1048,7 @@ function credentialLine(p) {
   const where = c.source === "stored" ? `saved ${when(c.set_at)}`
     : c.source === "environment" ? `from ${c.variable} in the supervisor's environment`
     : c.source === "plugin" ? "read by the plug-in itself"
-    : c.source === "withheld" ? `${c.variable || "the environment's"} is not sent here until the supervisor restarts — or type one in`
+    : c.source === "withheld" ? `${c.variable || "the environment's"} is never sent to an endpoint a setting names — type one in`
     : c.variable ? `none — type one in, or set ${c.variable}` : "none — type one in";
   const verdict = c.source === "missing" || c.source === "withheld" ? null
     : account.state === "valid" ? pill("valid", "ok")
@@ -1106,8 +1123,8 @@ function providerCard(p, data) {
       p.configured ? keepModelsControl(p) : null,
       p.search_error ? el("div", { class: "k" }, "last search") : null,
       p.search_error ? el("div", { class: "error" }, p.search_error) : null,
-      p.pending ? el("div", { class: "k" }, "waiting") : null,
-      p.pending ? el("div", { class: "warn-text" }, `The file's change ${p.pending}.`) : null),
+      p.pending ? el("div", { class: "k" }, "not applied") : null,
+      p.pending ? el("div", { class: "warn-text" }, `${p.pending[0].toUpperCase()}${p.pending.slice(1)}.`) : null),
     capabilityRows(p.capabilities),
     el("div", { class: "provider-actions" }, el("div", { class: "row" }, actions), el("div", { class: "row" }, aside)),
     reasons.length ? el("div", { class: "muted small-text" }, reasons.map((r) => el("div", {}, r))) : null,
@@ -1274,7 +1291,7 @@ function secretField(label, hint) {
   } }, "Show");
   const said = el("small", { id: `${id}-hint`, class: "muted" }, hint);
   // What the credential is, where the plug-in says (an id and a secret, say), before the hint.
-  const format = (text) => said.replaceChildren(...(text ? [el("strong", {}, text), " "] : []), hint);
+  const format = (text) => refill(said, ...(text ? [el("strong", {}, text), " "] : []), hint);
   return { input, format, node: el("div", { class: "field" }, el("label", { for: id }, label),
     el("div", { class: "row tight" }, input, toggle), said) };
 }
@@ -1302,7 +1319,7 @@ function credentialDialog(p, data) {
       dialog.close();
       await refresh();
     } catch (error) {
-      result.replaceChildren(el("p", { class: "error" }, error.message));
+      refill(result, el("p", { class: "error" }, error.message));
       save.disabled = false;
     } finally {
       save.textContent = "Test and save";
@@ -1320,7 +1337,7 @@ function credentialDialog(p, data) {
       delete providersView.tests[p.connection];
       dialog.close();
       await refresh();
-    } catch (error) { result.replaceChildren(el("p", { class: "error" }, error.message)); }
+    } catch (error) { refill(result, el("p", { class: "error" }, error.message)); }
   };
   fill(form,
     el("header", { class: "provider-head" }, providerIcon(p, 32), dialogTitle(`${stored ? "Replace" : "Type in"} the credential for ${providerLabel(p)}`)),
@@ -1332,7 +1349,7 @@ function credentialDialog(p, data) {
       el("button", { type: "button", onclick: () => dialog.close() }, "Cancel"),
       stored && !p.holds ? el("button", { type: "button", class: "danger", onclick: deleteSaved }, "Delete saved credential") : null,
       save));
-  dialog.replaceChildren(form);
+  refill(dialog, form);
   dialog.showModal();
   secret.input.focus();
 }
@@ -1351,7 +1368,7 @@ function editProviderDialog(p) {
     let parsed;
     try { parsed = JSON.parse(settings.value || "{}"); } catch { parsed = undefined; }
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      note.replaceChildren(el("p", { class: "error" }, "Settings are a JSON object, like {} or {\"name\": \"value\"}."));
+      refill(note, el("p", { class: "error" }, "Settings are a JSON object, like {} or {\"name\": \"value\"}."));
       return;
     }
     const moved = endpointKeys.filter((k) => JSON.stringify(parsed[k] ?? null) !== JSON.stringify((p.settings || {})[k] ?? null));
@@ -1367,7 +1384,7 @@ function editProviderDialog(p) {
       dialog.close();
       await refresh();
     } catch (error) {
-      note.replaceChildren(el("p", { class: "error" }, error.message));
+      refill(note, el("p", { class: "error" }, error.message));
     }
   };
   fill(form,
@@ -1376,12 +1393,12 @@ function editProviderDialog(p) {
       el("small", { id: "provider-prior-hint", class: "muted" }, "For a machine with no history here, how often an interruptible host is taken away. Empty uses the pool's default.")),
     el("div", { class: "field" }, el("label", { for: "provider-settings" }, "Plug-in settings"), settings,
       el("small", { id: "provider-settings-hint", class: "muted" }, endpointKeys.length
-        ? `${endpointKeys.join(", ")} decide where requests go: changing them deletes a saved credential. Never put a credential here. Takes effect when the supervisor restarts.`
-        : "The plug-in's own settings. Never put a credential here. Takes effect when the supervisor restarts.")),
+        ? `${endpointKeys.join(", ")} — where its requests go — is fixed for this account: to use another, remove the account and add it again. Never put a credential here. Takes effect at once.`
+        : "The plug-in's own settings. Never put a credential here. Takes effect at once.")),
     note,
     el("div", { class: "row" }, el("button", { type: "button", onclick: () => dialog.close() }, "Cancel"),
       el("button", { class: "primary", type: "submit" }, "Save")));
-  dialog.replaceChildren(form);
+  refill(dialog, form);
   dialog.showModal();
 }
 
@@ -1398,7 +1415,7 @@ function providerChoices({ rented, hosted }) {
     el("h3", { class: "choice-group" }, "Rent GPU machines", el("span", { class: "muted" }, " — paid by the hour")),
     el("p", { class: "muted small-text" }, "The pool rents machines with your account at a market, starts the engine on them and serves from them. One account per provider."),
     !r ? el("p", { class: "muted" }, "Rented accounts cannot be listed right now.")
-      : r.restart_needed ? el("p", { class: "warn-text" }, "A provider account was just added: another can be added once the pool has restarted.")
+      : r.restart_needed ? el("p", { class: "warn-text" }, "A provider account is in this pool's file but not running: put it right, or restart the pool, before adding another.")
         : el("div", { class: "plugin-tiles" }, free.length ? free.map(rented) : el("p", { class: "muted" }, "No other provider plug-in is installed.")),
     r && !r.restart_needed && taken.length ? el("p", { class: "muted small-text" }, `Already connected: ${taken.map((p) => p.display_name).join(", ")}.`) : null,
     el("h3", { class: "choice-group" }, "Hosted model APIs", el("span", { class: "muted" }, " — paid per token")),
@@ -1572,7 +1589,7 @@ function addProviderDialog(data, plugin = null) {
   function draw() {
     if (!current() && draft.step !== 1) return;
     const body = draft.step === 1 ? choose() : draft.step === 2 ? account() : draft.step === 3 ? testing() : saving();
-    dialog.replaceChildren(dialogTitle(draft.step === 1 ? "Add a provider" : `Add a provider — ${draft.plugin.display_name}`), stepper(), ...body.filter(Boolean));
+    refill(dialog, dialogTitle(draft.step === 1 ? "Add a provider" : `Add a provider — ${draft.plugin.display_name}`), stepper(), ...body.filter(Boolean));
     if (draft.step === 2) (dialog.querySelector("input[data-secret]") || dialog.querySelector("#provider-name"))?.focus();
   }
   dialog.showModal();
@@ -1588,12 +1605,17 @@ function addProviderDialog(data, plugin = null) {
 
 const hostedView = { tests: {}, data: null };
 
+// The provider's prices — never limits: budgets are each app's, set on its workload (D165).
 const PRICE_FIELDS = [
-  { key: "input", label: "input", hint: "$ per million input tokens" },
-  { key: "cached_input", label: "cached", hint: "$ per million input tokens read from the provider's cache" },
-  { key: "cache_write", label: "cache write", hint: "$ per million input tokens written to the cache (Anthropic's format needs it)" },
-  { key: "output", label: "output", hint: "$ per million output tokens" },
+  { key: "input", label: "$/1M in", hint: "The provider's price: $ per million input tokens" },
+  { key: "cached_input", label: "$/1M cached", hint: "The provider's price: $ per million input tokens read from its cache" },
+  { key: "cache_write", label: "$/1M cache write", hint: "The provider's price: $ per million input tokens written to its cache (Anthropic's format needs it)" },
+  { key: "output", label: "$/1M out", hint: "The provider's price: $ per million output tokens" },
 ];
+const PRICE_SOURCE = {
+  provider: "price from the provider's API",
+  price_list: "price from LiteLLM's public list — check it",
+};
 
 function hostedHealth(h) {
   const c = h.credential || {};
@@ -1625,8 +1647,10 @@ function hostedModels(h) {
     el("tbody", {}, h.models.map((m) => el("tr", {},
       el("td", { class: "mono" }, m.name, m.in_model_set ? null : el("span", { class: "muted" }, " (not in the model set)")),
       el("td", { class: "mono muted" }, m.tag),
-      ...PRICE_FIELDS.map((f) => el("td", {}, m.price ? perMillion(m.price[f.key]) : "—"))))),
-    el("caption", { class: "muted small-text" }, "Prices per million tokens, as typed here — from the provider's own price list."));
+      ...(m.price?.plan
+        ? [el("td", { colspan: PRICE_FIELDS.length, class: "muted" }, "paid by plan")]
+        : PRICE_FIELDS.map((f) => el("td", {}, m.price ? perMillion(m.price[f.key]) : "—")))))),
+    el("caption", { class: "muted small-text" }, "The provider's prices per million tokens, as saved here. Budgets are each app's, on its workload."));
 }
 
 function hostedCard(h, data) {
@@ -1731,7 +1755,7 @@ function hostedSettingsDialog(h) {
     problem,
     el("div", { class: "row wizard-nav" }, el("button", { type: "button", onclick: () => dialog.close() }, "Cancel"),
       el("button", { class: "primary", type: "submit" }, "Save")));
-  dialog.replaceChildren(form);
+  refill(dialog, form);
   dialog.showModal();
   workers.focus();
 }
@@ -1771,38 +1795,52 @@ function hostedKeyDialog(h) {
         await refresh();
       } }, "Remove key") : null,
       save));
-  dialog.replaceChildren(form);
+  refill(dialog, form);
   dialog.showModal();
   secret.input.focus();
 }
 
 // The models step, shared by Add and by Models and prices: each id the provider offers, the name
-// apps ask for it by, and its price — typed by the operator from the provider's own page.
-function modelsPicker(offered, current, format) {
+// apps ask for it by, and its price — the provider's, proposed from its API or a public price list
+// where either has it (D176), and saved only as the operator leaves it. Or paid by plan: no price
+// per token, the plan's own limit the cap.
+function modelsPicker(offered, current, format, proposals = {}) {
   const rows = new Map();
   const ids = [...new Set([...current.map((m) => m.tag), ...offered])].sort();
   const byTag = new Map();
   for (const m of current) { if (!byTag.has(m.tag)) byTag.set(m.tag, []); byTag.get(m.tag).push(m); }
+  const proposed = proposals.prices || {};
   const filter = el("input", { type: "search", placeholder: `Filter ${ids.length} model${ids.length === 1 ? "" : "s"}…`, autocomplete: "off" });
   const list = el("div", { class: "models-picker" });
-  const fieldsFor = (m) => PRICE_FIELDS.filter((f) => f.key !== "cache_write" || format === "Anthropic").map((f) => {
-    const input = el("input", { type: "number", min: "0", step: "any", inputmode: "decimal", value: m?.price?.[f.key] ?? "",
-      "aria-label": `${f.label} price`, title: f.hint, placeholder: f.label, class: "price" });
-    return { key: f.key, input };
-  });
+  const byPlan = el("input", { id: "models-plan", type: "checkbox",
+    checked: (current.length ? current.every((m) => m.price?.plan) : Boolean(proposals.paid_by_plan)) || undefined });
+  const fieldsFor = (m, tag) => {
+    const from = m?.price && !m.price.plan ? m.price : proposed[tag]?.price?.plan ? null : proposed[tag]?.price;
+    return PRICE_FIELDS.filter((f) => f.key !== "cache_write" || format === "Anthropic").map((f) => {
+      const input = el("input", { type: "number", min: "0", step: "any", inputmode: "decimal", value: from?.[f.key] ?? "",
+        "aria-label": `${tag}: ${f.hint}`, title: f.hint, placeholder: f.label, class: "price" });
+      return { key: f.key, input };
+    });
+  };
   for (const tag of ids) {
     const kept = (byTag.get(tag) || [])[0];
     const on = el("input", { type: "checkbox", checked: kept ? true : undefined, "aria-label": `Offer ${tag}` });
     const name = el("input", { type: "text", value: kept ? kept.name : tag, autocomplete: "off", spellcheck: "false",
       "aria-label": `Name apps ask for ${tag} by`, class: "mono" });
-    const prices = fieldsFor(kept);
+    const prices = fieldsFor(kept, tag);
+    const source = !(kept?.price && !kept.price.plan) && proposed[tag] && PRICE_SOURCE[proposed[tag].source];
+    const priceBox = el("span", { class: "row tight price-box" }, ...prices.map((p) => p.input),
+      source ? el("span", { class: "muted small-text price-source" }, source) : null);
     const detail = el("div", { class: "row tight model-prices", hidden: !kept || undefined },
-      el("label", { class: "muted small-text" }, "apps ask for"), name, ...prices.map((p) => p.input));
-    on.onchange = () => { detail.hidden = !on.checked; if (on.checked) prices[0].input.focus(); };
+      el("label", { class: "muted small-text" }, "apps ask for"), name, priceBox);
+    on.onchange = () => { detail.hidden = !on.checked; if (on.checked) (byPlan.checked ? name : prices[0].input).focus(); };
     const row = el("div", { class: "model-row", "data-tag": tag }, el("label", { class: "pick" }, on, el("span", { class: "mono" }, tag)), detail);
-    rows.set(tag, { on, name, prices, row });
+    rows.set(tag, { on, name, prices, priceBox, row });
     list.append(row);
   }
+  const showPrices = () => { for (const r of rows.values()) r.priceBox.hidden = byPlan.checked || undefined; };
+  byPlan.onchange = showPrices;
+  showPrices();
   filter.oninput = () => {
     const q = filter.value.trim().toLowerCase();
     for (const [tag, r] of rows) r.row.hidden = Boolean(q) && !tag.toLowerCase().includes(q) && !r.on.checked;
@@ -1812,30 +1850,48 @@ function modelsPicker(offered, current, format) {
     for (const [tag, r] of rows) {
       if (!r.on.checked) continue;
       const price = {};
-      for (const p of r.prices) if (p.input.value !== "") price[p.key] = Number(p.input.value);
+      if (byPlan.checked) price.plan = true;
+      else for (const p of r.prices) if (p.input.value !== "") price[p.key] = Number(p.input.value);
       out.push({ name: r.name.value.trim() || tag, tag, price });
     }
     return out;
   };
   const node = el("div", {},
+    el("label", { class: "pick option", for: "models-plan" }, byPlan,
+      "Paid by plan — a subscription, not per token. Its answers count nothing against a budget; the plan's own limit is the cap."),
     ids.length > 8 ? filter : null,
     ids.length ? list : el("p", { class: "muted" }, "The provider listed no models for this key."),
-    el("p", { class: "muted small-text" }, format === "Anthropic"
-      ? "Prices per million tokens from the provider's own page. The cache-write price is needed: the pool asks for every prompt to be cached, which the provider charges for once."
-      : "Prices per million tokens from the provider's own page. The cached price is optional; without it a cached token is charged as input."));
+    el("p", { class: "muted small-text" },
+      "These are the provider's prices, in dollars per million tokens — not limits: each app's budget is set on its workload, and the pool's on Hosted budget. ",
+      "They are filled in from the provider's API, or from LiteLLM's public price list, where either has them: check them against the provider's page before saving. ",
+      format === "Anthropic"
+        ? "The cache-write price is needed: the pool asks for every prompt to be cached, which the provider charges for once."
+        : "The cached price is optional; without it a cached token is charged as input."),
+    proposals.price_list_problem ? el("p", { class: "warn-text small-text" }, `${proposals.price_list_problem[0].toUpperCase()}${proposals.price_list_problem.slice(1)}: type the prices from the provider's page.`) : null);
   return { node, read };
 }
 
-function hostedModelsDialog(h) {
-  const { dialog } = providerDialog();
+async function hostedModelsDialog(h) {
+  const { dialog, opening } = providerDialog();
   const pinned = h.models.filter((m) => m.pinned);
-  const picker = modelsPicker(h.offered || [], pinned, h.format);
+  // What the provider offers now, with the prices it or the public list says (D176).
+  let proposals = {};
+  try { proposals = await api.testHosted({ host: h.id }); } catch { /* the saved list is shown as it is */ }
+  if (providersView.opened !== opening) return;
+  const picker = modelsPicker(proposals.models?.length ? proposals.models : (h.offered || []), pinned, h.format, proposals);
   const problem = el("p", { class: "error", role: "alert", hidden: true });
   const save = el("button", { type: "button", class: "primary" }, "Save");
   save.onclick = async () => {
+    const models = picker.read();
+    const unpriced = models.filter((m) => !m.price.plan && (m.price.input === undefined || m.price.output === undefined));
+    if (unpriced.length) {
+      problem.textContent = `Give ${unpriced.map((m) => m.name).join(", ")} the provider's input and output prices, or tick "Paid by plan".`;
+      problem.hidden = false;
+      return;
+    }
     save.disabled = true;
     try {
-      const done = await withRetype((confirm) => api.changeHosted(h.id, { models: picker.read(), ...(confirm ? { confirm } : {}) }),
+      const done = await withRetype((confirm) => api.changeHosted(h.id, { models, ...(confirm ? { confirm } : {}) }),
         `Change what ${h.provider || h.id} offers?`);
       if (done) { dialog.close(); await refresh(); return; }
     } catch (error) {
@@ -1844,9 +1900,9 @@ function hostedModelsDialog(h) {
     save.disabled = false;
   };
   const handWritten = h.models.filter((m) => !m.pinned);
-  dialog.replaceChildren(dialogTitle(`Models and prices — ${h.provider || h.id}`),
-    el("p", { class: "muted" }, "Tick the models apps may ask for, the name they ask by, and what each costs. A model unticked here is no longer served by this API."),
-    (h.offered || []).length ? null : el("p", { class: "warn-text" }, "The provider's list of models is not known yet: test it first, or wait for its next check."),
+  refill(dialog, dialogTitle(`Models and prices — ${h.provider || h.id}`),
+    el("p", { class: "muted" }, "Tick the models apps may ask for, and the name they ask by. A model unticked here is no longer served by this API."),
+    (proposals.models?.length || (h.offered || []).length) ? null : el("p", { class: "warn-text" }, "The provider's list of models is not known yet: test it first, or wait for its next check."),
     picker.node,
     handWritten.length ? el("p", { class: "muted small-text" }, `Also served here, from builds written by hand on the Configuration screen: ${handWritten.map((m) => m.name).join(", ")}.`) : null,
     problem,
@@ -1944,13 +2000,13 @@ function addHostedDialog(data, preset = null) {
 
   function models() {
     const format = draft.preset.engine === "anthropic-api" ? "Anthropic" : "OpenAI";
-    picker = picker || modelsPicker(draft.tested.models, draft.models, format);
-    return [el("p", { class: "muted" }, "Tick the models apps may ask for, the name they ask by, and what each costs."),
+    picker = picker || modelsPicker(draft.tested.models, draft.models, format, draft.tested);
+    return [el("p", { class: "muted" }, "Tick the models apps may ask for, and the name they ask by. Their prices are the provider's."),
       picker.node, problem(),
       nav(el("button", { type: "button", class: "primary", onclick: () => {
         draft.models = picker.read();
-        const unpriced = draft.models.filter((m) => m.price.input === undefined && m.price.output === undefined);
-        if (unpriced.length) { draft.problem = `Give ${unpriced.map((m) => m.name).join(", ")} a price: the pool counts every answer against the budget.`; draw(); return; }
+        const unpriced = draft.models.filter((m) => !m.price.plan && (m.price.input === undefined || m.price.output === undefined));
+        if (unpriced.length) { draft.problem = `Give ${unpriced.map((m) => m.name).join(", ")} the provider's input and output prices, or tick "Paid by plan": the pool counts each answer against its app's budget.`; draw(); return; }
         draft.problem = null; draft.step = 5; draft.plan = null; draw(); savePlan();
       } }, "Continue"))];
   }
@@ -2003,7 +2059,7 @@ function addHostedDialog(data, preset = null) {
   function draw() {
     if (!current() && draft.step !== 1) return;
     const parts = [choose, key, testing, models, saving][draft.step - 1]();
-    dialog.replaceChildren(dialogTitle(draft.step === 1 ? "Add a provider" : `Add a provider — ${draft.preset.name}`), stepper(), ...parts.filter(Boolean));
+    refill(dialog, dialogTitle(draft.step === 1 ? "Add a provider" : `Add a provider — ${draft.preset.name}`), stepper(), ...parts.filter(Boolean));
     if (draft.step === 2) (dialog.querySelector("input[data-secret]") || dialog.querySelector("#hosted-id"))?.focus();
   }
   if (preset) pickPreset(preset);
@@ -2035,7 +2091,7 @@ function hostedBudgetDialog(budget) {
     }
     save.disabled = false;
   };
-  dialog.replaceChildren(dialogTitle("Hosted budget"),
+  refill(dialog, dialogTitle("Hosted budget"),
     el("p", { class: "muted" }, "What the pool's shared hosted APIs may spend. A request is never sent beyond it: the worst it could cost is held before it goes. A workload's own hosted budget is set on its page."),
     day.node, month.node, each.node, wait.node, problem,
     el("div", { class: "row wizard-nav" }, el("button", { type: "button", onclick: () => dialog.close() }, "Cancel"), save));
@@ -2090,7 +2146,7 @@ screens.providers = async () => {
           addButton()))),
     rented.error ? el("p", { class: "error" }, `Rented accounts: ${rented.error}`) : null,
     hosted.error ? el("p", { class: "error" }, `Hosted APIs: ${hosted.error}`) : null,
-    rented.restart_needed ? el("p", { class: "warn-text" }, "A provider account was added to this pool's configuration. The pool uses it once restarted.") : null,
+    rented.restart_needed ? el("p", { class: "error" }, `${rented.problem || "A provider account is in this pool's file but not running"}. Put it right, or restart the pool.`) : null,
     state.status?.renting && !state.status.renting.set_up ? el("p", { class: "warn-text" },
       "Renting is not set up yet, so nothing is rented. ", el("a", { href: "#rented" }, "Set it up on Rented capacity →")) : null,
     secure === false ? el("p", { class: "warn-text" },
@@ -2115,14 +2171,14 @@ function limitsPanel(status) {
 }
 
 async function rentedHostsTab(status) {
-  const account = await api.account().catch((e) => ({ error: e.message }));
+  const accounts = await api.providers().catch((e) => ({ error: e.message }));
   // Read again on opening: the day's search quota (D121) moves with every search, and the
   // status the page holds may be from before the last one.
   status = await api.status().catch(() => status);
   const burn = status.rented.reduce((n, h) => n + (h.bid_hourly || 0), 0);
   return [
     el("div", { class: "grid" },
-      providerPanel(status, account),
+      providerPanel(status, accounts),
       el("div", { class: "panel" }, el("h2", {}, "Now"),
         el("div", { class: "kv" },
           el("div", { class: "k" }, "rented"), el("div", {}, `${status.rented.length} of at most ${status.limits.max_rented_hosts}`),
@@ -2374,9 +2430,35 @@ function engineSection(status) {
   if (!status.engine || !status.provider) return [];
   if (!engineEdit.draft) engineEdit.draft = engineDraft(status);
   const box = el("div", {});
-  const draw = () => box.replaceChildren(...profilesTab(status, draw));
+  const draw = () => refill(box, ...profilesTab(status, draw));
   draw();
-  return [box];
+  return [imagePanel(status.renting?.images), box];
+}
+
+// Which image new rented machines start from (D177): the engine's newest release, on trial until
+// a machine from it serves, or the image the file names.
+function imagePanel(images) {
+  if (!images) return null;
+  if (!images.tracked) {
+    return el("div", { class: "panel image-panel" }, el("strong", {}, "Engine image: "),
+      el("span", { class: "mono" }, images.pinned.join(", ")),
+      el("p", { class: "muted small-text" }, "Named in the file, so held to it. Remove rented.image (or set it to latest) to keep machines on the engine's newest release."));
+  }
+  const ago = (t) => (t ? `${Math.max(1, Math.round((Date.now() / 1000 - t) / 60))} min ago` : "never");
+  const lines = images.lines.filter((l) => l.image);
+  return el("div", { class: "panel image-panel" },
+    el("strong", {}, `Engine image — ${images.engine}'s newest release`),
+    lines.length
+      ? el("ul", { class: "plain" }, lines.map((l) => el("li", {},
+        el("span", { class: "mono" }, l.image), " ",
+        l.on_trial ? el("span", { class: "pill warn", title: "Dropped for the one before if two machines from it never answer" }, "on trial") : el("span", { class: "pill ok" }, "proven"),
+        l.min_driver ? el("span", { class: "muted" }, ` · driver ${l.min_driver}+`) : null,
+        l.previous ? el("span", { class: "muted" }, ` · before: ${l.previous}`) : null,
+        l.dropped.length ? el("span", { class: "warn-text" }, ` · dropped: ${l.dropped.join(", ")}`) : null)))
+      : el("p", { class: "muted" }, el("span", { class: "mono" }, images.shipped), " — the engine's shipped image, until the registry answers."),
+    el("p", { class: "muted small-text" },
+      `New machines start from it; running ones keep theirs. Checked ${ago(Math.max(0, ...images.lines.map((l) => l.checked_at || 0)) || null)}.`),
+    images.problem ? el("p", { class: "warn-text small-text" }, images.problem) : null);
 }
 
 // --- the Profiles tab (D111, D112) ---
@@ -2690,7 +2772,7 @@ function finderView(status, d, profile, draw) {
   const hubEngine = !!(((status.engine.offers || {})[d.rented] || {}).builds_on_hub);
   const f = v.filters;
   const results = el("div", {});
-  const redraw = () => results.replaceChildren(...finderResults(status, d, profile, draw, hubEngine, redraw));
+  const redraw = () => refill(results, ...finderResults(status, d, profile, draw, hubEngine, redraw));
   const number = (key, placeholder) => el("input", { type: "number", step: "any", min: "0", style: "width:5rem",
     placeholder, value: f[key], oninput: (ev) => { f[key] = ev.target.value; redraw(); } });
   const select = (key, options) => el("select", { onchange: (ev) => { f[key] = ev.target.value; redraw(); } },
@@ -3229,8 +3311,8 @@ function searchSection(market) {
           button.disabled = true; button.textContent = "asking…";
           try {
             const fresh = await api.market(1, searchValues());
-            marketView.box.replaceChildren(marketPanel(fresh));
-            marketView.quota.replaceChildren(...marketQuota(fresh));
+            refill(marketView.box, marketPanel(fresh));
+            refill(marketView.quota, ...marketQuota(fresh));
             marketView.at = Date.now();
             marketView.last = fresh;
             marketView.searchedAs = marketAsks();
@@ -3516,9 +3598,9 @@ async function refreshMarket() {
     marketView.last = fresh.error ? marketView.last : fresh;
     if (!fresh.error) marketView.searchedAs = marketAsks();
     if (marketOnScreen()) {  // the operator may have moved on while it was asked
-      marketView.box.replaceChildren(marketPanel(fresh));
+      refill(marketView.box, marketPanel(fresh));
       if (!fresh.error) document.querySelector(".chips")?.replaceWith(marketChips(fresh));
-      if (!fresh.error) marketView.quota.replaceChildren(...marketQuota(fresh));
+      if (!fresh.error) refill(marketView.quota, ...marketQuota(fresh));
     }
   } finally {
     marketView.at = Date.now();
@@ -3928,7 +4010,7 @@ function workloadForm(status) {
     planButton.textContent = d.planning ? "Working it out…" : "Plan";
     planButton.title = !nameOk() ? "Name it first" : twice() ? "Each model once" : "";
     nameCheck.textContent = d.name && !nameOk() ? "lower-case letters, digits and -, not starting with rented-" : "";
-    planHolder.replaceChildren(...(d.plan ? [workloadPlanView(d.plan)] : []));
+    refill(planHolder, ...(d.plan ? [workloadPlanView(d.plan)] : []));
     errorHolder.textContent = d.error || "";
     if (focusPlan && d.plan) planHolder.querySelector("[tabindex]")?.focus();
   };
@@ -4469,7 +4551,7 @@ async function drawWorkloadTables() {
   if (!holder || !holder.isConnected) return;
   let workloads;
   try { ({ workloads } = await api.workloads()); }
-  catch (error) { holder.replaceChildren(el("p", { class: "error" }, error.message)); return; }
+  catch (error) { refill(holder, el("p", { class: "error" }, error.message)); return; }
   const live = workloads.filter((w) => w.state !== "ended");
   const ended = workloads.filter((w) => w.state === "ended");
   const head = () => el("thead", {}, el("tr", {},
@@ -4479,7 +4561,7 @@ async function drawWorkloadTables() {
   const hadLive = workloadDraft.hasLive;
   workloadDraft.hasLive = live.length > 0;
   if (hadLive !== workloadDraft.hasLive) drawWorkloadForm();
-  holder.replaceChildren(...[
+  refill(holder, ...[
     el("h2", {}, `Active (${live.length})`),
     live.length ? el("table", { class: "workloads" }, head(), el("tbody", {}, live.flatMap(workloadRow)))
       : el("p", { class: "muted" }, "None. Apps with the pool's app key are served by the shared hosts."),
@@ -4494,11 +4576,11 @@ function drawWorkloadForm() {
   if (!holder || !holder.isConnected || !state.status) return;
   const drafting = d.formOpen || d.name.trim() || d.plan || d.hasLive === false;
   if (drafting) {
-    holder.replaceChildren(workloadForm(state.status));
+    refill(holder, workloadForm(state.status));
     return;
   }
   if (d.hasLive === null) { holder.replaceChildren(); return; }  // not known yet: nothing to fold
-  holder.replaceChildren(el("button", { class: "primary", onclick: () => { d.formOpen = true; drawWorkloadForm(); } },
+  refill(holder, el("button", { class: "primary", onclick: () => { d.formOpen = true; drawWorkloadForm(); } },
     "New workload…"));
 }
 
@@ -4638,14 +4720,14 @@ async function drawPrograms() {
   if (!holder || !holder.isConnected) return;
   let answer;
   try { answer = await api.provisioners(); }
-  catch (error) { holder.replaceChildren(el("p", { class: "error" }, error.message)); return; }
+  catch (error) { refill(holder, el("p", { class: "error" }, error.message)); return; }
   const provisioners = answer.provisioners || [];
   const status = state.status || {};
   const models = [...new Set([...(status.workload_models || []), ...(status.model_set || [])])];
   const usable = provisioners.filter((p) => p.usable);
   const gone = provisioners.filter((p) => !p.usable);
   const goneOpen = holder.querySelector("details.gone")?.open;
-  holder.replaceChildren(...[
+  refill(holder, ...[
     el("h2", {}, `Applications that create workloads (${usable.length})`),
     el("p", { class: "muted" }, "An application holding a provisioning key creates its own workloads through the SDK, within its grant.",
       answer.max_spend_per_day ? ` All of them together commit at most ${dollars(answer.max_spend_per_day)} a day.` : ""),
@@ -4760,7 +4842,7 @@ screens.config = async () => {
       const plan = await api.planConfig(editor.value);
       plannedText = editor.value;
       applyButton.disabled = plan.errors.length > 0;
-      output.replaceChildren(
+      refill(output, 
         plan.errors.length
           ? el("div", { class: "panel" }, el("h2", { class: "error" }, "Will not load"), el("pre", { class: "error" }, plan.errors.join("\n")))
           : el("div", { class: "panel" },
@@ -4774,7 +4856,7 @@ screens.config = async () => {
                 : el("p", { class: "muted" }, "The file parses to the same configuration."))
       );
     } catch (error) {
-      output.replaceChildren(el("p", { class: "error" }, error.message));
+      refill(output, el("p", { class: "error" }, error.message));
     } finally { button.disabled = false; button.textContent = label; }
   };
 
@@ -4806,7 +4888,7 @@ screens.config = async () => {
         const button = e.target; const label = button.textContent; button.disabled = true;
         try {
           const result = await api.validateConfig(editor.value);
-          output.replaceChildren(result.ok
+          refill(output, result.ok
             ? el("p", { class: "ok" }, "Valid.")
             : el("pre", { class: "error" }, result.errors.join("\n")));
         } finally { button.disabled = false; button.textContent = label; }
@@ -4851,7 +4933,7 @@ async function render() {
   const draw = (...children) => {
     const y = window.scrollY;
     const inner = again ? [...main.querySelectorAll(SCROLLERS)].map((box) => [box.scrollTop, box.scrollLeft]) : [];
-    main.replaceChildren(...children);
+    refill(main, ...children);
     if (!again) return;
     [...main.querySelectorAll(SCROLLERS)].forEach((box, i) => {
       if (inner[i] && (inner[i][0] || inner[i][1])) { box.scrollTop = inner[i][0]; box.scrollLeft = inner[i][1]; }
@@ -4863,7 +4945,7 @@ async function render() {
     if (pending instanceof Promise && !again) {
       // A screen that has to ask the provider takes seconds. Say so, rather than leaving the
       // previous screen on the page where it reads as this one's answer.
-      main.replaceChildren(el("p", { class: "muted" }, "Loading…"));
+      refill(main, el("p", { class: "muted" }, "Loading…"));
     }
     const parts = await pending;
     if (state.screen !== name || state.drawn !== where) return;  // the operator moved on while we were waiting

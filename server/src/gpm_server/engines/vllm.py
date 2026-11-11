@@ -71,7 +71,7 @@ class VllmEngine:
     image_words: ClassVar[tuple[str, ...]] = ("vllm",)
     #: The image a rented host starts from when the configuration names none: the project's own
     #: build, pinned (T10). It leaves out the audio extra; images that carry it say so (D146).
-    default_image: ClassVar[str] = "vllm/vllm-openai:v0.29.0"
+    default_image: ClassVar[str] = "vllm/vllm-openai:v0.33.0"
     #: What an image must carry for a kind (D146): speech needs vLLM's `audio` extra, which this
     #: engine's own image leaves out. Rented hosts holding such a build start only from an image
     #: whose `capabilities` name it.

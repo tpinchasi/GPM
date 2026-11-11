@@ -23,6 +23,8 @@ KEY = "test-hosted-key"
 class FakeHostedApi:
     def __init__(self, models: tuple[str, ...] = ("provider-llama", "provider-claude")) -> None:
         self.models = models
+        #: What its `/models` says each costs, as a provider that lists prices does (D176).
+        self.pricing: dict[str, dict[str, Any]] = {}
         self.seen: list[dict[str, Any]] = []
         #: The next answers: "ok", "busy", "out_of_funds", "refused" — the last one repeats.
         self.behaviour: list[str] = ["ok"]
@@ -43,7 +45,8 @@ class FakeHostedApi:
     async def _models(self, request: Request) -> Response:
         if not self._authorised(request):
             return JSONResponse({"error": {"message": "bad key"}}, status_code=401)
-        return JSONResponse({"object": "list", "data": [{"id": m, "object": "model"} for m in self.models]})
+        return JSONResponse({"object": "list", "data": [
+            {"id": m, "object": "model", **({"pricing": self.pricing[m]} if m in self.pricing else {})} for m in self.models]})
 
     def _next(self) -> str:
         return self.behaviour.pop(0) if len(self.behaviour) > 1 else self.behaviour[0]

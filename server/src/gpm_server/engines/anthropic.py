@@ -100,10 +100,15 @@ class AnthropicHostedEngine(HostedOpenAIEngine):
             return Health(ok=False, detail=f"/models returned {response.status_code}")
         return Health(ok=True)
 
-    async def _offered(self, client: httpx.AsyncClient) -> frozenset[str]:
+    async def listing(self, client: httpx.AsyncClient) -> list:
+        """Anthropic's `/models` entries: names and capabilities, never a price."""
         response = await client.get("models", headers=_VERSION_HEADER, params={"limit": 1000})
         response.raise_for_status()
         entries = response.json().get("data", [])
+        return entries if isinstance(entries, list) else []
+
+    async def _offered(self, client: httpx.AsyncClient) -> frozenset[str]:
+        entries = await self.listing(client)
         return frozenset(
             entry["id"] for entry in entries if isinstance(entry, dict) and isinstance(entry.get("id"), str)
         )

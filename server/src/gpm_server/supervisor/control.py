@@ -796,7 +796,8 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 },
                 # A provider account can be in before renting is set up; until it is, nothing is
                 # rented (D172). None where the pool has no rented section at all.
-                "renting": ({"set_up": supervisor.config.rented.set_up, "missing": supervisor.config.rented.setup_missing()}
+                "renting": ({"set_up": supervisor.config.rented.set_up, "missing": supervisor.config.rented.setup_missing(),
+                             "images": rented_images()}
                             if supervisor.config.rented else None),
                 "provider": (
                     {
@@ -877,6 +878,19 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     else [],
                 },
             }
+
+    def rented_images() -> dict[str, Any]:
+        """Which image rented hosts start from now (D177): the engine's newest releases, each on
+        trial or proven, where the pool names none; else the one it names."""
+        rented = supervisor.config.rented
+        if not rented.tracks_latest:
+            return {"tracked": False, "pinned": [i.image for i in rented.images] or [supervisor.config.rented_image()]}
+        fleet = supervisor.fleet
+        engine = supervisor.config.rented_engine()
+        if fleet is None:
+            return {"tracked": True, "engine": engine, "lines": [], "shipped": supervisor.config.rented_image()}
+        return {"tracked": True, "engine": engine, "lines": fleet.image_tracker.view(engine),
+                "shipped": supervisor.config.rented_image(), "problem": fleet.image_tracker.problem}
 
     @app.get("/pool/status")
     async def status() -> JSONResponse:
@@ -1602,9 +1616,14 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             return _error(400, "invalid_config", "; ".join(errors))
         candidate = store().parse(text)
         changes = plan_changes(supervisor.config, candidate, rented_now(), machines_now(), known_connections())
-        refused = [c for c in changes if c.refused]
+        refused = [c.refused for c in changes if c.refused]
+        # What the running plug-ins refuse — an account's address changed (D175), a holding one
+        # moved (D136) — is refused here, before the file is written, never after it.
+        moved = supervisor.accounts.refuse_moves(candidate)
+        if moved is not None and moved not in refused:
+            refused.append(moved)
         if refused:
-            return _error(409, "change_refused", "; ".join(c.refused for c in refused))
+            return _error(409, "change_refused", "; ".join(refused))
         loosening = [c for c in changes if c.requires_retype]
         if loosening and str(body.get("confirm")) not in {str(c.requires_retype) for c in loosening}:
             return JSONResponse(

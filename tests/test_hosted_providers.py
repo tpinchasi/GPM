@@ -99,13 +99,20 @@ def api(pool, method, path, **kwargs):
     return httpx.request(method, f"{pool.control}{path}", headers=AUTH, timeout=30, **kwargs)
 
 
-def settle(pool, until, timeout=10.0):
+def settle(pool, until, timeout=30.0):
     """A supervisor pass and the router's next read, until `until()` holds — and the router has
-    read the file as it is now, which it does on its own clock."""
+    read the file as it is now, which it does on its own clock.
+
+    Returns the moment `until()` holds, so the long timeout costs a passing run nothing. Found on
+    CI (twice, never on a developer's machine): a wait of 10 s ran out. What each side holds is
+    said on failure, so the next one names what was still waiting.
+    """
     deadline = time.monotonic() + timeout
     while True:
         hosts_now = {h.id for h in load_config(pool.path).hosts}
         if {h.id for h in pool.router_app.state.pool.config.hosts} != hosts_now:
+            if time.monotonic() > deadline:
+                raise AssertionError(f"never settled: the router never read the file's hosts {sorted(hosts_now)}")
             time.sleep(0.05)
             continue
         pool.loop.run(pool.supervisor.pass_once())
@@ -113,8 +120,19 @@ def settle(pool, until, timeout=10.0):
         if until():
             return
         if time.monotonic() > deadline:
-            raise AssertionError("never settled")
+            raise AssertionError(f"never settled: {where_things_stand(pool)}")
         time.sleep(0.1)
+
+
+def where_things_stand(pool) -> str:
+    """Each side's view of every host — never a key, only whether one is held."""
+    registry = pool.router_app.state.pool.registry
+    router = {h.host_id: h.state.value for h in pool.router_app.state.pool.hosts}
+    supervisor = {i: (h.state.value, h.last_error) for i, h in pool.supervisor.hosts.items()}
+    stamps = {i: s is not None for i, s in registry._key_stamps.items()}
+    on_disk = hosted_credentials.stamps(pool.supervisor.config)
+    return (f"router hosts {router}; router holds a key for {stamps}; supervisor hosts {supervisor}; "
+            f"key files {[(i, m is not None) for i, m in on_disk]}")
 
 
 def router_has_key(pool) -> bool:
@@ -354,7 +372,7 @@ def test_a_pool_that_rents_nothing_may_add_its_first_provider_with_renting_set_u
         value = next(c["value"] for c in answer.json()["changes"] if c.get("requires_retype"))
         answer = api(pool, "POST", "/pool/providers", json={**body, "confirm": value})
     assert answer.status_code == 200, answer.text
-    assert any(c.get("needs_restart") for c in answer.json()["changes"]), "renting starts with the next start"
+    assert not any(c.get("needs_restart") for c in answer.json()["changes"]), "renting starts at once (D173)"
     rented = yaml.safe_load(pool.path.read_text())["rented"]
     assert rented["providers"] == {"market": {"type": "fake"}}
     assert rented["engine"] == "ollama" and rented["models"] == ["llama"]
@@ -362,9 +380,15 @@ def test_a_pool_that_rents_nothing_may_add_its_first_provider_with_renting_set_u
     assert (pool.tmp / "provider-credentials" / "fake.json").exists()
     assert "fake-rented-credential-0001" not in everything_written(pool)
 
-    waiting = api(pool, "GET", "/pool/providers").json()
-    assert waiting["restart_needed"] is True
-    assert api(pool, "PATCH", "/pool/providers/market", json={"enabled": False}).json()["error"] == "restart_needed"
+    # In use at once, with no restart (D173): listed, its typed-in credential handed to it, and
+    # changed like any running account.
+    assert pool.supervisor.fleet is not None and "market" in pool.supervisor.fleet.providers
+    running = api(pool, "GET", "/pool/providers").json()
+    assert running["renting"] is True and running["restart_needed"] is False
+    assert [c["connection"] for c in running["connections"]] == ["market"]
+    assert running["connections"][0]["credential"]["source"] == "stored"
+    # Turning off the only account is refused by the file's own rule, no longer by a restart.
+    assert "must be enabled" in api(pool, "PATCH", "/pool/providers/market", json={"enabled": False}).json()["detail"]
 
 
 # --- the console ---

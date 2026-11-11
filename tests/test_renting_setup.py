@@ -126,8 +126,13 @@ def test_an_account_is_added_alone_and_renting_is_set_up_after(tmp_path, plugins
         assert "nothing is rented until renting is set up" in said
         assert yaml.safe_load(path.read_text())["rented"] == {"providers": {"market": {"type": "fake"}}}
 
+        # In use at once, with no restart (D173) — but renting nothing yet.
+        assert supervisor.fleet is not None and "market" in supervisor.fleet.providers
+        assert any(e["kind"] == "renting_started" for e in supervisor.events.since(0))
         view = call(base, "GET", "/pool/renting").json()
-        assert view["account"] and not view["set_up"] and view["restart_needed"]
+        assert view["account"] and not view["set_up"] and not view["restart_needed"]
+        with pytest.raises(LeaseRefused, match="renting is not set up"):
+            supervisor.fleet.open_lease(workers=1, max_hours=1, max_spend=1.0, allow_rent=True)
         assert len(view["missing"]) == 2
         # Only models the engine has a build of are offered, and the rest say why.
         assert view["engines"]["vllm"]["can"] == ["big"]
@@ -152,6 +157,35 @@ def test_an_account_is_added_alone_and_renting_is_set_up_after(tmp_path, plugins
         assert rented["engine"] == "ollama" and rented["models"] == ["chat"]
         assert rented["offer_policy"] == {"min_disk_gb": 40.0, "max_all_in_hourly": 0.5}
         assert call(base, "GET", "/pool/renting").json()["set_up"] is True
+        # Still no restart: a lease that may rent opens now.
+        assert supervisor.fleet.open_lease(workers=1, max_hours=1, max_spend=1.0, allow_rent=True).lease_id
+    finally:
+        stop()
+
+
+def test_renting_that_cannot_start_leaves_the_pool_as_it_was_and_says_why(tmp_path, plugins, monkeypatch):
+    from gpm_server.supervisor.renting import Fleet
+
+    supervisor, base, path, stop = start(tmp_path, BASE)
+    try:
+        supervisor.accounts.factory = lambda type_name, settings: plugins.twin()
+
+        def refuses(self):
+            raise RuntimeError("its records could not be read")
+
+        monkeypatch.setattr(Fleet, "claim_records", refuses)
+        added = call(base, "POST", "/pool/providers", json={"name": "market", "type": "fake", "credential": CREDENTIAL})
+        assert added.status_code == 200, added.text
+        assert supervisor.fleet is None and "could not be read" in supervisor.renting_problem
+        assert any(e["kind"] == "renting_refused" for e in supervisor.events.since(0))
+        listed = call(base, "GET", "/pool/providers").json()
+        assert listed["restart_needed"] and "could not be read" in listed["problem"]
+        assert call(base, "GET", "/pool/status").status_code == 200, "the pool runs on"
+
+        # Put right, the next change to the file starts it — still with no restart.
+        monkeypatch.undo()
+        supervisor.reload_config()
+        assert supervisor.fleet is not None and supervisor.renting_problem is None
     finally:
         stop()
 

@@ -490,9 +490,12 @@ left untouched — it names the tag that really ran — and the router adds `X-G
   schema-constrained requests.
 
 **A hosted build carries its price** (D164): `price: {input, cached_input, output}` in dollars per
-million tokens, or `per_minute` for transcription. A hosted variant without one is refused, since
+million tokens, `per_minute` for transcription, or `plan: true` — paid by the provider's plan, with
+no charge per token (D176): its answers cost nothing against a budget, and the plan's own limit is
+the cap, met as any provider's "out of money" is. A hosted variant without one is refused, since
 the budget that pays for it could not be counted (D166); a provider with peak and off-peak rates is
-priced at its peak. The pool reads no price from a provider: the operator keeps them. A model whose
+priced at its peak. The price in the file is the one the operator saved; the console proposes it
+from the provider's API or a public price list (providers.md §8), and nothing is priced unseen. A model whose
 variants are all hosted is **hosted-only** (D165): never placed on, rented for or planned onto a
 machine, and never in a machine's model set.
 

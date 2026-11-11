@@ -42,7 +42,7 @@ class OllamaEngine:
     models_dir: ClassVar[str] = "/root/.ollama/models"
     image_words: ClassVar[tuple[str, ...]] = ("ollama",)
     #: The image a rented host starts from when the configuration names none. Pinned (T10).
-    default_image: ClassVar[str] = "ollama/ollama:0.34.2"
+    default_image: ClassVar[str] = "ollama/ollama:0.40.15"
     loads_by_restart: ClassVar[bool] = False
     #: Ollama's start takes no named options, and its builds are its own library's names.
     options: ClassVar[dict[str, EngineOption]] = {}
@@ -52,9 +52,13 @@ class OllamaEngine:
         self, *, port: int, models_dir: str, agent_archive: str, proxy: bool,
         options: tuple[str, ...] = (),
     ) -> Optional[str]:
-        """None: images of this engine start it themselves, and where a provider's launch mode
-        skips that, the operator's `engine_start` names the image's own way (D71)."""
-        return None
+        """`ollama serve`, in the background, on the pool's port (D177). A provider's launch mode
+        may skip an image's own start — Vast's SSH mode and RunPod's do — and a pool that relied on
+        the image rented machines that never served; started here, any image of the engine works on
+        any provider. Where the image started one already, this one finds the port taken and
+        exits, and the image's goes on serving. `rented.engine_start` still replaces it."""
+        return (f'OLLAMA_HOST="${{OLLAMA_HOST:-127.0.0.1:{port}}}" '
+                "nohup ollama serve >/var/log/ollama.log 2>&1 &")
 
     def inference_paths(self) -> set[str]:
         """Both surfaces: this engine's own API, and the OpenAI-shaped one it also serves.
