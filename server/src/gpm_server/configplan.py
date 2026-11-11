@@ -201,15 +201,14 @@ def plan_changes(
                  and (before_of[conn.type][1].settings != conn.settings
                       or before_of[conn.type][1].credential_env != conn.credential_env)
                  and any(r.provider == conn.type for r in held)]
-        # A running connection is never rebuilt while the supervisor runs: these wait for a restart.
-        waits = sorted(name for name, conn in become.items()
+        # Renamed, or with new settings or credential source: built again at once (D174).
+        changed = sorted(name for name, conn in become.items()
                        if conn.type in before_of and (
                            before_of[conn.type][0] != name
                            or before_of[conn.type][1].settings != conn.settings
                            or before_of[conn.type][1].credential_env != conn.credential_env))
-        if waits:
-            said.append(f"{', '.join(waits)}: renamed, or new settings or credential source — takes effect when "
-                        "the supervisor restarts")
+        if changed:
+            said.append(f"{', '.join(changed)}: renamed, or new settings or credential source")
         # A name once one provider's names that provider's records (D133).
         reused = [f"{name!r} names {connection_types[name]!r}'s records; give {conn.type!r} another name"
                   for name, conn in become.items()
@@ -224,12 +223,12 @@ def plan_changes(
         changes.append(Change(
             "providers",
             "the provider accounts change" + (f": {'; '.join(said)}" if said else "")
-            + ((". Renting is new to this pool: it starts when the supervisor restarts" if candidate.rented.set_up
-                else ". The account is in use when the supervisor restarts; nothing is rented until renting is set up")
+            # Renting new to the pool starts at once, as the file is applied (D173).
+            + ((". Renting is new to this pool: it starts at once" if candidate.rented.set_up
+                else ". The account is in use at once; nothing is rented until renting is set up")
                if fresh
-               else "" if waits and not (added or removed or turned_on or turned_off) else ". The rest takes effect at once (D135)"
-               if waits else ". It takes effect at once (D135)"),
-            needs_restart=fresh or bool(waits),
+               else ". It takes effect at once (D135, D174)"),
+            needs_restart=False,
             restarts="supervisor",
             # Renting somewhere new is a loosening: typed again, like any (D129).
             # An account in a pool not set up to rent spends nothing (D172).

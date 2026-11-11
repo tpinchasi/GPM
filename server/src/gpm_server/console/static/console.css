@@ -217,8 +217,15 @@ h2.section { margin: 26px 0 10px; font-size: 18px; }
 .model-row { display: flex; flex-direction: column; gap: 4px; padding: 6px 8px; border-radius: 6px; background: var(--panel-alt, rgba(127,127,127,.06)); }
 .model-row .model-prices { flex-wrap: wrap; padding-left: 26px; }
 .model-row input.price { width: 7.5em; }
+.model-row .price-box { flex-wrap: wrap; }
+.model-row .model-prices input.mono { flex: 1 1 12em; min-width: 10em; }
+.model-row .price-source { white-space: nowrap; }
 .model-row input.mono { width: 14em; }
 .hosted-card table.compact { width: 100%; font-size: 13px; }
 .hosted-card table.compact caption { caption-side: bottom; text-align: left; padding-top: 4px; }
 .renting-setup { max-width: 640px; }
 .renting-setup ul { margin: 4px 0 0 18px; padding: 0; }
+
+/* Which image rented machines start from (D177). */
+.image-panel ul.plain { list-style: none; padding: 0; margin: 6px 0; }
+.image-panel ul.plain li { margin: 4px 0; }

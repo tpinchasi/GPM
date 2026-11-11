@@ -42,7 +42,7 @@ from ..directory import Directory
 from ..engines import Engine, get_engine
 from ..ledger import EventLog, LeaseStore, SpendLedger
 from ..models import RENTED_KINDS, HostState
-from ..providers.base import ProviderAuthError, ProviderError, get_provider
+from ..providers.base import ProviderAuthError, ProviderError, takes_credential
 from ..transports import SshTunnel, tunnel_maker
 from . import agents
 from .renting import Fleet
@@ -210,20 +210,13 @@ class Supervisor:
         from .connections import ProviderAccounts
 
         self.accounts = ProviderAccounts(self)
+        #: Why renting added to the file while the pool ran could not start, or None (D173).
+        self.renting_problem: Optional[str] = None
         if config.rented is not None:
-            # One provider per configured connection, enabled or not: a disabled one's hosts are
-            # still watched and swept (D129). Given one — a test's — it is the first connection's.
+            # Given one — a test's — it is the first connection's.
             given = provider if isinstance(provider, dict) else (
                 {config.rented.connection_name: provider} if provider is not None else None)
-            providers = given if given is not None else {
-                name: get_provider(conn.type, conn.settings) for name, conn in config.rented.providers.items()
-            }
-            # Each is handed its credential (D134): a plug-in reads none itself.
-            for name, built in providers.items():
-                if name in config.rented.providers:
-                    self.accounts.install(name, config.rented.providers[name], built)
-            self.fleet = Fleet(config, config.rented, providers, self.leases, self.events, self.spend)
-            self.fleet.make_tunnel = self.make_tunnel
+            self._build_fleet(config, given)
         #: Workloads inside the pool (D115): created from the control API, moved along each pass.
         from .provisioning import Provisioning
         from .workloads import Workloads
@@ -234,6 +227,8 @@ class Supervisor:
         self.provisioning = Provisioning(self)
         self.pass_lock = asyncio.Lock()
         self._request_watcher: Optional[asyncio.Task] = None
+        #: The registry being asked for the rented engine's newest release (D177), while it is.
+        self._image_refresh: Optional[asyncio.Task] = None
         self._requests_revision: Optional[float] = None
         #: Clients for hosts the pool rented, keyed by host id.
         self._rented_clients: dict[str, httpx.AsyncClient] = {}
@@ -241,6 +236,52 @@ class Supervisor:
         self._preparing: dict[str, asyncio.Task[None]] = {}
         #: Tests substitute a transport that answers as an agent would.
         self._agent_transport: Optional[httpx.AsyncBaseTransport] = None
+
+    def _build_fleet(self, config: PoolConfig, given: Optional[dict] = None) -> None:
+        """The rented half of the pool, from the file's `rented` section: one plug-in per
+        configured connection, enabled or not — a disabled one's hosts are still watched and swept
+        (D129) — each handed its credential (D134), for a plug-in reads none itself."""
+        providers = given if given is not None else {
+            name: self.accounts.factory(conn.type, dict(conn.settings)) for name, conn in config.rented.providers.items()
+        }
+        for name, built in providers.items():
+            if name in config.rented.providers:
+                self.accounts.install(name, config.rented.providers[name], built)
+        self.fleet = Fleet(config, config.rented, providers, self.leases, self.events, self.spend)
+        self.fleet.make_tunnel = self.make_tunnel
+
+    def _start_renting(self, new: PoolConfig) -> None:
+        """The file gained its first provider account while the pool runs: renting starts now,
+        as at a start, with no restart (D173). Nothing is rented by it — that still needs renting
+        set up (D172) and a lease that may rent. The pool held nothing rented a moment ago (a
+        start without `rented` drops any such record), so there is nothing to take back. A
+        plug-in that cannot be built leaves the pool as it was and says why."""
+        try:
+            self._build_fleet(new)
+            for name, built in self.fleet.providers.items():
+                conn = new.rented.providers.get(name)
+                if conn is not None and conn.settings and not takes_credential(built):
+                    # As for any account added while the pool runs (D135): a plug-in that reads its
+                    # own credential, given settings, could be pointed anywhere — built at a start.
+                    raise RuntimeError(f"{name!r}'s plug-in reads its own credential: it starts when the supervisor restarts")
+            self.fleet.claim_records()  # under the pool lock, which this running supervisor holds
+        except Exception as exc:  # noqa: BLE001 - a plug-in's failure must not take the pool down
+            for built in (self.fleet.providers.values() if self.fleet is not None else ()):
+                self.accounts.retire(built)
+            self.fleet = None
+            self.renting_problem = f"renting could not start: {exc}"
+            self.events.record("renting_refused", f"{self.renting_problem}. The pool runs as before; it is tried "
+                               "again when the file changes or the pool restarts")
+            log.error("renting could not start: %s", exc)
+            return
+        self.renting_problem = None
+        names = sorted(new.rented.providers)
+        self.events.record(
+            "renting_started",
+            f"provider account(s) {', '.join(names)} in use at once, with no restart"
+            + ("" if new.rented.set_up else "; nothing is rented until renting is set up"),
+            numbers={"connections": names})
+        log.info("renting started for %s", ", ".join(names))
 
     def _build(self, host_config: HostConfig) -> SupervisedHost:
         capabilities = frozenset(host_config.capabilities)
@@ -506,10 +547,23 @@ class Supervisor:
         what is broken, then acquire what is missing. Programs' requests are answered first,
         under the same lock the request watcher takes (D117).
         """
+        self._refresh_images()
         async with self.pass_lock:
             if self.config.provisioning.enabled:
                 await self.provisioning.answer_pending(limit=REQUESTS_PER_LOOK)
             await self._pass()
+
+    def _refresh_images(self) -> None:
+        """Ask the registry for the rented engine's newest release when it is due (D177): in the
+        background, never on a pass's way, never twice at once; only where the pool names no image."""
+        fleet = self.fleet
+        if fleet is None or self.config.rented is None or not self.config.rented.tracks_latest:
+            return
+        if self._image_refresh is not None and not self._image_refresh.done():
+            return
+        engines = [self.config.rented_engine()]
+        if fleet.image_tracker.due(engines):
+            self._image_refresh = asyncio.create_task(fleet.image_tracker.refresh(engines), name="gpm:engine-images")
 
     async def _pass(self) -> None:
         self._follow_config_file()
@@ -653,6 +707,9 @@ class Supervisor:
             self.fleet.rented = new.rented
             # Connections added, changed or removed take effect now (D135).
             self.accounts.sync(old, new)
+        elif self.fleet is None and new.rented is not None:
+            # The first provider account: renting starts now, not at the next start (D173).
+            self._start_renting(new)
         self.events.record(
             "config_applied",
             f"configuration reloaded: {len(after)} configured host(s)",
@@ -1408,6 +1465,7 @@ class Supervisor:
             if required <= resident:
                 if host.state != "ready":
                     host.ready_at = time.time()
+                    self.fleet.image_tracker.outcome(host.image, served=True)  # a release on trial is proven (D177)
                 host.state = "ready"
                 continue
             host.mark_preparing()

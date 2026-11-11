@@ -537,13 +537,17 @@ class Fleet:
         #: Images a host's agent found not to carry what they were listed as carrying, by image
         #: (D146): not rented again for those needs while this supervisor runs.
         self.images_lacking: dict[str, set[str]] = {}
+        #: The engine's newest releases, where the pool names no image (D177).
+        from ..engine_images import ImageTracker
+
+        self.image_tracker = ImageTracker(self.leases.db, self.events)
         #: The machine history, rebuilt from the logs every few seconds (D69).
         self._history: Optional[dict] = None
         self._history_at = 0.0
         #: Each connection's searching: its back-off after "too many requests", the provider's own
         #: words for it, and why its last search came back empty (D119, D129).
         self.searching: dict[str, SearchState] = {name: SearchState() for name in self.providers}
-        #: Connections not rented through while a change to them waits for a restart (D135).
+        #: Connections not rented through while a change to them could not be applied (D174).
         self.paused: set[str] = set()
 
     # --- connections (D129) ---
@@ -558,8 +562,8 @@ class Fleet:
 
     def searchable(self) -> list[str]:
         """The connections a search asks: the enabled ones the pool has a provider for, but for
-        one whose change waits for a restart — renting there now would put hosts on an account
-        the restart may replace (D136)."""
+        one whose change could not be applied — renting there now would put hosts on a plug-in
+        the file no longer describes (D136, D174)."""
         return [name for name in self.rented.enabled_connections if name in self.providers and name not in self.paused]
 
     def provider_for(self, what: Any) -> Provider:
@@ -1504,6 +1508,8 @@ class Fleet:
         needs an image with its audio extra, known before the bid as the driver floor is.
         """
         needs = self.config.image_needs(tags)
+        if self.rented.tracks_latest and not needs:
+            return self._tracked_image_for(offer)
         listed = [i for i in self.rented.images if needs <= set(i.capabilities)]
         # An image a host's agent found not to carry what it claimed is not rented again for
         # that need: every round would pay for a machine to learn the same thing (D146).
@@ -1789,6 +1795,25 @@ class Fleet:
         "error response from daemon",
         "cuda",
     )
+
+    def _tracked_image_for(self, offer) -> tuple[Optional[str], str]:
+        """The engine's newest release this machine can run (D177): a line with no driver floor
+        is taken as it is, the offer policy's floor keeping unusable machines out; lines with one
+        are matched to the machine's driver as `rented.images` are (D92)."""
+        from ..config import EngineImage
+
+        shipped = [(self.config.rented_image(), None, "the engine's shipped image, until the registry answers")]
+        lines = self.image_tracker.images(self.config.rented_engine(), shipped)
+        floorless = [line for line in lines if line[1] is None]
+        if floorless:
+            image, _, note = floorless[0]
+            return image, f"the engine's newest release — {note}"
+        chosen = image_for(offer, [EngineImage(image=i, min_driver=d, note=n) for i, d, n in lines])
+        if chosen is None:
+            wanted = ", ".join(f"{i} needs {d}" for i, d, _ in lines)
+            return None, (f"driver: this machine reports {offer.driver_version or 'nothing'}, and no release of the "
+                          f"engine runs on it ({wanted})")
+        return chosen.image, f"driver {offer.driver_version} meets {chosen.min_driver} — {chosen.note}"
 
     async def why_it_never_started(self, host: RentedHost, tail: int = 80) -> Optional[str]:
         """What the machine itself said, for a host that never answered (D78).
@@ -2190,7 +2215,7 @@ class Fleet:
                 "searchable": name in searchable,
                 "why_not": None if asked else (
                     "turned off" if not settings.enabled
-                    else "not running — it needs a credential, or waits for a restart" if name not in self.providers
+                    else "not running — it needs a credential, or a change to it could not be applied" if name not in self.providers
                     else "no search yet" if not search else "not chosen for this search"),
                 "error": state.error if asked and state is not None and state.error else None,
                 "seen": len(mine),
@@ -3660,6 +3685,25 @@ class Fleet:
         self.leases.db.execute("INSERT OR REPLACE INTO pool_meta (key, value) VALUES (?, ?)",
                                (f"connection_type:{name}", type_name))
 
+    def rename_connection(self, was: str, name: str) -> None:
+        """A connection renamed while the supervisor runs (D174): its plug-in, its search's
+        back-off and today's search use carry on under the new name. Records under the old name
+        stay that provider's (D133) and resolve to this one; the old name stays its provider's."""
+        type_name = self.connection_types[was]
+        was_named = self.connection_types.get(name)
+        if was_named is not None and was_named != type_name:
+            raise ConnectionNameReused(
+                f"provider connection {name!r} names {was_named!r}'s records; give {type_name!r} another name (D133)")
+        self.providers[name] = self.providers.pop(was)
+        self.searching[name] = self.searching.pop(was, None) or SearchState()
+        self.connection_types[name] = type_name
+        db = self.leases.db
+        db.execute("INSERT OR REPLACE INTO pool_meta (key, value) VALUES (?, ?)", (f"connection_type:{name}", type_name))
+        db.execute("UPDATE OR IGNORE provider_search_usage SET connection = ? WHERE connection = ?", (name, was))
+        if self.connection == was:
+            self.connection = name
+            self.events._connection = name
+
     def held_at(self, name: str) -> list[tuple[str, str]]:
         """What the pool holds at a connection, as (record, provider's instance or volume id):
         live hosts, kept volumes and hosts held back at a restart. While any is held, the
@@ -4843,6 +4887,7 @@ class Fleet:
                 # Stuck before it ever served anything: the provider is still scheduling or
                 # starting it. Waiting the full preparing window would bill three times as long.
                 self.avoid(host.offer.machine_id, "never started")
+                self.image_tracker.outcome(host.image, served=False)  # a release on trial counts it (D177)
                 said = await self.why_it_never_started(host)
                 self.events.record(
                     "host_stuck_starting",
@@ -4856,6 +4901,8 @@ class Fleet:
                 continue
             if (now - since) / 60 >= self.rented.teardown.max_preparing_minutes:
                 self.avoid(host.offer.machine_id, "never became ready")
+                if host.engine_seen_at is None:
+                    self.image_tracker.outcome(host.image, served=False)
                 await self.destroy(
                     host,
                     f"not ready after {self.rented.teardown.max_preparing_minutes:g} minutes",

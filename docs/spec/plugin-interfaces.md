@@ -333,9 +333,22 @@ rented:
     - { image: "vastai/vllm:v0.29.0-cuda-12.9", min_driver: "550", capabilities: [audio-decoding] }
 ```
 
-With neither `images` nor `image` named, rented hosts start from the rented engine's own pinned
-default (`default_image`: `ollama/ollama:0.34.2`, `vllm/vllm-openai:v0.29.0`), so changing engine never
-leaves the other engine's image behind (D147).
+With neither `images` nor `image` named — or `image: latest` — rented hosts start from **the
+rented engine's newest release, kept current** (D177, `engine_images.py`): the supervisor asks
+Docker Hub's tag list of the engine's official image every six hours, off every request's and
+pass's way, and takes the highest release tag built for x86-64 — `ollama/ollama:X.Y.Z`; for vLLM
+two lines, `vllm/vllm-openai:vX.Y.Z` (CUDA 13, driver 580+) and `vX.Y.Z-cu129` (driver 550+),
+matched per machine as `images` are. Never `latest`, a nightly, a release candidate or another
+accelerator's build. A new release is **on trial** until a host from it serves; two hosts from it
+whose engine never answered **drop** it for the release before, for good. Running hosts keep
+their image. Until the registry first answers, the engine's shipped `default_image` is used
+(`ollama/ollama:0.40.15`, `vllm/vllm-openai:v0.33.0`). The Engine tab shows the image, whether it
+is on trial, the one before and anything dropped; `GET /pool/status` carries it as
+`renting.images`. Changing engine never leaves the other engine's image behind (D147).
+
+**Ollama is started by the pool** on a rented host (D177): `ollama serve` in the background, on
+loopback at the pool's port, through the restart script — since a provider's launch mode may skip
+an image's own start. `rented.engine_start` replaces it.
 
 An image's `capabilities` say what it carries beyond the engine — `audio-decoding` for vLLM's
 audio extra. An engine names what its image must carry per kind (`image_needs`; vLLM:

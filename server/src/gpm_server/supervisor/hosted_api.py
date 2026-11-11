@@ -22,8 +22,9 @@ from urllib.parse import urlsplit
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 
-from .. import hosted_credentials
+from .. import hosted_credentials, hosted_prices
 from ..config import ANTHROPIC_ENGINE, HOSTED_ENGINES, HostConfig, Price, TransportConfig
 from ..configplan import (
     CannotEdit,
@@ -90,7 +91,12 @@ def transport_for(base_url: str) -> TransportConfig:
 def price_of(raw: Any) -> tuple[Optional[dict[str, float]], Optional[str]]:
     """A price as the screen sends it, checked as the catalog would check it."""
     if not isinstance(raw, dict):
-        return None, "every model needs its price: input and output per million tokens, or per minute"
+        return None, "every model needs its price: input and output per million tokens, per minute, or paid by plan"
+    if raw.get("plan") is True:
+        # Paid by the provider's plan (D176): nothing else is said with it.
+        if any(raw.get(k) not in (None, "") for k in ("input", "cached_input", "cache_write", "output", "per_minute")):
+            return None, "a model paid by plan names no per-token price"
+        return {"plan": True}, None
     cleaned = {}
     for key in ("input", "cached_input", "cache_write", "output", "per_minute"):
         value = raw.get(key)
@@ -105,8 +111,12 @@ def price_of(raw: Any) -> tuple[Optional[dict[str, float]], Optional[str]]:
         cleaned[key] = number
     try:
         Price(**cleaned)
+    except ValidationError as exc:
+        # The rule broken, in its own words — never pydantic's pointer to its documentation.
+        said = [str(e.get("msg", "")).removeprefix("Value error, ") for e in exc.errors()]
+        return None, "; ".join(m for m in said if m) or "not a price"
     except ValueError as exc:
-        return None, str(exc).splitlines()[-1] if str(exc) else "not a price"
+        return None, str(exc) or "not a price"
     return cleaned, None
 
 
@@ -118,6 +128,11 @@ def register(
     validate_plan_apply: Callable[[str, str, dict], JSONResponse],
     plan_of: Callable[[str], list[Any]],
 ) -> None:
+
+    if not hasattr(supervisor, "price_list"):
+        # The public price list (D176), fetched when a provider's models are listed; tests replace its fetch.
+        supervisor.price_list = hosted_prices.PriceList(supervisor.config.pool.price_list_url or None)
+        supervisor.pricing_pages = {}
 
     def file_or_refusal() -> Optional[JSONResponse]:
         if supervisor.store is None:
@@ -198,16 +213,18 @@ def register(
         })
 
     async def offered(engine: str, transport: TransportConfig, key: Optional[str],
-                      saved: Optional[HostConfig] = None) -> tuple[list[dict], list[str], bool]:
+                      saved: Optional[HostConfig] = None) -> tuple[list[dict], list[str], bool, dict]:
         """Ask a provider's `/models` — which spends nothing — with the key given, or a saved host's
-        own. Steps as the console shows them, the model ids, and whether every step passed."""
+        own. Steps as the console shows them, the model ids, whether every step passed, and the
+        prices the listing says, by id (D176)."""
         steps: list[dict] = []
         if saved is not None:
             client = hosted_credentials.client(supervisor.config, saved)
         else:
             client = build_client(transport, supervisor.config.pool, transport.base_url, bearer=key)
         try:
-            ids = await get_engine(engine)._offered(client)
+            entries = await get_engine(engine).listing(client)
+            ids = {e["id"] for e in entries if isinstance(e, dict) and isinstance(e.get("id"), str)}
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             if status in (401, 403):
@@ -217,18 +234,18 @@ def register(
                               "detail": "nothing answers /models there: is this the provider's API base?"})
             else:
                 steps.append({"step": "address", "ok": False, "detail": f"/models answered {status}"})
-            return steps, [], False
+            return steps, [], False, {}
         except (httpx.HTTPError, ValueError, KeyError, AttributeError) as exc:
             steps.append({"step": "address", "ok": False,
                           "detail": f"the provider could not be reached: {type(exc).__name__}"})
-            return steps, [], False
+            return steps, [], False, {}
         finally:
             await client.aclose()
         steps.append({"step": "address", "ok": True, "detail": "the provider answered"})
         steps.append({"step": "key", "ok": True, "detail": "the key was accepted"})
         steps.append({"step": "models", "ok": bool(ids), "detail": f"{len(ids)} model(s) offered"
                       if ids else "the provider offers no models to this key"})
-        return steps, sorted(ids), bool(ids)
+        return steps, sorted(ids), bool(ids), hosted_prices.from_listing(entries)
 
     @app.post("/pool/hosted/test")
     async def test_hosted(request: Request) -> JSONResponse:
@@ -245,10 +262,12 @@ def register(
             if host is None:
                 return error(404, "unknown_host", "no hosted API by that name")
             if key is not None:  # a replacement, tried where this host points before it is kept
-                steps, ids, ok = await offered(host.engine or "", host.transport, key)
+                steps, ids, ok, listed = await offered(host.engine or "", host.transport, key)
             else:
-                steps, ids, ok = await offered(host.engine or "", host.transport, None, saved=host)
-            return JSONResponse({"ok": ok, "steps": steps, "models": ids})
+                steps, ids, ok, listed = await offered(host.engine or "", host.transport, None, saved=host)
+            found = preset_for(host.transport.base_url or "", host.engine or "")
+            return JSONResponse({"ok": ok, "steps": steps, "models": ids,
+                                 **await prices_for(found.id if found else None, ids, listed)})
         engine, base_url = str(body.get("engine") or ""), str(body.get("base_url") or "").strip()
         if engine not in HOSTED_ENGINES:
             return error(400, "bad_engine", "choose OpenAI's format or Anthropic's")
@@ -258,8 +277,28 @@ def register(
         if key is None:
             # An unsaved address is tried only with a key typed for it: none of the pool's own goes there.
             return error(400, "no_credential", "type the provider's key to test it")
-        steps, ids, ok = await offered(engine, transport_for(base_url), key)
-        return JSONResponse({"ok": ok, "steps": steps, "models": ids})
+        steps, ids, ok, listed = await offered(engine, transport_for(base_url), key)
+        found = preset_for(base_url, engine)
+        return JSONResponse({"ok": ok, "steps": steps, "models": ids,
+                             **await prices_for(found.id if found else None, ids, listed)})
+
+    async def prices_for(preset_id: Optional[str], ids: list[str], listed: dict) -> dict[str, Any]:
+        """Each model's proposed price and its source (D176) — proposals only: nothing is priced
+        until the operator saves it."""
+        price_list = supervisor.price_list
+        url = supervisor.config.pool.price_list_url or None
+        if price_list.url != url:
+            supervisor.price_list = price_list = hosted_prices.PriceList(url, price_list.fetch)
+        found = next((p for p in PRESETS if p.id == preset_id), None)
+        page = None
+        if found is not None and found.pricing_page:
+            # The provider's own page, read the same way and kept as long as the list (D176).
+            pages = supervisor.pricing_pages
+            if found.pricing_page not in pages:
+                pages[found.pricing_page] = hosted_prices.PricingPage(found.pricing_page, price_list.fetch)
+            page = pages[found.pricing_page]
+        prices, problem = await hosted_prices.proposed(preset_id, ids, listed, price_list, page)
+        return {"prices": prices, "price_list_problem": problem, "paid_by_plan": preset_id in hosted_prices.PLAN_PRESETS}
 
     def models_wanted(raw: Any, engine: str) -> tuple[list[dict], Optional[JSONResponse]]:
         if not isinstance(raw, list):
@@ -341,7 +380,7 @@ def register(
         store = hosted_credentials.HostedKeys(supervisor.config)
         before = store.get(host_id) if key is not None else None
         if key is not None:
-            steps, _, ok = await offered(engine, transport_for(base_url), key)
+            steps, _, ok, _ = await offered(engine, transport_for(base_url), key)
             if not ok:
                 return error(400, "credential_refused", next((s["detail"] for s in steps if not s["ok"]), "refused"))
             store.put(host_id, key, {"base_url": base_url.rstrip("/")})
@@ -510,7 +549,7 @@ def register(
             return bad
         if key is None:
             return error(400, "no_credential", "type the provider's key")
-        steps, _, ok = await offered(host.engine or "", host.transport, key)
+        steps, _, ok, _ = await offered(host.engine or "", host.transport, key)
         if not ok:
             return error(400, "credential_refused", next((s["detail"] for s in steps if not s["ok"]), "refused"))
         async with supervisor.pass_lock:

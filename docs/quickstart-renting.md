@@ -52,7 +52,7 @@ limits:
 rented:
   providers:
     vast: { type: vast }       # a connection: a name, and the provider plug-in it uses
-  image: ollama/ollama:0.34.2  # pinned, never a floating tag
+  # image: left out — new hosts start from the engine's newest release, checked (D177); name one to pin it
   workers: 2                   # per card: a two-card machine runs twice this
   capabilities: [cuda]
   ssh_key: ~/.ssh/id_ed25519   # the pool installs its public half on each host it rents
@@ -177,9 +177,8 @@ Vast, RunPod and Verda ship with the framework; another provider is a plug-in (s
   `assumed_reliability`), marked *assumed* wherever they are shown. Its hosts get the dead-man
   timer: a pod's own key, which RunPod puts in every pod, ends that pod and cannot list, create or
   read anything else of the account. RunPod runs the pool's start-up script in place of the image's
-  own entrypoint, so an image that starts its engine itself needs `rented.engine_start` — for
-  Ollama, `nohup ollama serve > /var/log/ollama.log 2>&1 &` — and the image must carry python3
-  for the host agent (`vastai/ollama` does). Its SSH daemon is started for you.
+  own entrypoint; the pool starts Ollama and vLLM itself (D177), so no `rented.engine_start` is
+  needed. An image the host agent runs on must carry python3. Its SSH daemon is started for you.
 - **Verda** rents GPU virtual machines, on demand or **spot** — at its own price, which the pool pays
   as listed and never bids on; a spot machine can be taken back at any moment, without notice, and is
   replaced. Its credential is a Cloud API client's id and secret, written as `CLIENT_ID:CLIENT_SECRET`.

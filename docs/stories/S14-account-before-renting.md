@@ -55,8 +55,9 @@ Found by the owner adding Vast.ai to a pool that rented nothing (S13's first-acc
 
 ## What it gives up
 
-- **Still a restart after the first account.** The renting machinery is built when the pool
-  starts. Building it live at the first account is separate work.
+- ~~Still a restart after the first account.~~ Removed after the owner's first try (D173): the
+  renting machinery is built as the file gains its first account, and the account is listed at
+  once.
 - **`first` stays on `POST /pool/providers`** (released in 0.40.0) for a caller that wants both in
   one request. The console no longer sends it.
 

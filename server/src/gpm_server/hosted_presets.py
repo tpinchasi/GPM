@@ -4,8 +4,8 @@ the two API formats it speaks, so adding one is choosing it rather than typing a
 A preset is a starting point, nothing more. What is saved is an ordinary hosted host — its
 `base_url` and `engine` as the operator left them — and a provider missing here is added as
 "another OpenAI-format API" or "another Anthropic-format API" with its own URL. Nothing here is
-a price: a provider's prices are on its own page, change without notice, and are typed by the
-operator, who answers for them (D164).
+a price: prices are the provider's, proposed from its API, its pricing page or a public price list
+when its models are listed, and saved by the operator (D176, `hosted_prices.py`).
 """
 
 from __future__ import annotations
@@ -30,6 +30,9 @@ class HostedPreset:
     key_hint: str = ""
     #: A short note on what the provider serves through this format.
     note: str = ""
+    #: The provider's own page listing each model's price, where its API lists none and the page
+    #: is a table the pool can read (D176): proposed prices, never trusted unseen.
+    pricing_page: str = ""
 
     @property
     def custom(self) -> bool:
@@ -48,7 +51,8 @@ PRESETS: tuple[HostedPreset, ...] = (
     HostedPreset("groq", "Groq", "https://api.groq.com/openai/v1", OPENAI_ENGINE),
     HostedPreset("together", "Together AI", "https://api.together.xyz/v1", OPENAI_ENGINE),
     HostedPreset("ollama-cloud", "Ollama's cloud", "https://ollama.com/v1", OPENAI_ENGINE,
-                 note="the models Ollama serves on its own machines (D168)"),
+                 note="the models Ollama serves on its own machines (D168)",
+                 pricing_page="https://ollama.com/pricing"),
     HostedPreset("openrouter", "OpenRouter", "https://openrouter.ai/api/v1", OPENAI_ENGINE),
     HostedPreset("deepseek", "DeepSeek", "https://api.deepseek.com/v1", OPENAI_ENGINE),
     HostedPreset("fireworks", "Fireworks AI", "https://api.fireworks.ai/inference/v1", OPENAI_ENGINE),

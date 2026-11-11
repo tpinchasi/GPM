@@ -258,20 +258,36 @@ def test_a_bad_credential_on_a_new_account_adds_nothing(pool):
     assert path.read_text() == before and "second" not in supervisor.fleet.providers
 
 
-def test_moving_an_account_to_another_endpoint_clears_its_credential(pool):
-    """A running plug-in is never rebuilt (D135): the move waits for a restart, and there the
-    credential saved for the old endpoint is deleted rather than sent to the new one."""
+def test_an_accounts_address_is_fixed_once_it_is_added(pool):
+    """Where an account's requests go is part of which account it is (D175): changing it is
+    refused — from the console, before the file is written, and from a file edit, which is not
+    applied — whether or not the account holds anything. Another address is another account,
+    added as one. Other settings still change at once (D174)."""
     supervisor, market, base, path, database = pool
     assert httpx.put(f"{base}/pool/providers/fake/credential", headers=AUTH, json={"credential": GOOD}).status_code == 200
+    before = path.read_text()
     moved = httpx.patch(f"{base}/pool/providers/fake", headers=AUTH,
                         json={"settings": {"endpoint": "https://elsewhere.invalid"}})
-    assert moved.status_code == 200, moved.text
-    (change,) = [c for c in moved.json()["changes"] if c["kind"] == "providers"]
-    assert change["needs_restart"] and "when the supervisor restarts" in change["detail"]
-    assert market.credential == GOOD, "the running plug-in is as it was built"
-    view = httpx.get(f"{base}/pool/providers", headers=AUTH).json()["connections"][0]
-    assert "restarts" in view["pending"]
+    assert moved.status_code == 409 and "fixed once the account is added" in moved.json()["detail"], moved.text
+    assert path.read_text() == before, "refused before the file is written"
+    assert supervisor.fleet.providers["fake"] is market and market.credential == GOOD
 
+    other = httpx.patch(f"{base}/pool/providers/fake", headers=AUTH, json={"settings": {"region": "eu"}})
+    assert other.status_code == 200, other.text
+    assert supervisor.fleet.providers["fake"] is not market, "built again with its new settings, at once"
+    assert supervisor.fleet.providers["fake"].credential == GOOD, "same address: its credential goes with it"
+
+    # Edited by hand, the file is not applied, and says why.
+    edited = path.read_text().replace('region: "eu"', 'region: "eu", endpoint: "https://elsewhere.invalid"')
+    assert edited != path.read_text()
+    path.write_text(edited)
+    supervisor.reload_config()
+    assert any("fixed once the account is added" in e["summary"] for e in supervisor.events.recent(20)
+               if e["kind"] == "config_refused")
+    assert supervisor.accounts.store.get("fake") is not None
+
+    # Edited while the supervisor is stopped, the next start sends the saved credential nowhere:
+    # it was saved for the other address, so it is deleted (D130).
     restarted = Supervisor(load_config(path), database, config_path=str(path))
     assert restarted.accounts.store.get("fake") is None, "saved for another endpoint: deleted, never sent"
     assert restarted.fleet.providers["fake"].credential is None
@@ -416,7 +432,8 @@ def _hold_a_live_host(supervisor, market, connection="fake"):
 def test_renaming_a_connection_that_holds_a_host_never_sweeps_it(pool):
     """Found by both reviews: the old name was kept beside the new — two plug-ins on one account —
     and the sweep through the new one destroyed the pool's own host as a stray (D133). A rename
-    now waits for a restart, the old plug-in watching its hosts until then."""
+    now moves the one running plug-in to the new name at once (D174): still one per account, and
+    the host recorded under the old name is the new one's."""
     import asyncio
 
     supervisor, market, base, path, database = pool
@@ -427,11 +444,31 @@ def test_renaming_a_connection_that_holds_a_host_never_sweeps_it(pool):
     _hold_a_live_host(supervisor, market)
     path.write_text(path.read_text().replace("    fake: { type: fake }", "    renamed: { type: fake }"))
     supervisor.reload_config()
-    assert list(supervisor.fleet.providers) == ["fake"], "one plug-in per account, never two"
-    assert "restarts" in supervisor.accounts.pending["renamed"]
+    assert list(supervisor.fleet.providers) == ["renamed"], "one plug-in per account, never two"
+    assert supervisor.fleet.providers["renamed"] is market, "the running plug-in carries on, renamed"
+    assert "renamed" not in supervisor.accounts.pending and supervisor.fleet.connection == "renamed"
     asyncio.run(supervisor.fleet.sweep_orphans())
     assert not [e for e in supervisor.events.recent(50) if e["kind"] == "orphan_swept"]
-    assert "i-held" in market.instances and supervisor.fleet.held_at("fake")
+    assert "i-held" in market.instances and supervisor.fleet.held_at("renamed")
+    assert supervisor.fleet.provider_for("fake") is market, "a record under the old name is the new one's"
+
+
+def test_a_rename_carries_the_credential_and_todays_search_use_with_it(pool):
+    """Renamed while running (D174): the credential typed in is the provider's, so it stays; the
+    day's search use is the account's, so a rename cannot reset a quota the provider counts."""
+    supervisor, market, base, path, database = pool
+    assert httpx.put(f"{base}/pool/providers/fake/credential", headers=AUTH, json={"credential": GOOD}).status_code == 200
+    path.write_text(path.read_text().replace("provider: fake   # the old shape: the console's first save rewrites it",
+                                             "providers:\n    fake: { type: fake }"))
+    supervisor.reload_config()
+    database.execute("INSERT INTO provider_search_usage (connection, day, rows, updated_at) VALUES ('fake', '2026-11-08', 40, 0)")
+    path.write_text(path.read_text().replace("    fake: { type: fake }", "    renamed: { type: fake }"))
+    supervisor.reload_config()
+    assert list(supervisor.fleet.providers) == ["renamed"] and market.credential == GOOD
+    rows = database.query("SELECT connection, rows FROM provider_search_usage WHERE day = '2026-11-08'")
+    assert [(r["connection"], r["rows"]) for r in rows] == [("renamed", 40)]
+    view = httpx.get(f"{base}/pool/providers", headers=AUTH).json()["connections"]
+    assert [(c["connection"], c["credential"]["source"], c["pending"]) for c in view] == [("renamed", "stored", None)]
 
 
 def test_a_rename_that_also_moves_a_holding_connection_is_refused():
@@ -445,7 +482,7 @@ def test_a_rename_that_also_moves_a_holding_connection_is_refused():
     assert change.refused and "release them first" in change.refused
     (plain,) = [c for c in plan_changes(were, pool_config(providers={"renamed": {"type": "fake", "credential_env": "KEY_A"}}),
                                         [RentedNow("rented-a", 0.4, provider="fake")]) if c.kind == "providers"]
-    assert plain.refused is None and plain.needs_restart, "a plain rename is allowed, at a restart"
+    assert plain.refused is None and not plain.needs_restart, "a plain rename is allowed, at once (D174)"
 
 
 def test_no_request_can_point_the_environments_credential_somewhere(pool, monkeypatch):

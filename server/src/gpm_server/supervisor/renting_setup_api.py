@@ -73,7 +73,8 @@ def register(
             "set_up": rented.set_up,
             "missing": rented.setup_missing(),
             # The renting machinery is built when the pool starts (S13).
-            "restart_needed": supervisor.fleet is None,
+            "restart_needed": supervisor.fleet is None,  # only where renting could not start (D173)
+            "problem": supervisor.renting_problem,
             "current": {
                 "min_disk_gb": policy.min_disk_gb or None,
                 "max_all_in_hourly": policy.max_all_in_hourly,

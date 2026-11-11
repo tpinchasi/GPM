@@ -55,7 +55,8 @@ class ProviderAccounts:
         #: **Every credential decision reads this, never the file**: the file may already say
         #: what the running plug-in will only do after a restart.
         self.built: dict[str, ProviderConnection] = {}
-        #: What the file says that waits for a restart, by connection, in words.
+        #: Why a connection does not run as the file says — a plug-in that could not be built, a name
+        #: another provider's — by connection, in words; not rented through meanwhile.
         self.pending: dict[str, str] = {}
         #: Removed connections still holding something, already said.
         self._said_kept: set[str] = set()
@@ -125,7 +126,7 @@ class ProviderAccounts:
 
     def describe(self, name: str, provider: Any) -> dict[str, Any]:
         """The running plug-in's credential state, never its value: where it comes from, when it
-        was set, and what in the file waits for a restart."""
+        was set, and what in the file could not be applied."""
         conn = self.built[name]
         said: dict[str, Any]
         if not takes_credential(provider):
@@ -152,17 +153,27 @@ class ProviderAccounts:
         return said
 
     def refuse_moves(self, candidate: PoolConfig) -> Optional[str]:
-        """Why a file may not be applied, or None: it points a connection that holds hosts or
-        volumes at another endpoint or credential source — another account, maybe, where they
-        would read as gone while they bill (D136). Checked however the file arrives: the plan,
-        a raw save, a rollback, an edit the supervisor follows."""
+        """Why a file may not be applied, or None: it changes a running connection's address — fixed
+        once the account is added (D175) — or points one that holds hosts or volumes at another
+        credential source, another account maybe, where they would read as gone while they bill
+        (D136). Checked however the file arrives: the plan, a raw save, a rollback, an edit the
+        supervisor follows."""
         fleet = self.supervisor.fleet
         if fleet is None or candidate.rented is None:
             return None
         for name, built in self.built.items():
-            if name not in fleet.providers or not fleet.held_at(name):
+            if name not in fleet.providers:
                 continue
             after = next((conn for conn in candidate.rented.providers.values() if conn.type == built.type), None)
+            running = fleet.providers[name]
+            if after is not None and endpoint_of(running, after.settings) != endpoint_of(running, built.settings):
+                # Where an account's requests go is part of which account it is: fixed once it is
+                # added, held or not (D175). Another address is another account, added as one.
+                keys = ", ".join(getattr(running, "endpoint_settings", ()) or ())
+                return (f"provider connection {name!r}'s address ({keys}) is fixed once the account is added: to use "
+                        "another, remove the account and add it again (D175)")
+            if not fleet.held_at(name):
+                continue
             if after is not None and (after.settings, after.credential_env) != (built.settings, built.credential_env):
                 return (f"provider connection {name!r} holds hosts or volumes, and this changes where its requests go or "
                         "which credential it uses — it could become another account, where they would read as gone while "
@@ -199,11 +210,13 @@ class ProviderAccounts:
     # --- connections changing while it runs (D135) ---
 
     def sync(self, old: PoolConfig, new: PoolConfig, *, drop: bool = False) -> None:
-        """Bring the running plug-ins toward the file. A **new** connection is built and searched
-        at once, and one turned on or off is searched or not. A running connection is never
-        rebuilt: a change to its settings or credential source, or a rename, waits for a restart,
-        and it is not rented through meanwhile. With `drop` — under the pass's lock, never during
-        a pass — a connection gone from the file is dropped once the pool holds nothing there."""
+        """Bring the running plug-ins toward the file, all at once (D135, D174): a **new**
+        connection is built and searched, one turned on or off is searched or not, one with new
+        settings or credential source is built again and handed its credential by the rules in
+        force (D134), and a renamed one carries on under its new name. What would move a
+        connection that holds something to another account never gets here: the plan and the file
+        refuse it (D136). With `drop` — under the pass's lock, never during a pass — a connection
+        gone from the file is dropped once the pool holds nothing there."""
         fleet = self.supervisor.fleet
         if fleet is None or new.rented is None:
             return
@@ -218,16 +231,19 @@ class ProviderAccounts:
                     self.pending[name] = (f"names {built.type!r}, which is still running under it: give {conn.type!r} "
                                           "another name (D133)")
                 elif (built.settings, built.credential_env) != (conn.settings, conn.credential_env):
-                    self.pending[name] = "its new settings or credential source take effect when the supervisor restarts"
+                    self._rebuild(name, name, conn)
                 continue
             # One provider, one plug-in (D133): a running one of this provider under another name is
             # this connection renamed, or one still releasing what it holds — never a second.
             twin = next((n for n, kind in running_type.items() if n != name and kind == conn.type), None)
             if twin is not None:
-                if twin not in become:
+                if twin in become:
+                    self.pending[name] = f"{twin!r} is already this provider's connection"
+                elif self._rebuild(twin, name, conn):
+                    running_type.pop(twin, None)
+                    running_type[name] = conn.type
+                else:
                     renamed_from.add(twin)
-                self.pending[name] = (f"renamed from {twin!r}: takes effect when the supervisor restarts" if twin not in become
-                                      else f"{twin!r} is already this provider's connection")
                 continue
             try:
                 provider = self.factory(conn.type, dict(conn.settings))
@@ -282,6 +298,57 @@ class ProviderAccounts:
         if target is not None and fleet.connection != target:
             fleet.connection = target
             fleet.events._connection = target
+
+    def _rebuild(self, was: str, name: str, conn: ProviderConnection) -> bool:
+        """A running connection with new settings or credential source, or renamed from `was`,
+        or both, while the pool runs (D174). Its plug-in is built again where what it was built
+        from changed, and handed its credential by the rules in force — one from the supervisor's
+        environment only to the plug-in's own endpoint, one typed in only to the endpoint it was
+        saved for (D130, D134) — so the running plug-in always follows the file. A rename keeps
+        the running plug-in and everything counted under it; records under the old name are its
+        provider's, and resolve to the new one (D133). A plug-in that cannot be built leaves the
+        running one as it was, not rented through, and says why. True once done."""
+        fleet = self.supervisor.fleet
+        built = self.built[was]
+        running = fleet.providers[was]
+        provider = running
+        if (built.settings, built.credential_env) != (conn.settings, conn.credential_env):
+            try:
+                provider = self.factory(conn.type, dict(conn.settings))
+            except Exception as exc:  # noqa: BLE001 - one plug-in's failure stays its own (D129)
+                self.pending[name] = f"its new settings could not be set up: {exc}"
+                self.supervisor.events.record("provider_refused", f"provider connection {name!r} could not be set up "
+                                              f"with its new settings: {exc}; it is not rented through until they are "
+                                              "put right", numbers={"connection": name})
+                return False
+            if not takes_credential(provider) and conn.settings:
+                # A version-1 plug-in reads its own credential: given settings from a file the admin
+                # key writes, it could send it anywhere — built only by whoever starts the supervisor.
+                self.retire(provider)
+                self.pending[name] = "its plug-in reads its own credential: new settings take effect when the supervisor restarts"
+                return False
+        if was != name:
+            try:
+                fleet.rename_connection(was, name)
+            except ConnectionNameReused as exc:
+                if provider is not running:
+                    self.retire(provider)
+                self.pending[name] = str(exc)
+                self.supervisor.events.record("provider_refused", str(exc), numbers={"connection": name})
+                return False
+            self.built.pop(was, None)
+            if was in self._accounts:
+                self._accounts[name] = self._accounts.pop(was)
+        fleet.providers[name] = provider
+        self.install(name, conn, provider)
+        if provider is not running:
+            self.retire(running)
+            self.forget_account(name)
+        said = ([f"renamed from {was!r}"] if was != name else []) + (["built again with its new settings"]
+                                                                     if provider is not running else [])
+        self.supervisor.events.record("provider_changed", f"provider connection {name!r} {' and '.join(said)}, at once",
+                                      numbers={"connection": name, "was": was})
+        return True
 
     def retire(self, provider: Any) -> None:
         """Closed once whatever was using it has finished."""

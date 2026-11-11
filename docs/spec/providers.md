@@ -37,11 +37,17 @@ rented:
   until the provider is configured again.
 - **Turning a connection on** is a loosening, typed again like any (`requires_retype`).
 - **Adding, turning on or off, and removing take effect at once** (D135), from the console or the
-  file: a connection added is searched from the next pass, one turned off is not. A connection
+  file: a connection added is searched from the next pass, one turned off is not — the pool's first
+  as well, its renting machinery built as the file gains it (D173). A connection
   removed while the pool holds anything there is kept — watched, charged and released as usual,
-  never searched — until it holds nothing. **A running connection is never rebuilt**: a change to
-  its settings or credential source, or a rename, waits for the supervisor's restart, and its card
-  says so.
+  never searched — until it holds nothing. **A change to its settings or credential source, or a
+  rename, takes effect at once too** (D174) — but its address, which is fixed (D175): the plug-in is built again between passes and handed
+  its credential by the rules in force (§5), and a renamed one carries on under its new name — its
+  search state and the day's search use with it, records under the old name resolving to it (D133).
+  A plug-in that cannot be built with its new settings leaves the running one as it was, not rented
+  through, and its card says why. The one case left to a restart: a version-1 plug-in, which reads
+  its own credential, given new settings — whoever starts the supervisor builds it, never the admin
+  key.
 - **Keep models between hosts** (`keep_models`, D139; off unless set) — each workload renting on
   this account gets a model volume in its first host's data center, which its later hosts copy
   their models from (workloads.md §6). Offered only where the plug-in declares volumes that reach a
@@ -124,8 +130,8 @@ use counted before is carried into the per-connection counter once, under that n
 - **One plug-in's failure stays its own**: a search that raises anything leaves the other
   connections' offers standing, and says why beside them; on the Providers screen a plug-in that
   fails in its own way shows as a failed step or an unreachable account, never as a broken page.
-- **Adding, turning on or off, and removing connections take effect at once**; settings, credential
-  source and renames at a restart (D135, §1). The configuration plan says which.
+- **Adding, turning on or off, removing and renaming connections, and changing their settings or
+  credential source, take effect at once** (D135, D174, §1).
 - **Spend** is reconciled per connection, against each one's reported charges where it has them.
   A lease's caps hold on the sum.
 
@@ -166,8 +172,16 @@ How it is built (D130, D134, D136):
   typed in, or the plug-in's own variable with no settings. *Accepted:* a `credential_env` can
   name another variable, which is then sent to the provider's own endpoint — a third party the
   admin does not control.
-- **A connection whose change waits for a restart is not rented through** meanwhile: its hosts
-  would otherwise land on an account the restart may replace.
+- **A connection whose change could not be applied is not rented through** meanwhile: its hosts
+  would otherwise land on a plug-in the file no longer describes.
+- **An account's address is fixed once it is added** (D175): a change to the settings its plug-in
+  names as deciding where requests go (`endpoint_settings` — Vast's and Verda's `base_url`,
+  RunPod's `base_url` and `graphql_url`) is refused for a running connection, holding anything or
+  not, however it arrives — the plan and the console, before the file is written; a raw save; a
+  rollback; a file edit the supervisor follows, which is not applied. Another address is another
+  account: remove the account and add it again. A file edited while the supervisor is stopped is
+  read at the start as written, and a credential typed in for the old address is deleted, never
+  sent (D130).
 - **A connection holding hosts or volumes is not pointed elsewhere**: a change to its settings or
   credential source is refused however it arrives — the plan, a raw save, a rollback — and a file
   edit the supervisor follows is not applied (the running configuration is kept) — another endpoint or
@@ -240,9 +254,12 @@ panel: the disk each machine is rented with and the most one may cost an hour, a
 (`offer_policy.min_disk_gb`, `max_all_in_hourly`, D108), the engine rented machines run, and the
 models they are rented for — only models that engine has a build of are offered, and each other is
 listed with why (no build for it, or something the engine cannot serve). Saving it is a loosening,
-typed again. Until both ceilings are set no lease that may rent opens. The renting machinery is
-built when the pool starts, so the first account is in use after a restart; the plan says so, and
-the screens say a restart is waiting. `POST /pool/providers` still takes `first` (both ceilings,
+typed again. Until both ceilings are set no lease that may rent opens. **The first account is in use
+at once** (D173): the supervisor builds the renting machinery as the file gains its `rented`
+section, as it does at a start, so the account is listed as soon as it is saved. Where that cannot
+happen — a plug-in that fails to build, records it cannot claim — the pool runs on as it was, the
+event `renting_refused` and `problem` on `GET /pool/providers` and `GET /pool/renting` say why, and
+the next change to the file or the next start tries again. `POST /pool/providers` still takes `first` (both ceilings,
 the engine, the models) to do both in one request.
 
 A summary across accounts (how many, how many searching, hosts held, burn) with **Add provider**
@@ -345,7 +362,19 @@ hosted` host and catalog builds.
   event or the database. An unsaved address is tested only with a key typed for it.
 - **Its models.** After the test, each id the provider offers can be ticked, given the name apps
   ask for (the id by default) and its price per million tokens — `input`, `cached_input`,
-  `output`, and for Anthropic's format `cache_write` (D170). Each becomes a catalog build
+  `output`, and for Anthropic's format `cache_write` (D170). **The prices are the provider's, and
+  are proposed, not typed** (D176): from the provider's own `/models` where it says them
+  (OpenRouter, Together AI), else from its own pricing page where its preset names one the pool
+  can read (Ollama's cloud: its table of model, input, cached input and output; the peak row, an id
+  matched by itself or its name before the tag, read only with exactly those headings), else from
+  the public price list at `pool.price_list_url` — LiteLLM's
+  community-kept model cost map by default, fetched when models are listed, kept six hours, refused
+  past 32 MB, matched by the preset's provider and `mode: chat` — else typed. Each proposed price
+  is shown with where it came from and is saved only as the operator leaves it; a number that is
+  not a finite dollar amount under $10,000 per million tokens is dropped, never guessed at. Or the
+  operator ticks **paid by plan** — for a provider sold as a subscription with its own limit — and
+  each model is saved as `price: {plan: true}`. The fields are labelled as the provider's
+  prices: budgets are each app's, on its workload (D165), and the pool's, below. Each becomes a catalog build
   `{tag, engine, requires: [hosted:<id>], price}` and the host gains the capability
   `hosted:<id>`, so a model id two providers offer is sent and priced as each says; the name
   joins the model set. A name offered by two APIs is one catalog entry with a build for each.
@@ -359,7 +388,7 @@ hosted` host and catalog builds.
   key).
 - **The hosted budget** — `pool.bursts.hosted`: wait for a machine, dollars per request, day and
   month — is set from the same screen.
-- **What it does not do**: ship prices (they change, and the operator answers for them, D164);
+- **What it does not do**: ship prices, or price anything the operator has not saved (D164, D176);
   change a host's address (a different address is another host, added anew); edit a build written
   by hand without a pin (shown, left alone).
 
