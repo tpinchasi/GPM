@@ -25,8 +25,8 @@ environment of their own:
 
 ```sh
 python3 -m venv ~/gpm && ~/gpm/bin/pip install \
-  https://github.com/tpinchasi/GPM/releases/download/v0.42.0/gpm_server-0.42.0-py3-none-any.whl \
-  https://github.com/tpinchasi/GPM/releases/download/v0.42.0/gpm_agent-0.16.0-py3-none-any.whl
+  https://github.com/tpinchasi/GPM/releases/download/v0.42.1/gpm_server-0.42.0-py3-none-any.whl \
+  https://github.com/tpinchasi/GPM/releases/download/v0.42.1/gpm_agent-0.16.0-py3-none-any.whl
 ~/gpm/bin/gpm --version
 ```
 
@@ -42,7 +42,7 @@ uv run gpm --help
 **An app only needs the client**, which depends on `httpx` and nothing else:
 
 ```sh
-pip install "gpm-client @ https://github.com/tpinchasi/GPM/releases/download/v0.42.0/gpm_client-0.8.0-py3-none-any.whl"
+pip install "gpm-client @ https://github.com/tpinchasi/GPM/releases/download/v0.42.1/gpm_client-0.8.1-py3-none-any.whl"
 ```
 
 Step by step, from nothing to a working pool: [docs/quickstart.md](docs/quickstart.md).
@@ -126,8 +126,8 @@ everything it does is also a CLI verb — `gpm lease`, `gpm host`, `gpm workload
 then point `current` at it:
 
 ```sh
-deploy/gpm-deploy v0.42.0               # build it: git archive of the tag, its own venv
-deploy/gpm-deploy v0.42.0 --activate    # and make it current
+deploy/gpm-deploy v0.42.1               # build it: git archive of the tag, its own venv
+deploy/gpm-deploy v0.42.1 --activate    # and make it current
 ~/.local/share/gpm/releases/current/venv/bin/gpm --version
 ```
 

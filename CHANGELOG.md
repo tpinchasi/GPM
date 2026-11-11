@@ -12,7 +12,7 @@ version numbers and are reported at runtime, because other people's code depends
 ## Versions
 
 These are the versions on `main`. Each [GitHub release](https://github.com/tpinchasi/GPM/releases)
-carries the three packages' wheels and says which versions it covers; the newest is v0.42.0. **Each package's
+carries the three packages' wheels and says which versions it covers; the newest is v0.42.1. **Each package's
 version is raised in the same change that alters it** — a consumer cannot tell what it has
 otherwise — and CI refuses a pull request that edits a package's source without raising it.
 
