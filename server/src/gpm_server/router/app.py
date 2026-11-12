@@ -24,7 +24,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import ClientDisconnect
 
-from .. import hosted_credentials, translate
+from .. import translate
 from ..config import ConfigError, PoolConfig, load_config
 from ..contract import CONTRACT_VERSION
 from ..db import Database, RequestRecord
@@ -446,9 +446,9 @@ async def follow_config_file(state: RouterState, path: Path) -> None:
                 keys.append(key_file.stat().st_mtime_ns)
             except OSError:
                 keys.append(None)
-        # And a hosted API's key typed into the console (D171): written by the supervisor, sent by
-        # the router — a new one is used from the next request, without a restart.
-        return (own, tuple(keys), hosted_credentials.stamps(state.config))
+        # A hosted API's key typed into the console (D171) is not watched here: the registry
+        # compares the key each client holds with the store at every read of the table.
+        return (own, tuple(keys))
 
     seen = stamp()
     while True:
@@ -462,9 +462,16 @@ async def follow_config_file(state: RouterState, path: Path) -> None:
         except ConfigError as exc:
             log.error("configuration did not load; keeping the running one: %s", exc)
             continue
+        except Exception:  # noqa: BLE001 — the watcher must outlive anything one reading does
+            log.exception("configuration could not be read; keeping the running one")
+            continue
         if new.listen != state.config.listen:
             log.warning("the listen address or TLS changed in %s; that takes a router restart", path)
-        state.apply(new)
+        try:
+            state.apply(new)
+        except Exception:  # noqa: BLE001
+            log.exception("configuration from %s could not be applied; it is tried again at its next change", path)
+            continue
         log.info("configuration reloaded from %s", path)
 
 

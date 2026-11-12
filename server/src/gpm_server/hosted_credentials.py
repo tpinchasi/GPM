@@ -84,9 +84,17 @@ def stamp(config: PoolConfig, host: HostConfig) -> Optional[float]:
 def client(config: PoolConfig, host: HostConfig, base_url: Optional[str] = None,
            settings: Optional[PoolSettings] = None) -> httpx.AsyncClient:
     """The client a configured host is reached with: its transport, and a typed key where it takes one."""
+    return keyed_client(config, host, base_url, settings)[0]
+
+
+def keyed_client(config: PoolConfig, host: HostConfig, base_url: Optional[str] = None,
+                 settings: Optional[PoolSettings] = None) -> tuple[httpx.AsyncClient, Optional[float]]:
+    """The client, and the stamp of the key it holds — from one reading of the store, so the stamp
+    a process keeps is always the key its client sends, never one read a moment before or after."""
     record = stored(config, host)
-    return build_client(host.transport, settings or config.pool, base_url,
-                        bearer=record.value if record is not None else None)
+    built = build_client(host.transport, settings or config.pool, base_url,
+                         bearer=record.value if record is not None else None)
+    return built, (record.set_at if record is not None else None)
 
 
 def describe(config: PoolConfig, host: HostConfig) -> dict[str, Any]:
@@ -109,20 +117,3 @@ def describe(config: PoolConfig, host: HostConfig) -> dict[str, Any]:
         return {"source": "withheld", "variable": None, "can_type": True, "set_at": record.set_at,
                 "detail": "the key was saved for another address; type it again for this one"}
     return {"source": "stored", "variable": None, "can_type": True, "set_at": record.set_at}
-
-
-def stamps(config: PoolConfig) -> tuple:
-    """Every hosted key file's modification time, for a process watching for a new key."""
-    out = []
-    try:
-        store = HostedKeys(config)
-    except Exception:  # noqa: BLE001 — a store that cannot be found is no key at all
-        return ()
-    for host in config.hosts:
-        if host.kind != "hosted" or not HOST_ID.match(host.id):
-            continue
-        try:
-            out.append((host.id, (Path(store.directory) / f"{host.id}.json").stat().st_mtime_ns))
-        except OSError:
-            out.append((host.id, None))
-    return tuple(out)

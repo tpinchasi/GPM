@@ -357,8 +357,10 @@ hosted` host and catalog builds.
   It is used in one order: the host's `bearer_env` (or `basic_env`) when the file names one; else
   the typed key, **only while the host's `base_url` is the one it was saved for**; else none, and
   the host waits for one ("needs a key"). The supervisor writes it; **both processes read it** —
-  the router sends the requests — and each builds the host's client again when the file changes,
-  so a new or removed key takes effect without a restart. Never in the file, an answer, a log, an
+  the router sends the requests — so a new or removed key takes effect without a restart: the
+  supervisor builds the host's client again as it saves or removes the key, and the router at each
+  read of the host table, comparing the key its client holds with the store (never with an
+  earlier look at the store, which a key saved during a reload can make out of date). Never in the file, an answer, a log, an
   event or the database. An unsaved address is tested only with a key typed for it.
 - **Its models.** After the test, each id the provider offers can be ticked, given the name apps
   ask for (the id by default) and its price per million tokens — `input`, `cached_input`,
