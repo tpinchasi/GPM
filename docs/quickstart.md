@@ -16,7 +16,7 @@ own:
 
 ```sh
 python3 -m venv ~/gpm && ~/gpm/bin/pip install \
-  https://github.com/tpinchasi/GPM/releases/download/v0.42.1/gpm_server-0.42.0-py3-none-any.whl \
+  https://github.com/tpinchasi/GPM/releases/download/v0.42.1/gpm_server-0.42.1-py3-none-any.whl \
   https://github.com/tpinchasi/GPM/releases/download/v0.42.1/gpm_agent-0.16.0-py3-none-any.whl
 export PATH="$HOME/gpm/bin:$PATH"
 gpm --version
