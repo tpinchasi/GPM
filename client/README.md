@@ -12,7 +12,7 @@ The package is attached to each [GitHub release](https://github.com/tpinchasi/GP
 published on PyPI. Install the wheel from the newest release (its only dependency is `httpx`):
 
 ```sh
-pip install "gpm-client @ https://github.com/tpinchasi/GPM/releases/download/v0.42.0/gpm_client-0.8.0-py3-none-any.whl"
+pip install "gpm-client @ https://github.com/tpinchasi/GPM/releases/download/v0.42.1/gpm_client-0.8.1-py3-none-any.whl"
 ```
 
 Each release lists its wheels with a `SHA256SUMS` file. Inside a clone of the repository,
