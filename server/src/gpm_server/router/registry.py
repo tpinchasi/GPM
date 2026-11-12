@@ -78,9 +78,32 @@ class HostRegistry:
             # no longer sent because the host now points elsewhere, needs a new client.
             key = hosted_credentials.stamp(config, new)
             if old.transport != new.transport or key != self._key_stamps.get(host_id):
-                self._retired.append(host.client)
-                host.client = hosted_credentials.client(config, new, str(host.client.base_url))
-                self._key_stamps[host_id] = key
+                self._rekey(host, new)
+
+    def _rekey(self, host: Host, host_config: Any) -> None:
+        self._retired.append(host.client)
+        host.client, self._key_stamps[host.host_id] = hosted_credentials.keyed_client(
+            self.config, host_config, str(host.client.base_url))
+
+    async def follow_hosted_keys(self) -> None:
+        """A hosted API's key typed in, replaced or removed (D171) is used from the router's next
+        read of the table, without a restart — found by comparing the key each client holds with
+        the store, never with what an earlier look at the store saw. Found on CI: the file watcher
+        noted "no key", a reload it started then read the key just saved, and the key's removal
+        looked like no change at all, so the router kept sending a removed key."""
+        hosted = {host_id: config for host_id, config in self._host_config.items()
+                  if host_id in self.by_id and config.kind == "hosted"}
+        if not hosted:
+            return
+        config = self.config
+        now = await asyncio.to_thread(
+            lambda: {host_id: hosted_credentials.stamp(config, c) for host_id, c in hosted.items()})
+        if config is not self.config:
+            return  # a reload came between; it read the keys itself, and the next look checks again
+        for host_id, key in now.items():
+            host = self.by_id.get(host_id)
+            if host is not None and key != self._key_stamps.get(host_id):
+                self._rekey(host, hosted[host_id])
 
     # --- reading the table ---
 
@@ -104,6 +127,7 @@ class HostRegistry:
 
     async def refresh(self) -> bool:
         await self.refresh_workloads()
+        await self.follow_hosted_keys()
         revision = await asyncio.to_thread(self.table.revision)
         if revision == self.last_revision:
             return False
@@ -168,8 +192,9 @@ class HostRegistry:
         needs none."""
         host_config = self._host_config.get(row.host_id)
         if host_config is not None:
-            self._key_stamps[row.host_id] = hosted_credentials.stamp(self.config, host_config)
-            return hosted_credentials.client(self.config, host_config, row.dial_url)
+            client, self._key_stamps[row.host_id] = hosted_credentials.keyed_client(
+                self.config, host_config, row.dial_url)
+            return client
         return httpx.AsyncClient(
             base_url=row.dial_url,
             timeout=httpx.Timeout(

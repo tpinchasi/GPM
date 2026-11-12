@@ -130,9 +130,10 @@ def where_things_stand(pool) -> str:
     router = {h.host_id: h.state.value for h in pool.router_app.state.pool.hosts}
     supervisor = {i: (h.state.value, h.last_error) for i, h in pool.supervisor.hosts.items()}
     stamps = {i: s is not None for i, s in registry._key_stamps.items()}
-    on_disk = hosted_credentials.stamps(pool.supervisor.config)
+    on_disk = [(h.id, (pool.tmp / "provider-credentials" / "hosted" / f"{h.id}.json").exists())
+               for h in pool.supervisor.config.hosts if h.kind == "hosted"]
     return (f"router hosts {router}; router holds a key for {stamps}; supervisor hosts {supervisor}; "
-            f"key files {[(i, m is not None) for i, m in on_disk]}")
+            f"key files {on_disk}")
 
 
 def router_has_key(pool) -> bool:
@@ -249,6 +250,31 @@ def test_a_key_replaced_or_removed_takes_effect_without_a_restart(pool):
     assert api(pool, "DELETE", "/pool/hosted/anthropic/credential").status_code == 200
     settle(pool, lambda: not router_has_key(pool) and all(h.state.value != "ready" for h in pool.router_app.state.pool.hosts if h.host_id == "anthropic"))
     assert api(pool, "GET", "/pool/hosted").json()["hosts"][0]["credential"]["source"] == "missing"
+
+
+def test_a_key_removed_after_a_reload_read_it_is_dropped(pool):
+    """Found on CI, after the test above failed four times in a month: the router's file watcher
+    noted "no key", the reload it started read the key saved meanwhile, and the key's removal then
+    looked like no change — the router kept sending a removed key until a restart. The router now
+    compares the key its client holds with the store at each read of the table."""
+    assert add_claude(pool, credential=None).status_code == 200
+    settle(pool, lambda: any(h.host_id == "anthropic" for h in pool.router_app.state.pool.hosts))
+    registry = pool.router_app.state.pool.registry
+    config = load_config(pool.path)
+    host = next(h for h in config.hosts if h.id == "anthropic")
+    store = hosted_credentials.HostedKeys(config)
+
+    async def reload_reading_the_new_key():
+        store.put("anthropic", KEY, hosted_credentials.endpoint(host))
+        registry.apply_config(config)
+        assert router_has_key(pool)
+        store.remove("anthropic")
+        await registry.refresh()
+
+    pool.loop.run(reload_reading_the_new_key())
+    assert not router_has_key(pool), "the removed key was dropped at the next read of the table"
+    client = registry.by_id["anthropic"].client
+    assert not ({"authorization", "x-api-key"} & {k.lower() for k in client.headers}), "and is no longer sent"
 
 
 def test_a_typed_key_is_never_sent_where_the_host_was_moved_by_hand(pool):
