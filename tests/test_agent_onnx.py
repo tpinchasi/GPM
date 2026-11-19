@@ -105,10 +105,12 @@ def test_one_server_holds_every_build_and_is_started_again_when_the_set_changes(
         machine.set_specs({tag: OnnxFacts.checked_spec(tag, SPEC) for tag in (DOUBLER, ADDER)})
         async with client(machine) as c:
             await machine.hold(c, DOUBLER, pinned=True)
-            first = machine._current()["pid"]
-            await machine.hold(c, ADDER, pinned=True)
             both = machine._current()
-            assert both["pid"] != first and both["tags"] == sorted([DOUBLER, ADDER])
+            # Found in review: one start per build reloaded every earlier one. Every build the pool
+            # declared and that is on disk is started at once.
+            assert both["tags"] == sorted([DOUBLER, ADDER])
+            await machine.hold(c, ADDER, pinned=True)
+            assert machine._current()["pid"] == both["pid"], "nothing new to serve: not started again"
             assert sorted((await machine.describe(c))["models_loaded"]) == sorted([DOUBLER, ADDER])
             assert (await ask(machine, ADDER, [3, 4]))["outputs"] == {"v": [9.0, 16.0]}
             await machine.hold(c, ADDER, pinned=True)
@@ -202,3 +204,19 @@ def test_the_registry_knows_the_onnx_engine():
 
     assert isinstance(engine_facts("onnx", Settings(key_hash="x", engine="onnx", engine_url="http://127.0.0.1:8190")), OnnxFacts)
     assert json.dumps(OnnxFacts.checked_spec(DOUBLER, SPEC))  # plain data, all the way down
+
+
+def test_a_build_the_pool_sends_is_waited_for_never_pulled_and_never_a_failure(machine):
+    """Found in review: a pull refused while the file travelled backed the build off for minutes."""
+    tag = "upload/" + "d" * 64
+    work = ModelWork(machine, httpx.AsyncClient(base_url=machine.settings.engine_url),
+                     free_disk_bytes=lambda: 10**12, min_free_disk_gb=1, allow_delete=False)
+
+    async def scenario():
+        await work.apply({"tags": [tag], "residency": "pinned", "specs": {tag: SPEC}})
+        await work._task
+        return await work.snapshot()
+
+    snapshot = asyncio.run(scenario())
+    (model,) = snapshot["models"]
+    assert model["tag"] == tag and not model["on_disk"] and model["error"] is None and model["attempts"] == 0

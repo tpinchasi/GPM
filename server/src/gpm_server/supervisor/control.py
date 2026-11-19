@@ -1133,6 +1133,9 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     return _error(400, "credential_refused", f"{role} token: {exc}")
                 if role == "write" and who["role"] not in (None, "write", "fineGrained"):
                     return _error(400, "credential_refused", "the write token cannot write: give one with write access")
+                if role == "read" and who["role"] != "read":
+                    # The one a rented machine would carry: never one that can write (D182).
+                    return _error(400, "credential_refused", "the read token can write: give a read-only one")
                 _hub_store().put(role, token, bound)
                 said[role] = {"user": who["user"], "role": who["role"]}
         supervisor.events.record("hub_credential_set", f"the hub's {', '.join(sorted(said))} token saved")
@@ -1829,10 +1832,22 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
     async def rollback_config(request: Request) -> JSONResponse:
         if store() is None:
             return _error(400, "no_config_file", "this pool was not started from a file")
-        wanted = (await request.json()).get("version", "")
+        asked = await request.json()
+        wanted = asked.get("version", "")
         refused = _moves_holding(store().text_of(wanted) or "")
         if refused is not None:
             return _error(409, "change_refused", refused)
+        # A rollback is a write like any other: one that turns containers on is confirmed (D180).
+        try:
+            turned_on = containers_turned_on(supervisor.config, store().parse(store().text_of(wanted) or ""))
+        except ConfigError:
+            turned_on = None
+        if turned_on is not None and str(asked.get("confirm")) != turned_on.requires_retype:
+            return JSONResponse(status_code=400, content={
+                "error": "not_confirmed",
+                "detail": f"this version turns containers on; send `confirm`: {turned_on.requires_retype!r}",
+                "changes": [turned_on.as_dict()],
+            })
         try:
             version = store().rollback(wanted)
         except ConfigError as exc:

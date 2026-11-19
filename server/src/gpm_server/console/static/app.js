@@ -76,9 +76,9 @@ const api = {
   getConfig: () => call("GET", "/pool/config"),
   validateConfig: (text) => call("POST", "/pool/config/validate", { text }),
   planConfig: (text) => call("POST", "/pool/config/plan", { text }),
-  applyConfig: (text, version) => call("PUT", "/pool/config", { text, version }),
+  applyConfig: (text, version, confirm) => call("PUT", "/pool/config", { text, version, ...(confirm ? { confirm } : {}) }),
   configHistory: () => call("GET", "/pool/config/history"),
-  rollbackConfig: (version) => call("POST", "/pool/config/rollback", { version }),
+  rollbackConfig: (version, confirm) => call("POST", "/pool/config/rollback", { version, ...(confirm ? { confirm } : {}) }),
   testHost: (host) => call("POST", "/pool/hosts/test", host),
   hostDetail: (id) => call("GET", `/pool/hosts/${encodeURIComponent(id)}`),
   setSearch: (body) => call("PATCH", "/pool/config/rented", body),
@@ -3877,7 +3877,7 @@ const trained = { kind: "onnx", tag: "", file: null, inputs: [], outputs: [], na
 
 function trainedBuild() {
   const needs = {};
-  if (trained.memory_gb) needs.memory_gb = Number(trained.memory_gb);
+  if (trained.memory_gb && trained.kind === "container") needs.memory_gb = Number(trained.memory_gb);
   if (trained.card) needs.card = true;
   const build = { tag: trained.tag.trim(), engine: trained.kind };
   if (Object.keys(needs).length) build.needs = needs;
@@ -4001,7 +4001,7 @@ function trainedPanel(status) {
       field("Requests run together, up to", text(String(trained.max_batch), (v) => { trained.max_batch = v; }, { type: "number", min: 1, max: 1024 }))) : null,
     trained.tag || trained.inputs.length ? el("div", {},
       field("Apps ask for it as", text(trained.name, (v) => { trained.name = v; }, { class: "mono", placeholder: "my-classifier" })),
-      field("Memory it needs (GB)", text(trained.memory_gb, (v) => { trained.memory_gb = v; }, { type: "number", min: 0, step: "0.5" })),
+      onnx ? null : field("Memory it may use (GB)", text(trained.memory_gb, (v) => { trained.memory_gb = v; }, { type: "number", min: 0, step: "0.5" })),
       field("Needs a card", el("input", { type: "checkbox", checked: trained.card, onchange: (e) => { trained.card = e.target.checked; } })),
       el("div", {}, el("span", { class: "k" }, "Held by "),
         hosts.length ? hosts.map((h) => el("label", {}, el("input", { type: "checkbox", checked: trained.hosts.has(h.host_id),
@@ -5028,16 +5028,18 @@ screens.config = async () => {
   applyButton.onclick = async (e) => {
     const plan = await api.planConfig(editor.value);
     const loosening = plan.changes.filter((c) => c.requires_retype);
+    // Turning containers on is asked first: what is typed for it is the pool's name (D180).
+    const asked = loosening.find((c) => c.kind === "containers_enabled") || loosening[0];
     if (loosening.length) {
       const ok = await confirmAction({
         title: "This loosens a limit",
         body: el("div", {}, loosening.map((c) => el("p", {}, c.detail))),
-        retype: loosening[0].value,
+        retype: asked.value,
       });
       if (!ok) return;
     }
     run(e.target, async () => {
-      await api.applyConfig(editor.value, current.version);
+      await api.applyConfig(editor.value, current.version, asked ? asked.value : undefined);
       await render();
     });
   };
@@ -5069,7 +5071,17 @@ screens.config = async () => {
             el("td", { class: "muted" }, new Date(version.applied_at * 1000).toLocaleString()),
             el("td", { class: "mono" }, version.version.slice(0, 12)),
             el("td", {}, el("button", { class: "small", onclick: (e) => run(e.target, async () => {
-              await api.rollbackConfig(version.version); await render();
+              try {
+                await api.rollbackConfig(version.version);
+              } catch (error) {
+                // A version that turns containers on asks for the pool's name, as any other way does (D180).
+                const asked = error.code === "not_confirmed" && (error.changes || []).find((c) => c.requires_retype);
+                if (!asked) throw error;
+                const ok = await confirmAction({ title: "This turns containers on", body: asked.detail, retype: asked.value });
+                if (!ok) return;
+                await api.rollbackConfig(version.version, asked.value);
+              }
+              await render();
             }) }, "Roll back"))))))
       : el("p", { class: "muted" }, "No applied versions yet."),
   ];

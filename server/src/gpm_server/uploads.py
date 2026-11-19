@@ -35,12 +35,15 @@ class UploadStore:
         self.max_bytes = max_bytes
 
     def _ready(self) -> None:
-        self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # On Windows the folder inherits the profile's permissions (D163); elsewhere it is made
+        # owner-only below.
+        self.directory.mkdir(parents=True, exist_ok=True)
         found = os.lstat(self.directory)
-        mine = not hasattr(os, "getuid") or found.st_uid == os.getuid()  # Windows: the profile's ACLs (D163)
+        mine = not hasattr(os, "getuid") or found.st_uid == os.getuid()
         if not stat.S_ISDIR(found.st_mode) or not mine:
             raise UploadRefused(f"{self.directory} is not a directory of this user's")
-        os.chmod(self.directory, 0o700)
+        if os.name != "nt":
+            os.chmod(self.directory, 0o700)
 
     def path_of(self, digest: str) -> Optional[Path]:
         if not DIGEST.match(digest):

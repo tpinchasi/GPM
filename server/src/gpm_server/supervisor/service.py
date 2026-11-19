@@ -239,6 +239,8 @@ class Supervisor:
         self._agent_transport: Optional[httpx.AsyncBaseTransport] = None
         #: Uploaded files on their way to a host's agent (D182), by host and digest: one at a time each.
         self._sending: dict[tuple[str, str], asyncio.Task[None]] = {}
+        #: A send that failed waits before the next: (when it may be tried again, the last wait).
+        self._send_after: dict[tuple[str, str], tuple[float, float]] = {}
         #: How the model hub is reached for relayed uploads (D182) — only ever replaced by a test.
         self._hub_transport: Optional[httpx.AsyncBaseTransport] = None
 
@@ -1095,22 +1097,31 @@ class Supervisor:
             key = (host_id, digest)
             if key in self._sending and not self._sending[key].done():
                 continue
+            if time.monotonic() < self._send_after.get(key, (0.0, 0.0))[0]:
+                continue  # it failed lately: a multi-gigabyte file is not sent again every pass
             self._sending[key] = asyncio.create_task(self._send_upload(host_id, agent, digest), name=f"gpm:send:{host_id}")
 
     async def _send_upload(self, host_id: str, agent: Any, digest: str) -> None:
+        key = (host_id, digest)
         store = self.uploads()
         path = store.path_of(digest)
+        failed: Optional[str]
         if path is None:
-            self.events.record("upload_missing", f"host {host_id}: upload/{digest} is not in the pool's store "
-                               f"({store.directory}); upload it again", host_id=host_id)
-            return
-        size = path.stat().st_size
-        failed = await agents.send_file(agent, digest, size, store.chunks(digest), transport=self._agent_transport)
-        if failed is None:
-            self.events.record("upload_sent", f"host {host_id}: upload/{digest[:12]} sent ({size} bytes)",
-                               host_id=host_id, numbers={"bytes": size})
+            failed = f"upload/{digest} is not in the pool's store ({store.directory}); upload it again"
         else:
-            self.events.record("upload_failed", f"host {host_id}: upload/{digest[:12]}: {failed}", host_id=host_id)
+            size = path.stat().st_size
+            failed = await agents.send_file(agent, digest, size, store.chunks(digest), transport=self._agent_transport)
+            if failed is None:
+                self._send_after.pop(key, None)
+                self.events.record("upload_sent", f"host {host_id}: upload/{digest[:12]} sent ({size} bytes)",
+                                   host_id=host_id, numbers={"bytes": size})
+                return
+        # Tried again after a minute, doubling to an hour; each failure said once, not every pass.
+        waited = self._send_after.get(key, (0.0, 0.0))[1]
+        wait = min(max(60.0, waited * 2), 3600.0)
+        self._send_after[key] = (time.monotonic() + wait, wait)
+        self.events.record("upload_failed", f"host {host_id}: upload/{digest[:12]}: {failed} — tried again in {wait:.0f}s",
+                           host_id=host_id)
 
     # --- which engine a configured host runs (D93, D161) ---
 

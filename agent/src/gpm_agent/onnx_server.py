@@ -142,8 +142,12 @@ def _tensor(value: Any, dtype: str, rank: Optional[int]):
 class Build:
     """One ONNX build, loaded: its session, what it declares, and how to batch it."""
 
-    def __init__(self, tag: str, path: str, spec: dict[str, Any], max_batch: int, providers: list[str]):
+    def __init__(self, tag: str, path: str, spec: dict[str, Any], max_batch: int, providers: list[str],
+                 needs_card: bool = False):
         import onnxruntime
+
+        if needs_card and providers[:1] == ["CPUExecutionProvider"]:
+            raise ModelFault("it needs a card, and this machine runs ONNX builds on the processor")
 
         self.tag, self.spec, self.max_batch = tag, spec, max(1, int(max_batch or 1))
         options = onnxruntime.SessionOptions()
@@ -160,6 +164,11 @@ class Build:
         undeclared = sorted(set(self.inputs) - {d["input"] for d in spec["inputs"].values()})
         if undeclared:
             raise ModelFault(f"the file's inputs {undeclared} are not declared")
+        fixed = [m.name for m in self.inputs.values() if m.shape and isinstance(m.shape[0], int)]
+        if fixed and self.max_batch > 1:
+            # Exported without a dynamic batch: requests are run one at a time, never stacked.
+            log.info("%s takes batches of a fixed size (%s): requests run one at a time", tag, ", ".join(fixed))
+            self.max_batch = 1
         self.queue: "queue.Queue[_Job]" = queue.Queue()
         threading.Thread(target=self._batches, name=f"batch:{tag}", daemon=True).start()
         # Loaded means answered: one input made from what is declared, run before the build is
@@ -300,7 +309,8 @@ class Builds:
         self.failed: dict[str, str] = {}
         for tag, entry in plan.items():
             try:
-                self.loaded[tag] = Build(tag, entry["path"], entry["spec"], entry.get("max_batch") or 1, providers)
+                self.loaded[tag] = Build(tag, entry["path"], entry["spec"], entry.get("max_batch") or 1, providers,
+                                         needs_card=bool(entry.get("card")))
             except Exception as exc:  # noqa: BLE001 — one build that will not load is that build's failure
                 self.failed[tag] = f"{exc.__class__.__name__}: {str(exc)[:500]}"
                 log.error("build %s did not load: %s", tag, self.failed[tag])

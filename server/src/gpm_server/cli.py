@@ -595,7 +595,10 @@ def _config(args: argparse.Namespace) -> int:
         if not args.version:
             print("give --version, from `gpm config history`", file=sys.stderr)
             return 2
-        return _control(args, "POST", "/pool/config/rollback", {"version": args.version})
+        body = {"version": args.version}
+        if getattr(args, "confirm", None):
+            body["confirm"] = args.confirm  # a version that turns containers on: the pool's name (D180)
+        return _control(args, "POST", "/pool/config/rollback", body)
 
     if not args.file:
         print(f"give --file: the candidate configuration to {args.action}", file=sys.stderr)
@@ -627,7 +630,13 @@ def _config(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        return _control(args, "PUT", "/pool/config", {"text": text, "version": current.get("version")})
+        body = {"text": text, "version": current.get("version")}
+        # Turning containers on is confirmed by the pool's name, which the plan names (D180): with
+        # --yes, after the plan above was shown, that is what is sent.
+        turned_on = next((c for c in loosening if c.get("kind") == "containers_enabled"), None)
+        if turned_on is not None:
+            body["confirm"] = turned_on.get("value")
+        return _control(args, "PUT", "/pool/config", body)
     return 2
 
 
@@ -784,6 +793,8 @@ def main(argv: list[str] | None = None) -> int:
     config_cmd.add_argument("--file", "-f", default=None, help="the candidate configuration")
     config_cmd.add_argument("--version", default=None, help="for rollback, from `config history`")
     config_cmd.add_argument("--yes", action="store_true", help="confirm a change that loosens a limit")
+    config_cmd.add_argument("--confirm", default=None,
+                            help="for rollback to a version that turns containers on: the pool's name")
     config_cmd.add_argument("--url", default=None)
     config_cmd.set_defaults(func=_config)
 

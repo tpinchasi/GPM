@@ -26,7 +26,7 @@ SPEC = {
                           "labels": ["cat", "dog", "bird"]}},
 }
 ONNX_BUILD = {"tag": ONNX_FILE, "engine": "onnx", "max_batch": 8, "spec": SPEC,
-              "needs": {"memory_gb": 1}}
+              "needs": {"card": True}}
 CONTAINER_BUILD = {"tag": IMAGE, "engine": "container", "port": 8080, "needs": {"memory_gb": 4, "card": True}}
 
 
@@ -95,7 +95,7 @@ def test_an_onnx_model_is_asked_on_its_path_and_its_agent_is_told_what_it_takes(
         assert host.state.value == "preparing", "a server answering is not one holding the build"
         said = agent.asked[-1]
         assert said["tags"] == [ONNX_FILE] and said["residency"] == "pinned"
-        assert said["specs"][ONNX_FILE] == {"engine": "onnx", "spec": SPEC, "max_batch": 8, "needs": {"memory_gb": 1, "card": False}}
+        assert said["specs"][ONNX_FILE] == {"engine": "onnx", "spec": SPEC, "max_batch": 8, "needs": {"card": True}}
 
         make_ready(pool, agent, ONNX_FILE)
         with pool.client() as client:
@@ -314,3 +314,70 @@ def test_turning_containers_on_is_confirmed_by_the_pools_name_and_recorded(tmp_p
         control.stop()
         loop.stop()
         database.close()
+
+
+def test_one_file_is_declared_one_way_and_an_onnx_builds_needs_are_a_card_alone():
+    """Found in review: two models naming one file with different declarations — the agent is told
+    one per file, so one of them would be served with the other's."""
+    raw = {**ONNX_BUILD, "spec": {"inputs": SPEC["inputs"], "outputs": {"raw": {"as": "tensor", "output": "logits"}}}}
+    with pytest.raises(ValueError, match="declare it differently"):
+        config({CLASSIFIER: {"variants": [ONNX_BUILD]}, "pets-raw": {"variants": [raw]}})
+    config({CLASSIFIER: {"variants": [ONNX_BUILD]}, "pets-too": {"variants": [dict(ONNX_BUILD)]}})  # alike: fine
+    with pytest.raises(ValueError, match="`card` alone"):
+        config({CLASSIFIER: {"variants": [{**ONNX_BUILD, "needs": {"memory_gb": 1}}]}})
+
+
+def test_a_rollback_to_a_version_with_containers_on_is_confirmed_by_the_pools_name(tmp_path):
+    """Found in review: rolling back to an earlier version turned containers on unasked (D180)."""
+    from fakes.harness import BackgroundLoop, ServerHandle
+    from gpm_server.config import load_config
+    from gpm_server.db import Database
+    from gpm_server.supervisor import Supervisor
+    from gpm_server.supervisor.control import create_control_app
+
+    path = tmp_path / "pool.yaml"
+    path.write_text(
+        "pool: {name: trained, model_set: [chatter]}\n"
+        f"request_log: {tmp_path / 'gpm.sqlite3'}\n"
+        "auth: {admin_keys: [gpmx_trained_admin], app_keys: [gpma_trained_app]}\n"
+        "hosts:\n  - {id: mac, kind: local, transport: {type: http, base_url: 'http://127.0.0.1:1'}}\n"
+    )
+    loop, database = BackgroundLoop(), Database(tmp_path / "gpm.sqlite3")
+    supervisor = Supervisor(load_config(path), database, config_path=str(path))
+    control = ServerHandle(create_control_app(supervisor, supervisor.config), loop)
+    try:
+        with httpx.Client(base_url=control.base_url, timeout=30, headers={"Authorization": "Bearer gpmx_trained_admin"}) as api:
+            assert api.patch("/pool/containers", json={"enabled": True, "confirm": "trained"}).status_code == 200
+            with_containers = api.get("/pool/config").json()["version"]
+            assert api.patch("/pool/containers", json={"enabled": False}).status_code == 200
+            asked = api.post("/pool/config/rollback", json={"version": with_containers})
+            assert asked.status_code == 400 and asked.json()["error"] == "not_confirmed"
+            assert not supervisor.config.containers.enabled
+            assert api.post("/pool/config/rollback", json={"version": with_containers, "confirm": "trained"}).status_code == 200
+            assert supervisor.config.containers.enabled
+    finally:
+        control.stop()
+        loop.stop()
+        database.close()
+
+
+def test_gpm_config_apply_with_yes_confirms_turning_containers_on(tmp_path, monkeypatch):
+    """Found in review: the CLI never sent `confirm`, so it could not turn containers on at all."""
+    import types
+
+    import httpx as real_httpx
+    from gpm_server import cli
+
+    candidate = tmp_path / "pool.yaml"
+    candidate.write_text("containers: {enabled: true}\n")
+    plan = {"changes": [{"kind": "containers_enabled", "detail": "containers are turned on", "requires_retype": True,
+                         "value": "shop"}]}
+    monkeypatch.setattr(real_httpx, "get", lambda *a, **k: types.SimpleNamespace(json=lambda: {"version": "v1"}))
+    monkeypatch.setattr(real_httpx, "post", lambda *a, **k: types.SimpleNamespace(json=lambda: plan))
+    sent = []
+    monkeypatch.setattr(cli, "_control", lambda args, method, path, body=None: sent.append((method, path, body)) or 0)
+    args = types.SimpleNamespace(action="apply", file=str(candidate), yes=False, url="http://pool")
+    assert cli._config(args) == 1 and sent == [], "not without --yes"
+    args.yes = True
+    assert cli._config(args) == 0
+    assert sent == [("PUT", "/pool/config", {"text": "containers: {enabled: true}\n", "version": "v1", "confirm": "shop"})]

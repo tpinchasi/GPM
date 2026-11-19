@@ -216,3 +216,40 @@ def test_it_runs_as_a_program_from_a_plan_file(tmp_path):
     finally:
         process.terminate()
         process.wait(timeout=10)
+
+
+def fixed_batch(path):
+    """Exported without a dynamic batch: [1, 3] in, [1, 3] out."""
+    graph = helper.make_graph(
+        [helper.make_node("Identity", ["t"], ["v"])], "fixed",
+        [helper.make_tensor_value_info("t", TensorProto.FLOAT, [1, 3])],
+        [helper.make_tensor_value_info("v", TensorProto.FLOAT, [1, 3])],
+    )
+    return save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]), path)
+
+
+def test_a_file_with_a_fixed_batch_takes_requests_one_at_a_time(tmp_path):
+    """Found in review: requests stacked into a batch the file cannot take failed together."""
+    plan = {"a/b/fixed.onnx": {"path": fixed_batch(tmp_path / "f.onnx"), "spec": TENSOR_SPEC, "max_batch": 8}}
+    running = onnx_server.serve(plan, 0, CPU)
+    threading.Thread(target=running.serve_forever, daemon=True).start()
+    try:
+        with httpx.Client(base_url=f"http://127.0.0.1:{running.server_address[1]}", timeout=30) as client:
+            with concurrent.futures.ThreadPoolExecutor(8) as pool:
+                answers = list(pool.map(lambda i: predict(client, "a/b/fixed.onnx", {"t": [i, i, i]}), range(24)))
+        assert [a.status_code for a in answers] == [200] * 24
+        assert [a.json()["outputs"]["v"] for a in answers] == [[float(i)] * 3 for i in range(24)]
+    finally:
+        running.shutdown()
+
+
+def test_a_build_that_needs_a_card_does_not_load_where_it_would_run_on_the_processor(tmp_path):
+    plan = {"a/b/card.onnx": {"path": identity(tmp_path / "c.onnx"), "spec": TENSOR_SPEC, "card": True}}
+    running = onnx_server.serve(plan, 0, CPU)
+    threading.Thread(target=running.serve_forever, daemon=True).start()
+    try:
+        with httpx.Client(base_url=f"http://127.0.0.1:{running.server_address[1]}", timeout=30) as client:
+            (row,) = client.get("/v1/models").json()["data"]
+        assert not row["loaded"] and "needs a card" in row["error"]
+    finally:
+        running.shutdown()

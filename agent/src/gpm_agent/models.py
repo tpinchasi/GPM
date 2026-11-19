@@ -270,7 +270,10 @@ class ModelWork:
         # One load at a time. Two large models loading together contend for accelerator memory,
         # which is the one way this could cost more than it saves; the download it overlaps
         # costs nothing but disk.
+        sent_by_pool = getattr(self.engine, "sent_by_pool", lambda tag: False)
         for tag in self.desired.tags:
+            if tag not in on_disk and sent_by_pool(tag):
+                continue  # the pool sends it (D182): waited for, never fetched, never a failure
             if tag not in on_disk and self._may_retry(tag):
                 if not await self._pull(tag):
                     continue

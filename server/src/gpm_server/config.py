@@ -283,6 +283,8 @@ class Variant(BaseModel):
         if self.inputs is not None or self.price is not None or self.enforces_schema is not None:
             raise ValueError(f"{self.tag!r}: `inputs`, `price` and `enforces_schema` are not a {self.engine} build's")
         if self.engine == ONNX_ENGINE:
+            if self.needs is not None and self.needs.memory_gb is not None:
+                raise ValueError(f"{self.tag!r}: an ONNX build's `needs` is `card` alone; memory is a container's limit")
             if self.spec is None:
                 raise ValueError(f"{self.tag!r}: an ONNX build says what its inputs and outputs are, in `spec` (D179)")
             if self.port is not None:
@@ -1683,6 +1685,7 @@ class PoolConfig(BaseModel):
         self._builds_serve_what_their_engine_can()
         self._agent_managed_engines_are_well_placed()
         self._containers_only_where_enabled()
+        self._one_build_one_declaration()
         self._rented_images_carry_what_builds_need()
         # Declared models first: a host that declares one it cannot hold is refused naming it and
         # the build it lacks, not as a host with no usable build of anything.
@@ -2448,6 +2451,22 @@ class PoolConfig(BaseModel):
                     f"`rented.images` with `capabilities: {sorted(needs)}` — the host's agent checks the "
                     f"claim before it serves (D146)"
                 )
+
+    def _one_build_one_declaration(self) -> None:
+        """A trained model's build is declared once: the agent is told one set of declarations per
+        file, so two catalog entries naming one file must declare it alike."""
+        seen: dict[str, tuple[str, Any]] = {}
+        for name, entry in self.catalog.items():
+            for variant in entry.variants:
+                if variant.engine not in TRAINED_ENGINES:
+                    continue
+                said = variant.model_dump(exclude={"requires", "runtime_class", "size_gb"})
+                if variant.tag in seen and seen[variant.tag][1] != said:
+                    raise ValueError(
+                        f"{seen[variant.tag][0]!r} and {name!r} name the build {variant.tag!r} and declare it "
+                        "differently; a file is served one way — give both the same declarations, or one of them its own file"
+                    )
+                seen.setdefault(variant.tag, (name, said))
 
     def _containers_only_where_enabled(self) -> None:
         """A container build runs its image's code on a machine: none is catalogued while

@@ -102,7 +102,7 @@ def build_in(directory_name: str) -> Optional[Build]:
 
 
 #: What the pool may declare of a build, as the agent checks it: the shape of `specs` (D179).
-_SPEC_KEYS = {"engine", "spec", "max_batch", "needs", "port"}
+_SPEC_KEYS = {"engine", "spec", "max_batch", "needs"}
 
 
 def checked_spec(tag: str, said: Any) -> dict[str, Any]:
@@ -128,7 +128,10 @@ def checked_spec(tag: str, said: Any) -> dict[str, Any]:
     batch = said.get("max_batch", 1)
     if not isinstance(batch, int) or not 1 <= batch <= 1024:
         raise ValueError(f"{tag}: max_batch is a whole number from 1 to 1024")
-    return {"spec": spec, "max_batch": batch}
+    needs = said.get("needs") or {}
+    if not isinstance(needs, dict) or not set(needs) <= {"card"}:
+        raise ValueError(f"{tag}: an ONNX build's needs are `card` alone")
+    return {"spec": spec, "max_batch": batch, "card": bool(needs.get("card"))}
 
 
 class OnnxFacts:
@@ -338,11 +341,21 @@ class OnnxFacts:
             except modelhub.HubRefused as no:
                 raise _refused(str(no)) from no
 
+    @staticmethod
+    def sent_by_pool(tag: str) -> bool:
+        """A build the pool sends this machine (D182), never fetched from anywhere."""
+        try:
+            return build_of(tag).uploaded
+        except Exception:  # noqa: BLE001 — not a build: not the pool's to send
+            return False
+
     async def hold(self, client: httpx.AsyncClient, tag: str, *, pinned: bool) -> None:
         build = build_of(tag)
         async with self._lock:
             if pinned:
-                self._wanted.add(build.tag)
+                # Every build the pool declared at once (its whole desired set): one start for all
+                # that are on disk, not one per build, each start loading every one before it.
+                self._wanted |= {build.tag, *self.specs}
             else:
                 self._wanted.discard(build.tag)
             with _refusing(f"{PROGRAM} could not be started with {build.tag}"):
