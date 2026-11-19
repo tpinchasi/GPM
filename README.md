@@ -244,6 +244,7 @@ adopter.
 | [docs/quickstart.md](docs/quickstart.md) | Install, configure and start a pool over machines you already have — nothing able to spend |
 | [docs/quickstart-renting.md](docs/quickstart-renting.md) | Adding rented capacity: provider accounts, limits first, the market, one host, then unattended |
 | [docs/hosted-apis.md](docs/hosted-apis.md) | Adding hosted model APIs, their prices and the budgets they are paid from |
+| [docs/trained-models.md](docs/trained-models.md) | Serving models you trained — an ONNX file or a container image — with their inputs and outputs declared |
 | [client/README.md](client/README.md) | The client SDK, for application developers |
 | [STATUS.md](STATUS.md) | Where the project stands, what is decided, what is open, what to do next, session log |
 | [docs/overview.md](docs/overview.md) | The concepts in one read: pool, hosts, workers, model set, routing priority, leases, the two processes, the SDK, the console |

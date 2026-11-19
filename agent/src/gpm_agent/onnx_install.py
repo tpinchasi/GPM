@@ -87,11 +87,26 @@ class OnnxSet:
         )
 
 
-def load_sets(sets_dir: Path = SETS_DIR) -> list[OnnxSet]:
-    found = []
-    for path in sorted(Path(sets_dir).glob("*.json")) if Path(sets_dir).is_dir() else []:
-        found.append(OnnxSet.from_json(json.loads(path.read_text())))
-    return found
+def load_sets(sets_dir: Optional[Path] = None) -> list[OnnxSet]:
+    """The sets the agent carries — read as the package's resources, so they are found inside the
+    archive the pool ships to the machines it rents as well as from an installed package."""
+    if sets_dir is not None:
+        files = sorted(Path(sets_dir).glob("*.json")) if Path(sets_dir).is_dir() else []
+        return [OnnxSet.from_json(json.loads(path.read_text())) for path in files]
+    from importlib import resources
+
+    folder = resources.files("gpm_agent").joinpath("onnx_sets")
+    if not folder.is_dir():
+        return []
+    entries = sorted((e for e in folder.iterdir() if e.name.endswith(".json")), key=lambda e: e.name)
+    return [OnnxSet.from_json(json.loads(entry.read_text())) for entry in entries]
+
+
+def server_source() -> bytes:
+    """The pool's own server, as this package carries it — from an archive too."""
+    from importlib import resources
+
+    return resources.files("gpm_agent").joinpath(SERVER).read_bytes()
 
 
 def program_in(version_dir: Path) -> Path:
@@ -303,8 +318,7 @@ class OnnxRuntimeSource:
             await asyncio.to_thread(shutil.rmtree, work, True)
 
         progress("verifying", 0, None)
-        source = Path(__file__).with_name(SERVER)
-        await asyncio.to_thread(shutil.copyfile, source, server_in(into))
+        await asyncio.to_thread(server_in(into).write_bytes, server_source())
         await asyncio.to_thread(move_environment, venv, final / VENV)
         checked = await self.run(check_argv(venv), env=host_platform.program_environment({}),
                                  timeout_s=CHECK_TIMEOUT_S, log=log)

@@ -2416,12 +2416,13 @@ class PoolConfig(BaseModel):
             engine = get_engine(self.rented_engine())
         except EngineNotFound:
             return
-        if engine.name in TRAINED_ENGINES:
+        if engine.name == CONTAINER_ENGINE:
             raise ValueError(
-                f"rented hosts run one engine for every model they rent for; a trained model's engine "
-                f"({engine.name}) is held by hosts of your own until renting for trained models is built (S15)"
+                "rented hosts cannot run container builds yet: a provider starts a rented machine from its "
+                "own command, not the image's, and takes no registry login; hold container builds on hosts "
+                "of your own (S15)"
             )
-        if getattr(engine, "residency_from_agent", False):
+        if getattr(engine, "residency_from_agent", False) and engine.name not in TRAINED_ENGINES:
             raise ValueError(
                 f"rented hosts cannot run {engine.name}: its server is started by the agent of a machine "
                 "its owner set up (D148). Rent vLLM for speech to text, and run whisper.cpp on a host of your own"

@@ -396,15 +396,16 @@ hosted` host and catalog builds.
 
 ## 11. Trained models on rented machines (S15, D179–D182)
 
-- **An ONNX build** rents as any build does: the machine starts from a plain image carrying Python,
-  and its agent installs ONNX Runtime for the card it finds and takes the file — from the hub, or
-  sent by the pool through the machine's tunnel (D182).
-- **A container build**: the operator's image is the machine's image, as `rented.image` is, and the
-  pool's start adds its agent and dead-man timer to it (D63). A private image's registry login is
-  given **to the provider** through its API, to pull it; it never goes on the machine (D181).
-- **A relayed upload** (`delivery: hub`, D182): the machine is given the operator's read-only token
-  for that repository in its environment at creation — the only secret a rented machine carries,
-  and the provider can read it. The write token never leaves the supervisor.
+- **An ONNX build** rents as any build does, with `rented.engine: onnx`: the machine starts from a
+  plain Python image (`python:3.12.16-slim-bookworm` by default, pinned), its agent is installed
+  with `--install-engines` and told `latest`, installs ONNX Runtime for the card it finds from the
+  locked set it carries, and takes each build from the hub or from the pool through the machine's
+  tunnel (D182). The pool installs the agent before the engine answers — only the agent can start
+  it — and reads what the server loaded from the agent, as for whisper.cpp.
+- **A container build** is not rented: refused by the configuration until the owner decides how an
+  image's own start and a registry login reach a provider (D180, D181 amended).
+- **A relayed upload's read token** is not placed on rented machines yet (D182 amended): a provider's
+  instance spec carries nothing secret.
 - Leases, caps and the dead-man timer are unchanged.
 
 ## 9. Build order

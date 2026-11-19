@@ -134,6 +134,13 @@ class OnnxEngine(TrainedModelEngine):
     name: ClassVar[str] = "onnx"
     default_port: ClassVar[int] = 8190
     builds_on_hub: ClassVar[bool] = True
+    #: A rented machine starts from a plain Python, and its agent installs ONNX Runtime there from
+    #: the locked set for the card it finds — CUDA's libraries come as wheels, so the image needs
+    #: only Python 3.11 or later with `venv` (S15, D179). Pinned, as every shipped image is (D147).
+    default_image: ClassVar[str] = "python:3.12.16-slim-bookworm"
+    image_words: ClassVar[tuple[str, ...]] = ("python", "onnx")
+    #: The host's agent installs what runs this engine — on a rented machine too.
+    installed_by_agent: ClassVar[bool] = True
     #: A `.onnx` file at the root of a hub repository, or a file uploaded to the pool (D182).
     build_tag: ClassVar[re.Pattern[str]] = re.compile(
         rf"^(?:(?!.*__)(?!.*\.\.){_NAME}/{_NAME}/[A-Za-z0-9][A-Za-z0-9._-]*\.onnx|upload/[0-9a-f]{{64}})$"

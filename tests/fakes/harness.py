@@ -203,6 +203,10 @@ class PoolHarness:
                 from .fake_vllm import FakeVllm
 
                 fake = FakeVllm()
+            elif spec.engine in ("onnx", "container"):
+                from .fake_predict_server import FakePredictServer
+
+                fake = FakePredictServer()  # started by its agent, which the test stands in for
             else:
                 fake = FakeOllama(
                     resident=spec.resident, available=spec.available,

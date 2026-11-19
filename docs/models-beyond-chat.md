@@ -1,7 +1,7 @@
 # Beyond chat: speech to text, pictures and ranking
 
 > For operators. Apps call these as described in the
-> [client SDK's README](../client/README.md#beyond-chat-pictures-speech-to-text-ranking) and the
+> [client SDK's README](../client/README.md#beyond-chat-pictures-speech-to-text-ranking-trained-models) and the
 > [app contract](spec/app-contract.md#beyond-chat-what-a-request-asks-for-and-what-it-may-carry).
 > Working examples are in [examples/](../examples/).
 
