@@ -2543,7 +2543,8 @@ class Fleet:
         for attempt in range(self.agent_hold_attempts):
             if attempt:
                 await asyncio.sleep(self.agent_hold_retry_s)
-            report = await agents.hold(host.agent, tags, "pinned", transport=self._agent_transport, specs=specs)
+            report = await agents.hold(host.agent, tags, "pinned", transport=self._agent_transport,
+                                       **({"specs": specs} if specs else {}))
             if report is not None:
                 break
         if report is None:

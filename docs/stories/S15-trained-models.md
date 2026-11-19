@@ -1,6 +1,6 @@
 # S15 — Trained models: say what the model takes and returns, and the pool does the rest
 
-> Status: **decided** (2026-11-19) — D178–D182, specified; the build next. Part of the
+> Status: **built against fakes** (2026-11-19) — D178–D182; stages 1–6, with renting for ONNX builds only (container renting and the hub token on rented machines wait for the owner). Part of the
 > [feature list](README.md).
 
 ## The story
