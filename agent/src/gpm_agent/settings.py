@@ -97,11 +97,11 @@ def is_loopback(host: str) -> bool:
 
 
 #: Engines whose server this agent starts itself (D148), and so binds where it says.
-AGENT_STARTED_ENGINES = frozenset({"whisper-cpp"})
+AGENT_STARTED_ENGINES = frozenset({"whisper-cpp", "onnx", "container"})
 
 #: Engines this agent can install and run itself, where the machine's owner allows it (D150,
 #: D157) — those the installer's table names (`installs.RELEASES`).
-INSTALLABLE_ENGINES = frozenset({"ollama", "whisper-cpp", "vllm"})
+INSTALLABLE_ENGINES = frozenset({"ollama", "whisper-cpp", "vllm", "onnx"})
 
 #: An engine this agent chooses itself, from the machine, each time it starts (D161): vLLM where
 #: the machine runs the builds catalogs carry for it, Ollama anywhere else. Only where it installs
@@ -178,6 +178,12 @@ class Settings:
     #: Where installed engines live, an absolute path. Unset: the system's per-user place for an
     #: application's data (`platform.engines_dir`).
     engines_path: Optional[str] = None
+    #: Whether this machine runs container builds (S15, D180): `follow` — as the pool's
+    #: `containers.enabled` says — or `never`, the machine owner's last word. A container runs its
+    #: image's own code on this machine.
+    run_containers: str = "follow"
+    #: The Docker Engine's socket, an absolute path. Unset: the system's usual place.
+    docker_socket: Optional[str] = None
 
     def check(self) -> None:
         if not is_loopback(self.host) and not (self.tls_certfile and self.tls_keyfile):
@@ -202,6 +208,12 @@ class Settings:
             )
         if not isinstance(self.install_engines, bool):
             raise SettingsError("install_engines must be true or false")
+        if self.run_containers not in ("follow", "never"):
+            raise SettingsError("run_containers must be follow (as the pool says) or never")
+        if self.docker_socket is not None and (
+            not isinstance(self.docker_socket, str) or not Path(self.docker_socket).expanduser().is_absolute()
+        ):
+            raise SettingsError("docker_socket must be the socket's absolute path; leave it unset for the usual place")
         if self.engines_path is not None and (
             not isinstance(self.engines_path, str) or not Path(self.engines_path).expanduser().is_absolute()
         ):

@@ -150,6 +150,9 @@ class ContainerEngine(TrainedModelEngine):
     name: ClassVar[str] = "container"
     default_port: ClassVar[int] = 8191
     builds_on_hub: ClassVar[bool] = False
+    #: One image per machine, published at the agent's engine port: several images are several
+    #: hosts, as for whisper.cpp (D180).
+    serves_one_model: ClassVar[bool] = True
     #: An image by digest only — a registry path and `@sha256:` — never a tag that can move.
     build_tag: ClassVar[re.Pattern[str]] = re.compile(
         r"^(?!.*\.\.)[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?(?::[0-9]{1,5})?"

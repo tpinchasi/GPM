@@ -76,6 +76,11 @@ def server_for(
         if not isinstance(engine, WhisperCppFacts):
             return None  # nothing to drive: its server is the engine's own
         return InstalledServer(engine, engine_client)
+    if engine_name == "onnx":
+        from .onnx_engine import InstalledServer as OnnxServer
+        from .onnx_engine import OnnxFacts
+
+        return OnnxServer(engine, engine_client) if isinstance(engine, OnnxFacts) else None
     if engine_name == "vllm":
         return VllmServer(
             engine_dir, engine_url=settings.engine_url, models_path=settings.models_path, client=engine_client,
@@ -106,7 +111,7 @@ def default_installer(
         source, engine_dir_for(engines, settings), server, min_free_disk_gb=settings.min_free_disk_gb,
         switch_timeout_s=timeout_s, switch_bound_s=switch_bound_s(settings.engine, timeout_s),
     )
-    if isinstance(engine, WhisperCppFacts):
+    if hasattr(engine, "use_installer"):
         engine.use_installer(installer)
     return installer
 

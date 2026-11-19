@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""Generate ONNX Runtime's locked sets, for a release of GPM (D179, as D158 for vLLM).
+
+The agent installs what runs an ONNX build — ONNX Runtime, numpy and Pillow — only from a locked
+set: every wheel pinned, with its sha256, for one Python minor version, one system and processor,
+and one accelerator. GPM's release runs this for each ONNX Runtime version it supports and commits
+what it writes (docs/release-checklist.md):
+
+    tools/onnx-lock 1.23.2
+    tools/onnx-lock 1.23.2 --python 3.12 --target linux-x86_64-cuda
+
+One file per target and Python, `agent/src/gpm_agent/onnx_sets/onnxruntime-<version>-py<python>-<target>.json`.
+The targets:
+
+- `linux-x86_64-cuda` — `onnxruntime-gpu[cuda,cudnn]`: CUDA's and cuDNN's libraries come as wheels
+  too, so a rented machine needs nothing but the NVIDIA driver; the least driver is written in;
+- `linux-x86_64-cpu`, `linux-aarch64-cpu` — `onnxruntime`, the processor alone;
+- `macos-aarch64-cpu` — `onnxruntime`, whose CoreML provider runs a graph on an Apple-silicon Mac's
+  GPU and Neural Engine (named `cpu` for the set, since it needs no driver).
+
+Each resolved by uv as vllm-lock does — wheels only, hashes, one `--exclude-newer` time for the
+run — and each pin's one wheel chosen by pip's tag order and checked against uv's digests. This
+tool borrows vllm-lock's own functions for that, and adds macOS's tags.
+
+Standalone: the standard library and `uv` on PATH. It reads PyPI and installs nothing.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parent
+SETS_DIR = REPO / "agent" / "src" / "gpm_agent" / "onnx_sets"
+
+
+def _vllm_lock() -> Any:
+    loader = importlib.machinery.SourceFileLoader("vllm_lock", str(HERE / "vllm-lock"))
+    spec = importlib.util.spec_from_loader("vllm_lock", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+V = _vllm_lock()
+LockFailed = V.LockFailed
+
+PYTHONS = ("3.11", "3.12", "3.13", "3.14")
+#: Each target: the system and processor, the accelerator, and what is asked of PyPI.
+TARGETS = {
+    "linux-x86_64-cuda": ("linux", "x86_64", "cuda", "onnxruntime-gpu[cuda,cudnn]"),
+    "linux-x86_64-cpu": ("linux", "x86_64", "cpu", "onnxruntime"),
+    "linux-aarch64-cpu": ("linux", "aarch64", "cpu", "onnxruntime"),
+    "macos-aarch64-cpu": ("macos", "aarch64", "cpu", "onnxruntime"),
+}
+#: What the pool's ONNX server imports besides the runtime: arrays, and pictures.
+ALSO = ("numpy", "pillow")
+#: The oldest macOS a Mac set is for, and the oldest glibc tried on Linux.
+MACOS = "14.0"
+
+
+def macos_tags(python: str, version: str = MACOS) -> list[tuple[str, str, str]]:
+    """What CPython `python` accepts on an Apple-silicon Mac of `version` or later, most preferred
+    first: each macOS from that one down to 11 for arm64, then universal2, as pip orders them."""
+    major, minor = (int(part) for part in python.split("."))
+    newest = int(version.split(".")[0])
+    platforms = []
+    for release in range(newest, 10, -1):
+        platforms += [f"macosx_{release}_0_arm64", f"macosx_{release}_0_universal2"]
+    cp = f"cp{major}{minor}"
+    tags = [(cp, cp, p) for p in platforms] + [(cp, "abi3", p) for p in platforms] + [(cp, "none", p) for p in platforms]
+    for older in range(minor - 1, 1, -1):
+        tags += [(f"cp{major}{older}", "abi3", p) for p in platforms]
+    pythons = [f"py{major}{minor}", f"py{major}"] + [f"py{major}{m}" for m in range(minor - 1, -1, -1)]
+    tags += [(v, "none", p) for v in pythons for p in platforms]
+    tags.append((cp, "none", "any"))
+    tags += [(v, "none", "any") for v in pythons]
+    return tags
+
+
+def uv_compile_for(requirements: list[str], python: str, system: str, processor: str, level: str,
+                   index: str, exclude_newer: Optional[str]) -> str:
+    uv = shutil.which("uv")
+    if uv is None:
+        raise LockFailed("uv is not on PATH: https://docs.astral.sh/uv/")
+    environment = {k: v for k, v in os.environ.items() if not k.startswith(V._DROPPED) or k in V._KEPT}
+    if system == "macos":
+        target = f"{processor}-apple-darwin"
+        environment["MACOSX_DEPLOYMENT_TARGET"] = level
+    else:
+        target = f"{processor}-manylinux_{level.replace('.', '_')}"
+    with tempfile.TemporaryDirectory(prefix="onnx-lock-") as work:
+        source = Path(work) / "requirements.in"
+        source.write_text("\n".join(requirements) + "\n")
+        done = subprocess.run(
+            [uv, "pip", "compile", "--no-config", "--quiet", str(source), "--python-platform", target,
+             "--python-version", python, "--generate-hashes", "--only-binary", ":all:", "--no-header",
+             "--no-annotate", "--index-url", index, *(["--exclude-newer", exclude_newer] if exclude_newer else [])],
+            cwd=work, env=environment, capture_output=True, text=True, check=False,
+        )
+    if done.returncode != 0:
+        raise LockFailed((done.stderr or done.stdout).strip() or f"uv exited with {done.returncode}")
+    return done.stdout
+
+
+def lock(version: str, python: str, target: str, *, compile: Callable[..., str] = uv_compile_for,
+         files: Callable[[str, str], list[dict[str, Any]]] = V.pypi_files, index: str = V.INDEX,
+         exclude_newer: Optional[str] = None, workers: int = 8) -> dict[str, Any]:
+    if not V.VERSION.fullmatch(version):
+        raise LockFailed(f"{version!r} is not a version of digits and dots, which the agent names a directory by")
+    system, processor, accelerator, project = TARGETS[target]
+    requirements = [f"{project}=={version}", *ALSO]
+    levels = (MACOS,) if system == "macos" else V.LEVELS
+    tried = []
+    for level in levels:
+        try:
+            compiled = compile(requirements, python, system, processor, level, index, exclude_newer)
+            break
+        except LockFailed as no:
+            tried.append(f"{level}: {str(no).splitlines()[-1] if str(no) else no}")
+    else:
+        raise LockFailed(f"{requirements} do not resolve for Python {python} on {target}:\n  " + "\n  ".join(tried))
+    pins = V.parse_compiled(compiled)
+    runtime_name = V.normalized(project.split("[")[0])
+    if pins.get(runtime_name, ("",))[0] != version:
+        raise LockFailed(f"uv's resolution does not pin {runtime_name}=={version}")
+    preference = macos_tags(python, level) if system == "macos" else V.supported_tags(python, processor, level)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        listed = dict(zip(pins, pool.map(lambda name: files(name, pins[name][0]), pins)))
+    chosen, size = [], 0
+    for name in sorted(pins):
+        pinned, digests = pins[name]
+        wheel = V.choose_wheel(listed[name], preference)
+        if wheel is None:
+            raise LockFailed(f"{name} {pinned} has no wheel for Python {python} on {target} ({level})")
+        if wheel["sha256"] not in digests:
+            raise LockFailed(f"{wheel['filename']}'s digest on PyPI is not one uv listed for {name} {pinned}")
+        if not isinstance(wheel["size"], int):
+            raise LockFailed(f"PyPI gives no size for {wheel['filename']}")
+        chosen.append((name, pinned, wheel["sha256"]))
+        size += wheel["size"]
+    locked: dict[str, Any] = {
+        "onnxruntime": version, "python": python, "system": system, "platform": processor,
+        "accelerator": accelerator, "wheels": len(chosen), "size_bytes": size,
+        "requirements": V.requirements_text(chosen),
+    }
+    if system == "linux":
+        locked["glibc"] = level
+    else:
+        locked["macos"] = level
+    if accelerator == "cuda":
+        major, runtime = V.cuda_runtime(pins)
+        if major not in V.DRIVER_FLOORS:
+            raise LockFailed(f"the set's CUDA is {runtime} (CUDA {major}), whose least driver the table does not name")
+        locked["driver_floor"], locked["cuda_runtime"] = V.DRIVER_FLOORS[major], runtime
+    return locked
+
+
+def file_name(locked: dict[str, Any]) -> str:
+    return (f"onnxruntime-{locked['onnxruntime']}-py{locked['python']}-"
+            f"{locked['system']}-{locked['platform']}-{locked['accelerator']}.json")
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(prog="onnx-lock", description=__doc__.splitlines()[0])
+    parser.add_argument("version")
+    parser.add_argument("--python", nargs="+", default=list(PYTHONS))
+    parser.add_argument("--target", nargs="+", default=list(TARGETS), choices=list(TARGETS))
+    parser.add_argument("--out", default=str(SETS_DIR))
+    args = parser.parse_args(argv)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    moment, failed = V.now_rfc3339(), 0
+    for target in args.target:
+        for python in args.python:
+            try:
+                locked = lock(args.version, python, target, exclude_newer=moment)
+            except LockFailed as exc:
+                failed += 1
+                print(f"{target} py{python}: not locked — {exc}", file=sys.stderr)
+                continue
+            path = out / file_name(locked)
+            path.write_text(json.dumps(locked, indent=2) + "\n")
+            print(f"{path.name}: {locked['wheels']} wheels, {locked['size_bytes'] / 1e6:.0f} MB")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -241,7 +241,9 @@ def test_the_agent_never_runs_a_shell_or_a_command_it_was_given():
     # the argument list built in `server_argv` from the agent's own constants, a file under its
     # models directory and its port; and an installed Ollama (D150) — the program in a version
     # directory the agent unpacked, and `serve`, built in `serve_argv`.
-    for name, builder in (("whisper_cpp.py", "server_argv"), ("ollama_server.py", "serve_argv")):
+    # And the ONNX server (S15, D179): an interpreter running the pool's own server file, from `server_argv`.
+    for name, builder in (("whisper_cpp.py", "server_argv"), ("ollama_server.py", "serve_argv"),
+                          ("onnx_engine.py", "server_argv")):
         tree = ast.parse((root / name).read_text())
         starts = [
             node for node in ast.walk(tree)
@@ -292,7 +294,9 @@ def test_the_agent_never_runs_a_shell_or_a_command_it_was_given():
             continue  # startup.py has a `run_command` of its own, for the owner's commands
         if name == "vllm_server.py":
             continue  # its launcher and stop, above
-        assert name in ("whisper_build.py", "whisper_cpp.py", "vllm_install.py"), f"{name} runs commands"
+        # ONNX Runtime's environment, pip and its check, and the import check of a version (S15, D179).
+        assert name in ("whisper_build.py", "whisper_cpp.py", "vllm_install.py", "onnx_install.py",
+                        "onnx_engine.py"), f"{name} runs commands"
         tree = ast.parse(text)
         runs = [
             node for node in ast.walk(tree) if isinstance(node, ast.Call) and (

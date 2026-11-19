@@ -127,11 +127,12 @@ def _serve(args: argparse.Namespace) -> int:
 #: Where each engine keeps its models when nobody says otherwise.
 DEFAULT_MODELS_PATH = {
     "ollama": "~/.ollama/models", "vllm": "~/gpm-models", "whisper-cpp": whisper_cpp.DEFAULT_MODELS_PATH,
+    "onnx": "~/gpm-onnx-models",
 }
 
 #: Where each engine answers when nobody says otherwise. whisper.cpp's server is started by the
 #: agent on the port named here — the pool's default for that engine, not the server's own 8080.
-DEFAULT_ENGINE_URL = {"whisper-cpp": "http://127.0.0.1:8178"}
+DEFAULT_ENGINE_URL = {"whisper-cpp": "http://127.0.0.1:8178", "onnx": "http://127.0.0.1:8190"}
 
 
 #: The launcher's verbs (`vllm_launch.run_verb`), each with what it does.
