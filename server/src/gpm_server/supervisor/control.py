@@ -35,6 +35,7 @@ from ..configplan import (
     MachineNow,
     RentedNow,
     StaleVersion,
+    containers_turned_on,
     plan_changes,
     remove_list_item,
     set_in_list_item,
@@ -1060,6 +1061,17 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         refused = _moves_holding(body.get("text", ""))
         if refused is not None:
             return _error(409, "change_refused", refused)
+        # Raw text skips the plan, not this: containers run their image's code (D180).
+        try:
+            turned_on = containers_turned_on(supervisor.config, store().parse(body.get("text", "")))
+        except ConfigError:
+            turned_on = None  # refused below, by `apply`, in the operator's words
+        if turned_on is not None and str(body.get("confirm")) != turned_on.requires_retype:
+            return JSONResponse(status_code=400, content={
+                "error": "not_confirmed",
+                "detail": f"turning containers on is confirmed by typing the pool's name; send `confirm`: {turned_on.requires_retype!r}",
+                "changes": [turned_on.as_dict()],
+            })
         try:
             version = store().apply(body.get("text", ""), body.get("version"))
         except StaleVersion as exc:
@@ -1069,6 +1081,24 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         async with supervisor.pass_lock:  # a provider change never lands mid-pass (D135)
             supervisor.reload_config()
         return JSONResponse({"version": version})
+
+    @app.patch("/pool/containers")
+    async def set_containers(request: Request) -> JSONResponse:
+        """Turn container builds on or off (D180). On is confirmed by typing the pool's name: a
+        catalogued image then runs its own code on the machines that hold it."""
+        if store() is None:
+            return _error(400, "no_config_file", "this pool was not started from a file")
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
+            return _error(400, "bad_request", "send `enabled`: true or false")
+        text, version = store().read()
+        try:
+            text = set_values(text, ("containers",), {"enabled": body["enabled"]})
+        except CannotEdit:
+            if "\ncontainers:" in "\n" + text:
+                return _error(400, "cannot_edit", "`containers` is written on one line; change it on the Configuration screen")
+            text = text.rstrip("\n") + f"\ncontainers:\n  enabled: {'true' if body['enabled'] else 'false'}\n"
+        return _validate_plan_apply(text, version, body)
 
     @app.patch("/pool/config/rented")
     async def set_rented_search(request: Request) -> JSONResponse:

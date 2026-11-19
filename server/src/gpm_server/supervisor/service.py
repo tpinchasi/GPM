@@ -665,6 +665,13 @@ class Supervisor:
         old = self.config
         self.config = new
         self.app_keys_changed = old.auth != new.auth
+        if old.containers.enabled != new.containers.enabled:
+            # Whoever turned it on, and however: the file by hand, the console or the API (D180).
+            self.events.record(
+                "containers_enabled" if new.containers.enabled else "containers_disabled",
+                "containers are on: a container build's image runs its own code on the machines that hold it"
+                if new.containers.enabled else "containers are off: no container build may be catalogued",
+            )
 
         before = {host.id: host for host in old.hosts}
         after = {host.id: host for host in new.hosts}
@@ -1050,7 +1057,8 @@ class Supervisor:
             # engine than the configuration names: those builds would be the wrong engine's.
             # After the platform is known, so the machine is asked for the right builds.
             models = await agents.hold(
-                host.agent_endpoint, host.required_tags, host.config.residency, transport=self._agent_transport
+                host.agent_endpoint, host.required_tags, host.config.residency, transport=self._agent_transport,
+                specs=self.config.trained_build_specs(sorted(host.required_tags)),
             )
             host.agent = dataclasses.replace(host.agent, models=models)
             for kind, summary, numbers in agents.model_events(models_before, models):

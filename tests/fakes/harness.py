@@ -150,6 +150,11 @@ class PoolHarness:
 
                 fake = FakeWhisperCpp()
                 fake.start(spec.resident)  # started by its agent, which the test stands in for
+            elif spec.engine in ("onnx", "container"):
+                from .fake_predict_server import FakePredictServer
+
+                fake = FakePredictServer()
+                fake.start(spec.resident)  # started by its agent, which the test stands in for
             else:
                 fake = FakeOllama(
                     resident=spec.resident, available=spec.available,

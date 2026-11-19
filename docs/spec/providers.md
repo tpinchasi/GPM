@@ -394,6 +394,19 @@ hosted` host and catalog builds.
   change a host's address (a different address is another host, added anew); edit a build written
   by hand without a pin (shown, left alone).
 
+## 11. Trained models on rented machines (S15, D179–D182)
+
+- **An ONNX build** rents as any build does: the machine starts from a plain image carrying Python,
+  and its agent installs ONNX Runtime for the card it finds and takes the file — from the hub, or
+  sent by the pool through the machine's tunnel (D182).
+- **A container build**: the operator's image is the machine's image, as `rented.image` is, and the
+  pool's start adds its agent and dead-man timer to it (D63). A private image's registry login is
+  given **to the provider** through its API, to pull it; it never goes on the machine (D181).
+- **A relayed upload** (`delivery: hub`, D182): the machine is given the operator's read-only token
+  for that repository in its environment at creation — the only secret a rented machine carries,
+  and the provider can read it. The write token never leaves the supervisor.
+- Leases, caps and the dead-man timer are unchanged.
+
 ## 9. Build order
 
 Each step ships on its own and keeps a single-provider pool working as it does today.

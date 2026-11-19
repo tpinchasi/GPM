@@ -87,16 +87,23 @@ def _client(agent: AgentConfig, key: str, transport: Optional[httpx.AsyncBaseTra
 async def hold(
     agent: AgentConfig, tags: Iterable[str], residency: str,
     *, transport: Optional[httpx.AsyncBaseTransport] = None,
+    specs: Optional[dict[str, dict[str, Any]]] = None,
 ) -> Optional[dict[str, Any]]:
     """Send the whole desired state; read back where the machine stands. The agent works in
     the background and answers at once, so this never waits on a download. None on any failure:
-    the facts call already said whether the agent answers, and the next pass says it all again."""
+    the facts call already said whether the agent answers, and the next pass says it all again.
+
+    `specs`, by tag, are a trained model's declarations (D179, D180) — data, never a path, a URL
+    or a command — sent only where there are some, so every other body is as it was."""
     key = agent.key()
     if key is None:
         return None
+    body: dict[str, Any] = {"tags": sorted(tags), "residency": residency}
+    if specs:
+        body["specs"] = specs
     try:
         async with _client(agent, key, transport) as client:
-            response = await client.put(f"/agent/v{PROTOCOL}/models", json={"tags": sorted(tags), "residency": residency})
+            response = await client.put(f"/agent/v{PROTOCOL}/models", json=body)
         return response.json() if response.status_code == 200 else None
     except (httpx.HTTPError, ValueError):
         return None

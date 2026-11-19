@@ -82,6 +82,7 @@ the kinds it can, and a pool may run several engines (D93):
 | embeddings | `/v1/embeddings`; Ollama's `/api/embed`, `/api/embeddings` | Ollama, vLLM |
 | transcription | `/v1/audio/transcriptions`, `/v1/audio/translations` — a `multipart/form-data` upload | vLLM; whisper.cpp transcribes only (its server answers no translation path) |
 | ranking | `/v1/rerank` | vLLM |
+| prediction | `/v1/predict` — a trained model's own inputs and outputs (D178) | `onnx`, `container` |
 
 Only these exact paths are forwarded. A model name resolves to a build that serves the kind
 asked for; a name with no such build is refused `400 kind_not_served`.
@@ -98,6 +99,12 @@ media_not_inline`: a link would make the engine host fetch it from its own netwo
 of its own and never as a file. The pool rewrites the form before forwarding it, so the engine
 reads exactly what the pool checked; the file's bytes are not changed. A form it cannot read
 cleanly is `400 bad_upload`.
+
+**A trained model is asked on one path** (D178): `POST /v1/predict` with
+`{"model": "...", "inputs": {...}}`, answered `{"model": "...", "outputs": {...}}`. What
+`inputs` holds and what `outputs` means are the model's, as its build declares them — an ONNX
+build (D179) names its inputs and prepares them (a picture as a base64 string, decoded and resized
+by the pool), a container build (D180) receives them as sent. A picture is never a link.
 
 **Every request body has a size limit**, `pool.max_request_mb` (default 24, under the 25 MB
 the engines accept for an upload): over it is `413 request_too_large`, before the body is read.
@@ -211,6 +218,7 @@ pool.chat("my-vision-model", [{"role": "user", "content": [
     {"type": "text", "text": "what is this?"}, image_part("photo.jpg")]}])   # inline picture
 text = pool.transcribe("my-speech-model", "call.m4a", language="he").text
 ranked = pool.rerank("my-reranker", query, documents, top_n=5)            # best first
+labels = pool.predict("my-classifier", {"image": photo_bytes})["label"]      # a trained model (D178)
 pool.wait_until_ready()                     # optional pre-flight for a batch driver
 ```
 

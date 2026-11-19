@@ -59,6 +59,8 @@ without the pool's server package, so it cannot share the pool's adapters.
 |---|---|---|
 | `ollama` | The engine's own pull, watched for progress | Loaded and pinned through the engine |
 | `vllm` | **The agent fetches it**, over plain HTTP from a model hub, into one directory per repository under the machine's models path (D90) | Nothing to do: the engine is started with its model and holds it for the life of the process |
+| `onnx` (D179) | From a hub as vLLM's builds, or **sent by the pool** (`PUT /model-file`, D182), kept by its sha256 | The agent's own ONNX server, on loopback, holding every ONNX build the machine is told to hold, prepared as each build's declarations say |
+| `container` (D180) | **Pulled by digest** through the Docker Engine API on the machine's socket, with the machine's own registry login (D181) | A container per build, port bound to loopback, no host network, not privileged, the build's memory as its limit — only where the pool's `containers.enabled` is on and the machine's owner has not set `run_containers: never` |
 
 For vLLM the agent reports **models on disk and models served as different sets**, because they
 are: weights present with the engine not yet serving them is the state a vLLM host spends its
@@ -571,17 +573,22 @@ silent override in either direction.
 | **Delete a model** | Only as an **explicit operator action in the console** — never by the supervisor's own reconciliation, so no configuration change, bug or pass can delete anything. The tag is typed again to confirm; a tag this pool requires on that host is refused; and the agent refuses all deletion when its own configuration says `allow_delete: false`, which the machine's owner sets and the pool cannot change |
 | **Restart the engine, apply engine settings** (parallelism, keep-alive, models held at once) | Only through a command the **operator wrote into the agent's own configuration on that host** — or, for an engine the agent runs itself (§2.3), by restarting its own process with the pool's numbers. The pool can ask for it to be run; it cannot say what it is |
 | **Install an engine, and switch its version** (§2.3) | Only where the machine's owner set `install_engines: true`. An engine name from the agent's own list and a version — never a URL, path or command; only from the engine's official repository, each file checked against its published digest and, where the platform has one, its pinned signature. Switched only when the pool asks, after draining the host; the previous version kept for going back |
+| **Receive a model file** (D182) | Only bytes with their sha256, kept under the models directory by that hash and only if it matches; refused below the disk floor. Never a name, path or URL |
+| **Run a container image** (D180) | Only an image by digest that a catalogued build names, only while the pool's `containers.enabled` is on, never where this machine's owner set `run_containers: never`; run narrowly (§2.1) |
 
 | May not, ever | |
 |---|---|
-| Run a command the pool supplies | The agent has no "run this" operation. Its verbs are the closed list above |
+| Run a command the pool supplies | The agent has no "run this" operation. Its verbs are the closed list above. A container image (D180) is the one way code chosen by the pool's operator runs on a machine, and only as above |
 | Read or send request or response content | It is not on the request path and has no access to it |
 | Update itself | Upgrades are the operator's package manager, like the pool's own |
 
 The closed verb list is the security property: compromise of the pool's admin key lets an
 attacker make a host download *catalogued* models, restart its engine and — where the machine's
-owner has not switched it off — delete models that can be pulled again. It never lets them
-execute code, read traffic or reach anything that is not a model.
+owner has not switched it off — delete models that can be pulled again. It never lets them read
+traffic or reach anything that is not a model. **It lets them execute code only through a
+container image (D180)**: the admin key can turn `containers.enabled` on and catalogue an image of
+their choosing, which then runs on every machine whose owner has not set `run_containers: never`.
+With the switch off — the default — no verb runs code the pool chose.
 
 ## 5. Keys and enrolment
 
@@ -625,13 +632,14 @@ today. The console says the agent is unreachable; nothing is inferred from its s
 
 ## 7. The protocol
 
-Six verbs, all under `/agent/v1`, all behind the agent key. The list is closed, and a test
+Seven verbs, all under `/agent/v1`, all behind the agent key. The list is closed, and a test
 fails until it is edited on purpose to admit another.
 
 | Verb | Body | Does |
 |---|---|---|
 | `GET /facts` | — | §3 |
-| `PUT /models` | `{tags, residency}` — the **whole** desired state | Starts working toward it in the background, one pull at a time, and answers at once with where each tag stands (on disk, loaded, pulling with bytes, last error), free disk, the owner's floor, and the surplus. A tag that failed is left alone for a minute, not retried every pass |
+| `PUT /models` | `{tags, residency, specs?}` — `specs`, by tag, the declarations of `onnx` and `container` builds as data (D179): enumerations, bounded numbers, label strings, a port — the **whole** desired state | Starts working toward it in the background, one pull at a time, and answers at once with where each tag stands (on disk, loaded, pulling with bytes, last error), free disk, the owner's floor, and the surplus. A tag that failed is left alone for a minute, not retried every pass |
+| `PUT /model-file` | The file's bytes; one header, `X-GPM-SHA256` (D182) | Writes it under the models directory as `upload/<sha256>`, kept only if the hash matches and the disk floor holds; answers where it stands |
 | `DELETE /models` | `{tag}` | §4's deletion, inside its bounds |
 | `POST /heartbeat` | — | Touches the dead-man timer's file on a host the pool created (D63). No body, and no other bound: it can only *postpone* a shutdown the pool could equally cause by going silent. A machine nobody rented carries no timer, and the verb says so |
 | `PUT /engine/version` | `{version, switch}` and nothing else — `version` is `latest` or a version in the engine's own form; `switch` is a boolean (D151) | Works toward that version in the background — resolving, fetching or building, checking, staging — and answers **at once**, even to a switch, with `engine.install` (§2.3). `switch: true` starts the staged version, or the previous one when that is the version named — a rollback — in the background. Refused: `403 installs_not_allowed` unless the owner set `install_engines: true`; `409 busy` (a switch running), `not_staged`, `foreign_engine` (an engine it did not start holds the port), `older_than_running` (older than the version running, and not the one before it); `400` for anything else in the body |

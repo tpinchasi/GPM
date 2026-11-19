@@ -228,9 +228,10 @@ class EngineNotFound(Exception):
     """The configuration named an engine that is not installed."""
 
 
-#: What a request asks a model to do — read from the path it arrived on (D142).
-CHAT, EMBED, TRANSCRIBE, RERANK = "chat", "embed", "transcribe", "rerank"
-KINDS = frozenset({CHAT, EMBED, TRANSCRIBE, RERANK})
+#: What a request asks a model to do — read from the path it arrived on (D142). `predict` is a
+#: trained model's own inputs and outputs (D178).
+CHAT, EMBED, TRANSCRIBE, RERANK, PREDICT = "chat", "embed", "transcribe", "rerank", "predict"
+KINDS = frozenset({CHAT, EMBED, TRANSCRIBE, RERANK, PREDICT})
 #: What a request may carry besides text (D143).
 INPUTS = frozenset({"image", "audio"})
 #: What an engine that does not say serves: what every engine served before kinds existed.
