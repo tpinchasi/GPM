@@ -393,6 +393,7 @@ def test_the_verbs_are_a_closed_list():
         ("/agent/v1/engine", ("POST",)),    # stage 3: restart, with the owner's command (D41)
         ("/agent/v1/heartbeat", ("POST",)),  # stage 5a: postpone the timer on a rented host (D63)
         ("/agent/v1/engine/version", ("PUT",)),  # S9: set the engine's version, from the agent's table (D151)
+        ("/agent/v1/model-file", ("PUT",)),  # S15: a file the pool sends, kept by its hash alone (D182)
     }
 
 

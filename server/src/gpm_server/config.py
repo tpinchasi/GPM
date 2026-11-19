@@ -1604,6 +1604,15 @@ class DirectoryConfig(BaseModel):
     hub_max_age_hours: float = Field(default=168.0, gt=0)
 
 
+class ModelsConfig(BaseModel):
+    """Trained models' files uploaded to the pool (D182)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: The largest file the console takes, in megabytes.
+    max_upload_mb: int = Field(default=2048, ge=1, le=65536)
+
+
 class ContainersConfig(BaseModel):
     """Container builds (D180). A container runs its image's own code on the machine, so none
     runs until this is on; a machine's owner can still refuse in its agent's settings."""
@@ -1634,6 +1643,8 @@ class PoolConfig(BaseModel):
     provisioning: ProvisioningConfig = Field(default_factory=ProvisioningConfig)
     #: Whether container builds may run at all (D180): off by default.
     containers: ContainersConfig = Field(default_factory=ContainersConfig)
+    #: Trained models' uploaded files (D182).
+    models: ModelsConfig = Field(default_factory=ModelsConfig)
     request_log: str = "gpm.sqlite3"
     directory: DirectoryConfig = Field(default_factory=DirectoryConfig)
 
@@ -2075,6 +2086,10 @@ class PoolConfig(BaseModel):
                     reachable.append(variant)
                     break
         return reachable
+
+    def uploads_dir(self) -> Path:
+        """Where trained models' uploaded files are kept (D182): beside the database, owner-only."""
+        return Path(self.request_log).expanduser().resolve().parent / "model-uploads"
 
     def credentials_dir(self) -> Path:
         """Where typed-in provider credentials are kept (D130): beside the database unless named."""

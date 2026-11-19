@@ -44,6 +44,7 @@ from ..ledger import EventLog, LeaseStore, SpendLedger
 from ..models import RENTED_KINDS, HostState
 from ..providers.base import ProviderAuthError, ProviderError, takes_credential
 from ..transports import SshTunnel, tunnel_maker
+from ..uploads import UploadStore, digest_of
 from . import agents
 from .renting import Fleet
 from .upgrades import EngineUpgrades
@@ -236,6 +237,10 @@ class Supervisor:
         self._preparing: dict[str, asyncio.Task[None]] = {}
         #: Tests substitute a transport that answers as an agent would.
         self._agent_transport: Optional[httpx.AsyncBaseTransport] = None
+        #: Uploaded files on their way to a host's agent (D182), by host and digest: one at a time each.
+        self._sending: dict[tuple[str, str], asyncio.Task[None]] = {}
+        #: How the model hub is reached for relayed uploads (D182) — only ever replaced by a test.
+        self._hub_transport: Optional[httpx.AsyncBaseTransport] = None
 
     def _build_fleet(self, config: PoolConfig, given: Optional[dict] = None) -> None:
         """The rented half of the pool, from the file's `rented` section: one plug-in per
@@ -1061,11 +1066,49 @@ class Supervisor:
                 specs=self.config.trained_build_specs(sorted(host.required_tags)),
             )
             host.agent = dataclasses.replace(host.agent, models=models)
+            self._deliver_uploads(host, models)
             for kind, summary, numbers in agents.model_events(models_before, models):
                 self.events.record(kind, f"host {host.host_id}: {summary}", host_id=host.host_id, numbers=numbers)
         elif host.agent.reachable is False and models_before is not None:
             host.agent = dataclasses.replace(host.agent, models=None)
         await self._say_engine_version(host)
+
+    # --- files uploaded to the pool, sent to the hosts that hold them (D182) ---
+
+    def uploads(self) -> UploadStore:
+        return UploadStore(self.config.uploads_dir(), self.config.models.max_upload_mb * 2**20)
+
+    def _deliver_uploads(self, host: Any, report: Optional[dict[str, Any]]) -> None:
+        """Send each uploaded build the host holds and does not have yet, in the background: a
+        large file never holds up the pass. One send per file and host at a time."""
+        if report is None:
+            return
+        on_disk = {m.get("tag") for m in report.get("models") or [] if isinstance(m, dict) and m.get("on_disk")}
+        for tag in sorted(host.required_tags):
+            digest = digest_of(tag)
+            if digest is None or tag in on_disk:
+                continue
+            key = (host.host_id, digest)
+            if key in self._sending and not self._sending[key].done():
+                continue
+            self._sending[key] = asyncio.create_task(self._send_upload(host, digest), name=f"gpm:send:{host.host_id}")
+
+    async def _send_upload(self, host: Any, digest: str) -> None:
+        store = self.uploads()
+        path = store.path_of(digest)
+        if path is None:
+            self.events.record("upload_missing", f"host {host.host_id}: upload/{digest} is not in the pool's store "
+                               f"({store.directory}); upload it again", host_id=host.host_id)
+            return
+        size = path.stat().st_size
+        failed = await agents.send_file(host.agent_endpoint, digest, size, store.chunks(digest),
+                                        transport=self._agent_transport)
+        if failed is None:
+            self.events.record("upload_sent", f"host {host.host_id}: upload/{digest[:12]} sent ({size} bytes)",
+                               host_id=host.host_id, numbers={"bytes": size})
+        else:
+            self.events.record("upload_failed", f"host {host.host_id}: upload/{digest[:12]}: {failed}",
+                               host_id=host.host_id)
 
     # --- which engine a configured host runs (D93, D161) ---
 

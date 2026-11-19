@@ -457,6 +457,42 @@ class OnnxFacts:
             with _refusing(f"could not record in {self._state_dir} that {PROGRAM} was stopped"):
                 self._remember({**record, "stopped": True})
 
+    async def receive_file(self, digest: str, length: int, chunks: AsyncIterator[bytes]) -> str:
+        """A file the pool sends (D182), written beside the models as it arrives and kept as the
+        build `upload/<digest>` only if its bytes are `length` long and hash to `digest`."""
+        from .models import Refused
+
+        build = build_of(f"upload/{digest}")
+        directory = self._models_dir / build.directory
+        if modelhub.is_complete(directory):
+            async for _ in chunks:
+                pass
+            return build.tag
+        incoming = self._models_dir / f".incoming-{digest}"
+        hasher, received = hashlib.sha256(), 0
+        try:
+            host_platform.private_dir(self._models_dir, parents=True, exist_ok=True)
+            with open(incoming, "wb") as out:
+                async for chunk in chunks:
+                    received += len(chunk)
+                    if received > length:
+                        raise Refused(400, "too_long", "the file is longer than it said")
+                    hasher.update(chunk)
+                    out.write(chunk)
+            if received != length:
+                raise Refused(400, "too_short", f"the file ended at {received} of the {length} bytes it said")
+            if hasher.hexdigest() != digest:
+                raise Refused(400, "digest_mismatch", "the file's bytes do not hash to the digest it was sent with")
+            shutil.rmtree(directory, ignore_errors=True)
+            directory.mkdir(parents=True)
+            os.replace(incoming, directory / build.file)
+            (directory / modelhub.COMPLETE_MARKER).write_text(str(length))
+        except OSError as exc:
+            raise Refused(500, "not_written", f"the file could not be written under {self._models_dir}: {exc}") from exc
+        finally:
+            incoming.unlink(missing_ok=True)
+        return build.tag
+
     async def delete(self, client: httpx.AsyncClient, tag: str) -> None:
         build = build_of(tag)
         async with self._lock:

@@ -1,10 +1,11 @@
 """The agent's HTTP surface: a closed list of verbs, every one behind the agent key.
 
-docs/spec/host-agent.md §4, §7. Six verbs: report facts, hold this set of model tags, delete
-this model tag, restart the engine, postpone the dead-man timer, and set the engine's version.
-None takes a command, a path or a URL from the caller, and none ever will: the restart runs the
-owner's command or the agent's own server, its settings are bounded integers, and a version is a
-version — the agent's own table says where it comes from (D151).
+docs/spec/host-agent.md §4, §7. Seven verbs: report facts, hold this set of model tags, delete
+this model tag, restart the engine, postpone the dead-man timer, set the engine's version, and
+receive a model file the pool sends (D182). None takes a command, a path or a URL from the caller,
+and none ever will: the restart runs the owner's command or the agent's own server, its settings
+are bounded integers, a version is a version — the agent's own table says where it comes from
+(D151) — and a file is bytes kept by their own hash.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import dataclasses
 import json
 import logging
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -521,6 +523,33 @@ def create_app(
         except Refused as no:
             return _error(no.status, no.error, no.detail)
 
+    async def model_file(request: Request) -> JSONResponse:
+        """A file the pool sends this machine (S15, D182): its bytes, and one header — its sha256.
+        Never a name, a path or a URL: it is kept by its hash, and only if the bytes match it and
+        free disk stays above the owner's floor."""
+        refused = refusal(request)
+        if refused is not None:
+            return refused
+        receive = getattr(engine, "receive_file", None)
+        if receive is None:
+            return _error(409, "no_files", f"{settings.engine} takes no files from the pool; its builds come from a hub")
+        digest = request.headers.get("x-gpm-sha256", "")
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            return _error(400, "bad_digest", "send the file's sha256, 64 lower-case hex digits, in X-GPM-SHA256")
+        try:
+            length = int(request.headers.get("content-length", ""))
+        except ValueError:
+            return _error(411, "length_required", "send the file's length")
+        free = disk(probes, settings.models_path)["free_bytes"]
+        floor = int(settings.min_free_disk_gb * 1e9)
+        if free is not None and free - length < floor:
+            return _error(507, "disk_floor", f"the file would leave less than the owner's floor of {settings.min_free_disk_gb} GB free")
+        try:
+            tag = await receive(digest, length, request.stream())
+        except Refused as no:
+            return _error(no.status, no.error, no.detail)
+        return JSONResponse({"tag": tag, "on_disk": True})
+
     async def hold_models(request: Request) -> JSONResponse:
         return await _models(request, "apply")
 
@@ -559,6 +588,8 @@ def create_app(
             Route(f"{base}/heartbeat", heartbeat, methods=["POST"]),
             # A version from the agent's own table, never a URL or a path (D151).
             Route(f"{base}/engine/version", engine_version, methods=["PUT"]),
+            # A file the pool sends, kept by its hash alone (S15, D182).
+            Route(f"{base}/model-file", model_file, methods=["PUT"]),
         ],
         lifespan=lifespan,
     )

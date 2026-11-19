@@ -109,6 +109,34 @@ async def hold(
         return None
 
 
+async def send_file(
+    agent: AgentConfig, digest: str, size: int, chunks: Any,
+    *, transport: Optional[httpx.AsyncBaseTransport] = None,
+) -> Optional[str]:
+    """Send a file uploaded to the pool to the agent (D182): its bytes and its sha256, nothing
+    else. None once the agent kept it; otherwise why not, in the agent's words."""
+    key = agent.key()
+    if key is None:
+        return "no key for this agent"
+    try:
+        async with httpx.AsyncClient(
+            base_url=agent.url, verify=agent.verify, transport=transport,
+            timeout=httpx.Timeout(30.0, read=600.0, write=600.0),
+            headers={"Authorization": f"Bearer {key}"},
+        ) as client:
+            response = await client.put(f"/agent/v{PROTOCOL}/model-file", content=chunks,
+                                        headers={"X-GPM-SHA256": digest, "Content-Length": str(size)})
+    except httpx.HTTPError as exc:
+        return f"the agent could not be sent the file: {str(exc) or type(exc).__name__}"
+    if response.status_code == 200:
+        return None
+    try:
+        said = response.json().get("detail") or response.text
+    except ValueError:
+        said = response.text
+    return f"the agent refused the file ({response.status_code}): {str(said)[:300]}"
+
+
 async def beat(
     agent, *, transport: Optional[httpx.AsyncBaseTransport] = None
 ) -> Optional[str]:
