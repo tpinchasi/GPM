@@ -2279,6 +2279,8 @@ class PoolConfig(BaseModel):
                         f"variant matches both.{self._builds_missing(host, [name])} Give it the capability, "
                         f"add a variant for that engine, add a fallback with no requirements, or remove the host."
                     )
+            if not servable and not whole_set and not host.models and self.engine_of(host) in TRAINED_ENGINES:
+                continue  # a trained model's host, waiting for its first model (Add model, S15)
             if not servable:
                 raise ValueError(
                     f"host {host.id!r} has no usable variant of any model in the pool's set: it runs "

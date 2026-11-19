@@ -182,8 +182,9 @@ def test_a_build_whose_declarations_do_not_match_its_file_is_listed_as_not_loade
             rows = {row["id"]: row for row in client.get("/v1/models").json()["data"]}
             assert not rows["a/b/wrong.onnx"]["loaded"] and "pixels" in rows["a/b/wrong.onnx"]["error"]
             assert predict(client, "a/b/wrong.onnx", {}).status_code == 503
-            mismatch = predict(client, "a/b/labels.onnx", {"image": picture((9, 9, 9))})
-            assert mismatch.status_code == 500 and "3 scores and 2 labels" in mismatch.json()["error"]["message"]
+            # Loaded means answered one made-up input: the label count is found wrong at load.
+            assert not rows["a/b/labels.onnx"]["loaded"] and "3 scores and 2 labels" in rows["a/b/labels.onnx"]["error"]
+            assert predict(client, "a/b/labels.onnx", {"image": picture((9, 9, 9))}).status_code == 503
     finally:
         running.shutdown()
 

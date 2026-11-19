@@ -763,6 +763,8 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 # reloaded — so they are read from the supervisor, not from the config the
                 # app was built with.
                 "model_set": list(supervisor.config.pool.model_set),
+                # Whether container builds may run (D180), for the console's Add model.
+                "containers_enabled": supervisor.config.containers.enabled,
                 # Models only workloads serve (D115): offered for a workload, never shared.
                 "workload_models": sorted(
                     name for name, entry in supervisor.config.catalog.items() if entry.workloads_only
@@ -1789,6 +1791,11 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         plan_of=lambda text: plan_changes(supervisor.config, store().parse(text), rented_now(), machines_now(),
                                           known_connections()),
     )
+
+    # --- trained models: Add model (S15, D178–D182) ---
+    from .trained_api import register as register_trained
+
+    register_trained(app, supervisor, error=_error, validate_plan_apply=_validate_plan_apply)
 
     # --- hosted model APIs (S13, D171) ---
     from .hosted_api import register as register_hosted

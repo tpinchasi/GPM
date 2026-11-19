@@ -162,6 +162,28 @@ class Build:
             raise ModelFault(f"the file's inputs {undeclared} are not declared")
         self.queue: "queue.Queue[_Job]" = queue.Queue()
         threading.Thread(target=self._batches, name=f"batch:{tag}", daemon=True).start()
+        # Loaded means answered: one input made from what is declared, run before the build is
+        # served — a build whose declarations the file does not bear out fails here, not on a request.
+        self.run(self.prepare(self.made_up()))
+
+    def made_up(self) -> dict[str, Any]:
+        """One input of each declared kind, the shape the file and the declarations say."""
+        np = _np()
+        made: dict[str, Any] = {}
+        for name, decl in self.spec["inputs"].items():
+            if decl["as"] == "image":
+                from PIL import Image
+
+                buffer = io.BytesIO()
+                Image.new("RGB", (8, 8), (128, 128, 128)).save(buffer, format="PNG")
+                made[name] = base64.b64encode(buffer.getvalue()).decode()
+            elif decl["as"] == "features":
+                made[name] = {feature: 0 for feature in decl["names"]}
+            else:
+                shape = self.inputs[decl["input"]].shape or []
+                example = [d if isinstance(d, int) and d > 0 else 1 for d in shape[1:]]
+                made[name] = np.zeros(example, dtype=_DTYPES.get(self.inputs[decl["input"]].type, "float32")).tolist()
+        return made
 
     def prepare(self, inputs: Any) -> dict[str, Any]:
         """One example: each model input as an array without its batch dimension."""
