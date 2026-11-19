@@ -222,7 +222,7 @@ embeddings: On a path several engines share, the router reads requests with a ve
 reader where one is installed, so a version-1 plug-in never switches off what a version-2 one reads.
 
 ```python
-    kinds: ClassVar[frozenset[str]]          # what it can serve: chat, embed, transcribe, rerank
+    kinds: ClassVar[frozenset[str]]          # what it can serve: chat, embed, transcribe, rerank, predict
     def kind_of(self, path: str) -> str | None: ...                       # its own paths only
     def request_facts(self, path: str, content_type: str, body: bytes) -> RequestFacts: ...
     def rewrite_model(self, path: str, content_type: str, body: bytes, tag: str) -> tuple[str, bytes]: ...
@@ -245,7 +245,9 @@ reader where one is installed, so a version-1 plug-in never switches off what a 
 
 The shipped engines: **Ollama** (chat, embeddings), **vLLM** (chat, embeddings, transcription,
 ranking) and **whisper.cpp** (transcription; one model per server; its host must carry an agent,
-D148).
+D148), **`onnx`** (prediction: an ONNX file on the pool's own server, D179) and **`container`**
+(prediction: an operator's image answering the predict contract, D180) — both run by the host's
+agent, which every host holding them must carry.
 
 ### Why occupancy exists
 

@@ -89,6 +89,23 @@ class Ranking(list):
         self.raw = raw if raw is not None else {}
 
 
+@dataclasses.dataclass
+class Prediction:
+    """What `predict()` returns: a trained model's outputs, as its build declares them (D178), and
+    the facts of the call as a `Reply` carries them."""
+
+    outputs: dict
+    served_model: Optional[str] = None
+    host: Optional[str] = None
+    runtime_class: Optional[str] = None
+    wait_s: Optional[float] = None
+    cost_usd: Optional[float] = None
+    raw: dict = dataclasses.field(default_factory=dict, repr=False)
+
+    def __getitem__(self, name: str) -> Any:
+        return self.outputs[name]
+
+
 #: The two request shapes a pool can speak, and where each keeps its paths and its answer.
 #:
 #: `openai` is what both shipped engines serve, so it is what these convenience methods use by
@@ -104,6 +121,8 @@ DIALECTS = {
 #: for: Ollama serves neither, and the engines that do answer only there (D142).
 _TRANSCRIBE_PATH = "/v1/audio/transcriptions"
 _RERANK_PATH = "/v1/rerank"
+#: A trained model's one path (D178).
+_PREDICT_PATH = "/v1/predict"
 
 #: Transcription formats answered as plain text rather than JSON.
 _TEXT_FORMATS = frozenset({"text", "srt", "vtt"})
@@ -300,6 +319,20 @@ def _ranking_from_response(response: httpx.Response) -> Ranking:
     return Ranking(_ranked_of(data), raw=data, **_facts(response, data.get("model")))
 
 
+def _predict_body(model: str, inputs: dict) -> dict:
+    """Bytes — a picture — travel as base64 text, as the pool reads them (D178); a link never does."""
+    if not isinstance(inputs, dict):
+        raise TypeError("inputs is a dict of the model's input names to their values")
+    sent = {name: base64.b64encode(bytes(value)).decode("ascii") if isinstance(value, (bytes, bytearray)) else value
+            for name, value in inputs.items()}
+    return {"model": model, "inputs": sent}
+
+
+def _prediction_from_response(response: httpx.Response) -> Prediction:
+    data = response.json()
+    return Prediction(outputs=dict(data.get("outputs") or {}), raw=data, **_facts(response, data.get("model")))
+
+
 def _ranked_of(data: dict) -> list[Ranked]:
     """The ranking, best first, whatever order the engine listed it in."""
     ranked = []
@@ -433,6 +466,13 @@ class PoolClient:
         response = self._client.post(_RERANK_PATH, json=body, headers=headers)
         return _ranking_from_response(response)
 
+    def predict(self, model: str, inputs: dict, *, session_id: Optional[str] = None) -> Prediction:
+        """A trained model's answer to `inputs` — named as its build declares them; a picture as
+        bytes (D178). `prediction["label"]` reads one output."""
+        headers = {"X-GPM-Session": session_id} if session_id else {}
+        response = self._client.post(_PREDICT_PATH, json=_predict_body(model, inputs), headers=headers)
+        return _prediction_from_response(response)
+
     def wait_until_ready(self, timeout: Optional[float] = None) -> None:
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
@@ -549,6 +589,12 @@ class AsyncPoolClient:
         body = _rerank_body(model, query, documents, top_n)
         response = await self._client.post(_RERANK_PATH, json=body, headers=headers)
         return _ranking_from_response(response)
+
+    async def predict(self, model: str, inputs: dict, *, session_id: Optional[str] = None) -> Prediction:
+        """See `PoolClient.predict`."""
+        headers = {"X-GPM-Session": session_id} if session_id else {}
+        response = await self._client.post(_PREDICT_PATH, json=_predict_body(model, inputs), headers=headers)
+        return _prediction_from_response(response)
 
     async def wait_until_ready(self, timeout: Optional[float] = None) -> None:
         deadline = None if timeout is None else time.monotonic() + timeout

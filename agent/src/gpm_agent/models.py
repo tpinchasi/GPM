@@ -106,7 +106,7 @@ class ModelWork:
             pins = json.loads(self.state_path.read_text()).get("pinned_by_agent", [])
         except (OSError, ValueError, AttributeError):
             return set()  # unreadable: forget, and err toward leaving models loaded
-        return {tag for tag in pins if valid_tag(tag)}
+        return {tag for tag in pins if (getattr(self.engine, "valid_tag", None) or valid_tag)(tag)}
 
     def _remember(self) -> None:
         if self.state_path is None:
@@ -123,7 +123,8 @@ class ModelWork:
         if not isinstance(body, dict):
             raise Refused(400, "bad_request", "the desired state must be an object")
         tags, residency = body.get("tags"), body.get("residency")
-        if not isinstance(tags, list) or not all(valid_tag(tag) for tag in tags):
+        valid = getattr(self.engine, "valid_tag", None) or valid_tag
+        if not isinstance(tags, list) or not all(valid(tag) for tag in tags):
             raise Refused(400, "bad_tag", "every tag must be a plain model tag: no URL, no path, no scheme")
         cloud = sorted({tag for tag in tags if cloud_tag(tag)})
         if cloud:
@@ -140,6 +141,21 @@ class ModelWork:
                 f"{self.engine.name} serves one model at a time, and the desired set names "
                 f"{len(set(tags))}: {', '.join(sorted(set(tags)))}",
             )
+        specs = body.get("specs") or {}
+        if not isinstance(specs, dict):
+            raise Refused(400, "bad_specs", "specs are an object of each build's tag to its declarations")
+        checker = getattr(self.engine, "checked_spec", None)
+        if specs and checker is None:
+            raise Refused(400, "bad_specs", f"{self.engine.name} takes no declarations for its builds")
+        unknown = sorted(set(specs) - set(tags))
+        if unknown:
+            raise Refused(400, "bad_specs", f"declarations for builds not in the desired set: {', '.join(unknown[:5])}")
+        if checker is not None:
+            # A trained model's declarations (D179): data the engine checks — never a path, URL or command.
+            try:
+                self.engine.set_specs({tag: checker(tag, said) for tag, said in specs.items()})
+            except ValueError as exc:
+                raise Refused(400, "bad_specs", str(exc)) from exc
         self.desired = Desired(tuple(sorted(set(tags))), residency)
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._work(), name="gpm-agent:models")
@@ -147,7 +163,7 @@ class ModelWork:
 
     async def delete(self, body: Any) -> dict[str, Any]:
         tag = body.get("tag") if isinstance(body, dict) else None
-        if not valid_tag(tag):
+        if not (getattr(self.engine, "valid_tag", None) or valid_tag)(tag):
             raise Refused(400, "bad_tag", "name one plain model tag to delete")
         if not self.allow_delete:
             raise Refused(403, "owner_forbids_delete", "this machine's owner has set allow_delete: false; the pool cannot change that")
@@ -254,7 +270,10 @@ class ModelWork:
         # One load at a time. Two large models loading together contend for accelerator memory,
         # which is the one way this could cost more than it saves; the download it overlaps
         # costs nothing but disk.
+        sent_by_pool = getattr(self.engine, "sent_by_pool", lambda tag: False)
         for tag in self.desired.tags:
+            if tag not in on_disk and sent_by_pool(tag):
+                continue  # the pool sends it (D182): waited for, never fetched, never a failure
             if tag not in on_disk and self._may_retry(tag):
                 if not await self._pull(tag):
                     continue

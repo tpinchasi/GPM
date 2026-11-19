@@ -559,5 +559,14 @@ _ENGINES = {"ollama": OllamaFacts, "vllm": VllmFacts, "whisper-cpp": WhisperCppF
 
 
 def engine_facts(name: str, settings: Any = None) -> Optional[Any]:
+    if name == "onnx":
+        # Imported here: it builds on whisper.cpp's module, which imports this one (S15, D179).
+        from .onnx_engine import OnnxFacts
+
+        return OnnxFacts(settings)
+    if name == "container":
+        from .container_engine import ContainerFacts
+
+        return ContainerFacts(settings)
     factory = _ENGINES.get(name)
     return factory(settings) if factory else None

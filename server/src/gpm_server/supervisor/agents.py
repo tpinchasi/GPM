@@ -87,19 +87,54 @@ def _client(agent: AgentConfig, key: str, transport: Optional[httpx.AsyncBaseTra
 async def hold(
     agent: AgentConfig, tags: Iterable[str], residency: str,
     *, transport: Optional[httpx.AsyncBaseTransport] = None,
+    specs: Optional[dict[str, dict[str, Any]]] = None,
 ) -> Optional[dict[str, Any]]:
     """Send the whole desired state; read back where the machine stands. The agent works in
     the background and answers at once, so this never waits on a download. None on any failure:
-    the facts call already said whether the agent answers, and the next pass says it all again."""
+    the facts call already said whether the agent answers, and the next pass says it all again.
+
+    `specs`, by tag, are a trained model's declarations (D179, D180) — data, never a path, a URL
+    or a command — sent only where there are some, so every other body is as it was."""
     key = agent.key()
     if key is None:
         return None
+    body: dict[str, Any] = {"tags": sorted(tags), "residency": residency}
+    if specs:
+        body["specs"] = specs
     try:
         async with _client(agent, key, transport) as client:
-            response = await client.put(f"/agent/v{PROTOCOL}/models", json={"tags": sorted(tags), "residency": residency})
+            response = await client.put(f"/agent/v{PROTOCOL}/models", json=body)
         return response.json() if response.status_code == 200 else None
     except (httpx.HTTPError, ValueError):
         return None
+
+
+async def send_file(
+    agent: AgentConfig, digest: str, size: int, chunks: Any,
+    *, transport: Optional[httpx.AsyncBaseTransport] = None,
+) -> Optional[str]:
+    """Send a file uploaded to the pool to the agent (D182): its bytes and its sha256, nothing
+    else. None once the agent kept it; otherwise why not, in the agent's words."""
+    key = agent.key()
+    if key is None:
+        return "no key for this agent"
+    try:
+        async with httpx.AsyncClient(
+            base_url=agent.url, verify=agent.verify, transport=transport,
+            timeout=httpx.Timeout(30.0, read=600.0, write=600.0),
+            headers={"Authorization": f"Bearer {key}"},
+        ) as client:
+            response = await client.put(f"/agent/v{PROTOCOL}/model-file", content=chunks,
+                                        headers={"X-GPM-SHA256": digest, "Content-Length": str(size)})
+    except httpx.HTTPError as exc:
+        return f"the agent could not be sent the file: {str(exc) or type(exc).__name__}"
+    if response.status_code == 200:
+        return None
+    try:
+        said = response.json().get("detail") or response.text
+    except ValueError:
+        said = response.text
+    return f"the agent refused the file ({response.status_code}): {str(said)[:300]}"
 
 
 async def beat(

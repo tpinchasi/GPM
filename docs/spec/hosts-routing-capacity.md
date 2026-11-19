@@ -546,7 +546,7 @@ class**, derived from the variant and the host's platform, never typed in by han
 
 ### 4.4 What a request asks for, and what a build accepts (D142, D143)
 
-A request's path is its **kind** — chat, embeddings, transcription, ranking — and a build serves
+A request's path is its **kind** — chat, embeddings, transcription, ranking, prediction — and a build serves
 the kinds its catalog variant lists in `serves` (unset: chat and embeddings). A request carrying a
 picture or sound goes to a build whose `inputs` list it, else to one that states nothing; a build
 whose list leaves it out is never used. That is the structured-output guard's three-valued rule
@@ -563,6 +563,35 @@ catalog:
     variants:
       - { tag: "owner/my-vision-model", engine: "vllm", inputs: [image] }
       - { tag: "my-vision-model:7b" }        # Ollama: what it accepts is read from the host
+```
+
+**Trained models** (D178–D180) are builds that serve `predict`, on the engine `onnx` or
+`container`, and say what they take in and give back. A host kind other than `hosted` may hold
+them; rented machines hold them as profiles hold any build.
+
+```yaml
+containers: { enabled: false }          # D180: off by default; changeable from the console
+catalog:
+  my-classifier:
+    variants:
+      - tag: "owner/my-classifier/model.onnx"     # a hub file — or upload/<sha256> (D182)
+        engine: onnx
+        serves: [predict]
+        max_batch: 16
+        needs: { memory_gb: 1, card: false }
+        spec:
+          inputs:
+            image: { as: image, input: "pixel_values", size: [224, 224], channels: rgb,
+                     layout: nchw, scale: 255, mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225] }
+          outputs:
+            label: { as: scores, output: "logits", softmax: true, top_k: 3, labels: [cat, dog, bird] }
+  my-detector:
+    variants:
+      - tag: "registry.example/me/detector@sha256:…"   # a container image, by digest only
+        engine: container
+        serves: [predict]
+        port: 8080
+        needs: { memory_gb: 6, card: true }
 ```
 
 **Refused or waited for.** When no build of the model that any configured host, rented profile or

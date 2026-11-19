@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Mapping, Optional, Sequence
 from urllib.parse import urlparse
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -35,6 +36,7 @@ from ..configplan import (
     MachineNow,
     RentedNow,
     StaleVersion,
+    containers_turned_on,
     plan_changes,
     remove_list_item,
     set_in_list_item,
@@ -761,6 +763,8 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 # reloaded — so they are read from the supervisor, not from the config the
                 # app was built with.
                 "model_set": list(supervisor.config.pool.model_set),
+                # Whether container builds may run (D180), for the console's Add model.
+                "containers_enabled": supervisor.config.containers.enabled,
                 # Models only workloads serve (D115): offered for a workload, never shared.
                 "workload_models": sorted(
                     name for name, entry in supervisor.config.catalog.items() if entry.workloads_only
@@ -1060,6 +1064,17 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         refused = _moves_holding(body.get("text", ""))
         if refused is not None:
             return _error(409, "change_refused", refused)
+        # Raw text skips the plan, not this: containers run their image's code (D180).
+        try:
+            turned_on = containers_turned_on(supervisor.config, store().parse(body.get("text", "")))
+        except ConfigError:
+            turned_on = None  # refused below, by `apply`, in the operator's words
+        if turned_on is not None and str(body.get("confirm")) != turned_on.requires_retype:
+            return JSONResponse(status_code=400, content={
+                "error": "not_confirmed",
+                "detail": f"turning containers on is confirmed by typing the pool's name; send `confirm`: {turned_on.requires_retype!r}",
+                "changes": [turned_on.as_dict()],
+            })
         try:
             version = store().apply(body.get("text", ""), body.get("version"))
         except StaleVersion as exc:
@@ -1069,6 +1084,132 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         async with supervisor.pass_lock:  # a provider change never lands mid-pass (D135)
             supervisor.reload_config()
         return JSONResponse({"version": version})
+
+    @app.post("/pool/models/uploads")
+    async def upload_model(request: Request) -> JSONResponse:
+        """An ONNX file, streamed to the pool's store and kept by its sha256 (D182). Answers the
+        tag a catalog build names it by. Refused past `models.max_upload_mb`, before it is all read."""
+        from ..uploads import UploadRefused
+
+        try:
+            declared = int(request.headers.get("content-length") or "0")
+        except ValueError:
+            declared = 0
+        store = supervisor.uploads()
+        if declared > store.max_bytes:
+            return _error(413, "upload_too_large", f"the file is larger than models.max_upload_mb ({store.max_bytes // 2**20} MB)")
+        try:
+            digest, size = await store.keep(request.stream())
+        except UploadRefused as exc:
+            return _error(413 if "larger" in str(exc) else 400, "upload_refused", str(exc))
+        supervisor.events.record("model_uploaded", f"upload/{digest[:12]} kept ({size} bytes)", numbers={"bytes": size})
+        return JSONResponse({"tag": f"upload/{digest}", "size_bytes": size})
+
+    def _hub_store() -> Any:
+        from ..credentials import CredentialStore
+
+        return CredentialStore(supervisor.config.credentials_dir() / "hub")
+
+    @app.put("/pool/models/hub-credential")
+    async def set_hub_credential(request: Request) -> JSONResponse:
+        """The hub's tokens for relayed uploads (D182): a write token, tested with the hub and kept
+        by the supervisor alone; and a read-only one a rented machine is given. Never answered back."""
+        from .. import hubbuilds
+        from ..hubrelay import RelayFailed, whoami
+
+        body = await request.json()
+        if not isinstance(body, dict) or not any(isinstance(body.get(k), str) and body[k] for k in ("write_token", "read_token")):
+            return _error(400, "bad_request", "send write_token, read_token, or both")
+        bound = {"hub": hubbuilds.hub_url()}
+        said: dict[str, Any] = {}
+        checked: list[tuple[str, str]] = []
+        async with httpx.AsyncClient(base_url=hubbuilds.hub_url(), transport=supervisor._hub_transport, timeout=30) as hub:
+            for name, role in (("write_token", "write"), ("read_token", "read")):
+                token = body.get(name)
+                if not isinstance(token, str) or not token:
+                    continue
+                try:
+                    who = await whoami(hub, token)
+                except (RelayFailed, httpx.HTTPError) as exc:
+                    return _error(400, "credential_refused", f"{role} token: {exc}")
+                if role == "write" and who["role"] not in (None, "write", "fineGrained"):
+                    return _error(400, "credential_refused", "the write token cannot write: give one with write access")
+                if role == "read" and who["role"] == "write":
+                    # The one a rented machine would carry: never one that can write (D182). A
+                    # fine-grained token says no more than that; its scope is the operator's word.
+                    return _error(400, "credential_refused", "the read token can write: give a read-only one")
+                checked.append((role, token))
+                said[role] = {"user": who["user"], "role": who["role"]}
+        # Kept only once every token sent was found good: all or nothing.
+        for role, token in checked:
+            _hub_store().put(role, token, bound)
+        supervisor.events.record("hub_credential_set", f"the hub's {', '.join(sorted(said))} token saved")
+        return JSONResponse({"saved": said})
+
+    @app.delete("/pool/models/hub-credential")
+    async def remove_hub_credential(request: Request) -> JSONResponse:
+        removed = [role for role in ("write", "read") if _hub_store().remove(role)]
+        return JSONResponse({"removed": removed})
+
+    @app.post("/pool/models/uploads/{digest}/relay")
+    async def relay_upload(digest: str, request: Request) -> JSONResponse:
+        """Put an uploaded file into the operator's private hub repository (D182); answers the hub
+        build's tag, which machines then fetch as any build."""
+        from .. import hubbuilds
+        from ..hubrelay import RelayFailed, relay
+
+        body = await request.json()
+        store = supervisor.uploads()
+        path = store.path_of(digest)
+        if path is None:
+            return _error(404, "no_such_upload", f"upload/{digest} is not in the pool's store")
+        if not isinstance(body, dict) or not isinstance(body.get("repo"), str):
+            return _error(400, "bad_request", "send `repo`: the hub repository, owner/name")
+        token = _hub_store().get("write")
+        if token is None or not token.bound_to({"hub": hubbuilds.hub_url()}):
+            return _error(409, "no_hub_credential", "type the hub's write token first (PUT /pool/models/hub-credential)")
+        size = path.stat().st_size
+        with open(path, "rb") as handle:
+            sample = handle.read(512)
+
+        async def chunks(start: int, length: int):
+            with open(path, "rb") as handle:
+                handle.seek(start)
+                left = length
+                while left > 0:
+                    piece = handle.read(min(left, 1 << 20))
+                    if not piece:
+                        return
+                    left -= len(piece)
+                    yield piece
+
+        file = body.get("file") or f"model-{digest[:16]}.onnx"
+        async with httpx.AsyncClient(base_url=hubbuilds.hub_url(), transport=supervisor._hub_transport,
+                                     timeout=httpx.Timeout(60.0, read=1800.0, write=1800.0)) as hub:
+            try:
+                tag = await relay(hub, token.value, body["repo"], file, digest, size, sample, chunks)
+            except (RelayFailed, httpx.HTTPError) as exc:
+                return _error(502, "relay_failed", str(exc))
+        supervisor.events.record("upload_relayed", f"upload/{digest[:12]} put on the hub as {tag}")
+        return JSONResponse({"tag": tag})
+
+    @app.patch("/pool/containers")
+    async def set_containers(request: Request) -> JSONResponse:
+        """Turn container builds on or off (D180). On is confirmed by typing the pool's name: a
+        catalogued image then runs its own code on the machines that hold it."""
+        if store() is None:
+            return _error(400, "no_config_file", "this pool was not started from a file")
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
+            return _error(400, "bad_request", "send `enabled`: true or false")
+        text, version = store().read()
+        try:
+            text = set_values(text, ("containers",), {"enabled": body["enabled"]})
+        except CannotEdit:
+            if "\ncontainers:" in "\n" + text:
+                return _error(400, "cannot_edit", "`containers` is written on one line; change it on the Configuration screen")
+            text = text.rstrip("\n") + f"\ncontainers:\n  enabled: {'true' if body['enabled'] else 'false'}\n"
+        return _validate_plan_apply(text, version, body)
 
     @app.patch("/pool/config/rented")
     async def set_rented_search(request: Request) -> JSONResponse:
@@ -1659,6 +1800,11 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                                           known_connections()),
     )
 
+    # --- trained models: Add model (S15, D178–D182) ---
+    from .trained_api import register as register_trained
+
+    register_trained(app, supervisor, error=_error, validate_plan_apply=_validate_plan_apply)
+
     # --- hosted model APIs (S13, D171) ---
     from .hosted_api import register as register_hosted
 
@@ -1691,10 +1837,22 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
     async def rollback_config(request: Request) -> JSONResponse:
         if store() is None:
             return _error(400, "no_config_file", "this pool was not started from a file")
-        wanted = (await request.json()).get("version", "")
+        asked = await request.json()
+        wanted = asked.get("version", "")
         refused = _moves_holding(store().text_of(wanted) or "")
         if refused is not None:
             return _error(409, "change_refused", refused)
+        # A rollback is a write like any other: one that turns containers on is confirmed (D180).
+        try:
+            turned_on = containers_turned_on(supervisor.config, store().parse(store().text_of(wanted) or ""))
+        except ConfigError:
+            turned_on = None
+        if turned_on is not None and str(asked.get("confirm")) != turned_on.requires_retype:
+            return JSONResponse(status_code=400, content={
+                "error": "not_confirmed",
+                "detail": f"this version turns containers on; send `confirm`: {turned_on.requires_retype!r}",
+                "changes": [turned_on.as_dict()],
+            })
         try:
             version = store().rollback(wanted)
         except ConfigError as exc:

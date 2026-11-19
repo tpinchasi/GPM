@@ -103,6 +103,11 @@ HOSTED_ENGINE = "openai-api"
 ANTHROPIC_ENGINE = "anthropic-api"
 #: Every hosted engine: never pulled, loaded or rented; builds named for it carry a price.
 HOSTED_ENGINES = frozenset({HOSTED_ENGINE, ANTHROPIC_ENGINE})
+#: The engines of trained models (S15): an ONNX file (D179) and a container image (D180). They
+#: serve `predict` alone, and take only builds named for them.
+ONNX_ENGINE = "onnx"
+CONTAINER_ENGINE = "container"
+TRAINED_ENGINES = frozenset({ONNX_ENGINE, CONTAINER_ENGINE})
 
 
 def cloud_tag(tag: str) -> bool:
@@ -118,9 +123,113 @@ def cloud_tag(tag: str) -> bool:
 def _for_engine(variant: "Variant", engine: Optional[str]) -> bool:
     """`catalog.for_engine`'s rule, here for the configuration's own checks: a build naming no
     engine is any machine engine's; a hosted API takes only builds named for it (D164)."""
-    if engine in HOSTED_ENGINES:
+    if engine in HOSTED_ENGINES or engine in TRAINED_ENGINES:
         return variant.engine == engine
     return variant.engine is None or variant.engine == engine
+
+
+#: A name an app uses for one of a trained model's inputs or outputs (D179): the keys of `inputs`
+#: and `outputs` in a predict request and its answer.
+_PREDICT_FIELD = r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$"
+#: A tensor's name inside an ONNX file — free text there, held here to printable and short.
+_TENSOR_NAME = r"^[^\x00-\x1f\x7f]{1,128}$"
+_LABEL = r"^[^\x00-\x1f\x7f]{1,200}$"
+
+
+class PredictInput(BaseModel):
+    """How one input of an ONNX build arrives in a request (D179): numbers as sent, a picture the
+    pool decodes and prepares, or named values put in the order the model expects."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    as_: Literal["tensor", "image", "features"] = Field(alias="as")
+    #: The model's own input, by its name in the file.
+    input: str = Field(pattern=_TENSOR_NAME)
+    #: `image`: width and height the picture is resized to.
+    size: Optional[tuple[int, int]] = None
+    channels: Optional[Literal["rgb", "bgr", "gray"]] = None
+    layout: Optional[Literal["nchw", "nhwc"]] = None
+    #: `image`: each value divided by this, then less `mean` and over `std`, per channel.
+    scale: Optional[float] = Field(default=None, gt=0)
+    mean: Optional[list[float]] = None
+    std: Optional[list[float]] = None
+    #: `features`: the values' names, in the order the model's input takes them.
+    names: Optional[list[str]] = Field(default=None, min_length=1, max_length=4096)
+
+    @model_validator(mode="after")
+    def _says_what_its_kind_needs(self) -> "PredictInput":
+        image_fields = {"size": self.size, "channels": self.channels, "layout": self.layout,
+                        "scale": self.scale, "mean": self.mean, "std": self.std}
+        if self.as_ != "image" and any(v is not None for v in image_fields.values()):
+            raise ValueError(f"{sorted(k for k, v in image_fields.items() if v is not None)} are for `as: image` only")
+        if self.as_ != "features" and self.names is not None:
+            raise ValueError("`names` is for `as: features` only")
+        if self.as_ == "image":
+            missing = [k for k in ("size", "channels", "layout") if image_fields[k] is None]
+            if missing:
+                raise ValueError(f"`as: image` needs {missing}")
+            if not all(1 <= side <= 8192 for side in self.size):
+                raise ValueError("an image's size is two whole numbers from 1 to 8192: [width, height]")
+            count = 1 if self.channels == "gray" else 3
+            for name, values in (("mean", self.mean), ("std", self.std)):
+                if values is not None and len(values) != count:
+                    raise ValueError(f"`{name}` has one value per channel: {count} for {self.channels}")
+            if self.std is not None and any(v <= 0 for v in self.std):
+                raise ValueError("`std` values must be above zero")
+        if self.as_ == "features":
+            if self.names is None:
+                raise ValueError("`as: features` needs `names`, in the order the model's input takes them")
+            if len(set(self.names)) != len(self.names) or not all(re.match(_PREDICT_FIELD, n) for n in self.names):
+                raise ValueError("feature names are unique, and letters, digits, `_` and `-`")
+        return self
+
+
+class PredictOutput(BaseModel):
+    """What one output of an ONNX build means (D179)."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    as_: Literal["tensor", "scores", "vector", "value"] = Field(alias="as")
+    output: str = Field(pattern=_TENSOR_NAME)
+    #: `scores`: a label per score, in the model's order; softmax applied first or not; the best
+    #: `top_k` returned.
+    labels: Optional[list[str]] = Field(default=None, min_length=1, max_length=100_000)
+    softmax: Optional[bool] = None
+    top_k: Optional[int] = Field(default=None, ge=1, le=1000)
+
+    @model_validator(mode="after")
+    def _scores_alone_have_labels(self) -> "PredictOutput":
+        if self.as_ != "scores" and (self.labels is not None or self.softmax is not None or self.top_k is not None):
+            raise ValueError("`labels`, `softmax` and `top_k` are for `as: scores` only")
+        if self.labels is not None and not all(re.match(_LABEL, label) for label in self.labels):
+            raise ValueError("a label is printable text of at most 200 characters")
+        return self
+
+
+class PredictSpec(BaseModel):
+    """An ONNX build's declarations: what each input in a request is, and what each output in the
+    answer means. Data the agent is sent with the tag — never a path, a URL or a command (D179)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    inputs: dict[str, PredictInput] = Field(min_length=1, max_length=64)
+    outputs: dict[str, PredictOutput] = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _names_an_app_can_write(self) -> "PredictSpec":
+        for name in [*self.inputs, *self.outputs]:
+            if not re.match(_PREDICT_FIELD, name):
+                raise ValueError(f"{name!r}: an input's or output's name is letters, digits, `_` and `-`")
+        return self
+
+
+class BuildNeeds(BaseModel):
+    """What a trained model's build needs of a machine (D178)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    memory_gb: Optional[float] = Field(default=None, gt=0)
+    card: bool = False
 
 
 class Variant(BaseModel):
@@ -143,7 +252,7 @@ class Variant(BaseModel):
     size_gb: Optional[float] = Field(default=None, gt=0)
     #: What this build answers (D142). Unset: chat and embeddings — how every build behaved
     #: before kinds existed, so no catalog written then changes meaning.
-    serves: Optional[list[Literal["chat", "embed", "transcribe", "rerank"]]] = None
+    serves: Optional[list[Literal["chat", "embed", "transcribe", "rerank", "predict"]]] = None
     #: What it accepts besides text (D143). Three-valued, like `enforces_schema`: unset states
     #: nothing, and the build may still be sent a picture when none that lists one is free; a
     #: list refuses what it leaves out. A build that transcribes takes audio without saying so.
@@ -151,6 +260,41 @@ class Variant(BaseModel):
     #: What a hosted build costs (D164): required for one, meaningless elsewhere. Which provider
     #: serves it is said with `requires`, matched against a hosted host's `capabilities`.
     price: Optional[Price] = None
+    #: A trained model's build (S15). `spec`: an ONNX build's inputs and outputs (D179).
+    spec: Optional[PredictSpec] = None
+    #: An ONNX build: requests that arrive together run as one batch, up to this many.
+    max_batch: Optional[int] = Field(default=None, ge=1, le=1024)
+    needs: Optional[BuildNeeds] = None
+    #: A container build: the port its image serves the predict contract on (D180).
+    port: Optional[int] = Field(default=None, ge=1, le=65535)
+
+    @model_validator(mode="after")
+    def _a_trained_models_fields_are_its_own(self) -> "Variant":
+        trained = self.engine in TRAINED_ENGINES
+        if not trained:
+            if self.serves is not None and "predict" in self.serves:
+                raise ValueError(f"{self.tag!r}: only `engine: onnx` and `engine: container` builds serve `predict` (D178)")
+            given = [k for k in ("spec", "max_batch", "needs", "port") if getattr(self, k) is not None]
+            if given:
+                raise ValueError(f"{self.tag!r}: {given} are for a trained model's build (`engine: onnx` or `container`)")
+            return self
+        if self.serves is not None and set(self.serves) != {"predict"}:
+            raise ValueError(f"{self.tag!r}: a {self.engine} build serves `predict` alone (D178)")
+        if self.inputs is not None or self.price is not None or self.enforces_schema is not None:
+            raise ValueError(f"{self.tag!r}: `inputs`, `price` and `enforces_schema` are not a {self.engine} build's")
+        if self.engine == ONNX_ENGINE:
+            if self.needs is not None and self.needs.memory_gb is not None:
+                raise ValueError(f"{self.tag!r}: an ONNX build's `needs` is `card` alone; memory is a container's limit")
+            if self.spec is None:
+                raise ValueError(f"{self.tag!r}: an ONNX build says what its inputs and outputs are, in `spec` (D179)")
+            if self.port is not None:
+                raise ValueError(f"{self.tag!r}: `port` is a container build's; an ONNX build is served by the pool's own server")
+        else:
+            if self.port is None:
+                raise ValueError(f"{self.tag!r}: a container build names the port its image answers on, `port` (D180)")
+            if self.spec is not None or self.max_batch is not None:
+                raise ValueError(f"{self.tag!r}: `spec` and `max_batch` are an ONNX build's; a container prepares its own inputs")
+        return self
 
     @property
     def hosted(self) -> bool:
@@ -159,6 +303,8 @@ class Variant(BaseModel):
     def kinds(self) -> frozenset[str]:
         if self.serves is not None:
             return frozenset(self.serves)
+        if self.engine in TRAINED_ENGINES:
+            return frozenset({"predict"})
         # Anthropic's Messages format is chat alone (S12); every other build, chat and embeddings.
         return frozenset({"chat"}) if self.engine == ANTHROPIC_ENGINE else _CHAT_AND_EMBEDDINGS
 
@@ -1460,6 +1606,24 @@ class DirectoryConfig(BaseModel):
     hub_max_age_hours: float = Field(default=168.0, gt=0)
 
 
+class ModelsConfig(BaseModel):
+    """Trained models' files uploaded to the pool (D182)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: The largest file the console takes, in megabytes.
+    max_upload_mb: int = Field(default=2048, ge=1, le=65536)
+
+
+class ContainersConfig(BaseModel):
+    """Container builds (D180). A container runs its image's own code on the machine, so none
+    runs until this is on; a machine's owner can still refuse in its agent's settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+
+
 class PoolConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1479,6 +1643,10 @@ class PoolConfig(BaseModel):
     workloads: WorkloadsConfig = Field(default_factory=WorkloadsConfig)
     #: Programs creating their own workloads (D117).
     provisioning: ProvisioningConfig = Field(default_factory=ProvisioningConfig)
+    #: Whether container builds may run at all (D180): off by default.
+    containers: ContainersConfig = Field(default_factory=ContainersConfig)
+    #: Trained models' uploaded files (D182).
+    models: ModelsConfig = Field(default_factory=ModelsConfig)
     request_log: str = "gpm.sqlite3"
     directory: DirectoryConfig = Field(default_factory=DirectoryConfig)
 
@@ -1516,6 +1684,8 @@ class PoolConfig(BaseModel):
         self._copy_fits_the_preparing_window()
         self._builds_serve_what_their_engine_can()
         self._agent_managed_engines_are_well_placed()
+        self._containers_only_where_enabled()
+        self._one_build_one_declaration()
         self._rented_images_carry_what_builds_need()
         # Declared models first: a host that declares one it cannot hold is refused naming it and
         # the build it lacks, not as a host with no usable build of anything.
@@ -1920,6 +2090,10 @@ class PoolConfig(BaseModel):
                     break
         return reachable
 
+    def uploads_dir(self) -> Path:
+        """Where trained models' uploaded files are kept (D182): beside the database, owner-only."""
+        return Path(self.request_log).expanduser().resolve().parent / "model-uploads"
+
     def credentials_dir(self) -> Path:
         """Where typed-in provider credentials are kept (D130): beside the database unless named."""
         named = self.rented.credentials_dir if self.rented is not None else None
@@ -2108,6 +2282,8 @@ class PoolConfig(BaseModel):
                         f"variant matches both.{self._builds_missing(host, [name])} Give it the capability, "
                         f"add a variant for that engine, add a fallback with no requirements, or remove the host."
                     )
+            if not servable and not whole_set and not host.models and self.engine_of(host) in TRAINED_ENGINES:
+                continue  # a trained model's host, waiting for its first model (Add model, S15)
             if not servable:
                 raise ValueError(
                     f"host {host.id!r} has no usable variant of any model in the pool's set: it runs "
@@ -2243,7 +2419,13 @@ class PoolConfig(BaseModel):
             engine = get_engine(self.rented_engine())
         except EngineNotFound:
             return
-        if getattr(engine, "residency_from_agent", False):
+        if engine.name == CONTAINER_ENGINE:
+            raise ValueError(
+                "rented hosts cannot run container builds yet: a provider starts a rented machine from its "
+                "own command, not the image's, and takes no registry login; hold container builds on hosts "
+                "of your own (S15)"
+            )
+        if getattr(engine, "residency_from_agent", False) and engine.name not in TRAINED_ENGINES:
             raise ValueError(
                 f"rented hosts cannot run {engine.name}: its server is started by the agent of a machine "
                 "its owner set up (D148). Rent vLLM for speech to text, and run whisper.cpp on a host of your own"
@@ -2269,6 +2451,58 @@ class PoolConfig(BaseModel):
                     f"`rented.images` with `capabilities: {sorted(needs)}` — the host's agent checks the "
                     f"claim before it serves (D146)"
                 )
+
+    def _one_build_one_declaration(self) -> None:
+        """A trained model's build is declared once: the agent is told one set of declarations per
+        file, so two catalog entries naming one file must declare it alike."""
+        seen: dict[str, tuple[str, Any]] = {}
+        for name, entry in self.catalog.items():
+            for variant in entry.variants:
+                if variant.engine not in TRAINED_ENGINES:
+                    continue
+                needs = variant.needs or BuildNeeds()
+                said = (sorted(variant.kinds()), variant.spec.model_dump(by_alias=True, exclude_none=True) if variant.spec else None,
+                        variant.max_batch or 1, variant.port, needs.card, needs.memory_gb)
+                if variant.tag in seen and seen[variant.tag][1] != said:
+                    raise ValueError(
+                        f"{seen[variant.tag][0]!r} and {name!r} name the build {variant.tag!r} and declare it "
+                        "differently; a file is served one way — give both the same declarations, or one of them its own file"
+                    )
+                seen.setdefault(variant.tag, (name, said))
+
+    def _containers_only_where_enabled(self) -> None:
+        """A container build runs its image's code on a machine: none is catalogued while
+        `containers.enabled` is off (D180), so turning it off cannot leave one running."""
+        if self.containers.enabled:
+            return
+        found = sorted(name for name, entry in self.catalog.items()
+                       if any(v.engine == CONTAINER_ENGINE for v in entry.variants))
+        if found:
+            raise ValueError(
+                f"{found} have container builds, and containers are off: set `containers: {{enabled: true}}` "
+                "— a container runs its image's own code on the machines that hold it (D180)"
+            )
+
+    def trained_build_specs(self, tags: list[str]) -> dict[str, dict[str, Any]]:
+        """What the agent is told of each trained model's build it holds (D179, D180): the
+        declarations as data, by tag. Empty for every other build, so nothing else changes."""
+        found: dict[str, dict[str, Any]] = {}
+        wanted = set(tags)
+        for entry in self.catalog.values():
+            for variant in entry.variants:
+                if variant.tag not in wanted or variant.engine not in TRAINED_ENGINES:
+                    continue
+                said: dict[str, Any] = {"engine": variant.engine}
+                if variant.spec is not None:
+                    said["spec"] = variant.spec.model_dump(by_alias=True, exclude_none=True)
+                if variant.max_batch is not None:
+                    said["max_batch"] = variant.max_batch
+                if variant.port is not None:
+                    said["port"] = variant.port
+                if variant.needs is not None:
+                    said["needs"] = variant.needs.model_dump(exclude_none=True)
+                found[variant.tag] = said
+        return found
 
     def _agent_managed_engines_are_well_placed(self) -> None:
         """An engine whose server the host's agent runs — whisper.cpp (D148) — needs that agent,
@@ -2316,9 +2550,10 @@ class PoolConfig(BaseModel):
                 variants = entry.variants if entry else [Variant(tag=name)]
                 own = [v for v in variants if v.engine == engine.name and set(v.requires) <= set(host.capabilities)]
                 if not own:
+                    hint = getattr(engine, "build_tag_hint", "") or "a file in a hub repository (`owner/repo/file.bin`) (D148)"
                     raise ValueError(
                         f"host {host.id!r} runs {engine.name} and holds {name!r}, which has no build marked "
-                        f"`engine: {engine.name}`: give it one, a file in a hub repository (`owner/repo/file.bin`) (D148)"
+                        f"`engine: {engine.name}`: give it one, {hint}"
                     )
         for name, entry in self.catalog.items():
             for variant in entry.variants:
@@ -2329,9 +2564,10 @@ class PoolConfig(BaseModel):
                 except EngineNotFound:
                     continue
                 if pattern is not None and not pattern.match(variant.tag):
+                    hint = getattr(get_engine(variant.engine), "build_tag_hint", "") or (
+                        "`owner/repo/file.bin` — a hub repository and one `.bin` file at its root (D148)")
                     raise ValueError(
-                        f"{name!r}'s build {variant.tag!r} is not one {variant.engine} can fetch: expected "
-                        "`owner/repo/file.bin` — a hub repository and one `.bin` file at its root (D148)"
+                        f"{name!r}'s build {variant.tag!r} is not one {variant.engine} can fetch: expected {hint}"
                     )
 
 

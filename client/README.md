@@ -261,7 +261,7 @@ its idle cutoff.
 certificate, and the SDK uses it for every request (`pip install 'gpm-client[certs]'`). The
 private key never leaves your machine. Some grants require it.
 
-## Beyond chat: pictures, speech to text, ranking
+## Beyond chat: pictures, speech to text, ranking, trained models
 
 Ask the operator which models the pool has for each of these. A model name is the same kind of
 logical name as for chat: the pool picks the build that suits the host that gets the request.
@@ -336,6 +336,22 @@ with PoolClient() as pool:
 
 `rerank()` returns a `Ranking`: a list of `Ranked`, best first, that also carries the facts of
 the call as a `Reply` does.
+
+### A model you trained (from 0.9.0)
+
+A classifier, a detector, a forecaster — a model the pool's operator added as an ONNX file or a
+container image ([docs/trained-models.md](../docs/trained-models.md)). Its inputs and outputs
+are named as the operator declared them:
+
+```python
+with PoolClient() as pool:
+    prediction = pool.predict("pets", {"image": open("cat.jpg", "rb").read()})
+    best = prediction["label"][0]          # {"label": "cat", "score": 0.93}
+```
+
+Bytes — a picture — are sent as base64; a picture is never a link. `predict()` returns a
+`Prediction`: its `outputs`, and the facts of the call as a `Reply` carries them. It posts to
+`/v1/predict` with `{"model": ..., "inputs": {...}}`, so any HTTP client can do the same.
 
 ### With the OpenAI client instead
 

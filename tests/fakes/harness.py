@@ -150,6 +150,11 @@ class PoolHarness:
 
                 fake = FakeWhisperCpp()
                 fake.start(spec.resident)  # started by its agent, which the test stands in for
+            elif spec.engine in ("onnx", "container"):
+                from .fake_predict_server import FakePredictServer
+
+                fake = FakePredictServer()
+                fake.start(spec.resident)  # started by its agent, which the test stands in for
             else:
                 fake = FakeOllama(
                     resident=spec.resident, available=spec.available,
@@ -198,6 +203,10 @@ class PoolHarness:
                 from .fake_vllm import FakeVllm
 
                 fake = FakeVllm()
+            elif spec.engine in ("onnx", "container"):
+                from .fake_predict_server import FakePredictServer
+
+                fake = FakePredictServer()  # started by its agent, which the test stands in for
             else:
                 fake = FakeOllama(
                     resident=spec.resident, available=spec.available,
@@ -236,6 +245,9 @@ class PoolHarness:
                     **(pool_settings or {}),
                 },
                 "auth": {"app_keys": [APP_KEY]},
+                # The database the harness opens below: what the pool keeps beside it — uploads,
+                # credentials — lands in this test's own directory, never where the tests run.
+                "request_log": str(Path(self._tmp.name) / "gpm.sqlite3"),
                 "catalog": catalog or {},
                 "hosts": host_entries,
                 **({"rented": rented_section} if rented_section else {}),

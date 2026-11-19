@@ -1,0 +1,11 @@
+{
+  "onnxruntime": "1.32.0",
+  "python": "3.12",
+  "system": "linux",
+  "platform": "aarch64",
+  "accelerator": "cpu",
+  "wheels": 6,
+  "size_bytes": 45500986,
+  "requirements": "flatbuffers==25.12.19 \\\n    --hash=sha256:7634f50c427838bb021c2d66a3d1168e9d199b0607e6329399f04846d42e20b4\nnumpy==2.5.5 \\\n    --hash=sha256:a0750f2156d53446caca85663d0b65d67214e1664b9050454a731ea1418d176a\nonnxruntime==1.32.0 \\\n    --hash=sha256:e36c187006e7a7c8b8d6d57f1a209dd63f52430dca6c282b177718ad6b841054\npackaging==26.3 \\\n    --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c\npillow==13.0.0 \\\n    --hash=sha256:8bf295fe459343bc6093c8e5e0df60bfa189e0fcb775a22e2c2488fdeccc6c0d\nprotobuf==7.36.2 \\\n    --hash=sha256:e11e1f0180583a2af89db6a2ecd9e8dc40aa6d2988ca175bfd0e6d12ea72d74e\n",
+  "glibc": "2.28"
+}

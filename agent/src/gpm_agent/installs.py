@@ -720,8 +720,12 @@ class LockedRelease:
 #: (`vllm_install.VllmSource`).
 VLLM = LockedRelease(engine="vllm", project="vllm")
 
+#: What runs an ONNX build (S15, D179): ONNX Runtime with numpy and Pillow, and the pool's own
+#: server beside them, from a locked set (`onnx_install.OnnxRuntimeSource`).
+ONNX = LockedRelease(engine="onnx", project="onnxruntime")
+
 RELEASES: dict[str, ArchiveRelease | BuiltRelease | LockedRelease] = {
-    "ollama": OLLAMA, "whisper-cpp": WHISPER_CPP, "vllm": VLLM,
+    "ollama": OLLAMA, "whisper-cpp": WHISPER_CPP, "vllm": VLLM, "onnx": ONNX,
 }
 
 
@@ -857,6 +861,10 @@ def source_for(
         from .whisper_build import WhisperCppSource
 
         return WhisperCppSource(table, target, tools_dir=tools_dir)
+    if isinstance(table, LockedRelease) and table.engine == "onnx":
+        from .onnx_install import OnnxRuntimeSource
+
+        return OnnxRuntimeSource(target)
     if isinstance(table, LockedRelease):
         from .vllm_install import VllmSource
 

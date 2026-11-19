@@ -87,6 +87,7 @@ async def install(
     engine: str = "ollama",
     agent_port: int = AGENT_PORT,
     models_path: Optional[str] = None,
+    installs_engine: bool = False,
 ) -> str:
     """Put the agent on one host and return the key it minted.
 
@@ -123,10 +124,15 @@ async def install(
         f"{models_flag}"
         f"--engine-url http://127.0.0.1:{engine_port} "
         f"--heartbeat-file {HEARTBEAT} "
-        # On a host the pool created, what restarts the engine is the pool's own start-up
-        # material — fixed at installation, never sent over the protocol (D63 amending D41).
-        f"--restart-command {ENGINE_RESTART} "
-        f"--engine-env-file {ENGINE_ENV}"
+        + (
+            # An engine the agent installs and runs itself (ONNX Runtime, S15): from the locked set
+            # it carries, and restarted by the agent — no start-up material of the pool's (D150).
+            "--install-engines"
+            if installs_engine else
+            # On a host the pool created, what restarts the engine is the pool's own start-up
+            # material — fixed at installation, never sent over the protocol (D63 amending D41).
+            f"--restart-command {ENGINE_RESTART} --engine-env-file {ENGINE_ENV}"
+        )
     )
     if code != 0:
         raise AgentInstallFailed(f"the agent could not be set up: {output.strip()[:200]}")

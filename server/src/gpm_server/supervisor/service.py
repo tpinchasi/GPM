@@ -44,6 +44,7 @@ from ..ledger import EventLog, LeaseStore, SpendLedger
 from ..models import RENTED_KINDS, HostState
 from ..providers.base import ProviderAuthError, ProviderError, takes_credential
 from ..transports import SshTunnel, tunnel_maker
+from ..uploads import UploadStore, digest_of
 from . import agents
 from .renting import Fleet
 from .upgrades import EngineUpgrades
@@ -236,6 +237,12 @@ class Supervisor:
         self._preparing: dict[str, asyncio.Task[None]] = {}
         #: Tests substitute a transport that answers as an agent would.
         self._agent_transport: Optional[httpx.AsyncBaseTransport] = None
+        #: Uploaded files on their way to a host's agent (D182), by host and digest: one at a time each.
+        self._sending: dict[tuple[str, str], asyncio.Task[None]] = {}
+        #: A send that failed waits before the next: (when it may be tried again, the last wait, why).
+        self._send_after: dict[tuple[str, str], tuple[float, float, str]] = {}
+        #: How the model hub is reached for relayed uploads (D182) — only ever replaced by a test.
+        self._hub_transport: Optional[httpx.AsyncBaseTransport] = None
 
     def _build_fleet(self, config: PoolConfig, given: Optional[dict] = None) -> None:
         """The rented half of the pool, from the file's `rented` section: one plug-in per
@@ -249,6 +256,7 @@ class Supervisor:
                 self.accounts.install(name, config.rented.providers[name], built)
         self.fleet = Fleet(config, config.rented, providers, self.leases, self.events, self.spend)
         self.fleet.make_tunnel = self.make_tunnel
+        self.fleet.deliver_uploads = self.deliver_uploads_to
 
     def _start_renting(self, new: PoolConfig) -> None:
         """The file gained its first provider account while the pool runs: renting starts now,
@@ -665,6 +673,13 @@ class Supervisor:
         old = self.config
         self.config = new
         self.app_keys_changed = old.auth != new.auth
+        if old.containers.enabled != new.containers.enabled:
+            # Whoever turned it on, and however: the file by hand, the console or the API (D180).
+            self.events.record(
+                "containers_enabled" if new.containers.enabled else "containers_disabled",
+                "containers are on: a container build's image runs its own code on the machines that hold it"
+                if new.containers.enabled else "containers are off: no container build may be catalogued",
+            )
 
         before = {host.id: host for host in old.hosts}
         after = {host.id: host for host in new.hosts}
@@ -1050,14 +1065,75 @@ class Supervisor:
             # engine than the configuration names: those builds would be the wrong engine's.
             # After the platform is known, so the machine is asked for the right builds.
             models = await agents.hold(
-                host.agent_endpoint, host.required_tags, host.config.residency, transport=self._agent_transport
+                host.agent_endpoint, host.required_tags, host.config.residency, transport=self._agent_transport,
+                specs=self.config.trained_build_specs(sorted(host.required_tags)),
             )
             host.agent = dataclasses.replace(host.agent, models=models)
+            self._deliver_uploads(host, models)
             for kind, summary, numbers in agents.model_events(models_before, models):
                 self.events.record(kind, f"host {host.host_id}: {summary}", host_id=host.host_id, numbers=numbers)
         elif host.agent.reachable is False and models_before is not None:
             host.agent = dataclasses.replace(host.agent, models=None)
         await self._say_engine_version(host)
+
+    # --- files uploaded to the pool, sent to the hosts that hold them (D182) ---
+
+    def uploads(self) -> UploadStore:
+        return UploadStore(self.config.uploads_dir(), self.config.models.max_upload_mb * 2**20)
+
+    def _deliver_uploads(self, host: Any, report: Optional[dict[str, Any]]) -> None:
+        self.deliver_uploads_to(host.host_id, host.agent_endpoint, sorted(host.required_tags), report)
+
+    def deliver_uploads_to(self, host_id: str, agent: Any, tags: list[str], report: Optional[dict[str, Any]]) -> None:
+        """Send each uploaded build a host holds and does not have yet, in the background: a large
+        file never holds up the pass. One send per file and host at a time — owned or rented."""
+        if report is None or agent is None:
+            return
+        live = set(self.hosts) | (set(self.fleet.hosts) if self.fleet is not None else set())
+        for gone in [k for k in self._send_after if k[0] not in live]:
+            del self._send_after[gone]  # a host that left the pool keeps no wait
+        on_disk = {m.get("tag") for m in report.get("models") or [] if isinstance(m, dict) and m.get("on_disk")}
+        for tag in tags:
+            digest = digest_of(tag)
+            if digest is None or tag in on_disk:
+                continue
+            key = (host_id, digest)
+            if key in self._sending and not self._sending[key].done():
+                continue
+            waiting = self._send_after.get(key)
+            if waiting is not None and time.monotonic() < waiting[0]:
+                if waiting[2] != "missing" or self.uploads().path_of(digest) is None:
+                    continue  # it failed lately: a multi-gigabyte file is not sent again every pass
+                # Uploaded again since: the cause is gone, and the wait with it.
+            self._sending[key] = asyncio.create_task(self._send_upload(host_id, agent, digest), name=f"gpm:send:{host_id}")
+
+    async def _send_upload(self, host_id: str, agent: Any, digest: str) -> None:
+        key = (host_id, digest)
+        store = self.uploads()
+        path = store.path_of(digest)
+        failed: Optional[str]
+        cause = "missing"
+        if path is None:
+            failed = f"upload/{digest} is not in the pool's store ({store.directory}); upload it again"
+        else:
+            cause = "send"
+            try:
+                size = path.stat().st_size
+                failed = await agents.send_file(agent, digest, size, store.chunks(digest), transport=self._agent_transport)
+            except (OSError, ValueError) as exc:  # the file went, or could not be read, mid-send
+                failed = f"the pool's copy could not be read: {exc}"
+            if failed is None:
+                self._send_after.pop(key, None)
+                self.events.record("upload_sent", f"host {host_id}: upload/{digest[:12]} sent ({size} bytes)",
+                                   host_id=host_id, numbers={"bytes": size})
+                return
+        # Tried again after a minute, doubling to ten; each failure said once, not every pass. A
+        # file missing from the store is tried again as soon as it is uploaded again.
+        waited = self._send_after.get(key, (0.0, 0.0, cause))[1]
+        wait = min(max(60.0, waited * 2), 600.0)
+        self._send_after[key] = (time.monotonic() + wait, wait, cause)
+        self.events.record("upload_failed", f"host {host_id}: upload/{digest[:12]}: {failed} — tried again in {wait:.0f}s",
+                           host_id=host_id)
 
     # --- which engine a configured host runs (D93, D161) ---
 
@@ -1412,7 +1488,10 @@ class Supervisor:
 
             health = await self.engine_for(host).health(client)
             if not health.ok:
-                if self.engine_for(host).loads_by_restart:
+                # An engine whose server only its agent can start (S15) is brought up the same way
+                # as one that starts only once its models are here (D97): the agent first.
+                engine = self.engine_for(host)
+                if engine.loads_by_restart or getattr(engine, "installed_by_agent", False):
                     await self._bring_up_through_its_agent(host_id, host, client)
                 else:
                     host.mark_preparing()
@@ -1434,6 +1513,10 @@ class Supervisor:
             except httpx.HTTPError:
                 host.mark_preparing()
                 continue
+            if getattr(self.engine_for(host), "residency_from_agent", False):
+                # Its server cannot be trusted to say what it holds; its agent, which started it, says.
+                said = ((host.agent_facts or {}).get("engine") or {}).get("models_loaded")
+                resident = frozenset(t for t in said if isinstance(t, str)) if isinstance(said, list) else frozenset()
 
             # A rented host whose engine is serving from the processor is worthless at an
             # accelerator's price, and looks healthy by every other measure (D81). The driver

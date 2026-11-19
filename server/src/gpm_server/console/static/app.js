@@ -58,13 +58,27 @@ const api = {
   tightenLease: (id, body) => call("PATCH", `/pool/leases/${id}`, body),
   prepare: (body) => call("POST", "/pool/hosts/prepare", body),
   hostAction: (id, action) => call("POST", `/pool/hosts/${id}/${action}`),
+  // Trained models (S15, D178–D182).
+  inspectModel: (source) => call("POST", "/pool/models/inspect", source),
+  testModel: (build) => call("POST", "/pool/models/test", { build }),
+  addTrained: (body) => call("POST", "/pool/models/trained", body),
+  setContainers: (enabled, confirm) => call("PATCH", "/pool/containers", { enabled, confirm }),
+  // A file goes as itself, not as JSON: the pool keeps it by its own hash.
+  uploadModel: async (file) => {
+    const response = await fetch("/pool/models/uploads", {
+      method: "POST", headers: { Authorization: `Bearer ${ADMIN_KEY}` }, body: file,
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(payload?.detail || payload?.error || `${response.status}`);
+    return payload;
+  },
   down: () => call("POST", "/pool/down"),
   getConfig: () => call("GET", "/pool/config"),
   validateConfig: (text) => call("POST", "/pool/config/validate", { text }),
   planConfig: (text) => call("POST", "/pool/config/plan", { text }),
-  applyConfig: (text, version) => call("PUT", "/pool/config", { text, version }),
+  applyConfig: (text, version, confirm) => call("PUT", "/pool/config", { text, version, ...(confirm ? { confirm } : {}) }),
   configHistory: () => call("GET", "/pool/config/history"),
-  rollbackConfig: (version) => call("POST", "/pool/config/rollback", { version }),
+  rollbackConfig: (version, confirm) => call("POST", "/pool/config/rollback", { version, ...(confirm ? { confirm } : {}) }),
   testHost: (host) => call("POST", "/pool/hosts/test", host),
   hostDetail: (id) => call("GET", `/pool/hosts/${encodeURIComponent(id)}`),
   setSearch: (body) => call("PATCH", "/pool/config/rented", body),
@@ -3848,8 +3862,159 @@ screens.models = (status) => {
         el("td", {}, row.served ? residentPill(row) : pill("not served", "bad")))))),
     el("p", { class: "muted" }, "Models are added, and the variant each rented machine holds is chosen, under ",
       el("a", { href: "#rented/engine" }, "Rented capacity → Profiles"), "."),
+    trainedPanel(status),
   ];
 };
+
+// --- Add a trained model (S15, D178–D182) ---
+//
+// A model the operator trained: an ONNX file — uploaded here or on the hub — whose inputs and
+// outputs the pool reads from the file, each given how it arrives and what it means; or a container
+// image by digest. Test holds the declarations to the file; Add writes the catalog, the model set
+// and the hosts that hold it in one change. The draft lives across renders until it is added.
+const trained = { kind: "onnx", tag: "", file: null, inputs: [], outputs: [], name: "", port: 8080,
+  max_batch: 8, memory_gb: "", card: false, hosts: new Set(), problems: null, busy: "" };
+
+function trainedBuild() {
+  const needs = {};
+  if (trained.memory_gb && trained.kind === "container") needs.memory_gb = Number(trained.memory_gb);
+  if (trained.card) needs.card = true;
+  const build = { tag: trained.tag.trim(), engine: trained.kind };
+  if (Object.keys(needs).length) build.needs = needs;
+  if (trained.kind === "container") return { ...build, port: Number(trained.port) };
+  const numbers = (text) => text.split(",").map((v) => Number(v.trim())).filter((v) => !Number.isNaN(v));
+  const inputs = {}, outputs = {};
+  for (const i of trained.inputs) {
+    const decl = { as: i.as, input: i.input };
+    if (i.as === "image") {
+      Object.assign(decl, { size: [Number(i.width), Number(i.height)], channels: i.channels, layout: i.layout });
+      if (i.scale) decl.scale = Number(i.scale);
+      if (i.mean.trim()) decl.mean = numbers(i.mean);
+      if (i.std.trim()) decl.std = numbers(i.std);
+    }
+    if (i.as === "features") decl.names = i.names.split(",").map((n) => n.trim()).filter(Boolean);
+    inputs[i.name] = decl;
+  }
+  for (const o of trained.outputs.filter((o) => o.keep)) {
+    const decl = { as: o.as, output: o.output };
+    if (o.as === "scores") {
+      const labels = o.labels.split("\n").map((l) => l.trim()).filter(Boolean);
+      if (labels.length) decl.labels = labels;
+      if (o.softmax) decl.softmax = true;
+      if (o.top_k) decl.top_k = Number(o.top_k);
+    }
+    outputs[o.name] = decl;
+  }
+  return { ...build, spec: { inputs, outputs }, max_batch: Number(trained.max_batch) || 1 };
+}
+
+function readDeclarations(found) {
+  const safe = (n) => n.replace(/[^A-Za-z0-9_-]/g, "_").replace(/^[^A-Za-z_]/, "_").slice(0, 64) || "x";
+  trained.inputs = found.inputs.map((i) => {
+    const shape = i.shape || [];
+    const picture = shape.length === 4;
+    const nchw = picture && (shape[1] === 3 || shape[1] === 1);
+    const side = (k) => (typeof shape[k] === "number" ? shape[k] : 224);
+    return { name: safe(i.name), input: i.name, type: i.type, shape, as: picture ? "image" : shape.length === 2 ? "features" : "tensor",
+      width: nchw ? side(3) : side(2), height: nchw ? side(2) : side(1), channels: (nchw ? shape[1] : shape[3]) === 1 ? "gray" : "rgb",
+      layout: nchw || !picture ? "nchw" : "nhwc", scale: "255", mean: "", std: "",
+      names: typeof shape[1] === "number" && shape.length === 2 ? Array.from({ length: shape[1] }, (_, k) => `f${k}`).join(", ") : "" };
+  });
+  trained.outputs = found.outputs.map((o) => ({ name: safe(o.name), output: o.name, type: o.type, shape: o.shape || [],
+    keep: true, as: (o.shape || []).length === 2 ? "scores" : "tensor", labels: "", softmax: true, top_k: "" }));
+}
+
+function trainedPanel(status) {
+  const redraw = () => render();
+  const field = (label, input) => el("label", { class: "field" }, el("span", { class: "k" }, label), input);
+  const text = (value, set, attrs = {}) => el("input", { value, ...attrs, oninput: (e) => set(e.target.value) });
+  const choice = (value, options, set) => el("select", { onchange: (e) => { set(e.target.value); redraw(); } },
+    options.map((o) => el("option", { value: o, selected: o === value }, o)));
+  const hosts = (status.hosts || []).filter((h) => h.engine === trained.kind);
+  const busy = (what, work) => async () => {
+    trained.busy = what; redraw();
+    try { await work(); } catch (error) { alert(error.message); } finally { trained.busy = ""; redraw(); }
+  };
+  const read = busy("reading the file", async () => {
+    if (trained.file) trained.tag = (await api.uploadModel(trained.file)).tag;
+    readDeclarations(await api.inspectModel(trained.tag.startsWith("upload/") ? { upload: trained.tag } : { hub: trained.tag.trim() }));
+    trained.problems = null;
+  });
+  const test = busy("testing", async () => { trained.problems = (await api.testModel(trainedBuild())).problems; });
+  const add = busy("adding", async () => {
+    await api.addTrained({ name: trained.name.trim(), build: trainedBuild(), hosts: [...trained.hosts] });
+    Object.assign(trained, { tag: "", file: null, inputs: [], outputs: [], name: "", problems: null, hosts: new Set() });
+    await refresh();
+  });
+  const containers = async () => {
+    if (status.containers_enabled) { await api.setContainers(false); await refresh(); return; }
+    const sure = await confirmAction({
+      title: "Turn containers on", retype: status.pool, retypeLabel: "Type the pool's name to confirm", okLabel: "Turn on",
+      body: "A container build's image runs its own code on every machine that holds it whose owner has not set " +
+        "run_containers: never. Anyone with the admin key can then add an image of their choosing (D180).",
+    });
+    if (sure) { await api.setContainers(true, status.pool); await refresh(); }
+  };
+  const onnx = trained.kind === "onnx";
+  return el("div", { class: "panel" },
+    el("h2", {}, "Add a trained model"),
+    el("p", { class: "muted" }, "A model you trained that is not a language or speech model — a classifier, a detector, a forecaster. ",
+      "Apps ask it with POST /v1/predict: {model, inputs} → {model, outputs}."),
+    field("Comes as", choice(trained.kind, ["onnx", "container"], (v) => { trained.kind = v; trained.inputs = []; trained.outputs = []; })),
+    onnx
+      ? el("div", {},
+          field("The file", el("input", { type: "file", accept: ".onnx", onchange: (e) => { trained.file = e.target.files[0] || null; } })),
+          field("…or on the hub", text(trained.tag, (v) => { trained.tag = v; }, { placeholder: "owner/repo/model.onnx", class: "mono" })),
+          el("button", { onclick: read, disabled: !!trained.busy }, trained.busy === "reading the file" ? "reading…" : "Read the file"))
+      : el("div", {},
+          el("p", {}, "Containers are ", status.containers_enabled ? pill("on", "ok") : pill("off", "bad"), " ",
+            el("button", { onclick: containers }, status.containers_enabled ? "Turn off" : "Turn on…")),
+          field("Image, by digest", text(trained.tag, (v) => { trained.tag = v; }, { placeholder: "registry.example/me/model@sha256:…", class: "mono" })),
+          field("Port it answers on", text(String(trained.port), (v) => { trained.port = v; }, { type: "number", min: 1, max: 65535 })),
+          el("p", { class: "muted" }, "The image serves POST /v1/predict, GET /v1/models and GET /health on that port. One image per host.")),
+    onnx && trained.inputs.length ? el("div", {},
+      el("h3", {}, "What it takes in"),
+      el("table", {}, el("tbody", {}, trained.inputs.map((i) => el("tr", {},
+        el("td", { class: "mono" }, `${i.input}  ${i.type} [${i.shape.join(", ")}]`),
+        el("td", {}, field("named", text(i.name, (v) => { i.name = v; }))),
+        el("td", {}, field("arrives as", choice(i.as, ["tensor", "image", "features"], (v) => { i.as = v; }))),
+        el("td", {}, i.as === "image" ? el("div", {},
+            field("size", el("span", {}, text(String(i.width), (v) => { i.width = v; }, { size: 4 }), " × ", text(String(i.height), (v) => { i.height = v; }, { size: 4 }))),
+            field("channels", choice(i.channels, ["rgb", "bgr", "gray"], (v) => { i.channels = v; })),
+            field("layout", choice(i.layout, ["nchw", "nhwc"], (v) => { i.layout = v; })),
+            field("divide by", text(i.scale, (v) => { i.scale = v; }, { size: 5 })),
+            field("mean", text(i.mean, (v) => { i.mean = v; }, { placeholder: "0.485, 0.456, 0.406" })),
+            field("std", text(i.std, (v) => { i.std = v; }, { placeholder: "0.229, 0.224, 0.225" })))
+          : i.as === "features" ? field("names, in order", text(i.names, (v) => { i.names = v; }, { size: 40 }))
+          : el("span", { class: "muted" }, "numbers as sent, one example")))))),
+      el("h3", {}, "What it gives back"),
+      el("table", {}, el("tbody", {}, trained.outputs.map((o) => el("tr", {},
+        el("td", {}, el("input", { type: "checkbox", checked: o.keep, onchange: (e) => { o.keep = e.target.checked; } })),
+        el("td", { class: "mono" }, `${o.output}  ${o.type} [${o.shape.join(", ")}]`),
+        el("td", {}, field("named", text(o.name, (v) => { o.name = v; }))),
+        el("td", {}, field("means", choice(o.as, ["tensor", "scores", "vector", "value"], (v) => { o.as = v; }))),
+        el("td", {}, o.as === "scores" ? el("div", {},
+            field("labels, one a line", el("textarea", { rows: 3, oninput: (e) => { o.labels = e.target.value; } }, o.labels)),
+            field("softmax", el("input", { type: "checkbox", checked: o.softmax, onchange: (e) => { o.softmax = e.target.checked; } })),
+            field("best", text(o.top_k, (v) => { o.top_k = v; }, { size: 4, placeholder: "all" })))
+          : null))))),
+      field("Requests run together, up to", text(String(trained.max_batch), (v) => { trained.max_batch = v; }, { type: "number", min: 1, max: 1024 }))) : null,
+    trained.tag || trained.inputs.length ? el("div", {},
+      field("Apps ask for it as", text(trained.name, (v) => { trained.name = v; }, { class: "mono", placeholder: "my-classifier" })),
+      onnx ? null : field("Memory it may use (GB)", text(trained.memory_gb, (v) => { trained.memory_gb = v; }, { type: "number", min: 0, step: "0.5" })),
+      field("Needs a card", el("input", { type: "checkbox", checked: trained.card, onchange: (e) => { trained.card = e.target.checked; } })),
+      el("div", {}, el("span", { class: "k" }, "Held by "),
+        hosts.length ? hosts.map((h) => el("label", {}, el("input", { type: "checkbox", checked: trained.hosts.has(h.host_id),
+          onchange: (e) => { e.target.checked ? trained.hosts.add(h.host_id) : trained.hosts.delete(h.host_id); } }), ` ${h.host_id} `))
+          : el("span", { class: "muted" }, `no host runs ${trained.kind} yet — add one under Hosts, with an agent`)),
+      trained.problems === null ? null : trained.problems.length
+        ? el("div", { class: "panel" }, el("strong", {}, "Not yet: "), el("ul", {}, trained.problems.map((p) => el("li", {}, p))))
+        : el("p", {}, pill("matches its file", "ok"), onnx ? " — each machine also runs one made-up input through it before it serves." : ""),
+      el("div", {},
+        el("button", { onclick: test, disabled: !!trained.busy }, trained.busy === "testing" ? "testing…" : "Test"), " ",
+        el("button", { onclick: add, disabled: !!trained.busy }, trained.busy === "adding" ? "adding…" : "Add"))) : null,
+  );
+}
 
 screens.leases = async () => {
   const { leases } = await api.leases();
@@ -4863,16 +5028,18 @@ screens.config = async () => {
   applyButton.onclick = async (e) => {
     const plan = await api.planConfig(editor.value);
     const loosening = plan.changes.filter((c) => c.requires_retype);
+    // Turning containers on is asked first: what is typed for it is the pool's name (D180).
+    const asked = loosening.find((c) => c.kind === "containers_enabled") || loosening[0];
     if (loosening.length) {
       const ok = await confirmAction({
         title: "This loosens a limit",
         body: el("div", {}, loosening.map((c) => el("p", {}, c.detail))),
-        retype: loosening[0].value,
+        retype: asked.value,
       });
       if (!ok) return;
     }
     run(e.target, async () => {
-      await api.applyConfig(editor.value, current.version);
+      await api.applyConfig(editor.value, current.version, asked ? asked.value : undefined);
       await render();
     });
   };
@@ -4904,7 +5071,17 @@ screens.config = async () => {
             el("td", { class: "muted" }, new Date(version.applied_at * 1000).toLocaleString()),
             el("td", { class: "mono" }, version.version.slice(0, 12)),
             el("td", {}, el("button", { class: "small", onclick: (e) => run(e.target, async () => {
-              await api.rollbackConfig(version.version); await render();
+              try {
+                await api.rollbackConfig(version.version);
+              } catch (error) {
+                // A version that turns containers on asks for the pool's name, as any other way does (D180).
+                const asked = error.code === "not_confirmed" && (error.changes || []).find((c) => c.requires_retype);
+                if (!asked) throw error;
+                const ok = await confirmAction({ title: "This turns containers on", body: asked.detail, retype: asked.value });
+                if (!ok) return;
+                await api.rollbackConfig(version.version, asked.value);
+              }
+              await render();
             }) }, "Roll back"))))))
       : el("p", { class: "muted" }, "No applied versions yet."),
   ];

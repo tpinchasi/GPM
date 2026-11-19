@@ -1,0 +1,11 @@
+{
+  "onnxruntime": "1.32.0",
+  "python": "3.14",
+  "system": "macos",
+  "platform": "aarch64",
+  "accelerator": "cpu",
+  "wheels": 6,
+  "size_bytes": 33227392,
+  "requirements": "flatbuffers==25.12.19 \\\n    --hash=sha256:7634f50c427838bb021c2d66a3d1168e9d199b0607e6329399f04846d42e20b4\nnumpy==2.5.5 \\\n    --hash=sha256:229743571f901a082f031f511dc4f926b4b4a714075d98b1ff2af62d836365ac\nonnxruntime==1.32.0 \\\n    --hash=sha256:ab327b736552324af8d2a38bef5a65ed773f67184a36ff642beec7f5b4e9b03f\npackaging==26.3 \\\n    --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c\npillow==13.0.0 \\\n    --hash=sha256:d9b0a2bee3f3e03e9f29057aedb807dbf1e1d96ee1b9d0f422d9db6c8583271d\nprotobuf==7.36.2 \\\n    --hash=sha256:bdb3a345d48db958e6ce1f18e508beb0cc981d64f24088427549c866cd039f1e\n",
+  "macos": "14.0"
+}

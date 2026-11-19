@@ -76,6 +76,20 @@ class RentedNow:
     provider: str = ""
 
 
+def containers_turned_on(current: PoolConfig, candidate: PoolConfig) -> Optional[Change]:
+    """Turning containers on lets a catalogued image run its own code on every machine whose
+    owner has not refused (D180): confirmed by typing the pool's name again, whichever way the
+    file is written."""
+    if current.containers.enabled or not candidate.containers.enabled:
+        return None
+    return Change(
+        "containers_enabled",
+        "containers are turned on: a container build's image runs its own code on every machine that "
+        "holds it whose owner has not set `run_containers: never` (D180)",
+        requires_retype=candidate.pool.name,
+    )
+
+
 def plan_changes(
     current: PoolConfig,
     candidate: PoolConfig,
@@ -88,6 +102,9 @@ def plan_changes(
     held = list(rented)
     rented = [r for r in held if not r.host_id.startswith("volume:")]
     changes.extend(_machine_changes(candidate, machines or {}))
+    turned_on = containers_turned_on(current, candidate)
+    if turned_on is not None:
+        changes.append(turned_on)
 
     # --- hosts ---
     before = {host.id: host for host in current.hosts}

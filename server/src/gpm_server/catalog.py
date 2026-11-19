@@ -9,7 +9,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 
-from .config import HOSTED_ENGINE, CatalogEntry, Variant
+from .config import HOSTED_ENGINE, TRAINED_ENGINES, CatalogEntry, Variant
 
 
 @dataclasses.dataclass(frozen=True)
@@ -42,8 +42,9 @@ def for_engine(variant: "Variant", engine_name: str) -> bool:
     produces a host that looks ready and cannot serve. A hosted API takes only builds named for
     it (D164): they carry its price, and a plain tag is a machine's.
     """
-    if engine_name == HOSTED_ENGINE:
-        return variant.engine == HOSTED_ENGINE
+    if engine_name == HOSTED_ENGINE or engine_name in TRAINED_ENGINES:
+        # A trained model's engine, too: its builds are its own files and images (D178).
+        return variant.engine == engine_name
     return variant.engine is None or variant.engine == engine_name
 
 

@@ -505,6 +505,9 @@ class Fleet:
         self.state_dir = Path(config.request_log).expanduser().resolve().parent
         #: Tests dial the agent through their own transport; nothing else sets this.
         self._agent_transport = None
+        #: Sends files uploaded to the pool to a host's agent (D182): the supervisor's, set once it
+        #: has made the fleet — `(host_id, agent, tags, report)`.
+        self.deliver_uploads: Optional[Any] = None
         #: Engine adapters by name, loaded once each.
         self._engines: dict[str, Any] = {}
         #: How a forward is opened — `SshTunnel` here, or through the forwarder (D110), which the
@@ -1742,6 +1745,8 @@ class Fleet:
                 # Where the agent fetches to, for an engine that does not fetch for itself —
                 # the same directory its start command reads (D97).
                 models_path=hostagent.MODELS_DIR if self.engine_of(host).loads_by_restart else None,
+                # An engine its agent installs from the locked set it carries (ONNX Runtime, S15).
+                installs_engine=bool(getattr(self.engine_of(host), "installed_by_agent", False)),
             )
         except hostagent.HostNotReachable as exc:
             # Not an attempt: nothing was learned about the machine, only that it is not up yet.
@@ -2529,17 +2534,26 @@ class Fleet:
         # the slow way for its whole life — a minute of idle accelerator that D57 exists to
         # remove. A few seconds of patience is cheap next to that; a real silence still falls
         # back, as before.
+        if getattr(self.engine_of(host), "installed_by_agent", False):
+            # Its agent installs what runs the engine (S15): the newest version it carries a set
+            # for, started as soon as it is in, since nothing runs there yet to drain.
+            await agents.set_engine_version(host.agent, "latest", transport=self._agent_transport)
+        specs = self.config.trained_build_specs(tags)
         report = None
         for attempt in range(self.agent_hold_attempts):
             if attempt:
                 await asyncio.sleep(self.agent_hold_retry_s)
-            report = await agents.hold(host.agent, tags, "pinned", transport=self._agent_transport)
+            report = await agents.hold(host.agent, tags, "pinned", transport=self._agent_transport,
+                                       **({"specs": specs} if specs else {}))
             if report is not None:
                 break
         if report is None:
             host.agent_detail = "the agent stopped answering while the model set was loading"
             return None
         host.agent_models = report
+        if self.deliver_uploads is not None:
+            # Files uploaded to the pool go to a rented machine as to any (D182), through its tunnel.
+            self.deliver_uploads(host.host_id, host.agent, tags, report)
         held = {
             model.get("tag"): model
             for model in report.get("models", [])
