@@ -245,6 +245,9 @@ class PoolHarness:
                     **(pool_settings or {}),
                 },
                 "auth": {"app_keys": [APP_KEY]},
+                # The database the harness opens below: what the pool keeps beside it — uploads,
+                # credentials — lands in this test's own directory, never where the tests run.
+                "request_log": str(Path(self._tmp.name) / "gpm.sqlite3"),
                 "catalog": catalog or {},
                 "hosts": host_entries,
                 **({"rented": rented_section} if rented_section else {}),

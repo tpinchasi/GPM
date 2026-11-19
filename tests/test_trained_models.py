@@ -381,3 +381,8 @@ def test_gpm_config_apply_with_yes_confirms_turning_containers_on(tmp_path, monk
     args.yes = True
     assert cli._config(args) == 0
     assert sent == [("PUT", "/pool/config", {"text": "containers: {enabled: true}\n", "version": "v1", "confirm": "shop"})]
+
+
+def test_declarations_that_mean_the_same_are_alike():
+    same = {**ONNX_BUILD, "serves": ["predict"]}
+    config({CLASSIFIER: {"variants": [ONNX_BUILD]}, "pets-too": {"variants": [same]}})

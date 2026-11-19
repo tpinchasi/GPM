@@ -239,8 +239,8 @@ class Supervisor:
         self._agent_transport: Optional[httpx.AsyncBaseTransport] = None
         #: Uploaded files on their way to a host's agent (D182), by host and digest: one at a time each.
         self._sending: dict[tuple[str, str], asyncio.Task[None]] = {}
-        #: A send that failed waits before the next: (when it may be tried again, the last wait).
-        self._send_after: dict[tuple[str, str], tuple[float, float]] = {}
+        #: A send that failed waits before the next: (when it may be tried again, the last wait, why).
+        self._send_after: dict[tuple[str, str], tuple[float, float, str]] = {}
         #: How the model hub is reached for relayed uploads (D182) — only ever replaced by a test.
         self._hub_transport: Optional[httpx.AsyncBaseTransport] = None
 
@@ -1089,6 +1089,9 @@ class Supervisor:
         file never holds up the pass. One send per file and host at a time — owned or rented."""
         if report is None or agent is None:
             return
+        live = set(self.hosts) | (set(self.fleet.hosts) if self.fleet is not None else set())
+        for gone in [k for k in self._send_after if k[0] not in live]:
+            del self._send_after[gone]  # a host that left the pool keeps no wait
         on_disk = {m.get("tag") for m in report.get("models") or [] if isinstance(m, dict) and m.get("on_disk")}
         for tag in tags:
             digest = digest_of(tag)
@@ -1097,8 +1100,11 @@ class Supervisor:
             key = (host_id, digest)
             if key in self._sending and not self._sending[key].done():
                 continue
-            if time.monotonic() < self._send_after.get(key, (0.0, 0.0))[0]:
-                continue  # it failed lately: a multi-gigabyte file is not sent again every pass
+            waiting = self._send_after.get(key)
+            if waiting is not None and time.monotonic() < waiting[0]:
+                if waiting[2] != "missing" or self.uploads().path_of(digest) is None:
+                    continue  # it failed lately: a multi-gigabyte file is not sent again every pass
+                # Uploaded again since: the cause is gone, and the wait with it.
             self._sending[key] = asyncio.create_task(self._send_upload(host_id, agent, digest), name=f"gpm:send:{host_id}")
 
     async def _send_upload(self, host_id: str, agent: Any, digest: str) -> None:
@@ -1106,20 +1112,26 @@ class Supervisor:
         store = self.uploads()
         path = store.path_of(digest)
         failed: Optional[str]
+        cause = "missing"
         if path is None:
             failed = f"upload/{digest} is not in the pool's store ({store.directory}); upload it again"
         else:
-            size = path.stat().st_size
-            failed = await agents.send_file(agent, digest, size, store.chunks(digest), transport=self._agent_transport)
+            cause = "send"
+            try:
+                size = path.stat().st_size
+                failed = await agents.send_file(agent, digest, size, store.chunks(digest), transport=self._agent_transport)
+            except (OSError, ValueError) as exc:  # the file went, or could not be read, mid-send
+                failed = f"the pool's copy could not be read: {exc}"
             if failed is None:
                 self._send_after.pop(key, None)
                 self.events.record("upload_sent", f"host {host_id}: upload/{digest[:12]} sent ({size} bytes)",
                                    host_id=host_id, numbers={"bytes": size})
                 return
-        # Tried again after a minute, doubling to an hour; each failure said once, not every pass.
-        waited = self._send_after.get(key, (0.0, 0.0))[1]
-        wait = min(max(60.0, waited * 2), 3600.0)
-        self._send_after[key] = (time.monotonic() + wait, wait)
+        # Tried again after a minute, doubling to ten; each failure said once, not every pass. A
+        # file missing from the store is tried again as soon as it is uploaded again.
+        waited = self._send_after.get(key, (0.0, 0.0, cause))[1]
+        wait = min(max(60.0, waited * 2), 600.0)
+        self._send_after[key] = (time.monotonic() + wait, wait, cause)
         self.events.record("upload_failed", f"host {host_id}: upload/{digest[:12]}: {failed} — tried again in {wait:.0f}s",
                            host_id=host_id)
 

@@ -2460,7 +2460,9 @@ class PoolConfig(BaseModel):
             for variant in entry.variants:
                 if variant.engine not in TRAINED_ENGINES:
                     continue
-                said = variant.model_dump(exclude={"requires", "runtime_class", "size_gb"})
+                needs = variant.needs or BuildNeeds()
+                said = (sorted(variant.kinds()), variant.spec.model_dump(by_alias=True, exclude_none=True) if variant.spec else None,
+                        variant.max_batch or 1, variant.port, needs.card, needs.memory_gb)
                 if variant.tag in seen and seen[variant.tag][1] != said:
                     raise ValueError(
                         f"{seen[variant.tag][0]!r} and {name!r} name the build {variant.tag!r} and declare it "

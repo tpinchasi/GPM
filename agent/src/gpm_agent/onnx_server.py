@@ -153,6 +153,9 @@ class Build:
         options = onnxruntime.SessionOptions()
         options.log_severity_level = 3
         self.session = onnxruntime.InferenceSession(path, sess_options=options, providers=providers)
+        if needs_card and self.session.get_providers()[:1] == ["CPUExecutionProvider"]:
+            # Asked for a card and given the processor — CUDA that would not start, say.
+            raise ModelFault("it needs a card, and ONNX Runtime could only run it on the processor here")
         self.inputs = {meta.name: meta for meta in self.session.get_inputs()}
         self.outputs = {meta.name for meta in self.session.get_outputs()}
         for name, decl in spec["inputs"].items():

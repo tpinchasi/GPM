@@ -1122,6 +1122,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             return _error(400, "bad_request", "send write_token, read_token, or both")
         bound = {"hub": hubbuilds.hub_url()}
         said: dict[str, Any] = {}
+        checked: list[tuple[str, str]] = []
         async with httpx.AsyncClient(base_url=hubbuilds.hub_url(), transport=supervisor._hub_transport, timeout=30) as hub:
             for name, role in (("write_token", "write"), ("read_token", "read")):
                 token = body.get(name)
@@ -1133,11 +1134,15 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     return _error(400, "credential_refused", f"{role} token: {exc}")
                 if role == "write" and who["role"] not in (None, "write", "fineGrained"):
                     return _error(400, "credential_refused", "the write token cannot write: give one with write access")
-                if role == "read" and who["role"] != "read":
-                    # The one a rented machine would carry: never one that can write (D182).
+                if role == "read" and who["role"] == "write":
+                    # The one a rented machine would carry: never one that can write (D182). A
+                    # fine-grained token says no more than that; its scope is the operator's word.
                     return _error(400, "credential_refused", "the read token can write: give a read-only one")
-                _hub_store().put(role, token, bound)
+                checked.append((role, token))
                 said[role] = {"user": who["user"], "role": who["role"]}
+        # Kept only once every token sent was found good: all or nothing.
+        for role, token in checked:
+            _hub_store().put(role, token, bound)
         supervisor.events.record("hub_credential_set", f"the hub's {', '.join(sorted(said))} token saved")
         return JSONResponse({"saved": said})
 

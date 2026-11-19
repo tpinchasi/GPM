@@ -220,3 +220,20 @@ def test_a_build_the_pool_sends_is_waited_for_never_pulled_and_never_a_failure(m
     snapshot = asyncio.run(scenario())
     (model,) = snapshot["models"]
     assert model["tag"] == tag and not model["on_disk"] and model["error"] is None and model["attempts"] == 0
+
+
+def test_a_released_build_is_not_brought_back_by_another_builds_hold(machine):
+    """Found in the second review: holding one build re-added every declared build, released ones too."""
+    async def scenario():
+        await fetched(machine, DOUBLER, ADDER)
+        machine.set_specs({tag: OnnxFacts.checked_spec(tag, SPEC) for tag in (DOUBLER, ADDER)})
+        async with client(machine) as c:
+            await machine.hold(c, DOUBLER, pinned=True)
+            await machine.hold(c, ADDER, pinned=False)
+            assert machine._current()["tags"] == [DOUBLER]
+            await machine.hold(c, DOUBLER, pinned=True)
+            assert machine._current()["tags"] == [DOUBLER], "released, and stays released"
+            await machine.hold(c, ADDER, pinned=True)
+            assert machine._current()["tags"] == sorted([DOUBLER, ADDER]), "held again when the pool holds it"
+
+    asyncio.run(scenario())

@@ -146,8 +146,10 @@ class OnnxFacts:
         self.hub_transport = hub_transport
         #: The pool's declarations for each build it named, as last checked (`PUT /models`).
         self.specs: dict[str, dict[str, Any]] = {}
-        #: The builds the pool wants served now.
+        #: The builds the pool wants served now, and those it released — never brought back by
+        #: another build's hold until the pool holds them again.
         self._wanted: set[str] = set()
+        self._released: set[str] = set()
         self._process: Optional[host_platform.Process] = None
         self._record: Optional[dict[str, Any]] = None
         self._record_read = False
@@ -160,6 +162,7 @@ class OnnxFacts:
 
     def set_specs(self, specs: dict[str, dict[str, Any]]) -> None:
         self.specs = dict(specs)
+        self._released &= set(specs)
 
     @staticmethod
     def checked_spec(tag: str, said: Any) -> dict[str, Any]:
@@ -353,11 +356,13 @@ class OnnxFacts:
         build = build_of(tag)
         async with self._lock:
             if pinned:
-                # Every build the pool declared at once (its whole desired set): one start for all
-                # that are on disk, not one per build, each start loading every one before it.
-                self._wanted |= {build.tag, *self.specs}
+                # Every build the pool declared at once (its whole desired set) — less any it released
+                # — so one start serves all that are on disk, not one start per build.
+                self._released.discard(build.tag)
+                self._wanted |= {build.tag, *(set(self.specs) - self._released)}
             else:
                 self._wanted.discard(build.tag)
+                self._released.add(build.tag)
             with _refusing(f"{PROGRAM} could not be started with {build.tag}"):
                 await self._serve(client)
             if pinned:

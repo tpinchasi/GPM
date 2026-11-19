@@ -339,3 +339,36 @@ def test_a_file_an_agent_refuses_is_not_sent_again_every_pass(monkeypatch):
         assert sends == [1], "refused once, then waited for"
         failed = [r["summary"] for r in pool.database.query("SELECT kind, summary FROM events ORDER BY id") if r["kind"] == "upload_failed"]
         assert len(failed) == 1 and "below the floor" in failed[0] and "tried again in 60s" in failed[0]
+
+
+def test_tokens_are_kept_all_or_nothing(control_pool):
+    supervisor, api = control_pool
+    supervisor._hub_transport = FakeHub().transport
+    refused = api.put("/pool/models/hub-credential", json={"write_token": "hf_fake_write", "read_token": "hf_fake_write"})
+    assert refused.status_code == 400
+    assert not (supervisor.config.credentials_dir() / "hub" / "write.json").exists(), "the good one is not kept alone"
+
+
+def test_a_file_missing_from_the_store_is_sent_as_soon_as_it_is_uploaded_again(monkeypatch):
+    from test_trained_models import SPEC
+
+    monkeypatch.setenv("UPLOAD_AGENT_KEY", "test-agent-key")
+    build = {"tag": TAG, "engine": "onnx", "spec": SPEC}
+    with pool_harness(
+        [EngineSpec(id="box", resident=set(), engine="onnx"), EngineSpec(id="mac", resident={"chatter:7b"})],
+        model_set=["pets", "chatter"], catalog={"pets": {"variants": [build]}, "chatter": {"variants": [{"tag": "chatter:7b"}]}},
+        pool_settings={"models_per_host": "declared"},
+        host_overrides={"box": {"models": ["pets"], "agent": {"url": "http://127.0.0.1:8096", "bearer_env": "UPLOAD_AGENT_KEY"}},
+                        "mac": {"models": ["chatter"]}},
+    ) as pool:
+        agent_stub = Receiving()
+        pool.supervisor._agent_transport = agent_stub.transport
+        agent_stub.models = [{"tag": TAG, "on_disk": False}]
+        pool.reprobe()
+        pool.loop.run(settled(pool))
+        assert agent_stub.received == [] and any(
+            r["kind"] == "upload_failed" for r in pool.database.query("SELECT kind FROM events"))
+        asyncio.run(pool.supervisor.uploads().keep(chunks(FILE)))
+        pool.reprobe()
+        pool.loop.run(settled(pool))
+        assert [body for _, body in agent_stub.received] == [FILE], "uploaded again: sent at once, not after the wait"

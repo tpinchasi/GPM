@@ -35,9 +35,12 @@ class UploadStore:
         self.max_bytes = max_bytes
 
     def _ready(self) -> None:
-        # On Windows the folder inherits the profile's permissions (D163); elsewhere it is made
-        # owner-only below.
-        self.directory.mkdir(parents=True, exist_ok=True)
+        # Owner-only from the moment it exists on POSIX; on Windows it inherits the profile's
+        # permissions, as every folder the pool makes there (D163).
+        if os.name != "nt":
+            os.makedirs(self.directory, mode=0o700, exist_ok=True)
+        else:
+            self.directory.mkdir(parents=True, exist_ok=True)
         found = os.lstat(self.directory)
         mine = not hasattr(os, "getuid") or found.st_uid == os.getuid()
         if not stat.S_ISDIR(found.st_mode) or not mine:
