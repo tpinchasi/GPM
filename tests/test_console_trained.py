@@ -96,4 +96,16 @@ def test_a_model_is_read_described_tested_and_added_and_containers_turned_on(ser
         page.js("const i = document.getElementById('confirm-input'); i.value = 'shop'; i.dispatchEvent(new Event('input'));"
                 "document.getElementById('confirm-ok').click(); true")
         page.until("!!__button('Turn off')", within=30, what="containers on")
+
+        # A private registry's login, for rented machines (D183): saved, listed, never shown again.
+        page.js("__type(__field('Registry').querySelector('input'), 'ghcr.io');"
+                "__type(__field('User').querySelector('input'), 'me');"
+                "__type(__field('Password or token').querySelector('input'), 'not-a-real-password'); true")
+        page.js("__button('Save login').click(); true")
+        page.until("__panel().textContent.includes('ghcr.io') && !!__button('Remove')", within=30, what="the login listed")
+        assert page.js("__field('Password or token').querySelector('input').value") == ""
+        assert "not-a-real-password" not in page.js("document.body.innerHTML")
+        page.js("__type(__field('Start on a rented machine').querySelector('textarea'), 'python\\n-m\\nserver'); true")
+        assert page.js("JSON.stringify(trainedBuild().start)") == '["python","-m","server"]'
     assert supervisor.config.containers.enabled
+    assert supervisor.registry_logins().listed() == [{"registry": "ghcr.io", "username": "me"}]

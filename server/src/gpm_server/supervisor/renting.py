@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import re
+import shlex
 import time
 import uuid
 from pathlib import Path
@@ -511,6 +512,9 @@ class Fleet:
         #: The hub's read-only token, for a rented machine one of whose builds is a hub file
         #: (D184) — set by the supervisor; None, or answering None, places none.
         self.hub_read_token: Optional[Callable[[], Optional[str]]] = None
+        #: The login for an image's private registry, where the operator saved one (D183) — set by
+        #: the supervisor; handed only to a provider that declares `private_images`.
+        self.registry_login: Optional[Callable[[str], Any]] = None
         #: Engine adapters by name, loaded once each.
         self._engines: dict[str, Any] = {}
         #: How a forward is opened — `SshTunnel` here, or through the forwarder (D110), which the
@@ -1060,6 +1064,11 @@ class Fleet:
         line an operator should have to get exactly right."""
         if self.rented.engine_start:
             return self.rented.engine_start
+        container = self.config.rented_container_build()
+        if container is not None and container.start:
+            # The build's own start, as an argument list made into one line word by word (D183):
+            # in the background, as every engine is, so the start-up script goes on.
+            return f"nohup {shlex.join(container.start)} >/var/log/gpm-container.log 2>&1 &"
         return self.engine.default_start_command(
             port=self.engine_port,
             models_dir=hostagent.MODELS_DIR,
@@ -1734,6 +1743,11 @@ class Fleet:
             return
         if host.agent_attempts >= self.rented.agent_attempts:
             return
+        if self.engine_of(host).name == "container":
+            # The machine is the image (D183): its server is the build's, started by its `start`,
+            # and an agent there would look for a Docker to run images with. None is put on it.
+            host.agent_detail = "a rented container host is its image alone; it runs without the pool's agent"
+            return
         archive = agentpkg.cached(self.state_dir)
         if archive is None:
             host.agent_detail = "the agent could not be packed on the pool's machine"
@@ -1799,6 +1813,14 @@ class Fleet:
                 host_id=host.host_id,
                 lease_id=host.lease_id,
             )
+
+    def registry_login_for(self, image: str) -> Any:
+        """The operator's login for `image`'s registry, for a container build (D183) — None for any
+        other engine's image, or where none is saved."""
+        found = getattr(self, "registry_login", None)
+        if found is None or self.config.rented_container_build() is None:
+            return None
+        return found(image)
 
     def hub_token_for(self, host: RentedHost) -> Optional[str]:
         """The hub's read-only token for this machine, where one of its builds is a file on the hub
@@ -4261,11 +4283,23 @@ class Fleet:
                 onstart=self.deadman_onstart(for_this_host, offer.connection),
                 volume=self._volume_for(spec, offer, here, for_this_host, builds) if spec is not None else None,
             )
+            provider = self.provider_for(offer)
+            login = self.registry_login_for(image)
+            if login is not None and not getattr(provider.capabilities, "private_images", False):
+                # Its registry needs a login, and this provider takes none (D183): a machine bought
+                # here could never pull the image.
+                self.events.record(
+                    "offer_refused",
+                    f"{offer.machine_id}: its provider takes no registry login, and {login.registry} needs one for {image}",
+                    lease_id=lease.lease_id,
+                )
+                continue
             try:
                 # No price on an on-demand rental: the provider's listed rate is what is paid. A spot
                 # rental is told the most the pool pays, which a provider that takes a maximum price
                 # holds it to (D132).
-                instance = await self.provider_for(offer).create(offer, instance_spec, self._price_for_create(offer, capped, lease))
+                instance = await provider.create(offer, instance_spec, self._price_for_create(offer, capped, lease),
+                                                 **({"registry_login": login} if login is not None else {}))
             except (BidLost, OfferGone) as exc:
                 numbers = {"bid": capped, "offer": offer.offer_id, "score": offer_score}
                 response = getattr(exc, "response", None)

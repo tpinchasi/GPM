@@ -1,6 +1,6 @@
 # S15 — Trained models: say what the model takes and returns, and the pool does the rest
 
-> Status: **built against fakes** (2026-11-19) — D178–D182; stages 1–6, with renting for ONNX builds only (container renting and the hub token on rented machines wait for the owner). Part of the
+> Status: **built against fakes** (2026-11-19) — D178–D182; stages 1–6, with renting for ONNX builds only; container renting, the hub token on rented machines and ONNX on Windows were built in [S16](S16-trained-models-rented-and-windows.md). Part of the
 > [feature list](README.md).
 
 ## The story

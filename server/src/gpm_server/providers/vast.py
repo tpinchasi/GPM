@@ -88,6 +88,8 @@ class VastProvider:
         #: Vast sells volumes bound to one machine (D139, verified 2026-10-07): not used, and
         #: said, so keeping models between hosts is shown greyed here with that reason.
         volume_reach="machine",
+        #: `image_login` on create: "-u <user> -p <password> <registry>" (create-instance API).
+        private_images=True,
         interruptible=True,
         parkable=True,
         same_machine_rebid=True,
@@ -377,7 +379,8 @@ class VastProvider:
             raw=entry,
         )
 
-    async def create(self, offer: Offer, spec: InstanceSpec, bid: Optional[float]) -> Instance:
+    async def create(self, offer: Offer, spec: InstanceSpec, bid: Optional[float], *,
+                     registry_login: Any = None) -> Instance:
         env = " ".join(f"-e {key}={value}" for key, value in spec.env.items())
         env = " ".join(filter(None, [env] + [f"-p {port}:{port}" for port in spec.ports]))
         body: dict[str, Any] = {
@@ -393,6 +396,11 @@ class VastProvider:
             body["env"] = env
         if spec.onstart:
             body["onstart"] = spec.onstart
+        if registry_login is not None:
+            # Vast's own field for a private image (D183): the login goes to the provider, in this
+            # call alone; nothing here writes the body down.
+            body["image_login"] = (f"-u {registry_login.username} -p {registry_login.password} "
+                                   f"{registry_login.registry}")
 
         payload = await self._call("PUT", f"/api/v0/asks/{offer.offer_id}/", json=body)
         answer = redacted(payload)

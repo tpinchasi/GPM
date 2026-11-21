@@ -394,7 +394,7 @@ hosted` host and catalog builds.
   change a host's address (a different address is another host, added anew); edit a build written
   by hand without a pin (shown, left alone).
 
-## 11. Trained models on rented machines (S15, D179–D182)
+## 11. Trained models on rented machines (S15, S16, D179–D185)
 
 - **An ONNX build** rents as any build does, with `rented.engine: onnx`: the machine starts from a
   plain Python image (`python:3.12.16-slim-bookworm` by default, pinned), its agent is installed
@@ -402,10 +402,19 @@ hosted` host and catalog builds.
   locked set it carries, and takes each build from the hub or from the pool through the machine's
   tunnel (D182). The pool installs the agent before the engine answers — only the agent can start
   it — and reads what the server loaded from the agent, as for whisper.cpp.
-- **A container build** is not rented: refused by the configuration until the owner decides how an
-  image's own start and a registry login reach a provider (D180, D181 amended).
-- **A relayed upload's read token** is not placed on rented machines yet (D182 amended): a provider's
-  instance spec carries nothing secret.
+- **A container build** rents with `rented.engine: container` and its one model in `rented.models`
+  (D183): the machine is the build's image, started by the build's `start` (an argument list) after
+  the dead-man timer, on the build's `port`; no agent is put on it, and it is ready when
+  `GET /health` answers. `rented.image`, `engine_start`, `engine_port` and `engine_options` are
+  refused beside it. A **private image**'s registry login — saved by registry in the supervisor's
+  credential store — goes only into the create call of a plug-in declaring
+  `capabilities.private_images` (`registry_login=`); an offer from any other is refused for that
+  image. Vast takes it as `image_login`; RunPod keeps it as a registry credential, saved once per
+  login and named on each pod.
+- **A hub file's read-only token** (D184): on a machine one of whose builds is a hub file its agent
+  fetches, the supervisor's read-only token (never the write token) is copied over the SSH session
+  that installs the agent, as an owner-only file read into the agent's environment as `HF_TOKEN`.
+  It is never in the instance spec, which carries nothing secret; where it went is an event.
 - Leases, caps and the dead-man timer are unchanged.
 
 ## 9. Build order

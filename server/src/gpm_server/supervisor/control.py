@@ -1211,6 +1211,36 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             text = text.rstrip("\n") + f"\ncontainers:\n  enabled: {'true' if body['enabled'] else 'false'}\n"
         return _validate_plan_apply(text, version, body)
 
+    @app.get("/pool/containers/registry-logins")
+    async def list_registry_logins(request: Request) -> JSONResponse:
+        """The logins saved for private registries (D183): each registry and user name, never a password."""
+        try:
+            return JSONResponse({"logins": supervisor.registry_logins().listed()})
+        except Exception as exc:  # noqa: BLE001 — said, never a traceback
+            return _error(500, "credential_store", str(exc))
+
+    @app.put("/pool/containers/registry-logins")
+    async def set_registry_login(request: Request) -> JSONResponse:
+        """Save the login for one private registry (D183): kept by the supervisor alone, handed only
+        to a provider's own create call when a rented container host pulls from it. Never answered back."""
+        body = await request.json()
+        if not isinstance(body, dict) or not all(isinstance(body.get(k), str) and body[k] for k in ("registry", "username", "password")):
+            return _error(400, "bad_request", "send `registry`, `username` and `password`")
+        try:
+            supervisor.registry_logins().put(body["registry"], body["username"], body["password"])
+        except ValueError as exc:
+            return _error(400, "bad_request", str(exc))
+        registry = body["registry"].strip().lower()
+        supervisor.events.record("registry_login_set", f"a login for {registry} was saved, for rented container hosts")
+        return JSONResponse({"saved": {"registry": registry, "username": body["username"]}})
+
+    @app.delete("/pool/containers/registry-logins/{registry}")
+    async def remove_registry_login(registry: str, request: Request) -> JSONResponse:
+        if not supervisor.registry_logins().remove(registry):
+            return _error(404, "not_found", f"no login is saved for {registry}")
+        supervisor.events.record("registry_login_removed", f"the login for {registry.strip().lower()} was removed")
+        return JSONResponse({"removed": registry.strip().lower()})
+
     @app.patch("/pool/config/rented")
     async def set_rented_search(request: Request) -> JSONResponse:
         """Change what the Rented capacity screen edits: the offer search, the bidding, and how

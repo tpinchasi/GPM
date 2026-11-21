@@ -267,6 +267,11 @@ class Variant(BaseModel):
     needs: Optional[BuildNeeds] = None
     #: A container build: the port its image serves the predict contract on (D180).
     port: Optional[int] = Field(default=None, ge=1, le=65535)
+    #: A container build: the command that starts its server on a **rented** machine (D183) — an
+    #: argument list, run after the dead-man timer is armed, since a provider starts a rented
+    #: machine with its own command rather than the image's. Machines of the operator's own run the
+    #: image's own entrypoint and never use it.
+    start: Optional[list[str]] = Field(default=None, min_length=1, max_length=64)
 
     @model_validator(mode="after")
     def _a_trained_models_fields_are_its_own(self) -> "Variant":
@@ -274,7 +279,7 @@ class Variant(BaseModel):
         if not trained:
             if self.serves is not None and "predict" in self.serves:
                 raise ValueError(f"{self.tag!r}: only `engine: onnx` and `engine: container` builds serve `predict` (D178)")
-            given = [k for k in ("spec", "max_batch", "needs", "port") if getattr(self, k) is not None]
+            given = [k for k in ("spec", "max_batch", "needs", "port", "start") if getattr(self, k) is not None]
             if given:
                 raise ValueError(f"{self.tag!r}: {given} are for a trained model's build (`engine: onnx` or `container`)")
             return self
@@ -287,13 +292,17 @@ class Variant(BaseModel):
                 raise ValueError(f"{self.tag!r}: an ONNX build's `needs` is `card` alone; memory is a container's limit")
             if self.spec is None:
                 raise ValueError(f"{self.tag!r}: an ONNX build says what its inputs and outputs are, in `spec` (D179)")
-            if self.port is not None:
-                raise ValueError(f"{self.tag!r}: `port` is a container build's; an ONNX build is served by the pool's own server")
+            if self.port is not None or self.start is not None:
+                raise ValueError(f"{self.tag!r}: `port` and `start` are a container build's; an ONNX build is served "
+                                 "by the pool's own server")
         else:
             if self.port is None:
                 raise ValueError(f"{self.tag!r}: a container build names the port its image answers on, `port` (D180)")
             if self.spec is not None or self.max_batch is not None:
                 raise ValueError(f"{self.tag!r}: `spec` and `max_batch` are an ONNX build's; a container prepares its own inputs")
+            for word in self.start or []:
+                if not word or len(word) > 4096 or any(c in word for c in "\x00\n\r"):
+                    raise ValueError(f"{self.tag!r}: each word of `start` is one line of text, not empty (D183)")
         return self
 
     @property
@@ -1676,6 +1685,7 @@ class PoolConfig(BaseModel):
         self._hosted_builds_are_priced()
         self._rented_engine_is_said_where_the_default_moved()
         self._rented_engine_is_one_a_rented_host_can_run()
+        self._rented_container_builds_can_start()
         self._engine_can_hold_what_the_pool_asks()
         self._rented_hosts_have_a_build_of_what_they_rent_for()
         self._images_are_built_for_this_engine()
@@ -1752,6 +1762,9 @@ class PoolConfig(BaseModel):
         releases (D177), is used only until the registry has answered once."""
         if self.rented is not None and self.rented.image and self.rented.image != "latest":
             return self.rented.image
+        container = self.rented_container_build()
+        if container is not None:
+            return container.tag  # the build is the image (D183)
         from .engines import EngineNotFound, get_engine
 
         try:
@@ -2126,6 +2139,9 @@ class PoolConfig(BaseModel):
         """
         if self.rented is not None and self.rented.engine_port is not None:
             return self.rented.engine_port
+        container = self.rented_container_build()
+        if container is not None and container.port is not None:
+            return container.port  # where the image answers (D183)
         from .engines import EngineNotFound, get_engine
 
         try:
@@ -2408,6 +2424,43 @@ class PoolConfig(BaseModel):
                 f"`engine: vllm` (the model's hub repository) and say `rented.engine: vllm`"
             )
 
+    def rented_container_build(self) -> Optional[Variant]:
+        """The container build rented machines start from, where rented hosts run container builds
+        (D183): the one model they may hold's build for the engine — None otherwise."""
+        if self.rented is None or self.rented_engine() != CONTAINER_ENGINE:
+            return None
+        names = self._models_rented_hosts_may_hold()
+        if len(names) != 1 or names[0] not in self.catalog:
+            return None
+        return next((v for v in self.catalog[names[0]].variants if v.engine == CONTAINER_ENGINE), None)
+
+    def _rented_container_builds_can_start(self) -> None:
+        """A rented machine is one image, started by the build's own `start` (D183): one model,
+        whose container build says how it starts, and nothing beside it that names another image
+        or another start."""
+        if self.rented is None or self.rented_engine() != CONTAINER_ENGINE:
+            return
+        names = self._models_rented_hosts_may_hold()
+        if len(names) != 1:
+            raise ValueError(
+                f"rented container hosts are one image each, so they hold one model; they may now hold {names}. "
+                "Name one in `rented.models` (several images are several pools of hosts, D183)"
+            )
+        build = self.rented_container_build()
+        if build is None:
+            raise ValueError(f"rented hosts run container builds, and {names[0]!r} has none (D183)")
+        if not build.start:
+            raise ValueError(
+                f"{names[0]!r}'s container build ({build.tag}) says no `start`: a provider starts a rented machine "
+                "with its own command, not the image's, so the build names the command that starts its server (D183)"
+            )
+        named = [k for k in ("image", "engine_start", "engine_port") if getattr(self.rented, k) not in (None, "latest")]
+        if self.rented.images or self.rented.engine_options or named:
+            raise ValueError(
+                f"rented container hosts start from the build's image, its `start` and its `port`; remove rented."
+                f"{', rented.'.join(named + (['images'] if self.rented.images else []) + (['engine_options'] if self.rented.engine_options else []))} (D183)"
+            )
+
     def _rented_engine_is_one_a_rented_host_can_run(self) -> None:
         """An engine whose server the host's agent starts on a machine its owner set up —
         whisper.cpp (D148) — has no image a rented host could start from."""
@@ -2420,11 +2473,7 @@ class PoolConfig(BaseModel):
         except EngineNotFound:
             return
         if engine.name == CONTAINER_ENGINE:
-            raise ValueError(
-                "rented hosts cannot run container builds yet: a provider starts a rented machine from its "
-                "own command, not the image's, and takes no registry login; hold container builds on hosts "
-                "of your own (S15)"
-            )
+            return  # one image, started by the build's own `start` (D183)
         if getattr(engine, "residency_from_agent", False) and engine.name not in TRAINED_ENGINES:
             raise ValueError(
                 f"rented hosts cannot run {engine.name}: its server is started by the agent of a machine "

@@ -1081,3 +1081,50 @@ def test_the_self_terminate_request_never_carries_a_credential(monkeypatch):
     stop = api.self_terminate_request("stop")
     assert stop.method == "POST" and stop.url.endswith("/pods/$RUNPOD_POD_ID/action")
     assert json.loads(stop.body) == {"action": "stop"}
+
+
+async def test_a_private_images_login_is_saved_with_runpod_once_and_named_on_each_pod():
+    """D183: `POST /v2/registries` once per login, its id as the pod's `registry`."""
+    from gpm_server.providers import RunPodProvider as Provider
+    from gpm_server.registry_logins import RegistryLogin
+
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path, json.loads(request.read() or b"null")))
+        if request.url.path == "/v2/registries":
+            return httpx.Response(201, json={"id": "reg42", "name": "x"})
+        return httpx.Response(201, json=pod(status="PROVISIONING"))
+
+    login = RegistryLogin("ghcr.io", "me", "not-a-real-password")
+    p = provider(handler)
+    offer = await an_offer(min_gpus=1)
+    await p.create(offer, SPEC, None, registry_login=login)
+    await p.create(offer, SPEC, None, registry_login=login)
+    registries = [body for method, path, body in seen if path == "/v2/registries"]
+    assert len(registries) == 1, "saved once, then named"
+    assert registries[0]["username"] == "me" and registries[0]["password"] == "not-a-real-password"
+    assert registries[0]["name"].startswith("gpm-") and "me" not in registries[0]["name"]
+    pods = [body for method, path, body in seen if path == "/v2/pods"]
+    assert [b["registry"] for b in pods] == ["reg42", "reg42"]
+    assert all("not-a-real-password" not in json.dumps(b) for b in pods)
+    assert Provider.capabilities.private_images
+
+
+async def test_a_login_runpod_already_keeps_is_found_by_its_name():
+    from gpm_server.registry_logins import RegistryLogin
+
+    names = []
+
+    def handler(request):
+        if request.method == "POST" and request.url.path == "/v2/registries":
+            names.append(json.loads(request.read())["name"])
+            return httpx.Response(400, json={"error": "a registry auth with this name already exists"})
+        if request.method == "GET" and request.url.path == "/v2/registries":
+            return httpx.Response(200, json=[{"id": "other", "name": "gpm-else"}, {"id": "reg7", "name": names[0]}])
+        body = json.loads(request.read())
+        assert body["registry"] == "reg7"
+        return httpx.Response(201, json=pod(status="PROVISIONING"))
+
+    await provider(handler).create(await an_offer(min_gpus=1), SPEC, None,
+                                   registry_login=RegistryLogin("ghcr.io", "me", "not-a-real-password"))

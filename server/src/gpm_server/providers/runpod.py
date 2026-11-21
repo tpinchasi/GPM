@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import datetime
+import hashlib
 import json
 import logging
 import math
@@ -131,6 +132,9 @@ class RunPodProvider:
     capabilities = ProviderCapabilities(
         #: Spot ("interruptible") pods are no longer offered: every pod is on demand.
         interruptible=False,
+        #: A private image's login is saved with RunPod (`POST /v2/registries`) and named on the pod
+        #: (`registry`), so it is RunPod's to use when it pulls (D183).
+        private_images=True,
         #: `stop` releases the GPU and keeps the volume disk; `start` boots the pod back on the
         #: same machine — and fails if its GPU has been taken meanwhile.
         parkable=True,
@@ -202,6 +206,9 @@ class RunPodProvider:
         self.charges_window_days = 45
         #: A guard on the paginated pod listing: better to refuse than to act on half of it.
         self.max_instance_pages = 50
+        #: Registry credentials this plug-in saved with RunPod, by the name it gave each (D183): one
+        #: per login, made once and named on every pod that pulls from that registry.
+        self._registries: dict[str, str] = {}
         #: The provider's `Retry-After`, honoured: until then no call is made.
         self._quiet_until = 0.0
         #: How long a log read listens: the stream stays open after its backfill.
@@ -490,21 +497,50 @@ class RunPodProvider:
         volume = max(_MIN_VOLUME_GB, total - math.ceil(self.container_disk_gb))
         return max(1, total - volume), volume
 
-    async def create(self, offer: Offer, spec: InstanceSpec, bid: Optional[float]) -> Instance:
+    async def create(self, offer: Offer, spec: InstanceSpec, bid: Optional[float], *,
+                     registry_login: Any = None) -> Instance:
         if bid is not None:
             raise ProviderError("RunPod rents on demand only: a pod is created at its listed price, never with a bid")
         cloud, _, rest = offer.offer_id.partition(":")
         gpu_id, _, count = rest.rpartition(":")
         if cloud not in _CLOUDS or not gpu_id or not count.isdigit():
             raise ProviderError(f"not an offer from this provider: {offer.offer_id!r}")
+        registry = await self._registry_for(registry_login) if registry_login is not None else None
         if spec.volume is None:
-            pod = await self._create_pod(offer, spec, cloud, gpu_id, int(count))
+            pod = await self._create_pod(offer, spec, cloud, gpu_id, int(count), registry=registry)
             return Instance(instance_id=str(pod["id"]), label=spec.label, machine_id=offer.machine_id, raw=pod,
                             location=str(pod.get("dataCenterId") or "") or None)
-        return await self._create_with_volume(offer, spec, cloud, gpu_id, int(count))
+        return await self._create_with_volume(offer, spec, cloud, gpu_id, int(count), registry=registry)
+
+    async def _registry_for(self, login: Any) -> str:
+        """The id of the registry credential RunPod keeps for `login`, saved with it the first time
+        this plug-in needs it (D183). Named by a digest of the login, so a changed password is a new
+        credential and the old one is never used again; the password is sent in this call alone."""
+        name = "gpm-" + hashlib.sha256(
+            f"{login.registry}\n{login.username}\n{login.password}".encode()).hexdigest()[:20]
+        if name in self._registries:
+            return self._registries[name]
+        response = await self._send("POST", "/registries",
+                                    json={"name": name, "username": login.username, "password": login.password})
+        if response.status_code < 400:
+            found = response.json().get("id") if response.content else None
+        elif response.status_code in (400, 409):
+            # Saved before, by an earlier run of the pool: found by its name.
+            listed = await self._call("GET", "/registries", missing_ok=True)
+            rows = listed if isinstance(listed, list) else (listed or {}).get("registries") or []
+            found = next((r.get("id") for r in rows if isinstance(r, dict) and r.get("name") == name), None)
+            if found is None:
+                raise ProviderError(f"RunPod would not keep the login for {login.registry}: "
+                                    f"{self._quiet(_problem(response))}")
+        else:
+            raise self._fail("POST", "/registries", response)
+        if not isinstance(found, str) or not found:
+            raise ProviderError(f"RunPod kept the login for {login.registry} and gave no id for it")
+        self._registries[name] = found
+        return found
 
     async def _create_with_volume(self, offer: Offer, spec: InstanceSpec, cloud: str, gpu_id: str,
-                                  count: int) -> Instance:
+                                  count: int, registry: Optional[str] = None) -> Instance:
         """A pod with a network volume mounted (D139): the one named, or a new one made for it in
         a data center the offer can land in. Either the pod is in the volume's data center, or
         nothing this call made is left — never a pod elsewhere without its volume."""
@@ -538,7 +574,8 @@ class RunPodProvider:
             made = True
 
         try:
-            pod = await self._create_pod(offer, spec, cloud, gpu_id, count, network=(volume_id, volume.mount, where))
+            pod = await self._create_pod(offer, spec, cloud, gpu_id, count, network=(volume_id, volume.mount, where),
+                                         registry=registry)
             pod_id = str(pod["id"])
             landed = str(pod.get("dataCenterId") or "") or None
             if landed is None:
@@ -571,7 +608,8 @@ class RunPodProvider:
                         volume_id=volume_id, location=landed or where)
 
     async def _create_pod(self, offer: Offer, spec: InstanceSpec, cloud: str, gpu_id: str, count: int,
-                          network: Optional[tuple[str, str, str]] = None) -> dict[str, Any]:
+                          network: Optional[tuple[str, str, str]] = None,
+                          registry: Optional[str] = None) -> dict[str, Any]:
         """The pod itself, created and starting, or an error with nothing left behind. `network`
         is (volume, mount path, data center) for a pod that mounts a network volume."""
         if network is not None:
@@ -599,6 +637,8 @@ class RunPodProvider:
             body["mounts"] = {"persistent": {"size": volume_gb, "path": self.volume_path}}
         if spec.env:
             body["env"] = {str(k): str(v) for k, v in spec.env.items()}
+        if registry is not None:
+            body["registry"] = registry  # the saved login's id: RunPod pulls the private image with it (D183)
         if spec.onstart:
             # The start-up script is the container's command. Its last line keeps the container
             # alive: a pod whose command returns is `EXITED`, and the script's work (the timer,
