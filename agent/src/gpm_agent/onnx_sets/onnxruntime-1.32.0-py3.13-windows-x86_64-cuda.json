@@ -1,0 +1,12 @@
+{
+  "onnxruntime": "1.32.0",
+  "python": "3.13",
+  "system": "windows",
+  "platform": "x86_64",
+  "accelerator": "cuda",
+  "wheels": 13,
+  "size_bytes": 1347902810,
+  "requirements": "flatbuffers==25.12.19 \\\n    --hash=sha256:7634f50c427838bb021c2d66a3d1168e9d199b0607e6329399f04846d42e20b4\nnumpy==2.5.5 \\\n    --hash=sha256:e0608d1585557b68dcb6a70a41654f7536567960afad79d91752d2863b242b68\nnvidia-cublas==13.10.0.20 \\\n    --hash=sha256:c310b749eea855b88fafb906de08d6819b87216c6711640771764fea5dcd8546\nnvidia-cuda-nvrtc==13.5.37 \\\n    --hash=sha256:e8e6c10b251385707ae3abd7b4ee118de6736fd7678d0f0f4eab4d759f679c21\nnvidia-cuda-runtime==13.5.37 \\\n    --hash=sha256:f225d3fa5ea6bfbb58fc4979ef72375cbe661d9107f0d8a4ff22cc151525e4a9\nnvidia-cudnn-cu13==9.28.1.4 \\\n    --hash=sha256:73d874c6bd8a1c75ca040228f77c4e163efe9bab3b65bd85914e2b7334ac68ee\nnvidia-cufft==12.5.0.14 \\\n    --hash=sha256:78e7585159ecf37d73af1ce43a5dea7fd3360e1af71cde08f070c07966a336bc\nnvidia-curand==10.4.5.25 \\\n    --hash=sha256:f6a02a70f5b9715235df31a164a4bf3237a45be1600a5f435f5e4a0d8682eb22\nnvidia-nvjitlink==13.5.37 \\\n    --hash=sha256:4465d4e8f2212118220b580c82523c5654f93a62906bd51d29d79bdfc12376c1\nonnxruntime-gpu==1.32.0 \\\n    --hash=sha256:9e7b6b5772c5cd99be9c47dace5f0b2faf4608f6ab638cdc0bccc096405baaee\npackaging==26.3 \\\n    --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c\npillow==13.0.0 \\\n    --hash=sha256:9dda0788a9932776a75d8bcc020076edc308ce2508b51f6739a45e3158b3fc42\nprotobuf==7.36.2 \\\n    --hash=sha256:a300819d441e078a5608c0d3c709796bb548136058fda017ae51d425b44fd353\n",
+  "driver_floor": "580",
+  "cuda_runtime": "13.5.37"
+}

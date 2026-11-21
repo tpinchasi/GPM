@@ -3,11 +3,11 @@
 A version is a private Python environment with exactly the wheels of one set — ONNX Runtime, numpy
 and Pillow, and on a Linux machine with an NVIDIA card CUDA's and cuDNN's libraries as wheels too —
 and the pool's own ONNX server (`onnx_server.py`) copied beside it. Sets are generated at GPM's
-release by `tools/onnx-lock` for Linux (x86_64 and aarch64) and Apple-silicon Macs; on Windows, an
-owner gives the agent a Python of their own (`engine_binary`), which this does not install.
+release by `tools/onnx-lock` for Linux (x86_64 and aarch64), Windows (x86_64, D185) and
+Apple-silicon Macs; an owner may instead give the agent a Python of their own (`engine_binary`).
 
-The machine decides the set: the CUDA one where an NVIDIA card's driver meets its floor, else the
-processor's. Nothing is fetched before the machine is found able to run it.
+The machine decides the set: the CUDA one (Linux and Windows) where an NVIDIA card's driver meets
+its floor, else the processor's. Nothing is fetched before the machine is found able to run it.
 """
 
 from __future__ import annotations
@@ -38,15 +38,16 @@ from .vllm_install import (
     VENV_TIMEOUT_S,
     WORK,
     _last_words,
+    card_reasons,
     driver_key,
     index_arguments,
-    machine_can_run,
     machine_glibc,
     move_environment,
     nvidia_cards,
     pip_argv,
     this_python,
     venv_argv,
+    venv_python,
 )
 
 SETS_DIR = Path(__file__).parent / "onnx_sets"
@@ -61,7 +62,7 @@ MIN_CAPABILITY = (6, 0)
 class OnnxSet:
     onnxruntime: str
     python: str
-    #: "linux" or "macos".
+    #: "linux", "windows" or "macos".
     system: str
     #: "x86_64" or "aarch64".
     platform: str
@@ -111,7 +112,7 @@ def server_source() -> bytes:
 
 def program_in(version_dir: Path) -> Path:
     """A version's interpreter: the server is run by it, never by the agent's."""
-    return Path(version_dir) / VENV / "bin" / "python"
+    return venv_python(Path(version_dir) / VENV)
 
 
 def server_in(version_dir: Path) -> Path:
@@ -126,7 +127,7 @@ def server_argv(python: str, server: str, port: int, plan: Path) -> list[str]:
 
 
 def check_argv(venv: Path) -> list[str]:
-    return [str(venv / "bin" / "python"), "-I", "-c",
+    return [str(venv_python(venv)), "-I", "-c",
             "import numpy, PIL, onnxruntime; print('onnxruntime', onnxruntime.__version__)"]
 
 
@@ -163,7 +164,8 @@ class OnnxRuntimeSource:
     ) -> None:
         self.target = target
         self.python = python or this_python()
-        self.system = {host_platform.LINUX: "linux", host_platform.MACOS: "macos"}.get(target.os)
+        self.system = {host_platform.LINUX: "linux", host_platform.MACOS: "macos",
+                       host_platform.WINDOWS: "windows"}.get(target.os)
         arch = target.arch or ""
         self.processor = PROCESSORS.get(arch, arch if arch in ("x86_64", "aarch64") else None)
         self.sets = sets
@@ -192,7 +194,7 @@ class OnnxRuntimeSource:
         refused = _installs().InstallRefused
         if self.system is None:
             raise refused(
-                "the agent installs ONNX Runtime on Linux and on Apple-silicon Macs; on this machine, give it a "
+                "the agent installs ONNX Runtime on Linux, Windows and Apple-silicon Macs; on this machine, give it a "
                 "Python with onnxruntime, numpy and pillow installed (`engine_binary`)"
             )
         if self.processor is None:
@@ -246,8 +248,8 @@ class OnnxRuntimeSource:
             if cards is None:
                 reasons.append("nvidia-smi does not answer here: no NVIDIA card, or no driver for one")
             else:
-                reasons += machine_can_run(cards, os_name="Linux", arch=self.processor or "", minimum=MIN_CAPABILITY,
-                                           driver_floor=locked.driver_floor or "")
+                reasons += card_reasons(cards, minimum=MIN_CAPABILITY, driver_floor=locked.driver_floor or "",
+                                        needs="ONNX Runtime's CUDA")
         return reasons
 
     async def choose(self, version: str) -> tuple[OnnxSet, list[str]]:
@@ -306,7 +308,9 @@ class OnnxRuntimeSource:
             requirements.write_text(locked.requirements)
             installed = await self.run(
                 pip_argv(venv, requirements, index),
-                env=host_platform.program_environment({"TMPDIR": str(work), **PIP_SETTINGS}),
+                # Where pip unpacks: the work directory, by every name a system reads it by.
+                env=host_platform.program_environment({"TMPDIR": str(work), "TEMP": str(work), "TMP": str(work),
+                                                       **PIP_SETTINGS}),
                 timeout_s=INSTALL_TIMEOUT_S, low_priority=True, log=log,
             )
             if installed.code != 0:
