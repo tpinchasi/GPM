@@ -879,7 +879,9 @@ def source_for(
 class InstallState:
     """`<engines>/<engine>/state.json`: which version runs, which is staged, which came before,
     the latest seen and when, what the pool last asked for, and the last error. Versions that
-    failed to start here are remembered, and not tried again by `latest` (D153)."""
+    failed to start here are remembered, and not tried again by `latest` (D153). `failure` is
+    what a failed install or check last wrote in `error`: the next one that succeeds takes it out
+    of `error` if `error` still says it, across a restart of the agent too."""
 
     running: Optional[str] = None
     staged: Optional[str] = None
@@ -889,6 +891,7 @@ class InstallState:
     wanted: Optional[str] = None
     error: Optional[str] = None
     failed: dict[str, str] = dataclasses.field(default_factory=dict)
+    failure: Optional[str] = None
 
     @classmethod
     def read(cls, path: Path) -> InstallState:
@@ -915,6 +918,7 @@ class InstallState:
             wanted=wanted if isinstance(wanted, str) and (wanted == LATEST or VERSION.fullmatch(wanted)) else None,
             error=body.get("error") if isinstance(body.get("error"), str) else None,
             failed={k: str(v) for k, v in failed.items() if isinstance(k, str) and VERSION.fullmatch(k)},
+            failure=body.get("failure") if isinstance(body.get("failure"), str) else None,
         )
 
     def write(self, path: Path) -> None:
@@ -1038,9 +1042,6 @@ class Installer:
         #: What the installer last said in the record's error about what it was asked — a version
         #: it will not go back to, a latest older than what runs — removed once that no longer holds.
         self._told: Optional[str] = None
-        #: What a failed install or check last wrote in the record's error: taken out by the next
-        #: one that succeeds, if the error still says it — never a notice that pass wrote itself.
-        self._failure_error: Optional[str] = None
 
     # --- what the pool sees ---
 
@@ -1333,12 +1334,14 @@ class Installer:
                     await self._stage(http, release)
             self._retry_at.pop(wanted, None)
             self._backoff = (None, 0.0)
-            if self._failure_error is not None and self.record.error == self._failure_error:
+            record = self.record
+            if record.failure is not None:
                 # A check that failed — GitHub out of reach — and then succeeded with nothing to
                 # stage: what it said no longer holds. A notice this pass wrote does not match.
-                self.record.error = None
+                if record.error == record.failure:
+                    record.error = None
+                record.failure = None
                 self._save()
-            self._failure_error = None
             target = self.record.staged
             if self.record.running is None and target:
                 # Nothing runs yet, so there is nothing to drain: the first version starts now.
@@ -1353,7 +1356,7 @@ class Installer:
             wait = min(waited * 2, RETRY_AT_MOST_S) if asked == wanted else RETRY_AFTER_S
             self._backoff = (wanted, wait)
             self._retry_at[wanted] = self.clock() + wait
-            self.record.error = self._failure_error = str(no) or type(no).__name__
+            self.record.error = self.record.failure = str(no) or type(no).__name__
             with contextlib.suppress(OSError):
                 self._save()
         finally:
