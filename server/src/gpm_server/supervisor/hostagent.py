@@ -31,6 +31,9 @@ SETTINGS = f"{REMOTE_DIR}/agent.json"
 HEARTBEAT = f"{REMOTE_DIR}/heartbeat"
 ENGINE_RESTART = f"{REMOTE_DIR}/restart-engine.sh"
 ENGINE_ENV = f"{REMOTE_DIR}/engine.env"
+#: The hub's read-only token, for an agent that fetches a private hub file (D184): owner-only,
+#: read into the agent's environment as it starts — never on its command line or in its settings.
+HUB_ENV = f"{REMOTE_DIR}/hub.env"
 #: The agent listens here, on the host's loopback only. Never exposed; the pool forwards to it.
 AGENT_PORT = 8195
 #: Where an engine the agent fetches for keeps its weights on a rented host (D97). On the
@@ -88,8 +91,13 @@ async def install(
     agent_port: int = AGENT_PORT,
     models_path: Optional[str] = None,
     installs_engine: bool = False,
+    hub_token: Optional[str] = None,
 ) -> str:
     """Put the agent on one host and return the key it minted.
+
+    `hub_token`, where given, is the hub's read-only token (D184): copied as an owner-only file
+    over the same connection and read into the agent's environment as `HF_TOKEN` when it starts,
+    so it never appears in a command line, the agent's settings or the provider's instance spec.
 
     `run(command) -> (code, output)` and `push(data, path) -> (code, output)` are the pool's
     existing ways of reaching a rented host: one SSH exec, and one with a file on its input.
@@ -140,6 +148,14 @@ async def install(
     if minted is None:
         raise AgentInstallFailed("the agent did not mint a key this pool could read")
 
+    environment = ""
+    if hub_token:
+        code, output = await push(f"HF_TOKEN={shlex.quote(hub_token)}\nexport HF_TOKEN\n".encode(), HUB_ENV)
+        if code != 0:
+            # Its output is the machine's shell's, never the token: the token went on its input.
+            raise AgentInstallFailed(f"the hub's read token could not be copied: {output.strip()[:200]}")
+        environment = f". {HUB_ENV}; "
+
     # Started detached, so it outlives this SSH session; its log stays on the host for an
     # operator who goes looking, and carries no request content.
     #
@@ -151,7 +167,7 @@ async def install(
     # (`AGENT_PROCESS`); a BSD `pkill` spares its ancestors, a Linux one does not.
     code, output = await run(
         f"pkill -f '{AGENT_PROCESS}' 2>/dev/null; sleep 0.5; "
-        f"(setsid nohup python3 {ARCHIVE} -c {SETTINGS} serve "
+        f"({environment}setsid nohup python3 {ARCHIVE} -c {SETTINGS} serve "
         f">{REMOTE_DIR}/agent.log 2>&1 &) ; sleep 1; "
         f"kill -0 $(pgrep -f '{AGENT_PROCESS}' | head -1) 2>/dev/null && echo started"
     )

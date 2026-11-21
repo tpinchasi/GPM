@@ -257,6 +257,7 @@ class Supervisor:
         self.fleet = Fleet(config, config.rented, providers, self.leases, self.events, self.spend)
         self.fleet.make_tunnel = self.make_tunnel
         self.fleet.deliver_uploads = self.deliver_uploads_to
+        self.fleet.hub_read_token = self.hub_read_token
 
     def _start_renting(self, new: PoolConfig) -> None:
         """The file gained its first provider account while the pool runs: renting starts now,
@@ -1083,6 +1084,18 @@ class Supervisor:
 
     def _deliver_uploads(self, host: Any, report: Optional[dict[str, Any]]) -> None:
         self.deliver_uploads_to(host.host_id, host.agent_endpoint, sorted(host.required_tags), report)
+
+    def hub_read_token(self) -> Optional[str]:
+        """The hub's read-only token the operator saved (D182), for a rented machine (D184): only the
+        one saved as read-only, only for the hub it was saved for — never the write token."""
+        from .. import hubbuilds
+        from ..credentials import CredentialStore
+
+        try:
+            found = CredentialStore(self.config.credentials_dir() / "hub").get("read")
+        except Exception:  # noqa: BLE001 — a store that cannot be read holds no token
+            return None
+        return found.value if found is not None and found.bound_to({"hub": hubbuilds.hub_url()}) else None
 
     def deliver_uploads_to(self, host_id: str, agent: Any, tags: list[str], report: Optional[dict[str, Any]]) -> None:
         """Send each uploaded build a host holds and does not have yet, in the background: a large

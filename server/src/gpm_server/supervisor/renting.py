@@ -19,7 +19,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from gpm_agent import volume as model_volume
 
@@ -508,6 +508,9 @@ class Fleet:
         #: Sends files uploaded to the pool to a host's agent (D182): the supervisor's, set once it
         #: has made the fleet — `(host_id, agent, tags, report)`.
         self.deliver_uploads: Optional[Any] = None
+        #: The hub's read-only token, for a rented machine one of whose builds is a hub file
+        #: (D184) — set by the supervisor; None, or answering None, places none.
+        self.hub_read_token: Optional[Callable[[], Optional[str]]] = None
         #: Engine adapters by name, loaded once each.
         self._engines: dict[str, Any] = {}
         #: How a forward is opened — `SshTunnel` here, or through the forwarder (D110), which the
@@ -1735,6 +1738,7 @@ class Fleet:
         if archive is None:
             host.agent_detail = "the agent could not be packed on the pool's machine"
             return
+        hub_token = self.hub_token_for(host)
         try:
             key = await hostagent.install(
                 run=lambda command: self.run_on_host(host, command),
@@ -1747,6 +1751,7 @@ class Fleet:
                 models_path=hostagent.MODELS_DIR if self.engine_of(host).loads_by_restart else None,
                 # An engine its agent installs from the locked set it carries (ONNX Runtime, S15).
                 installs_engine=bool(getattr(self.engine_of(host), "installed_by_agent", False)),
+                hub_token=hub_token,
             )
         except hostagent.HostNotReachable as exc:
             # Not an attempt: nothing was learned about the machine, only that it is not up yet.
@@ -1786,6 +1791,24 @@ class Fleet:
             host_id=host.host_id,
             lease_id=host.lease_id,
         )
+        if hub_token:
+            # Where the read token went is the operator's to know (D184); the token itself, never.
+            self.events.record(
+                "hub_token_placed",
+                f"{host.host_id} was given the hub's read-only token, to fetch a private hub file; it leaves with the machine",
+                host_id=host.host_id,
+                lease_id=host.lease_id,
+            )
+
+    def hub_token_for(self, host: RentedHost) -> Optional[str]:
+        """The hub's read-only token for this machine, where one of its builds is a file on the hub
+        its agent fetches (D184) — never for a machine with none, never the write token."""
+        token = getattr(self, "hub_read_token", None)
+        if token is None or not getattr(self.engine_of(host), "installed_by_agent", False):
+            return None
+        if not any(not tag.startswith("upload/") for tag in self.tags_for(host)):
+            return None
+        return token()
 
     #: Lines in a machine's boot output worth repeating when a host never answered. A stuck
     #: host writes thousands of lines and almost all of them are ordinary; these are the ones
