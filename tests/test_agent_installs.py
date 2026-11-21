@@ -975,6 +975,46 @@ async def test_a_check_that_failed_is_no_longer_said_once_one_succeeds_with_noth
     assert Installer(source, tmp_path / "engines" / "ollama", StandInServer()).state()["error"] is None, "saved"
 
 
+async def test_a_failed_checks_error_is_taken_out_after_a_restart_too(tmp_path):
+    """The agent restarted between the failed check and the one that succeeds: the record says
+    what the failure wrote, so the new agent takes it out as the old one would have."""
+    source, installer, now = scripted(tmp_path)
+    source.fails = False
+    await asked_every_minute(installer, now, "latest", 1)
+    healthy = source.latest
+    unreachable = [httpx.ConnectError("could not reach GitHub")]
+
+    async def latest(http):
+        if unreachable:
+            raise unreachable.pop()
+        return await healthy(http)
+
+    source.latest = latest
+    now[0] += installs.LATEST_EVERY_S + 1
+    await asked_every_minute(installer, now, "latest", 1)
+    assert installer.state()["error"] == "could not reach GitHub"
+
+    restarted = Installer(source, tmp_path / "engines" / "ollama", StandInServer(), clock=lambda: now[0])
+    assert restarted.state()["error"] == "could not reach GitHub"
+    await asked_every_minute(restarted, now, "latest", 1)
+    state = restarted.state()
+    assert (state["running"], state["error"]) == (V1, None)
+    assert installs.InstallState.read(tmp_path / "engines" / "ollama" / installs.STATE_FILE).failure is None
+
+
+async def test_an_error_the_start_wrote_is_not_taken_out_by_a_check_that_succeeds(tmp_path):
+    """Only what a failed install or check wrote is taken out: an error written since — here
+    set by hand, as a start that failed would — stays."""
+    source, installer, now = scripted(tmp_path)
+    source.fails = False
+    await asked_every_minute(installer, now, "latest", 1)
+    installer.record.failure, installer.record.error = "could not reach GitHub", "ollama 0.40.10 did not start again"
+    now[0] += installs.LATEST_EVERY_S + 1
+    await asked_every_minute(installer, now, "latest", 1)
+    assert installer.state()["error"] == "ollama 0.40.10 did not start again"
+    assert installer.record.failure is None
+
+
 async def test_a_notice_written_by_the_pass_after_a_failed_check_stays(tmp_path):
     """The check that follows a failed one finds the latest older than what runs: that is said,
     and not taken out with the failure it replaced."""
