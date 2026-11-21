@@ -1134,7 +1134,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                     return _error(400, "credential_refused", f"{role} token: {exc}")
                 if role == "write" and who["role"] not in (None, "write", "fineGrained"):
                     return _error(400, "credential_refused", "the write token cannot write: give one with write access")
-                if role == "read" and who["role"] == "write":
+                if role == "read" and (who["role"] == "write" or who.get("can_write")):
                     # The one a rented machine would carry: never one that can write (D182). A
                     # fine-grained token says no more than that; its scope is the operator's word.
                     return _error(400, "credential_refused", "the read token can write: give a read-only one")

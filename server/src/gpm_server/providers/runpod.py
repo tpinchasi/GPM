@@ -506,24 +506,35 @@ class RunPodProvider:
         if cloud not in _CLOUDS or not gpu_id or not count.isdigit():
             raise ProviderError(f"not an offer from this provider: {offer.offer_id!r}")
         registry = await self._registry_for(registry_login) if registry_login is not None else None
-        if spec.volume is None:
-            pod = await self._create_pod(offer, spec, cloud, gpu_id, int(count), registry=registry)
-            return Instance(instance_id=str(pod["id"]), label=spec.label, machine_id=offer.machine_id, raw=pod,
-                            location=str(pod.get("dataCenterId") or "") or None)
-        return await self._create_with_volume(offer, spec, cloud, gpu_id, int(count), registry=registry)
+        try:
+            if spec.volume is None:
+                pod = await self._create_pod(offer, spec, cloud, gpu_id, int(count), registry=registry)
+                return Instance(instance_id=str(pod["id"]), label=spec.label, machine_id=offer.machine_id, raw=pod,
+                                location=str(pod.get("dataCenterId") or "") or None)
+            return await self._create_with_volume(offer, spec, cloud, gpu_id, int(count), registry=registry)
+        except ProviderError:
+            if registry is not None:
+                # A credential deleted in the account since it was saved would fail every create:
+                # its id is asked for again at the next.
+                self._registries = {n: i for n, i in self._registries.items() if i != registry}
+            raise
 
     async def _registry_for(self, login: Any) -> str:
         """The id of the registry credential RunPod keeps for `login`, saved with it the first time
-        this plug-in needs it (D183). Named by a digest of the login, so a changed password is a new
-        credential and the old one is never used again; the password is sent in this call alone."""
-        name = "gpm-" + hashlib.sha256(
-            f"{login.registry}\n{login.username}\n{login.password}".encode()).hexdigest()[:20]
+        this plug-in needs it (D183). Named by the random key the pool gave the login when it was
+        saved — nothing of the password shows in the name, and a login saved again is a new
+        credential; the password is sent in this call alone, and taken out of any error."""
+        name = "gpm-" + (login.key or hashlib.sha256(f"{login.registry}\n{login.username}".encode()).hexdigest()[:20])
         if name in self._registries:
             return self._registries[name]
         response = await self._send("POST", "/registries",
                                     json={"name": name, "username": login.username, "password": login.password})
         if response.status_code < 400:
-            found = response.json().get("id") if response.content else None
+            try:
+                answer = response.json() if response.content else {}
+            except ValueError:
+                answer = None
+            found = answer.get("id") if isinstance(answer, dict) else None
         elif response.status_code in (400, 409):
             # Saved before, by an earlier run of the pool: found by its name.
             listed = await self._call("GET", "/registries", missing_ok=True)
@@ -531,9 +542,10 @@ class RunPodProvider:
             found = next((r.get("id") for r in rows if isinstance(r, dict) and r.get("name") == name), None)
             if found is None:
                 raise ProviderError(f"RunPod would not keep the login for {login.registry}: "
-                                    f"{self._quiet(_problem(response))}")
+                                    f"{login.scrub(self._quiet(_problem(response)))}")
         else:
-            raise self._fail("POST", "/registries", response)
+            failed = self._fail("POST", "/registries", response)
+            raise type(failed)(login.scrub(str(failed))) from None
         if not isinstance(found, str) or not found:
             raise ProviderError(f"RunPod kept the login for {login.registry} and gave no id for it")
         self._registries[name] = found

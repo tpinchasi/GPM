@@ -103,9 +103,10 @@ machines in one of two ways, your choice per model:
   machines read it with their own `HF_TOKEN`. A rented machine is given the **read-only** token you
   save beside the write token (`read_token`; one that can write is refused): copied over the SSH
   connection the pool installs the agent on, into an owner-only file the agent reads as
-  `HF_TOKEN`, only on a machine that holds a hub file, and gone with the machine. It is never in
-  the provider's instance settings, a log or an event, but the owner of the rented machine could
-  read it while it runs: make it a fine-grained token limited to your model repositories.
+  `HF_TOKEN` (with the hub it was checked against as `HF_ENDPOINT`), only on a machine that holds a
+  hub file, and gone with the machine. It is never in the provider's instance settings, a log or an
+  event, but the owner of the rented machine could read it while it runs: make it a fine-grained
+  token limited to your model repositories. A fine-grained token that may write is refused.
 
 ## 4. Containers
 
@@ -163,8 +164,9 @@ catalog:
         start: ["python", "-m", "detector", "--port", "8080"]
 ```
 
-The pool runs `start` in the background after the dead-man timer is armed, as it starts any rented
-engine, and the machine is ready once `GET /health` answers on `port`. No agent is put on it. The
+The pool runs `start` in the background from the machine's start-up script after the dead-man timer
+is armed, as it starts any rented engine, and the machine is ready once `GET /health` answers on
+`port`. The provider stores that script: put nothing secret in `start`. No agent is put on it. The
 image needs `/bin/sh`; on RunPod, which starts no SSH server of its own, the pool installs one
 with the image's package manager (`apt-get` or `apk`). Your own machines ignore `start` and run the
 image's own entrypoint.
@@ -176,6 +178,12 @@ The pool keeps it in its credential store and hands it only to the provider's ow
 Vast's `image_login`, or a registry credential RunPod keeps for it. It never goes on the machine's
 disk by the pool's hand, in `pool.yaml`, a log or an event. A provider whose plug-in takes no login
 is not rented from for an image that needs one.
+
+> **Use a pull-only token.** On a marketplace the rented machine's own Docker daemon pulls the image,
+> so whoever runs that machine can capture the login it was given. Give a token that can only pull
+> the images you rent (a registry's read-only, repository-scoped token), never your account
+> password. Removing a login removes the pool's copy; a credential RunPod saved for it stays in your
+> RunPod account until you delete it there.
 
 ## Not yet
 

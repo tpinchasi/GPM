@@ -10,7 +10,7 @@ import time
 import pytest
 from fakes.harness import EngineSpec, pool_harness
 from gpm_server.config import PoolConfig
-from gpm_server.registry_logins import RegistryLogin, RegistryLogins, registry_of
+from gpm_server.registry_logins import RegistryLogins, registry_of
 from test_trained_add import pool  # noqa: F401 - the control API over a pool from a file
 from test_trained_models import CHAT, DETECTOR, IMAGE
 
@@ -71,11 +71,18 @@ def test_a_login_is_kept_by_registry_and_never_said_back(tmp_path):
     logins = RegistryLogins(tmp_path / "registries")
     logins.put("GHCR.io", "me", "not-a-real-password")
     assert logins.listed() == [{"registry": "ghcr.io", "username": "me"}]
-    assert logins.for_image("ghcr.io/me/model@sha256:" + "a" * 64) == RegistryLogin("ghcr.io", "me", "not-a-real-password")
+    found = logins.for_image("ghcr.io/me/model@sha256:" + "a" * 64)
+    assert (found.registry, found.username, found.password) == ("ghcr.io", "me", "not-a-real-password")
+    assert len(found.key) == 20 and found.key not in "not-a-real-password"
+    logins.put("ghcr.io", "me", "not-a-real-password")
+    assert logins.for_image("ghcr.io/me/x@sha256:" + "a" * 64).key != found.key, "saved again: a new credential"
     assert logins.for_image("docker.io/me/model@sha256:" + "a" * 64) is None
     assert "not-a-real-password" not in repr(logins.for_image("ghcr.io/me/x@sha256:" + "a" * 64))
     with pytest.raises(ValueError, match="registry's host name"):
         logins.put("https://ghcr.io/v2", "me", "x")
+    for password in ("two words", "it's", "$(rm)", "a;b", "a\\b", "x\ny"):
+        with pytest.raises(ValueError, match="is a token"):
+            logins.put("ghcr.io", "me", password)
     assert logins.remove("ghcr.io") and logins.listed() == [] and not logins.remove("ghcr.io")
 
 
@@ -186,3 +193,56 @@ def test_the_control_api_keeps_a_login_and_never_answers_its_password(pool):  # 
     assert api.delete("/pool/containers/registry-logins/ghcr.io").status_code == 200
     assert api.delete("/pool/containers/registry-logins/ghcr.io").status_code == 404
     assert "not-a-real-password" not in json.dumps(supervisor.events.recent(50))
+
+
+def test_a_model_with_two_container_builds_is_not_rented_for():
+    """D183: one image per rented host — which of two it should start is not guessed."""
+    second = {**BUILD, "tag": "registry.example/me/detector@sha256:" + "c" * 64}
+    cfg = {"pool": {"name": "t", "model_set": [DETECTOR], "models_per_host": "declared"},
+           "auth": {"app_keys": ["gpma_t"]}, "containers": {"enabled": True}, "hosts": [],
+           "catalog": {DETECTOR: {"variants": [BUILD, second]}}, "rented": RENTED}
+    with pytest.raises(ValueError, match="has 2 container builds"):
+        PoolConfig.model_validate(cfg)
+
+
+def test_a_providers_error_never_carries_the_password_into_the_events():
+    from gpm_server.providers.base import ProviderError
+
+    with rented_pool() as rig:
+        supervisor, fleet = rig.supervisor, rig.supervisor.fleet
+        supervisor.registry_logins().put("registry.example", "me", "not-a-real-password")
+        provider = fleet.provider_for(None)
+        real = provider.create
+
+        async def refusing(offer, spec, bid, **kwargs):
+            raise ProviderError(f"refused: image_login '-u me -p {kwargs['registry_login'].password} registry.example' is bad")
+
+        provider.create = refusing
+        fleet.open_lease(workers=2, max_hours=2, max_spend=2.00, allow_rent=True)
+        deadline = time.monotonic() + 5
+        said = []
+        while time.monotonic() < deadline and not said:
+            rig.reprobe()
+            said = [e for e in supervisor.events.recent(50) if "refused: image_login" in json.dumps(e)]
+            time.sleep(0.1)
+        provider.create = real
+        assert said, [e["summary"] for e in supervisor.events.recent(20)]
+        assert "not-a-real-password" not in json.dumps(supervisor.events.recent(100))
+        assert "[redacted]" in json.dumps(said)
+
+
+def test_a_store_that_cannot_be_read_stops_renting_rather_than_renting_without_the_login(monkeypatch):
+    with rented_pool() as rig:
+        fleet = rig.supervisor.fleet
+
+        def unreadable(image):
+            raise OSError("the credential directory can be read by others")
+
+        fleet.registry_login = unreadable
+        fleet.open_lease(workers=2, max_hours=2, max_spend=2.00, allow_rent=True)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and "could not be read" not in (fleet.last_refusal or ""):
+            rig.reprobe()
+            time.sleep(0.1)
+        assert "registry logins could not be read" in (fleet.last_refusal or "")
+        assert not fleet.hosts and not fleet.provider_for(None).instances

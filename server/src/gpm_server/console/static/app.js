@@ -3981,7 +3981,9 @@ function trainedPanel(status) {
     return el("div", {},
       el("h3", {}, "Private registries, for rented machines"),
       el("p", { class: "muted" }, "A login is kept by the pool and handed only to the provider's own create call, so the provider can pull ",
-        "a private image. Your own machines use their own Docker login."),
+        "a private image. The rented machine's own Docker pulls it, so whoever runs that machine can capture the login: ",
+        "give a pull-only token scoped to these images, never your password. Removing one removes the pool's copy only. ",
+        "Your own machines use their own Docker login."),
       trained.logins.length
         ? el("table", {}, el("tbody", {}, trained.logins.map((l) => el("tr", {},
             el("td", { class: "mono" }, l.registry), el("td", {}, l.username),
@@ -3990,7 +3992,7 @@ function trainedPanel(status) {
       el("div", {},
         field("Registry", text(trained.login.registry, (v) => { trained.login.registry = v; }, { placeholder: "ghcr.io", class: "mono" })),
         field("User", text(trained.login.username, (v) => { trained.login.username = v; })),
-        field("Password or token", text(trained.login.password, (v) => { trained.login.password = v; }, { type: "password", autocomplete: "off" })),
+        field("Pull-only token", text(trained.login.password, (v) => { trained.login.password = v; }, { type: "password", autocomplete: "off" })),
         el("button", { onclick: save, disabled: !!trained.busy }, trained.busy === "saving the login" ? "saving…" : "Save login")));
   };
   const onnx = trained.kind === "onnx";

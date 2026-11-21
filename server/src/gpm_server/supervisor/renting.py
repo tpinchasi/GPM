@@ -31,6 +31,7 @@ from ..deadman import heartbeat_command, onstart_script
 from ..engines import get_engine
 from ..engines.base import PullResult
 from ..history import adjustment as history_adjustment
+from ..hubbuilds import hub_url as hub_endpoint
 from ..ledger import EventLog, Lease, LeaseRefused, LeaseStore, SpendLedger
 from ..providers.base import (
     BidLost,
@@ -439,6 +440,25 @@ def _count(value: Any, whole: bool = True) -> float:
 #: benchmark (decisions.md, Verified facts). The lower figure, so the saving is never overstated.
 VOLUME_COPY_MB_PER_S = 300.0
 
+
+
+def _scrub_exception(exc: BaseException, login: Any) -> None:
+    """Take a registry password out of everything the pool may write down about a failed create —
+    its message, and the provider's answer kept beside it (D183). In place, so its type stays."""
+
+    def clean(value: Any) -> Any:
+        if isinstance(value, str):
+            return login.scrub(value)
+        if isinstance(value, dict):
+            return {k: clean(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [clean(v) for v in value]
+        return value
+
+    exc.args = tuple(clean(a) for a in exc.args)
+    for name in ("response", "instance_state"):
+        if hasattr(exc, name):
+            setattr(exc, name, clean(getattr(exc, name)))
 
 class Fleet:
     """The rented half of the pool: what exists, what it costs, and what to do next."""
@@ -1766,6 +1786,7 @@ class Fleet:
                 # An engine its agent installs from the locked set it carries (ONNX Runtime, S15).
                 installs_engine=bool(getattr(self.engine_of(host), "installed_by_agent", False)),
                 hub_token=hub_token,
+                hub_endpoint=hub_endpoint() if hub_token else None,
             )
         except hostagent.HostNotReachable as exc:
             # Not an attempt: nothing was learned about the machine, only that it is not up yet.
@@ -4259,6 +4280,26 @@ class Fleet:
                 )
                 continue
 
+            provider = self.provider_for(offer)
+            try:
+                login = self.registry_login_for(image)
+            except Exception as exc:  # noqa: BLE001 — said, and nothing rented this round
+                # The saved logins cannot be read (D183): an image needing one, rented without it,
+                # would bill until it is given up, never having pulled.
+                self.last_refusal = f"the registry logins could not be read: {exc}"
+                self.events.record("rent_refused", self.last_refusal, lease_id=lease.lease_id)
+                return None
+            if login is not None and not getattr(provider.capabilities, "private_images", False):
+                # Its registry needs a login, and this provider takes none (D183): a machine bought
+                # here could never pull the image.
+                self.events.record(
+                    "offer_refused",
+                    f"{offer.machine_id}: its provider takes no registry login, and {login.registry} needs one for {image}",
+                    lease_id=lease.lease_id,
+                )
+                self.last_refusal = (f"no provider rented from takes a registry login, and {login.registry} needs one "
+                                     f"for {image}")
+                continue
             created = True
             host_id = f"rented-{uuid.uuid4().hex[:6]}"
             workers, workers_why = self.workers_for(offer, workload, tuple(for_this_host) if spec is not None else None)
@@ -4283,23 +4324,17 @@ class Fleet:
                 onstart=self.deadman_onstart(for_this_host, offer.connection),
                 volume=self._volume_for(spec, offer, here, for_this_host, builds) if spec is not None else None,
             )
-            provider = self.provider_for(offer)
-            login = self.registry_login_for(image)
-            if login is not None and not getattr(provider.capabilities, "private_images", False):
-                # Its registry needs a login, and this provider takes none (D183): a machine bought
-                # here could never pull the image.
-                self.events.record(
-                    "offer_refused",
-                    f"{offer.machine_id}: its provider takes no registry login, and {login.registry} needs one for {image}",
-                    lease_id=lease.lease_id,
-                )
-                continue
             try:
                 # No price on an on-demand rental: the provider's listed rate is what is paid. A spot
                 # rental is told the most the pool pays, which a provider that takes a maximum price
                 # holds it to (D132).
-                instance = await provider.create(offer, instance_spec, self._price_for_create(offer, capped, lease),
-                                                 **({"registry_login": login} if login is not None else {}))
+                try:
+                    instance = await provider.create(offer, instance_spec, self._price_for_create(offer, capped, lease),
+                                                     **({"registry_login": login} if login is not None else {}))
+                except BaseException as failed:
+                    if login is not None:
+                        _scrub_exception(failed, login)  # a provider's words may quote what it was sent
+                    raise
             except (BidLost, OfferGone) as exc:
                 numbers = {"bid": capped, "offer": offer.offer_id, "score": offer_score}
                 response = getattr(exc, "response", None)

@@ -2446,6 +2446,13 @@ class PoolConfig(BaseModel):
                 f"rented container hosts are one image each, so they hold one model; they may now hold {names}. "
                 "Name one in `rented.models` (several images are several pools of hosts, D183)"
             )
+        containers = [v for v in self.catalog[names[0]].variants if v.engine == CONTAINER_ENGINE] \
+            if names[0] in self.catalog else []
+        if len(containers) > 1:
+            raise ValueError(
+                f"{names[0]!r} has {len(containers)} container builds; a rented container host starts from one image, "
+                "so the model rented for has one container build (D183)"
+            )
         build = self.rented_container_build()
         if build is None:
             raise ValueError(f"rented hosts run container builds, and {names[0]!r} has none (D183)")

@@ -410,10 +410,13 @@ hosted` host and catalog builds.
   credential store — goes only into the create call of a plug-in declaring
   `capabilities.private_images` (`registry_login=`); an offer from any other is refused for that
   image. Vast takes it as `image_login`; RunPod keeps it as a registry credential, saved once per
-  login and named on each pod.
+  login under a random name and named on each pod. A provider's error text is scrubbed of the
+  password before it is recorded; an unreadable store stops renting. On a marketplace the machine's
+  own Docker pulls, so the login should be a pull-only token.
 - **A hub file's read-only token** (D184): on a machine one of whose builds is a hub file its agent
   fetches, the supervisor's read-only token (never the write token) is copied over the SSH session
-  that installs the agent, as an owner-only file read into the agent's environment as `HF_TOKEN`.
+  that installs the agent, as an owner-only file read into the agent's environment as `HF_TOKEN`
+  (and the hub it was checked against as `HF_ENDPOINT`).
   It is never in the instance spec, which carries nothing secret; where it went is an event.
 - Leases, caps and the dead-man timer are unchanged.
 

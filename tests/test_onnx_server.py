@@ -253,3 +253,19 @@ def test_a_build_that_needs_a_card_does_not_load_where_it_would_run_on_the_proce
         assert not row["loaded"] and "needs a card" in row["error"]
     finally:
         running.shutdown()
+
+
+def test_cudas_libraries_from_wheels_are_loaded_before_a_session_asks_for_cuda(monkeypatch):
+    """Found in review (D185): pip-installed CUDA and cuDNN live where neither Windows nor Linux looks,
+    so the server has ONNX Runtime load them, or a CUDA session would quietly run on the processor."""
+    import onnxruntime
+    from gpm_agent import onnx_server
+
+    loaded = []
+    monkeypatch.setattr(onnxruntime, "get_available_providers", lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"])
+    monkeypatch.setattr(onnxruntime, "preload_dlls", lambda *a, **k: loaded.append(True), raising=False)
+    assert onnx_server.providers_here()[0] == "CUDAExecutionProvider" and loaded == [True]
+    monkeypatch.setattr(onnxruntime, "get_available_providers", lambda: ["CPUExecutionProvider"])
+    loaded.clear()
+    onnx_server.providers_here()
+    assert loaded == [], "no CUDA, nothing loaded"

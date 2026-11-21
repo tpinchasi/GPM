@@ -92,12 +92,15 @@ async def install(
     models_path: Optional[str] = None,
     installs_engine: bool = False,
     hub_token: Optional[str] = None,
+    hub_endpoint: Optional[str] = None,
 ) -> str:
     """Put the agent on one host and return the key it minted.
 
     `hub_token`, where given, is the hub's read-only token (D184): copied as an owner-only file
     over the same connection and read into the agent's environment as `HF_TOKEN` when it starts,
     so it never appears in a command line, the agent's settings or the provider's instance spec.
+    `hub_endpoint` goes with it as `HF_ENDPOINT`: the token is sent only to the hub it was checked
+    against.
 
     `run(command) -> (code, output)` and `push(data, path) -> (code, output)` are the pool's
     existing ways of reaching a rented host: one SSH exec, and one with a file on its input.
@@ -150,7 +153,10 @@ async def install(
 
     environment = ""
     if hub_token:
-        code, output = await push(f"HF_TOKEN={shlex.quote(hub_token)}\nexport HF_TOKEN\n".encode(), HUB_ENV)
+        lines = f"HF_TOKEN={shlex.quote(hub_token)}\nexport HF_TOKEN\n"
+        if hub_endpoint:
+            lines += f"HF_ENDPOINT={shlex.quote(hub_endpoint)}\nexport HF_ENDPOINT\n"
+        code, output = await push(lines.encode(), HUB_ENV)
         if code != 0:
             # Its output is the machine's shell's, never the token: the token went on its input.
             raise AgentInstallFailed(f"the hub's read token could not be copied: {output.strip()[:200]}")

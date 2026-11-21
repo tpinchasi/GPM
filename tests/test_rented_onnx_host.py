@@ -125,7 +125,7 @@ def test_the_agent_is_installed_to_install_its_engine():
 TOKEN = "hf_not_a_real_read_token"
 
 
-def install_with(hub_token):
+def install_with(hub_token, hub_endpoint=None):
     import asyncio
     from pathlib import Path
 
@@ -145,7 +145,7 @@ def install_with(hub_token):
         return 0, ""
 
     asyncio.run(hostagent.install(run=run, push=push, archive=Path(__file__), engine_port=8190, engine="onnx",
-                                  installs_engine=True, hub_token=hub_token))
+                                  installs_engine=True, hub_token=hub_token, hub_endpoint=hub_endpoint))
     return ran, pushed
 
 
@@ -158,6 +158,10 @@ def test_the_hub_token_goes_to_the_machine_as_an_owner_only_file_never_on_a_comm
     assert all(TOKEN not in command for command in ran), "never on a command line the machine could list"
     serve = next(c for c in ran if " serve " in c)
     assert serve.index(f". {hostagent.HUB_ENV};") < serve.index("setsid nohup python3")
+
+    _, pushed = install_with(TOKEN, "https://hub.example")
+    (data,) = [data for path, data in pushed if path == hostagent.HUB_ENV]
+    assert "HF_ENDPOINT=https://hub.example\nexport HF_ENDPOINT\n" in data.decode(), "sent only to the hub it was checked with"
 
     ran, pushed = install_with(None)
     assert [path for path, _ in pushed] == [hostagent.ARCHIVE]
@@ -188,6 +192,7 @@ def test_a_machine_is_given_the_token_only_for_a_hub_file_its_agent_fetches(monk
 
         async def install(**kwargs):
             given.append(kwargs.get("hub_token"))
+            assert kwargs.get("hub_endpoint"), "the hub the token was checked against goes with it"
             return AGENT_KEY
 
         async def forward(*_):

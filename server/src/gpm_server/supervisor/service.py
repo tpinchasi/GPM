@@ -1093,10 +1093,9 @@ class Supervisor:
         return RegistryLogins(self.config.credentials_dir() / "registries")
 
     def registry_login_for(self, image: str) -> Any:
-        try:
-            return self.registry_logins().for_image(image)
-        except Exception:  # noqa: BLE001 — a store that cannot be read holds no login
-            return None
+        """The saved login for `image`'s registry, or None — raising where the store cannot be read,
+        which stops renting rather than renting a private image without its login (D183)."""
+        return self.registry_logins().for_image(image)
 
     def hub_read_token(self) -> Optional[str]:
         """The hub's read-only token the operator saved (D182), for a rented machine (D184): only the

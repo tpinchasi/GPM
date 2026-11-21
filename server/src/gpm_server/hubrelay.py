@@ -44,8 +44,15 @@ async def whoami(client: httpx.AsyncClient, token: str) -> dict[str, Any]:
     if response.status_code != 200:
         raise RelayFailed(f"the hub refused the token ({_said(response)})")
     body = response.json()
-    role = ((body.get("auth") or {}).get("accessToken") or {}).get("role")
-    return {"user": body.get("name"), "role": role}
+    token = (body.get("auth") or {}).get("accessToken") or {}
+    role = token.get("role")
+    # A fine-grained token says what it may do per repository and globally: one that may write
+    # anywhere is never taken for the read-only token a rented machine is given (D184).
+    granted = token.get("fineGrained") or {}
+    permissions = [p for scope in (granted.get("scoped") or []) if isinstance(scope, dict)
+                   for p in (scope.get("permissions") or [])] + list(granted.get("global") or [])
+    can_write = role == "write" or any(isinstance(p, str) and "write" in p.lower() for p in permissions)
+    return {"user": body.get("name"), "role": role, "can_write": can_write}
 
 
 async def relay(

@@ -1096,7 +1096,7 @@ async def test_a_private_images_login_is_saved_with_runpod_once_and_named_on_eac
             return httpx.Response(201, json={"id": "reg42", "name": "x"})
         return httpx.Response(201, json=pod(status="PROVISIONING"))
 
-    login = RegistryLogin("ghcr.io", "me", "not-a-real-password")
+    login = RegistryLogin("ghcr.io", "me", "not-a-real-password", key="test-login-key")
     p = provider(handler)
     offer = await an_offer(min_gpus=1)
     await p.create(offer, SPEC, None, registry_login=login)
@@ -1104,7 +1104,7 @@ async def test_a_private_images_login_is_saved_with_runpod_once_and_named_on_eac
     registries = [body for method, path, body in seen if path == "/v2/registries"]
     assert len(registries) == 1, "saved once, then named"
     assert registries[0]["username"] == "me" and registries[0]["password"] == "not-a-real-password"
-    assert registries[0]["name"].startswith("gpm-") and "me" not in registries[0]["name"]
+    assert registries[0]["name"] == "gpm-test-login-key", "named by the login's random key, nothing of the password"
     pods = [body for method, path, body in seen if path == "/v2/pods"]
     assert [b["registry"] for b in pods] == ["reg42", "reg42"]
     assert all("not-a-real-password" not in json.dumps(b) for b in pods)
@@ -1128,3 +1128,38 @@ async def test_a_login_runpod_already_keeps_is_found_by_its_name():
 
     await provider(handler).create(await an_offer(min_gpus=1), SPEC, None,
                                    registry_login=RegistryLogin("ghcr.io", "me", "not-a-real-password"))
+
+
+async def test_a_credential_deleted_in_the_account_is_asked_for_again_after_a_failed_create():
+    from gpm_server.registry_logins import RegistryLogin
+
+    made, fail = [], [True]
+
+    def handler(request):
+        if request.url.path == "/v2/registries":
+            made.append(1)
+            return httpx.Response(201, json={"id": f"reg{len(made)}"})
+        if fail[0]:
+            fail[0] = False
+            return httpx.Response(400, json={"error": "registry auth not found"})
+        return httpx.Response(201, json=pod(status="PROVISIONING"))
+
+    p = provider(handler)
+    login = RegistryLogin("ghcr.io", "me", "not-a-real-password", key="k" * 20)
+    offer = await an_offer(min_gpus=1)
+    with pytest.raises(Exception):
+        await p.create(offer, SPEC, None, registry_login=login)
+    await p.create(offer, SPEC, None, registry_login=login)
+    assert len(made) == 2, "the stale id was forgotten and the login saved again"
+
+
+async def test_a_registry_answer_that_is_not_json_is_a_provider_error():
+    from gpm_server.providers.base import ProviderError
+    from gpm_server.registry_logins import RegistryLogin
+
+    def handler(request):
+        return httpx.Response(201, content=b"<html>ok</html>")
+
+    with pytest.raises(ProviderError, match="gave no id"):
+        await provider(handler).create(await an_offer(min_gpus=1), SPEC, None,
+                                       registry_login=RegistryLogin("ghcr.io", "me", "x", key="k" * 20))

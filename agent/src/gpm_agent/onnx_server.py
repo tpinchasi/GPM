@@ -400,6 +400,14 @@ def providers_here() -> list[str]:
     import onnxruntime
 
     available = onnxruntime.get_available_providers()
+    if "CUDAExecutionProvider" in available and callable(getattr(onnxruntime, "preload_dlls", None)):
+        # CUDA's and cuDNN's libraries came as wheels (the locked set, D179, D185): ONNX Runtime's
+        # own loader for them, since neither Windows nor Linux searches those folders by itself — a
+        # session asked for CUDA would otherwise fall back to the processor without a word.
+        try:
+            onnxruntime.preload_dlls()
+        except Exception as exc:  # noqa: BLE001 — said; a build that needs a card still refuses to load
+            print(f"gpm-onnx-server: CUDA's libraries could not be loaded: {exc}", file=sys.stderr)
     preferred = ["CUDAExecutionProvider", "CoreMLExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"]
     return [p for p in preferred if p in available] or ["CPUExecutionProvider"]
 

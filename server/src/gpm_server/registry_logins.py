@@ -5,6 +5,9 @@ registry they are for. Handed to a provider only in its own create call, and onl
 declares `capabilities.private_images`: the login then sits with the provider, never on the machine's
 disk by the pool's hand, in `pool.yaml`, an event or a browser. A machine of the operator's own pulls
 with its own Docker login and never sees these.
+
+On a marketplace the machine's own Docker daemon pulls the image, so whoever runs that machine can
+capture the login it is given: a login here should be a pull-only token scoped to the images rented.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
+import secrets
 from pathlib import Path
 from typing import Optional
 
@@ -22,6 +26,10 @@ _NAME = "registry-logins"
 _BOUND = {"kind": "registry-logins"}
 #: Docker Hub, as an image name with no registry of its own is pulled from.
 DOCKER_HUB = "docker.io"
+#: What a password may hold: a token's characters. No space, quote, backslash or shell character,
+#: since a provider may join it into a `docker login` line (Vast's `image_login`).
+PASSWORD = re.compile(r"^[A-Za-z0-9._~+/=:@%,!*#^-]{1,4096}$")
+USERNAME = re.compile(r"^[A-Za-z0-9._@+-]{1,256}$")
 #: A registry's host, with a port where it has one: what an image name starts with.
 REGISTRY = re.compile(r"^(?=.{1,253}(?::\d{1,5})?$)(?:localhost|[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+)(?::\d{1,5})?$")
 
@@ -33,6 +41,13 @@ class RegistryLogin:
     registry: str
     username: str
     password: str = dataclasses.field(repr=False)
+    #: A random name given when it was saved: what a provider keeps it under (RunPod's credential),
+    #: so nothing of the password shows there, and a new save is a new credential.
+    key: str = ""
+
+    def scrub(self, text: str) -> str:
+        """`text` with the password, and anything a provider made of it, taken out."""
+        return text.replace(self.password, "[redacted]") if self.password else text
 
 
 def registry_of(image: str) -> str:
@@ -60,6 +75,11 @@ class RegistryLogins:
         return {r: v for r, v in data.items() if isinstance(v, dict) and isinstance(v.get("username"), str)
                 and isinstance(v.get("password"), str)} if isinstance(data, dict) else {}
 
+    def readable(self) -> None:
+        """Raises where the store cannot be read: renting a private image without its login would
+        buy a machine that can never pull it."""
+        self.store.get(_NAME)
+
     def listed(self) -> list[dict[str, str]]:
         """Each login's registry and user name — never its password."""
         return [{"registry": r, "username": v["username"]} for r, v in sorted(self._all().items())]
@@ -67,16 +87,20 @@ class RegistryLogins:
     def for_image(self, image: str) -> Optional[RegistryLogin]:
         registry = registry_of(image)
         found = self._all().get(registry)
-        return RegistryLogin(registry, found["username"], found["password"]) if found else None
+        if not found:
+            return None
+        return RegistryLogin(registry, found["username"], found["password"], str(found.get("key") or ""))
 
     def put(self, registry: str, username: str, password: str) -> None:
         registry = registry.strip().lower()
         if not REGISTRY.match(registry):
             raise ValueError(f"{registry!r} is not a registry's host name (such as ghcr.io, or docker.io)")
-        if not username or not password or any(c in username for c in " \t\r\n") or "\n" in password:
-            raise ValueError("a registry login is a user name without spaces and a password, both given")
+        if not USERNAME.match(username or ""):
+            raise ValueError("a registry login's user name is letters, digits and . _ @ + -")
+        if not PASSWORD.match(password or ""):
+            raise ValueError("a registry login's password is a token: no spaces, quotes, backslashes or $ ; & | < > `")
         logins = self._all()
-        logins[registry] = {"username": username, "password": password}
+        logins[registry] = {"username": username, "password": password, "key": secrets.token_hex(10)}
         self.store.put(_NAME, json.dumps(logins, sort_keys=True), _BOUND)
 
     def remove(self, registry: str) -> bool:
