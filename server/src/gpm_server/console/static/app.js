@@ -63,6 +63,10 @@ const api = {
   testModel: (build) => call("POST", "/pool/models/test", { build }),
   addTrained: (body) => call("POST", "/pool/models/trained", body),
   setContainers: (enabled, confirm) => call("PATCH", "/pool/containers", { enabled, confirm }),
+  // Logins to private registries, for rented container hosts (D183): never answered back.
+  registryLogins: () => call("GET", "/pool/containers/registry-logins"),
+  saveRegistryLogin: (body) => call("PUT", "/pool/containers/registry-logins", body),
+  removeRegistryLogin: (registry) => call("DELETE", `/pool/containers/registry-logins/${encodeURIComponent(registry)}`),
   // A file goes as itself, not as JSON: the pool keeps it by its own hash.
   uploadModel: async (file) => {
     const response = await fetch("/pool/models/uploads", {
@@ -3873,7 +3877,8 @@ screens.models = (status) => {
 // image by digest. Test holds the declarations to the file; Add writes the catalog, the model set
 // and the hosts that hold it in one change. The draft lives across renders until it is added.
 const trained = { kind: "onnx", tag: "", file: null, inputs: [], outputs: [], name: "", port: 8080,
-  max_batch: 8, memory_gb: "", card: false, hosts: new Set(), problems: null, busy: "" };
+  max_batch: 8, memory_gb: "", card: false, hosts: new Set(), problems: null, busy: "", start: "",
+  logins: null, login: { registry: "", username: "", password: "" } };
 
 function trainedBuild() {
   const needs = {};
@@ -3881,7 +3886,11 @@ function trainedBuild() {
   if (trained.card) needs.card = true;
   const build = { tag: trained.tag.trim(), engine: trained.kind };
   if (Object.keys(needs).length) build.needs = needs;
-  if (trained.kind === "container") return { ...build, port: Number(trained.port) };
+  if (trained.kind === "container") {
+    // One word a line: the argument list a rented machine starts the image's server with (D183).
+    const start = trained.start.split("\n").map((w) => w.trim()).filter(Boolean);
+    return { ...build, port: Number(trained.port), ...(start.length ? { start } : {}) };
+  }
   const numbers = (text) => text.split(",").map((v) => Number(v.trim())).filter((v) => !Number.isNaN(v));
   const inputs = {}, outputs = {};
   for (const i of trained.inputs) {
@@ -3955,6 +3964,37 @@ function trainedPanel(status) {
     });
     if (sure) { await api.setContainers(true, status.pool); await refresh(); }
   };
+  const registryLogins = () => {
+    if (trained.logins === null) {
+      trained.logins = [];
+      api.registryLogins().then((r) => { trained.logins = r.logins || []; redraw(); }).catch(() => {});
+    }
+    const save = busy("saving the login", async () => {
+      await api.saveRegistryLogin({ ...trained.login });
+      trained.login = { registry: "", username: "", password: "" };
+      trained.logins = (await api.registryLogins()).logins || [];
+    });
+    const remove = (registry) => busy("removing the login", async () => {
+      await api.removeRegistryLogin(registry);
+      trained.logins = (await api.registryLogins()).logins || [];
+    });
+    return el("div", {},
+      el("h3", {}, "Private registries, for rented machines"),
+      el("p", { class: "muted" }, "A login is kept by the pool and handed only to the provider's own create call, so the provider can pull ",
+        "a private image. The rented machine's own Docker pulls it, so whoever runs that machine can capture the login: ",
+        "give a pull-only token scoped to these images, never your password. Removing one removes the pool's copy only. ",
+        "Your own machines use their own Docker login."),
+      trained.logins.length
+        ? el("table", {}, el("tbody", {}, trained.logins.map((l) => el("tr", {},
+            el("td", { class: "mono" }, l.registry), el("td", {}, l.username),
+            el("td", {}, el("button", { class: "small", onclick: remove(l.registry), disabled: !!trained.busy }, "Remove"))))))
+        : el("p", { class: "muted" }, "No login saved."),
+      el("div", {},
+        field("Registry", text(trained.login.registry, (v) => { trained.login.registry = v; }, { placeholder: "ghcr.io", class: "mono" })),
+        field("User", text(trained.login.username, (v) => { trained.login.username = v; })),
+        field("Pull-only token", text(trained.login.password, (v) => { trained.login.password = v; }, { type: "password", autocomplete: "off" })),
+        el("button", { onclick: save, disabled: !!trained.busy }, trained.busy === "saving the login" ? "saving…" : "Save login")));
+  };
   const onnx = trained.kind === "onnx";
   return el("div", { class: "panel" },
     el("h2", {}, "Add a trained model"),
@@ -3971,7 +4011,12 @@ function trainedPanel(status) {
             el("button", { onclick: containers }, status.containers_enabled ? "Turn off" : "Turn on…")),
           field("Image, by digest", text(trained.tag, (v) => { trained.tag = v; }, { placeholder: "registry.example/me/model@sha256:…", class: "mono" })),
           field("Port it answers on", text(String(trained.port), (v) => { trained.port = v; }, { type: "number", min: 1, max: 65535 })),
-          el("p", { class: "muted" }, "The image serves POST /v1/predict, GET /v1/models and GET /health on that port. One image per host.")),
+          el("p", { class: "muted" }, "The image serves POST /v1/predict, GET /v1/models and GET /health on that port. One image per host."),
+          field("Start on a rented machine", el("textarea", { rows: 3, class: "mono", placeholder: "one word a line, e.g.\npython\n-m\nserver",
+            oninput: (e) => { trained.start = e.target.value; } }, trained.start)),
+          el("p", { class: "muted" }, "Only for renting: a provider starts a rented machine with its own command, not the image's. ",
+            "Your own machines run the image's own entrypoint."),
+          registryLogins()),
     onnx && trained.inputs.length ? el("div", {},
       el("h3", {}, "What it takes in"),
       el("table", {}, el("tbody", {}, trained.inputs.map((i) => el("tr", {},

@@ -1,0 +1,10 @@
+{
+  "onnxruntime": "1.32.0",
+  "python": "3.11",
+  "system": "windows",
+  "platform": "x86_64",
+  "accelerator": "cpu",
+  "wheels": 6,
+  "size_bytes": 37195888,
+  "requirements": "flatbuffers==25.12.19 \\\n    --hash=sha256:7634f50c427838bb021c2d66a3d1168e9d199b0607e6329399f04846d42e20b4\nnumpy==2.4.6 \\\n    --hash=sha256:1e254a00cdf42b1e4d5b3d68d33af63268d41340d8885df2ab6470f2e1500147\nonnxruntime==1.32.0 \\\n    --hash=sha256:d7e0c45cc5f456ad7805e6dd256a7662736cda9c2fd17becae194eb3c2f6df72\npackaging==26.3 \\\n    --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c\npillow==13.0.0 \\\n    --hash=sha256:d7710eb676e9bb68965cb045be0d333b4c0d7f9dfbaa7fbf121385b1588683d3\nprotobuf==7.36.2 \\\n    --hash=sha256:a300819d441e078a5608c0d3c709796bb548136058fda017ae51d425b44fd353\n"
+}

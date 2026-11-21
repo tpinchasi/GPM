@@ -203,6 +203,12 @@ class FakeHub:
             self.tokens_seen_at.append(request.url.host + path)
         if path == "/api/whoami-v2":
             token = request.headers.get("authorization", "")
+            if token == "Bearer hf_fake_scoped_write":
+                # A fine-grained token: no role, its permissions said per repository (D184).
+                return httpx.Response(200, json={"name": "operator", "auth": {"accessToken": {
+                    "role": "fineGrained", "fineGrained": {"scoped": [{"entity": {"type": "model", "name": "operator/models"},
+                                                                       "permissions": ["repo.content.read", "repo.write"]}],
+                                                           "global": []}}}})
             if token not in ("Bearer hf_fake_write", "Bearer hf_fake_read"):
                 return httpx.Response(401, json={"error": "Invalid credentials"})
             role = "write" if token.endswith("write") else "read"
@@ -304,6 +310,8 @@ def test_a_read_token_that_can_write_is_refused(control_pool):
     supervisor._hub_transport = FakeHub().transport
     refused = api.put("/pool/models/hub-credential", json={"read_token": "hf_fake_write"})
     assert refused.status_code == 400 and "read token can write" in refused.json()["detail"]
+    scoped = api.put("/pool/models/hub-credential", json={"read_token": "hf_fake_scoped_write"})
+    assert scoped.status_code == 400, "a fine-grained token that may write anywhere is no read token (D184)"
     assert api.put("/pool/models/hub-credential", json={"read_token": "hf_fake_read"}).status_code == 200
 
 

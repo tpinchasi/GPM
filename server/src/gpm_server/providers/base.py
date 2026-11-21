@@ -37,7 +37,7 @@ class OfferGone(ProviderError):
 #: Fields of a provider's answer that are credentials, by name. Anything the pool writes down
 #: from an answer — an event, a log line, a message — has these replaced first: an instance key
 #: was found live in the event log, inside the answer to a bid that did not take.
-CREDENTIAL_FIELD = ("key", "token", "secret", "password", "credential")
+CREDENTIAL_FIELD = ("key", "token", "secret", "password", "credential", "login")
 
 
 def redacted(answer: Any) -> Any:
@@ -96,6 +96,10 @@ class ProviderCapabilities:
     #: A volume can be made with an instance and attached to a later one (D116, D139). Without
     #: it, a workload's next host always fetches.
     volumes: bool = False
+    #: `create` takes `registry_login=` — a private image's registry login, passed only in the
+    #: provider's own create call, never in the instance spec (D183). Without it, an image whose
+    #: registry the operator saved a login for is not rented from this provider.
+    private_images: bool = False
     #: How far a volume reaches (D139): `"machine"` — only a later instance on the machine it was
     #: made on — or `"data_center"` — any later instance in its data center, several at once.
     #: Unset with `volumes`: `"machine"`. Only a data-center volume is offered to the operator
@@ -371,7 +375,11 @@ class Provider(Protocol):
 
     async def create(self, offer: Offer, spec: InstanceSpec, bid: Optional[float]) -> Instance:
         """Either returns a running-or-scheduling instance, or raises and **leaves nothing
-        behind**. A bid that loses must fail, not leave a parked instance."""
+        behind**. A bid that loses must fail, not leave a parked instance.
+
+        A plug-in declaring `capabilities.private_images` also takes `registry_login=` (a
+        `RegistryLogin`, or absent): the image's registry login, for the provider's own create call
+        alone — never written down, logged or put on the machine by the plug-in (D183)."""
 
     async def set_bid(self, instance: Instance, bid: float) -> None: ...
 

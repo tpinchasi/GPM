@@ -16,11 +16,13 @@ The targets:
   too, so a rented machine needs nothing but the NVIDIA driver; the least driver is written in;
 - `linux-x86_64-cpu`, `linux-aarch64-cpu` — `onnxruntime`, the processor alone;
 - `macos-aarch64-cpu` — `onnxruntime`, whose CoreML provider runs a graph on an Apple-silicon Mac's
-  GPU and Neural Engine (named `cpu` for the set, since it needs no driver).
+  GPU and Neural Engine (named `cpu` for the set, since it needs no driver);
+- `windows-x86_64-cuda`, `windows-x86_64-cpu` — as Linux's, for a Windows PC (D185): NVIDIA publishes
+  CUDA's and cuDNN's wheels for Windows too, and the least driver is that system's.
 
 Each resolved by uv as vllm-lock does — wheels only, hashes, one `--exclude-newer` time for the
 run — and each pin's one wheel chosen by pip's tag order and checked against uv's digests. This
-tool borrows vllm-lock's own functions for that, and adds macOS's tags.
+tool borrows vllm-lock's own functions for that, and adds macOS's and Windows' tags.
 
 Standalone: the standard library and `uv` on PATH. It reads PyPI and installs nothing.
 """
@@ -63,7 +65,13 @@ TARGETS = {
     "linux-x86_64-cpu": ("linux", "x86_64", "cpu", "onnxruntime"),
     "linux-aarch64-cpu": ("linux", "aarch64", "cpu", "onnxruntime"),
     "macos-aarch64-cpu": ("macos", "aarch64", "cpu", "onnxruntime"),
+    "windows-x86_64-cuda": ("windows", "x86_64", "cuda", "onnxruntime-gpu[cuda,cudnn]"),
+    "windows-x86_64-cpu": ("windows", "x86_64", "cpu", "onnxruntime"),
 }
+#: The least Windows driver for each CUDA major: the branch NVIDIA's release notes name for its
+#: minor-version compatibility (Table 3: R525 for CUDA 12, R580 for CUDA 13). Windows' driver
+#: numbers are not Linux's, so vllm-lock's table, Linux's, is not used for a Windows set.
+WINDOWS_DRIVER_FLOORS = {12: "525", 13: "580"}
 #: What the pool's ONNX server imports besides the runtime: arrays, and pictures.
 ALSO = ("numpy", "pillow")
 #: The oldest macOS a Mac set is for, and the oldest glibc tried on Linux.
@@ -73,11 +81,21 @@ MACOS = "14.0"
 def macos_tags(python: str, version: str = MACOS) -> list[tuple[str, str, str]]:
     """What CPython `python` accepts on an Apple-silicon Mac of `version` or later, most preferred
     first: each macOS from that one down to 11 for arm64, then universal2, as pip orders them."""
-    major, minor = (int(part) for part in python.split("."))
     newest = int(version.split(".")[0])
     platforms = []
     for release in range(newest, 10, -1):
         platforms += [f"macosx_{release}_0_arm64", f"macosx_{release}_0_universal2"]
+    return cpython_tags(python, platforms)
+
+
+def windows_tags(python: str) -> list[tuple[str, str, str]]:
+    """What CPython `python` accepts on 64-bit Windows on x86_64, most preferred first."""
+    return cpython_tags(python, ["win_amd64"])
+
+
+def cpython_tags(python: str, platforms: list[str]) -> list[tuple[str, str, str]]:
+    """Every tag CPython `python` accepts on `platforms` (most preferred first), in pip's order."""
+    major, minor = (int(part) for part in python.split("."))
     cp = f"cp{major}{minor}"
     tags = [(cp, cp, p) for p in platforms] + [(cp, "abi3", p) for p in platforms] + [(cp, "none", p) for p in platforms]
     for older in range(minor - 1, 1, -1):
@@ -98,6 +116,8 @@ def uv_compile_for(requirements: list[str], python: str, system: str, processor:
     if system == "macos":
         target = f"{processor}-apple-darwin"
         environment["MACOSX_DEPLOYMENT_TARGET"] = level
+    elif system == "windows":
+        target = f"{processor}-pc-windows-msvc"
     else:
         target = f"{processor}-manylinux_{level.replace('.', '_')}"
     with tempfile.TemporaryDirectory(prefix="onnx-lock-") as work:
@@ -121,29 +141,30 @@ def lock(version: str, python: str, target: str, *, compile: Callable[..., str] 
         raise LockFailed(f"{version!r} is not a version of digits and dots, which the agent names a directory by")
     system, processor, accelerator, project = TARGETS[target]
     requirements = [f"{project}=={version}", *ALSO]
-    levels = (MACOS,) if system == "macos" else V.LEVELS
+    levels = (MACOS,) if system == "macos" else ("",) if system == "windows" else V.LEVELS
     tried = []
     for level in levels:
         try:
             compiled = compile(requirements, python, system, processor, level, index, exclude_newer)
             break
         except LockFailed as no:
-            tried.append(f"{level}: {str(no).splitlines()[-1] if str(no) else no}")
+            tried.append(f"{level or system}: {str(no).splitlines()[-1] if str(no) else no}")
     else:
         raise LockFailed(f"{requirements} do not resolve for Python {python} on {target}:\n  " + "\n  ".join(tried))
     pins = V.parse_compiled(compiled)
     runtime_name = V.normalized(project.split("[")[0])
     if pins.get(runtime_name, ("",))[0] != version:
         raise LockFailed(f"uv's resolution does not pin {runtime_name}=={version}")
-    preference = macos_tags(python, level) if system == "macos" else V.supported_tags(python, processor, level)
+    preference = (macos_tags(python, level) if system == "macos" else windows_tags(python) if system == "windows"
+                  else V.supported_tags(python, processor, level))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        listed = dict(zip(pins, pool.map(lambda name: files(name, pins[name][0]), pins)))
+        listed = dict(zip(pins, pool.map(lambda name: files(name, pins[name][0]), pins)))  # noqa: B905 - both come from `pins`; the tool runs on an older Python too
     chosen, size = [], 0
     for name in sorted(pins):
         pinned, digests = pins[name]
         wheel = V.choose_wheel(listed[name], preference)
         if wheel is None:
-            raise LockFailed(f"{name} {pinned} has no wheel for Python {python} on {target} ({level})")
+            raise LockFailed(f"{name} {pinned} has no wheel for Python {python} on {target} ({level or system})")
         if wheel["sha256"] not in digests:
             raise LockFailed(f"{wheel['filename']}'s digest on PyPI is not one uv listed for {name} {pinned}")
         if not isinstance(wheel["size"], int):
@@ -157,13 +178,14 @@ def lock(version: str, python: str, target: str, *, compile: Callable[..., str] 
     }
     if system == "linux":
         locked["glibc"] = level
-    else:
+    elif system == "macos":
         locked["macos"] = level
     if accelerator == "cuda":
         major, runtime = V.cuda_runtime(pins)
-        if major not in V.DRIVER_FLOORS:
+        floors = WINDOWS_DRIVER_FLOORS if system == "windows" else V.DRIVER_FLOORS
+        if major not in floors:
             raise LockFailed(f"the set's CUDA is {runtime} (CUDA {major}), whose least driver the table does not name")
-        locked["driver_floor"], locked["cuda_runtime"] = V.DRIVER_FLOORS[major], runtime
+        locked["driver_floor"], locked["cuda_runtime"] = floors[major], runtime
     return locked
 
 

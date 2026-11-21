@@ -257,6 +257,8 @@ class Supervisor:
         self.fleet = Fleet(config, config.rented, providers, self.leases, self.events, self.spend)
         self.fleet.make_tunnel = self.make_tunnel
         self.fleet.deliver_uploads = self.deliver_uploads_to
+        self.fleet.hub_read_token = self.hub_read_token
+        self.fleet.registry_login = self.registry_login_for
 
     def _start_renting(self, new: PoolConfig) -> None:
         """The file gained its first provider account while the pool runs: renting starts now,
@@ -1084,6 +1086,29 @@ class Supervisor:
     def _deliver_uploads(self, host: Any, report: Optional[dict[str, Any]]) -> None:
         self.deliver_uploads_to(host.host_id, host.agent_endpoint, sorted(host.required_tags), report)
 
+    def registry_logins(self) -> Any:
+        """The operator's logins to private registries (D183), in the credential store."""
+        from ..registry_logins import RegistryLogins
+
+        return RegistryLogins(self.config.credentials_dir() / "registries")
+
+    def registry_login_for(self, image: str) -> Any:
+        """The saved login for `image`'s registry, or None — raising where the store cannot be read,
+        which stops renting rather than renting a private image without its login (D183)."""
+        return self.registry_logins().for_image(image)
+
+    def hub_read_token(self) -> Optional[str]:
+        """The hub's read-only token the operator saved (D182), for a rented machine (D184): only the
+        one saved as read-only, only for the hub it was saved for — never the write token."""
+        from .. import hubbuilds
+        from ..credentials import CredentialStore
+
+        try:
+            found = CredentialStore(self.config.credentials_dir() / "hub").get("read")
+        except Exception:  # noqa: BLE001 — a store that cannot be read holds no token
+            return None
+        return found.value if found is not None and found.bound_to({"hub": hubbuilds.hub_url()}) else None
+
     def deliver_uploads_to(self, host_id: str, agent: Any, tags: list[str], report: Optional[dict[str, Any]]) -> None:
         """Send each uploaded build a host holds and does not have yet, in the background: a large
         file never holds up the pass. One send per file and host at a time — owned or rented."""
@@ -1514,9 +1539,14 @@ class Supervisor:
                 host.mark_preparing()
                 continue
             if getattr(self.engine_for(host), "residency_from_agent", False):
-                # Its server cannot be trusted to say what it holds; its agent, which started it, says.
-                said = ((host.agent_facts or {}).get("engine") or {}).get("models_loaded")
-                resident = frozenset(t for t in said if isinstance(t, str)) if isinstance(said, list) else frozenset()
+                if self.engine_for(host).name == "container" and host.agent is None:
+                    # A rented container host is its one image (D183): its server answering is
+                    # that build up — there is no agent there to say so, and nothing else it holds.
+                    resident = frozenset(self.fleet.tags_for(host))
+                else:
+                    # Its server cannot be trusted to say what it holds; its agent, which started it, says.
+                    said = ((host.agent_facts or {}).get("engine") or {}).get("models_loaded")
+                    resident = frozenset(t for t in said if isinstance(t, str)) if isinstance(said, list) else frozenset()
 
             # A rented host whose engine is serving from the processor is worthless at an
             # accelerator's price, and looks healthy by every other measure (D81). The driver

@@ -139,6 +139,7 @@ def card_reasons(
     *,
     minimum: tuple[int, int] = MIN_CAPABILITY,
     driver_floor: Optional[str] = None,
+    needs: str = "vLLM's CUDA",
 ) -> list[str]:
     """Every reason this machine's cards cannot run vLLM, in words — none where they can: no
     NVIDIA card, a card below `minimum` or whose compute capability could not be read, and where
@@ -164,7 +165,7 @@ def card_reasons(
             if have is None:
                 reasons.append(f"{name}: its driver's version could not be read")
             elif need is not None and have < need:
-                reasons.append(f"{name}'s driver {card.get('driver')} is older than {driver_floor}, which vLLM's CUDA needs")
+                reasons.append(f"{name}'s driver {card.get('driver')} is older than {driver_floor}, which {needs} needs")
     return reasons
 
 
@@ -325,13 +326,23 @@ def venv_argv(python: str, venv: Path) -> list[str]:
 PIP_SETTINGS = {"PIP_CONFIG_FILE": os.devnull}
 
 
+def venv_scripts(venv: Path) -> Path:
+    """Where an environment keeps its interpreter and programs: `Scripts` on Windows, `bin` elsewhere."""
+    return Path(venv) / ("Scripts" if os.name == "nt" else "bin")
+
+
+def venv_python(venv: Path) -> Path:
+    """An environment's own interpreter."""
+    return venv_scripts(venv) / ("python.exe" if os.name == "nt" else "python")
+
+
 def pip_argv(venv: Path, requirements: Path, index: Sequence[str]) -> list[str]:
     """pip, in the version's environment, installing exactly the set: wheels only, so no build
     script runs; nothing beyond the list; every file checked against the digest it records; none
     of the owner's pip settings (`--isolated`, and `PIP_SETTINGS` in its environment), and no
     cache left behind."""
     return [
-        str(venv / "bin" / "python"), "-I", "-m", "pip", "install", "--isolated",
+        str(venv_python(venv)), "-I", "-m", "pip", "install", "--isolated",
         "--require-hashes", "--only-binary=:all:", "--no-deps", "--no-input",
         "--disable-pip-version-check", "--no-cache-dir", "--progress-bar=off",
         *index, "-r", str(requirements),
@@ -371,7 +382,7 @@ def move_environment(venv: Path, to: Path) -> None:
     old, new = os.fsencode(str(venv)), os.fsencode(str(to))
     # Both as Python names its own interpreter, and so as pip writes it: absolute, with no `..`.
     old, new = os.path.abspath(old), os.path.abspath(new)
-    for path in [*sorted((venv / "bin").iterdir()), venv / "pyvenv.cfg"]:
+    for path in [*sorted(venv_scripts(venv).iterdir()), venv / "pyvenv.cfg"]:
         if path.is_symlink() or not path.is_file():
             continue
         with path.open("rb") as handle:

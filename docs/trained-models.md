@@ -35,10 +35,11 @@ hosts:
 
 On the machine, the agent's own settings say how it runs the model:
 
-- **ONNX:** `install_engines: true` lets the agent install ONNX Runtime from a locked set (Linux
-  on x86_64 or aarch64, CUDA's set where an NVIDIA card's driver allows it; Apple-silicon Macs).
-  On Windows, or to use a Python of your own instead, set `engine_binary` to a Python with
-  `onnxruntime`, `numpy` and `pillow` installed.
+- **ONNX:** `install_engines: true` lets the agent install ONNX Runtime from a locked set: Linux
+  on x86_64 or aarch64 and Windows on x86_64, CUDA's set where an NVIDIA card's driver allows it
+  (Windows: driver 580 or later), else the processor's; and Apple-silicon Macs. To use a Python of
+  your own instead, set `engine_binary` to a Python with `onnxruntime`, `numpy` and `pillow`
+  installed.
 - **Containers:** Docker on the machine. The agent reaches it through Docker's own socket
   (`docker_socket` if it is not in the usual place) and pulls a private image with the machine's
   own Docker login. `run_containers: never` makes the machine refuse every container.
@@ -99,8 +100,13 @@ machines in one of two ways, your choice per model:
 - **Relayed through the hub:** the pool commits the file to a private repository of yours on the
   model hub (`POST /pool/models/uploads/<sha256>/relay`), with a write token you give it once
   (`PUT /pool/models/hub-credential`). From then on the model is an ordinary hub file. Your own
-  machines read it with their own `HF_TOKEN`. A rented machine would be given a read-only token
-  you provide; that is the one secret a rented machine would carry.
+  machines read it with their own `HF_TOKEN`. A rented machine is given the **read-only** token you
+  save beside the write token (`read_token`; one that can write is refused): copied over the SSH
+  connection the pool installs the agent on, into an owner-only file the agent reads as
+  `HF_TOKEN` (with the hub it was checked against as `HF_ENDPOINT`), only on a machine that holds a
+  hub file, and gone with the machine. It is never in the provider's instance settings, a log or an
+  event, but the owner of the rented machine could read it while it runs: make it a fine-grained
+  token limited to your model repositories. A fine-grained token that may write is refused.
 
 ## 4. Containers
 
@@ -135,7 +141,7 @@ sent as base64. A picture is never a link.
 
 ## 5. Rented machines
 
-A pool can rent machines for ONNX models: `rented.engine: onnx`, with the models in
+**ONNX.** A pool can rent machines for ONNX models: `rented.engine: onnx`, with the models in
 `rented.models` or a profile. A rented machine starts from a plain Python image
 (`python:3.12.16-slim-bookworm` unless `rented.image` names another with Python 3.11 or later), its
 agent installs ONNX Runtime there from the locked set for the card it finds, takes each build from
@@ -143,12 +149,43 @@ the hub or from the pool, and the machine is ready once its server has answered 
 for every build. Leases, caps and the dead-man timer are as for any rented machine. A pool rents
 one engine, so a pool that rents ONNX machines does not also rent vLLM or Ollama ones.
 
+**Containers.** With containers on, a pool can rent machines for one container build:
+`rented.engine: container`, its model alone in `rented.models`. The rented machine is the image
+itself. Because Vast and RunPod start a rented machine with their own command rather than the
+image's, the build says how its server starts, as an argument list, one word each:
+
+```yaml
+catalog:
+  boxes:
+    variants:
+      - tag: "ghcr.io/me/detector@sha256:…"
+        engine: container
+        port: 8080
+        start: ["python", "-m", "detector", "--port", "8080"]
+```
+
+The pool runs `start` in the background from the machine's start-up script after the dead-man timer
+is armed, as it starts any rented engine, and the machine is ready once `GET /health` answers on
+`port`. The provider stores that script: put nothing secret in `start`. No agent is put on it. The
+image needs `/bin/sh`; on RunPod, which starts no SSH server of its own, the pool installs one
+with the image's package manager (`apt-get` or `apk`). Your own machines ignore `start` and run the
+image's own entrypoint.
+
+**A private image** is pulled with a login you save for its registry (Models → Add a trained
+model → Container → Private registries, or `PUT /pool/containers/registry-logins` with `registry`,
+`username` and `password`; `GET` lists them without passwords, `DELETE …/<registry>` removes one).
+The pool keeps it in its credential store and hands it only to the provider's own create call:
+Vast's `image_login`, or a registry credential RunPod keeps for it. It never goes on the machine's
+disk by the pool's hand, in `pool.yaml`, a log or an event. A provider whose plug-in takes no login
+is not rented from for an image that needs one.
+
+> **Use a pull-only token.** On a marketplace the rented machine's own Docker daemon pulls the image,
+> so whoever runs that machine can capture the login it was given. Give a token that can only pull
+> the images you rent (a registry's read-only, repository-scoped token), never your account
+> password. Removing a login removes the pool's copy; a credential RunPod saved for it stays in your
+> RunPod account until you delete it there.
+
 ## Not yet
 
-- **Renting machines for container builds.** A provider starts a rented machine with its own
-  command, not the image's, and the providers' APIs as the pool uses them take no registry login:
-  container builds are held by your own machines.
-- **The hub's read-only token on a rented machine**, for a relayed upload: rent for a model sent
-  by the pool, or one in a public repository.
 - **Text inputs** to an ONNX model, which need a tokenizer: use a container.
 - **Hosted endpoints** for trained models (SageMaker, Vertex, Hugging Face Inference Endpoints).

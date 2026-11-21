@@ -189,7 +189,8 @@ def test_a_valid_trained_catalog_loads():
 
 @pytest.mark.parametrize("change, said", [
     ({"spec": None}, "says what its inputs and outputs are"),
-    ({"port": 9000}, "`port` is a container build's"),
+    ({"port": 9000}, "`port` and `start` are a container build's"),
+    ({"start": ["serve"]}, "`port` and `start` are a container build's"),
     ({"tag": "owner/pets-classifier/model.bin"}, "`owner/repo/file.onnx`"),
     ({"serves": ["chat"]}, "serves `predict` alone"),
     ({"price": {"input": 1, "output": 1}}, "are not a onnx build's"),

@@ -96,8 +96,11 @@ class FakeProvider:
             reports_charges=True,
             direct_port_mapping=False,
             reports_instance_logs=True,
+            private_images=True,
         )
         self.offers: list[Offer] = list(offers or [default_offer()])
+        #: The registry login each create was handed, by instance id (D183) — for a test to read.
+        self.registry_logins: dict[str, Any] = {}
         self.instances: dict[str, FakeInstance] = {}
         #: What a test says a machine wrote to its own boot output, by instance id (D78).
         self.boot_output: dict[str, str] = {}
@@ -274,8 +277,11 @@ class FakeProvider:
             None,
         )
 
-    async def create(self, offer: Offer, spec: InstanceSpec, bid: Optional[float]) -> Instance:
+    async def create(self, offer: Offer, spec: InstanceSpec, bid: Optional[float], *,
+                     registry_login: Any = None) -> Instance:
         self._guard("create")
+        if registry_login is not None and not self.capabilities.private_images:
+            raise AssertionError("handed a registry login without declaring private_images (D183)")
         if offer.offer_id in self.offer_gone_on:
             raise OfferGone(f"offer {offer.offer_id} is no longer available")
         if offer.offer_id in self.lose_bid_on:
@@ -322,6 +328,8 @@ class FakeProvider:
                     hourly=round(spec.volume.size_gb * (offer.storage_per_gb_hourly or 0.0002), 6),
                 )
         instance_id = f"i-{next(self._ids)}"
+        if registry_login is not None:
+            self.registry_logins[instance_id] = registry_login
         self.instances[instance_id] = FakeInstance(
             instance_id=instance_id,
             label=spec.label,

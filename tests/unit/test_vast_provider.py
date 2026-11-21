@@ -733,3 +733,27 @@ async def test_a_spent_quota_is_read_from_the_providers_own_refusal():
         await api.search_offers(OfferQuery(interruptible=True))
     refusal = api.take_search_usage()["refusal"]
     assert refusal["limit"] == 20000 and refusal["remaining"] == 0 and refusal["retry_after_s"] == 44237
+
+
+async def test_a_private_images_login_goes_in_vasts_own_field_and_nowhere_else():
+    """D183: `image_login`, in the create call alone; a refusal's answer, if it echoed it, is redacted."""
+    from gpm_server.providers.base import redacted
+    from gpm_server.registry_logins import RegistryLogin
+
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.read())
+        return httpx.Response(200, json={"success": True, "new_contract": 778})
+
+    login = RegistryLogin("ghcr.io", "me", "not-a-real-password")
+    await provider(handler).create(
+        (await provider(market()).search_offers(OfferQuery()))[0],
+        InstanceSpec(label="pool/rented-2", image="ghcr.io/me/model@sha256:" + "a" * 64, disk_gb=20, onstart="x"),
+        bid=0.13, registry_login=login,
+    )
+    assert seen["body"]["image_login"] == "-u me -p not-a-real-password ghcr.io"
+    assert "not-a-real-password" not in json.dumps(seen["body"]["onstart"])
+    assert VastProvider.capabilities.private_images
+    assert redacted({"image_login": "-u me -p x ghcr.io"}) == {"image_login": "[redacted]"}
+    assert "not-a-real-password" not in repr(login)

@@ -153,7 +153,7 @@ Both processes follow the file. The supervisor applies a change on its next pass
 | `POST /pool/models/uploads` | Stream an ONNX file; answers its tag, `upload/<sha256>`, and size; bounded by `models.max_upload_mb` (D182) |
 | `POST /pool/models/inspect` | An ONNX file's inputs and outputs (names, element types, shapes), read from a hub file or an upload, for Add model |
 | `POST /pool/models/test`, `POST /pool/models/trained` | Hold a build's declarations to its file before saving, spending nothing (each machine also runs one made-up input as the build loads); add the build — catalog entry, model set, the hosts that hold it — in one validated, planned write (D178) |
-| `PUT /pool/registries/{host}/credential`, `DELETE …` | A container registry's login, tested against its `/v2/` and kept by the supervisor (D181) |
+| `GET`/`PUT /pool/containers/registry-logins`, `DELETE …/{registry}` | A private registry's login (`registry`, `username`, `password`), kept by the supervisor and handed only to a provider's own create call for a rented container host; listed without passwords, never answered back (D183) |
 | `PUT /pool/models/hub-credential`, `DELETE …` | The hub's write token for relayed uploads, and the read-only token rented machines are given (D182) |
 | `PATCH /pool/containers` | `{enabled, confirm}` — the pool's name typed again to turn it on; recorded as an event (D180) |
 | `GET /pool/models/size?repo=` | One hub repository's weights, exactly, from its file listing; read once, then kept (D112) |

@@ -59,7 +59,7 @@ without the pool's server package, so it cannot share the pool's adapters.
 |---|---|---|
 | `ollama` | The engine's own pull, watched for progress | Loaded and pinned through the engine |
 | `vllm` | **The agent fetches it**, over plain HTTP from a model hub, into one directory per repository under the machine's models path (D90) | Nothing to do: the engine is started with its model and holds it for the life of the process |
-| `onnx` (D179) | From a hub as vLLM's builds, or **sent by the pool** (`PUT /model-file`, D182), kept by its sha256 | The agent's own ONNX server, on loopback, holding every ONNX build the machine is told to hold, prepared as each build's declarations say; started again when that set changes. Run by the version the agent installed from a locked set (`tools/onnx-lock`: Linux x86_64 and aarch64, CUDA or processor; Apple-silicon Macs), or by the owner's Python (`engine_binary`) |
+| `onnx` (D179) | From a hub as vLLM's builds, or **sent by the pool** (`PUT /model-file`, D182), kept by its sha256 | The agent's own ONNX server, on loopback, holding every ONNX build the machine is told to hold, prepared as each build's declarations say; started again when that set changes. Run by the version the agent installed from a locked set (`tools/onnx-lock`: Linux x86_64 and aarch64 and Windows x86_64, CUDA or processor; Apple-silicon Macs — D185), or by the owner's Python (`engine_binary`) |
 | `container` (D180) | **Pulled by digest** through the Docker Engine API on the machine's socket, with the machine's own registry login (D181) | One build per machine, its port published at the agent's `engine_url` on loopback; no host network, not privileged, no new privileges, no added capability, no host directory, the build's memory as its limit, a card only where it needs one — only where the pool's `containers.enabled` is on and the machine's owner has not set `run_containers: never` (agent settings: `run_containers: follow|never`, `docker_socket`) |
 
 For vLLM the agent reports **models on disk and models served as different sets**, because they
@@ -694,6 +694,13 @@ agent, with the same closed verbs, and **the pool still dials**.
   interpreter gets no agent, and joins without one. Nothing secret goes into the
   start-up script, which a provider stores and can read. The pool reaches the agent through a
   second forward on the SSH connection it already holds (stage 4).
+- **The one secret it may carry: the hub's read-only token** (D184), only where one of the host's
+  builds is a hub file the agent fetches — copied on that SSH connection's input as an owner-only
+  file (`/var/run/gpm/hub.env`) and read into the agent's environment as `HF_TOKEN` when it
+  starts; never on a command line, in its settings or the start-up script. Its engine's server is
+  never given it.
+- **A rented container host gets no agent** (D183): the machine is the build's image, whose server
+  is the build's own; an agent there would look for a Docker to run images with.
 - **Packed once a run, never once a state directory.** The archive is built from the agent
   installed beside the supervisor, and an archive an *earlier* run left on disk is not reused:
   a pool running today's agent would otherwise ship a file packed weeks ago. Seen live — every
