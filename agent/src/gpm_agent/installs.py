@@ -1038,6 +1038,9 @@ class Installer:
         #: What the installer last said in the record's error about what it was asked — a version
         #: it will not go back to, a latest older than what runs — removed once that no longer holds.
         self._told: Optional[str] = None
+        #: What a failed install or check last wrote in the record's error: taken out by the next
+        #: one that succeeds, if the error still says it — never a notice that pass wrote itself.
+        self._failure_error: Optional[str] = None
 
     # --- what the pool sees ---
 
@@ -1330,6 +1333,12 @@ class Installer:
                     await self._stage(http, release)
             self._retry_at.pop(wanted, None)
             self._backoff = (None, 0.0)
+            if self._failure_error is not None and self.record.error == self._failure_error:
+                # A check that failed — GitHub out of reach — and then succeeded with nothing to
+                # stage: what it said no longer holds. A notice this pass wrote does not match.
+                self.record.error = None
+                self._save()
+            self._failure_error = None
             target = self.record.staged
             if self.record.running is None and target:
                 # Nothing runs yet, so there is nothing to drain: the first version starts now.
@@ -1344,7 +1353,7 @@ class Installer:
             wait = min(waited * 2, RETRY_AT_MOST_S) if asked == wanted else RETRY_AFTER_S
             self._backoff = (wanted, wait)
             self._retry_at[wanted] = self.clock() + wait
-            self.record.error = str(no) or type(no).__name__
+            self.record.error = self._failure_error = str(no) or type(no).__name__
             with contextlib.suppress(OSError):
                 self._save()
         finally:

@@ -948,6 +948,56 @@ async def test_another_version_asked_for_is_tried_at_once_and_waits_from_five_mi
     assert source.attempts[0] == (1_800_000_000.0 + 60 * 60, V2) and waits(source.attempts) == [300, 600]
 
 
+async def test_a_check_that_failed_is_no_longer_said_once_one_succeeds_with_nothing_to_stage(tmp_path):
+    """GitHub out of reach for one check — a lookup that failed — then answering with the release
+    already running: nothing is staged, and the error the failed check left is taken out."""
+    source, installer, now = scripted(tmp_path)
+    source.fails = False
+    await asked_every_minute(installer, now, "latest", 1)
+    assert installer.state()["running"] == V1 and installer.state()["error"] is None
+
+    unreachable = [httpx.ConnectError("could not reach GitHub for ollama/ollama: getaddrinfo failed")]
+
+    async def latest(http):
+        if unreachable:
+            raise unreachable.pop()
+        return installs.Release(source.newest, f"v{source.newest}", ())
+
+    source.latest = latest
+    now[0] += installs.LATEST_EVERY_S + 1
+    await asked_every_minute(installer, now, "latest", 1)
+    assert "could not reach GitHub" in installer.state()["error"]
+
+    now[0] += installs.RETRY_AFTER_S
+    await asked_every_minute(installer, now, "latest", 1)
+    state = installer.state()
+    assert (state["running"], state["staged"], state["latest"], state["error"]) == (V1, None, V1, None)
+    assert Installer(source, tmp_path / "engines" / "ollama", StandInServer()).state()["error"] is None, "saved"
+
+
+async def test_a_notice_written_by_the_pass_after_a_failed_check_stays(tmp_path):
+    """The check that follows a failed one finds the latest older than what runs: that is said,
+    and not taken out with the failure it replaced."""
+    source, installer, now = scripted(tmp_path)
+    source.fails, source.newest = False, V2
+    await asked_every_minute(installer, now, "latest", 1)
+    assert installer.state()["running"] == V2
+
+    unreachable = [httpx.ConnectError("could not reach GitHub")]
+
+    async def latest(http):
+        if unreachable:
+            raise unreachable.pop()
+        return installs.Release(V1, f"v{V1}", ())  # withdrawn: older than what runs
+
+    source.latest = latest
+    now[0] += installs.LATEST_EVERY_S + 1
+    await asked_every_minute(installer, now, "latest", 1)
+    now[0] += installs.RETRY_AFTER_S
+    await asked_every_minute(installer, now, "latest", 1)
+    assert f"the latest release of ollama, {V1}, is older than the {V2} running here" in installer.state()["error"]
+
+
 async def test_versions_are_removed_away_from_the_event_loop_the_agent_answers_on(tmp_path, monkeypatch):
     """A version of vLLM is some 8 GB in tens of thousands of files: removing one takes seconds,
     in which the agent would answer no one. Every version and half-staged directory goes in a
