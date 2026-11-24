@@ -16,8 +16,8 @@ own:
 
 ```sh
 python3 -m venv ~/gpm && ~/gpm/bin/pip install \
-  https://github.com/tpinchasi/GPM/releases/download/v0.44.0/gpm_server-0.44.0-py3-none-any.whl \
-  https://github.com/tpinchasi/GPM/releases/download/v0.44.0/gpm_agent-0.18.1-py3-none-any.whl
+  https://github.com/tpinchasi/GPM/releases/download/v0.45.0/gpm_server-0.45.0-py3-none-any.whl \
+  https://github.com/tpinchasi/GPM/releases/download/v0.45.0/gpm_agent-0.19.0-py3-none-any.whl
 export PATH="$HOME/gpm/bin:$PATH"
 gpm --version
 ```
@@ -151,7 +151,7 @@ Everything the console does is also a CLI verb, so anything you can click you ca
 The application installs the client, whose only dependency is `httpx`:
 
 ```sh
-pip install "gpm-client @ https://github.com/tpinchasi/GPM/releases/download/v0.44.0/gpm_client-0.9.0-py3-none-any.whl"
+pip install "gpm-client @ https://github.com/tpinchasi/GPM/releases/download/v0.45.0/gpm_client-0.9.0-py3-none-any.whl"
 ```
 
 ```python
