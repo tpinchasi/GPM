@@ -352,7 +352,10 @@ is on trial, the one before and anything dropped; `GET /pool/status` carries it 
 
 **Ollama is started by the pool** on a rented host (D177): `ollama serve` in the background, on
 loopback at the pool's port, through the restart script — since a provider's launch mode may skip
-an image's own start. `rented.engine_start` replaces it.
+an image's own start. On a machine with more than one NVIDIA card, once the agent's archive is
+there, the same script runs the agent's `ollama-start` instead: a server per card behind the
+router (D190, host-agent §2.4), or the one server where the models do not fit a card (D191).
+`rented.engine_start` replaces both.
 
 An image's `capabilities` say what it carries beyond the engine — `audio-decoding` for vLLM's
 audio extra. An engine names what its image must carry per kind (`image_needs`; vLLM:

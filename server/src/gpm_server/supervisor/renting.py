@@ -163,6 +163,14 @@ class RentedHost:
     #: takes minutes, and asking again every pass would only ever interrupt it.
     restarted_for: Optional[frozenset] = None
     restart_asked_at: Optional[float] = None
+    #: Whether the pool has asked this host's agent to start its Ollama again, now that the agent's
+    #: launcher is on the machine, as one server per card (D190). Once per host: what the launcher
+    #: chose is in the agent's facts afterwards, and a host adopted with them is not asked again.
+    per_card_asked: bool = False
+    #: How often, and when last, its engine was started again because the router in front of its
+    #: servers per card was found not running (D190): a few times, apart.
+    per_card_recoveries: int = 0
+    per_card_recovered_at: Optional[float] = None
     #: When the pool last re-bid for this host and asked the provider to start it again. While
     #: that start is in flight the instance still reads "stopped", and read as a fresh
     #: eviction the pool bids against itself (D106).
@@ -2740,6 +2748,121 @@ class Fleet:
                 )
 
         host.restart_task = asyncio.create_task(ask(), name=f"gpm:restart:{host.host_id}")
+
+    def wants_per_card(self, host: RentedHost) -> bool:
+        """Whether this host's Ollama is to be started again as one server per card (D190): an
+        Ollama host with more than one card — as its agent counts them, else as it was bought —
+        whose agent answers and has not said what its launcher chose, started by the pool's own
+        start (not an operator's `engine_start`), not yet serving, and whose models fit one card
+        (`per_card_fits`, D191). Asked once."""
+        if host.per_card_asked or host.agent is None or not host.agent.manage_models:
+            return False
+        if self.engine_of(host).name != "ollama" or self.rented.engine_start or host.state == "ready":
+            return False
+        facts = host.agent_facts or {}
+        if (facts.get("engine") or {}).get("layout") is not None:
+            host.per_card_asked = True  # its launcher has run: a host adopted after it is not asked again
+            return False
+        fits, why = self.per_card_fits(host)
+        if not fits:
+            host.per_card_asked = True
+            if why:
+                self.events.record("engine_one_server", f"{host.host_id}: its Ollama stays one server across its "
+                                   f"cards — {why}", host_id=host.host_id, lease_id=host.lease_id)
+            return False
+        return True
+
+    def per_card_fits(self, host: RentedHost) -> tuple[bool, Optional[str]]:
+        """Whether a server on each of this host's cards would hold every model it is for (D191):
+        more than one card, every model's size known, and the set — by the pool's own sizing, as
+        the search sized the machine (D111) — within the smallest card. The pool decides, before
+        anything is pulled: on the machine nothing is on disk yet to judge by. A reason where it
+        does not fit; None where there is one card."""
+        facts = host.agent_facts or {}
+        accelerators = facts.get("accelerators")
+        cuda = [card for card in accelerators if isinstance(card, dict) and card.get("kind") == "cuda"] \
+            if isinstance(accelerators, list) and accelerators else []
+        cards = len(cuda) if cuda else int(getattr(host.offer, "gpus", 1) or 1)
+        if cards < 2:
+            return False, None
+        sizes = self.build_sizes(self.models_of(host), host.builds or None)
+        unknown = sorted(model for model, size in sizes.items() if not size)
+        if unknown or not sizes:
+            return False, f"the size of {', '.join(unknown) or 'its models'} is not known, so it cannot be told they fit one card"
+        memory = [card.get("memory_bytes") for card in cuda]
+        if cuda and all(isinstance(size, int) and size > 0 for size in memory):
+            card_gb = min(memory) / 1e9
+        else:
+            card_gb = float(getattr(host.offer, "gpu_memory_gb", 0.0) or 0.0)
+        needs = needs_for(sizes, 1)
+        if needs.card_memory_gb > card_gb:
+            return False, (f"its models need {needs.card_memory_gb:.0f} GB of a card and its smallest has "
+                           f"{card_gb:.0f} GB")
+        return True, None
+
+    def recover_per_card(self, host: RentedHost) -> None:
+        """Ask again, in the background, for the engine of a host whose servers per card are recorded
+        and whose router is not running (D190): killed, or the record outlived the processes (a
+        machine started again by its provider, D106). Three times at most, two minutes apart."""
+        if host.agent is None or self.engine_of(host).name != "ollama" or self.rented.engine_start:
+            return
+        layout = ((host.agent_facts or {}).get("engine") or {}).get("layout")
+        if not isinstance(layout, dict) or not layout.get("servers") or layout.get("running"):
+            return
+        now = time.time()
+        if host.per_card_recoveries >= self.PER_CARD_RECOVERIES:
+            return
+        if host.per_card_recovered_at is not None and now - host.per_card_recovered_at < self.RESTART_RETRY_S:
+            return
+        if host.restart_task is not None and not host.restart_task.done():
+            return
+        host.per_card_recoveries += 1
+        host.per_card_recovered_at = now
+        self.events.record(
+            "engine_per_card_recovered",
+            f"{host.host_id}: the router in front of its Ollama servers per card is not running; "
+            f"starting its engine again ({host.per_card_recoveries} of {self.PER_CARD_RECOVERIES})",
+            host_id=host.host_id, lease_id=host.lease_id,
+        )
+        host.restart_task = asyncio.create_task(self._restart_per_card(host), name=f"gpm:per-card:{host.host_id}")
+
+    #: How often a host's servers per card are started again when their router is found not running.
+    PER_CARD_RECOVERIES = 3
+
+    async def start_per_card(self, host: RentedHost) -> None:
+        """Start a several-card Ollama host's engine again through its agent, before any model is
+        pulled, so that the pool's restart script — at boot without the agent's archive, and so the
+        one server — now finds the launcher and starts an Ollama on each card behind the router
+        (D190), or the one server where the cards or the models do not allow it (D191). With the
+        host's own numbers, as any restart: the workers it was launched for, the set it holds, its
+        context. A restart that fails leaves the one server serving, as before; it is said, and the
+        host prepares on it."""
+        if not self.wants_per_card(host):
+            return
+        await self._restart_per_card(host)
+
+    async def _restart_per_card(self, host: RentedHost) -> None:
+        host.per_card_asked = True
+        settings: dict[str, int] = agents.wanted_engine_settings(
+            host.launch_workers or host.workers, len(self.tags_for(host)))
+        context = int(self.rented.context_length or 0)
+        if 256 <= context <= 1_048_576:
+            settings["context"] = context
+        self.events.record(
+            "engine_per_card",
+            f"{host.host_id}: its agent is on the machine; starting its Ollama again, as one server per card",
+            host_id=host.host_id,
+            lease_id=host.lease_id,
+        )
+        status, answer = await agents.restart_engine(host.agent, settings, transport=self._agent_transport)
+        if status != 200 or not answer.get("engine_answers"):
+            self.events.record(
+                "engine_per_card_failed",
+                f"{host.host_id}: its Ollama was not started again as one server per card — "
+                f"{str(answer.get('detail') or answer.get('error') or answer.get('restart_output') or status)[-300:]}",
+                host_id=host.host_id,
+                lease_id=host.lease_id,
+            )
 
     async def load_model_set(self, host: RentedHost, engine, client) -> bool:
         """Fetch the set, loading each model as its own download finishes, then check they are

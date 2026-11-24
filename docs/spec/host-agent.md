@@ -57,7 +57,7 @@ without the pool's server package, so it cannot share the pool's adapters.
 
 | Engine | Fetching a model | Holding one |
 |---|---|---|
-| `ollama` | The engine's own pull, watched for progress | Loaded and pinned through the engine |
+| `ollama` | The engine's own pull, watched for progress — through the first server, where one runs per card (§2.4) | Loaded and pinned through the engine — on every server, where one runs per card (§2.4) |
 | `vllm` | **The agent fetches it**, over plain HTTP from a model hub, into one directory per repository under the machine's models path (D90) | Nothing to do: the engine is started with its model and holds it for the life of the process |
 | `onnx` (D179) | From a hub as vLLM's builds, or **sent by the pool** (`PUT /model-file`, D182), kept by its sha256 | The agent's own ONNX server, on loopback, holding every ONNX build the machine is told to hold, prepared as each build's declarations say; started again when that set changes. Run by the version the agent installed from a locked set (`tools/onnx-lock`: Linux x86_64 and aarch64 and Windows x86_64, CUDA or processor; Apple-silicon Macs — D185), or by the owner's Python (`engine_binary`) |
 | `container` (D180) | **Pulled by digest** through the Docker Engine API on the machine's socket, with the machine's own registry login (D181) | One build per machine, its port published at the agent's `engine_url` on loopback; no host network, not privileged, no new privileges, no added capability, no host directory, the build's memory as its limit, a card only where it needs one — only where the pool's `containers.enabled` is on and the machine's owner has not set `run_containers: never` (agent settings: `run_containers: follow|never`, `docker_socket`) |
@@ -256,6 +256,16 @@ archive is already on every host the pool creates.
 
 The pool names a model, in a header. It never names a port, a path or a command.
 
+**In front of one Ollama server per card** (`proxy --engine ollama`, D190) the upstreams are whole
+Ollama servers, each serving every model on the machine's disk, listed in the file whoever started
+them wrote (`copies.json`, §2.4) — loopback URLs only. It differs from the above in these:
+
+| | |
+|---|---|
+| Routes | To the server with the fewest requests in flight, whatever model a request names; one refusing the connection is passed over |
+| Forwards | `POST` on `/api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/responses` and `/v1/messages` only, each by its exact name, every answer relayed as it comes. Never Ollama's `/api/pull`, `/api/delete`, `/api/create`, `/api/copy`, `/api/push` or `/api/blobs/…`: `404 path_not_served` |
+| Answers itself | `GET /api/version` and `/` and `/health` only when every server answers, else `503` naming the card that did not; `GET /api/tags` and `/api/ps` with the models **every** server lists, each `/api/ps` entry as the server with the least of it on its card lists it (D192); `POST /api/show` from the first server, its body bounded at 64 KB |
+
 ## 2.3 Installing and running engines on the owner's machine (S9, D150–D154)
 
 On a machine its owner gives it — `install_engines: true` in the agent's own settings, which
@@ -265,7 +275,8 @@ it at the version the pool asks for. Hosts the pool rents are unchanged: their e
 the image.
 
 **It runs the engine itself**, as it runs whisper.cpp's server (D148): `ollama serve` on
-loopback at the engine URL's port, with the models directory and the pool's numbers (workers,
+loopback at the engine URL's port — or, on a machine with more than one NVIDIA card, one per card
+behind the router (§2.4) — with the models directory and the pool's numbers (workers,
 models held, context) as its environment, built here from integers. A restart or new settings
 need no command from the owner. An engine on the port that the agent did not start is reported
 (`engine.foreign`) and left alone: the agent never stops a program it did not start, so a
@@ -477,8 +488,10 @@ resolving, downloading, verifying, unpacking, building or switching), `error`, `
 the engine may take from its beginning until it has an outcome, sized for a switch that fails — the
 version stopped, started and waited for, then stopped again and the one before started and waited
 for — 2 × (stop + launch + serve) for vLLM (4340 s), and the same shape from Ollama's and
-whisper.cpp's own stop grace and two-minute wait (335 s; 815 s on Windows, where `taskkill` may
-take its whole two minutes); `null` where installs are not allowed; and `engine.foreign` when an
+whisper.cpp's own stop grace and two-minute wait (whisper.cpp 335 s; 815 s on Windows, where
+`taskkill` may take its whole two minutes); for Ollama with its stop in three steps — the router,
+the servers per card, the one server — a start's own stop, and the one server's own wait where the servers per card did not start (§2.4:
+867 s; 3027 s on Windows); `null` where installs are not allowed; and `engine.foreign` when an
 engine the agent did not start holds its port.
 
 **Running across reboots** (D154): `gpm-agent init --start-at-login` — or `gpm-agent startup
@@ -544,6 +557,63 @@ the profile, inheriting its permissions, never with `mode=0o700`, which since Py
 folder an owner-only access list whose owner, for an agent run elevated, is the Administrators
 group, leaving it unreadable to the same user afterwards (D163). An agent run with administrator
 rights says so as it starts.
+
+## 2.4 One Ollama server per card (D190–D192)
+
+On a machine with more than one NVIDIA card, Ollama runs **once per card**: `ollama serve` pinned to
+its card with `CUDA_VISIBLE_DEVICES`, on its own loopback port — the engine port plus one, plus two,
+and so on — with the router (§2.2, `--engine ollama`) on the engine's port in front of them.
+
+- **Which cards.** Those `nvidia-smi` lists, or those the environment limits the machine to
+  (`CUDA_VISIBLE_DEVICES`); none where `nvidia-smi` lists none — an Apple-silicon Mac, an AMD card,
+  the processor alone — and then, as on one card or more than 16, the one server as before.
+- **Only where the models fit one card** (D191): the models held — the pool's set, on a machine the
+  agent runs Ollama on (before the pool has said, every model in the store, and with none there the
+  one server until it is told); every model on disk, on one the pool rents — as far as they are on disk,
+  each its weights and a tenth plus a 3 GiB cache reserve, within nine tenths of the smallest card
+  (vLLM's arithmetic, D104). Sizes come from Ollama's own manifests in the store. Otherwise the one
+  server spans every card, and Ollama spreads a model too large for one across them itself.
+- **One store.** Every server is given the same `OLLAMA_MODELS`. A model is pulled once, through the
+  first server, which the agent dials directly (the router forwards no pull), and deleted through it;
+  only the first prunes the store as it starts (`OLLAMA_NOPRUNE=1` on the others).
+- **Each server's numbers.** The pool's `OLLAMA_NUM_PARALLEL` divided between the servers, rounded
+  up; the rest as the one server's.
+- **Held on each** (D192). Pinned: loaded with `keep_alive: -1` on every server, so the machine holds
+  a model once all do — a server that lost one is pinned again on the next pass. Released only on
+  the servers that hold it now. Under `on_demand`, each server loads a model on its first request and
+  unloads it by its own keep-alive.
+- **Recorded beside the models directory**, never in it: `<models>.gpm-state/ollama-<port>/` holds
+  `copies.json` — the cards, a loopback URL each, and why this layout (`servers` empty where a choice
+  was made against them) — and each server's and the router's record and log (`card-N/`, `router/`).
+- **Facts** add `engine.layout` (`cards`, `servers`, `why`, `running`), `engine.copies` (each server: its
+  card, whether it answers, what it holds) and `engine.models_loaded_anywhere`.
+- **Trusted only while the router runs.** The record is on disk and can outlive the processes (a
+  machine started again by its provider, D106): the agent dials the servers it lists only while the
+  router it records is running — its process alive, running exactly its recorded command line —
+  and says `running: false` otherwise. The one server's start removes the record.
+- **Servers per card that do not start** — a card's port taken (asked by binding it), one that exits
+  or does not answer in time — are stopped and the one server started instead, with a wait of its
+  own, `why` saying so; that plan is not tried again until the cards or the models change.
+
+**Who starts them.** Where the agent runs Ollama (§2.3), its own runner does, and starts them again
+in the other layout when the models it holds stop or start fitting one card — never before the pool
+has said what it holds, after the agent starts. On a machine the pool
+rents, the pool's restart script runs **`gpm-agent ollama-start --port <port> --pinned`** from the
+agent's archive (its verbs are the script's, never the protocol's: no verb is added, D40) where the
+archive is there and `nvidia-smi -L` lists more than one card — else the one server, as before
+(§9). It stops what it started last time, never an Ollama it did not start (it then starts nothing,
+says so, and the script's one server finds the port taken), gives each try 30 s and stops what it
+started when it gives up, and gives its servers the start-up's
+environment less the hub's token, the shared store, `OLLAMA_NO_CLOUD=1`, and with `--pinned`
+`OLLAMA_KEEP_ALIVE=-1` where the environment has not said. `gpm-agent ollama-stop` stops them.
+
+**Known limits.** A change of layout where the agent runs Ollama — a model landing that does not
+fit one card — stops the servers at once, as a vLLM restart does, cutting requests in flight; the
+pinned models are loaded again on the next pass. On a machine the pool rents, a card's server that
+dies is not started again by itself: the router answers for the machine with `503`, naming the
+card, until the host is given up as any whose engine stops answering. A server per card that puts
+part of a model on the processor is seen as on the processor only where none of it is on its card
+(D81) — which the fit of D191 is there to prevent.
 
 ## 3. What it reports — facts
 
@@ -718,6 +788,18 @@ agent, with the same closed verbs, and **the pool still dials**.
   been seen working on a live host — it can only postpone a shutdown the pool could equally cause by going silent.
   `GET /facts` adds load average, accelerator utilisation and memory, and measured generation
   rate. The verb list stays closed; the test that guards it is edited for exactly this.
+- **Ollama on several cards** (D190). The start-up script starts the one server at boot, before the
+  agent's archive is there. Once the agent answers, before any model is pulled, the pool asks it
+  once to start its engine again (`POST /engine` with the host's own numbers — its workers, its set,
+  its context); the pool's restart script then finds the archive and runs `ollama-start` (§2.4). The
+  pool asks only where every model the host is for has a known size and the set fits the smallest
+  card by its own sizing (D191) — otherwise the one server stays (`engine_one_server`). A host whose
+  facts already say what the launcher chose (`engine.layout`) is not asked; a restart that does not
+  come back is said (`engine_per_card_failed`) and the host prepares on what serves. A router found
+  not running (`engine.layout.running` false, the engine not answering) has the engine started again
+  the same way, three times at most, two minutes apart (`engine_per_card_recovered`). The install
+  stops an agent already running by a pattern anchored to the agent's own command line
+  (`… gpm-agent.pyz -c <settings> serve`), never the router or the launcher from the same archive.
 - **The restart command is the pool's here.** On a host the pool created, what restarts the
   engine comes from the pool's own start-up material — what the pool creates is the pool's to
   configure — fixed at installation and never sent over the protocol. On a delegated host it

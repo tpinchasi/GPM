@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from typing import Any, ClassVar, Optional
 
 import httpx
@@ -56,9 +57,24 @@ class OllamaEngine:
         may skip an image's own start — Vast's SSH mode and RunPod's do — and a pool that relied on
         the image rented machines that never served; started here, any image of the engine works on
         any provider. Where the image started one already, this one finds the port taken and
-        exits, and the image's goes on serving. `rented.engine_start` still replaces it."""
-        return (f'OLLAMA_HOST="${{OLLAMA_HOST:-127.0.0.1:{port}}}" '
-                "nohup ollama serve >/var/log/ollama.log 2>&1 &")
+        exits, and the image's goes on serving. `rented.engine_start` still replaces it.
+
+        **One server per card** (D190): on a machine with more than one NVIDIA card, once the
+        agent's archive is there — the pool asks for this script again after putting the agent
+        on the machine, before any model is pulled — the agent's launcher starts an Ollama on each
+        card behind the router (`ollama-start`), or the one server where the models do not fit a
+        card (D191). At boot, on one card, without the archive, or where the launcher could start
+        nothing, the one server as before."""
+        # The one server forgets any servers per card recorded before — a machine started again by
+        # its provider keeps its disk, not its processes (D106) — so nothing dials them.
+        single = (f'rm -f "$HOME/.ollama/models.gpm-state/ollama-{int(port)}/copies.json"; '
+                  f'OLLAMA_HOST="${{OLLAMA_HOST:-127.0.0.1:{int(port)}}}" '
+                  "nohup ollama serve >/var/log/ollama.log 2>&1 &")
+        archive = shlex.quote(agent_archive)
+        return (
+            f"if [ -f {archive} ] && [ \"$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ')\" -gt 1 ] "
+            f"&& python3 {archive} ollama-start --port {int(port)} --pinned; then :; else {single} fi"
+        )
 
     def inference_paths(self) -> set[str]:
         """Both surfaces: this engine's own API, and the OpenAI-shaped one it also serves.

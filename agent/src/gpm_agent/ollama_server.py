@@ -33,7 +33,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
 
 import httpx
@@ -107,13 +107,26 @@ class OllamaServer:
         models_path: str,
         client: httpx.AsyncClient,
         os_name: Optional[str] = None,
+        port: Optional[int] = None,
+        environment: Optional[Callable[[], dict[str, str]]] = None,
+        argv: Optional[Callable[[Path], list[str]]] = None,
+        what: str = "ollama serve",
     ) -> None:
+        """One server, on the engine URL's port — or, for one of the servers kept one per card
+        (`ollama_cards`, D190), on `port`, with the whole `environment` it is started with and
+        the argument list `argv` makes from the program (the router in front of them is kept the
+        same way). `what` names it in what is said about it."""
         self.state_dir = state_dir
         #: The settings refuse an engine URL that is not loopback with a port, for such a host.
-        self.port = int(urlsplit(engine_url).port or 11434)
+        self.port = int(port if port is not None else (urlsplit(engine_url).port or 11434))
         self.models_path = models_path
         self.client = client
         self.os_name = os_name
+        self.what = what
+        self._environment = environment
+        self._argv = argv or serve_argv
+        #: Asked of the engine URL itself, as always; of its own port where it has one.
+        self._version_url = "/api/version" if port is None else f"http://127.0.0.1:{self.port}/api/version"
         self.foreign_reason = (
             f"something this agent did not start already answers on port {self.port}: quit the Ollama "
             "you started yourself, and remove it from login items, to let the agent run it"
@@ -155,7 +168,10 @@ class OllamaServer:
         """The server's whole environment: what `platform.program_environment` keeps of the
         agent's own, with the pool's numbers and — last, so nothing overrides them — the address,
         the models directory and `OLLAMA_NO_CLOUD`: this Ollama never reaches Ollama's cloud, which
-        bills an account the pool cannot see (D168). Every `OLLAMA_*` name in it is one written here."""
+        bills an account the pool cannot see (D168). Every `OLLAMA_*` name in it is one written here.
+        A server given its environment (one of several, D190) is started with that instead."""
+        if self._environment is not None:
+            return self._environment()
         own = dict(self.pool_environment() or {})
         own["OLLAMA_HOST"] = f"127.0.0.1:{self.port}"
         own["OLLAMA_MODELS"] = str(Path(self.models_path).expanduser())
@@ -248,7 +264,7 @@ class OllamaServer:
         own = self._own_process(record)
         code = own.returncode if own is not None else None
         line = _last_error_line(record.get("log"), int(record.get("log_offset") or 0))
-        reason = f"ollama serve exited{f' with code {code}' if code is not None else ''}"
+        reason = f"{self.what} exited{f' with code {code}' if code is not None else ''}"
         return f"{reason}: {line}" if line else reason
 
     # --- what answers on the port ---
@@ -256,7 +272,7 @@ class OllamaServer:
     async def answers(self) -> Optional[str]:
         """The version the server on the port says it is, or None if nothing answers so."""
         try:
-            response = await self.client.get("/api/version", timeout=ANSWER_TIMEOUT_S)
+            response = await self.client.get(self._version_url, timeout=ANSWER_TIMEOUT_S)
             if response.status_code != 200:
                 return None
             version = response.json().get("version")
@@ -267,7 +283,7 @@ class OllamaServer:
     async def listening(self) -> bool:
         """Does anything at all answer on the port — Ollama or not?"""
         try:
-            await self.client.get("/api/version", timeout=ANSWER_TIMEOUT_S)
+            await self.client.get(self._version_url, timeout=ANSWER_TIMEOUT_S)
         except httpx.ConnectError:
             return False
         except httpx.HTTPError:
@@ -280,10 +296,11 @@ class OllamaServer:
 
     # --- starting and stopping ---
 
-    async def start(self, program: Path, version: str, timeout_s: float) -> Optional[str]:
-        """Start `program serve` and wait for it to answer as `version`. None once it does;
-        otherwise why not — and then whatever was started is left for the caller to stop. An error
-        from the system, such as a directory this user may not write, is a reason like any other."""
+    async def start(self, program: Path, version: Optional[str], timeout_s: float) -> Optional[str]:
+        """Start `program serve` and wait for it to answer as `version` — as any version, where
+        none is named (a machine the pool rents runs its image's). None once it does; otherwise
+        why not — and then whatever was started is left for the caller to stop. An error from the
+        system, such as a directory this user may not write, is a reason like any other."""
         if self.ours():
             return "this agent's server is already running"
         if await self.listening():
@@ -292,7 +309,7 @@ class OllamaServer:
             return f"{program} is not there"
         logs = self.state_dir / "logs"
         log_path = logs / LOG_FILE
-        argv = serve_argv(program)
+        argv = self._argv(program)
         try:
             host_platform.private_dir(logs, parents=True, exist_ok=True)
         except OSError as exc:
@@ -300,7 +317,7 @@ class OllamaServer:
         try:
             process, offset = host_platform.start(
                 argv, env=self.environment(), log=log_path, cwd=self.state_dir,
-                note=f"starting ollama {version}", os_name=self.os_name,
+                note=f"starting {self.what} {version or ''}".rstrip(), os_name=self.os_name,
             )
         except OSError as exc:
             return f"could not start {program}: {exc}"
@@ -322,7 +339,7 @@ class OllamaServer:
             said = await self.answers()
             # An answer counts only from a server still running after it.
             if said is not None and self._alive(record):
-                if said == version:
+                if version is None or said == version:
                     return None
                 return f"it answered as version {said}, not {version}"
             if time.monotonic() >= deadline:
@@ -346,7 +363,7 @@ class OllamaServer:
             if host_platform.alive(pid, os_name=self.os_name):
                 said = self._is_ours(pid, record)
                 if said is None:
-                    raise OSError(f"whether process {pid} is the ollama serve it started could not be read now")
+                    raise OSError(f"whether process {pid} is the {self.what} it started could not be read now")
                 if said:
                     await host_platform.stop(pid, os_name=self.os_name)
         self._forget()

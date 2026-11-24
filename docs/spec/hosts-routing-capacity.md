@@ -226,9 +226,10 @@ only when an operator resizes that host (§2.3). With no match, a rented host ru
 **per card** — times the cards the offer lists, held at 64, like a profile that names the card
 (D107) — marked as the default wherever it is shown. The market preview shows what each offer
 would run. For vLLM the launcher runs a copy of every model on each card, so the number is real
-for every model. **For Ollama it is not yet:** Ollama keeps one instance of a model, on one card
-when it fits, so a two-card Ollama host runs twice the work only when its traffic is spread over
-models on different cards.
+for every model. **For Ollama too** (D190): a machine with more than one NVIDIA card runs an Ollama
+server on each card behind the agent's router, each given its share of the host's workers, where
+the models it holds fit one card (D191 — on a rented host, as the pool judges from every model's known size); where
+they do not, one server spans every card, as Ollama always ran.
 
 Worker counts are recomputed when the pool's model set or context length changes — never per
 request.
@@ -417,6 +418,11 @@ How a host holds what it was given is its **residency** policy, set per host:
 
 Hosts the pool creates are always `pinned`: it configures them, so it sets this at creation.
 On the others the policy is verified by test-connection and every probe.
+
+On a machine running **one Ollama server per card** (D190, D192), what the pool reads — loaded, on
+disk, healthy — is the router's answer for the machine: a model is loaded only once **every** server
+holds it, and the host answers only while every server does. Under `pinned` the agent pins each
+model on every server; under `on_demand` each server loads and unloads by itself.
 
 - The model set belongs to the pool, with its hosts, key and budget. **Leases do not name models.**
 - **A host that cannot hold what it was given does not join the pool**, whatever its kind — not

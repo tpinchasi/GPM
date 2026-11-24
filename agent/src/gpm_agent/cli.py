@@ -145,11 +145,15 @@ LAUNCHER_VERBS = {
     "vllm-in-turn": "(started by vllm-start) start a card's further models one after another",
     # Run by the agent that runs vLLM itself (D159), as a program of its own.
     "vllm-stop": "stop what vllm-start last started here",
+    # Run by the pool's restart script on a machine it rents with several cards (D190), never over
+    # the agent's protocol: one Ollama server per card behind the router, or the one server.
+    "ollama-start": "start Ollama here — a server per card behind the router where the cards allow — stopping what ran before",
+    "ollama-stop": "stop what ollama-start last started here",
 }
 
 
 def _proxy(args: Any) -> int:
-    proxy_module.serve(args.upstreams, host=args.host, port=args.port)
+    proxy_module.serve(args.upstreams, host=args.host, port=args.port, engine=args.engine)
     return 0
 
 
@@ -215,6 +219,10 @@ def main(argv: list[str] | None = None) -> int:
 
     args, rest = parser.parse_known_args(argv)
     if getattr(args, "launcher_verb", None) is not None:
+        if args.launcher_verb.startswith("ollama-"):
+            from . import ollama_cards
+
+            return ollama_cards.run_verb(args.launcher_verb, rest)
         from . import vllm_launch
 
         return vllm_launch.run_verb(args.launcher_verb, rest)
