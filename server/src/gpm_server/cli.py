@@ -534,6 +534,38 @@ def _provisioner(args: argparse.Namespace) -> int:
     return 2
 
 
+def _app(args: argparse.Namespace) -> int:
+    """Named app keys for the shared pool (D193): each app on it shown apart in the stats."""
+    if args.action == "create":
+        if not args.name:
+            print("name the app: gpm app create <name>", file=sys.stderr)
+            return 2
+        status, answer = _control_json(args, "POST", "/pool/apps", {"app": args.name})
+        if status != 201:
+            print(answer.get("detail") or json.dumps(answer), file=sys.stderr)
+            return 1
+        print(f"{answer['key']['key_id']}  app {answer['app']}")
+        print(answer["connection"]["api_key"])
+        print("\nThis is the only time the key is shown: only its hash is stored. It reaches the shared pool "
+              "as the app key does, and its requests are counted under this app.", file=sys.stderr)
+        return 0
+    if args.action == "list":
+        return _control(args, "GET", "/pool/apps")
+    if args.action == "revoke":
+        if not args.name:
+            print("name the app: gpm app revoke <name> [--key-id ID]", file=sys.stderr)
+            return 2
+        path = f"/pool/apps/{args.name}" + (f"/keys/{args.key_id}" if args.key_id else "")
+        return _control(args, "DELETE", path)
+    return 2
+
+
+def _stats(args: argparse.Namespace) -> int:
+    query = f"/pool/stats?range={args.range}" + (f"&by={args.by}" if args.by else "") + (
+        f"&bucket={args.bucket}" if args.bucket else "")
+    return _control(args, "GET", query)
+
+
 def _ca(args: argparse.Namespace) -> int:
     from .certs import make_ca
 
@@ -782,6 +814,22 @@ def main(argv: list[str] | None = None) -> int:
     provisioner.add_argument("--end-workloads", action="store_true", help="for revoke: end the workloads it made")
     provisioner.add_argument("--url", default=None)
     provisioner.set_defaults(func=_provisioner)
+
+    app_cmd = subparsers.add_parser(
+        "app", help="named app keys for the shared pool: each app counted on its own (D193)"
+    )
+    app_cmd.add_argument("action", choices=["create", "list", "revoke"])
+    app_cmd.add_argument("name", nargs="?", default=None)
+    app_cmd.add_argument("--key-id", default=None, help="for revoke: that one key, not all of the app's")
+    app_cmd.add_argument("--url", default=None)
+    app_cmd.set_defaults(func=_app)
+
+    stats_cmd = subparsers.add_parser("stats", help="requests, errors, latency, tokens and cost over a range (D196)")
+    stats_cmd.add_argument("--range", default="24h", help="24h, 7d, 30d …")
+    stats_cmd.add_argument("--by", choices=["app", "model", "host", "provider", "kind"], default=None)
+    stats_cmd.add_argument("--bucket", choices=["hour", "day"], default=None)
+    stats_cmd.add_argument("--url", default=None)
+    stats_cmd.set_defaults(func=_stats)
 
     ca = subparsers.add_parser("ca", help="make the pool's client CA, for workloads' client certificates (D117)")
     ca.add_argument("action", choices=["create"])

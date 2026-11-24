@@ -675,6 +675,15 @@ effect is visible.
 
 Every request is recorded: time, session id if sent, host, worker, model requested, model
 served, runtime class, its kind and its body's size (D145), queue wait, latency, token counts,
-outcome. Measures built on output tokens read only the kinds that produce them. It is the source for the
+outcome, the workload it was for, and — for a named app key on the shared pool — its app's name
+(`app`, D193; empty for the configured app key and for a workload's key, whose workload names
+it). Measures built on output tokens read only the kinds that produce them. It is the source for the
 console, for idle detection, for corrupt-output counters, and for the offline join described in
 §4.3. It contains **no prompt or completion text**.
+
+The router only writes it, off its request path. **The supervisor folds it into hourly stats**
+(D194, [supervisor.md](supervisor.md) §4.1) — per app, model, host, provider and kind — and
+**prunes it** after `stats.keep_requests_days` (default 30, D195), never a row not yet folded and
+never, within 32 days, a row that carries a hosted cost, which the budgets read. The measures
+above read the last few thousand rows or minutes, so a pool keeps them within any retention; a
+latency measured on a class of card (D156) is forgotten with its rows.

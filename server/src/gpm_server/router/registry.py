@@ -14,6 +14,7 @@ from typing import Any, Optional
 import httpx
 
 from .. import hosted_credentials
+from ..app_keys import AppKeyStore
 from ..catalog import ResolvedVariant
 from ..config import PoolConfig
 from ..db import CounterRow, HostCounters, HostRow, HostTable
@@ -62,6 +63,10 @@ class HostRegistry:
         self.provisioning_store = ProvisioningStore(table.db)
         self.provisioners: dict[str, KeyReach] = {}
         self.last_provisioner_revision: Optional[float] = None
+        #: Named app keys for the shared pool (D193), as hash → app, for keys not revoked.
+        self.app_key_store = AppKeyStore(table.db)
+        self.app_keys: dict[str, str] = {}
+        self.last_app_key_revision: Optional[float] = None
 
     def apply_config(self, config: PoolConfig) -> None:
         """A configuration applied while the router runs. The table still says which hosts
@@ -114,6 +119,10 @@ class HostRegistry:
         if provisioner_revision != self.last_provisioner_revision:
             self.provisioners = await asyncio.to_thread(self.provisioning_store.usable_hashes)
             self.last_provisioner_revision = provisioner_revision
+        app_key_revision = await asyncio.to_thread(self.app_key_store.revision)
+        if app_key_revision != self.last_app_key_revision:
+            self.app_keys = await asyncio.to_thread(self.app_key_store.usable_hashes)
+            self.last_app_key_revision = app_key_revision
         revision = await asyncio.to_thread(self.workload_store.revision)
         if revision == self.last_workload_revision:
             return False

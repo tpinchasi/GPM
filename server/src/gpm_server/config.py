@@ -865,6 +865,31 @@ class PoolSettings(BaseModel):
         return self
 
 
+class StatsConfig(BaseModel):
+    """Stats kept, and how long the raw logs are (D194, D195). The supervisor folds the request
+    log and the spend ledger into hourly tables; the raw rows go after `keep_requests_days`, the
+    hourly ones after `keep_rollups_days`. `null` keeps them for ever. Whatever lease and budget
+    enforcement reads is never pruned, whatever is set here."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: The request log, the decision log (but the machine record's events) and superseded spend rows.
+    keep_requests_days: Optional[int] = Field(default=30, ge=1)
+    #: The hourly tables the dashboards read.
+    keep_rollups_days: Optional[int] = Field(default=400, ge=1)
+    #: How often the supervisor folds what is new, in seconds.
+    rollup_interval_s: float = Field(default=60.0, gt=0)
+
+    @model_validator(mode="after")
+    def _rollups_outlive_requests(self) -> "StatsConfig":
+        if (self.keep_rollups_days is not None and self.keep_requests_days is not None
+                and self.keep_rollups_days < self.keep_requests_days):
+            raise ValueError(
+                "stats.keep_rollups_days is shorter than stats.keep_requests_days: the hourly stats would go "
+                "before the rows they are made from — keep them at least as long")
+        return self
+
+
 class ProvisioningConfig(BaseModel):
     """Programs that create their own workloads through the SDK (D117, stories/S6). Off unless
     enabled; then a pool-wide daily cap is required, so the operator's total exposure is a
@@ -1656,6 +1681,8 @@ class PoolConfig(BaseModel):
     containers: ContainersConfig = Field(default_factory=ContainersConfig)
     #: Trained models' uploaded files (D182).
     models: ModelsConfig = Field(default_factory=ModelsConfig)
+    #: Stats kept, and how long the raw logs are (D194, D195).
+    stats: StatsConfig = Field(default_factory=StatsConfig)
     request_log: str = "gpm.sqlite3"
     directory: DirectoryConfig = Field(default_factory=DirectoryConfig)
 

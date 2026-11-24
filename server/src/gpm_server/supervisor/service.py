@@ -243,6 +243,13 @@ class Supervisor:
         self._send_after: dict[tuple[str, str], tuple[float, float, str]] = {}
         #: How the model hub is reached for relayed uploads (D182) — only ever replaced by a test.
         self._hub_transport: Optional[httpx.AsyncBaseTransport] = None
+        #: Stats kept, and the raw logs pruned (D194, D195): folded here, never in the router — on
+        #: a connection of their own, so a long read in their thread never holds the one the passes
+        #: and the control API use.
+        from ..stats import Stats
+
+        self.stats = Stats(Database(database.path), lambda: self.config)
+        self._stats_task: Optional[asyncio.Task] = None
 
     def _build_fleet(self, config: PoolConfig, given: Optional[dict] = None) -> None:
         """The rented half of the pool, from the file's `rented` section: one plug-in per
@@ -396,6 +403,19 @@ class Supervisor:
         await self.pass_once()
         if self.config.provisioning.enabled and self._request_watcher is None:
             self._request_watcher = asyncio.create_task(self._watch_requests(), name="gpm:provisioning")
+        if self._stats_task is None:
+            self._stats_task = asyncio.create_task(self._keep_stats(), name="gpm:stats")
+
+    async def _keep_stats(self) -> None:
+        """Fold the request log and the spend ledger into the hourly stats, and prune what retention
+        lets go (D194, D195): in a thread, beside the passes and never inside one — the pass lock is
+        not taken, as nothing here decides anything. A failure is logged and tried again next time."""
+        while not self._stopping:
+            try:
+                await asyncio.to_thread(self.stats.run_once)
+            except Exception:  # noqa: BLE001 - stats are never worth stopping the supervisor for
+                log.exception("keeping the stats failed; tried again next time")
+            await asyncio.sleep(self.config.stats.rollup_interval_s)
 
     async def _watch_requests(self) -> None:
         """Answer programs' requests within a second or so, rather than a pass (D117): a cheap
@@ -529,6 +549,11 @@ class Supervisor:
         self._stopping = True
         if self._request_watcher is not None:
             self._request_watcher.cancel()
+        if self._stats_task is not None:
+            self._stats_task.cancel()
+            with contextlib.suppress(BaseException):
+                await self._stats_task
+        self.stats.db.close()
         await self.directory.aclose()
         for host in self.hosts.values():
             # Detached, not stopped: with the forwarder (D110) the forwards outlive this

@@ -1,6 +1,6 @@
 # Specification — Operator Console and Control API
 
-> Reasons are in [../decisions.md](../decisions.md) (D8, D16, D21). The console is for the
+> Reasons are in [../decisions.md](../decisions.md) (D8, D16, D21; named app keys and dashboards D193–D197). The console is for the
 > **operator**. It is not part of any app, and apps never see it.
 
 ## 1. Ground rules
@@ -25,7 +25,7 @@
   change without appearing in it (D42).
 - **The admin key is required on every control-API request**, sent as a header, never a cookie,
   with `Host` / `Origin` checked — on loopback too, because any web page open in the same
-  browser can send requests to `127.0.0.1`. The app key is refused here.
+  browser can send requests to `127.0.0.1`. The app key is refused here, and every named app key (D193) with it.
 - **Several providers** rent side by side (D129–D136). The **Providers** screen is where
   their accounts are managed, in one list with the hosted model APIs (S13): a card each, with its icon, credential state, quota, holdings and
   capabilities, and Add provider — choose, name, credential, test, save — with no restart
@@ -48,6 +48,8 @@
 | **Rented capacity → Profiles** | What each machine the pool rents holds (D111, D112); for an engine that can, how many cards each model is split across, the needs then per card of a group (D114). The engine rented machines run, then each **model profile** as a card: a rent tick, its name, whether a machine holds **one model** (choosing another replaces it) or **several** (a chosen few), and its rows — each a **model and the variant** a machine fetches for it, with precision and size — and the least card and disk that needs. **Every picker here chooses a model and its variant together, in one click**: *In the pool* lists the variants the pool already has that rented machines can run, with no search; a search lists every model on the model hub (or in Ollama's library, for an Ollama pool) with **its variants side by side** — the original and its quantisations — filtered by parameters, size, card fit, precision and kind. A variant new to the pool is added under the pool's name for that model, or a name typed beside it. **Machine setup** — images, engine options, start command — is folded below. **Saved as one change** with the engine, since a variant is one engine's; a variant is written into the catalog after those there, only if a profile uses it | `PATCH /pool/config/engine` `{profiles, rent, add}` · `GET /pool/models/search` · `GET /pool/models/size` |
 | **Rented capacity → finding machines: the next host** | What the next machine would be bought as, what that needs, and — where it is more than the minimums set here — the card, disk and whole groups of cards the search asks for because of it (D111, D114) | — (`GET /pool/market/preview` `next_host`) |
 | **Workloads** | The running workloads — state, hosts ready, latency p95 against the target, spend against the cap, hours left — each with Extend…, New key and End; a form that plans a new one — a row per model, with "Add model" and, for several, a placement (D118) — (the plan shows the start, the first host, the time to serve and the budget, typed or proposed; for several models, both placements priced, the one kept and each group's split) before Create is allowed, a proposed budget typed again to accept it, and the key shown once with copy buttons until put away (D115) | `/pool/workloads…` |
+| **Workloads → apps on the shared pool** | Each named app key's app (D193): its keys by id and date — never a key — and whether any is usable | **Make key** for a new name, or **Add a key** to one there (how a key is rotated), the key and the pool's URL shown once with copy buttons until put away; **Revoke** one key, or **Revoke…** every key of an app | `GET/POST /pool/apps`, `DELETE /pool/apps/{app}[/keys/{key_id}]` |
+| **Dashboards** | The stats kept (D194, D197), in four tabs at `#dashboards/<tab>`: **Apps** — each workload, each named app key, the configured key: requests, errors, p50 and p95, tokens, hosted and rented cost; **Hosts & cost** — each machine and hosted API: requests, errors, p95, busy worker-hours, cost, per hour, per 1 000 tokens out and per request; **Providers** — own machines, each rented account, each hosted API: spend over time, requests, errors, refusals for money; **Models**. Over 24 h or 7 d by the hour, 30 d by the day: total tiles, line charts drawn by the page as SVG — titled, with a legend, a tooltip per time slot and the same numbers as a table beneath — and a table per tab. At most six series a chart, the rest as "others"; a series keeps its colour whatever else is shown | Choose the range; Refresh | `GET /pool/stats` |
 | **Spending** | What hosted APIs and rented bursts cost, today and this month (UTC days and months, as every budget is counted): totals; each budget — the shared workload's `pool.bursts.hosted`, each workload's hosted and rented burst — with its spend against its day's and month's limits; hosted answers per workload and provider, counted and priced. Hosted answers are charged from their own token counts at the catalog's prices; rented bursts from the spend ledger (D165, D166) | `GET /pool/hosted` | Every hosted API: format, address, its key's source (never the key), state, models offered with prices, spend; the presets; the hosted budget (providers.md §10) |
 | `POST /pool/hosted/test` | Ask a provider's `/models` with a typed key — or a saved API with its own — which spends nothing |
 | `POST /pool/hosted`, `PATCH /pool/hosted/{id}`, `DELETE /pool/hosted/{id}` | Add (host, pinned builds, model set; key tested and kept), change (workers, service, caching, models and prices), remove (typed again) — through validate → plan → apply |
@@ -136,6 +138,8 @@ Both processes follow the file. The supervisor applies a change on its next pass
 | `POST /pool/hosts/{id}/engine/upgrade`, `POST /pool/hosts/{id}/engine/rollback` | For a host whose agent installs its engine (D153): switch to the staged version now, through the same drain and check; or go back to the previous version. The host id typed again (`confirm`) |
 | `POST /pool/hosts/{id}/funds-restored` | A hosted API's money is back (D164): the router routes to it again. 404 for a host that is not a hosted API; the event names what the provider had said |
 | `GET /pool/spending` | Hosted spend today and this month — per workload and provider, with each hosted budget against its limits — each workload's rented burst against its budget, and each hosted API's out-of-money mark (D165, D166) |
+| `GET /pool/apps`, `POST /pool/apps` `{app}`, `DELETE /pool/apps/{app}`, `DELETE /pool/apps/{app}/keys/{key_id}` | Named app keys for the shared pool (D193): each app and its keys, never a key or a hash; a new key for an app, the app made if new, answered with `connection: {base_url, api_key}` **once**; revoke all of an app's keys or one. A named key is an app key: refused here like the configured one |
+| `GET /pool/stats` | The stats kept (D194, D196): `range` (`24h`, `7d`, `30d` …) or `from`/`to`; `bucket` `hour` (31 days at most) or `day` (UTC); `by` `app`, `model`, `host`, `provider` or `kind`; narrowed by `workload` (`shared`), `app`, `model`, `host`, `provider`, `kind`. Each series and the whole, per bucket and in total: requests, answered, errors, refused, failed, cancelled, 4xx, 5xx, refused for money, tokens in and out, p50, p95, mean and largest latency, queue wait, worker time, cost hosted, rented and both; `notes` where rented cost is per machine and so left out or a line of its own; the retention in force. New rows are folded first |
 | `POST /pool/down` | Destroy all rented hosts now, verified |
 | `GET /pool/market/preview` | Run the offer pipeline read-only with supplied settings — the market is searched only with `search=true`; without it, the settings and the next host's needs only (D120, D122). `POST` likewise. `kinds=both` lists bid and on-demand offers together whatever `rented.mode` is; every row carries its `offer_id` and `kind` |
 | `POST /pool/keys`, `DELETE /pool/keys/{id}` | Create, rotate and revoke app and admin keys |
@@ -160,7 +164,7 @@ Both processes follow the file. The supervisor applies a change on its next pass
 
 CLI verbs map one-to-one: `gpm status | plan | serve | stop [--release] | restart | lease … |
 host test | host prepare | host drain | host release | host park | host funds-restored | spending |
-down --all | key …`.
+down --all | key … | app create/list/revoke | stats`.
 
 ## 5. How it is built
 

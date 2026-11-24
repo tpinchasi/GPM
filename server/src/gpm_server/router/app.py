@@ -108,12 +108,14 @@ _READ_OFF_LOOP_BYTES = 1_000_000
 
 @dataclasses.dataclass(frozen=True)
 class Identity:
-    """Who a request is from, as its key says (D115, D117): the shared workload (an app key), one
-    workload (its `gpmw_` key), or a program's provisioning key (`gpmp_`), which asks for
-    workloads and never for a completion."""
+    """Who a request is from, as its key says (D115, D117, D193): the shared workload (an app key —
+    the configured one, or a named one, whose app is `app`), one workload (its `gpmw_` key), or a
+    program's provisioning key (`gpmp_`), which asks for workloads and never for a completion."""
 
     workload: Optional[str] = None
     provisioner: Optional[str] = None
+    #: The app a named app key was made for (D193); None for the configured app key.
+    app: Optional[str] = None
 
 
 def _identity(state: RouterState, request: Request) -> Optional[Identity]:
@@ -128,6 +130,10 @@ def _identity(state: RouterState, request: Request) -> Optional[Identity]:
             return None
     if verify(token, state.app_hashes):
         return Identity()
+    # A named app key (D193): the shared workload's, exactly as the app key is, with a name.
+    app = match(token, state.registry.app_keys)
+    if app is not None:
+        return Identity(app=app)
     now = time.time()
     reach = match(token, state.registry.provisioners)
     if reach is not None:
@@ -994,6 +1000,7 @@ def create_app(
                     session_id=session_id,
                     model_requested=requested,
                     workload=who.workload,
+                    app=who.app,
                     kind=facts.kind,
                     request_bytes=len(body),
                     **fields,  # type: ignore[arg-type]

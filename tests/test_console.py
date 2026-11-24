@@ -247,7 +247,7 @@ def test_every_screens_data_call_is_refused_to_the_app_key(console):
     """An app that can request a completion must not be able to read or spend here."""
     _, url, _, _ = console
     paths = ["/pool/status", "/pool/events", "/pool/leases", "/pool/plan", "/pool/config",
-             "/pool/config/history", "/pool/market/preview", "/pool/account"]
+             "/pool/config/history", "/pool/market/preview", "/pool/account", "/pool/apps", "/pool/stats"]
     with client(url, key=APP_KEY) as http:
         for path in paths:
             assert http.get(path).status_code == 403, path
