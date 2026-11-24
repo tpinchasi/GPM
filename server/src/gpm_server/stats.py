@@ -345,11 +345,16 @@ class Stats:
             if settings.keep_requests_days is not None:
                 cutoff = now - settings.keep_requests_days * DAY_S
                 folded = self._mark(_REQUESTS_MARK)
+                hosted_since, rented_since = self._balance_moments()
+                # A hosted answer's cost stays for budgets (a month) and for as long as an account's
+                # balance is counted down from it (D188): a balance typed long ago still needs every
+                # cost since.
+                cost_kept_from = min([cutoff, now - BUDGET_LOOKBACK_S, *hosted_since])
                 removed["request_log"] = self._delete_behind_cursor(
                     "request_log",
                     "SELECT id FROM request_log WHERE id > ? AND id <= ? AND ts < ? AND (cost_usd IS NULL OR ts < ?) "
                     "ORDER BY id LIMIT ?",
-                    (folded, cutoff, min(cutoff, now - BUDGET_LOOKBACK_S)), self._requests_kept(), batch, batches)
+                    (folded, cutoff, cost_kept_from), self._requests_kept(), batch, batches)
                 kinds = sorted(KEPT_EVENT_KINDS)
                 removed["events"] = self._delete_behind_cursor(
                     "events",
@@ -361,11 +366,15 @@ class Stats:
                 spend_folded = self._mark(_SPEND_MARK)
                 kept: set[int] = set()
                 # Per lease, host and source: the newest figure, the newest before today and before
-                # this month, and the newest folded — every figure enforcement and the fold read.
+                # this month, the newest folded, and the newest before each moment an account's
+                # balance is counted down from (D188) — every figure enforcement, the fold and the
+                # balances read.
+                moments = sorted(set(rented_since))
+                extra = "".join(f", MAX(CASE WHEN ts < ? THEN id END) AS before_{i}" for i in range(len(moments)))
                 for row in self.db.query(
                         "SELECT MAX(id) AS newest, MAX(CASE WHEN ts < ? THEN id END) AS before_day, "
-                        "MAX(CASE WHEN ts < ? THEN id END) AS before_month, MAX(CASE WHEN id <= ? THEN id END) AS folded "
-                        "FROM spend GROUP BY lease_id, host_id, source", (day, month, spend_folded)):
+                        "MAX(CASE WHEN ts < ? THEN id END) AS before_month, MAX(CASE WHEN id <= ? THEN id END) AS folded"
+                        f"{extra} FROM spend GROUP BY lease_id, host_id, source", (day, month, spend_folded, *moments)):
                     kept.update(int(v) for v in tuple(row) if v is not None)
                 removed["spend"] = self._delete_behind_cursor(
                     "spend", "SELECT id FROM spend WHERE id > ? AND id <= ? AND ts < ? ORDER BY id LIMIT ?",
@@ -378,6 +387,23 @@ class Stats:
                         (before,), set(), batch, batches, column="rowid")
         self.last_pruned_at = now
         return removed
+
+    def _balance_moments(self) -> tuple[list[float], list[float]]:
+        """When each account's balance in force was typed or read (D188): hosted ones, and rented
+        ones. Nothing where the pool keeps no balances."""
+        try:
+            rows = self.db.query("SELECT account, typed_usd, typed_at, read_at FROM provider_balances")
+        except Exception:  # noqa: BLE001 — no such table: a database from before balances
+            return [], []
+        hosted: list[float] = []
+        rented: list[float] = []
+        for row in rows:
+            moments = [float(m) for m in (row["typed_at"] if row["typed_usd"] is not None else None, row["read_at"])
+                       if m is not None]
+            if not moments:
+                continue
+            (hosted if str(row["account"]).startswith("hosted:") else rented).append(min(moments))
+        return hosted, rented
 
     def _requests_kept(self) -> set[int]:
         """Request rows the pool's own measures read whatever their age, chosen as those readers

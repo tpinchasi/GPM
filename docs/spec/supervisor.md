@@ -270,9 +270,9 @@ lock of the prune's own — folding and `GET /pool/stats` go on beside it:
 
 | Table | Pruned after | Never pruned |
 |---|---|---|
-| `request_log` | `stats.keep_requests_days` (30, at least 7) | a row not yet folded; a row with a hosted cost younger than 32 days — the UTC month and a provisioner's rolling 30 days are read from them; per build, the newest 20 000 answers a latency curve is made of (D156), and the newest 20 000 chat answers the machine record folds (D69) — the readers' own predicates and limit (`stats.MEASURED_ROWS`) |
+| `request_log` | `stats.keep_requests_days` (30, at least 7) | a row not yet folded; a row with a hosted cost younger than 32 days — the UTC month and a provisioner's rolling 30 days are read from them; per build, the newest 20 000 answers a latency curve is made of (D156), and the newest 20 000 chat answers the machine record folds (D69) — the readers' own predicates and limit (`stats.MEASURED_ROWS`); a hosted cost since the moment an account's balance in force was typed or read (D188) |
 | `events` | `stats.keep_requests_days` | the machine record's kinds — `rented`, `prepared`, `eviction`, `released`, `host_gone` and the failures the history counts (D69), which sizing and burst spend read back; `replaced_for_value` and `machine_avoided`, from which a lease's replacements and avoid list are restored; any event of a lease still open |
-| `spend` | `stats.keep_requests_days` | per lease, host and source: the newest row, the newest before the start of today and of this month (UTC), and the newest already folded — every figure lease and burst enforcement reads, which read the same after a prune |
+| `spend` | `stats.keep_requests_days` | per lease, host and source: the newest row, the newest before the start of today and of this month (UTC), and the newest already folded — every figure lease and burst enforcement reads, which read the same after a prune; and the newest before each moment an account's balance is counted down from (D188) |
 | the hourly tables | `stats.keep_rollups_days` (400) | — |
 
 `null` keeps a table for ever; `keep_rollups_days` is never shorter than `keep_requests_days`.

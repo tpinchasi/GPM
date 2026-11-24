@@ -471,3 +471,31 @@ def test_retention_is_at_least_a_week():
     with pytest.raises(ValueError):
         StatsConfig(keep_requests_days=6, keep_rollups_days=400)
     assert StatsConfig(keep_requests_days=7).keep_requests_days == 7
+
+
+def test_pruning_keeps_what_an_accounts_balance_is_counted_down_from(db):
+    """A typed balance stands until it is cleared (D188), so it can be months old: pruning must not
+    take away the hosted costs since it, or a rented account's figure from just before it — the
+    estimate would read too much left, or too little, and rent or route wrongly."""
+    typed_at = NOW - 60 * DAY_S
+    db.execute("INSERT INTO provider_balances (account, typed_usd, typed_at, updated_at) VALUES (?, ?, ?, ?)",
+               ("hosted:openai", 64.0, typed_at, NOW))
+    db.execute("INSERT INTO provider_balances (account, typed_usd, typed_at, updated_at) VALUES (?, ?, ?, ?)",
+               ("rented:vast", 50.0, typed_at, NOW))
+    # Embeddings: rows the sizing and machine-record measures do not read, so only the balance
+    # can keep them.
+    log(db, ts=NOW - 50 * DAY_S, host_id="openai", cost_usd=0.75, kind="embed")  # since the balance
+    log(db, ts=NOW - 70 * DAY_S, host_id="openai", cost_usd=0.10, kind="embed")  # before it: may go
+    spend(db, typed_at - 2 * DAY_S, 1.00)                               # newest before the balance
+    spend(db, typed_at - 1 * DAY_S, 2.00)
+    spend(db, typed_at + 1 * DAY_S, 3.00)
+    spend(db, NOW - 1 * HOUR_S, 9.00)
+    stats = Stats(db, lambda: config(keep_requests_days=30))
+    while stats.roll_up()["requests"] or stats.roll_up()["spend"]:
+        pass
+    stats.prune(NOW)
+    costs = sorted(r["cost_usd"] for r in db.query("SELECT cost_usd FROM request_log WHERE host_id = 'openai'"))
+    assert costs == [0.75], "every hosted cost since the balance stays; one before it may go"
+    amounts = sorted(r["amount"] for r in db.query("SELECT amount FROM spend"))
+    assert 2.00 in amounts and 9.00 in amounts, "the figure the countdown starts from, and the newest"
+    assert 1.00 not in amounts, "older than the figure before the balance, and nothing else reads it"
