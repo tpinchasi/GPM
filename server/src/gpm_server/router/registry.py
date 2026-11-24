@@ -40,7 +40,6 @@ def _literal_variants(variants: dict[str, tuple[ResolvedVariant, ...]]) -> dict[
     return {variant.tag: variant for group in variants.values() for variant in group}
 
 
-
 def _follow_balance(host: Host, row: HostRow) -> None:
     """A hosted API whose balance the supervisor found at $0 (D188) is out of routing as if its
     provider had said so — unless an operator said its money is back since; and back in once the
@@ -53,6 +52,7 @@ def _follow_balance(host: Host, row: HostRow) -> None:
     elif host.out_of_funds_by_balance:
         host.out_of_funds = host.out_of_funds_at = None
         host.out_of_funds_by_balance = False
+
 
 class HostRegistry:
     def __init__(self, config: PoolConfig, table: HostTable, counters: HostCounters, dispatcher: Dispatcher):
