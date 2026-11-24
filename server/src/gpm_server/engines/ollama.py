@@ -65,7 +65,10 @@ class OllamaEngine:
         card behind the router (`ollama-start`), or the one server where the models do not fit a
         card (D191). At boot, on one card, without the archive, or where the launcher could start
         nothing, the one server as before."""
-        single = (f'OLLAMA_HOST="${{OLLAMA_HOST:-127.0.0.1:{int(port)}}}" '
+        # The one server forgets any servers per card recorded before — a machine started again by
+        # its provider keeps its disk, not its processes (D106) — so nothing dials them.
+        single = (f'rm -f "$HOME/.ollama/models.gpm-state/ollama-{int(port)}/copies.json"; '
+                  f'OLLAMA_HOST="${{OLLAMA_HOST:-127.0.0.1:{int(port)}}}" '
                   "nohup ollama serve >/var/log/ollama.log 2>&1 &")
         archive = shlex.quote(agent_archive)
         return (

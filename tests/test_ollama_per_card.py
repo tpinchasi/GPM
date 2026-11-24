@@ -41,6 +41,14 @@ watched = ["OLLAMA_HOST", "CUDA_VISIBLE_DEVICES", "OLLAMA_NUM_PARALLEL", "OLLAMA
            "OLLAMA_KEEP_ALIVE", "OLLAMA_NO_CLOUD", "HF_TOKEN"]
 with open(os.environ.get("FAKE_STARTS") or os.path.join(os.path.dirname(sys.argv[0]), "starts.jsonl"), "a") as f:
     f.write(json.dumps({"pid": os.getpid(), "args": sys.argv[1:], "env": {k: os.environ.get(k) for k in watched}}) + "\n")
+try:
+    # Cards whose server hangs as it starts, and never answers: "all", or card numbers.
+    silent = open(os.path.join(os.path.dirname(sys.argv[0]), "silent")).read().split()
+except OSError:
+    silent = []
+if "all" in silent or os.environ.get("CUDA_VISIBLE_DEVICES") in silent:
+    import time
+    time.sleep(3600)
 loaded = []
 
 
@@ -246,7 +254,7 @@ class Servers:
 
 
 def router_for(tmp_path, servers: Servers) -> httpx.AsyncClient:
-    listed = tmp_path / "servers.json"
+    listed = tmp_path / "copies.json"
     listed.write_text(json.dumps({"cards": ["0", "1"], "why": "two cards", "servers": [
         {"card": "0", "url": "http://127.0.0.1:9001"}, {"card": "1", "url": "http://127.0.0.1:9002"}]}))
     app = create_app(str(listed), engine="ollama", client=httpx.AsyncClient(transport=servers.transport()))
@@ -277,7 +285,7 @@ async def test_a_request_goes_to_the_server_with_the_fewest_in_flight(tmp_path):
             await hold.wait()
         return answered({"served_by_card": card})
 
-    listed = tmp_path / "servers.json"
+    listed = tmp_path / "copies.json"
     listed.write_text(json.dumps({"servers": [{"card": "0", "url": "http://127.0.0.1:9001"},
                                               {"card": "1", "url": "http://127.0.0.1:9002"}]}))
     app = create_app(str(listed), engine="ollama", client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
@@ -354,7 +362,7 @@ async def test_the_pools_headers_never_reach_a_server(tmp_path):
         seen.append(request.headers)
         return inner.handle_request(request)
 
-    listed = tmp_path / "servers.json"
+    listed = tmp_path / "copies.json"
     listed.write_text(json.dumps({"servers": [{"card": "0", "url": "http://127.0.0.1:9001"}]}))
     app = create_app(str(listed), engine="ollama", client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://router") as router:
@@ -363,7 +371,7 @@ async def test_the_pools_headers_never_reach_a_server(tmp_path):
 
 
 def test_a_server_listed_off_this_machine_is_never_taken(tmp_path):
-    listed = tmp_path / "servers.json"
+    listed = tmp_path / "copies.json"
     listed.write_text(json.dumps({"servers": [{"card": "0", "url": "http://10.0.0.5:9001"},
                                               {"card": "1", "url": "http://127.0.0.1:9002"}]}))
     from gpm_agent.proxy import OllamaServers
@@ -374,11 +382,18 @@ def test_a_server_listed_off_this_machine_is_never_taken(tmp_path):
 # --- the agent's model work through them (D190, D192) ---
 
 
+@pytest.fixture
+def router_up(monkeypatch):
+    """The router in front of the servers is running, as its record says (the processes are fakes
+    behind a mock transport here)."""
+    monkeypatch.setattr(ollama_cards, "router_running", lambda *args, **kwargs: True)
+
+
 def facts_with_servers(tmp_path, servers: Servers) -> tuple[OllamaFacts, httpx.AsyncClient]:
     models = tmp_path / "models"
     state = ollama_cards.state_dir(models, 9000)
     state.mkdir(parents=True)
-    (state / "servers.json").write_text(json.dumps({"cards": ["0", "1"], "why": "two cards", "servers": [
+    (state / "copies.json").write_text(json.dumps({"cards": ["0", "1"], "why": "two cards", "servers": [
         {"card": "0", "url": "http://127.0.0.1:9001"}, {"card": "1", "url": "http://127.0.0.1:9002"}]}))
     settings = Settings(key_hash=fingerprint(AGENT_KEY), engine_url="http://127.0.0.1:9000", models_path=str(models))
     inner = servers.transport()
@@ -408,7 +423,7 @@ def facts_with_servers(tmp_path, servers: Servers) -> tuple[OllamaFacts, httpx.A
     return OllamaFacts(settings), client
 
 
-async def test_a_model_is_pulled_once_through_the_first_server(tmp_path):
+async def test_a_model_is_pulled_once_through_the_first_server(tmp_path, router_up):
     servers = Servers(loaded=((), ()))
     facts, client = facts_with_servers(tmp_path, servers)
     async with client:
@@ -417,7 +432,7 @@ async def test_a_model_is_pulled_once_through_the_first_server(tmp_path):
     assert [(card, path) for card, path, _ in servers.seen if path == "/api/pull"] == [(0, "/api/pull")]
 
 
-async def test_a_pinned_model_is_held_on_every_server(tmp_path):
+async def test_a_pinned_model_is_held_on_every_server(tmp_path, router_up):
     servers = Servers(loaded=((), ()))
     facts, client = facts_with_servers(tmp_path, servers)
     async with client:
@@ -425,11 +440,11 @@ async def test_a_pinned_model_is_held_on_every_server(tmp_path):
         described = await facts.describe(client)
     assert servers.loaded == [["small:1"], ["small:1"]]
     assert described["models_loaded"] == ["small:1"]
-    assert described["layout"] == {"cards": ["0", "1"], "servers": 2, "why": "two cards"}
+    assert described["layout"] == {"cards": ["0", "1"], "servers": 2, "why": "two cards", "running": True}
     assert [copy["models_loaded"] for copy in described["copies"]] == [["small:1"], ["small:1"]]
 
 
-async def test_a_release_goes_only_to_the_servers_that_hold_it(tmp_path):
+async def test_a_release_goes_only_to_the_servers_that_hold_it(tmp_path, router_up):
     """Releasing a model a server does not hold would load it there (D192)."""
     servers = Servers(loaded=(("small:1",), ()))
     facts, client = facts_with_servers(tmp_path, servers)
@@ -442,7 +457,7 @@ async def test_a_release_goes_only_to_the_servers_that_hold_it(tmp_path):
     assert servers.loaded == [[], []]
 
 
-async def test_a_pin_held_by_one_server_is_still_released(tmp_path):
+async def test_a_pin_held_by_one_server_is_still_released(tmp_path, router_up):
     """A model left by the set, pinned by this agent, held on one card of two: released there —
     not forgotten as an engine restart's doing, which would keep it on that card for good."""
     from gpm_agent.models import ModelWork
@@ -490,7 +505,8 @@ class Machine:
         self.made: list[OllamaCards] = []
         self.clients: list[httpx.AsyncClient] = []
 
-    def cards(self, cards=("0", "1"), card_gib=24, held=None) -> OllamaCards:
+    def cards(self, cards=("0", "1"), card_gib=24, held=()) -> OllamaCards:
+        """The agent's runner; `held` what the pool told it to hold — None for not told yet."""
         client = httpx.AsyncClient(base_url=f"http://127.0.0.1:{self.port}", timeout=10)
         self.clients.append(client)
         runner = OllamaCards(
@@ -498,8 +514,7 @@ class Machine:
             models_path=str(self.root / "models"), client=client,
             cards=lambda: list(cards), card_bytes=lambda: card_gib * GIB, command=own_command(),
         )
-        if held is not None:
-            runner.held = lambda: held
+        runner.held = lambda: held
         self.made.append(runner)
         return runner
 
@@ -697,7 +712,9 @@ def test_the_pools_start_runs_the_launcher_on_several_cards_and_the_one_server_o
     assert head.startswith("if [ -f /a.pyz ] && ") and "nvidia-smi -L" in head and "-gt 1" in head
     assert "python3 /a.pyz ollama-start --port 11434 --pinned; then :;" in head
     # The one server where the launcher does not run — or could start nothing.
-    assert single.startswith('OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}" nohup ollama serve') and single.endswith("& fi")
+    assert 'OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}" nohup ollama serve' in single and single.endswith("& fi")
+    # And forgets any servers per card recorded before: a machine started again keeps its disk only.
+    assert single.startswith('rm -f "$HOME/.ollama/models.gpm-state/ollama-11434/copies.json"; ')
     done = subprocess.run(["sh", "-n", "-c", start], capture_output=True, text=True)
     assert done.returncode == 0, done.stderr
 
@@ -712,12 +729,13 @@ def ollama_fleet(tmp_path):
 
     databases = []
 
-    def build(**rented):
+    def build(sizes=None, **rented):
+        sizes = {"size_gb": 4.0} if sizes is None else sizes
         config = PoolConfig.model_validate({
             "pool": {"name": "t", "model_set": ["chat"], "models_per_host": "all"},
             "auth": {"app_keys": ["k"]},
             "engine": "ollama",
-            "catalog": {"chat": {"variants": [{"tag": "chat:1", "engine": "ollama"}]}},
+            "catalog": {"chat": {"variants": [{"tag": "chat:1", "engine": "ollama", **sizes}]}},
             "hosts": [],
             "rented": {
                 "provider": "fake", "workers": 6, "capabilities": ["cuda"], "engine": "ollama",
@@ -821,3 +839,162 @@ def test_the_agent_that_runs_ollama_runs_it_one_server_per_card_where_it_can(tmp
     assert server.held() is None, "until the pool has said"
     app.state.work.desired = Desired(("small:1",), "pinned")
     assert tuple(server.held()) == ("small:1",)
+
+
+# --- the review's findings ---
+
+
+def test_only_the_agent_itself_matches_what_a_reinstall_stops():
+    """Finding 1: the install's `pkill -f` stopped every program of the archive whose command line
+    held "serve" — the router's `--upstreams …/servers.json` among them — on every reinstall."""
+    import re
+
+    from gpm_server.supervisor import hostagent
+
+    pattern = hostagent.AGENT_PROCESS
+    archive, models = hostagent.ARCHIVE, "/root/.ollama/models.gpm-state/ollama-11434"
+    assert re.search(pattern, f"python3 {archive} -c {hostagent.SETTINGS} serve")
+    assert re.search(pattern, f"/usr/bin/python3 {archive} -c {hostagent.SETTINGS} serve")
+    for other in (
+        f"/usr/bin/python3 {archive} proxy --engine ollama --upstreams {models}/copies.json --port 11434",
+        f"/usr/bin/python3 {archive} proxy --engine ollama --upstreams {models}/servers.json --port 11434",
+        f"python3 {archive} ollama-start --port 11434 --pinned",
+        f"python3 {archive} vllm-start --models-dir /opt/gpm/models --port 8000 --proxy",
+        f"python3 {archive} -c {hostagent.SETTINGS} serve-ish",
+    ):
+        assert not re.search(pattern, other), other
+    assert "serve" not in ollama_cards.COPIES_FILE
+
+
+async def test_a_record_whose_router_is_not_running_is_never_dialled(tmp_path):
+    """Finding 3: the record outlives its processes (a machine started again keeps its disk), and
+    a pull sent to a port nothing listens on can never land."""
+    servers = Servers(loaded=((), ()))
+    facts, client = facts_with_servers(tmp_path, servers)
+    async with client:
+        assert facts.copies() == []
+        described = await facts.describe(client)
+        async for _ in facts.pull(client, "small:1"):
+            pass
+    assert described["layout"]["running"] is False and "copies" not in described
+    assert not [seen for seen in servers.seen if seen[1] == "/api/pull"], "pulled through the engine URL"
+
+
+async def test_a_router_is_running_only_as_its_record_says(machine):
+    runner = machine.cards()
+    try:
+        assert await runner.start(machine.ollama, VERSION, 30) is None
+        assert ollama_cards.router_running(machine.root / "models", machine.port)
+        record = runner._router()._current()
+        os.kill(record["pid"], 9)
+        deadline = time.monotonic() + 10
+        while ollama_cards.router_running(machine.root / "models", machine.port):
+            assert time.monotonic() < deadline
+            time.sleep(0.1)
+        layout = ollama_cards.read_layout(machine.root / "models", machine.port)
+        assert layout["servers"] and layout["running"] is False
+        assert ollama_cards.copy_urls(machine.root / "models", machine.port) == []
+    finally:
+        await runner.stop()
+
+
+async def test_before_the_pool_has_said_models_that_do_not_fit_are_not_split(machine):
+    """Finding 2: before the pool's first pass the plan saw no models and split the cards — a set
+    too large for one was then pinned partly on the processor, and restarted."""
+    manifest(machine.root / "models", "big:1", 30 * GIB)
+    runner = machine.cards(held=None)
+    try:
+        assert await runner.start(machine.ollama, VERSION, 30) is None
+        assert len(starts(machine.bin)) == 1
+        assert "one server spans every card" in ollama_cards.read_layout(machine.root / "models", machine.port)["why"]
+    finally:
+        await runner.stop()
+
+
+async def test_with_nothing_known_one_server_runs_until_the_pool_says(machine):
+    runner = machine.cards(held=None)
+    try:
+        assert await runner.start(machine.ollama, VERSION, 30) is None
+        assert len(starts(machine.bin)) == 1
+        assert "until the pool says" in runner.why
+        assert not runner.wants_restart()
+        runner.held = lambda: ["small:1"]
+        assert runner.wants_restart(), "told a set that fits: a server on each card"
+    finally:
+        await runner.stop()
+
+
+async def test_the_one_server_has_a_wait_of_its_own_after_cards_that_hung(machine):
+    """Finding 4: a card's server that hung to the end of the shared wait left the one server a
+    second to start in."""
+    (machine.bin / "silent").write_text("1")
+    runner = machine.cards()
+    try:
+        assert await runner.start(machine.ollama, VERSION, 4) is None
+        layout = ollama_cards.read_layout(machine.root / "models", machine.port)
+        assert layout["servers"] == [] and "card 1" in layout["why"]
+        assert await version_on(machine.port) == 200
+    finally:
+        await runner.stop()
+
+
+async def test_a_launcher_that_could_not_start_stops_what_it_started(machine):
+    """Finding 4: a launcher that gave up left its servers starting, racing the restart script's
+    one server for the port."""
+    (machine.bin / "silent").write_text("all")
+    done = launcher(machine, "ollama-start", "--pinned", "--timeout", "2")
+    assert done.returncode == 1
+    started = starts(machine.bin)
+    assert len(started) == 3, "two cards' servers, then the one server"
+    deadline = time.monotonic() + 10
+    while any(host_platform.alive(record["pid"]) for record in started):
+        assert time.monotonic() < deadline, "the launcher left a server running"
+        time.sleep(0.1)
+
+
+def test_the_launcher_gives_up_inside_the_restart_commands_time():
+    """Both tries, after the restart script's 30 s for the engine before, inside the 120 s the agent
+    gives the pool's restart command."""
+    assert 30 + 2 * ollama_cards.START_TIMEOUT_S < Settings(key_hash="x").restart_timeout_s
+
+
+@pytest.mark.parametrize("sizes, why", [({}, "is not known"), ({"size_gb": 60.0}, "need")])
+async def test_a_set_that_cannot_be_shown_to_fit_one_card_stays_one_server(ollama_fleet, sizes, why):
+    """Finding 5: on a rented machine nothing is on disk when the engine is started again, so the
+    pool decides — every size known, and the set within the smallest card (D191)."""
+    fleet = ollama_fleet(sizes=sizes)
+    asked = agent_answering(fleet)
+    host = rented_host()
+    await fleet.start_per_card(host)
+    assert asked == []
+    said = [event for event in fleet.events.recent(limit=20) if event["kind"] == "engine_one_server"]
+    assert said and why in said[0]["summary"]
+
+
+async def test_the_agents_card_memory_wins_over_the_offers(ollama_fleet):
+    fleet = ollama_fleet(sizes={"size_gb": 20.0})
+    asked = agent_answering(fleet)
+    host = rented_host(facts={"accelerators": [{"kind": "cuda", "memory_bytes": 16 * GIB}] * 2,
+                              "engine": {"name": "ollama"}})
+    await fleet.start_per_card(host)
+    assert asked == []
+
+
+async def test_a_router_found_not_running_has_the_engine_started_again_a_few_times(ollama_fleet):
+    """Finding 1's other half: nothing started a dead router again."""
+    fleet = ollama_fleet()
+    asked = agent_answering(fleet)
+    host = rented_host(state="ready")
+    host.per_card_asked = True
+    host.agent_facts["engine"]["layout"] = {"cards": ["0", "1"], "servers": 2, "why": "two cards", "running": False}
+    for _ in range(5):
+        fleet.recover_per_card(host)
+        if host.restart_task is not None:
+            await host.restart_task
+        if host.per_card_recovered_at is not None:
+            host.per_card_recovered_at -= fleet.RESTART_RETRY_S + 1
+    assert len(asked) == fleet.PER_CARD_RECOVERIES == 3
+    host.per_card_recoveries = 0
+    host.agent_facts["engine"]["layout"]["running"] = True
+    fleet.recover_per_card(host)
+    assert len(asked) == 3, "a router running is left alone"

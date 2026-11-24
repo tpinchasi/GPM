@@ -1520,6 +1520,8 @@ class Supervisor:
                     await self._bring_up_through_its_agent(host_id, host, client)
                 else:
                     host.mark_preparing()
+                    # Servers per card whose router is not running are started again (D190).
+                    self.fleet.recover_per_card(host)
                 continue
 
             if host.agent is None:

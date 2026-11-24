@@ -150,7 +150,8 @@ def switch_bound_s(engine: str, switch_timeout_s: float, os_name: Optional[str] 
         # Its servers one per card (D190) stop in three steps — the router, the cards' servers
         # together, the one server — and a start stops whatever of them still runs first.
         stop = 3 * stop
-        start = 2 * stop + look + switch_timeout_s + look
+        # And the one server, where the servers per card did not start, has a wait of its own.
+        start = 2 * stop + 2 * (look + switch_timeout_s + look)
     return 2 * (stop + start) + look
 
 

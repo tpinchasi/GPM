@@ -65,9 +65,10 @@ class OllamaFacts:
 
     def copies(self) -> list[str]:
         """The servers this machine runs one per card, by URL — the first is pulled through, each
-        holds every model (D190, D192) — or none, where one server is the engine URL's."""
+        holds every model (D190, D192) — or none, where one server is the engine URL's, or where
+        the router in front of them is not running: a record that outlived them is never dialled."""
         layout = self.layout()
-        return [entry["url"] for entry in layout["servers"]] if layout else []
+        return [entry["url"] for entry in layout["servers"]] if layout and layout.get("running") else []
 
     def layout(self) -> Optional[dict[str, Any]]:
         """What whoever runs this machine's Ollama recorded: the cards, a server on each, and why."""
@@ -117,9 +118,11 @@ class OllamaFacts:
         layout = self.layout()
         if layout is None:
             return {}
+        # `running`: whether the router in front of servers per card is running now — false where
+        # the record outlived them, or the router died; the pool asks the engine started again.
         said: dict[str, Any] = {"layout": {"cards": layout["cards"], "servers": len(layout["servers"]),
-                                           "why": layout["why"]}}
-        if not layout["servers"]:
+                                           "why": layout["why"], "running": bool(layout.get("running"))}}
+        if not layout["servers"] or not layout.get("running"):
             return said
         copies, anywhere = [], set()
         for entry in layout["servers"]:

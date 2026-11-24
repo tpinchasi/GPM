@@ -226,7 +226,7 @@ only when an operator resizes that host (§2.3). With no match, a rented host ru
 would run. For vLLM the launcher runs a copy of every model on each card, so the number is real
 for every model. **For Ollama too** (D190): a machine with more than one NVIDIA card runs an Ollama
 server on each card behind the agent's router, each given its share of the host's workers, where
-the models it holds fit one card (D191, which the search already asks of a rented card); where
+the models it holds fit one card (D191 — on a rented host, as the pool judges from every model's known size); where
 they do not, one server spans every card, as Ollama always ran.
 
 Worker counts are recomputed when the pool's model set or context length changes — never per

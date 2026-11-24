@@ -24,7 +24,7 @@ Two run it. On a machine whose owner lets the agent install engines, the agent's
 (`OllamaCards`, the installer's server) starts them and starts them again. On a machine the pool
 rents, the pool's restart script runs `gpm-agent ollama-start` from the agent's archive (the same
 class, from the command line), and the agent there only reads what it started. Either writes the
-servers it started to `servers.json`, beside the models directory, never in it — which the router
+servers it started to `copies.json`, beside the models directory, never in it — which the router
 reads, and the agent's model work reads to pull through the first and hold on each (D192).
 """
 
@@ -48,11 +48,11 @@ import httpx
 
 from . import facts as machine_facts
 from . import platform as host_platform
-from .ollama_server import OllamaServer
+from .ollama_server import RECORD_FILE, OllamaServer
 from .vllm_state import state_dir_for
 
 #: What was started, in the order it was: the cards, a URL each, and why this layout.
-SERVERS_FILE = "servers.json"
+COPIES_FILE = "copies.json"
 #: The router's record and log, and each card's server's, under the state directory.
 ROUTER_DIR = "router"
 CARD_DIR = "card-"
@@ -77,8 +77,11 @@ DEFAULT_REGISTRY = "registry.ollama.ai"
 DEFAULT_NAMESPACE = "library"
 _PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
-#: How long the launcher gives everything it starts to answer, in all.
-START_TIMEOUT_S = 90.0
+#: How long the launcher gives each try to answer — the servers per card and the router, then the
+#: one server if they did not start. Both, after the restart script's 30 s for the engine before
+#: to stop, fit inside the 120 s the agent gives the pool's restart command (`restart_timeout_s`):
+#: an Ollama server answers in seconds.
+START_TIMEOUT_S = 30.0
 
 #: The most cards given a server each; a machine with more runs the one server, saying so.
 MOST_CARDS = 16
@@ -97,12 +100,17 @@ def state_dir(models_dir: str | Path, port: int) -> Path:
 
 
 def servers_path(models_dir: str | Path, port: int) -> Path:
-    return state_dir(models_dir, port) / SERVERS_FILE
+    return state_dir(models_dir, port) / COPIES_FILE
 
 
-def read_layout(models_dir: str | Path, port: int) -> Optional[dict[str, Any]]:
+def read_layout(models_dir: str | Path, port: int, *, look: bool = True) -> Optional[dict[str, Any]]:
     """What whoever runs this port's Ollama last wrote — `{cards, servers: [{card, url}], why}` —
-    or None. Only loopback URLs are taken: every server runs on this machine."""
+    or None. Only loopback URLs are taken: every server runs on this machine.
+
+    With `look`, also `running`: for servers per card, whether the router in front of them is
+    running now — its recorded process alive and running exactly its recorded command line. The
+    file is on the machine's disk and can outlive what it describes (a machine started again by its
+    provider, D106); servers per card are taken to be there only while their router is."""
     try:
         raw = json.loads(servers_path(models_dir, port).read_text())
     except (OSError, ValueError):
@@ -117,13 +125,37 @@ def read_layout(models_dir: str | Path, port: int) -> Optional[dict[str, Any]]:
         servers.append({"card": entry["card"], "url": entry["url"]})
     cards = raw.get("cards") if isinstance(raw.get("cards"), list) else []
     why = raw.get("why") if isinstance(raw.get("why"), str) else ""
-    return {"cards": [card for card in cards if isinstance(card, str)], "servers": servers, "why": why}
+    layout: dict[str, Any] = {"cards": [card for card in cards if isinstance(card, str)], "servers": servers,
+                              "why": why}
+    if look:
+        layout["running"] = bool(servers) and router_running(models_dir, port)
+    return layout
+
+
+def router_running(models_dir: str | Path, port: int, *, os_name: Optional[str] = None) -> bool:
+    """Whether the router this port's record names is running now: its process alive, on this
+    port, running exactly the argument list recorded for it (on Windows, created when recorded)."""
+    try:
+        record = json.loads((state_dir(models_dir, port) / ROUTER_DIR / RECORD_FILE).read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(record, dict):
+        return False
+    pid, argv, created = record.get("pid"), record.get("argv"), record.get("created")
+    if (not isinstance(pid, int) or record.get("port") != int(port) or not isinstance(argv, list)
+            or not argv or not all(isinstance(part, str) for part in argv)):
+        return False
+    if not host_platform.alive(pid, os_name=os_name):
+        return False
+    return host_platform.recognised(pid, argv, created=created if isinstance(created, int) else None,
+                                    os_name=os_name) is True
 
 
 def copy_urls(models_dir: str | Path, port: int) -> list[str]:
-    """The per-card servers' URLs, in order — empty where one server serves the port."""
+    """The per-card servers' URLs, in order — empty where one server serves the port, or where
+    the router in front of them is not running (the record is stale, or they are down)."""
     layout = read_layout(models_dir, port)
-    return [entry["url"] for entry in layout["servers"]] if layout else []
+    return [entry["url"] for entry in layout["servers"]] if layout and layout["running"] else []
 
 
 # --- the machine ---
@@ -334,11 +366,20 @@ class OllamaCards:
         return cards, size
 
     def _plan(self) -> tuple[Layout, tuple[Any, ...]]:
+        """The plan for the models held — or, before the pool has said which (an agent just
+        started), for every model in the store, as a machine the pool rents is planned; and with
+        nothing in the store either, one server until it is told: a set that does not fit one card
+        must never be split on a guess and pinned partly on the processor (D191)."""
         cards, size = self.machine()
         held = self.held()
-        sizes = {tag: size_on_disk(self.models_path, tag) for tag in (held or ())}
-        layout = plan(cards, sizes, size)
-        return layout, (tuple(cards), tuple(sorted((tag, value or 0) for tag, value in sizes.items())))
+        told = held is not None
+        tags = list(held) if told else tags_on_disk(self.models_path)
+        sizes = {tag: size_on_disk(self.models_path, tag) for tag in tags}
+        key = (tuple(cards), told, tuple(sorted((tag, value or 0) for tag, value in sizes.items())))
+        if not told and not tags and len(cards) > 1:
+            return Layout((), "the models this machine holds are not known yet, so one server spans every card "
+                              "until the pool says which"), key
+        return plan(cards, sizes, size), key
 
     def plan(self) -> Layout:
         return self._plan()[0]
@@ -346,7 +387,7 @@ class OllamaCards:
     # --- what runs ---
 
     def recorded(self) -> Optional[dict[str, Any]]:
-        return read_layout(self.models_path, self.port)
+        return read_layout(self.models_path, self.port, look=False)
 
     def _member(self, directory: Path, *, port: Optional[int] = None, environment=None, argv=None,
                 what: str = "ollama serve") -> OllamaServer:
@@ -364,7 +405,7 @@ class OllamaCards:
         return member
 
     def _router(self) -> OllamaServer:
-        upstreams = str(self.state / SERVERS_FILE)
+        upstreams = str(self.state / COPIES_FILE)
 
         def argv(program: Path) -> list[str]:
             return [*self._command, "proxy", "--engine", "ollama", "--upstreams", upstreams,
@@ -438,13 +479,13 @@ class OllamaCards:
             "servers": [{"card": card, "url": f"http://127.0.0.1:{port}"} for card, port in zip(layout.cards, ports, strict=False)],
             "why": layout.why,
         }
-        target = self.state / SERVERS_FILE
+        target = self.state / COPIES_FILE
         draft = target.with_name(target.name + ".new")
         draft.write_text(json.dumps(body, indent=2))
         os.replace(draft, target)
 
     def _forget(self) -> None:
-        (self.state / SERVERS_FILE).unlink(missing_ok=True)
+        (self.state / COPIES_FILE).unlink(missing_ok=True)
 
     def _copy_environment(self, base: Mapping[str, str], index: int, card: str, port: int, count: int) -> dict[str, str]:
         environment = dict(base)
@@ -466,7 +507,8 @@ class OllamaCards:
         """Start the layout the plan says, and wait for it to answer as `version` (any, where None).
         None once it does; otherwise why not. Servers per card that do not start are stopped and
         one server is started instead, saying why — a machine is never left without an engine
-        for want of its cards."""
+        for want of its cards. Each try has `timeout_s` of its own: a card's server that hung to
+        the end of its wait does not leave the one server a second to start in."""
         deadline = self.clock() + timeout_s
         try:
             await self.stop()  # whatever of a layout still runs: a card's server that died leaves the rest
@@ -490,7 +532,7 @@ class OllamaCards:
         else:
             self._forget()
         self.why = layout.why
-        return await self.single.start(program, version, max(1.0, deadline - self.clock()))
+        return await self.single.start(program, version, timeout_s)
 
     async def _start_copies(self, program: Path, version: Optional[str], layout: Layout, deadline: float) -> Optional[str]:
         ports = self._copy_ports(len(layout.cards))
@@ -599,6 +641,12 @@ async def _launch(verb: str, args: argparse.Namespace) -> int:
         problem = await cards.start(Path(found), None, args.timeout)
         print(f"gpm-agent {verb}: {cards.why}")
         if problem:
+            # Whatever it started and did not answer in time is stopped: the restart script's one
+            # server, started next, must not race it for the port.
+            try:
+                await cards.stop()
+            except OSError as exc:
+                problem = f"{problem}; and what it started could not be stopped: {exc}"
             print(f"gpm-agent {verb}: {problem}", file=sys.stderr)
             return 1
         return 0

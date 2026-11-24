@@ -47,7 +47,7 @@ cards are unchanged too: their cards would be counted with `rocm-smi` and pinned
   - It reads the cards from `nvidia-smi`, or from the environment's `CUDA_VISIBLE_DEVICES`.
   - It reads model sizes from Ollama's manifests in the store, and plans the layout.
   - `OllamaCards` starts, recognises and stops the servers and the router. They are recorded in
-    `<models>.gpm-state/ollama-<port>/`, which includes `servers.json`.
+    `<models>.gpm-state/ollama-<port>/`, which includes `copies.json`.
   - If the servers per card cannot start, it falls back to one server and says why.
   - On a machine the agent runs Ollama on, it starts the servers again in the other layout when the
     models it holds change (`wants_restart`).
@@ -64,6 +64,23 @@ cards are unchanged too: their cards would be counted with `rocm-smi` and pinned
   - Once the agent answers, and before any pull, the pool asks it once to start the engine again,
     with the host's own workers, set and context (`engine_per_card`, or `engine_per_card_failed`).
   - A host whose facts already carry `engine.layout` is not asked.
+
+## Fixed after review
+
+An independent review found five faults. Each is now fixed, each with a test:
+
+1. **The reinstall killed the router.** The install's stop pattern matched the router's command line,
+   because "serve" appeared inside "servers.json". The pattern is now anchored to the agent's own
+   `-c <settings> serve`, and the file is now `copies.json`. If the router is found not running, the
+   pool asks for the engine to be started again, at most three times, two minutes apart.
+2. **Before the pool's first pass, the agent's runner split the cards on a guess.** It now plans from
+   the models in the store, and runs one server until it is told what to hold.
+3. **A stale `copies.json` was trusted.** It is now trusted only while the router it records is
+   running. The one server's start removes it.
+4. **The fallback had no time left.** The one server gets a wait of its own after the servers per
+   card. The launcher gives each try 30 s, and stops what it started when it gives up.
+5. **On rented hosts the pool now decides.** It asks for servers per card only when every model's
+   size is known and the set fits the smallest card.
 
 ## Tests
 
