@@ -17,6 +17,7 @@ world-readable (threat model T19).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import os
@@ -26,7 +27,7 @@ import stat
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS request_log (
@@ -283,6 +284,65 @@ CREATE TABLE IF NOT EXISTS provider_balances (
     updated_at  REAL NOT NULL
 );
 
+-- Named app keys for the shared pool (D193): several apps on the shared workload, each with a name
+-- the request log carries. Only a key's hash is kept. The supervisor writes them; the router
+-- reads the hashes in the background. An app key named here has exactly the app key's powers.
+CREATE TABLE IF NOT EXISTS app_keys (
+    key_id      TEXT PRIMARY KEY,
+    app         TEXT NOT NULL,
+    hashed      TEXT NOT NULL UNIQUE,
+    created_at  REAL NOT NULL,
+    revoked_at  REAL,
+    updated_at  REAL NOT NULL
+);
+
+-- Stats kept (D194): the request log folded into one row per UTC hour and per app, model, host,
+-- provider and kind, written by the supervisor alone, never by the router. '' rather than NULL
+-- in the key columns, so a row is one row (SQLite holds NULLs distinct in a key).
+CREATE TABLE IF NOT EXISTS stats_requests_hourly (
+    hour            INTEGER NOT NULL,       -- epoch seconds at the hour's start, UTC
+    workload        TEXT NOT NULL,          -- '' the shared workload
+    app             TEXT NOT NULL,          -- a named app key's app; '' none (D193)
+    model           TEXT NOT NULL,          -- the model asked for
+    host_id         TEXT NOT NULL,          -- '' never reached a host
+    host_kind       TEXT NOT NULL,          -- owned | rented | hosted | ''
+    provider        TEXT NOT NULL,          -- a rented host's connection, a hosted API's id, or ''
+    kind            TEXT NOT NULL,          -- chat, embed, transcribe, rerank, predict, ...
+    requests        INTEGER NOT NULL DEFAULT 0,
+    ok              INTEGER NOT NULL DEFAULT 0,
+    rejected        INTEGER NOT NULL DEFAULT 0,
+    failed          INTEGER NOT NULL DEFAULT 0,
+    cancelled       INTEGER NOT NULL DEFAULT 0,
+    status_4xx      INTEGER NOT NULL DEFAULT 0,
+    status_5xx      INTEGER NOT NULL DEFAULT 0,
+    out_of_funds    INTEGER NOT NULL DEFAULT 0,
+    borrowed        INTEGER NOT NULL DEFAULT 0,
+    tokens_in       INTEGER NOT NULL DEFAULT 0,
+    tokens_out      INTEGER NOT NULL DEFAULT 0,
+    latency_n       INTEGER NOT NULL DEFAULT 0,
+    latency_sum_ms  REAL NOT NULL DEFAULT 0,
+    latency_max_ms  REAL NOT NULL DEFAULT 0,
+    latency_hist    TEXT NOT NULL DEFAULT '[]', -- counts per fixed bucket (stats.LATENCY_BUCKETS_MS)
+    busy_ms         REAL NOT NULL DEFAULT 0,    -- time workers spent on these requests
+    queue_n         INTEGER NOT NULL DEFAULT 0,
+    queue_sum_ms    REAL NOT NULL DEFAULT 0,
+    cost_usd        REAL NOT NULL DEFAULT 0,    -- hosted answers' cost (D166)
+    PRIMARY KEY (hour, workload, app, model, host_id, host_kind, provider, kind)
+);
+
+-- What rented machines (and a workload's volumes) cost per UTC hour (D194): the spend ledger's
+-- running totals turned into what each hour added.
+CREATE TABLE IF NOT EXISTS stats_rented_hourly (
+    hour          INTEGER NOT NULL,
+    host_id       TEXT NOT NULL,
+    lease_id      TEXT NOT NULL,
+    connection    TEXT NOT NULL,
+    workload      TEXT NOT NULL,          -- '' the shared workload
+    estimate_usd  REAL NOT NULL DEFAULT 0,
+    reported_usd  REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (hour, host_id, lease_id, connection)
+);
+
 -- One row per pool. Exactly one supervisor runs at a time (supervisor.md §1).
 CREATE TABLE IF NOT EXISTS supervisor_lock (
     pool       TEXT PRIMARY KEY,
@@ -348,6 +408,8 @@ _ADDED_COLUMNS = {
         # budget it counted towards — read back at start, so a restart forgets nothing spent.
         ("tokens_in", "INTEGER"),
         ("cost_usd", "REAL"),
+        # The named app key it came with (D193); NULL: the configured app key, or a workload's.
+        ("app", "TEXT"),
     ],
     "hosts": [
         ("available", "TEXT NOT NULL DEFAULT '[]'"),
@@ -431,6 +493,10 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS request_log_workload ON request_log (workload, ts)")
     # A hosted API's spend since its balance was set or read, counted every half minute (D188).
     conn.execute("CREATE INDEX IF NOT EXISTS request_log_host ON request_log (host_id, ts)")
+    # The spend ledger read per host and source — the latest figure, the newest before a moment —
+    # by enforcement and by the stats (D194, D195).
+    conn.execute("CREATE INDEX IF NOT EXISTS spend_key ON spend (lease_id, host_id, source, id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS stats_rented_hour ON stats_rented_hourly (hour)")
 
 
 class Database:
@@ -453,6 +519,19 @@ class Database:
     def query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
         with self._lock:
             return self._conn.execute(sql, params).fetchall()
+
+    @contextlib.contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """Several statements as one: all written or none. `BEGIN IMMEDIATE` takes the file's write
+        lock at once, so what is read inside is what the writes are based on — across processes too."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield self._conn
+            except BaseException:
+                self._conn.rollback()
+                raise
+            self._conn.commit()
 
     def close(self) -> None:
         with self._lock:
@@ -493,6 +572,8 @@ class RequestRecord:
     #: A hosted API's answer (D166): the input charged for, and its cost in dollars.
     tokens_in: Optional[int] = None
     cost_usd: Optional[float] = None
+    #: The named app key it came with (D193); None for the configured app key or a workload's key.
+    app: Optional[str] = None
 
 
 class RequestLog:
@@ -506,8 +587,8 @@ class RequestLog:
                 ts, request_id, session_id, host_id, worker_id, model_requested,
                 model_served, runtime_class, queue_wait_ms, latency_ms, status_code,
                 outcome, reason, tokens_out, generate_ms, workload, borrowed, concurrency, model_concurrency,
-                kind, request_bytes, tokens_in, cost_usd
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                kind, request_bytes, tokens_in, cost_usd, app
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.ts,
@@ -533,6 +614,7 @@ class RequestLog:
                 record.request_bytes,
                 record.tokens_in,
                 record.cost_usd,
+                record.app,
             ),
         )
 

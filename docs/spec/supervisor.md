@@ -242,8 +242,40 @@ Ordered by value — idle time, not the hourly rate, dominates cost.
 | Rate caps | Maximum rented hosts at once; maximum hourly burn; per-offer bid, all-in and download-price ceilings |
 | Driver floor | `offer_policy.min_driver_version`: a machine whose accelerator driver is below what the engine image needs is refused **before renting** (D81). Below it the engine finds the card unusable and serves from the CPU — at the accelerator's price, with every other filter passed |
 | Replace only when it is cheaper | Re-bidding in place beats replacing whenever the download cost of a new host exceeds the price difference over the hours left (§6) |
-| Spend ledger | Append-only cost events per host and lease |
+| Spend ledger | Append-only cost events per host and lease: each row a **running total** for its host, lease and source (`estimate`, `reported`), never an increment — a lease's spend is each host's newest figure, a burst's today and this month what the totals rose by since (D165) |
 | Account balance | What is left in each provider account — read from the provider where its API says it (every 15 minutes, in the background), else typed by the operator — counted down by the spend records since. Nothing new is rented on an account it would not cover an hour of what the pool would run there; running machines are never stopped for it. A hosted API at $0 leaves routing (D188, providers.md §12) |
+
+### 4.1 Stats kept, and what is pruned (D194, D195)
+
+The supervisor — never the router — folds the request log and the spend ledger into two hourly
+tables, every `stats.rollup_interval_s` (60 s) in a thread beside the passes, on a database
+connection of its own, and again before every `GET /pool/stats`:
+
+- `stats_requests_hourly` — per UTC hour, workload, named app (D193), model, host, the host's kind
+  (`owned`, `rented`, `hosted`) and provider (a rented host's connection, a hosted API itself) and
+  kind: requests and how each ended, refusals for money, borrowed, tokens in and out, latency as a
+  count, sum, largest and a fixed-bucket histogram (24 edges from 25 ms to 10 min, and one above),
+  worker time, queue wait, hosted cost.
+- `stats_rented_hourly` — per UTC hour, host, lease and connection, with the lease's workload: what
+  the ledger's running totals rose by in that hour, estimate and reported apart. A total that went
+  down was re-based and takes nothing back. Readers count the higher of the two, as caps do.
+
+Each table follows a watermark in `pool_meta` (the last row folded), moved in the same
+`BEGIN IMMEDIATE` transaction as the rows it made, after checking it is still the one read: a
+fold run twice, or by two callers, counts each row once; a row logged late lands in its own hour.
+
+**Pruning**, once an hour: what must stay is worked out once per prune by one grouped read per
+table, then candidates are read 2 000 at a time behind an id cursor and deleted by id, under a
+lock of the prune's own — folding and `GET /pool/stats` go on beside it:
+
+| Table | Pruned after | Never pruned |
+|---|---|---|
+| `request_log` | `stats.keep_requests_days` (30, at least 7) | a row not yet folded; a row with a hosted cost younger than 32 days — the UTC month and a provisioner's rolling 30 days are read from them; per build, the newest 20 000 answers a latency curve is made of (D156), and the newest 20 000 chat answers the machine record folds (D69) — the readers' own predicates and limit (`stats.MEASURED_ROWS`) |
+| `events` | `stats.keep_requests_days` | the machine record's kinds — `rented`, `prepared`, `eviction`, `released`, `host_gone` and the failures the history counts (D69), which sizing and burst spend read back; `replaced_for_value` and `machine_avoided`, from which a lease's replacements and avoid list are restored; any event of a lease still open |
+| `spend` | `stats.keep_requests_days` | per lease, host and source: the newest row, the newest before the start of today and of this month (UTC), and the newest already folded — every figure lease and burst enforcement reads, which read the same after a prune |
+| the hourly tables | `stats.keep_rollups_days` (400) | — |
+
+`null` keeps a table for ever; `keep_rollups_days` is never shorter than `keep_requests_days`.
 
 ## 5. Rented hosts — when to rent
 
@@ -614,6 +646,11 @@ capacity_profiles:                             # workers per hardware class; fir
 
 calibration:                                   # memory-ceiling constants, per model set
   "<model set>@32k": { fixed_gib: 10.0, per_worker_gib: 7.6, operate_at: 0.67 }
+
+stats:                                         # D194, D195; null keeps for ever
+  keep_requests_days: 30                       # request log, decisions, superseded spend rows (7 at least)
+  keep_rollups_days: 400                       # the hourly stats the dashboards read
+  rollup_interval_s: 60
 ```
 
 The numbers are illustrative defaults, not recommendations for any particular hardware.

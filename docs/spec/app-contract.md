@@ -169,6 +169,11 @@ It is served from a cached copy, never by asking a third party while the app wai
   after the pool's machines, within the app's spending policy (workloads.md §13). The request and
   the answer pass through untouched as ever; what the app sends then reaches that provider. `GET
   /pool/status` shows a workload's budgets and what is left of each.
+- **Named app key** (`gpma_`, D193) — an app key the operator made for one app by name, on the
+  control API, the CLI (`gpm app create <name>`) or the console. It is an app key in every way an
+  app can see: the same requests, the same answers, the same `GET /pool/status`; it never reaches
+  the control API. Its requests are counted under its app's name in the pool's stats. The app does
+  nothing different — it is given one URL and one key, as ever.
 - **Workload key** (`gpmw_`) — permits inference on one workload's hosts and `GET /pool/status`
   for that workload's view; nothing else ([workloads.md](workloads.md) §3, D115). Minted when the
   workload is created, expires with its lease. `/w/<name>/v1/…` means the same as `/v1/…` and is
@@ -192,7 +197,8 @@ It is served from a cached copy, never by asking a third party while the app wai
   published key.
 
 Requests are otherwise anonymous. The pool does not distinguish between apps holding the same
-key; separation is by workload ([workloads.md](workloads.md), D115), or by separate pools.
+key: an app counted apart holds a named key of its own (D193); separation — its own hosts, lease
+and budget — is by workload ([workloads.md](workloads.md), D115), or by separate pools.
 
 ## 4. Client SDK
 

@@ -25,6 +25,11 @@ _FAILURES = {
     "host_without_startup": "came up without its start-up script",
 }
 
+#: Every kind of event the machine record is built from, and the renting code reads back — the
+#: hardware a host was rented on, the hosts a burst rented (D165). Kept when the decision log is
+#: pruned (D195): one or a few per rental, and the pool's only memory of a machine.
+MACHINE_EVENT_KINDS = frozenset({"rented", "prepared", "eviction", "released", "host_gone", *_FAILURES})
+
 
 @dataclasses.dataclass(frozen=True)
 class MachineRecord:

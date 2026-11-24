@@ -83,7 +83,9 @@ A workload whose start would cross a pool cap — `max_rented_hosts`, `max_hourl
 - **One listener, the key picks the workload.** Every app dials the same URL. A `gpmw_` key is
   looked up by its hash in the `workload_keys` table (owned by the supervisor, read by the router
   as it reads the host table); the request is then that workload's. An app key is the shared
-  workload's, as before. An unknown key, or a rotated-out one past its grace, is `401`.
+  workload's, as before — the configured one, or a named one (`app_keys`, D193), whose app's name
+  the request log keeps so several apps on the shared workload are counted apart; a named key
+  reaches exactly what the app key does. An unknown key, or a rotated-out one past its grace, is `401`.
 - A path prefix `/w/<name>/v1/…` may be used and means the same; it is refused (`403`) when the
   key is another workload's, so a misconfigured client fails loudly rather than serves quietly.
 - **The key reaches nothing else.** Not the control API, not the console, not the shared hosts

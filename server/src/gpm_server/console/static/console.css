@@ -229,3 +229,51 @@ h2.section { margin: 26px 0 10px; font-size: 18px; }
 /* Which image rented machines start from (D177). */
 .image-panel ul.plain { list-style: none; padding: 0; margin: 6px 0; }
 .image-panel ul.plain li { margin: 4px 0; }
+
+/* Dashboards (D197): charts drawn as SVG by the page itself. Eight series colours, chosen and
+   checked for colour-blind separation as a set, each stepped for the light and the dark surface;
+   "others" is the muted ink. Identity is never colour alone: a legend and a table beside each. */
+:root { --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-4: #eda100;
+        --series-5: #e87ba4; --series-6: #008300; --series-7: #6250d6; --series-8: #e34948; }
+@media (prefers-color-scheme: dark) {
+  :root { --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
+          --series-5: #d55181; --series-6: #0ca30c; --series-7: #9085e9; --series-8: #e66767; }
+}
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 12px 0; }
+.tile .stat { margin: 2px 0; }
+.charts { display: grid; grid-template-columns: 1fr; gap: 12px; }
+figure.chart-panel { margin: 0; }
+figure.chart-panel figcaption h2 { margin-top: 0; }
+svg.chart { display: block; overflow: visible; }
+svg.chart .grid line { stroke: var(--line); stroke-width: 1; }
+svg.chart text { fill: var(--muted); font: 11px system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+svg.chart path.series { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+svg.chart circle.dot { stroke: var(--panel); stroke-width: 1.5; }
+svg.chart rect.slot { fill: transparent; }
+svg.chart rect.slot:hover { fill: var(--ink); fill-opacity: .06; }
+.s0 { stroke: var(--muted); fill: var(--muted); background: var(--muted); }
+.s1 { stroke: var(--series-1); fill: var(--series-1); background: var(--series-1); }
+.s2 { stroke: var(--series-2); fill: var(--series-2); background: var(--series-2); }
+.s3 { stroke: var(--series-3); fill: var(--series-3); background: var(--series-3); }
+.s4 { stroke: var(--series-4); fill: var(--series-4); background: var(--series-4); }
+.s5 { stroke: var(--series-5); fill: var(--series-5); background: var(--series-5); }
+.s6 { stroke: var(--series-6); fill: var(--series-6); background: var(--series-6); }
+.s7 { stroke: var(--series-7); fill: var(--series-7); background: var(--series-7); }
+.s8 { stroke: var(--series-8); fill: var(--series-8); background: var(--series-8); }
+svg.chart path.series.s0, svg.chart path.series.s1, svg.chart path.series.s2, svg.chart path.series.s3, svg.chart path.series.s4,
+svg.chart path.series.s5, svg.chart path.series.s6, svg.chart path.series.s7, svg.chart path.series.s8 { fill: none; }
+ul.legend { display: flex; flex-wrap: wrap; gap: 4px 16px; list-style: none; padding: 0; margin: 8px 0 0; font-size: 12.5px; }
+ul.legend li { display: inline-flex; align-items: center; gap: 6px; }
+ul.legend .swatch { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
+details.chart-table { margin-top: 6px; }
+details.chart-table caption { text-align: left; padding-bottom: 4px; }
+.table-scroll { overflow-x: auto; max-width: 100%; }
+table.dash-table th[scope=row] { font-weight: 400; text-transform: none; letter-spacing: 0; color: var(--ink); font-size: 14px; }
+.chart-table th[scope=row] { text-transform: none; letter-spacing: 0; font-weight: 400; }
+.row.tight-row { margin-top: 0; gap: 6px; }
+.app-keys { margin-top: 28px; }
+.app-keys .field { max-width: 22rem; }
+@media (max-width: 720px) {
+  header#top { flex-wrap: wrap; gap: 8px 16px; }
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
