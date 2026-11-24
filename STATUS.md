@@ -21,14 +21,21 @@ Workloads give an app its own key, latency target and budget; trained models (ON
 container images) are served on `POST /v1/predict`. The console and the control API manage all of
 it. Stories S1, S2 and S4–S16 are built ([docs/stories/README.md](docs/stories/README.md)).
 
-**In progress (2026-11-24), each on its own branch, none merged yet:**
+**Ready to merge, waiting for the owner's word to push (2026-11-24):** branch
+`integration/v0.45.0`, local only — four branches, each built, reviewed by an independent
+reviewer, every finding fixed with a test, merged together; full suite on the combination
+2932 passed before S17 joined (S17 alone: 2904 passed). gpm-server 0.45.0, gpm-agent 0.19.0,
+gpm-client 0.9.0 unchanged.
 
 | Branch | What | Decisions |
 |---|---|---|
 | `fix/small-items` | The supervisor stops with its router; a build's thinking default; a download-price ceiling proposed when renting is set up (and set on the laptop pool); RunPod's and Verda's refusals kept whole, avoided machines remembered across a restart, a refused create that made an instance avoids its machine; the adopter-internal files moved out; this file cleaned | D186, D187, D189 |
-| `story/s17-ollama-per-card` | S17: one Ollama server per card on a machine with several | D190–D192 |
-| `story/s18-stats-and-dashboards` | S18: stats kept with retention, a Dashboards screen, named app keys for the shared pool | D193–D197 |
-| `feature/provider-balances` | An account's balance on each provider card, read where the provider reports it, typed and counted down where not; no routing to, or renting on, an account at $0 | D188 |
+| `feature/provider-balances` | An account's balance on each provider card, read where the provider reports it, typed (standing until cleared) and counted down where not; no routing to a hosted API at $0, no new rental an account could not pay an hour for; running machines never stopped | D188 |
+| `story/s18-stats-and-dashboards` | S18: hourly stats with retention, `GET /pool/stats`, a Dashboards screen, named app keys for the shared pool | D193–D197 |
+| `story/s17-ollama-per-card` | S17: one Ollama server per card on a machine with several, where the models fit one card | D190–D192 |
+
+Where two of them meet, fixed on the integration branch: the prune keeps what an account's
+balance is counted down from (a typed balance can be older than the retention).
 
 **Running on the owner's laptop:**
 - **`~/gpm-pool`** — a pool from this repository's `main` (router 8100, console 8101), hosts
@@ -40,8 +47,9 @@ it. Stories S1, S2 and S4–S16 are built ([docs/stories/README.md](docs/stories
 
 ## Next actions, in order
 
-1. **Review and merge the four branches above**, each with a security and a correctness review,
-   then release **v0.45.0**. Versions and the changelog are set at merge, one branch after another.
+1. **On the owner's word: push `integration/v0.45.0`, one pull request, merge on a green CI,
+   release v0.45.0** (gpm-server 0.45.0, gpm-agent 0.19.0). The agent's permission check refused a
+   push not asked for.
 2. **Owner, by hand** (the agent's permission check refused it):
    `git push origin --delete v0.40.0 v0.42.0` and `git tag -d v0.40.0 v0.42.0` — the two tags
    whose releases were deleted earlier.
@@ -65,6 +73,8 @@ it. Stories S1, S2 and S4–S16 are built ([docs/stories/README.md](docs/stories
    - `spend_drift` is recorded on every pass while the drift lasts, not once (seen on the laptop
      pool: 29 in one rental).
    - A type-check in CI is deferred; `NOTICE` names the copyright holder without a legal suffix.
+   - `tests/test_provisioning.py::test_a_create_sent_twice_is_one_workload` fails now and then in a
+     full run (about one run in five on `main`), never alone.
 
 ## Open owner decisions
 
@@ -81,6 +91,14 @@ Built and tested against fakes only. Each would be checked on the smallest case 
   container image on Vast or RunPod; a rented machine reading a private hub repository. Whether a
   provider keeps a registry login after the machine is gone (registry logins should be pull-only
   tokens).
+- **S17:** one Ollama per card has run only against a fake `ollama` and `nvidia-smi` — whether
+  Ollama honours `CUDA_VISIBLE_DEVICES` per process, shares one models directory, and keeps
+  `OLLAMA_NOPRUNE`. On the first such host: a `card-N/logs/ollama.log` per card and memory in use on
+  each card.
+- **Balances (D188):** no provider's balance has been read live; Vast's `credit` is shown but not
+  acted on until it is.
+- **S18:** the first fold of a long existing request log (it catches up at up to 100 000 rows a
+  minute) has not run on a live pool.
 - **S15 trained models:** never served on a real machine. Whether CoreML (Mac) and DirectML
   (Windows) run common exported models without falling back to the processor.
 - **S10 vLLM on an owned Linux machine:** the owner will test on a machine of their own.
@@ -104,8 +122,7 @@ these rest on.
 ## What is decided
 
 Every decision, numbered with why and what was rejected, is in
-[docs/decisions.md](docs/decisions.md) (D1–D189 at this writing; D190–D197 reserved for S17 and
-S18). The specification in [docs/spec/](docs/spec/) says how things are, without the history.
+[docs/decisions.md](docs/decisions.md) (D1–D197 at this writing). The specification in [docs/spec/](docs/spec/) says how things are, without the history.
 
 ## The adopter-internal files (decided 2026-11-24, D189)
 
@@ -143,7 +160,7 @@ In `~/workspace/Aletheia`: the adoption guide and history in `docs/gpm-adoption/
 
 | Date | What happened |
 |---|---|
-| 2026-11-24 | **v0.44.0 released; STATUS cleaned; the small items, the adopter files and three stories under way.** At the owner's word: vLLM's locked sets regenerated for 0.34.0 and 0.33.0 (gpm-agent 0.18.1, PR #103) and v0.44.0 released, verified after download. The latest pool started again in `~/gpm-pool` beside SpaceGarage's 0.37.4 pool. On `fix/small-items`: the supervisor left running by a SIGTERM to `gpm serve` (uvicorn re-raises the signal after shutdown, and the default handler skipped the `finally`) now stops — and one whose router is killed outright stops itself; a build's thinking default (D187; Ollama 0.40.17 checked by hand); a download ceiling proposed when renting is set up, and $0.01/GB set on the laptop pool (its last rental paid ~$0.014/GB); the three September renting fixes found already shipped, their gaps closed; leases counted in workers let go (D186); the adopter-internal files moved to the adopter's repository (D189). Deleting tags v0.40.0 and v0.42.0 was refused by the agent's permission check — left to the owner. S17 (one Ollama per card), S18 (stats, dashboards, named app keys) and provider balances (D188) built by parallel agents on their own branches. |
+| 2026-11-24 | **v0.44.0 released; STATUS cleaned; the small items, the adopter files and three stories under way.** At the owner's word: vLLM's locked sets regenerated for 0.34.0 and 0.33.0 (gpm-agent 0.18.1, PR #103) and v0.44.0 released, verified after download. The latest pool started again in `~/gpm-pool` beside SpaceGarage's 0.37.4 pool. On `fix/small-items`: the supervisor left running by a SIGTERM to `gpm serve` (uvicorn re-raises the signal after shutdown, and the default handler skipped the `finally`) now stops — and one whose router is killed outright stops itself; a build's thinking default (D187; Ollama 0.40.17 checked by hand); a download ceiling proposed when renting is set up, and $0.01/GB set on the laptop pool (its last rental paid ~$0.014/GB); the three September renting fixes found already shipped, their gaps closed; leases counted in workers let go (D186); the adopter-internal files moved to the adopter's repository (D189). Deleting tags v0.40.0 and v0.42.0 was refused by the agent's permission check — left to the owner. S17 (one Ollama per card), S18 (stats, dashboards, named app keys) and provider balances (D188) built by parallel agents on their own branches; each reviewed independently (the reviews found, among others: a running spot host drained over its account balance; a quadratic spend prune that would stall stats for hours; the agent reinstall killing S17's per-card router) and every finding fixed with a test; all four merged on `integration/v0.45.0` (gpm-server 0.45.0, gpm-agent 0.19.0), waiting for the owner's word to push. |
 | 2026-11-21 | **S16 built: S15's open items (D183–D185).** At the owner's word ("do however you recommend"): stage 1 ONNX Runtime on Windows (onnx-lock Windows targets, the 1.32.0 sets, Scripts paths, the installer's first own tests, one on CI's Windows job); stage 2 the hub read token on rented machines (over SSH into the agent's environment, never the instance spec); stage 3 rented container builds (`start`, no agent, readiness from health) and private registry logins (credential store, control API, console, Vast and RunPod). Provider facts read from Vast's and RunPod's API references and NVIDIA's release notes; listed as verified or unverified in decisions.md. |
 | 2026-11-21 | **Closed the restart gap in the install-error fix (gpm-agent 0.17.2).** The text a failed install or check wrote is kept in `state.json` as `failure`, so it is taken out after a restart too; an error written since stays. Two tests; the agent suites and lint pass. The owner then decided S15's three open items (D183–D185): rent container builds with private images, the hub read token on rented machines, ONNX Runtime installed on Windows; recorded, not built. |
 | 2026-11-21 | **Released v0.43.0** (gpm-server 0.43.0, gpm-client 0.9.0, gpm-agent 0.17.1) at the owner's word: S15 and PR #99. Install links moved to it first, so the tag carries them. |
