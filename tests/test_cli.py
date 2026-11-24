@@ -117,3 +117,12 @@ def test_named_app_keys_and_stats_from_the_command_line(control, capsys):
     code, out, err = run(capsys, "stats", "--range", "7d", "--by", "app")
     assert code == 0, err
     assert json.loads(out)["by"] == "app"
+
+
+def test_an_app_name_is_sent_as_one_path_part(control, capsys):
+    """Found in review: a name carrying `?` or `/` must not reach another app's keys."""
+    assert run(capsys, "app", "create", "shop")[0] == 0
+    code, _, _ = run(capsys, "app", "revoke", "shop?all=1")
+    assert code == 1, "no app is named that"
+    code, out, _ = run(capsys, "app", "list")
+    assert json.loads(out)["apps"][0]["usable"] is True, "shop's key is untouched"

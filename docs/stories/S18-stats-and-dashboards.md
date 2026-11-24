@@ -29,9 +29,11 @@ counted apart. That takes up the per-client identity D16 and D115 had deferred.
   It runs every minute in a thread, on its own database connection, and before every stats read.
 - **Retention (D195).** `stats: {keep_requests_days: 30, keep_rollups_days: 400}` in `pool.yaml`,
   validated with defaults. The request log, the decision log and superseded spend rows are pruned,
-  in batches, once an hour. Never pruned: a row not yet folded, a hosted cost the budgets still
-  read (32 days), the machine record's events, and the spend rows lease and burst enforcement
-  read — the tests show both read the same before and after a prune.
+  in batches, once an hour, with what stays worked out once per table. Never pruned: a row not
+  yet folded, a hosted cost the budgets still read (32 days), the newest rows sizing and the
+  machine record read, the events renting reads back and those of open leases, and the spend
+  rows lease and burst enforcement read — the tests show each reads the same before and after a
+  prune, and a 120 000-row host ledger prunes in well under five seconds.
 - **`GET /pool/stats` (D196)** — series and totals by hour or day, by app, model, host, provider
   or kind, narrowed by any; p50 and p95 from the histograms; cost hosted, rented and both. And
   `gpm stats`.
@@ -46,8 +48,8 @@ counted apart. That takes up the per-client identity D16 and D115 had deferred.
   shared one. On the Apps tab the shared pool's rented hosts are a line of their own.
 - "Utilisation" is busy worker-hours — the time requests held a worker — not a share of the
   workers a host had, which the pool does not keep per hour.
-- A latency measured on a class of card (D156) is forgotten with its request rows after
-  `keep_requests_days`; a pool that wants a longer memory for sizing raises it.
+- The rows sizing (D156) and the machine record (D69) read are kept past `keep_requests_days` —
+  the newest 20 000 per build, and of chat answers — so the request log holds at least that many.
 
 ## Not run on a live pool
 

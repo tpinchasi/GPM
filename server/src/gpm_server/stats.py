@@ -20,10 +20,12 @@ each row once.
 **Retention** (D195): the request log, the decision log and superseded spend rows are pruned after
 `stats.keep_requests_days`, the hourly tables after `stats.keep_rollups_days`. Never pruned: a row
 not yet folded; a request row that carries a hosted cost and is younger than any budget looks back
-(32 days: a UTC month, a provisioner's rolling 30); the machine record's events; and, per lease,
-host and source of the spend ledger, the newest figure, the newest before the start of today and of
-this month (UTC), and the newest already folded — every figure lease and budget enforcement reads.
-Rows are found by a read, then deleted by id, a small batch at a time.
+(32 days: a UTC month, a provisioner's rolling 30); the newest rows sizing (D156) and the machine
+record (D69) read; the machine record's events, those renting restores from, and any of a lease
+still open; and, per lease, host and source of the spend ledger, the newest figure, the newest
+before the start of today and of this month (UTC), and the newest already folded — every figure
+lease and budget enforcement reads. What stays is worked out once per prune by one grouped read per
+table; candidates are then read a batch at a time behind an id cursor and deleted by id.
 """
 
 from __future__ import annotations
@@ -51,6 +53,16 @@ LATENCY_BUCKETS_MS: tuple[float, ...] = (
     25, 50, 100, 200, 300, 500, 750, 1_000, 1_500, 2_000, 3_000, 5_000, 7_500, 10_000, 15_000,
     20_000, 30_000, 45_000, 60_000, 90_000, 120_000, 180_000, 300_000, 600_000,
 )
+
+#: How many of its newest rows each of the pool's own measures reads from the request log — a
+#: build's latency curve at a card (D156) and the machine record (D69). The prune spares as many,
+#: so retention never changes what they read; the readers take their limit from here.
+MEASURED_ROWS = 20_000
+
+#: Events never pruned: the machine record's (D69) and those renting reads back — a lease's
+#: replacements for value (D75) and the machines it avoids, with when each may be tried again. An
+#: event of a lease still open is kept too, whatever its kind.
+KEPT_EVENT_KINDS = frozenset({*MACHINE_EVENT_KINDS, "replaced_for_value", "machine_avoided"})
 
 _REQUESTS_MARK = "stats.request_log_folded_to"
 _SPEND_MARK = "stats.spend_folded_to"
@@ -117,6 +129,9 @@ class Stats:
         self._config = config
         #: One fold at a time in this process; the watermark keeps two processes honest.
         self._lock = threading.Lock()
+        #: One prune at a time. Never held with the fold's lock: a prune deletes only rows already
+        #: folded, so neither needs the other to wait.
+        self._prune_lock = threading.Lock()
         self.last_pruned_at: Optional[float] = None
         #: When a fold last began that left nothing behind it: everything logged before then is
         #: in the hourly tables.
@@ -316,57 +331,83 @@ class Stats:
 
     # --- forgetting ---
 
-    def prune(self, now: Optional[float] = None, batch: int = 2000, batches: int = 25) -> dict[str, int]:
-        """Delete what retention lets go, a batch at a time: found by a read, deleted by id, so the
-        file's write lock is held only for the delete. How many rows went from each table."""
+    def prune(self, now: Optional[float] = None, batch: int = 2000, batches: int = 250) -> dict[str, int]:
+        """Delete what retention lets go. What must stay is worked out once per prune — a grouped
+        read per table, never a lookup per row — then candidates are read a batch at a time, in id
+        order behind a cursor, and deleted by id: the file's write lock is held only for each
+        delete, and folding and stats reads go on beside it. How many rows went from each table."""
         from .router.budgets import period_starts
 
         now = time.time() if now is None else now
         settings = self._config().stats
         removed = {"request_log": 0, "events": 0, "spend": 0, "stats": 0}
-        with self._lock:
+        with self._prune_lock:  # one prune at a time; never the fold's lock
             if settings.keep_requests_days is not None:
                 cutoff = now - settings.keep_requests_days * DAY_S
                 folded = self._mark(_REQUESTS_MARK)
-                removed["request_log"] = self._delete_in_batches(
+                removed["request_log"] = self._delete_behind_cursor(
                     "request_log",
-                    "SELECT id FROM request_log WHERE id <= ? AND ts < ? AND (cost_usd IS NULL OR ts < ?) ORDER BY id LIMIT ?",
-                    (folded, cutoff, min(cutoff, now - BUDGET_LOOKBACK_S)), batch, batches)
-                kinds = sorted(MACHINE_EVENT_KINDS)
-                removed["events"] = self._delete_in_batches(
+                    "SELECT id FROM request_log WHERE id > ? AND id <= ? AND ts < ? AND (cost_usd IS NULL OR ts < ?) "
+                    "ORDER BY id LIMIT ?",
+                    (folded, cutoff, min(cutoff, now - BUDGET_LOOKBACK_S)), self._requests_kept(), batch, batches)
+                kinds = sorted(KEPT_EVENT_KINDS)
+                removed["events"] = self._delete_behind_cursor(
                     "events",
-                    f"SELECT id FROM events WHERE ts < ? AND kind NOT IN ({','.join('?' * len(kinds))}) ORDER BY id LIMIT ?",
-                    (cutoff, *kinds), batch, batches)
+                    f"SELECT id FROM events WHERE id > ? AND ts < ? AND kind NOT IN ({','.join('?' * len(kinds))}) "
+                    "AND (lease_id IS NULL OR lease_id NOT IN (SELECT lease_id FROM leases WHERE state = 'open')) "
+                    "ORDER BY id LIMIT ?",
+                    (cutoff, *kinds), set(), batch, batches)
                 day, month = period_starts(now)
                 spend_folded = self._mark(_SPEND_MARK)
-                same = "lease_id IS s.lease_id AND host_id IS s.host_id AND source = s.source"
-                removed["spend"] = self._delete_in_batches(
-                    "spend",
-                    "SELECT s.id FROM spend s WHERE s.id <= ? AND s.ts < ? "
-                    f"AND s.id <> (SELECT MAX(id) FROM spend WHERE {same}) "
-                    f"AND s.id IS NOT (SELECT MAX(id) FROM spend WHERE {same} AND ts < ?) "
-                    f"AND s.id IS NOT (SELECT MAX(id) FROM spend WHERE {same} AND ts < ?) "
-                    f"AND s.id IS NOT (SELECT MAX(id) FROM spend WHERE {same} AND id <= ?) "
-                    "ORDER BY s.id LIMIT ?",
-                    (spend_folded, cutoff, day, month, spend_folded), batch, batches)
+                kept: set[int] = set()
+                # Per lease, host and source: the newest figure, the newest before today and before
+                # this month, and the newest folded — every figure enforcement and the fold read.
+                for row in self.db.query(
+                        "SELECT MAX(id) AS newest, MAX(CASE WHEN ts < ? THEN id END) AS before_day, "
+                        "MAX(CASE WHEN ts < ? THEN id END) AS before_month, MAX(CASE WHEN id <= ? THEN id END) AS folded "
+                        "FROM spend GROUP BY lease_id, host_id, source", (day, month, spend_folded)):
+                    kept.update(int(v) for v in tuple(row) if v is not None)
+                removed["spend"] = self._delete_behind_cursor(
+                    "spend", "SELECT id FROM spend WHERE id > ? AND id <= ? AND ts < ? ORDER BY id LIMIT ?",
+                    (spend_folded, cutoff), kept, batch, batches)
             if settings.keep_rollups_days is not None:
                 before = _hour(now - settings.keep_rollups_days * DAY_S)
                 for table in ("stats_requests_hourly", "stats_rented_hourly"):
-                    removed["stats"] += self._delete_in_batches(
-                        table, f"SELECT rowid AS id FROM {table} WHERE hour < ? LIMIT ?", (before,), batch, batches,
-                        column="rowid")
+                    removed["stats"] += self._delete_behind_cursor(
+                        table, f"SELECT rowid AS id FROM {table} WHERE rowid > ? AND hour < ? ORDER BY rowid LIMIT ?",
+                        (before,), set(), batch, batches, column="rowid")
         self.last_pruned_at = now
         return removed
 
-    def _delete_in_batches(self, table: str, find: str, params: tuple, batch: int, batches: int,
-                           column: str = "id") -> int:
-        removed = 0
+    def _requests_kept(self) -> set[int]:
+        """Request rows the pool's own measures read whatever their age, chosen as those readers
+        choose them: per build, the newest answers a latency curve is made of (D156's sizing at a
+        card's latency), and the newest chat answers the machine record folds (D69)."""
+        kept = {int(r["id"]) for r in self.db.query(
+            "SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY model_served ORDER BY id DESC) AS newest "
+            "FROM request_log WHERE outcome = 'ok' AND model_served IS NOT NULL AND concurrency IS NOT NULL "
+            "AND latency_ms IS NOT NULL AND host_id IS NOT NULL "
+            "AND (model_concurrency IS NULL OR model_concurrency = concurrency)) WHERE newest <= ?",
+            (MEASURED_ROWS,))}
+        kept.update(int(r["id"]) for r in self.db.query(
+            "SELECT id FROM request_log WHERE host_id IS NOT NULL AND (kind IS NULL OR kind = 'chat') "
+            "ORDER BY id DESC LIMIT ?", (MEASURED_ROWS,)))
+        return kept
+
+    def _delete_behind_cursor(self, table: str, find: str, params: tuple, kept: set[int], batch: int, batches: int,
+                              column: str = "id") -> int:
+        """Read candidates `batch` at a time after the last one read — so a row kept is read once,
+        never again — and delete those not in `kept`. `find` takes the cursor first, the batch last."""
+        removed, cursor = 0, 0
         for _ in range(batches):
-            ids = [int(r["id"]) for r in self.db.query(find, (*params, batch))]
+            ids = [int(r["id"]) for r in self.db.query(find, (cursor, *params, batch))]
             if not ids:
                 break
-            self.db.execute(f"DELETE FROM {table} WHERE {column} IN ({','.join('?' * len(ids))})", tuple(ids))
-            removed += len(ids)
+            cursor = ids[-1]
+            gone = [i for i in ids if i not in kept]
+            if gone:
+                self.db.execute(f"DELETE FROM {table} WHERE {column} IN ({','.join('?' * len(gone))})", tuple(gone))
+                removed += len(gone)
             if len(ids) < batch:
                 break
         return removed

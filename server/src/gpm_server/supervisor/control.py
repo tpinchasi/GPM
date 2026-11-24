@@ -48,7 +48,7 @@ from ..directory import HUB, DirectoryStore, build_sizes_gb, read_directory
 from ..engines import INPUTS, KINDS, EngineNotFound, available_engines, get_engine, kinds_of
 from ..hostcheck import test_connection
 from ..hubbuilds import HubUnavailable, valid_search
-from ..keys import match, verify
+from ..keys import verify
 from ..ledger import LeaseRefused
 from ..sizing import needs_for
 from . import agents
@@ -460,12 +460,10 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
     )
 
     def _named_app_key(token: str, admin_hashes: set[str]) -> bool:
-        """A named app key (D193) — one the pool knows, or one shaped as an app key that is not an
-        admin key: it has exactly the app key's powers, and none of them reaches here."""
-        if verify(token, admin_hashes):
-            return False  # the admin key itself: no need to read the table
-        if match(token, named_app_keys.usable_hashes()) is not None:
-            return True
+        """A named app key (D193) — any key shaped as an app key that is not an admin key: it has
+        exactly the app key's powers, and none of them reaches here."""
+        # Every named key is minted as `gpma_`: its shape says enough, so nothing is read from the
+        # table on the event loop for a request.
         return token.startswith("gpma_") and not verify(token, admin_hashes)
 
     def authorised(request: Request) -> Optional[JSONResponse]:

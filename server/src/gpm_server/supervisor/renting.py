@@ -50,6 +50,7 @@ from ..providers.base import (
     redacted,
 )
 from ..sizing import Needs, needs_for
+from ..stats import MEASURED_ROWS
 from ..strategies import (
     Demand,
     HostView,
@@ -1135,7 +1136,8 @@ class Fleet:
                 dict(row)
                 for row in self.events.db.query(
                     "SELECT host_id, outcome, latency_ms, tokens_out, generate_ms FROM request_log "
-                    "WHERE host_id IS NOT NULL AND (kind IS NULL OR kind = 'chat') ORDER BY id DESC LIMIT 20000"
+                    "WHERE host_id IS NOT NULL AND (kind IS NULL OR kind = 'chat') ORDER BY id DESC LIMIT ?",
+                    (MEASURED_ROWS,),
                 )
             ]
         except Exception as exc:  # noqa: BLE001 - a view is never worth failing a bid for
@@ -1223,8 +1225,8 @@ class Fleet:
                 f"SELECT concurrency, latency_ms FROM request_log WHERE outcome = 'ok' AND model_served = ? "
                 f"AND concurrency IS NOT NULL AND latency_ms IS NOT NULL AND host_id IN ({marks}) "
                 "AND (model_concurrency IS NULL OR model_concurrency = concurrency) "
-                "ORDER BY id DESC LIMIT 20000",
-                (tag, *host_ids),
+                "ORDER BY id DESC LIMIT ?",
+                (tag, *host_ids, MEASURED_ROWS),
             )
             samples = [(int(r["concurrency"]), float(r["latency_ms"]) / 1000) for r in rows]
         # Read once in a while, not once per offer: a search weighs dozens (the review's finding 12).

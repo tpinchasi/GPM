@@ -146,3 +146,19 @@ def test_the_stats_endpoint_shows_each_app_apart(pool):
         for params in ({"by": "colour"}, {"range": "forever"}, {"bucket": "minute"},
                        {"range": "60d", "bucket": "hour"}, {"from": str(time.time()), "to": str(time.time() - 10)}):
             assert admin.get("/pool/stats", params=params).status_code == 400, params
+
+
+def test_the_control_api_reads_no_table_to_refuse_a_named_key(pool, monkeypatch):
+    """Found in review: every bearer read the key table on the event loop. A named key is told
+    by its shape; the table is never read to answer an admin call or refuse an app key."""
+    with control(pool) as admin:
+        key = admin.post("/pool/apps", json={"app": "shop"}).json()["connection"]["api_key"]
+
+    def no_read(self):
+        raise AssertionError("the control API read the key table")
+
+    monkeypatch.setattr(AppKeyStore, "usable_hashes", no_read)
+    with control(pool, key=key) as client:
+        assert client.get("/pool/status").json()["error"] == "app_key_refused"
+    with control(pool) as admin:
+        assert admin.get("/pool/status").status_code == 200

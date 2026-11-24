@@ -536,6 +536,8 @@ def _provisioner(args: argparse.Namespace) -> int:
 
 def _app(args: argparse.Namespace) -> int:
     """Named app keys for the shared pool (D193): each app on it shown apart in the stats."""
+    from urllib.parse import quote
+
     if args.action == "create":
         if not args.name:
             print("name the app: gpm app create <name>", file=sys.stderr)
@@ -555,15 +557,16 @@ def _app(args: argparse.Namespace) -> int:
         if not args.name:
             print("name the app: gpm app revoke <name> [--key-id ID]", file=sys.stderr)
             return 2
-        path = f"/pool/apps/{args.name}" + (f"/keys/{args.key_id}" if args.key_id else "")
+        path = f"/pool/apps/{quote(args.name, safe='')}" + (f"/keys/{quote(args.key_id, safe='')}" if args.key_id else "")
         return _control(args, "DELETE", path)
     return 2
 
 
 def _stats(args: argparse.Namespace) -> int:
-    query = f"/pool/stats?range={args.range}" + (f"&by={args.by}" if args.by else "") + (
-        f"&bucket={args.bucket}" if args.bucket else "")
-    return _control(args, "GET", query)
+    from urllib.parse import urlencode
+
+    query = urlencode({k: v for k, v in (("range", args.range), ("by", args.by), ("bucket", args.bucket)) if v})
+    return _control(args, "GET", f"/pool/stats?{query}")
 
 
 def _ca(args: argparse.Namespace) -> int:

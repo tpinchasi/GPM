@@ -874,7 +874,9 @@ class StatsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     #: The request log, the decision log (but the machine record's events) and superseded spend rows.
-    keep_requests_days: Optional[int] = Field(default=30, ge=1)
+    #: At least a week (D195): fewer days would leave an operator no raw rows to trace a recent
+    #: fault by.
+    keep_requests_days: Optional[int] = Field(default=30, ge=7)
     #: The hourly tables the dashboards read.
     keep_rollups_days: Optional[int] = Field(default=400, ge=1)
     #: How often the supervisor folds what is new, in seconds.

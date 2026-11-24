@@ -254,9 +254,9 @@ def test_daily_buckets_are_utc_days(db):
 def test_old_rows_go_once_folded_and_not_before(db):
     stats = Stats(db, lambda: config(keep_requests_days=30, keep_rollups_days=60))
     old = NOW - 40 * DAY_S
-    log(db, ts=old)
+    log(db, ts=old, kind="embed")  # not a row the machine record or sizing reads
     stats.roll_up()
-    log(db, ts=old + 1)  # as old, but not folded yet
+    log(db, ts=old + 1, kind="embed")  # as old, but not folded yet
     log(db, ts=NOW - 60)
     EventLog(db).record("worker_adjusted", "an old decision")
     EventLog(db).record("rented", "an old rental", host_id="rented-1", lease_id="lease-a")
@@ -277,9 +277,9 @@ def test_old_rows_go_once_folded_and_not_before(db):
 def test_pruning_never_changes_what_budgets_read(db):
     """Hosted spend this month and over a provisioner's 30 days is read from the request log; it
     is kept for 32 days whatever the retention says."""
-    stats = Stats(db, lambda: config(keep_requests_days=1, keep_rollups_days=1))
+    stats = Stats(db, lambda: config(keep_requests_days=7, keep_rollups_days=7))
     for days in (2, 20, 29.5, 31, 40):
-        log(db, ts=NOW - days * DAY_S, host_id="openai", workload="research", cost_usd=0.01)
+        log(db, ts=NOW - days * DAY_S, host_id="openai", workload="research", cost_usd=0.01, kind="embed")
     reader = RequestLog(db)
     day, month = period_starts(NOW)
     before = (reader.hosted_spend_of(["research"], NOW - 30 * DAY_S), reader.hosted_spend_of(["research"], month),
@@ -296,7 +296,7 @@ def test_pruning_never_changes_what_budgets_read(db):
 def test_pruning_never_changes_what_lease_and_burst_enforcement_read(db):
     """The ledger keeps running totals: a lease's spend is each host's newest figure, a burst's
     today and this month what the totals rose by since then. Both read the same after pruning."""
-    stats = Stats(db, lambda: config(keep_requests_days=1, keep_rollups_days=400))
+    stats = Stats(db, lambda: config(keep_requests_days=7, keep_rollups_days=400))
     events = EventLog(db)
     events.record("rented", "a burst host", host_id="burst-1", lease_id="lease-a", numbers={"burst": 1})
     events.record("rented", "another", host_id="burst-2", lease_id="lease-a", numbers={"burst": 1})
@@ -337,7 +337,7 @@ def test_retention_is_validated_with_defaults():
     with pytest.raises(ValueError, match="keep_rollups_days is shorter"):
         StatsConfig(keep_requests_days=60, keep_rollups_days=30)
     with pytest.raises(ValueError):
-        StatsConfig(keep_requests_days=0)
+        StatsConfig(keep_requests_days=6)
     assert StatsConfig(keep_requests_days=None).keep_requests_days is None, "null keeps them for ever"
     pool = PoolConfig.model_validate({
         "pool": {"name": "p", "model_set": ["m1"]}, "auth": {"app_keys": ["gpma_stats_app"]},
@@ -381,3 +381,93 @@ def test_a_database_from_before_gains_the_app_column_and_the_stats_tables(tmp_pa
         assert stats.query(HOUR - HOUR_S, HOUR + HOUR_S)["totals"]["requests"] == 1
     finally:
         db.close()
+
+
+# --- found in review ---
+
+
+def test_pruning_a_long_spend_ledger_takes_seconds_not_minutes(db):
+    """One host's ledger for a long lease: what is kept is worked out once per key, not by a
+    lookup per row (found in review: 95 000 rows took 40 s, a host-month 25 minutes, holding the
+    stats lock all the while)."""
+    stats = Stats(db, lambda: config(keep_requests_days=7, keep_rollups_days=400))
+    day, month = period_starts(NOW)
+    rows, total = [], 0.0
+    for i in range(120_000):  # every 30 s for about 42 days
+        total += 0.001
+        rows.append((NOW - 42 * DAY_S + i * 30, "lease-a", "rented-1", "estimate", total, "vast"))
+    with db.transaction() as conn:
+        conn.executemany("INSERT INTO spend (ts, lease_id, host_id, source, amount, connection) VALUES (?, ?, ?, ?, ?, ?)",
+                         rows)
+    ledger, fleet = SpendLedger(db), SimpleNamespace(events=SimpleNamespace(db=db))
+    db.execute("INSERT INTO events (ts, kind, host_id, lease_id, summary, numbers) VALUES (?, 'rented', 'rented-1', "
+               "'lease-a', 'a burst host', '{\"burst\": 1}')", (NOW - 42 * DAY_S,))
+    before = (ledger.latest_for_lease("lease-a"), Fleet.burst_spend(fleet, "lease-a", day),
+              Fleet.burst_spend(fleet, "lease-a", month))
+    stats.roll_up(batches=1000)
+    started = time.monotonic()
+    removed = stats.prune(NOW)
+    took = time.monotonic() - started
+    assert took < 5.0, f"the prune took {took:.1f} s"
+    assert removed["spend"] > 90_000
+    assert (ledger.latest_for_lease("lease-a"), Fleet.burst_spend(fleet, "lease-a", day),
+            Fleet.burst_spend(fleet, "lease-a", month)) == before
+
+
+def test_pruning_leaves_what_sizing_and_the_machine_record_read(db):
+    """A build's latency on a card (D156) and the machine record (D69) read the newest rows of the
+    request log, however old: the prune spares as many as they read."""
+    from gpm_server.stats import MEASURED_ROWS
+
+    stats = Stats(db, lambda: config(keep_requests_days=7, keep_rollups_days=400))
+    events = EventLog(db)
+    events.record("rented", "a machine", host_id="rented-1", lease_id="lease-a",
+                  numbers={"machine": "m-1", "hardware": "1x RTX TEST 48GB"})
+    old = NOW - 40 * DAY_S
+    with db.transaction() as conn:
+        conn.executemany(
+            "INSERT INTO request_log (ts, request_id, host_id, model_served, outcome, status_code, latency_ms, "
+            "concurrency, model_concurrency, kind, tokens_out, generate_ms) VALUES (?, ?, 'rented-1', 'tag-a', 'ok', 200, ?, ?, ?, "
+            "'chat', 50, ?)",
+            [(old + i, f"r{i}", 1000.0 + (i % 7) * 400, 1 + i % 6, 1 + i % 6, 900.0) for i in range(MEASURED_ROWS + 5000)])
+
+    def stub():
+        fleet = SimpleNamespace(events=events, _sizing_cache={}, _hardware_cache=None, _history=None, _history_at=0.0,
+                                _card_of=Fleet._card_of)
+        fleet._hardware_of_hosts = lambda: Fleet._hardware_of_hosts(fleet)
+        return fleet
+
+    def read():
+        fleet = stub()
+        at = Fleet.model_at_latency(fleet, "1x RTX TEST 48GB", "tag-a", 2.0, ceiling=6)
+        samples = next(iter(fleet._sizing_cache.values()))[1]
+        machines = {k: v.as_dict() for k, v in Fleet.machine_history(fleet).items()}
+        return at, samples, machines
+
+    before = read()
+    assert len(before[1]) == MEASURED_ROWS and before[2]["m-1"]["requests"] == MEASURED_ROWS
+    stats.roll_up(batches=1000)
+    assert stats.prune(NOW)["request_log"] == 5000, "the older ones beyond what is read do go"
+    assert read() == before
+
+
+def test_events_renting_reads_back_and_those_of_open_leases_are_kept(db):
+    stats = Stats(db, lambda: config(keep_requests_days=7, keep_rollups_days=400))
+    db.execute("INSERT INTO leases (lease_id, workers, max_hours, max_spend, allow_rent, state, opened_at) "
+               "VALUES ('open-lease', 1, 2000, 10, 1, 'open', ?), ('closed-lease', 1, 4, 10, 1, 'closed', ?)", (NOW, NOW))
+    events = EventLog(db)
+    events.record("replaced_for_value", "a host replaced for value", host_id="h1", lease_id="closed-lease")
+    events.record("machine_avoided", "a machine avoided", host_id="h1", numbers={"avoid_until": NOW + DAY_S})
+    events.record("worker_adjusted", "of an open lease", host_id="h1", lease_id="open-lease")
+    events.record("worker_adjusted", "of a closed lease", host_id="h1", lease_id="closed-lease")
+    events.record("worker_adjusted", "of none")
+    db.execute("UPDATE events SET ts = ?", (NOW - 40 * DAY_S,))
+    stats.prune(NOW)
+    assert sorted(e["summary"] for e in events.recent(10)) == ["a host replaced for value", "a machine avoided",
+                                                              "of an open lease"]
+
+
+def test_retention_is_at_least_a_week():
+    with pytest.raises(ValueError):
+        StatsConfig(keep_requests_days=6, keep_rollups_days=400)
+    assert StatsConfig(keep_requests_days=7).keep_requests_days == 7

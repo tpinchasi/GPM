@@ -259,12 +259,14 @@ Each table follows a watermark in `pool_meta` (the last row folded), moved in th
 `BEGIN IMMEDIATE` transaction as the rows it made, after checking it is still the one read: a
 fold run twice, or by two callers, counts each row once; a row logged late lands in its own hour.
 
-**Pruning**, once an hour, a batch of 2 000 rows at a time — found by a read, deleted by id:
+**Pruning**, once an hour: what must stay is worked out once per prune by one grouped read per
+table, then candidates are read 2 000 at a time behind an id cursor and deleted by id, under a
+lock of the prune's own — folding and `GET /pool/stats` go on beside it:
 
 | Table | Pruned after | Never pruned |
 |---|---|---|
-| `request_log` | `stats.keep_requests_days` (30) | a row not yet folded; a row with a hosted cost younger than 32 days — the UTC month and a provisioner's rolling 30 days are read from them |
-| `events` | `stats.keep_requests_days` | the machine record's kinds — `rented`, `prepared`, `eviction`, `released`, `host_gone` and the failures the history counts (D69); sizing and burst spend read them back |
+| `request_log` | `stats.keep_requests_days` (30, at least 7) | a row not yet folded; a row with a hosted cost younger than 32 days — the UTC month and a provisioner's rolling 30 days are read from them; per build, the newest 20 000 answers a latency curve is made of (D156), and the newest 20 000 chat answers the machine record folds (D69) — the readers' own predicates and limit (`stats.MEASURED_ROWS`) |
+| `events` | `stats.keep_requests_days` | the machine record's kinds — `rented`, `prepared`, `eviction`, `released`, `host_gone` and the failures the history counts (D69), which sizing and burst spend read back; `replaced_for_value` and `machine_avoided`, from which a lease's replacements and avoid list are restored; any event of a lease still open |
 | `spend` | `stats.keep_requests_days` | per lease, host and source: the newest row, the newest before the start of today and of this month (UTC), and the newest already folded — every figure lease and burst enforcement reads, which read the same after a prune |
 | the hourly tables | `stats.keep_rollups_days` (400) | — |
 
@@ -636,7 +638,7 @@ calibration:                                   # memory-ceiling constants, per m
   "<model set>@32k": { fixed_gib: 10.0, per_worker_gib: 7.6, operate_at: 0.67 }
 
 stats:                                         # D194, D195; null keeps for ever
-  keep_requests_days: 30                       # request log, decisions, superseded spend rows
+  keep_requests_days: 30                       # request log, decisions, superseded spend rows (7 at least)
   keep_rollups_days: 400                       # the hourly stats the dashboards read
   rollup_interval_s: 60
 ```

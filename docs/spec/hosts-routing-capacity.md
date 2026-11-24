@@ -685,5 +685,5 @@ The router only writes it, off its request path. **The supervisor folds it into 
 (D194, [supervisor.md](supervisor.md) §4.1) — per app, model, host, provider and kind — and
 **prunes it** after `stats.keep_requests_days` (default 30, D195), never a row not yet folded and
 never, within 32 days, a row that carries a hosted cost, which the budgets read. The measures
-above read the last few thousand rows or minutes, so a pool keeps them within any retention; a
-latency measured on a class of card (D156) is forgotten with its rows.
+that read the newest rows whatever their age — a build's latency at a card (D156) and the
+machine record (D69) — keep theirs: the prune spares the newest 20 000 rows each reads.
