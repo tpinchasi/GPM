@@ -437,8 +437,9 @@ Every account the pool spends through — a hosted API (`hosted:<host id>`), a r
     at exactly the preset's address is read; the address is on the same scheme, host and port as
     the host's `base_url`, and is sent the host's own key — its own provider, nothing else;
   - a rented plug-in declares `capabilities.reports_balance` when `account()`'s
-    `credit_remaining` is the account's balance in dollars as its API documents it (Vast, RunPod,
-    Verda). A figure from a plug-in that does not declare it is shown as credit, never acted on;
+    `credit_remaining` is the account's balance in dollars as its API documents it (RunPod,
+    Verda). A figure from a plug-in that does not declare it is shown as credit, never acted on —
+    Vast's, until a live check confirms what its `credit` is;
 - **typed** — what the operator types on the card ("$64 as of now"), for a provider whose API says
   none (Anthropic, Ollama's cloud, any other) or where they know better;
 - **unknown**.
@@ -449,9 +450,11 @@ minute per account — never the router, never on a request's way. A failed read
 figure and says why in the pool's own words; a figure in another currency is no balance. What is
 kept (`provider_balances`) is the number, its moment and those words.
 
-**The countdown.** Whichever of the read and typed figures is newer is counted down by the pool's
+**The countdown.** A typed figure stands until the operator clears it: while one is set, the
+provider's reading is shown beside it and not acted on; clearing it returns to the provider's. The
+one in force is counted down by the pool's
 own records since its moment — a hosted API's answers' costs from the request log; a rented
-account's hosts' and volumes' running estimates from the spend ledger — every 30 seconds, and
+account's hosts' and volumes' running estimates from the spend ledger — every 30 seconds (a page is served the last count), and
 shown as *about $63.20 left — $64.00 set on 8 Nov, less $0.80 spent here since*. It is an
 estimate: another user of the same key or account is not counted, and a top-up is not seen until
 it is typed again or read.
@@ -466,8 +469,16 @@ the provider itself gave stays until the operator's word, as before.
 
 **A rented account** rents nothing new once its balance would not cover an hour of everything the
 pool would run there with the machine in question — no new rental, no parked host restarted, no
-evicted host won back — said in a `rent_refused` event at most every 15 minutes and on its card.
-**Machines already running are never stopped for it.**
+outbid host won back (it stopped when outbid; its re-bid is new spending) — said in a `rent_refused`
+event at most every 15 minutes per account and on its card. An account that would not cover even
+what runs there is not searched, nor is the market asked to restart a parked host there.
+**Machines already running are never stopped for it**: a running spot host whose price moves is held
+to its ceilings, the burn cap and its lease as before — never to the balance.
+
+**One account, one balance.** Removing a hosted API or a rented connection removes its balance; a
+hosted API whose address, format or key changes, or a connection whose plug-in, settings or
+credential source changes, is taken for another account under the same name and starts with
+nothing known.
 
 ## 9. Build order
 

@@ -207,7 +207,7 @@ def register(
     async def list_hosted(request: Request) -> JSONResponse:
         counters = supervisor.counters.all()
         spend = await asyncio.to_thread(spend_by_host)
-        await supervisor.balances.count()
+        await supervisor.balances.fresh()
         return JSONResponse({
             "hosts": [view(h, counters, spend) for h in supervisor.config.hosts if h.kind == "hosted"],
             "presets": [p.as_dict() for p in PRESETS],
@@ -528,6 +528,7 @@ def register(
             response = validate_plan_apply(text, version, {**body, "confirm": host_id})
         if response.status_code == 200:
             hosted_credentials.HostedKeys(supervisor.config).remove(host_id) if hosted_credentials.HOST_ID.match(host_id) else None
+            supervisor.balances.forget(f"hosted:{host_id}")  # its balance goes with it (D188)
             supervisor.events.record("hosted_removed", f"hosted API {host_id!r} removed from the console",
                                      numbers={"host": host_id})
         return response

@@ -271,6 +271,9 @@ CREATE TABLE IF NOT EXISTS provisioning_requests (
 -- since; never a credential, never a provider's answer as it came.
 CREATE TABLE IF NOT EXISTS provider_balances (
     account     TEXT PRIMARY KEY,
+    -- What the account was when this was written: its address, plug-in and credential's source and
+    -- moment. Another one under the same name starts with nothing known.
+    fingerprint TEXT,
     typed_usd   REAL,
     typed_at    REAL,
     read_usd    REAL,
@@ -426,6 +429,8 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
     # On added columns, so after them: a workload's last request, read every pass (D117).
     conn.execute("CREATE INDEX IF NOT EXISTS request_log_workload ON request_log (workload, ts)")
+    # A hosted API's spend since its balance was set or read, counted every half minute (D188).
+    conn.execute("CREATE INDEX IF NOT EXISTS request_log_host ON request_log (host_id, ts)")
 
 
 class Database:

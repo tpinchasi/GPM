@@ -762,9 +762,10 @@ async def test_a_private_images_login_goes_in_vasts_own_field_and_nowhere_else()
 # --- the account's balance (D188) ---
 
 
-async def test_the_balance_is_the_current_users_credit_and_declared_as_reported():
-    """`GET /api/v0/users/current/` carries `credit` — what Vast's own CLI shows as "Credit" — and
-    the plug-in says the provider reports a balance, so the pool may act on it (D188)."""
+async def test_the_credit_is_read_but_not_yet_declared_the_accounts_balance():
+    """`GET /api/v0/users/current/` carries `credit` — what Vast's own CLI shows as "Credit". Its API
+    reference names only `balance`, so until a live check says what `credit` is, the plug-in does
+    not declare it the account's balance and the pool never acts on it (D188)."""
     asked = []
 
     def handler(request):
@@ -774,7 +775,7 @@ async def test_the_balance_is_the_current_users_credit_and_declared_as_reported(
     status = await provider(handler).account()
     assert status.credential_valid and status.credit_remaining == pytest.approx(42.17)
     assert asked == ["/api/v0/users/current/"]
-    assert VastProvider.capabilities.reports_balance
+    assert not VastProvider.capabilities.reports_balance
 
 
 async def test_an_answer_without_credit_leaves_the_balance_unknown():

@@ -9,7 +9,9 @@ account — has a balance that is one of three things:
 - **typed**: what the operator typed on the account's card, as of that moment;
 - **unknown**.
 
-Whichever of the first two is newer is counted down by the pool's own spend records since its
+A typed balance stands until the operator clears it: while one is set, the provider's reading is
+shown beside it and not acted on — a provider answering a wrong $0 cannot keep an account out
+against the operator's word. The one in force is counted down by the pool's own spend records since its
 moment — hosted answers' costs from the request log, rented hosts' and volumes' estimates from the
 spend ledger — so the card says *about $63.20 left — $64.00 typed on 8 Nov, less $0.80 spent
 here since*. It is an estimate: what other users of the same key or account spend is not counted.
@@ -24,12 +26,13 @@ rents nothing new once its balance would not cover an hour of what the pool woul
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import time
 from typing import TYPE_CHECKING, Any, Optional
 
-from .. import hosted_balances
+from .. import hosted_balances, hosted_credentials
 from ..hosted_presets import preset_for
 
 if TYPE_CHECKING:
@@ -82,6 +85,13 @@ class BalanceStore:
         else:
             self._upsert(account, read_detail=detail, asked_at=now)
 
+    def forget(self, account: str) -> None:
+        """The account is gone, or is another account under the same name: nothing is known."""
+        self.db.execute("DELETE FROM provider_balances WHERE account = ?", (account,))
+
+    def stamp(self, account: str, fingerprint: str) -> None:
+        self._upsert(account, fingerprint=fingerprint)
+
     def forget_read(self, account: str) -> None:
         """The last reading is no longer believed: asked again at once."""
         self._upsert(account, read_usd=None, read_at=None, asked_at=None,
@@ -107,9 +117,34 @@ class Balances:
                 out[f"hosted:{host.id}"] = ("hosted", host.id)
         fleet = self.supervisor.fleet
         if fleet is not None:
-            for name in fleet.providers:
+            for name in list(fleet.providers):  # copied: this may run on a worker thread
                 out[f"rented:{name}"] = ("rented", name)
         return out
+
+    def fingerprint(self, account: str) -> Optional[str]:
+        """What makes this the same account: for a hosted API its address, format and key's source
+        and moment; for a rented one its plug-in, settings and credential's source and moment. None
+        where it cannot be said (the account is not running): left as it is."""
+        kind, _, ident = account.partition(":")
+        try:
+            if kind == "hosted":
+                host = next((h for h in self.supervisor.config.hosts if h.id == ident and h.kind == "hosted"), None)
+                if host is None:
+                    return None
+                key = hosted_credentials.describe(self.supervisor.config, host)
+                return json.dumps([host.transport.base_url, host.engine, key.get("source"), key.get("variable"),
+                                   key.get("set_at")])
+            accounts = self.supervisor.accounts
+            built = accounts.built.get(ident)
+            fleet = self.supervisor.fleet
+            provider = fleet.providers.get(ident) if fleet is not None else None
+            if built is None or provider is None:
+                return None
+            said = accounts.describe(ident, provider)
+            return json.dumps([built.type, built.credential_env, built.settings, said.get("source"),
+                               said.get("variable"), said.get("set_at")], sort_keys=True, default=str)
+        except Exception:  # noqa: BLE001 - a credential store that cannot be read says nothing here
+            return None
 
     def _hosted_reader(self, host_id: str) -> Optional[Any]:
         """The preset that says where this host's provider answers its balance, or None. Only a
@@ -209,9 +244,13 @@ class Balances:
             if view.get("source") == "typed":
                 self.store.type_in(account, None)
                 said = "its typed balance, at $0, was cleared: type the new one to count it down again"
-            elif view.get("source") == "provider":
+                self.supervisor.events.record("balance_cleared", f"{account}: the typed balance, at $0, was cleared "
+                                              "as the operator said its money is back", host_id=host_id,
+                                              numbers={"account": account})
+            if view.get("read") and view["read"].get("usd") is not None:
+                # A provider's figure would take over once the typed one is gone: asked again first.
                 self.store.forget_read(account)
-                said = "its provider's balance is asked again"
+                said = (f"{said}; " if said else "") + "its provider's balance is asked again"
         self.supervisor.table.mark_balance(host_id, None)
         self._counted_at = 0.0
         return said
@@ -228,23 +267,32 @@ class Balances:
         """The ledger's estimates are each host's (and volume's) running total for its lease: what
         it cost since is its newest less its newest before."""
         fleet = self.supervisor.fleet
-        legacy = 1 if fleet is not None and fleet.legacy_connection == name else 0
-        where = "(connection = ? OR (connection IS NULL AND ? = 1)) AND source = 'estimate'"
+        # Every name its records were written under: renamed, a connection's records stay its
+        # provider's (D133), and a record from before connections is the legacy one's.
+        written = [r["connection"] for r in self.supervisor.db.query(
+            "SELECT DISTINCT connection FROM spend WHERE ts >= ?", (since,))]
+        legacy = fleet.legacy_connection if fleet is not None else name
+        names = sorted({n for n in written if n is not None and (n == name or (fleet is not None and fleet.resolve(n) == name))}
+                       | {name})
+        with_null = 1 if None in written and (legacy == name or (fleet is not None and fleet.resolve(legacy) == name)) else 0
+        marks = ", ".join("?" for _ in names)
+        where = f"(connection IN ({marks}) OR (connection IS NULL AND ? = 1)) AND source = 'estimate'"
         after = self.supervisor.db.query(
             f"SELECT lease_id, host_id, MAX(amount) AS amount FROM spend WHERE {where} AND ts >= ? "
-            "GROUP BY lease_id, host_id", (name, legacy, since))
+            "GROUP BY lease_id, host_id", (*names, with_null, since))
         if not after:
             return 0.0
         before = {(r["lease_id"], r["host_id"]): float(r["amount"] or 0.0) for r in self.supervisor.db.query(
             f"SELECT lease_id, host_id, MAX(amount) AS amount FROM spend WHERE {where} AND ts < ? "
-            "GROUP BY lease_id, host_id", (name, legacy, since))}
+            "GROUP BY lease_id, host_id", (*names, with_null, since))}
         return sum(max(0.0, float(r["amount"] or 0.0) - before.get((r["lease_id"], r["host_id"]), 0.0)) for r in after)
 
     def _view(self, account: str, kind: str, ident: str, row: dict[str, Any]) -> dict[str, Any]:
         typed = row.get("typed_usd")
         read = row.get("read_usd")
         typed_at, read_at = row.get("typed_at") or 0.0, row.get("read_at") or 0.0
-        if typed is not None and (read is None or typed_at >= read_at):
+        if typed is not None:
+            # The operator's word stands until they clear it; a provider's reading is shown beside it.
             source, amount, as_of = "typed", float(typed), typed_at
         elif read is not None:
             source, amount, as_of = "provider", float(read), read_at
@@ -280,6 +328,23 @@ class Balances:
 
     def _count(self) -> dict[str, dict[str, Any]]:
         rows = self.store.all()
+        for account in self.accounts():
+            now = self.fingerprint(account)
+            if now is None:
+                continue
+            was = (rows.get(account) or {}).get("fingerprint")
+            if account in rows and was is None:
+                self.store.stamp(account, now)  # written before it was first counted: this account's
+                rows[account]["fingerprint"] = now
+                continue
+            if account in rows and was != now:
+                # Another account under the same name — moved, re-keyed, removed and added again:
+                # nothing said of the old one is believed of it.
+                self.store.forget(account)
+                rows.pop(account, None)
+            if account not in rows:
+                self.store.stamp(account, now)
+                rows[account] = {"fingerprint": now}
         return {account: self._view(account, kind, ident, rows.get(account, {}))
                 for account, (kind, ident) in self.accounts().items()}
 
@@ -327,6 +392,19 @@ class Balances:
                 self._reading = asyncio.create_task(self._read_all(due), name="gpm:balances")
         if time.monotonic() - self._counted_at >= COUNT_EVERY_S:
             await self.count()
+
+    async def fresh(self) -> dict[str, dict[str, Any]]:
+        """The figures last worked out, counted again only when older than half a minute — a page
+        opened often costs no more than the pass does."""
+        if not self.views or time.monotonic() - self._counted_at >= COUNT_EVERY_S:
+            return await self.count()
+        return self.views
+
+    def forget(self, account: str) -> None:
+        """An account removed: what was read or typed of it goes with it."""
+        self.store.forget(account)
+        self.views.pop(account, None)
+        self._counted_at = 0.0
 
     def view_of(self, account: str) -> dict[str, Any]:
         """The last view of one account, for a card: never a provider call."""

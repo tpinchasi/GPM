@@ -170,7 +170,7 @@ def register(
         if fresh:
             await supervisor.balances.read_now()  # Check every account asks each balance too (D188)
         else:
-            await supervisor.balances.count()
+            await supervisor.balances.fresh()
         return JSONResponse({
             "connections": [connection_view(name) for name in names],
             "plugins": accounts.plugins(),
@@ -398,6 +398,7 @@ def register(
         if response.status_code == 200:
             accounts.store.remove(conn.type)
             accounts.cleared.pop(conn.type, None)
+            supervisor.balances.forget(f"rented:{name}")  # its balance goes with it (D188)
             async with supervisor.pass_lock:
                 accounts.sync(supervisor.config, supervisor.config, drop=True)
         return response

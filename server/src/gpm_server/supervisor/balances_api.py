@@ -36,7 +36,7 @@ def register(app: FastAPI, supervisor: "Supervisor", *, error: Callable[..., JSO
     async def list_balances() -> JSONResponse:
         """Every account's balance: its source (provider-reported, typed, unknown), as of when,
         what the pool has spent there since, and so about what is left."""
-        return JSONResponse(listing(await balances.count()))
+        return JSONResponse(listing(await balances.fresh()))
 
     @app.post("/pool/balances/read")
     async def read_balances(request: Request) -> JSONResponse:

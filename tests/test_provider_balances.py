@@ -102,6 +102,8 @@ def test_the_rented_plugins_declare_the_balance_their_apis_answer():
 
 
 def view(pool, account):
+    """Counted now: the pass counts every half minute, and a page is served the last count."""
+    pool.supervisor.balances._counted_at = 0.0
     answer = api(pool, "GET", "/pool/balances")
     assert answer.status_code == 200, answer.text
     return next(b for b in answer.json()["balances"] if b["account"] == account)
@@ -143,6 +145,7 @@ def test_a_typed_balance_is_counted_down_and_its_api_taken_out_of_routing_at_zer
     # Money is back: the typed balance at $0 would take it out again, so it is cleared.
     restored = api(pool, "POST", "/pool/hosts/anthropic/funds-restored")
     assert restored.status_code == 200 and "cleared" in restored.json()["balance"], restored.text
+    assert pool.supervisor.events.recent(20, kind="balance_cleared"), "the typed figure's clearing is said"
     assert view(pool, "hosted:anthropic")["source"] == "unknown"
     assert router_host(pool, "anthropic").out_of_funds is None, "routed to again"
 
@@ -311,14 +314,33 @@ async def test_a_reported_rented_balance_is_read_counted_and_shown(tmp_path):
             card = (await client.get("/pool/providers")).json()["connections"][0]
             assert card["balance"]["source"] == "provider" and card["balance_refusal"] is None, "nothing running there"
             typed = await client.put(f"/pool/balances/rented/{name}", json={"usd": 40})
-            assert typed.status_code == 200 and typed.json()["source"] == "typed", "the newer of read and typed"
+            assert typed.status_code == 200 and typed.json()["source"] == "typed"
         assert supervisor.fleet.balances == {name: 40.0}
+
+        # A provider's later reading — a wrong $0, say — is shown beside the operator's figure and
+        # never acted on while that stands.
+        provider.credit = 0.0
+        supervisor.balances.store.asked(f"rented:{name}", None, None)  # as if asked long ago
+        supervisor.db.execute("UPDATE provider_balances SET asked_at = 0")
+        await supervisor.balances.read_now()
+        shown = supervisor.balances.view_of(f"rented:{name}")
+        assert shown["source"] == "typed" and shown["read"]["usd"] == 0.0 and supervisor.fleet.balances == {name: 40.0}
 
         # Money the pool spends there since is counted down from the ledger's running totals.
         supervisor.spend.record(lease_id="l1", host_id="h1", source="estimate", amount=1.0, connection=name)
         supervisor.spend.record(lease_id="l1", host_id="h1", source="estimate", amount=1.5, connection=name)
         await supervisor.balances.count()
         assert supervisor.fleet.balances[name] == pytest.approx(38.5)
+        # Spend written under the name the connection had before a rename is its spend too (D133).
+        supervisor.fleet.connection_types["before-rename"] = supervisor.fleet.connection_types[name]
+        supervisor.spend.record(lease_id="l2", host_id="h2", source="estimate", amount=2.0, connection="before-rename")
+        await supervisor.balances.count()
+        assert supervisor.fleet.balances[name] == pytest.approx(36.5)
+
+        # Cleared, the provider's figure is the one in force again.
+        await supervisor.balances.type_in(f"rented:{name}", None)
+        assert supervisor.balances.view_of(f"rented:{name}")["source"] == "provider"
+        assert supervisor.fleet.balances[name] <= 0
     finally:
         await supervisor.aclose()
         database.close()
@@ -363,3 +385,105 @@ def test_the_providers_card_shows_the_balance_and_takes_one_typed(pool):
         assert "$64.00 set on" in line and "less $0.00 spent here since" in line and "estimate" in line
     shown = api(pool, "GET", "/pool/balances").json()["balances"][0]
     assert shown["source"] == "typed" and shown["amount"] == 64.0
+
+
+# --- the review's findings (each held here) ---
+
+
+def test_vast_is_not_acted_on_until_its_credit_is_checked_live():
+    from gpm_server.providers import VastProvider
+
+    assert not VastProvider.capabilities.reports_balance, "an unverified meaning is shown, never acted on (D188)"
+
+
+def test_the_countdowns_query_has_its_index(tmp_path):
+    database = Database(tmp_path / "gpm.sqlite3")
+    try:
+        names = {r["name"] for r in database.query("SELECT name FROM sqlite_master WHERE type = 'index'")}
+        assert "request_log_host" in names
+    finally:
+        database.close()
+
+
+def test_a_card_says_why_without_a_made_up_hourly_figure(fleet):
+    fleet.balances[fleet.connection] = 0.0
+    said = fleet.balance_refusal(fleet.connection, 0.0)
+    assert said is not None and "/h" not in said and "about $0.00 left" in said
+
+
+def _spot_fleet(tmp_path):
+    from test_several_providers import make_fleet, market, open_workload, run
+
+    database = Database(tmp_path / "spot.sqlite3")
+    providers = market()
+    made = make_fleet(database, providers, enabled=["spot"])
+    workload, lease = open_workload(made, kind="interruptible")
+    return database, providers, made, workload, lease, run
+
+
+async def test_a_running_spot_hosts_price_moving_never_stops_it_for_the_balance(tmp_path):
+    """Found by review: a spot price moving (even down) went through the re-bid check, which asked
+    the balance, and a running host was drained for it. Running machines are never stopped (D188)."""
+    database, providers, fleet, workload, _, run = _spot_fleet(tmp_path)
+    try:
+        await run(fleet, workload)
+        (host,) = fleet.hosts_of("w")
+        fleet.balances["spot"] = 0.05  # less than an hour of it
+        providers["spot"].set_spot_price(host.instance.instance_id, 0.59)
+        await fleet.handle_evictions()
+        assert host.state != "draining" and not host.released
+        assert not [e for e in fleet.events.recent(20) if e["kind"] == "spot_price_refused"]
+    finally:
+        database.close()
+
+
+async def test_a_parked_host_is_not_restarted_nor_the_market_asked_while_the_balance_refuses(tmp_path):
+    database, providers, fleet, workload, lease, run = _spot_fleet(tmp_path)
+    try:
+        await run(fleet, workload)
+        (host,) = fleet.hosts_of("w")
+        host.state = "parked"
+        fleet.balances["spot"] = 0.05
+        searched = providers["spot"].calls.count("search_offers")
+        assert await fleet.restart_parked(lease, "w") is None
+        assert await fleet.restart_parked(lease, "w") is None
+        assert providers["spot"].calls.count("search_offers") == searched, "no search for what cannot be paid for"
+        said = [e for e in fleet.events.recent(20) if e["kind"] == "rent_refused"]
+        assert len(said) == 1 and "stays parked" in said[0]["summary"], "said once, not every pass"
+        assert not [e for e in fleet.events.recent(20) if e["kind"] == "park_restart_refused"]
+    finally:
+        database.close()
+
+
+async def test_an_account_that_covers_nothing_more_is_not_searched(fleet):
+    lease = fleet.leases.open(workers=20, max_hours=4, max_spend=5.0, allow_rent=True)
+    fleet.balances[fleet.connection] = 0.0
+    assert await fleet.rent_one(lease, []) is None
+    assert "search_offers" not in fleet.provider.calls and "about $0.00 left" in fleet.last_refusal
+
+
+def test_a_hosted_apis_balance_does_not_outlive_it(pool):
+    assert add_claude(pool).status_code == 200
+    assert api(pool, "PUT", "/pool/balances/hosted/anthropic", json={"usd": 9}).status_code == 200
+    removed = api(pool, "DELETE", "/pool/hosted/anthropic", json={"confirm": "anthropic"})
+    assert removed.status_code == 200, removed.text
+    assert not pool.db.query("SELECT 1 FROM provider_balances WHERE account = 'hosted:anthropic'")
+    assert add_claude(pool).status_code == 200
+    assert view(pool, "hosted:anthropic")["source"] == "unknown", "the same id added again starts with nothing"
+
+    # A new key may be another account: what was typed for the old one is not believed of it.
+    assert api(pool, "PUT", "/pool/balances/hosted/anthropic", json={"usd": 9}).status_code == 200
+    rekeyed = api(pool, "PUT", "/pool/hosted/anthropic/credential", json={"credential": KEY})
+    assert rekeyed.status_code == 200, rekeyed.text
+    assert view(pool, "hosted:anthropic")["source"] == "unknown"
+
+
+def test_a_page_opened_often_is_served_the_last_count(pool, monkeypatch):
+    assert add_claude(pool).status_code == 200
+    counted = []
+    real = pool.supervisor.balances._count
+    monkeypatch.setattr(pool.supervisor.balances, "_count", lambda: counted.append(1) or real())
+    for _ in range(3):
+        assert api(pool, "GET", "/pool/balances").status_code == 200
+        assert api(pool, "GET", "/pool/hosted").status_code == 200
+    assert len(counted) <= 1, "counted at most every half minute, not on every look"
