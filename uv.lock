@@ -264,7 +264,7 @@ wheels = [
 
 [[package]]
 name = "gpm-agent"
-version = "0.18.0"
+version = "0.18.1"
 source = { editable = "agent" }
 dependencies = [
     { name = "httpx" },
