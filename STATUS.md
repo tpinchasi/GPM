@@ -9,9 +9,10 @@
 
 ## Current state — 2026-11-24
 
-**Released: v0.44.0** (2026-11-24, marked Latest): gpm-server 0.44.0, gpm-client 0.9.0,
-gpm-agent 0.18.1, wheels and `SHA256SUMS` attached and checked after download. Install commands
-in the README point at it. Older releases kept: v0.43.0, v0.42.1, v0.37.4, v0.37.3 and earlier.
+**Released: v0.45.0** (2026-11-24, marked Latest, PR #104): gpm-server 0.45.0, gpm-client 0.9.0,
+gpm-agent 0.19.0, wheels and `SHA256SUMS` attached, checked after download and installed from the
+links. Install commands in the README point at it. Older releases kept: v0.44.0, v0.43.0, v0.42.1,
+v0.37.4, v0.37.3 and earlier.
 
 **What GPM does today:** one endpoint and key for apps, in OpenAI's and Anthropic's formats, over
 the operator's own machines (agents that install and keep current Ollama, whisper.cpp, vLLM and
@@ -19,13 +20,9 @@ ONNX Runtime on macOS, Linux and Windows), fixed remote hosts, hosted model APIs
 from budgets, and machines rented on Vast, RunPod or Verda under leases with dollar caps.
 Workloads give an app its own key, latency target and budget; trained models (ONNX files and
 container images) are served on `POST /v1/predict`. The console and the control API manage all of
-it. Stories S1, S2 and S4–S16 are built ([docs/stories/README.md](docs/stories/README.md)).
+it. Stories S1, S2 and S4–S18 are built ([docs/stories/README.md](docs/stories/README.md)).
 
-**Ready to merge, waiting for the owner's word to push (2026-11-24):** branch
-`integration/v0.45.0`, local only — four branches, each built, reviewed by an independent
-reviewer, every finding fixed with a test, merged together; full suite on the combination
-2932 passed before S17 joined (S17 alone: 2904 passed). gpm-server 0.45.0, gpm-agent 0.19.0,
-gpm-client 0.9.0 unchanged.
+**In v0.45.0** (CI green on the pull request; full local suite 2996 passed):
 
 | Branch | What | Decisions |
 |---|---|---|
@@ -47,9 +44,13 @@ balance is counted down from (a typed balance can be older than the retention).
 
 ## Next actions, in order
 
-1. **On the owner's word: push `integration/v0.45.0`, one pull request, merge on a green CI,
-   release v0.45.0** (gpm-server 0.45.0, gpm-agent 0.19.0). The agent's permission check refused a
-   push not asked for.
+1. **S19, a serving plan per workload** (proposed 2026-11-24, not yet written as a story): the
+   app declares a target (where it runs steady), a bridge (used only while the target cannot
+   serve — start-up, an eviction, a ramp), an ordered overflow (today's bursts), and rules from a
+   closed list (private requests only on machines, spend thresholds, time windows, evictions);
+   the supervisor evaluates them, the router reads the result. A console plan builder with
+   presets and generated SDK code, and later a chat on a pool-served model that writes the plan
+   JSON against its schema. Waiting on the owner's three answers (below), then the story.
 2. **Owner, by hand** (the agent's permission check refused it):
    `git push origin --delete v0.40.0 v0.42.0` and `git tag -d v0.40.0 v0.42.0` — the two tags
    whose releases were deleted earlier.
@@ -78,6 +79,9 @@ balance is counted down from (a typed balance can be older than the retention).
 
 ## Open owner decisions
 
+- **S19's three questions** (asked 2026-11-24): request classes (private, priority) from an
+  optional request header; a smaller model as a last resort, in or out (proposed: out); the plan
+  builder first and the chat after, or both together.
 - **The benchmark's spend** (next action 5).
 - **Which live checks to pay for, and when** (below).
 - Nothing else is waiting on the owner. Let go on 2026-11-24: a lease counted in workers rather
@@ -160,6 +164,7 @@ In `~/workspace/Aletheia`: the adoption guide and history in `docs/gpm-adoption/
 
 | Date | What happened |
 |---|---|
+| 2026-11-24 | **v0.45.0 released; S19 proposed.** At the owner's word: `integration/v0.45.0` pushed as PR #104, install links moved to v0.45.0 first, merged on a green CI, released (gpm-server 0.45.0, gpm-agent 0.19.0, gpm-client 0.9.0), the wheels checked against `SHA256SUMS` after download and installed from the links. vLLM still 0.34.0 on PyPI, so the agent's sets stand. Proposed to the owner a serving plan per workload (target, bridge, overflow, rules) with a console builder and a chat that writes the plan; three questions open. |
 | 2026-11-24 | **v0.44.0 released; STATUS cleaned; the small items, the adopter files and three stories under way.** At the owner's word: vLLM's locked sets regenerated for 0.34.0 and 0.33.0 (gpm-agent 0.18.1, PR #103) and v0.44.0 released, verified after download. The latest pool started again in `~/gpm-pool` beside SpaceGarage's 0.37.4 pool. On `fix/small-items`: the supervisor left running by a SIGTERM to `gpm serve` (uvicorn re-raises the signal after shutdown, and the default handler skipped the `finally`) now stops — and one whose router is killed outright stops itself; a build's thinking default (D187; Ollama 0.40.17 checked by hand); a download ceiling proposed when renting is set up, and $0.01/GB set on the laptop pool (its last rental paid ~$0.014/GB); the three September renting fixes found already shipped, their gaps closed; leases counted in workers let go (D186); the adopter-internal files moved to the adopter's repository (D189). Deleting tags v0.40.0 and v0.42.0 was refused by the agent's permission check — left to the owner. S17 (one Ollama per card), S18 (stats, dashboards, named app keys) and provider balances (D188) built by parallel agents on their own branches; each reviewed independently (the reviews found, among others: a running spot host drained over its account balance; a quadratic spend prune that would stall stats for hours; the agent reinstall killing S17's per-card router) and every finding fixed with a test; all four merged on `integration/v0.45.0` (gpm-server 0.45.0, gpm-agent 0.19.0), waiting for the owner's word to push. |
 | 2026-11-21 | **S16 built: S15's open items (D183–D185).** At the owner's word ("do however you recommend"): stage 1 ONNX Runtime on Windows (onnx-lock Windows targets, the 1.32.0 sets, Scripts paths, the installer's first own tests, one on CI's Windows job); stage 2 the hub read token on rented machines (over SSH into the agent's environment, never the instance spec); stage 3 rented container builds (`start`, no agent, readiness from health) and private registry logins (credential store, control API, console, Vast and RunPod). Provider facts read from Vast's and RunPod's API references and NVIDIA's release notes; listed as verified or unverified in decisions.md. |
 | 2026-11-21 | **Closed the restart gap in the install-error fix (gpm-agent 0.17.2).** The text a failed install or check wrote is kept in `state.json` as `failure`, so it is taken out after a restart too; an error written since stays. Two tests; the agent suites and lint pass. The owner then decided S15's three open items (D183–D185): rent container builds with private images, the hub read token on rented machines, ONNX Runtime installed on Windows; recorded, not built. |
