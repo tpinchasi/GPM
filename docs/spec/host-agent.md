@@ -446,7 +446,7 @@ from vLLM with `CUDA_VISIBLE_DEVICES`.
 **An engine of `auto`** (D161) is chosen by the agent each time it starts, from the machine alone:
 vLLM on Linux on x86_64 or aarch64 with an NVIDIA card of compute capability 8.0 or higher (Ampere
 onward, where the BF16, FP8 and FP4 builds catalogs carry for vLLM run) the locked set's driver, a
-glibc at least the newest set's (RHEL 8's 2.28 is below vLLM 0.32.0's 2.31), and an interpreter the
+glibc at least the newest set's (RHEL 8's 2.28 is below vLLM 0.34.0's 2.31), and an interpreter the
 agent carries a set for, named as the installer names it (a free-threaded `3.13t` has none); Ollama
 anywhere else, a Turing card included. Where an NVIDIA driver is installed (`nvidia-smi` on the
 PATH, or `/proc/driver/nvidia/version`) and its cards could not be read as the agent started — none

@@ -24,7 +24,7 @@ machine can change.
 On a Linux machine with an NVIDIA card (S10), `--engine vllm` with `--install-engines` has the
 agent install vLLM from PyPI — only the exact wheels, checked by hash, of the locked set it carries
 for its Python (3.11–3.14) and processor — and run it once the models it holds are on disk.
-vLLM 0.32.0 needs NVIDIA driver 580.65.06 or later and a card of compute capability 7.5 or higher;
+vLLM 0.34.0 (and 0.33.0) needs NVIDIA driver 580.65.06 or later and a card of compute capability 7.5 or higher;
 `--prerequisites` checks both and installs Python's `venv`. `--engine auto` lets the agent choose
 each time it starts: vLLM on an Ampere or newer card with that driver, Ollama anywhere else, with
 the reasons in its facts and on the pool's Hosts screen. **Not yet run on real hardware**: built
