@@ -1307,6 +1307,7 @@ def create_app(
                     else:
                         host.out_of_funds = said[:300].decode("utf-8", "replace")
                         host.out_of_funds_at = time.time()
+                        host.out_of_funds_by_balance = False  # the provider's own word now (D188)
                         log.warning("hosted API %s is out of money: %s", host.host_id, host.out_of_funds)
                     await free(assignment, cost=0.0)
                     if meaning == "out_of_funds":

@@ -112,8 +112,13 @@ That is the guard against a misplaced decimal point.
 
 ```sh
 uv run gpm account       # is the credential valid, how much credit is left
+uv run gpm balance       # what is left in each provider account, and where the figure comes from
 uv run gpm market        # the real offer pipeline, read-only
 ```
+
+The pool reads each account's balance every 15 minutes where the provider's API states it, and
+rents nothing new on an account that would not cover an hour of what it would run there; machines
+already running are never stopped for it (D188).
 
 `market` runs the same filters and the same bid strategy the supervisor would, and shows you
 what passed, what did not, and why:

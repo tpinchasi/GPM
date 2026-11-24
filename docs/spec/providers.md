@@ -277,6 +277,9 @@ used up*, *searches failing*, *searching*):
   only when that same machine is free again, which is rare, and it is billed the whole time.”*;
   for a provider with no volumes: *“This provider keeps no storage between hosts.”*;
 - its credential's state and the credit left;
+- **its balance** (§12): provider-reported, typed or unknown, as of when, counted down by what the
+  pool spent there since, with **Type it** / **Change**; and, where the account would not cover an
+  hour of what the pool would run there, *not renting* with why;
 - the day's search use against its quota;
 - what is rented on it and burning;
 - **Test connection**, **Edit**, **Disable/Enable**.
@@ -337,6 +340,7 @@ of the decision log.
 | `POST /pool/providers`, `PATCH /pool/providers/{name}` | Add or change a connection through validate → plan → apply; enabling is retyped like any loosening |
 | `PUT /pool/providers/{name}/credential`, `DELETE …/credential` | Set or replace, or remove, the credential; answers with its state only |
 | `DELETE /pool/providers/{name}` | Remove; refused while it holds a host, a parked disk or a volume |
+| `GET /pool/balances`, `POST /pool/balances/read`, `PUT`/`DELETE /pool/balances/{hosted\|rented}/{id}` | Every account's balance; ask the providers that state one now; type or clear one (§12, D188) |
 | `GET /pool/hosted`, `POST /pool/hosted/test`, `POST /pool/hosted`, `PATCH`/`DELETE /pool/hosted/{id}`, `PUT`/`DELETE /pool/hosted/{id}/credential`, `PATCH /pool/hosted-budget` | Hosted model APIs (§10) |
 | `GET /pool/market/preview` | Gains `providers=` to narrow the search; each row carries its connection |
 
@@ -382,8 +386,8 @@ hosted` host and catalog builds.
   joins the model set. A name offered by two APIs is one catalog entry with a build for each.
 - **Its card**: status (*serving*, *needs a key*, *key saved for another address*, *key refused*,
   *out of money* with **Money is back**, *cannot be reached*, *out of service*), address, the
-  key's source and when it was set, requests at once, spend today and this month, its models and
-  prices. **Test**, **Type in / Replace key** (and **Remove key**), **Settings** (requests at once,
+  key's source and when it was set, requests at once, spend today and this month, its balance
+  (§12), its models and prices. **Test**, **Type in / Replace key** (and **Remove key**), **Settings** (requests at once,
   1–1000, in effect at once; for Anthropic's format whether prompts are cached), **Models and prices** (the same
   picker; unticking removes the build, and an entry left with none leaves the catalog and the
   model set), **Take out of service / Return**, **Remove** (typed again; removes its builds and its
@@ -419,6 +423,62 @@ hosted` host and catalog builds.
   (and the hub it was checked against as `HF_ENDPOINT`).
   It is never in the instance spec, which carries nothing secret; where it went is an event.
 - Leases, caps and the dead-man timer are unchanged.
+
+## 12. What is left in each account (D188)
+
+Every account the pool spends through — a hosted API (`hosted:<host id>`), a rented account
+(`rented:<connection>`) — has a **balance**, always said with its source and its moment:
+
+- **provider-reported** — read from the provider's own API, where its reference states one:
+  - a hosted preset names the address and how its answer reads (`hosted_presets.py`
+    `balance_url`, `balance_format`): OpenRouter `GET /api/v1/credits`, `total_credits` less
+    `total_usage` (answered only to a management key: with an ordinary one the card says so and the
+    balance is typed); DeepSeek `GET /user/balance`, the `USD` entry's `total_balance`. Only a host
+    at exactly the preset's address is read; the address is on the same scheme, host and port as
+    the host's `base_url`, and is sent the host's own key — its own provider, nothing else;
+  - a rented plug-in declares `capabilities.reports_balance` when `account()`'s
+    `credit_remaining` is the account's balance in dollars as its API documents it (RunPod,
+    Verda). A figure from a plug-in that does not declare it is shown as credit, never acted on —
+    Vast's, until a live check confirms what its `credit` is;
+- **typed** — what the operator types on the card ("$64 as of now"), for a provider whose API says
+  none (Anthropic, Ollama's cloud, any other) or where they know better;
+- **unknown**.
+
+The supervisor reads every 15 minutes, in the background so a slow provider never holds a pass,
+and when the operator asks (**Check every account**, `POST /pool/balances/read`), at most once a
+minute per account — never the router, never on a request's way. A failed read keeps the last
+figure and says why in the pool's own words; a figure in another currency is no balance. What is
+kept (`provider_balances`) is the number, its moment and those words.
+
+**The countdown.** A typed figure stands until the operator clears it: while one is set, the
+provider's reading is shown beside it and not acted on; clearing it returns to the provider's. The
+one in force is counted down by the pool's
+own records since its moment — a hosted API's answers' costs from the request log; a rented
+account's hosts' and volumes' running estimates from the spend ledger — every 30 seconds (a page is served the last count), and
+shown as *about $63.20 left — $64.00 set on 8 Nov, less $0.80 spent here since*. It is an
+estimate: another user of the same key or account is not counted, and a top-up is not seen until
+it is typed again or read.
+
+**At $0.** A hosted API whose balance is at or below $0 is taken out of routing through the
+out-of-money state it already has (D164): the supervisor writes `balance_out` and its moment in
+the host table, never through the routine publish; the router reads it with the table and treats
+it as its provider's refusal, until the supervisor clears it (a balance above $0 again) or the
+operator's word is newer. **Money is back** clears a typed balance at $0 (or asks the provider
+again for a reported one), and a new balance typed above $0 is the operator's word too. A refusal
+the provider itself gave stays until the operator's word, as before.
+
+**A rented account** rents nothing new once its balance would not cover an hour of everything the
+pool would run there with the machine in question — no new rental, no parked host restarted, no
+outbid host won back (it stopped when outbid; its re-bid is new spending) — said in a `rent_refused`
+event at most every 15 minutes per account and on its card. An account that would not cover even
+what runs there is not searched, nor is the market asked to restart a parked host there.
+**Machines already running are never stopped for it**: a running spot host whose price moves is held
+to its ceilings, the burn cap and its lease as before — never to the balance.
+
+**One account, one balance.** Removing a hosted API or a rented connection removes its balance; a
+hosted API whose address, format or key changes, or a connection whose plug-in, settings or
+credential source changes, is taken for another account under the same name and starts with
+nothing known.
 
 ## 9. Build order
 

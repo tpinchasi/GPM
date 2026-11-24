@@ -119,6 +119,11 @@ class ProviderCapabilities:
     #: The provider says what an instance has cost. Without it, spend is estimate-only and the
     #: cap safety margin is widened.
     reports_charges: bool = False
+    #: `account()`'s `credit_remaining` is the account's own balance in dollars, as the provider's
+    #: API documents it (D188). With it, the pool reads it on a slow schedule and rents nothing new
+    #: on this account once it would not cover an hour of what the pool runs there; without it, a
+    #: figure the plug-in returns is shown but never acted on, and the operator may type one.
+    reports_balance: bool = False
     price_history: bool = False
     #: A public port can be mapped to the engine. Without it, rented hosts are tunnel-only.
     direct_port_mapping: bool = False

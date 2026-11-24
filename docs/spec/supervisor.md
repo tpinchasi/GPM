@@ -243,6 +243,7 @@ Ordered by value — idle time, not the hourly rate, dominates cost.
 | Driver floor | `offer_policy.min_driver_version`: a machine whose accelerator driver is below what the engine image needs is refused **before renting** (D81). Below it the engine finds the card unusable and serves from the CPU — at the accelerator's price, with every other filter passed |
 | Replace only when it is cheaper | Re-bidding in place beats replacing whenever the download cost of a new host exceeds the price difference over the hours left (§6) |
 | Spend ledger | Append-only cost events per host and lease |
+| Account balance | What is left in each provider account — read from the provider where its API says it (every 15 minutes, in the background), else typed by the operator — counted down by the spend records since. Nothing new is rented on an account it would not cover an hour of what the pool would run there; running machines are never stopped for it. A hosted API at $0 leaves routing (D188, providers.md §12) |
 
 ## 5. Rented hosts — when to rent
 

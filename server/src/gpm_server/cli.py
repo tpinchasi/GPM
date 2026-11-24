@@ -425,6 +425,25 @@ def _lease(args: argparse.Namespace) -> int:
     return _control(args, "GET", "/pool/leases")
 
 
+def _balance(args: argparse.Namespace) -> int:
+    """What is left in each provider account (D188): list, ask the providers now, type one, clear it."""
+    if args.action == "list":
+        return _control(args, "GET", "/pool/balances")
+    if args.action == "read":
+        return _control(args, "POST", "/pool/balances/read", {"account": args.account} if args.account else {})
+    kind, _, ident = (args.account or "").partition(":")
+    if kind not in ("hosted", "rented") or not ident:
+        print("name the account as hosted:<host id> or rented:<connection>", file=sys.stderr)
+        return 2
+    path = f"/pool/balances/{kind}/{ident}"
+    if args.action == "clear":
+        return _control(args, "DELETE", path)
+    if args.usd is None:
+        print("set: give the dollars left with --usd", file=sys.stderr)
+        return 2
+    return _control(args, "PUT", path, {"usd": args.usd})
+
+
 def _control_json(args: argparse.Namespace, method: str, path: str, body: Optional[dict] = None) -> tuple[int, Any]:
     """The control call, answered as data rather than printed — for commands that say more than
     the JSON does."""
@@ -943,6 +962,15 @@ def main(argv: list[str] | None = None) -> int:
     spending = subparsers.add_parser("spending", help="what hosted APIs and rented bursts cost, today and this month")
     spending.add_argument("--url", default=None)
     spending.set_defaults(func=lambda a: _control(a, "GET", "/pool/spending"))
+
+    balance = subparsers.add_parser(
+        "balance", help="what is left in each provider account: read from the provider, typed, or unknown (D188)")
+    balance.add_argument("action", nargs="?", default="list", choices=["list", "read", "set", "clear"],
+                         help="list; read: ask the providers now; set: type what is left now; clear: forget it")
+    balance.add_argument("account", nargs="?", default=None, help="hosted:<host id> or rented:<connection>")
+    balance.add_argument("--usd", type=float, default=None, help="set: the dollars left in the account now")
+    balance.add_argument("--url", default=None)
+    balance.set_defaults(func=_balance)
 
     account = subparsers.add_parser("account", help="is the provider credential valid; spends nothing")
     account.add_argument("--url", default=None)

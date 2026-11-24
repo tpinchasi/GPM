@@ -96,6 +96,7 @@ A provider states what it can do; the pool adapts rather than assumes.
 | `same_machine_rebid` — a stopped instance can be restarted by raising its bid | Eviction choice is "replace" only |
 | `self_terminate` — an **instance-scoped** credential lets an instance end itself | No dead-man timer; the pool refuses leases longer than a short maximum on this provider. The start-up script still carries the pool's key and the engine's start, without the timer (D140) |
 | `reports_charges` | Spend is estimate-only; the cap safety margin is widened and the console says why |
+| `reports_balance` — `account()`'s `credit_remaining` is the account's balance in dollars, as the provider's API documents it (D188) | The balance is never read on schedule or acted on; the operator may type one, which the pool counts down |
 | `price_history` | Volatility-aware bidding relies on the pool's own samples only |
 | `direct_port_mapping` — a public port can be mapped to the engine | `http` / `https` transports to rented hosts are unavailable; `tunnel` only |
 | `private_images` — `create` also takes `registry_login=` (registry, user name, password), for the provider's own create call alone, never written down or put on the machine by the plug-in (D183) | An image whose registry needs a login is not rented from this provider; nothing else changes, and `create` is never handed a login |
