@@ -8,8 +8,10 @@ be played elsewhere — Windows' flags on a Mac, a lost console — is played wi
 import asyncio
 import logging
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 import types
 
@@ -288,3 +290,92 @@ def test_the_status_says_whether_a_supervisor_is_there(tmp_path):
         assert _supervisor_now(database, "shop")["running"] is False
     finally:
         database.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX signals")
+def test_sigterm_to_the_router_stops_its_supervisor_and_still_ends_by_sigterm():
+    """uvicorn takes SIGTERM, shuts down, puts back the handler it found and raises the signal
+    again. With Python's default handler put back, `gpm serve` died on the spot and never stopped
+    its supervisor, which ran on alone holding the pool's lock (seen on the laptop pool). The
+    process still ends by SIGTERM, so a service manager reads a stop, not a failure (exit 143)."""
+    script = (
+        "import signal\n"
+        "from gpm_server import cli\n"
+        "def serve():\n"
+        "    signal.raise_signal(signal.SIGTERM)  # what uvicorn does once it has shut down\n"
+        "    print('not reached')\n"
+        "cli._run_then_stop(serve, lambda: print('supervisor stopped', flush=True))\n"
+        "print('not reached either')\n"
+    )
+    ran = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=120)
+    assert ran.stdout.strip() == "supervisor stopped", ran.stderr
+    assert ran.returncode == -signal.SIGTERM
+
+
+def test_a_router_that_ends_on_its_own_stops_its_supervisor_too():
+    stopped = []
+    assert cli._run_then_stop(lambda: None, lambda: stopped.append(True)) == 0 and stopped
+
+
+def test_a_supervisor_whose_router_is_gone_stops(monkeypatch, caplog):
+    """A router killed outright runs no `finally`; its supervisor notices and stops itself."""
+    monkeypatch.setattr(cli, "_parent_watch", lambda pid: (lambda: False))
+
+    async def scenario() -> bool:
+        async def supervisor() -> None:
+            await asyncio.sleep(60)
+
+        task = asyncio.ensure_future(supervisor())
+        await cli._exit_with(4242, task, every_s=0.01)
+        try:
+            await task
+        except asyncio.CancelledError:
+            return True
+        return False
+
+    with caplog.at_level(logging.ERROR, logger="gpm"):
+        assert asyncio.run(scenario())
+    assert "the pool's router (pid 4242) is gone" in caplog.text
+
+
+def test_the_parent_is_told_apart_from_any_other_process():
+    assert cli._parent_watch(os.getppid())()
+    if os.name != "nt":
+        assert not cli._parent_alive(os.getpid()), "this process is not its own parent"
+
+
+def test_the_supervisor_is_started_with_the_routers_pid(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(processes, "pool_command", lambda *args: seen.append(args) or [sys.executable, "-c", "pass"])
+    monkeypatch.setattr(cli, "RESTART_FIRST_S", 3600.0)
+    config = types.SimpleNamespace(request_log=str(tmp_path / "requests.sqlite3"))
+    supervised = cli._supervisor_child(config, str(tmp_path / "pool.yaml"), "info")
+    supervised.stop()
+    assert seen[0][-2:] == ("--exit-with", str(os.getpid()))
+
+
+def test_stopping_while_a_restart_is_due_starts_nothing(tmp_path, monkeypatch):
+    """The restart thread had read a dead child and was about to start another as stop() ran:
+    the new one was never stopped."""
+    monkeypatch.setattr(processes, "pool_command", lambda *args: [sys.executable, "-c", "import sys; sys.exit(1)"])
+    monkeypatch.setattr(cli, "RESTART_FIRST_S", 0.0)
+    config = types.SimpleNamespace(request_log=str(tmp_path / "requests.sqlite3"))
+    supervised = cli.SupervisorChild(config, str(tmp_path / "pool.yaml"), "info")
+    spawned = []
+    real_spawn = supervised._spawn
+
+    def spawn():
+        child = real_spawn()
+        spawned.append(child)
+        if len(spawned) == 3:
+            threading.Thread(target=supervised.stop).start()
+            time.sleep(0.2)  # stop() waits for this start to finish, then stops what it started
+        return child
+
+    supervised._spawn = spawn
+    supervised.start()
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline and not supervised._stopping.is_set():
+        time.sleep(0.05)
+    time.sleep(0.5)
+    assert len(spawned) == 3, "nothing started once stop() had begun"

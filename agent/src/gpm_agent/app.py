@@ -29,15 +29,22 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from . import PROTOCOL_VERSION, __version__, installs, vllm_install, vllm_server, whisper_cpp
+from . import (
+    PROTOCOL_VERSION,
+    __version__,
+    installs,
+    vllm_install,
+    vllm_server,
+    whisper_cpp,
+)
 from . import facts as facts_module
 from . import platform as host_platform
 from .engine_control import EngineControl
 from .engines import VllmFacts, engine_facts
 from .facts import Probes, disk, gather
 from .models import ModelWork, Refused
+from .ollama_cards import OllamaCards
 from .ollama_server import ANSWER_TIMEOUT_S as OLLAMA_ANSWER_TIMEOUT_S
-from .ollama_server import OllamaServer
 from .settings import AUTO, AUTO_ENGINES, FOREIGN_PREFIXES, INSTALLABLE_ENGINES, Settings
 from .vllm_server import START_TIMEOUT_S as VLLM_START_TIMEOUT_S
 from .vllm_server import VllmServer
@@ -88,7 +95,9 @@ def server_for(
             engine_dir, engine_url=settings.engine_url, models_path=settings.models_path, client=engine_client,
             engines_dir=engines,
         )
-    return OllamaServer(
+    # One server per card where the machine's NVIDIA cards and the models held allow (D190, D191);
+    # elsewhere the one server it always was, its record where it always was.
+    return OllamaCards(
         engine_dir, engine_url=settings.engine_url, models_path=settings.models_path, client=engine_client,
     )
 
@@ -137,6 +146,12 @@ def switch_bound_s(engine: str, switch_timeout_s: float, os_name: Optional[str] 
     stop = 2 * grace + (host_platform.COMMAND_TIMEOUT_S if (os_name or host_platform.system()) == host_platform.WINDOWS else 0)
     look = max(OLLAMA_ANSWER_TIMEOUT_S, whisper_cpp.ANSWER_TIMEOUT_S)
     start = stop + look + switch_timeout_s + look
+    if engine == "ollama":
+        # Its servers one per card (D190) stop in three steps — the router, the cards' servers
+        # together, the one server — and a start stops whatever of them still runs first.
+        stop = 3 * stop
+        # And the one server, where the servers per card did not start, has a wait of its own.
+        start = 2 * stop + 2 * (look + switch_timeout_s + look)
     return 2 * (stop + start) + look
 
 
@@ -343,13 +358,14 @@ def create_app(
 
     async def keep() -> None:
         """One look at the engine this agent runs: the engine an `auto` agent ran before handed
-        over first, then started if it is not running — and vLLM started again when the models it
-        holds on disk have changed (D159)."""
+        over first, then started if it is not running — and started again when what it should run
+        has changed: vLLM's models on disk (D159), or whether Ollama's models held fit one card (D191)."""
         try:
             if hand_over is not None and not await hand_over.settle():
                 return
             await installer.ensure_running()
-            if runs_vllm and installer.server.wants_restart():
+            wants_restart = getattr(installer.server, "wants_restart", None)
+            if wants_restart is not None and wants_restart():
                 with contextlib.suppress(Refused):  # busy, or not installed yet: the next look
                     await installer.restart()
         except Exception:  # noqa: BLE001 - a bad look must never end the looking
@@ -383,7 +399,7 @@ def create_app(
         )
         if engine is not None else None
     )
-    if runs_vllm and work is not None:
+    if installer is not None and work is not None and hasattr(installer.server, "held"):
         # What the pool told this machine to hold, once it has said: the model work starts blank,
         # and the pool's first pass replaces that with its set.
         untold = work.desired

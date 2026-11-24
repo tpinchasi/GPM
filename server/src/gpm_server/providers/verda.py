@@ -60,6 +60,7 @@ from .base import (
     ProviderUnavailable,
     SelfTerminateRequest,
     VolumeInfo,
+    answer_of,
 )
 from .hostscript import SSH_DAEMON
 
@@ -155,6 +156,8 @@ class VerdaProvider:
         self_terminate=False,
         #: A balance, and each instance's rate; no charges per instance.
         reports_charges=False,
+        #: `GET /v1/balance`: `amount` and `currency` (`usd` or `eur`) — acted on only in dollars (D188).
+        reports_balance=True,
         price_history=False,
         #: Every port is open: the engine is reached only through the SSH tunnel.
         direct_port_mapping=False,
@@ -553,7 +556,7 @@ class VerdaProvider:
             if response.status_code in (400, 409, 422) or (response.status_code == 503 and _says_no_capacity(response)):
                 words = self._quiet(_problem(response))
                 if _says_no_capacity(response):
-                    raise OfferGone(f"{place}: no capacity now ({words})")
+                    raise OfferGone(f"{place}: no capacity now ({words})", response=answer_of(response, self._quiet))
                 raise ProviderError(f"POST {path}: the provider refused the request ({words})")
             if response.status_code == 402:
                 raise ProviderError(

@@ -50,6 +50,7 @@ from ..providers.base import (
     redacted,
 )
 from ..sizing import Needs, needs_for
+from ..stats import MEASURED_ROWS
 from ..strategies import (
     Demand,
     HostView,
@@ -162,6 +163,14 @@ class RentedHost:
     #: takes minutes, and asking again every pass would only ever interrupt it.
     restarted_for: Optional[frozenset] = None
     restart_asked_at: Optional[float] = None
+    #: Whether the pool has asked this host's agent to start its Ollama again, now that the agent's
+    #: launcher is on the machine, as one server per card (D190). Once per host: what the launcher
+    #: chose is in the agent's facts afterwards, and a host adopted with them is not asked again.
+    per_card_asked: bool = False
+    #: How often, and when last, its engine was started again because the router in front of its
+    #: servers per card was found not running (D190): a few times, apart.
+    per_card_recoveries: int = 0
+    per_card_recovered_at: Optional[float] = None
     #: When the pool last re-bid for this host and asked the provider to start it again. While
     #: that start is in flight the instance still reads "stopped", and read as a fresh
     #: eviction the pool bids against itself (D106).
@@ -579,6 +588,12 @@ class Fleet:
         self.searching: dict[str, SearchState] = {name: SearchState() for name in self.providers}
         #: Connections not rented through while a change to them could not be applied (D174).
         self.paused: set[str] = set()
+        #: What is known or estimated to be left in each account, by connection, in dollars (D188):
+        #: set by the supervisor's balances, absent where nothing is known. Nothing new is rented
+        #: on an account it would not cover an hour of what the pool would run there.
+        self.balances: dict[str, float] = {}
+        #: When a refusal for an account's balance was last recorded, by connection: said, not repeated.
+        self._balance_said: dict[str, float] = {}
 
     # --- connections (D129) ---
 
@@ -1135,7 +1150,8 @@ class Fleet:
                 dict(row)
                 for row in self.events.db.query(
                     "SELECT host_id, outcome, latency_ms, tokens_out, generate_ms FROM request_log "
-                    "WHERE host_id IS NOT NULL AND (kind IS NULL OR kind = 'chat') ORDER BY id DESC LIMIT 20000"
+                    "WHERE host_id IS NOT NULL AND (kind IS NULL OR kind = 'chat') ORDER BY id DESC LIMIT ?",
+                    (MEASURED_ROWS,),
                 )
             ]
         except Exception as exc:  # noqa: BLE001 - a view is never worth failing a bid for
@@ -1223,8 +1239,8 @@ class Fleet:
                 f"SELECT concurrency, latency_ms FROM request_log WHERE outcome = 'ok' AND model_served = ? "
                 f"AND concurrency IS NOT NULL AND latency_ms IS NOT NULL AND host_id IN ({marks}) "
                 "AND (model_concurrency IS NULL OR model_concurrency = concurrency) "
-                "ORDER BY id DESC LIMIT 20000",
-                (tag, *host_ids),
+                "ORDER BY id DESC LIMIT ?",
+                (tag, *host_ids, MEASURED_ROWS),
             )
             samples = [(int(r["concurrency"]), float(r["latency_ms"]) / 1000) for r in rows]
         # Read once in a while, not once per offer: a search weighs dozens (the review's finding 12).
@@ -2434,23 +2450,30 @@ class Fleet:
         minutes = self.rented.teardown.avoid_failed_machine_minutes if minutes is None else minutes
         if minutes <= 0:
             return
-        self.avoided[machine_id] = (time.time() + minutes * 60, why)
+        until = time.time() + minutes * 60
+        self.avoided[machine_id] = (until, why)
         self.events.record(
             "machine_avoided",
             f"machine {machine_id} {why}; not bidding on it for {minutes:g} minutes",
-            numbers={"machine": machine_id, "minutes": minutes},
+            numbers={"machine": machine_id, "minutes": minutes, "avoid_until": until, "why": why},
         )
 
     def avoided_now(self) -> dict[str, str]:
         now = time.time()
         if not self._value_avoids_restored:
-            # The rest of the list is forgotten at a restart at the cost of one more try; a machine
-            # given up for bad value would be bought straight back, as the cheapest (D75).
+            # Read back after a restart: a machine given up for bad value would be bought straight
+            # back, as the cheapest (D75), and one whose bid just lost bid on again at once — the
+            # burst of creates that tripped the provider's request limits (D124).
             self._value_avoids_restored = True
             for event in self.events.recent(200, kind="replaced_for_value"):
                 until, machine = event["numbers"].get("avoid_until"), event["numbers"].get("machine")
                 if until and machine and until > now:
                     self.avoided.setdefault(machine, (until, "given up for bad value"))
+            for event in self.events.recent(200, kind="machine_avoided"):
+                numbers = event["numbers"] or {}
+                until, machine = numbers.get("avoid_until"), numbers.get("machine")
+                if isinstance(until, (int, float)) and isinstance(machine, str) and until > now:
+                    self.avoided.setdefault(machine, (until, str(numbers.get("why") or "avoided before a restart")))
         self.avoided = {m: (until, why) for m, (until, why) in self.avoided.items() if until > now}
         skipped = {m: why for m, (_, why) in self.avoided.items()}
         # A machine this pool already rents still appears in the interruptible listing — its
@@ -2726,6 +2749,121 @@ class Fleet:
 
         host.restart_task = asyncio.create_task(ask(), name=f"gpm:restart:{host.host_id}")
 
+    def wants_per_card(self, host: RentedHost) -> bool:
+        """Whether this host's Ollama is to be started again as one server per card (D190): an
+        Ollama host with more than one card — as its agent counts them, else as it was bought —
+        whose agent answers and has not said what its launcher chose, started by the pool's own
+        start (not an operator's `engine_start`), not yet serving, and whose models fit one card
+        (`per_card_fits`, D191). Asked once."""
+        if host.per_card_asked or host.agent is None or not host.agent.manage_models:
+            return False
+        if self.engine_of(host).name != "ollama" or self.rented.engine_start or host.state == "ready":
+            return False
+        facts = host.agent_facts or {}
+        if (facts.get("engine") or {}).get("layout") is not None:
+            host.per_card_asked = True  # its launcher has run: a host adopted after it is not asked again
+            return False
+        fits, why = self.per_card_fits(host)
+        if not fits:
+            host.per_card_asked = True
+            if why:
+                self.events.record("engine_one_server", f"{host.host_id}: its Ollama stays one server across its "
+                                   f"cards — {why}", host_id=host.host_id, lease_id=host.lease_id)
+            return False
+        return True
+
+    def per_card_fits(self, host: RentedHost) -> tuple[bool, Optional[str]]:
+        """Whether a server on each of this host's cards would hold every model it is for (D191):
+        more than one card, every model's size known, and the set — by the pool's own sizing, as
+        the search sized the machine (D111) — within the smallest card. The pool decides, before
+        anything is pulled: on the machine nothing is on disk yet to judge by. A reason where it
+        does not fit; None where there is one card."""
+        facts = host.agent_facts or {}
+        accelerators = facts.get("accelerators")
+        cuda = [card for card in accelerators if isinstance(card, dict) and card.get("kind") == "cuda"] \
+            if isinstance(accelerators, list) and accelerators else []
+        cards = len(cuda) if cuda else int(getattr(host.offer, "gpus", 1) or 1)
+        if cards < 2:
+            return False, None
+        sizes = self.build_sizes(self.models_of(host), host.builds or None)
+        unknown = sorted(model for model, size in sizes.items() if not size)
+        if unknown or not sizes:
+            return False, f"the size of {', '.join(unknown) or 'its models'} is not known, so it cannot be told they fit one card"
+        memory = [card.get("memory_bytes") for card in cuda]
+        if cuda and all(isinstance(size, int) and size > 0 for size in memory):
+            card_gb = min(memory) / 1e9
+        else:
+            card_gb = float(getattr(host.offer, "gpu_memory_gb", 0.0) or 0.0)
+        needs = needs_for(sizes, 1)
+        if needs.card_memory_gb > card_gb:
+            return False, (f"its models need {needs.card_memory_gb:.0f} GB of a card and its smallest has "
+                           f"{card_gb:.0f} GB")
+        return True, None
+
+    def recover_per_card(self, host: RentedHost) -> None:
+        """Ask again, in the background, for the engine of a host whose servers per card are recorded
+        and whose router is not running (D190): killed, or the record outlived the processes (a
+        machine started again by its provider, D106). Three times at most, two minutes apart."""
+        if host.agent is None or self.engine_of(host).name != "ollama" or self.rented.engine_start:
+            return
+        layout = ((host.agent_facts or {}).get("engine") or {}).get("layout")
+        if not isinstance(layout, dict) or not layout.get("servers") or layout.get("running"):
+            return
+        now = time.time()
+        if host.per_card_recoveries >= self.PER_CARD_RECOVERIES:
+            return
+        if host.per_card_recovered_at is not None and now - host.per_card_recovered_at < self.RESTART_RETRY_S:
+            return
+        if host.restart_task is not None and not host.restart_task.done():
+            return
+        host.per_card_recoveries += 1
+        host.per_card_recovered_at = now
+        self.events.record(
+            "engine_per_card_recovered",
+            f"{host.host_id}: the router in front of its Ollama servers per card is not running; "
+            f"starting its engine again ({host.per_card_recoveries} of {self.PER_CARD_RECOVERIES})",
+            host_id=host.host_id, lease_id=host.lease_id,
+        )
+        host.restart_task = asyncio.create_task(self._restart_per_card(host), name=f"gpm:per-card:{host.host_id}")
+
+    #: How often a host's servers per card are started again when their router is found not running.
+    PER_CARD_RECOVERIES = 3
+
+    async def start_per_card(self, host: RentedHost) -> None:
+        """Start a several-card Ollama host's engine again through its agent, before any model is
+        pulled, so that the pool's restart script — at boot without the agent's archive, and so the
+        one server — now finds the launcher and starts an Ollama on each card behind the router
+        (D190), or the one server where the cards or the models do not allow it (D191). With the
+        host's own numbers, as any restart: the workers it was launched for, the set it holds, its
+        context. A restart that fails leaves the one server serving, as before; it is said, and the
+        host prepares on it."""
+        if not self.wants_per_card(host):
+            return
+        await self._restart_per_card(host)
+
+    async def _restart_per_card(self, host: RentedHost) -> None:
+        host.per_card_asked = True
+        settings: dict[str, int] = agents.wanted_engine_settings(
+            host.launch_workers or host.workers, len(self.tags_for(host)))
+        context = int(self.rented.context_length or 0)
+        if 256 <= context <= 1_048_576:
+            settings["context"] = context
+        self.events.record(
+            "engine_per_card",
+            f"{host.host_id}: its agent is on the machine; starting its Ollama again, as one server per card",
+            host_id=host.host_id,
+            lease_id=host.lease_id,
+        )
+        status, answer = await agents.restart_engine(host.agent, settings, transport=self._agent_transport)
+        if status != 200 or not answer.get("engine_answers"):
+            self.events.record(
+                "engine_per_card_failed",
+                f"{host.host_id}: its Ollama was not started again as one server per card — "
+                f"{str(answer.get('detail') or answer.get('error') or answer.get('restart_output') or status)[-300:]}",
+                host_id=host.host_id,
+                lease_id=host.lease_id,
+            )
+
     async def load_model_set(self, host: RentedHost, engine, client) -> bool:
         """Fetch the set, loading each model as its own download finishes, then check they are
         resident **together** — a host that cannot hold the whole set does not join the pool.
@@ -2826,6 +2964,13 @@ class Fleet:
             limit = self.lease_hours_on(host.connection_name)
             if limit is not None and (limit < lease.max_hours or host.hours_held >= limit):
                 continue  # no dead-man timer there: this lease, or this host's hours, run past it
+            account = self.resolve(host.connection_name) or host.connection_name
+            broke = self.balance_refusal(account, host.bid_hourly, without=host)
+            if broke is not None:
+                # Restarting starts its bid billing again: new spending, which the account would
+                # not cover (D188). Decided before the market is asked, and said once in a while.
+                self._say_balance_refusal(account, f"{host.host_id} stays parked: {broke}", lease, host.host_id)
+                continue
             offers = await self._offers(connections=[host.connection_name])
             same_machine = next((o for o in offers if self._at(o) == self._at(host.offer)
                                  and o.interruptible == host.offer.interruptible
@@ -2837,6 +2982,11 @@ class Fleet:
             if capped is None:
                 continue
             refused = self._refuse_rebid(host, capped, lease)
+            if refused is None:
+                refused = self.balance_refusal(account, capped, without=host)
+                if refused is not None:
+                    self._say_balance_refusal(account, f"{host.host_id} stays parked: {refused}", lease, host.host_id)
+                    continue
             if refused is not None:
                 self.events.record("park_restart_refused", f"{host.host_id} stays parked: {refused}",
                                    host_id=host.host_id, lease_id=lease.lease_id)
@@ -3089,7 +3239,8 @@ class Fleet:
             )
         return adopted
 
-    async def _left_nothing_behind(self, label: str, lease: Lease, connection: Optional[str] = None) -> bool:
+    async def _left_nothing_behind(self, label: str, lease: Lease, connection: Optional[str] = None,
+                                   found: Optional[list[str]] = None) -> bool:
         """After a bid the provider reported lost: is anything running under its label?
 
         Returns False when something was left and could not be ended, or when the provider
@@ -3109,6 +3260,8 @@ class Fleet:
             return False
         if not stray:
             return True
+        if found is not None:
+            found.extend(instance.instance_id for instance in stray)
 
         ended = []
         for instance in stray:
@@ -3358,6 +3511,11 @@ class Fleet:
                 else None
             )
             over_cap = self._refuse_rebid(host, capped, lease) if capped is not None else None
+            if over_cap is None and capped is not None:
+                # Winning it back starts its bid billing again: new spending, refused where the
+                # account would not cover an hour of it (D188). It is not running: outbid, it stopped.
+                over_cap = self.balance_refusal(self.resolve(host.connection_name) or host.connection_name,
+                                                capped, without=host)
             if over_cap is not None:
                 capped = None
             if capped is not None:
@@ -4068,6 +4226,37 @@ class Fleet:
             )
         return None
 
+    def balance_refusal(self, connection: str, adding_hourly: float,
+                        without: Optional["RentedHost"] = None) -> Optional[str]:
+        """Why nothing more may be rented on this account for its balance, or None (D188). The
+        safety margin is an hour of everything the pool would then run there — the machine about to
+        be rented with the rest — so a machine the account cannot pay for is never rented. Machines
+        already running are never stopped for it: this only refuses what would start billing."""
+        left = self.balances.get(connection)
+        if left is None:
+            return None
+        running = sum(h.rate() for h in self.hosts.values()
+                      if not h.released and h is not without and self.resolve(h.connection_name) == connection)
+        need = running + adding_hourly
+        if left > need:
+            return None
+        if adding_hourly <= 0:
+            what = f"not more than an hour of what the pool runs there (${running:.3f}/h)" if running > 0 else "nothing"
+            return f"the {connection} account has about ${left:.2f} left, {what}: nothing new is rented there until it is topped up"
+        return (f"the {connection} account has about ${left:.2f} left, not more than an hour of what the pool would run "
+                f"there (${need:.3f}/h with this machine): nothing new is rented there until it is topped up")
+
+    def _say_balance_refusal(self, connection: str, refusal: str, lease: Optional[Lease] = None,
+                             host_id: Optional[str] = None) -> None:
+        """An event says why, once in a while rather than every pass the demand lasts."""
+        now = time.time()
+        if now - self._balance_said.get(connection, 0.0) < 900:
+            return
+        self._balance_said[connection] = now
+        self.events.record("rent_refused", refusal, numbers={"connection": connection,
+                                                              "balance": self.balances.get(connection)},
+                           lease_id=lease.lease_id if lease is not None else None, host_id=host_id)
+
     def _refuse_rebid(self, host: "RentedHost", bid: float, lease: Lease) -> Optional[str]:
         """A new bid on a host the pool already holds — won back after an eviction, or restarted
         from parked — is spending like any other: the pool's burn with this host at its new
@@ -4130,7 +4319,18 @@ class Fleet:
             policy = policy.model_copy(
                 update={"min_reliability": max(policy.min_reliability, self.config.workloads.min_reliability)}
             )
-        offers = await self._offers(policy, kinds=kind or ("both" if offer_id else None))
+        searchable = self.searchable()
+        affordable = [n for n in searchable if self.balance_refusal(n, 0.0) is None]
+        if searchable and not affordable:
+            # No account the pool may rent on would cover anything more (D188): its market is not
+            # asked — a search spends the provider's daily quota for offers that could not be rented.
+            for name in searchable:
+                self._say_balance_refusal(name, self.balance_refusal(name, 0.0) or "", lease)
+            self.last_refusal = self.balance_refusal(searchable[0], 0.0)
+            reasons.append(self.last_refusal)
+            return None
+        offers = await self._offers(policy, kinds=kind or ("both" if offer_id else None),
+                                    connections=affordable if len(affordable) < len(searchable) else None)
         # A connection with no dead-man timer serves only short leases (spec §7): for a longer
         # one, its offers are not among those this lease may rent (D129).
         too_long = {(o.connection, o.offer_id) for o in offers
@@ -4259,6 +4459,12 @@ class Fleet:
                     "rent_refused", refusal, numbers={"bid": capped}, lease_id=lease.lease_id
                 )
                 continue
+            broke = self.balance_refusal(offer.connection, capped)
+            if broke is not None:
+                # The account would not cover it (D188): never rented, said once in a while.
+                self.last_refusal = broke
+                self._say_balance_refusal(offer.connection, broke, lease)
+                continue
             if spec is not None:
                 unaffordable = self._refuse_for_workload_budget(
                     offer, capped, lease, workload, also_hourly=self._new_volume_hourly(spec, offer, here, for_this_host, builds),
@@ -4357,8 +4563,16 @@ class Fleet:
                 # next offer while a machine from this one bills is how one lease ends up
                 # paying for three hosts (D43) — so this is checked here, in the pool, and not
                 # left to a plug-in's own discipline. Unprovable means stop, not carry on.
-                if not await self._left_nothing_behind(instance_spec.label, lease, offer.connection):
+                stray: list[str] = []
+                if not await self._left_nothing_behind(instance_spec.label, lease, offer.connection, stray):
                     return None
+                machines_are_machines = getattr(self.provider_for(offer).capabilities, "machine_ids_are_machines", True)
+                if stray and not isinstance(exc, BidLost) and machines_are_machines:
+                    # Refused, yet a machine was made and billing (the D43 pattern, from a provider
+                    # that says "gone" rather than "lost"): the same create would do it again. Not
+                    # where an id names a class of machine (a GPU type in a cloud): that would bar the
+                    # whole class, and those plug-ins give up a misplaced instance themselves.
+                    self.avoid(offer.machine_id, "refused a create yet made an instance")
                 if isinstance(exc, BidLost):
                     # Lost: someone holds the machine above the listed least bid, and the same bid
                     # loses again. Avoided for a while, and this round stops here — firing the next

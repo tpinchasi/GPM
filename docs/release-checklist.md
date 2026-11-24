@@ -13,15 +13,17 @@
       carries internal product material, exported data, and local credentials in prototype
       scripts and environment backups. `git filter-repo` style extraction is not safe enough:
       one missed path publishes it permanently.
-- [ ] All of `docs/` was moved in on 2026-09-17, **including** `adopters/`, `archive/` and the
-      review, because the repository is private. Decide what happens to those three before
-      going public — see `STATUS.md`, "Before anything here becomes public". Nothing is ever
-      moved from the adopter's application or prototype folders.
+- [x] All of `docs/` was moved in on 2026-09-17, **including** `adopters/`, `archive/` and the
+      review, because the repository was private. Done 2026-11-24 (D189): the three moved to the
+      first adopter's repository; the build-or-adopt comparison kept as `docs/build-or-adopt.md`;
+      history not rewritten (public since 2026-10-06). Nothing is ever moved from the adopter's
+      application or prototype folders.
 - [x] Run a secret scanner over the new repository before the first push, and add it to CI —
       done 2026-09-19: scanned before the first commit (the only matches are test fixtures: an
       example public key and a literal `super-secret-host-token`), and gitleaks runs in CI.
-- [ ] The adopter guide stays in the adopter's repository and links to the public docs, not the
-      reverse. The generic docs must read completely without it.
+- [x] The adopter guide stays in the adopter's repository and links to the public docs, not the
+      reverse. The generic docs must read completely without it — `docs/adopters/README.md` says
+      how one is written (D189).
 
 ### 1.2 Name — **owner** — decided 2026-09-19 (D36)
 
@@ -41,8 +43,8 @@ well-known tool (`pool` alone is too generic for a CLI on a shared machine).
       accepted, since a pip install shadows it for a normal user.
 - [x] Apply it consistently: package, CLI, environment-variable prefix, HTTP header prefix,
       label prefix, directories — done, with zero occurrences of the old identifiers left.
-- [x] Nothing anywhere is named after the first adopter — outside `docs/adopters/`, which is
-      still to be dealt with before going public.
+- [x] Nothing anywhere is named after the first adopter — `docs/adopters/` holds only the
+      generic guide to writing one (D189).
 
 ### 1.3 Licence — **owner**
 

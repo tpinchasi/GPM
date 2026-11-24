@@ -101,6 +101,10 @@ class VastProvider:
         #: `/api/v0/charges/` reports per-instance charges by day, with an itemised breakdown.
         #: The pool still only narrows the cap margin once a figure has actually arrived.
         reports_charges=True,
+        #: `GET /api/v0/users/current/` answers `credit`, the figure Vast's own CLI shows as "Credit";
+        #: its API reference names only `balance`. Shown on the card, never acted on, until a live
+        #: check confirms `credit` is the money left to spend (D188).
+        reports_balance=False,
         price_history=False,
         direct_port_mapping=True,
         #: `PUT /instances/request_logs/{id}/` hands back a URL the boot output is fetched

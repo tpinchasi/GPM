@@ -272,6 +272,17 @@ class Variant(BaseModel):
     #: machine with its own command rather than the image's. Machines of the operator's own run the
     #: image's own entrypoint and never use it.
     start: Optional[list[str]] = Field(default=None, min_length=1, max_length=64)
+    #: Whether a chat request to this build thinks before it answers, when the app does not say
+    #: (D187). Unset: the engine's own default, as before. `off` is accepted by Ollama whatever the
+    #: build; a hosted model that takes no `reasoning_effort` refuses it, and `on` is refused by a
+    #: build that cannot think — set it only where the build is known to take it.
+    thinking: Optional[Literal["on", "off"]] = None
+
+    @model_validator(mode="after")
+    def _thinking_is_a_chat_builds(self) -> "Variant":
+        if self.thinking is not None and "chat" not in self.kinds():
+            raise ValueError(f"{self.tag!r}: `thinking` is a chat build's (D187); this one does not serve chat")
+        return self
 
     @model_validator(mode="after")
     def _a_trained_models_fields_are_its_own(self) -> "Variant":
@@ -862,6 +873,33 @@ class PoolSettings(BaseModel):
                 f"pool.max_held_request_mb ({self.max_held_request_mb:g}) must be at least "
                 f"pool.max_request_mb ({self.max_request_mb:g})"
             )
+        return self
+
+
+class StatsConfig(BaseModel):
+    """Stats kept, and how long the raw logs are (D194, D195). The supervisor folds the request
+    log and the spend ledger into hourly tables; the raw rows go after `keep_requests_days`, the
+    hourly ones after `keep_rollups_days`. `null` keeps them for ever. Whatever lease and budget
+    enforcement reads is never pruned, whatever is set here."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: The request log, the decision log (but the machine record's events) and superseded spend rows.
+    #: At least a week (D195): fewer days would leave an operator no raw rows to trace a recent
+    #: fault by.
+    keep_requests_days: Optional[int] = Field(default=30, ge=7)
+    #: The hourly tables the dashboards read.
+    keep_rollups_days: Optional[int] = Field(default=400, ge=1)
+    #: How often the supervisor folds what is new, in seconds.
+    rollup_interval_s: float = Field(default=60.0, gt=0)
+
+    @model_validator(mode="after")
+    def _rollups_outlive_requests(self) -> "StatsConfig":
+        if (self.keep_rollups_days is not None and self.keep_requests_days is not None
+                and self.keep_rollups_days < self.keep_requests_days):
+            raise ValueError(
+                "stats.keep_rollups_days is shorter than stats.keep_requests_days: the hourly stats would go "
+                "before the rows they are made from — keep them at least as long")
         return self
 
 
@@ -1656,6 +1694,8 @@ class PoolConfig(BaseModel):
     containers: ContainersConfig = Field(default_factory=ContainersConfig)
     #: Trained models' uploaded files (D182).
     models: ModelsConfig = Field(default_factory=ModelsConfig)
+    #: Stats kept, and how long the raw logs are (D194, D195).
+    stats: StatsConfig = Field(default_factory=StatsConfig)
     request_log: str = "gpm.sqlite3"
     directory: DirectoryConfig = Field(default_factory=DirectoryConfig)
 
@@ -2512,8 +2552,16 @@ class PoolConfig(BaseModel):
         """A trained model's build is declared once: the agent is told one set of declarations per
         file, so two catalog entries naming one file must declare it alike."""
         seen: dict[str, tuple[str, Any]] = {}
+        thinks: dict[str, tuple[str, Optional[str]]] = {}
         for name, entry in self.catalog.items():
             for variant in entry.variants:
+                # The router finds a build's thinking default by its tag (D187), so one tag under
+                # two names says one thing — or a request for one would think as the other says.
+                if variant.tag in thinks and thinks[variant.tag][1] != variant.thinking:
+                    raise ValueError(
+                        f"{thinks[variant.tag][0]!r} and {name!r} name the build {variant.tag!r} with different "
+                        "`thinking`; a build has one default — give both the same, or leave it to each request")
+                thinks.setdefault(variant.tag, (name, variant.thinking))
                 if variant.engine not in TRAINED_ENGINES:
                     continue
                 needs = variant.needs or BuildNeeds()

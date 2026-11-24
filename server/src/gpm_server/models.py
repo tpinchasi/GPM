@@ -98,6 +98,9 @@ class Host:
     #: out of routing until an operator says the money is back. What it said, and when.
     out_of_funds: Optional[str] = None
     out_of_funds_at: Optional[float] = None
+    #: The mark above was put there by the supervisor's balance reaching $0 (D188), not by the
+    #: provider's answer: it goes when the supervisor clears it.
+    out_of_funds_by_balance: bool = False
     #: A hosted API answered busy: not tried again before this moment (its `retry-after`).
     cooling_until: float = 0.0
 

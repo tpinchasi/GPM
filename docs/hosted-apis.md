@@ -117,6 +117,12 @@ transcription model's is per minute.
 - **Out of money**: the pool stops routing to the host and the console shows what the provider
   said. Top up the account, then tell the pool with **Money is back** on the host's card, or
   `gpm host funds-restored <id>`.
+- **Its balance at $0**: each card shows what is left in the account — read from the provider
+  where its API says it (OpenRouter with a management key, DeepSeek), otherwise typed by you on
+  the card ("$64 as of now") and counted down by what the pool spends there. It is an estimate:
+  anything else using the same key is not counted, so type it again after topping up. At $0 the
+  pool stops sending there, as for a refusal; **Money is back** or a new balance sends there again.
+  `gpm balance` lists, reads and sets them.
 - **Anything else**, such as a request too long for the model, goes back to the app as the
   provider said it, and costs nothing.
 

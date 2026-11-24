@@ -102,7 +102,9 @@ funds-restored <id>`, `POST /pool/hosts/{id}/funds-restored`): the router publis
 provider said with its counters, the supervisor publishes the operator's word in the host table,
 and the router routes to the host again on reading a word newer than the refusal. A refusal after
 that takes it out again; a refusal is charged nothing. A router restarted forgets the mark, and
-tries the provider once more. Anything else is the request's own, returned to the app as the
+tries the provider once more. **A balance at $0** (D188, providers.md §12) takes it out the same way:
+the supervisor writes it in the host table and clears it when the balance is above $0 again; the
+operator's word newer than it wins, and a router restarted reads it again. Anything else is the request's own, returned to the app as the
 provider said it and charged nothing.
 
 ### 1.3 Transports
@@ -224,9 +226,10 @@ only when an operator resizes that host (§2.3). With no match, a rented host ru
 **per card** — times the cards the offer lists, held at 64, like a profile that names the card
 (D107) — marked as the default wherever it is shown. The market preview shows what each offer
 would run. For vLLM the launcher runs a copy of every model on each card, so the number is real
-for every model. **For Ollama it is not yet:** Ollama keeps one instance of a model, on one card
-when it fits, so a two-card Ollama host runs twice the work only when its traffic is spread over
-models on different cards.
+for every model. **For Ollama too** (D190): a machine with more than one NVIDIA card runs an Ollama
+server on each card behind the agent's router, each given its share of the host's workers, where
+the models it holds fit one card (D191 — on a rented host, as the pool judges from every model's known size); where
+they do not, one server spans every card, as Ollama always ran.
 
 Worker counts are recomputed when the pool's model set or context length changes — never per
 request.
@@ -416,6 +419,11 @@ How a host holds what it was given is its **residency** policy, set per host:
 Hosts the pool creates are always `pinned`: it configures them, so it sets this at creation.
 On the others the policy is verified by test-connection and every probe.
 
+On a machine running **one Ollama server per card** (D190, D192), what the pool reads — loaded, on
+disk, healthy — is the router's answer for the machine: a model is loaded only once **every** server
+holds it, and the host answers only while every server does. Under `pinned` the agent pins each
+model on every server; under `on_demand` each server loads and unloads by itself.
+
 - The model set belongs to the pool, with its hosts, key and budget. **Leases do not name models.**
 - **A host that cannot hold what it was given does not join the pool**, whatever its kind — not
   loaded on a pinned host, not on disk on an on-demand one. Under `all` that is the whole set;
@@ -488,6 +496,18 @@ left untouched — it names the tag that really ran — and the router adds `X-G
   entry has no declaration and is passed through as it would be to a bare engine.
   Holding both builds costs memory; where they do not both fit, that host simply does not take
   schema-constrained requests.
+- **A chat build may say whether it thinks before answering**, `thinking: on | off` (D187), for a
+  request that does not say. Unset, the engine's own default stands. The router adds the engine's
+  own switch to a chat request naming none — Ollama's API `think`; the OpenAI-shaped path
+  `reasoning_effort` (`none`, or `medium` for on), or for vLLM `chat_template_kwargs.enable_thinking`;
+  Anthropic's `thinking` (`disabled`, or `adaptive` for on, on `anthropic-api` alone) — as one
+  member put in after the opening brace, every other byte as the app sent it. A request that says
+  anything of its own (`think`, `reasoning_effort`, `reasoning`, `chat_template_kwargs`,
+  `thinking`) is never changed — checked on the path the request arrived on too, so a field a
+  translation dropped still counts. One build tag under two names has one default. `off` is
+  accepted by Ollama whatever the build; a hosted model that takes no `reasoning_effort` refuses
+  it, and `on` is refused by a build that cannot think — set it where the build is known to take
+  it.
 
 **A hosted build carries its price** (D164): `price: {input, cached_input, output}` in dollars per
 million tokens, `per_minute` for transcription, or `plan: true` — paid by the provider's plan, with
@@ -675,6 +695,15 @@ effect is visible.
 
 Every request is recorded: time, session id if sent, host, worker, model requested, model
 served, runtime class, its kind and its body's size (D145), queue wait, latency, token counts,
-outcome. Measures built on output tokens read only the kinds that produce them. It is the source for the
+outcome, the workload it was for, and — for a named app key on the shared pool — its app's name
+(`app`, D193; empty for the configured app key and for a workload's key, whose workload names
+it). Measures built on output tokens read only the kinds that produce them. It is the source for the
 console, for idle detection, for corrupt-output counters, and for the offline join described in
 §4.3. It contains **no prompt or completion text**.
+
+The router only writes it, off its request path. **The supervisor folds it into hourly stats**
+(D194, [supervisor.md](supervisor.md) §4.1) — per app, model, host, provider and kind — and
+**prunes it** after `stats.keep_requests_days` (default 30, D195), never a row not yet folded and
+never, within 32 days, a row that carries a hosted cost, which the budgets read. The measures
+that read the newest rows whatever their age — a build's latency at a card (D156) and the
+machine record (D69) — keep theirs: the prune spares the newest 20 000 rows each reads.

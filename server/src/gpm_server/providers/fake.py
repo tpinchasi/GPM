@@ -99,6 +99,8 @@ class FakeProvider:
             private_images=True,
         )
         self.offers: list[Offer] = list(offers or [default_offer()])
+        #: What `account()` says is left, in dollars (D188); a test sets it.
+        self.credit: Optional[float] = 100.0
         #: The registry login each create was handed, by instance id (D183) — for a test to read.
         self.registry_logins: dict[str, Any] = {}
         self.instances: dict[str, FakeInstance] = {}
@@ -440,7 +442,7 @@ class FakeProvider:
 
     async def account(self) -> AccountStatus:
         self._guard("account")
-        return AccountStatus(credential_valid=True, credit_remaining=100.0, detail=f"account {self._account()}")
+        return AccountStatus(credential_valid=True, credit_remaining=self.credit, detail=f"account {self._account()}")
 
     def self_terminate_request(self, action: str = "destroy") -> SelfTerminateRequest:
         # Instance-scoped credential only, exactly as a real provider's would be.

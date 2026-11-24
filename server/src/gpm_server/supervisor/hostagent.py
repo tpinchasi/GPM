@@ -49,7 +49,12 @@ _KEY = re.compile(r"\b(gpmg_[0-9a-f]{64})\b")
 #: and `pkill -f` on Linux matches that shell and kills it (found live: the install ended with
 #: the provider's banner and nothing else, three times). Writing `[.]` protects only against
 #: the pattern matching its own text; the anchor is what keeps it off the shell.
-AGENT_PROCESS = "^[^ ]*python3 [^ ]*gpm-agent[.]pyz .*serve"
+#:
+#: And anchored to the agent's own form — `-c <settings> serve`, `serve` the last word — so the
+#: other programs the same archive runs on the machine are never taken for it: the router in
+#: front of one Ollama per card (`… gpm-agent.pyz proxy …`, D190) was killed by an earlier, looser
+#: pattern on every reinstall, and nothing started it again.
+AGENT_PROCESS = "^[^ ]*python3 [^ ]*gpm-agent[.]pyz -c [^ ]+ serve$"
 
 
 @dataclasses.dataclass

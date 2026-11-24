@@ -39,6 +39,7 @@ from gpm_agent.engines import VllmFacts
 from gpm_agent.facts import Probes
 from gpm_agent.installs import Installer, Release
 from gpm_agent.models import Refused
+from gpm_agent.ollama_cards import OllamaCards
 from gpm_agent.ollama_server import OllamaServer
 from gpm_agent.settings import Settings, SettingsError, fingerprint, load, save
 from gpm_agent.vllm_server import VllmServer
@@ -1058,7 +1059,7 @@ async def test_an_auto_agent_that_now_chooses_ollama_stops_the_vllm_it_started(m
         accelerators=[card("Tesla T4", "7.5")])})
     monkeypatch.setattr(agent_app.VllmServer, "__init__", _with_runner(agent_app.VllmServer.__init__, machine))
     app = create_app(machine.settings(engine="auto"), vllm_sets=[SET])
-    assert app.state.installer.server.__class__ is OllamaServer
+    assert app.state.installer.server.__class__ is OllamaCards  # one server here: the machine has no card (D190)
     await app.state.look()
     await wait_until(lambda: gone(pid))
     assert json.loads(choice.read_text()) == {"engine": "ollama"}

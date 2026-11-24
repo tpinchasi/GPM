@@ -36,6 +36,7 @@ capabilities = ProviderCapabilities(
     same_machine_rebid=True,   # a stopped instance restarts by raising its bid
     self_terminate=True,       # an instance-scoped credential lets it end itself
     reports_charges=True,      # you can say what an instance has cost so far
+    reports_balance=True,      # account() returns the account's balance, in dollars
     direct_port_mapping=False, # a public port can be mapped to the engine
 )
 ```
@@ -44,7 +45,9 @@ The pool **adapts to what you lack** rather than assuming. Without `interruptibl
 strategy applies. Without `parkable`, tear-down is always destroy. Without `self_terminate`
 there is no dead-man timer, and the pool refuses leases longer than a short maximum on your
 provider — so declare that one honestly. Without `reports_charges`, spend is estimate-only and
-the cap safety margin widens by itself.
+the cap safety margin widens by itself. Without `reports_balance`, the pool never acts on the credit
+`account()` returns: declare it only where your API documents the account's balance in dollars,
+since the pool rents nothing new on an account whose balance would not cover an hour (D188).
 
 Declaring a capability you do not really have is the one way to hurt an operator: GPM narrows
 the cap margin only once a charge has *actually* been reported, precisely because a provider

@@ -28,6 +28,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from ..app_keys import AppKeyRefused, AppKeyStore
 from ..catalog import variants_for_host
 from ..config import AUTO_ENGINES, ConfigError, PoolConfig, Variant
 from ..configplan import (
@@ -70,6 +71,17 @@ def _priced(offer) -> str:
 
 def _error(status_code: int, error: str, detail: Optional[str] = None) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"error": error, "detail": detail})
+
+
+_SPAN = re.compile(r"^(\d+(?:\.\d+)?)([hd])$")
+
+
+def _span(text: str) -> float:
+    """`24h`, `7d`, `30d` — a stats range — in seconds."""
+    found = _SPAN.fullmatch(text.strip())
+    if found is None:
+        raise ValueError(f"range {text!r} is a number of hours or days, as 24h or 7d")
+    return float(found.group(1)) * (3600 if found.group(2) == "h" else 86400)
 
 
 def _same_origin(request: Request, allowed_hosts: set[str]) -> bool:
@@ -432,6 +444,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
     keys = _KeyHashes(lambda: config.auth if supervisor.config is started_with else supervisor.config.auth)
     keys.current()  # a key in both roles, or a missing app key, stops the start
     allowed_hosts = {"127.0.0.1", "localhost", "::1", config.control.host}
+    named_app_keys = AppKeyStore(supervisor.db)
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -446,12 +459,19 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         openapi_url=None,
     )
 
+    def _named_app_key(token: str, admin_hashes: set[str]) -> bool:
+        """A named app key (D193) — any key shaped as an app key that is not an admin key: it has
+        exactly the app key's powers, and none of them reaches here."""
+        # Every named key is minted as `gpma_`: its shape says enough, so nothing is read from the
+        # table on the event loop for a request.
+        return token.startswith("gpma_") and not verify(token, admin_hashes)
+
     def authorised(request: Request) -> Optional[JSONResponse]:
         scheme, _, token = request.headers.get("authorization", "").partition(" ")
         if scheme.lower() != "bearer" or not token:
             return _error(401, "unauthorized", "the control API requires the admin key")
         app_hashes, admin_hashes = keys.current()
-        if verify(token, app_hashes):
+        if verify(token, app_hashes) or _named_app_key(token, admin_hashes):
             # Said plainly, because this is a mistake an operator will otherwise repeat.
             return _error(
                 403,
@@ -1844,6 +1864,11 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                                           known_connections()),
     )
 
+    # --- what is left in each provider account (D188) ---
+    from .balances_api import register as register_balances
+
+    register_balances(app, supervisor, error=_error)
+
     def _has_section(text: str, name: str) -> bool:
         """Is this block already in the file? A missing one is written whole, once."""
         import re as _re
@@ -2056,6 +2081,98 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         except WorkloadRefused as exc:
             return _error(404, "not_found", str(exc))
         return JSONResponse({"provisioner": name, "revoked": True, "ended": ended})
+
+    # --- named app keys for the shared pool (D193) ---
+
+    @app.get("/pool/apps")
+    async def list_apps() -> JSONResponse:
+        """Every named app and its keys — ids and dates, never a key or a hash — beside the shared
+        pool's URL. The configured app key is the unnamed one, and is not listed here."""
+        keys_now = await asyncio.to_thread(named_app_keys.all)
+        apps: dict[str, dict[str, Any]] = {}
+        for key in keys_now:
+            entry = apps.setdefault(key.app, {"app": key.app, "keys": [], "usable": False})
+            entry["keys"].append(key.view())
+            entry["usable"] = entry["usable"] or key.revoked_at is None
+        return JSONResponse({"apps": list(apps.values()), "base_url": _connection("-", None)["base_url"]})
+
+    @app.post("/pool/apps")
+    async def create_app_key(request: Request) -> JSONResponse:
+        """A new key for an app on the shared pool — the app made if it is new; a second key for an
+        app already there is how a key is rotated. The key is in this answer **once**."""
+        try:
+            body = await request.json()
+        except ValueError:
+            return _error(400, "bad_request", "the body is JSON: {\"app\": name}")
+        name = body.get("app") if isinstance(body, dict) else None
+        try:
+            key, record = await asyncio.to_thread(named_app_keys.create, name)
+        except AppKeyRefused as exc:
+            return _error(400, "bad_request", str(exc))
+        supervisor.events.record("app_key_created", f"a key was made for app {record.app!r} on the shared pool",
+                                 numbers={"app": record.app, "key_id": record.key_id})
+        return JSONResponse({"app": record.app, "key": record.view(),
+                             "connection": _connection("-", key), "shown_once": True}, status_code=201)
+
+    @app.delete("/pool/apps/{name}")
+    async def revoke_app(name: str) -> JSONResponse:
+        """Every key of this app revoked: the router refuses them from its next read of the table."""
+        if not await asyncio.to_thread(named_app_keys.known, name):
+            return _error(404, "not_found", f"no app named {name!r}")
+        revoked = await asyncio.to_thread(named_app_keys.revoke, name)
+        if revoked:
+            supervisor.events.record("app_key_revoked", f"app {name!r}'s keys were revoked ({len(revoked)})",
+                                     numbers={"app": name, "key_ids": revoked})
+        return JSONResponse({"app": name, "revoked": revoked})
+
+    @app.delete("/pool/apps/{name}/keys/{key_id}")
+    async def revoke_app_key(name: str, key_id: str) -> JSONResponse:
+        if not any(k.key_id == key_id and k.app == name for k in await asyncio.to_thread(named_app_keys.all)):
+            return _error(404, "not_found", f"app {name!r} has no key {key_id!r}")
+        revoked = await asyncio.to_thread(named_app_keys.revoke, name, key_id)
+        if revoked:
+            supervisor.events.record("app_key_revoked", f"a key of app {name!r} was revoked",
+                                     numbers={"app": name, "key_ids": revoked})
+        return JSONResponse({"app": name, "revoked": revoked})
+
+    # --- stats kept (D194, D196) ---
+
+    @app.get("/pool/stats")
+    async def stats(request: Request) -> JSONResponse:
+        """Series and totals over a range: requests and how they ended, tokens, latency at p50 and
+        p95, cost split hosted and rented — per hour or day, per app, model, host, provider or kind,
+        narrowed by any of them. What is new in the logs is folded first, so the answer is current."""
+        q = request.query_params
+        now = time.time()
+        try:
+            to = float(q["to"]) if q.get("to") else now
+            span = _span(q.get("range")) if q.get("range") else None
+            start = float(q["from"]) if q.get("from") else to - (span or 86400.0)
+        except ValueError as exc:
+            return _error(400, "bad_request", f"from, to and range: {exc}")
+        if not (start < to):
+            return _error(400, "bad_request", "`from` is before `to`")
+        bucket = q.get("bucket") or ("hour" if to - start <= 8 * 86400 else "day")
+        if bucket not in ("hour", "day"):
+            return _error(400, "bad_request", "bucket is hour or day")
+        if bucket == "hour" and to - start > 31 * 86400:
+            return _error(400, "bad_request", "an hourly view covers at most 31 days; ask for bucket=day")
+        if to - start > 800 * 86400:
+            return _error(400, "bad_request", "a view covers at most 800 days")
+        by = q.get("by") or None
+        if by not in (None, "app", "model", "host", "provider", "kind"):
+            return _error(400, "bad_request", "by is one of app, model, host, provider, kind")
+        filters = {name: q.get(name) for name in ("workload", "app", "model", "host", "provider", "kind")}
+
+        def read() -> dict[str, Any]:
+            supervisor.stats.roll_up(batches=5)
+            answer = supervisor.stats.query(start, to, bucket, by, filters)
+            settings = supervisor.config.stats
+            answer["retention"] = {"keep_requests_days": settings.keep_requests_days,
+                                   "keep_rollups_days": settings.keep_rollups_days}
+            return answer
+
+        return JSONResponse(await asyncio.to_thread(read))
 
     @app.post("/pool/workloads/plan")
     async def workload_plan(request: Request) -> JSONResponse:
@@ -2553,13 +2670,18 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         said = counter.out_of_funds if counter else None
         if not supervisor.table.reset_funds(host_id):
             return _error(409, "not_published", f"{host_id} is not in the host table yet; the supervisor publishes it first")
+        # A balance at $0 would take it out again at once: a typed one is cleared, a provider's
+        # asked again (D188).
+        balance = supervisor.balances.funds_restored(host_id)
         supervisor.events.record(
             "hosted_funds_restored",
             f"{host_id}: the operator says its money is back; the router routes to it again"
-            + (f" (its provider had said: {said})" if said else " (the router had not seen it out of money)"),
+            + (f" (its provider had said: {said})" if said else " (the router had not seen it out of money)")
+            + (f"; {balance}" if balance else ""),
             host_id=host_id,
         )
-        return JSONResponse({"host_id": host_id, "was_out_of_funds": said is not None, "provider_said": said})
+        return JSONResponse({"host_id": host_id, "was_out_of_funds": said is not None, "provider_said": said,
+                             "balance": balance})
 
     @app.get("/pool/spending")
     async def spending() -> JSONResponse:
@@ -2620,7 +2742,8 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             counter = counters.get(h.host_id)
             providers.append({"host_id": h.host_id, "state": h.state.value,
                               "out_of_funds": counter.out_of_funds if counter else None,
-                              "out_of_funds_at": counter.out_of_funds_at if counter else None})
+                              "out_of_funds_at": counter.out_of_funds_at if counter else None,
+                              "balance": supervisor.balances.view_of(f"hosted:{h.host_id}")})
         return {
             "day_starts": day, "month_starts": month,
             "hosted": {"today": round(sum(r["today"] for r in by), 6),

@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Optional
 
 import httpx
 
 from .. import hosted_credentials
+from ..app_keys import AppKeyStore
 from ..catalog import ResolvedVariant
 from ..config import PoolConfig
 from ..db import CounterRow, HostCounters, HostRow, HostTable
@@ -39,6 +41,20 @@ def _literal_variants(variants: dict[str, tuple[ResolvedVariant, ...]]) -> dict[
     return {variant.tag: variant for group in variants.values() for variant in group}
 
 
+def _follow_balance(host: Host, row: HostRow) -> None:
+    """A hosted API whose balance the supervisor found at $0 (D188) is out of routing as if its
+    provider had said so — unless an operator said its money is back since; and back in once the
+    supervisor clears it. A mark the provider's own answer made is left alone."""
+    if row.balance_out is not None and not (row.funds_reset_at is not None
+                                            and row.funds_reset_at >= (row.balance_out_at or 0.0)):
+        if host.out_of_funds is None:
+            host.out_of_funds, host.out_of_funds_at = row.balance_out, row.balance_out_at or time.time()
+            host.out_of_funds_by_balance = True
+    elif host.out_of_funds_by_balance:
+        host.out_of_funds = host.out_of_funds_at = None
+        host.out_of_funds_by_balance = False
+
+
 class HostRegistry:
     def __init__(self, config: PoolConfig, table: HostTable, counters: HostCounters, dispatcher: Dispatcher):
         self.config = config
@@ -62,6 +78,10 @@ class HostRegistry:
         self.provisioning_store = ProvisioningStore(table.db)
         self.provisioners: dict[str, KeyReach] = {}
         self.last_provisioner_revision: Optional[float] = None
+        #: Named app keys for the shared pool (D193), as hash → app, for keys not revoked.
+        self.app_key_store = AppKeyStore(table.db)
+        self.app_keys: dict[str, str] = {}
+        self.last_app_key_revision: Optional[float] = None
 
     def apply_config(self, config: PoolConfig) -> None:
         """A configuration applied while the router runs. The table still says which hosts
@@ -114,6 +134,10 @@ class HostRegistry:
         if provisioner_revision != self.last_provisioner_revision:
             self.provisioners = await asyncio.to_thread(self.provisioning_store.usable_hashes)
             self.last_provisioner_revision = provisioner_revision
+        app_key_revision = await asyncio.to_thread(self.app_key_store.revision)
+        if app_key_revision != self.last_app_key_revision:
+            self.app_keys = await asyncio.to_thread(self.app_key_store.usable_hashes)
+            self.last_app_key_revision = app_key_revision
         revision = await asyncio.to_thread(self.workload_store.revision)
         if revision == self.last_workload_revision:
             return False
@@ -162,7 +186,7 @@ class HostRegistry:
 
     def _build(self, row: HostRow) -> Host:
         variants = _variants(row)
-        return Host(
+        built = Host(
             host_id=row.host_id,
             kind=row.kind,
             priority=row.priority,
@@ -181,6 +205,8 @@ class HostRegistry:
             last_error=row.last_error,
             workload=row.workload,
         )
+        _follow_balance(built, row)
+        return built
 
     def host_config(self, host_id: str) -> Any:
         """A configured host's settings, or None for one the pool rented."""
@@ -231,6 +257,8 @@ class HostRegistry:
                 and row.funds_reset_at >= (host.out_of_funds_at or 0.0)):
             # An operator said its money is back, after its provider said it was gone (D164).
             host.out_of_funds = host.out_of_funds_at = None
+            host.out_of_funds_by_balance = False
+        _follow_balance(host, row)
 
         if str(host.client.base_url).rstrip("/") != row.dial_url.rstrip("/"):
             self._retired.append(host.client)

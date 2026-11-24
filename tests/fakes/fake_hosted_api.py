@@ -34,7 +34,16 @@ class FakeHostedApi:
             Route("/v1/chat/completions", self._chat, methods=["POST"]),
             Route("/v1/messages", self._messages, methods=["POST"]),
             Route("/v1/messages/count_tokens", self._count, methods=["POST"]),
+            # What is left in the account (D188), in the shapes OpenRouter's and DeepSeek's API
+            # references give: `GET /api/v1/credits`, `GET /user/balance`.
+            Route("/v1/credits", self._credits, methods=["GET"]),
+            Route("/user/balance", self._user_balance, methods=["GET"]),
         ])
+        self.credits: dict[str, Any] = {"data": {"total_credits": 10.0, "total_usage": 2.5}}
+        self.user_balance: dict[str, Any] = {"is_available": True, "balance_infos": [
+            {"currency": "USD", "total_balance": "7.50", "granted_balance": "0.00", "topped_up_balance": "7.50"}]}
+        #: What the balance addresses answer with instead, where a test says (403: not a management key).
+        self.balance_status = 200
         #: Anthropic's counts: input after the last cache mark, read from and written to the cache.
         self.anthropic_usage = {"input_tokens": 100, "cache_read_input_tokens": 700,
                                 "cache_creation_input_tokens": 200, "output_tokens": 500}
@@ -47,6 +56,21 @@ class FakeHostedApi:
             return JSONResponse({"error": {"message": "bad key"}}, status_code=401)
         return JSONResponse({"object": "list", "data": [
             {"id": m, "object": "model", **({"pricing": self.pricing[m]} if m in self.pricing else {})} for m in self.models]})
+
+    async def _credits(self, request: Request) -> Response:
+        self.seen.append({"path": request.url.path, "headers": dict(request.headers)})
+        if not self._authorised(request):
+            return JSONResponse({"error": {"code": 401, "message": "Missing Authentication header"}}, status_code=401)
+        if self.balance_status != 200:
+            return JSONResponse({"error": {"code": self.balance_status, "message": "Only management keys can perform this operation"}},
+                                status_code=self.balance_status)
+        return JSONResponse(self.credits)
+
+    async def _user_balance(self, request: Request) -> Response:
+        self.seen.append({"path": request.url.path, "headers": dict(request.headers)})
+        if not self._authorised(request):
+            return JSONResponse({"error": {"message": "Authentication Fails"}}, status_code=401)
+        return JSONResponse(self.user_balance, status_code=self.balance_status)
 
     def _next(self) -> str:
         return self.behaviour.pop(0) if len(self.behaviour) > 1 else self.behaviour[0]

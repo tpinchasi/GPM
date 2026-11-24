@@ -757,3 +757,27 @@ async def test_a_private_images_login_goes_in_vasts_own_field_and_nowhere_else()
     assert VastProvider.capabilities.private_images
     assert redacted({"image_login": "-u me -p x ghcr.io"}) == {"image_login": "[redacted]"}
     assert "not-a-real-password" not in repr(login)
+
+
+# --- the account's balance (D188) ---
+
+
+async def test_the_credit_is_read_but_not_yet_declared_the_accounts_balance():
+    """`GET /api/v0/users/current/` carries `credit` — what Vast's own CLI shows as "Credit". Its API
+    reference names only `balance`, so until a live check says what `credit` is, the plug-in does
+    not declare it the account's balance and the pool never acts on it (D188)."""
+    asked = []
+
+    def handler(request):
+        asked.append(request.url.path)
+        return httpx.Response(200, json={"id": 1, "credit": 42.17, "balance": 0.0, "email": "someone@example.com"})
+
+    status = await provider(handler).account()
+    assert status.credential_valid and status.credit_remaining == pytest.approx(42.17)
+    assert asked == ["/api/v0/users/current/"]
+    assert not VastProvider.capabilities.reports_balance
+
+
+async def test_an_answer_without_credit_leaves_the_balance_unknown():
+    status = await provider(lambda r: httpx.Response(200, json={"id": 1})).account()
+    assert status.credential_valid and status.credit_remaining is None

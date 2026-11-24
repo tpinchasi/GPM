@@ -104,6 +104,12 @@ const api = {
   extendWorkload: (name, body) => call("POST", `/pool/workloads/${encodeURIComponent(name)}/extend`, body),
   endWorkload: (name) => call("POST", `/pool/workloads/${encodeURIComponent(name)}/end`),
   rotateWorkloadKey: (name) => call("POST", `/pool/workloads/${encodeURIComponent(name)}/keys`),
+  // Named app keys for the shared pool (D193): a key shown once, only its hash kept.
+  apps: () => call("GET", "/pool/apps"),
+  createAppKey: (app) => call("POST", "/pool/apps", { app }),
+  revokeApp: (app) => call("DELETE", `/pool/apps/${encodeURIComponent(app)}`),
+  revokeAppKey: (app, keyId) => call("DELETE", `/pool/apps/${encodeURIComponent(app)}/keys/${encodeURIComponent(keyId)}`),
+  stats: (query) => call("GET", `/pool/stats?${new URLSearchParams(query)}`),
   provisioners: () => call("GET", "/pool/provisioners"),
   createProvisioner: (body) => call("POST", "/pool/provisioners", body),
   revokeProvisioner: (name, end) => call("DELETE", `/pool/provisioners/${encodeURIComponent(name)}?end_workloads=${end ? "true" : "false"}`),
@@ -125,6 +131,11 @@ const api = {
   setHostedKey: (id, credential) => call("PUT", `/pool/hosted/${encodeURIComponent(id)}/credential`, { credential }),
   removeHostedKey: (id) => call("DELETE", `/pool/hosted/${encodeURIComponent(id)}/credential`),
   setHostedBudget: (body) => call("PATCH", "/pool/hosted-budget", body),
+  // What is left in each provider account (D188): read from the provider, or typed and counted down.
+  balances: () => call("GET", "/pool/balances"),
+  readBalances: (account) => call("POST", "/pool/balances/read", account ? { account } : {}),
+  setBalance: (kind, id, usd) => call("PUT", `/pool/balances/${kind}/${encodeURIComponent(id)}`, { usd }),
+  clearBalance: (kind, id) => call("DELETE", `/pool/balances/${kind}/${encodeURIComponent(id)}`),
   // Renting, set up once an account is in (S14, D172).
   renting: () => call("GET", "/pool/renting"),
   setUpRenting: (body) => call("POST", "/pool/renting/setup", body),
@@ -840,7 +851,9 @@ function rentingSetup(view) {
   if (view.set_up) return [restart, el("div", { class: "panel" }, el("p", {}, "Renting is set up."))];
   const cur = view.current || {};
   const reach = (engine) => view.engines[engine].can.length;
-  const f = { disk: cur.min_disk_gb ?? "", hourly: cur.max_all_in_hourly ?? "",
+  // A download ceiling is proposed, not required: unset, a provider's per-GB charge for every
+  // model a machine fetches is paid at whatever it asks.
+  const f = { disk: cur.min_disk_gb ?? "", hourly: cur.max_all_in_hourly ?? "", download: cur.max_download_per_gb ?? "0.01",
     engine: cur.engine && view.engines[cur.engine] ? cur.engine : (reach("ollama") > reach("vllm") ? "ollama" : "vllm"),
     models: [...(cur.models || [])] };
   const choose = view.models_per_host === "declared" && !view.profiles;
@@ -875,6 +888,8 @@ function rentingSetup(view) {
     disk.oninput = () => { f.disk = disk.value; };
     const hourly = el("input", { id: "setup-hourly", type: "number", min: "0", step: "0.01", value: f.hourly, required: true });
     hourly.oninput = () => { f.hourly = hourly.value; };
+    const download = el("input", { id: "setup-download", type: "number", min: "0", step: "0.005", value: f.download });
+    download.oninput = () => { f.download = download.value; };
     const engine = el("select", { id: "setup-engine" }, ["vllm", "ollama"].map((e) => el("option", { value: e, selected: f.engine === e || undefined },
       `${e === "vllm" ? "vLLM" : "Ollama"} — ${reach(e)} of the pool's models`)));
     engine.onchange = () => { f.engine = engine.value; say(""); draw(); };
@@ -884,7 +899,9 @@ function rentingSetup(view) {
       if (!(Number(f.disk) >= 1)) return say("Say the disk each machine is rented with, in GB.");
       if (!(Number(f.hourly) > 0)) return say("Say the most one machine may cost an hour, all-in, in dollars.");
       if (choose && !f.models.length) return say("Tick at least one model machines are rented for.");
-      const body = { min_disk_gb: Number(f.disk), max_all_in_hourly: Number(f.hourly), engine: f.engine, ...(choose ? { models: f.models } : {}) };
+      if (f.download !== "" && !(Number(f.download) >= 0)) return say("The download ceiling is dollars per GB — or leave it empty for none.");
+      const body = { min_disk_gb: Number(f.disk), max_all_in_hourly: Number(f.hourly), engine: f.engine,
+        ...(f.download !== "" ? { max_download_per_gb: Number(f.download) } : {}), ...(choose ? { models: f.models } : {}) };
       save.disabled = true;
       try {
         const done = await withRetype((confirm) => api.setUpRenting({ ...body, ...(confirm ? { confirm } : {}) }), "Set up renting?");
@@ -901,6 +918,8 @@ function rentingSetup(view) {
         el("small", { class: "muted" }, "Enough for the models a machine holds; only machines offering this much are considered.")),
       el("div", { class: "field" }, el("label", { for: "setup-hourly" }, "The most one machine may cost an hour, all-in ($)"), hourly,
         el("small", { class: "muted" }, "No bid or rental goes above it.")),
+      el("div", { class: "field" }, el("label", { for: "setup-download" }, "The most a machine's provider may charge per GB downloaded ($)"), download,
+        el("small", { class: "muted" }, "Some providers charge for every gigabyte a machine fetches, at the machine's own price — a 20 GB model at $0.014/GB is $0.28. Leave it empty for no ceiling.")),
       el("div", { class: "field" }, el("label", { for: "setup-engine" }, "Engine on rented machines"), engine),
       modelsField(),
       problem,
@@ -1002,6 +1021,7 @@ const CAP_ICON = {
   self_terminate: '<circle cx="12" cy="13" r="7"/><path d="M12 13V9M10 3h4"/>',
   interruption_notice: '<path d="M12 4l9 16H3z"/><path d="M12 10v4M12 17v.5"/>',
   reports_charges: '<path d="M6 3h12v18l-3-2-3 2-3-2-3 2z"/><path d="M9 8h6M9 12h6"/>',
+  reports_balance: '<circle cx="12" cy="12" r="8"/><path d="M14.5 9.5c-.5-1-1.5-1.5-2.5-1.5-1.4 0-2.5.8-2.5 2s1.1 1.6 2.5 2 2.5.8 2.5 2-1.1 2-2.5 2c-1 0-2-.5-2.5-1.5M12 6.5v1.5M12 16v1.5"/>',
   volumes: '<ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v12c0 1.7 3.1 3 7 3s7-1.3 7-3V6"/>',
   copies: '<rect x="8" y="8" width="11" height="11" rx="2"/><path d="M5 15V5h10"/>',
   reports_instance_logs: '<path d="M5 5h14M5 10h14M5 15h9M5 20h6"/>',
@@ -1018,6 +1038,7 @@ const CAPABILITIES = [
   ["interruption_notice", "Interruption warning", "The provider warns before it takes a host back; the pool drains it at once."],
   ["self_terminate", "Dead-man timer", "A host ends itself if the pool goes quiet. Without it, leases here are kept short."],
   ["reports_charges", "Reports charges", "The provider says what each host cost, and spend is reconciled against it."],
+  ["reports_balance", "Reports its balance", "The provider says what is left in the account; nothing new is rented once it would not cover an hour of what runs there."],
   ["volumes", "Keeps models", "Storage that outlives a host, so a later host can take its models from it instead of downloading them."],
   ["copies", "Copies between hosts", "A new host takes its models from a sibling instead of the hub."],
   ["reports_instance_logs", "Boot logs", "A host that never answered says why."],
@@ -1107,6 +1128,68 @@ function testResults(steps) {
     el("div", {}, el("strong", {}, label[s.step] || s.step), el("div", { class: "muted" }, s.detail)))));
 }
 
+// What is left in a provider account (D188): read from the provider, typed by the operator and
+// counted down by what the pool spends there, or unknown — always said which, and as of when.
+const BALANCE_SOURCE = { provider: "reported by the provider", typed: "set" };
+const shortWhen = (ts) => new Date(ts * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+
+function balanceLine(b, name) {
+  if (!b) return el("span", { class: "muted" }, "—");
+  const button = el("button", { class: "small", onclick: () => balanceDialog(b, name) },
+    b.typed ? "Change" : "Type it");
+  const asked = b.read && b.read.detail ? el("div", { class: "warn-text small-text" }, b.read.detail) : null;
+  if (b.source === "unknown") {
+    return el("div", { class: "balance", "data-balance": b.account },
+      el("span", { class: "muted" }, b.can_read ? "not read yet" : "not known — its provider's API says none"), " ", button,
+      asked, !asked && b.note ? el("div", { class: "muted small-text" }, b.note) : null);
+  }
+  const out = b.estimate <= 0;
+  return el("div", { class: "balance", "data-balance": b.account },
+    el("span", { class: out ? "error" : "" }, `about ${dollars(b.estimate)} left`),
+    el("span", { class: "muted" }, ` — ${dollars(b.amount)} ${BALANCE_SOURCE[b.source]} on ${shortWhen(b.as_of)}, less ${dollars(b.spent_since)} spent here since`),
+    " ", button,
+    el("div", { class: "muted small-text" }, b.source === "typed"
+      ? "An estimate: what anything else spends with the same account is not counted. Type it again after topping up."
+      : "An estimate between reads: the provider is asked every 15 minutes."),
+    asked);
+}
+
+function balanceDialog(b, name) {
+  const { dialog } = providerDialog();
+  const input = el("input", { id: "balance-usd", type: "number", min: "0", step: "0.01", required: true,
+    value: b.typed ? b.typed.usd : "", "aria-describedby": "balance-usd-hint" });
+  const problem = el("p", { class: "error", role: "alert", hidden: true });
+  const form = el("form", { method: "dialog" });
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    const usd = Number(input.value);
+    if (input.value === "" || !Number.isFinite(usd) || usd < 0) { problem.textContent = "A number of dollars, 0 or more."; problem.hidden = false; return; }
+    try {
+      await api.setBalance(b.kind, b.id, usd);
+      dialog.close();
+      await refresh();
+    } catch (error) {
+      problem.textContent = error.message; problem.hidden = false;
+    }
+  };
+  const clear = b.typed ? el("button", { type: "button", onclick: async () => {
+    try { await api.clearBalance(b.kind, b.id); dialog.close(); await refresh(); } catch (error) { problem.textContent = error.message; problem.hidden = false; }
+  } }, "Clear it") : null;
+  fill(form,
+    dialogTitle(`What is left at ${name}`),
+    el("div", { class: "field" }, el("label", { for: "balance-usd" }, "Dollars left in the account now"), input,
+      el("small", { id: "balance-usd-hint", class: "muted" },
+        "As the provider's own page shows it. The pool counts it down by what it spends there from now; at $0 it stops sending there "
+        + (b.kind === "hosted" ? "(Money is back, or a new figure, sends there again)." : "and rents nothing new there; machines already running are not stopped."),
+        " Other uses of the same account are not counted: type it again after topping up.")),
+    problem,
+    el("div", { class: "row wizard-nav" }, el("button", { type: "button", onclick: () => dialog.close() }, "Cancel"), clear,
+      el("button", { class: "primary", type: "submit" }, "Save")));
+  refill(dialog, form);
+  dialog.showModal();
+  input.focus();
+}
+
 function providerCard(p, data) {
   const health = providerHealth(p);
   const c = p.credential || {};
@@ -1137,6 +1220,10 @@ function providerCard(p, data) {
       el("div", { class: "k" }, "credential"), credentialLine(p),
       el("div", { class: "k" }, "search quota"), quotaMeter(p.search_quota),
       el("div", { class: "k" }, "holding"), holdingLine(p),
+      p.balance ? el("div", { class: "k" }, "balance") : null,
+      p.balance ? balanceLine(p.balance, p.display_name || p.connection) : null,
+      p.balance_refusal ? el("div", { class: "k" }, "not renting") : null,
+      p.balance_refusal ? el("div", { class: "error" }, p.balance_refusal) : null,
       p.configured ? el("div", { class: "k" }, "model storage") : null,
       p.configured ? keepModelsControl(p) : null,
       p.search_error ? el("div", { class: "k" }, "last search") : null,
@@ -1698,6 +1785,8 @@ function hostedCard(h, data) {
       el("div", { class: "k" }, "key"), hostedKeyLine(h),
       el("div", { class: "k" }, "in flight"), el("div", {}, `at most ${h.workers} request${h.workers === 1 ? "" : "s"} at once`),
       el("div", { class: "k" }, "spent"), el("div", {}, `${money(h.spend.today)} today · ${money(h.spend.this_month)} this month`),
+      h.balance ? el("div", { class: "k" }, "balance") : null,
+      h.balance ? balanceLine(h.balance, name) : null,
       h.format === "Anthropic" ? el("div", { class: "k" }, "caching") : null,
       h.format === "Anthropic" ? el("div", {}, h.cache_prompts ? "prompts cached for 5 minutes unless a request says otherwise" : "requests sent as they came") : null,
       h.out_of_funds ? el("div", { class: "k" }, "provider said") : null,
@@ -2243,7 +2332,7 @@ const SEARCH_FIELDS = [
   ["offer_policy", "min_disk_gb", "range", "the disk each host is rented with — only machines offering this much are considered", 10, 500, 10],
   ["offer_policy", "max_all_in_hourly", "range", "the most this pool pays per host, per hour, all-in with that disk — bids and re-bids stop here", 0.05, 20, 0.05],
   ["offer_policy", "max_all_in_per_gpu", "range", "and per accelerator — a multi-GPU machine is judged by the card, not the bill", 0, 10, 0.05],
-  ["offer_policy", "max_download_per_gb", "range", "the most it will pay per GB downloaded", 0, 0.5, 0.005],
+  ["offer_policy", "max_download_per_gb", "range", "the most it will pay per GB downloaded — unset, a provider's download charge is paid whatever it is", 0, 0.5, 0.005],
   ["offer_policy", "min_download_mbps", "range", "slower than this and the model set takes too long", 0, 10000, 100],
   ["offer_policy", "min_reliability", "range", "the provider's own score, 0 to 1", 0, 1, 0.01],
   ["offer_policy", "min_driver_version", "text", "the accelerator driver this engine image needs — below it the card sits idle and the CPU serves"],
@@ -4460,7 +4549,7 @@ function copyButton(text, label = "Copy", ariaLabel = null) {
 }
 
 // Leaving the page while a key is on it loses the key for good.
-const keepKey = (e) => { if (workloadDraft.shown || programDraft.shown) { e.preventDefault(); e.returnValue = ""; } };
+const keepKey = (e) => { if (workloadDraft.shown || programDraft.shown || appKeysDraft.shown) { e.preventDefault(); e.returnValue = ""; } };
 window.addEventListener("beforeunload", keepKey);
 
 function keyPanel() {
@@ -4963,9 +5052,111 @@ screens.workloads = (status) => {
     drawWorkloadTables();
   }, 5000);
   programDraft.holder = el("div", { class: "programs" });
-  setTimeout(() => { drawWorkloadTables(); drawWorkloadForm(); drawPrograms(); }, 0);
-  return [el("h1", {}, "Workloads"), keyPanel(), holder, workloadDraft.formHolder, programDraft.holder];
+  appKeysDraft.holder = el("div", { class: "app-keys" });
+  setTimeout(() => { drawWorkloadTables(); drawWorkloadForm(); drawPrograms(); drawAppKeys(); }, 0);
+  return [el("h1", {}, "Workloads"), keyPanel(), holder, workloadDraft.formHolder, appKeysDraft.holder, programDraft.holder];
 };
+
+// --- named app keys for the shared pool (D193) ---
+//
+// Several apps may share the shared workload; each with a key of its own is counted apart on the
+// dashboards. A named key does exactly what the app key does — requests on the shared pool — and
+// reaches nothing here. Shown once when made; only its hash is kept.
+
+const appKeysDraft = { holder: null, name: "", shown: null, error: null };
+const APP_NAME = /^[a-z0-9][a-z0-9_-]{0,39}$/;
+
+function appKeyPanel(d) {
+  const shown = d.shown;
+  const c = shown.connection;
+  const heading = el("h2", { tabindex: "-1" }, `Key for ${shown.app} — give the app these`);
+  const panel = el("div", { class: "panel key-panel", "aria-live": "polite" },
+    heading,
+    el("p", {}, el("strong", {}, "The key is shown this once."),
+      " Only its hash is kept. It reaches the shared pool as the app key does, and its requests are counted under ",
+      el("strong", {}, shown.app), "."),
+    el("div", { class: "kv" },
+      el("div", { class: "k" }, "base_url"), el("div", { class: "row" }, el("code", {}, c.base_url), copyButton(c.base_url, "Copy", "Copy base URL")),
+      el("div", { class: "k" }, "api_key"),
+      el("div", { class: "row" }, el("code", { class: "secret" }, c.api_key), copyButton(c.api_key, "Copy", "Copy API key"))),
+    el("div", { class: "row" },
+      copyButton(`base_url: ${c.base_url}\napi_key: ${c.api_key}`, "Copy both for the app"),
+      el("button", { onclick: async () => {
+        if (await confirmAction({ title: "Put the key away?", body: "It will not be shown again. If it is lost, make a new key for the app.",
+          okLabel: "I have saved it" })) {
+          d.shown = null; drawAppKeys();
+        }
+      } }, "I have saved it")));
+  if (!shown.focused) { shown.focused = true; setTimeout(() => heading.focus(), 0); }
+  return panel;
+}
+
+async function makeAppKey(button, name) {
+  const d = appKeysDraft;
+  button.disabled = true;
+  d.error = null;
+  try {
+    const made = await api.createAppKey(name);
+    d.shown = { app: made.app, connection: made.connection };
+    d.name = "";
+  } catch (error) { d.error = error.message; }
+  drawAppKeys();
+}
+
+function appRow(a, d) {
+  const usable = a.keys.filter((k) => k.usable);
+  const revoke = async (e, key) => {
+    const ok = await confirmAction({
+      title: key ? `Revoke one of ${a.app}'s keys?` : `Revoke every key of ${a.app}?`, okLabel: "Revoke",
+      body: key ? `Key ${key.key_id}, made ${new Date(key.created_at * 1000).toLocaleString()}, is refused from the router's next look at the table — within seconds.`
+        : `Its ${usable.length} key${usable.length === 1 ? "" : "s"} are refused within seconds. Its stats are kept.`,
+    });
+    if (!ok) return;
+    e.target.disabled = true;
+    try { await (key ? api.revokeAppKey(a.app, key.key_id) : api.revokeApp(a.app)); } catch (error) { d.error = error.message; }
+    drawAppKeys();
+  };
+  return el("tr", {},
+    el("th", { scope: "row" }, el("strong", {}, a.app), usable.length ? null : el("div", { class: "muted" }, "revoked")),
+    el("td", {}, usable.length ? usable.map((k) => el("div", { class: "row tight-row" },
+      el("span", { class: "mono" }, k.key_id), el("span", { class: "muted" }, `made ${new Date(k.created_at * 1000).toLocaleDateString()}`),
+      usable.length > 1 ? el("button", { class: "small danger", "aria-label": `Revoke key ${k.key_id}`, onclick: (e) => revoke(e, k) }, "Revoke") : null))
+      : el("span", { class: "muted" }, "none")),
+    el("td", {}, el("div", { class: "row tight-row" },
+      el("button", { class: "small", onclick: (e) => makeAppKey(e.target, a.app) }, usable.length ? "New key" : "New key (reinstate)"),
+      el("a", { href: "#dashboards/apps" }, "Stats"),
+      usable.length ? el("button", { class: "small danger", onclick: (e) => revoke(e, null) }, "Revoke…") : null)));
+}
+
+async function drawAppKeys() {
+  const d = appKeysDraft;
+  const holder = d.holder;
+  if (!holder || !holder.isConnected) return;
+  let answer;
+  try { answer = await api.apps(); } catch (error) { refill(holder, el("p", { class: "error" }, error.message)); return; }
+  const name = el("input", { type: "text", maxlength: "40", placeholder: "e.g. support-bot", value: d.name, "aria-describedby": "app-name-hint",
+    oninput: (e) => { d.name = e.target.value; sync(); } });
+  const create = el("button", { class: "primary" }, "Make key");
+  const sync = () => {
+    const taken = answer.apps.some((a) => a.app === d.name.trim());
+    create.disabled = !APP_NAME.test(d.name.trim());
+    create.textContent = taken ? "Add a key" : "Make key";
+  };
+  create.onclick = (e) => makeAppKey(e.target, d.name.trim());
+  sync();
+  refill(holder, ...[
+    el("h2", {}, `Apps on the shared pool (${answer.apps.filter((a) => a.usable).length})`),
+    el("p", { class: "muted" }, "Each app given its own key is counted on its own on the Dashboards. A named key does exactly what the app key does — requests on the shared pool — and never reaches this console. The configured app key still works, as the unnamed app."),
+    d.error ? el("p", { class: "error", role: "status" }, d.error) : null,
+    d.shown ? appKeyPanel(d) : null,
+    answer.apps.length ? el("div", { class: "table-scroll" }, el("table", { class: "programs-table" },
+      el("thead", {}, el("tr", {}, el("th", { scope: "col" }, "App"), el("th", { scope: "col" }, "Keys"), el("th", { scope: "col" }, ""))),
+      el("tbody", {}, answer.apps.map((a) => appRow(a, d)))))
+      : el("p", { class: "muted" }, "None yet: every shared-pool request comes with the configured app key."),
+    el("div", { class: "row" }, el("label", { class: "field" }, el("span", {}, "New app"), name,
+      el("small", { id: "app-name-hint", class: "muted" }, "lower-case letters, digits, '-' and '_'")), create),
+  ].filter(Boolean));
+}
 
 // What hosted APIs and rented bursts have cost (D165, D166): today and this month, in UTC days
 // and months — the periods every budget is counted in — per workload and provider, against each
@@ -5015,6 +5206,225 @@ screens.spending = async () => {
         el("td", { class: "num" }, r.answers_today), el("td", { class: "num" }, money(r.today)),
         el("td", { class: "num" }, r.answers_this_month), el("td", { class: "num" }, money(r.this_month))))))
       : el("p", { class: "muted" }, "No hosted API has answered this month."),
+  ];
+};
+
+// --- dashboards: the stats kept (D194, D196, D197) ---
+//
+// Read from `GET /pool/stats`, which the supervisor folds from the request log and the spend
+// ledger into hourly rows. Charts are drawn here as plain SVG — no library, no other origin —
+// each with a title, a legend, a tooltip per time slot and the same numbers as a table beside it.
+
+const DASH_TABS = [
+  { id: "apps", label: "Apps", by: "app",
+    about: "Each workload, each named app key on the shared pool, and the shared pool's configured key: what it asked for, how it was answered, and what its hosted answers cost." },
+  { id: "hosts", label: "Hosts & cost", by: "host",
+    about: "Each machine and hosted API that served: requests, worker time, and what it cost — rented machines from the spend ledger, hosted APIs from each answer's own token counts." },
+  { id: "providers", label: "Providers", by: "provider",
+    about: "Your own machines, each rented provider account and each hosted API: spend over time, requests, errors, and refusals for money." },
+  { id: "models", label: "Models", by: "model",
+    about: "Each model apps asked for: requests, latency and tokens. Rented machines' cost is per machine, not per model, so it is in the totals only." },
+];
+const DASH_RANGES = [["24h", "24 h"], ["7d", "7 d"], ["30d", "30 d"]];
+const dash = { range: "24h" };
+const SERIES_SHOWN = 6;
+
+const count = (n) => (n === null || n === undefined ? "—" : Number(n).toLocaleString());
+const millis = (n) => (n === null || n === undefined ? "—" : n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)} s` : `${Math.round(n)} ms`);
+const share = (part, whole) => (whole ? `${((100 * part) / whole).toFixed(part && part < whole / 100 ? 2 : 1)}%` : "—");
+const usd = (n) => (n === null || n === undefined ? "—"
+  : Math.abs(n) >= 100 ? `$${Number(n).toFixed(0)}` : `$${Number(n).toFixed(n && Math.abs(n) < 0.1 ? 4 : 2)}`);
+
+function slotLabel(t, bucket, long = false) {
+  const d = new Date(t * 1000);
+  if (bucket === "day") return d.toLocaleDateString([], { month: "short", day: "numeric", ...(long ? { weekday: "short" } : {}) });
+  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return long || dash.range !== "24h" ? `${d.toLocaleDateString([], { weekday: "short", day: "numeric" })} ${time}` : time;
+}
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+function svg(tag, attrs = {}, ...children) {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [key, value] of Object.entries(attrs)) {
+    if (value === undefined || value === null || value === false) continue;
+    node.setAttribute(key, value);
+  }
+  return fill(node, ...children);
+}
+
+// A round number at or above the largest value, for the top of the axis.
+function niceTop(max) {
+  if (!(max > 0)) return 1;
+  const step = 10 ** Math.floor(Math.log10(max));
+  for (const m of [1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]) if (m * step >= max) return m * step;
+  return 10 * step;
+}
+
+// The few series with the most of `metric` keep a colour each; the rest fold into one "others".
+// A series' colour follows its name, not its rank, so a narrower view does not repaint it.
+function topSeries(stats, metric) {
+  const ranked = [...stats.series].filter((s) => (s.totals[metric] || 0) > 0)
+    .sort((a, b) => (b.totals[metric] || 0) - (a.totals[metric] || 0));
+  const shown = ranked.slice(0, ranked.length > SERIES_SHOWN ? SERIES_SHOWN - 1 : SERIES_SHOWN);
+  const rest = ranked.slice(shown.length);
+  const names = stats.series.map((s) => s.label).sort();
+  const lines = shown.map((s) => ({ label: s.label, slot: (names.indexOf(s.label) % 8) + 1,
+    values: s.points.map((p) => p[metric] || 0) }));
+  if (rest.length) {
+    lines.push({ label: `${rest.length} other${rest.length === 1 ? "" : "s"}`, slot: 0,
+      values: stats.buckets.map((_, i) => rest.reduce((n, s) => n + (s.points[i][metric] || 0), 0)) });
+  }
+  return lines;
+}
+
+let chartCount = 0;
+// A line chart over the time slots: one axis, from zero; a legend; a tooltip per slot naming every
+// series' value there; and a table of the same numbers, folded away beneath it.
+function lineChart({ title, stats, lines, format }) {
+  const id = `chart-${++chartCount}`;
+  const width = Math.max(280, Math.min(window.innerWidth, 1400) - 72);
+  const height = width < 520 ? 180 : 220;
+  const pad = { left: 56, right: 12, top: 12, bottom: 26 };
+  const plotW = width - pad.left - pad.right, plotH = height - pad.top - pad.bottom;
+  const n = stats.buckets.length;
+  const top = niceTop(Math.max(0, ...lines.flatMap((l) => l.values)));
+  const x = (i) => pad.left + (n <= 1 ? plotW / 2 : (i * plotW) / (n - 1));
+  const y = (v) => pad.top + plotH - (v / top) * plotH;
+  const grid = [0, 0.5, 1].map((f) => svg("g", { class: "grid" },
+    svg("line", { x1: pad.left, x2: width - pad.right, y1: y(top * f), y2: y(top * f) }),
+    svg("text", { x: pad.left - 6, y: y(top * f) + 4, "text-anchor": "end" }, format(top * f))));
+  const ticks = [...new Set([0, Math.floor((n - 1) / 2), n - 1])].filter((i) => i >= 0).map((i) =>
+    svg("text", { class: "tick", x: x(i), y: height - 8, "text-anchor": i === 0 ? "start" : i === n - 1 ? "end" : "middle" },
+      slotLabel(stats.buckets[i], stats.bucket)));
+  const paths = lines.map((line) => svg("path", {
+    class: `series s${line.slot}`,
+    d: line.values.map((v, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" "),
+  }));
+  const dots = n <= 48 ? lines.flatMap((line) => line.values.map((v, i) => (v > 0
+    ? svg("circle", { class: `dot s${line.slot}`, cx: x(i).toFixed(1), cy: y(v).toFixed(1), r: 3 }) : null))) : [];
+  const half = n <= 1 ? plotW / 2 : plotW / (n - 1) / 2;
+  const hover = stats.buckets.map((t, i) => {
+    const left = Math.max(pad.left, x(i) - half), right = Math.min(width - pad.right, x(i) + half);
+    return svg("rect", { class: "slot", x: left.toFixed(1), y: pad.top, width: Math.max(1, right - left).toFixed(1), height: plotH },
+      svg("title", {}, [slotLabel(t, stats.bucket, true), ...lines.map((l) => `${l.label}: ${format(l.values[i])}`)].join("\n")));
+  });
+  const total = lines.reduce((sum, l) => sum + l.values.reduce((a, b) => a + b, 0), 0);
+  const chart = svg("svg", { class: "chart", viewBox: `0 0 ${width} ${height}`, width: "100%", role: "img",
+    "aria-labelledby": `${id}-title ${id}-desc` },
+  svg("title", { id: `${id}-title` }, title),
+  svg("desc", { id: `${id}-desc` }, `${lines.length} series over ${n} ${stats.bucket === "day" ? "days" : "hours"}: `
+    + `${lines.map((l) => l.label).join(", ")}. The same numbers are in the table beneath.`),
+  ...grid, ...paths, ...dots, ...hover, ...ticks);
+  const legend = el("ul", { class: "legend" }, lines.map((l) =>
+    el("li", {}, el("span", { class: `swatch s${l.slot}`, "aria-hidden": "true" }), l.label)));
+  const table = el("details", { class: "chart-table" }, el("summary", {}, "As a table"),
+    el("div", { class: "table-scroll" }, el("table", {},
+      el("caption", { class: "muted" }, title),
+      el("thead", {}, el("tr", {}, el("th", { scope: "col" }, stats.bucket === "day" ? "Day" : "Hour"),
+        lines.map((l) => el("th", { class: "num", scope: "col" }, l.label)))),
+      el("tbody", {}, stats.buckets.map((t, i) => el("tr", {},
+        el("th", { scope: "row", class: "mono" }, slotLabel(t, stats.bucket, true)),
+        lines.map((l) => el("td", { class: "num" }, format(l.values[i])))))))));
+  return el("figure", { class: "panel chart-panel" },
+    el("figcaption", {}, el("h2", {}, title)),
+    total > 0 ? [chart, legend, table] : el("p", { class: "muted" }, "Nothing in this range."));
+}
+
+function tile(label, value, note) {
+  return el("div", { class: "panel tile" }, el("div", { class: "muted" }, label), el("div", { class: "stat" }, value),
+    note ? el("div", { class: "muted small-text" }, note) : null);
+}
+
+function dashTiles(stats) {
+  const t = stats.totals;
+  return el("div", { class: "tiles" },
+    tile("Requests", count(t.requests), `${count(t.ok)} answered`),
+    tile("Errors", count(t.errors), `${share(t.errors, t.requests)} · ${count(t.status_5xx)} 5xx, ${count(t.status_4xx)} 4xx`),
+    tile("Latency p95", millis(t.p95_ms), `p50 ${millis(t.p50_ms)}`),
+    tile("Tokens out", count(t.tokens_out), `${count(t.tokens_in)} in`),
+    tile("Cost", usd(t.cost_usd), `${usd(t.hosted_usd)} hosted · ${usd(t.rented_usd)} rented`));
+}
+
+const dashHours = () => ({ "24h": 24, "7d": 168, "30d": 720 }[dash.range] || 24);
+const perThousand = (cost, tokens) => (tokens > 0 && cost > 0 ? usd((1000 * cost) / tokens) : "—");
+const errorsCell = (s) => `${count(s.totals.errors)} (${share(s.totals.errors, s.totals.requests)})`;
+const DASH_COLUMNS = {
+  apps: [
+    ["App", (s) => el("span", {}, el("strong", {}, s.label), " ", el("span", { class: "muted" }, s.type || ""))],
+    ["Requests", (s) => count(s.totals.requests)], ["Errors", errorsCell],
+    ["p50", (s) => millis(s.totals.p50_ms)], ["p95", (s) => millis(s.totals.p95_ms)],
+    ["Tokens in", (s) => count(s.totals.tokens_in)], ["Tokens out", (s) => count(s.totals.tokens_out)],
+    ["Hosted cost", (s) => usd(s.totals.hosted_usd)], ["Rented cost", (s) => usd(s.totals.rented_usd)]],
+  hosts: [
+    ["Host", (s) => el("span", {}, s.key.host ? hostLink(s.key.host) : s.label, " ",
+      el("span", { class: "muted" }, [s.type, s.key.provider].filter(Boolean).join(" · ")))],
+    ["Requests", (s) => count(s.totals.requests)], ["Errors", errorsCell], ["p95", (s) => millis(s.totals.p95_ms)],
+    ["Busy worker-hours", (s) => (s.totals.busy_s / 3600).toFixed(2)], ["Tokens out", (s) => count(s.totals.tokens_out)],
+    ["Cost", (s) => usd(s.totals.cost_usd)], ["Per hour", (s) => usd(s.totals.cost_usd / dashHours())],
+    ["Per 1k tokens out", (s) => perThousand(s.totals.cost_usd, s.totals.tokens_out)],
+    ["Per request", (s) => (s.totals.requests && s.totals.cost_usd ? usd(s.totals.cost_usd / s.totals.requests) : "—")]],
+  providers: [
+    ["Provider", (s) => s.label], ["Requests", (s) => count(s.totals.requests)], ["Errors", errorsCell],
+    ["Refused for money", (s) => (s.totals.out_of_funds ? el("span", { class: "warn-text" }, count(s.totals.out_of_funds)) : "0")],
+    ["p95", (s) => millis(s.totals.p95_ms)], ["Hosted", (s) => usd(s.totals.hosted_usd)], ["Rented", (s) => usd(s.totals.rented_usd)],
+    ["Per 1k tokens out", (s) => perThousand(s.totals.cost_usd, s.totals.tokens_out)]],
+  models: [
+    ["Model", (s) => el("span", { class: "mono" }, s.label)], ["Requests", (s) => count(s.totals.requests)], ["Errors", errorsCell],
+    ["p50", (s) => millis(s.totals.p50_ms)], ["p95", (s) => millis(s.totals.p95_ms)],
+    ["Tokens in", (s) => count(s.totals.tokens_in)], ["Tokens out", (s) => count(s.totals.tokens_out)],
+    ["Hosted cost", (s) => usd(s.totals.hosted_usd)]],
+};
+
+function dashTable(tab, stats) {
+  const columns = DASH_COLUMNS[tab];
+  if (!stats.series.length) return el("p", { class: "muted" }, "Nothing was asked of the pool in this range.");
+  return el("div", { class: "table-scroll" }, el("table", { class: "dash-table" },
+    el("thead", {}, el("tr", {}, columns.map(([h], i) => el("th", { scope: "col", ...(i ? { class: "num" } : {}) }, h)))),
+    el("tbody", {}, stats.series.map((s) => el("tr", {}, columns.map(([, cell], i) =>
+      el(i ? "td" : "th", i ? { class: "num" } : { scope: "row" }, cell(s))))))));
+}
+
+function dashCharts(tab, stats) {
+  const per = stats.bucket === "day" ? "day" : "hour";
+  const chart = (title, metric, format) => lineChart({ title, stats, lines: topSeries(stats, metric), format });
+  if (tab === "apps") {
+    return [chart(`Requests per ${per}, by app`, "requests", count), chart(`Errors per ${per}, by app`, "errors", count),
+      chart(`Cost per ${per}, by app`, "cost_usd", usd)];
+  }
+  if (tab === "hosts") return [chart(`Cost per ${per}, by host`, "cost_usd", usd), chart(`Requests per ${per}, by host`, "requests", count)];
+  if (tab === "providers") {
+    return [chart(`Spend per ${per}, by provider`, "cost_usd", usd), chart(`Requests per ${per}, by provider`, "requests", count),
+      chart(`Refused for money, per ${per}`, "out_of_funds", count)];
+  }
+  return [chart(`Requests per ${per}, by model`, "requests", count), chart(`p95 latency per ${per}, by model`, "p95_ms", millis)];
+}
+
+screens.dashboards = async () => {
+  const tab = DASH_TABS.find((t) => t.id === (state.sub || "apps")) || DASH_TABS[0];
+  const range = dash.range;
+  const stats = await api.stats({ range, bucket: range === "30d" ? "day" : "hour", by: tab.by });
+  const each = { apps: "Each app", hosts: "Each host", providers: "Each provider", models: "Each model" }[tab.id];
+  return [
+    el("h1", {}, "Dashboards"),
+    el("nav", { class: "tabs", "aria-label": "Dashboards" }, DASH_TABS.map((t) => el("a", {
+      href: `#dashboards/${t.id}`, ...(t.id === tab.id ? { class: "active", "aria-current": "page" } : {}) }, t.label))),
+    el("p", { class: "muted tab-about" }, tab.about),
+    el("div", { class: "row chips", role: "group", "aria-label": "Range" },
+      DASH_RANGES.map(([value, label]) => el("button", {
+        class: `chip ${value === range ? "on" : ""}`, "aria-pressed": value === range ? "true" : "false",
+        onclick: () => { dash.range = value; render(); } }, label)),
+      el("button", { class: "small", onclick: () => render() }, "Refresh"),
+      el("span", { class: "muted small-text" }, stats.folded_to ? `counted up to ${clock(stats.folded_to)}` : "nothing counted yet")),
+    dashTiles(stats),
+    el("div", { class: "charts" }, dashCharts(tab.id, stats)),
+    el("h2", {}, each),
+    dashTable(tab.id, stats),
+    stats.notes.length ? el("ul", { class: "muted small-text" }, stats.notes.map((n) => el("li", {}, n))) : null,
+    el("p", { class: "muted small-text" },
+      `Kept: each request ${stats.retention.keep_requests_days ?? "for ever"} days, the hourly stats `
+      + `${stats.retention.keep_rollups_days ?? "for ever"} days (stats in the configuration). Latency percentiles are read from `
+      + "fixed buckets, so each is within its bucket's width of the true value. Rented cost is the higher of the pool's estimate "
+      + "and the provider's figure, as caps count it. Named app keys are made on the Workloads screen."),
   ];
 };
 
@@ -5185,7 +5595,7 @@ async function render() {
 function operatorIsBusy() {
   const active = document.activeElement;
   return Boolean(
-    workloadDraft.shown || programDraft.shown || document.querySelector("dialog[open]")
+    workloadDraft.shown || programDraft.shown || appKeysDraft.shown || document.querySelector("dialog[open]")
     || (active && ["INPUT", "TEXTAREA", "SELECT"].includes(active.tagName))
     || workloadDraft.plan || (workloadDraft.name || "").trim() || programDraft.open);
 }

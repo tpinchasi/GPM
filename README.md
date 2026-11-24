@@ -25,8 +25,8 @@ environment of their own:
 
 ```sh
 python3 -m venv ~/gpm && ~/gpm/bin/pip install \
-  https://github.com/tpinchasi/GPM/releases/download/v0.44.0/gpm_server-0.44.0-py3-none-any.whl \
-  https://github.com/tpinchasi/GPM/releases/download/v0.44.0/gpm_agent-0.18.1-py3-none-any.whl
+  https://github.com/tpinchasi/GPM/releases/download/v0.45.0/gpm_server-0.45.0-py3-none-any.whl \
+  https://github.com/tpinchasi/GPM/releases/download/v0.45.0/gpm_agent-0.19.0-py3-none-any.whl
 ~/gpm/bin/gpm --version
 ```
 
@@ -42,7 +42,7 @@ uv run gpm --help
 **An app only needs the client**, which depends on `httpx` and nothing else:
 
 ```sh
-pip install "gpm-client @ https://github.com/tpinchasi/GPM/releases/download/v0.44.0/gpm_client-0.9.0-py3-none-any.whl"
+pip install "gpm-client @ https://github.com/tpinchasi/GPM/releases/download/v0.45.0/gpm_client-0.9.0-py3-none-any.whl"
 ```
 
 Step by step, from nothing to a working pool: [docs/quickstart.md](docs/quickstart.md).
@@ -126,8 +126,8 @@ everything it does is also a CLI verb — `gpm lease`, `gpm host`, `gpm workload
 then point `current` at it:
 
 ```sh
-deploy/gpm-deploy v0.44.0               # build it: git archive of the tag, its own venv
-deploy/gpm-deploy v0.44.0 --activate    # and make it current
+deploy/gpm-deploy v0.45.0               # build it: git archive of the tag, its own venv
+deploy/gpm-deploy v0.45.0 --activate    # and make it current
 ~/.local/share/gpm/releases/current/venv/bin/gpm --version
 ```
 
@@ -260,6 +260,5 @@ adopter.
 | [docs/decisions.md](docs/decisions.md) | Every decision, numbered: what, why, what was rejected; verified facts and unverified assumptions |
 | [docs/threat-model.md](docs/threat-model.md) | Assets, actors, threats with mitigations and residual risk, deliberate non-goals |
 | [docs/release-checklist.md](docs/release-checklist.md) | What must be true before the first public commit, and at every release |
-| [docs/architecture-review.md](docs/architecture-review.md) | The critical review of the original single-file design; every finding carries its decision |
-| [docs/adopters/aletheia/](docs/adopters/aletheia/README.md) | First adopter guide — **adopter-internal, see the note in STATUS.md before publishing** |
-| [docs/archive/](docs/archive/design-2026-09-17-pre-split.md) | The pre-split single-file design, kept only so the review's section references resolve — **adopter-internal** |
+| [docs/build-or-adopt.md](docs/build-or-adopt.md) | The comparison with existing routers and orchestrators that GPM was built on (D25) |
+| [docs/adopters/](docs/adopters/README.md) | Writing an adopter guide — kept in the adopter's own repository |

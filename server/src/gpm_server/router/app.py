@@ -41,6 +41,7 @@ from ..engines import (
     rewrite_of,
 )
 from ..engines.anthropic import AnthropicHostedEngine
+from ..engines.thinking import says_thinking, with_thinking
 from ..keys import match, verify
 from ..models import HostState
 from ..provisioning_store import HashTaken
@@ -108,12 +109,24 @@ _READ_OFF_LOOP_BYTES = 1_000_000
 
 @dataclasses.dataclass(frozen=True)
 class Identity:
-    """Who a request is from, as its key says (D115, D117): the shared workload (an app key), one
-    workload (its `gpmw_` key), or a program's provisioning key (`gpmp_`), which asks for
-    workloads and never for a completion."""
+    """Who a request is from, as its key says (D115, D117, D193): the shared workload (an app key —
+    the configured one, or a named one, whose app is `app`), one workload (its `gpmw_` key), or a
+    program's provisioning key (`gpmp_`), which asks for workloads and never for a completion."""
 
     workload: Optional[str] = None
     provisioner: Optional[str] = None
+    #: The app a named app key was made for (D193); None for the configured app key.
+    app: Optional[str] = None
+
+
+def _prepared(engine: Any, path: str, content_type: str, body: bytes, tag: str,
+              thinking: Optional[str]) -> tuple[str, bytes]:
+    """The body as the host gets it: its model named, and the build's thinking default added
+    where the request says nothing of its own (D187)."""
+    content_type, body = rewrite_of(engine, path, content_type, body, tag)
+    if thinking is not None:
+        body = with_thinking(getattr(engine, "name", ""), path, body, thinking)
+    return content_type, body
 
 
 def _identity(state: RouterState, request: Request) -> Optional[Identity]:
@@ -128,6 +141,10 @@ def _identity(state: RouterState, request: Request) -> Optional[Identity]:
             return None
     if verify(token, state.app_hashes):
         return Identity()
+    # A named app key (D193): the shared workload's, exactly as the app key is, with a name.
+    app = match(token, state.registry.app_keys)
+    if app is not None:
+        return Identity(app=app)
     now = time.time()
     reach = match(token, state.registry.provisioners)
     if reach is not None:
@@ -994,6 +1011,7 @@ def create_app(
                     session_id=session_id,
                     model_requested=requested,
                     workload=who.workload,
+                    app=who.app,
                     kind=facts.kind,
                     request_bytes=len(body),
                     **fields,  # type: ignore[arg-type]
@@ -1202,11 +1220,14 @@ def create_app(
                     return _error(400, "bad_request", "unsupported_feature",
                                   f"the request could not be carried to the other API format: {exc}")
                 send_path, send_type = translation.target_path, "application/json"
-            rewrite = (host_engine, send_path, send_type, send_body, assignment.variant.tag)
+            thinking = state.thinking_of(assignment.variant.tag)
+            if thinking is not None and translation is not None and says_thinking(path, body):
+                thinking = None  # the app said, in the format it sent; a dropped field still counts
+            rewrite = (host_engine, send_path, send_type, send_body, assignment.variant.tag, thinking)
             if len(send_body) > _READ_OFF_LOOP_BYTES:
-                forwarded_type, forwarded = await asyncio.to_thread(rewrite_of, *rewrite)
+                forwarded_type, forwarded = await asyncio.to_thread(_prepared, *rewrite)
             else:
-                forwarded_type, forwarded = rewrite_of(*rewrite)
+                forwarded_type, forwarded = _prepared(*rewrite)
             hosted = assignment.host.hosted
             app_asked_usage = True
             upstream_path = send_path
@@ -1293,6 +1314,7 @@ def create_app(
                     else:
                         host.out_of_funds = said[:300].decode("utf-8", "replace")
                         host.out_of_funds_at = time.time()
+                        host.out_of_funds_by_balance = False  # the provider's own word now (D188)
                         log.warning("hosted API %s is out of money: %s", host.host_id, host.out_of_funds)
                     await free(assignment, cost=0.0)
                     if meaning == "out_of_funds":

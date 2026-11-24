@@ -45,6 +45,9 @@ class SupervisorChild:
         self.child: Optional[subprocess.Popen] = None
         self.restarts = 0
         self._stopping = threading.Event()
+        #: Held while a child is started and while stop() reads which one to stop, so a restart
+        #: that was about to happen as the router stopped cannot start one nobody stops.
+        self._spawning = threading.Lock()
         self._log_path: Optional[pathlib.Path] = None
         self._thread = threading.Thread(target=self._keep, name="gpm:supervisor-child", daemon=True)
 
@@ -63,7 +66,8 @@ class SupervisorChild:
             output = {"stdout": open(self._log_path, "ab"), "stderr": subprocess.STDOUT}
         try:
             return subprocess.Popen(
-                pool_command("supervise", "-c", self.config_path, "--log-level", self.log_level),
+                pool_command("supervise", "-c", self.config_path, "--log-level", self.log_level,
+                             "--exit-with", str(os.getpid())),
                 stdin=subprocess.DEVNULL, **output, **windowless(),
             )
         finally:
@@ -89,17 +93,21 @@ class SupervisorChild:
             if self._stopping.wait(delay):
                 return
             delay = min(delay * 2, RESTART_MOST_S)
-            try:
-                self.child = self._spawn()
-                self.restarts += 1
-            except OSError as exc:
-                log.error("the supervisor could not be started again: %s", exc)
-                self.child = None
+            with self._spawning:
+                if self._stopping.is_set():
+                    return
+                try:
+                    self.child = self._spawn()
+                    self.restarts += 1
+                except OSError as exc:
+                    log.error("the supervisor could not be started again: %s", exc)
+                    self.child = None
 
     def stop(self, timeout: float = 10.0) -> None:
         """Stop it for good — the router is going — and never start it again."""
-        self._stopping.set()
-        child = self.child
+        with self._spawning:
+            self._stopping.set()
+            child = self.child
         if child is None or child.poll() is not None:
             return
         child.terminate()
@@ -158,13 +166,91 @@ def _serve(args: argparse.Namespace) -> int:
     if not args.router_only:
         child = _supervisor_child(config, args.config, args.log_level)
 
-    try:
+    def serve() -> None:
         app = create_app(config, config_path=args.config)
         uvicorn.run(app, **listener_options(config), log_level=args.log_level)
+
+    if child is None:
+        serve()
+        return 0
+    return _run_then_stop(serve, child.stop)
+
+
+class _Terminated(BaseException):
+    """SIGTERM, raised where it arrived so that what runs after it can run."""
+
+
+def _run_then_stop(run: Any, stop: Any) -> int:
+    """Run `run`, then `stop` — the supervisor — however `run` ends, SIGTERM included.
+
+    uvicorn takes SIGTERM while it serves, shuts down, puts back the handler it found and raises
+    the signal again. Python's default handler then ended the process on the spot, `finally` and
+    all, and the supervisor it started ran on alone, holding the pool's lock, until someone found
+    it. A handler of our own is the one put back: it raises, `stop` runs, and the process then
+    ends by SIGTERM as before — so a service manager reads a stop, not a failure."""
+    import signal
+
+    def leave(signum: int, frame: Any) -> None:
+        raise _Terminated()
+
+    try:
+        signal.signal(signal.SIGTERM, leave)
+    except (ValueError, OSError):  # not the main thread (a test's server), or no such signal
+        pass
+    terminated = False
+    try:
+        run()
+    except _Terminated:
+        terminated = True
     finally:
-        if child is not None:
-            child.stop()
+        stop()
+    if terminated:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.raise_signal(signal.SIGTERM)
     return 0
+
+
+async def _exit_with(pid: int, task: "asyncio.Task[Any]", every_s: float = 2.0) -> None:
+    """Cancel the supervisor once the `gpm serve` that started it is gone.
+
+    A router killed outright (SIGKILL, the OOM killer, a closed terminal's whole group) runs no
+    `finally`, and nothing else would stop its supervisor. On POSIX an orphan is handed to
+    another parent, so a parent id that is no longer `pid` says it. Windows keeps the first
+    parent's id, and may give it to another process: there a handle to the router is opened
+    once, at the start, and asked whether that process — not that number — still runs."""
+    alive = _parent_watch(pid)
+    while True:
+        await asyncio.sleep(every_s)
+        if not alive():
+            logging.getLogger("gpm").error(
+                "the pool's router (pid %s) is gone; the supervisor it started stops too.", pid)
+            task.cancel()
+            return
+
+
+def _parent_watch(pid: int) -> Any:
+    """A check, made once, of whether the process `pid` named at the start still runs."""
+    if os.name != "nt":
+        return lambda: _parent_alive(pid)
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    # SYNCHRONIZE: held for the supervisor's life, so the id cannot be given to another process
+    # while it is watched.
+    handle = kernel32.OpenProcess(0x00100000, False, pid)
+    if not handle:
+        return lambda: False
+    return lambda: kernel32.WaitForSingleObject(handle, 0) == 0x00000102  # WAIT_TIMEOUT: still running
+
+
+def _parent_alive(pid: int) -> bool:
+    """POSIX: is `pid` still this process's parent?"""
+    return os.getppid() == pid
 
 
 def _supervise(args: argparse.Namespace) -> int:
@@ -197,7 +283,14 @@ def _supervise(args: argparse.Namespace) -> int:
                 # stops this process outright (TerminateProcess), and Ctrl-C still raises
                 # KeyboardInterrupt, which ends `asyncio.run` with its cleanup.
                 break
-        await run(config, database, config_path=args.config)
+        watch = None
+        if getattr(args, "exit_with", 0) and task is not None:
+            watch = asyncio.ensure_future(_exit_with(args.exit_with, task))
+        try:
+            await run(config, database, config_path=args.config)
+        finally:
+            if watch is not None:
+                watch.cancel()
 
     try:
         asyncio.run(supervised())
@@ -330,6 +423,25 @@ def _lease(args: argparse.Namespace) -> int:
         ) if v is not None}
         return _control(args, "PATCH", f"/pool/leases/{args.lease_id}", {**body, "confirm": args.confirm})
     return _control(args, "GET", "/pool/leases")
+
+
+def _balance(args: argparse.Namespace) -> int:
+    """What is left in each provider account (D188): list, ask the providers now, type one, clear it."""
+    if args.action == "list":
+        return _control(args, "GET", "/pool/balances")
+    if args.action == "read":
+        return _control(args, "POST", "/pool/balances/read", {"account": args.account} if args.account else {})
+    kind, _, ident = (args.account or "").partition(":")
+    if kind not in ("hosted", "rented") or not ident:
+        print("name the account as hosted:<host id> or rented:<connection>", file=sys.stderr)
+        return 2
+    path = f"/pool/balances/{kind}/{ident}"
+    if args.action == "clear":
+        return _control(args, "DELETE", path)
+    if args.usd is None:
+        print("set: give the dollars left with --usd", file=sys.stderr)
+        return 2
+    return _control(args, "PUT", path, {"usd": args.usd})
 
 
 def _control_json(args: argparse.Namespace, method: str, path: str, body: Optional[dict] = None) -> tuple[int, Any]:
@@ -534,6 +646,41 @@ def _provisioner(args: argparse.Namespace) -> int:
     return 2
 
 
+def _app(args: argparse.Namespace) -> int:
+    """Named app keys for the shared pool (D193): each app on it shown apart in the stats."""
+    from urllib.parse import quote
+
+    if args.action == "create":
+        if not args.name:
+            print("name the app: gpm app create <name>", file=sys.stderr)
+            return 2
+        status, answer = _control_json(args, "POST", "/pool/apps", {"app": args.name})
+        if status != 201:
+            print(answer.get("detail") or json.dumps(answer), file=sys.stderr)
+            return 1
+        print(f"{answer['key']['key_id']}  app {answer['app']}")
+        print(answer["connection"]["api_key"])
+        print("\nThis is the only time the key is shown: only its hash is stored. It reaches the shared pool "
+              "as the app key does, and its requests are counted under this app.", file=sys.stderr)
+        return 0
+    if args.action == "list":
+        return _control(args, "GET", "/pool/apps")
+    if args.action == "revoke":
+        if not args.name:
+            print("name the app: gpm app revoke <name> [--key-id ID]", file=sys.stderr)
+            return 2
+        path = f"/pool/apps/{quote(args.name, safe='')}" + (f"/keys/{quote(args.key_id, safe='')}" if args.key_id else "")
+        return _control(args, "DELETE", path)
+    return 2
+
+
+def _stats(args: argparse.Namespace) -> int:
+    from urllib.parse import urlencode
+
+    query = urlencode({k: v for k, v in (("range", args.range), ("by", args.by), ("bucket", args.bucket)) if v})
+    return _control(args, "GET", f"/pool/stats?{query}")
+
+
 def _ca(args: argparse.Namespace) -> int:
     from .certs import make_ca
 
@@ -686,6 +833,8 @@ def main(argv: list[str] | None = None) -> int:
     supervise = subparsers.add_parser("supervise", help="run the supervisor alone")
     supervise.add_argument("--config", "-c", default="pool.yaml")
     supervise.add_argument("--log-level", default="info")
+    supervise.add_argument("--exit-with", type=int, default=0, metavar="PID",
+                           help=argparse.SUPPRESS)  # `gpm serve`'s own pid: stop once it is gone
     supervise.set_defaults(func=_supervise)
 
     forwarder = subparsers.add_parser(
@@ -783,6 +932,22 @@ def main(argv: list[str] | None = None) -> int:
     provisioner.add_argument("--url", default=None)
     provisioner.set_defaults(func=_provisioner)
 
+    app_cmd = subparsers.add_parser(
+        "app", help="named app keys for the shared pool: each app counted on its own (D193)"
+    )
+    app_cmd.add_argument("action", choices=["create", "list", "revoke"])
+    app_cmd.add_argument("name", nargs="?", default=None)
+    app_cmd.add_argument("--key-id", default=None, help="for revoke: that one key, not all of the app's")
+    app_cmd.add_argument("--url", default=None)
+    app_cmd.set_defaults(func=_app)
+
+    stats_cmd = subparsers.add_parser("stats", help="requests, errors, latency, tokens and cost over a range (D196)")
+    stats_cmd.add_argument("--range", default="24h", help="24h, 7d, 30d …")
+    stats_cmd.add_argument("--by", choices=["app", "model", "host", "provider", "kind"], default=None)
+    stats_cmd.add_argument("--bucket", choices=["hour", "day"], default=None)
+    stats_cmd.add_argument("--url", default=None)
+    stats_cmd.set_defaults(func=_stats)
+
     ca = subparsers.add_parser("ca", help="make the pool's client CA, for workloads' client certificates (D117)")
     ca.add_argument("action", choices=["create"])
     ca.add_argument("--dir", default="~/.config/gpm/ca")
@@ -848,6 +1013,15 @@ def main(argv: list[str] | None = None) -> int:
     spending = subparsers.add_parser("spending", help="what hosted APIs and rented bursts cost, today and this month")
     spending.add_argument("--url", default=None)
     spending.set_defaults(func=lambda a: _control(a, "GET", "/pool/spending"))
+
+    balance = subparsers.add_parser(
+        "balance", help="what is left in each provider account: read from the provider, typed, or unknown (D188)")
+    balance.add_argument("action", nargs="?", default="list", choices=["list", "read", "set", "clear"],
+                         help="list; read: ask the providers now; set: type what is left now; clear: forget it")
+    balance.add_argument("account", nargs="?", default=None, help="hosted:<host id> or rented:<connection>")
+    balance.add_argument("--usd", type=float, default=None, help="set: the dollars left in the account now")
+    balance.add_argument("--url", default=None)
+    balance.set_defaults(func=_balance)
 
     account = subparsers.add_parser("account", help="is the provider credential valid; spends nothing")
     account.add_argument("--url", default=None)

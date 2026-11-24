@@ -211,6 +211,10 @@ class Supervisor:
         from .connections import ProviderAccounts
 
         self.accounts = ProviderAccounts(self)
+        #: What is left in each provider account, read or typed, counted down (D188).
+        from .balances import Balances
+
+        self.balances = Balances(self)
         #: Why renting added to the file while the pool ran could not start, or None (D173).
         self.renting_problem: Optional[str] = None
         if config.rented is not None:
@@ -243,6 +247,13 @@ class Supervisor:
         self._send_after: dict[tuple[str, str], tuple[float, float, str]] = {}
         #: How the model hub is reached for relayed uploads (D182) — only ever replaced by a test.
         self._hub_transport: Optional[httpx.AsyncBaseTransport] = None
+        #: Stats kept, and the raw logs pruned (D194, D195): folded here, never in the router — on
+        #: a connection of their own, so a long read in their thread never holds the one the passes
+        #: and the control API use.
+        from ..stats import Stats
+
+        self.stats = Stats(Database(database.path), lambda: self.config)
+        self._stats_task: Optional[asyncio.Task] = None
 
     def _build_fleet(self, config: PoolConfig, given: Optional[dict] = None) -> None:
         """The rented half of the pool, from the file's `rented` section: one plug-in per
@@ -396,6 +407,19 @@ class Supervisor:
         await self.pass_once()
         if self.config.provisioning.enabled and self._request_watcher is None:
             self._request_watcher = asyncio.create_task(self._watch_requests(), name="gpm:provisioning")
+        if self._stats_task is None:
+            self._stats_task = asyncio.create_task(self._keep_stats(), name="gpm:stats")
+
+    async def _keep_stats(self) -> None:
+        """Fold the request log and the spend ledger into the hourly stats, and prune what retention
+        lets go (D194, D195): in a thread, beside the passes and never inside one — the pass lock is
+        not taken, as nothing here decides anything. A failure is logged and tried again next time."""
+        while not self._stopping:
+            try:
+                await asyncio.to_thread(self.stats.run_once)
+            except Exception:  # noqa: BLE001 - stats are never worth stopping the supervisor for
+                log.exception("keeping the stats failed; tried again next time")
+            await asyncio.sleep(self.config.stats.rollup_interval_s)
 
     async def _watch_requests(self) -> None:
         """Answer programs' requests within a second or so, rather than a pass (D117): a cheap
@@ -529,7 +553,13 @@ class Supervisor:
         self._stopping = True
         if self._request_watcher is not None:
             self._request_watcher.cancel()
+        if self._stats_task is not None:
+            self._stats_task.cancel()
+            with contextlib.suppress(BaseException):
+                await self._stats_task
+        self.stats.db.close()
         await self.directory.aclose()
+        await self.balances.aclose()
         for host in self.hosts.values():
             # Detached, not stopped: with the forwarder (D110) the forwards outlive this
             # process, and the next supervisor finds them on the same ports.
@@ -604,6 +634,12 @@ class Supervisor:
             # are enforced and hosts are torn down below (the security review's finding).
             log.exception("probing rented hosts failed; the pass goes on")
         self._publish_all()
+        try:
+            # After the publish, so a hosted API it would take out is in the table; before renting,
+            # so an account that would not cover a machine rents none this pass (D188).
+            await self.balances.pass_once()
+        except Exception:  # noqa: BLE001 - a balance must never stop the pass that enforces leases
+            log.exception("counting provider balances failed; the pass goes on")
 
         if self.fleet is not None and not self._adoption_pending:
             active = await self.workloads.advance()
@@ -1520,6 +1556,8 @@ class Supervisor:
                     await self._bring_up_through_its_agent(host_id, host, client)
                 else:
                     host.mark_preparing()
+                    # Servers per card whose router is not running are started again (D190).
+                    self.fleet.recover_per_card(host)
                 continue
 
             if host.agent is None:
@@ -1628,6 +1666,9 @@ class Supervisor:
         try:
             if await self.fleet.models_from_sibling_pending(host):
                 return  # a copy from a sibling is still coming (D116); the next pass looks again
+            # An Ollama host with several cards runs a server on each once its agent's launcher
+            # is there (D190): started again so, before anything is pulled — once.
+            await self.fleet.start_per_card(host)
             # A host with an agent is fetched by its agent: one pull at a time, each model
             # loaded as its own download finishes (D57). Without one, the pool does it the way
             # it always has, over the engine's own API.

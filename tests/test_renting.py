@@ -1207,3 +1207,103 @@ def test_a_provider_without_its_own_words_is_heard_through_its_detail():
 
     assert provider_words(InstanceStatus(state="stopped", detail="status EXITED")) == "status EXITED"
     assert provider_words(InstanceStatus(state="stopped")) is None
+
+
+# --- what is left of September's three renting fixes (2026-11-24) ---
+
+
+async def test_a_refusal_that_says_gone_keeps_the_providers_answer_and_a_machine_it_made_is_avoided(fleet):
+    """RunPod's and Verda's refusals carried the provider's words in the summary only; and a
+    create refused as "gone" that had made an instance anyway (the D43 pattern) was destroyed but
+    its machine bid on again at once."""
+    from gpm_server.providers.base import OfferGone
+
+    made = fleet.provider.create
+
+    async def refuses_but_makes(offer, spec, bid, **kwargs):
+        await made(offer, spec, bid, **kwargs)
+        raise OfferGone("no capacity now", response={"error": "no capacity", "api_key": "abc"})
+
+    fleet.provider.create = refuses_but_makes
+    open_lease(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    failed = [e for e in fleet.events.recent() if e["kind"] == "bid_failed"]
+    assert failed and failed[0]["numbers"]["provider_response"] == {"error": "no capacity", "api_key": "[redacted]"}
+    assert "bid_left_an_instance" in kinds(fleet)
+    assert not [i for i in fleet.provider.instances.values() if i.state != "destroyed"], "nothing left billing"
+    machine = default_offer().machine_id
+    assert "made an instance" in fleet.avoided_now().get(machine, "")
+
+
+async def test_a_lost_bids_avoid_outlives_a_restart(fleet, tmp_path):
+    """Lost-bid avoids were kept in memory only: a supervisor restarted within the half hour bid
+    on the same machine again — the burst D124 was written to stop."""
+    from gpm_server.providers.base import BidLost
+
+    async def loses(offer, spec, bid, **kwargs):
+        raise BidLost("did not win", response={"success": False})
+
+    fleet.provider.create = loses
+    open_lease(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    machine = default_offer().machine_id
+    assert machine in fleet.avoided_now()
+
+    database = Database(tmp_path / "gpm.sqlite3")
+    try:
+        config = make_config()
+        again = Fleet(config, config.rented, FakeProvider(), LeaseStore(database), EventLog(database), SpendLedger(database))
+        assert "lost" in again.avoided_now().get(machine, ""), "read back after the restart"
+    finally:
+        database.close()
+
+
+def test_a_providers_answer_is_kept_as_data_without_its_credential():
+    from gpm_server.providers.base import answer_of
+
+    class Answer:
+        text = "plain words with fake-cred in them"
+
+        def json(self):
+            raise ValueError("not JSON")
+
+    class Json:
+        def json(self):
+            return {"error": "echoed fake-cred", "list": ["fake-cred"]}
+
+    quiet = lambda text: text.replace("fake-cred", "[credential]")  # noqa: E731
+    assert answer_of(Answer(), quiet) == "plain words with [credential] in them"
+    assert answer_of(Json(), quiet) == {"error": "echoed [credential]", "list": ["[credential]"]}
+
+
+async def test_a_class_of_machine_is_not_avoided_for_one_refused_create(fleet):
+    """Where an id names a GPU class in a cloud, avoiding it would bar the whole class."""
+    import dataclasses as dc
+
+    from gpm_server.providers.base import OfferGone
+
+    fleet.provider.capabilities = dc.replace(fleet.provider.capabilities, machine_ids_are_machines=False)
+    made = fleet.provider.create
+
+    async def refuses_but_makes(offer, spec, bid, **kwargs):
+        await made(offer, spec, bid, **kwargs)
+        raise OfferGone("landed elsewhere")
+
+    fleet.provider.create = refuses_but_makes
+    open_lease(fleet)
+    await fleet.pass_once(ready_workers_higher_tiers=0, idle_seconds={})
+    assert "bid_left_an_instance" in kinds(fleet)
+    assert default_offer().machine_id not in fleet.avoided
+
+
+def test_a_credential_across_the_cut_is_still_taken_out():
+    from gpm_server.providers.base import answer_of
+
+    class Answer:
+        text = "x" * 1020 + "fake-cred-value" + "y" * 50
+
+        def json(self):
+            raise ValueError("not JSON")
+
+    kept = answer_of(Answer(), lambda text: text.replace("fake-cred-value", "[credential]"))
+    assert "fake" not in kept and len(kept) == 1024

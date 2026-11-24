@@ -6,7 +6,7 @@ the environment and waits for capacity like every `gpm-client` call. The ones bu
 in each response's `X-GPM-*` headers.
 
 ```sh
-pip install "gpm-client @ https://github.com/tpinchasi/GPM/releases/download/v0.44.0/gpm_client-0.9.0-py3-none-any.whl"
+pip install "gpm-client @ https://github.com/tpinchasi/GPM/releases/download/v0.45.0/gpm_client-0.9.0-py3-none-any.whl"
 export GPM_URL=http://127.0.0.1:8080  # the pool's root
 export GPM_API_KEY=gpma_your_app_key  # an app key from the pool's operator — never an admin key
 ```

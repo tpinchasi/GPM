@@ -31,7 +31,39 @@ class ProviderUnavailable(ProviderError):
 
 
 class OfferGone(ProviderError):
-    """The offer disappeared between search and create — normal in a live market."""
+    """The offer disappeared between search and create — normal in a live market.
+
+    `response` is the provider's own answer where it gave one (its credential taken out by the
+    plug-in, credential-named fields redacted by the pool before it is written down), so a refusal
+    is read later in its own terms, as a lost bid's is.
+    """
+
+    def __init__(self, message: str, response: Any = None):
+        super().__init__(message)
+        self.response = response
+
+
+def answer_of(response: Any, quiet: Any = None) -> Any:
+    """A provider's answer as data to keep beside a refusal: its JSON where it is JSON, else its
+    first kilobyte of text — every string passed through `quiet`, the plug-in's own removal of
+    its credential, should the answer echo it."""
+    try:
+        data: Any = response.json()
+    except Exception:  # noqa: BLE001 — not JSON: kept as the text it was, its first kilobyte
+        text = getattr(response, "text", "") or ""
+        # Quieted whole, then cut: a credential echoed across the cut would keep its first part.
+        return (quiet(text) if quiet is not None else text)[:1024]
+
+    def clean(value: Any) -> Any:
+        if isinstance(value, str):
+            return quiet(value) if quiet is not None else value
+        if isinstance(value, dict):
+            return {k: clean(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [clean(v) for v in value]
+        return value
+
+    return clean(data)
 
 
 #: Fields of a provider's answer that are credentials, by name. Anything the pool writes down
@@ -87,6 +119,11 @@ class ProviderCapabilities:
     #: The provider says what an instance has cost. Without it, spend is estimate-only and the
     #: cap safety margin is widened.
     reports_charges: bool = False
+    #: `account()`'s `credit_remaining` is the account's own balance in dollars, as the provider's
+    #: API documents it (D188). With it, the pool reads it on a slow schedule and rents nothing new
+    #: on this account once it would not cover an hour of what the pool runs there; without it, a
+    #: figure the plug-in returns is shown but never acted on, and the operator may type one.
+    reports_balance: bool = False
     price_history: bool = False
     #: A public port can be mapped to the engine. Without it, rented hosts are tunnel-only.
     direct_port_mapping: bool = False

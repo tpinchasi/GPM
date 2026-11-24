@@ -56,7 +56,7 @@ class Provider(Protocol):
 | `status` | Distinguishes at least: running, scheduling, stopped-by-us, **outbid / stopped-by-provider**, gone. An instance the provider has decided not to run is stopped **whatever its container is doing** — outbid while still loading its image included (D109) |
 | `search_offers` | Each `Offer` carries what ranking needs: hardware, memory, a throughput proxy, the current minimum bid, on-demand price if any, storage price, download price per gigabyte, download speed, reliability, provider verification flag, a stable machine identifier |
 | `reported_charges` | What the provider says the instance has cost so far, or `None` if it cannot say |
-| Every operation | Bounded by a timeout; raises typed errors (`ProviderAuthError`, `ProviderRateLimited`, `ProviderUnavailable`, `OfferGone`, `BidLost`); never blocks indefinitely |
+| Every operation | Bounded by a timeout; raises typed errors (`ProviderAuthError`, `ProviderRateLimited`, `ProviderUnavailable`, `OfferGone`, `BidLost`); never blocks indefinitely. `OfferGone` and `BidLost` carry the provider's own answer as `response` where it gave one (`answer_of`, with the plug-in's credential taken out) |
 | `BidLost` | Carries the provider's answer (`response`) and, where the attempt created an instance, that instance's state as read **before** it was destroyed (`instance_state`) — with every credential-named field replaced. The pool writes both into the `bid_failed` event, and replaces credentials once more before it does |
 
 **`self_terminate_request(action)`** returns the call one instance makes to end itself — method,
@@ -96,6 +96,7 @@ A provider states what it can do; the pool adapts rather than assumes.
 | `same_machine_rebid` — a stopped instance can be restarted by raising its bid | Eviction choice is "replace" only |
 | `self_terminate` — an **instance-scoped** credential lets an instance end itself | No dead-man timer; the pool refuses leases longer than a short maximum on this provider. The start-up script still carries the pool's key and the engine's start, without the timer (D140) |
 | `reports_charges` | Spend is estimate-only; the cap safety margin is widened and the console says why |
+| `reports_balance` — `account()`'s `credit_remaining` is the account's balance in dollars, as the provider's API documents it (D188) | The balance is never read on schedule or acted on; the operator may type one, which the pool counts down |
 | `price_history` | Volatility-aware bidding relies on the pool's own samples only |
 | `direct_port_mapping` — a public port can be mapped to the engine | `http` / `https` transports to rented hosts are unavailable; `tunnel` only |
 | `private_images` — `create` also takes `registry_login=` (registry, user name, password), for the provider's own create call alone, never written down or put on the machine by the plug-in (D183) | An image whose registry needs a login is not rented from this provider; nothing else changes, and `create` is never handed a login |
@@ -351,7 +352,10 @@ is on trial, the one before and anything dropped; `GET /pool/status` carries it 
 
 **Ollama is started by the pool** on a rented host (D177): `ollama serve` in the background, on
 loopback at the pool's port, through the restart script — since a provider's launch mode may skip
-an image's own start. `rented.engine_start` replaces it.
+an image's own start. On a machine with more than one NVIDIA card, once the agent's archive is
+there, the same script runs the agent's `ollama-start` instead: a server per card behind the
+router (D190, host-agent §2.4), or the one server where the models do not fit a card (D191).
+`rented.engine_start` replaces both.
 
 An image's `capabilities` say what it carries beyond the engine — `audio-decoding` for vLLM's
 audio extra. An engine names what its image must carry per kind (`image_needs`; vLLM:
