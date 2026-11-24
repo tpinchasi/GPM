@@ -579,6 +579,12 @@ class Fleet:
         self.searching: dict[str, SearchState] = {name: SearchState() for name in self.providers}
         #: Connections not rented through while a change to them could not be applied (D174).
         self.paused: set[str] = set()
+        #: What is known or estimated to be left in each account, by connection, in dollars (D188):
+        #: set by the supervisor's balances, absent where nothing is known. Nothing new is rented
+        #: on an account it would not cover an hour of what the pool would run there.
+        self.balances: dict[str, float] = {}
+        #: When a refusal for an account's balance was last recorded, by connection: said, not repeated.
+        self._balance_said: dict[str, float] = {}
 
     # --- connections (D129) ---
 
@@ -4068,6 +4074,34 @@ class Fleet:
             )
         return None
 
+    def balance_refusal(self, connection: str, adding_hourly: float,
+                        without: Optional["RentedHost"] = None) -> Optional[str]:
+        """Why nothing more may be rented on this account for its balance, or None (D188). The
+        safety margin is an hour of everything the pool would then run there — the machine about to
+        be rented with the rest — so a machine the account cannot pay for is never rented. Machines
+        already running are never stopped for it: this only refuses what would start billing."""
+        left = self.balances.get(connection)
+        if left is None:
+            return None
+        running = sum(h.rate() for h in self.hosts.values()
+                      if not h.released and h is not without and self.resolve(h.connection_name) == connection)
+        need = running + adding_hourly
+        if left > need:
+            return None
+        return (f"the {connection} account has about ${left:.2f} left, not more than an hour of what the pool would run "
+                f"there (${need:.3f}/h with this machine): nothing new is rented there until it is topped up")
+
+    def _say_balance_refusal(self, connection: str, refusal: str, lease: Optional[Lease] = None,
+                             host_id: Optional[str] = None) -> None:
+        """An event says why, once in a while rather than every pass the demand lasts."""
+        now = time.time()
+        if now - self._balance_said.get(connection, 0.0) < 900:
+            return
+        self._balance_said[connection] = now
+        self.events.record("rent_refused", refusal, numbers={"connection": connection,
+                                                              "balance": self.balances.get(connection)},
+                           lease_id=lease.lease_id if lease is not None else None, host_id=host_id)
+
     def _refuse_rebid(self, host: "RentedHost", bid: float, lease: Lease) -> Optional[str]:
         """A new bid on a host the pool already holds — won back after an eviction, or restarted
         from parked — is spending like any other: the pool's burn with this host at its new
@@ -4075,6 +4109,9 @@ class Fleet:
         left = self.budget_left(lease)
         if left <= 0:
             return f"the lease has ${left:.4f} left"
+        broke = self.balance_refusal(self.resolve(host.connection_name) or host.connection_name, bid, without=host)
+        if broke is not None:
+            return broke
         cap = self.config.limits.max_hourly_burn
         if cap is None:
             return None
@@ -4258,6 +4295,12 @@ class Fleet:
                 self.events.record(
                     "rent_refused", refusal, numbers={"bid": capped}, lease_id=lease.lease_id
                 )
+                continue
+            broke = self.balance_refusal(offer.connection, capped)
+            if broke is not None:
+                # The account would not cover it (D188): never rented, said once in a while.
+                self.last_refusal = broke
+                self._say_balance_refusal(offer.connection, broke, lease)
                 continue
             if spec is not None:
                 unaffordable = self._refuse_for_workload_budget(

@@ -265,6 +265,21 @@ CREATE TABLE IF NOT EXISTS provisioning_requests (
     updated_at  REAL NOT NULL
 );
 
+-- What is left in each provider account (D188), written by the supervisor alone: the balance its
+-- provider last answered, and one an operator typed, each with when. `account` is
+-- 'hosted:<host id>' or 'rented:<connection>'. Counted down from the pool's own spend records
+-- since; never a credential, never a provider's answer as it came.
+CREATE TABLE IF NOT EXISTS provider_balances (
+    account     TEXT PRIMARY KEY,
+    typed_usd   REAL,
+    typed_at    REAL,
+    read_usd    REAL,
+    read_at     REAL,
+    read_detail TEXT,
+    asked_at    REAL,
+    updated_at  REAL NOT NULL
+);
+
 -- One row per pool. Exactly one supervisor runs at a time (supervisor.md §1).
 CREATE TABLE IF NOT EXISTS supervisor_lock (
     pool       TEXT PRIMARY KEY,
@@ -346,6 +361,12 @@ _ADDED_COLUMNS = {
         # again if its provider said otherwise before then. Written by the supervisor alone,
         # and never by the routine publish, which leaves it as it is.
         ("funds_reset_at", "REAL"),
+        # A hosted API whose known or estimated balance reached $0 (D188): why, and since when.
+        # The router takes it out of routing as if its provider had said so, until it is cleared or
+        # an operator's word (funds_reset_at) is newer. Written by the supervisor alone, and never
+        # by the routine publish.
+        ("balance_out", "TEXT"),
+        ("balance_out_at", "REAL"),
     ],
     "leases": [
         # The workload a lease belongs to (D115); NULL is the shared workload.
@@ -567,6 +588,9 @@ class HostRow:
     workload: Optional[str] = None
     #: When an operator last said this hosted API's money is back (D164).
     funds_reset_at: Optional[float] = None
+    #: Its balance reached $0 (D188): the supervisor's words, and since when.
+    balance_out: Optional[str] = None
+    balance_out_at: Optional[float] = None
 
 
 def _row_to_host(row: sqlite3.Row) -> HostRow:
@@ -595,6 +619,8 @@ def _row_to_host(row: sqlite3.Row) -> HostRow:
         updated_at=row["updated_at"],
         workload=row["workload"],
         funds_reset_at=row["funds_reset_at"],
+        balance_out=row["balance_out"],
+        balance_out_at=row["balance_out_at"],
     )
 
 
@@ -659,6 +685,19 @@ class HostTable:
         if not self.db.query("SELECT 1 FROM hosts WHERE host_id = ?", (host_id,)):
             return False
         self.db.execute("UPDATE hosts SET funds_reset_at = ?, updated_at = ? WHERE host_id = ?", (now, now, host_id))
+        return True
+
+    def mark_balance(self, host_id: str, words: Optional[str]) -> bool:
+        """A hosted API's balance reached $0 (D188), with why — or, with None, no longer. The router
+        reads it with the table. Kept as it is when unchanged, so its moment stays the first."""
+        rows = self.db.query("SELECT balance_out FROM hosts WHERE host_id = ?", (host_id,))
+        if not rows:
+            return False
+        if (rows[0]["balance_out"] is None) == (words is None):
+            return True
+        now = time.time()
+        self.db.execute("UPDATE hosts SET balance_out = ?, balance_out_at = ?, updated_at = ? WHERE host_id = ?",
+                        (words, now if words is not None else None, now, host_id))
         return True
 
     def revision(self) -> float:

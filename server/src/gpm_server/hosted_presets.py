@@ -33,6 +33,14 @@ class HostedPreset:
     #: The provider's own page listing each model's price, where its API lists none and the page
     #: is a table the pool can read (D176): proposed prices, never trusted unseen.
     pricing_page: str = ""
+    #: Where the provider's API answers what is left in the account (D188), and how that answer
+    #: reads (`hosted_balances.READERS`). On the same scheme, host and port as `base_url`, so the
+    #: key goes nowhere but its own provider. Empty: the provider's API says no balance, and the
+    #: operator may type one on the card.
+    balance_url: str = ""
+    balance_format: str = ""
+    #: What to know about reading it, said on the card when the provider will not answer.
+    balance_note: str = ""
 
     @property
     def custom(self) -> bool:
@@ -53,8 +61,12 @@ PRESETS: tuple[HostedPreset, ...] = (
     HostedPreset("ollama-cloud", "Ollama's cloud", "https://ollama.com/v1", OPENAI_ENGINE,
                  note="the models Ollama serves on its own machines (D168)",
                  pricing_page="https://ollama.com/pricing"),
-    HostedPreset("openrouter", "OpenRouter", "https://openrouter.ai/api/v1", OPENAI_ENGINE),
-    HostedPreset("deepseek", "DeepSeek", "https://api.deepseek.com/v1", OPENAI_ENGINE),
+    HostedPreset("openrouter", "OpenRouter", "https://openrouter.ai/api/v1", OPENAI_ENGINE,
+                 balance_url="https://openrouter.ai/api/v1/credits", balance_format="openrouter-credits",
+                 balance_note="OpenRouter answers the account's credits only to a management key; "
+                              "with an ordinary key, type the balance here"),
+    HostedPreset("deepseek", "DeepSeek", "https://api.deepseek.com/v1", OPENAI_ENGINE,
+                 balance_url="https://api.deepseek.com/user/balance", balance_format="deepseek-balance"),
     HostedPreset("fireworks", "Fireworks AI", "https://api.fireworks.ai/inference/v1", OPENAI_ENGINE),
     HostedPreset("deepinfra", "DeepInfra", "https://api.deepinfra.com/v1/openai", OPENAI_ENGINE),
     HostedPreset("openai-compatible", "Another OpenAI-format API", "", OPENAI_ENGINE,

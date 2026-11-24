@@ -389,6 +389,8 @@ def test_the_operator_reads_spending_per_workload_provider_and_burst(programs, c
     assert night["per_day"] == 9.0 and night["today"] == pytest.approx(0.75)
     assert spending["rented_bursts"] == [{"workload": "night", "per_day": 2.0, "per_month": None, "max_hosts": 1,
                                           "today": 0.0, "this_month": 0.0, "hosts": 0}]
+    balance = spending["providers"][0].pop("balance")
+    assert balance["source"] == "unknown", "a provider whose API says no balance, none typed (D188)"
     assert spending["providers"] == [{"host_id": "provider", "state": spending["providers"][0]["state"],
                                       "out_of_funds": None, "out_of_funds_at": None}]
     monkeypatch.setenv("GPM_ADMIN_KEY", ADMIN)

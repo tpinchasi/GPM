@@ -102,7 +102,9 @@ funds-restored <id>`, `POST /pool/hosts/{id}/funds-restored`): the router publis
 provider said with its counters, the supervisor publishes the operator's word in the host table,
 and the router routes to the host again on reading a word newer than the refusal. A refusal after
 that takes it out again; a refusal is charged nothing. A router restarted forgets the mark, and
-tries the provider once more. Anything else is the request's own, returned to the app as the
+tries the provider once more. **A balance at $0** (D188, providers.md §12) takes it out the same way:
+the supervisor writes it in the host table and clears it when the balance is above $0 again; the
+operator's word newer than it wins, and a router restarted reads it again. Anything else is the request's own, returned to the app as the
 provider said it and charged nothing.
 
 ### 1.3 Transports

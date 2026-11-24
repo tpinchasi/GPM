@@ -145,6 +145,8 @@ class RunPodProvider:
         self_terminate=True,
         #: `GET /v2/billing/pods`: per-pod amounts in time buckets.
         reports_charges=True,
+        #: GraphQL's `myself { clientBalance }` — the only balance RunPod's APIs answer (D138, D188).
+        reports_balance=True,
         price_history=False,
         direct_port_mapping=True,
         #: `GET /v2/pods/{id}/logs`: the container's and the system's output, as server-sent events.

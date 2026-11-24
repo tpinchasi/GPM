@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Optional
 
 import httpx
@@ -38,6 +39,20 @@ def _variants(row: HostRow) -> dict[str, tuple[ResolvedVariant, ...]]:
 def _literal_variants(variants: dict[str, tuple[ResolvedVariant, ...]]) -> dict[str, ResolvedVariant]:
     return {variant.tag: variant for group in variants.values() for variant in group}
 
+
+
+def _follow_balance(host: Host, row: HostRow) -> None:
+    """A hosted API whose balance the supervisor found at $0 (D188) is out of routing as if its
+    provider had said so — unless an operator said its money is back since; and back in once the
+    supervisor clears it. A mark the provider's own answer made is left alone."""
+    if row.balance_out is not None and not (row.funds_reset_at is not None
+                                            and row.funds_reset_at >= (row.balance_out_at or 0.0)):
+        if host.out_of_funds is None:
+            host.out_of_funds, host.out_of_funds_at = row.balance_out, row.balance_out_at or time.time()
+            host.out_of_funds_by_balance = True
+    elif host.out_of_funds_by_balance:
+        host.out_of_funds = host.out_of_funds_at = None
+        host.out_of_funds_by_balance = False
 
 class HostRegistry:
     def __init__(self, config: PoolConfig, table: HostTable, counters: HostCounters, dispatcher: Dispatcher):
@@ -162,7 +177,7 @@ class HostRegistry:
 
     def _build(self, row: HostRow) -> Host:
         variants = _variants(row)
-        return Host(
+        built = Host(
             host_id=row.host_id,
             kind=row.kind,
             priority=row.priority,
@@ -181,6 +196,8 @@ class HostRegistry:
             last_error=row.last_error,
             workload=row.workload,
         )
+        _follow_balance(built, row)
+        return built
 
     def host_config(self, host_id: str) -> Any:
         """A configured host's settings, or None for one the pool rented."""
@@ -231,6 +248,8 @@ class HostRegistry:
                 and row.funds_reset_at >= (host.out_of_funds_at or 0.0)):
             # An operator said its money is back, after its provider said it was gone (D164).
             host.out_of_funds = host.out_of_funds_at = None
+            host.out_of_funds_by_balance = False
+        _follow_balance(host, row)
 
         if str(host.client.base_url).rstrip("/") != row.dial_url.rstrip("/"):
             self._retired.append(host.client)

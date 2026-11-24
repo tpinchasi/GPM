@@ -155,6 +155,8 @@ class VerdaProvider:
         self_terminate=False,
         #: A balance, and each instance's rate; no charges per instance.
         reports_charges=False,
+        #: `GET /v1/balance`: `amount` and `currency` (`usd` or `eur`) — acted on only in dollars (D188).
+        reports_balance=True,
         price_history=False,
         #: Every port is open: the engine is reached only through the SSH tunnel.
         direct_port_mapping=False,

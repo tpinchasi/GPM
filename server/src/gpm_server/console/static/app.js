@@ -125,6 +125,11 @@ const api = {
   setHostedKey: (id, credential) => call("PUT", `/pool/hosted/${encodeURIComponent(id)}/credential`, { credential }),
   removeHostedKey: (id) => call("DELETE", `/pool/hosted/${encodeURIComponent(id)}/credential`),
   setHostedBudget: (body) => call("PATCH", "/pool/hosted-budget", body),
+  // What is left in each provider account (D188): read from the provider, or typed and counted down.
+  balances: () => call("GET", "/pool/balances"),
+  readBalances: (account) => call("POST", "/pool/balances/read", account ? { account } : {}),
+  setBalance: (kind, id, usd) => call("PUT", `/pool/balances/${kind}/${encodeURIComponent(id)}`, { usd }),
+  clearBalance: (kind, id) => call("DELETE", `/pool/balances/${kind}/${encodeURIComponent(id)}`),
   // Renting, set up once an account is in (S14, D172).
   renting: () => call("GET", "/pool/renting"),
   setUpRenting: (body) => call("POST", "/pool/renting/setup", body),
@@ -1002,6 +1007,7 @@ const CAP_ICON = {
   self_terminate: '<circle cx="12" cy="13" r="7"/><path d="M12 13V9M10 3h4"/>',
   interruption_notice: '<path d="M12 4l9 16H3z"/><path d="M12 10v4M12 17v.5"/>',
   reports_charges: '<path d="M6 3h12v18l-3-2-3 2-3-2-3 2z"/><path d="M9 8h6M9 12h6"/>',
+  reports_balance: '<circle cx="12" cy="12" r="8"/><path d="M14.5 9.5c-.5-1-1.5-1.5-2.5-1.5-1.4 0-2.5.8-2.5 2s1.1 1.6 2.5 2 2.5.8 2.5 2-1.1 2-2.5 2c-1 0-2-.5-2.5-1.5M12 6.5v1.5M12 16v1.5"/>',
   volumes: '<ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v12c0 1.7 3.1 3 7 3s7-1.3 7-3V6"/>',
   copies: '<rect x="8" y="8" width="11" height="11" rx="2"/><path d="M5 15V5h10"/>',
   reports_instance_logs: '<path d="M5 5h14M5 10h14M5 15h9M5 20h6"/>',
@@ -1018,6 +1024,7 @@ const CAPABILITIES = [
   ["interruption_notice", "Interruption warning", "The provider warns before it takes a host back; the pool drains it at once."],
   ["self_terminate", "Dead-man timer", "A host ends itself if the pool goes quiet. Without it, leases here are kept short."],
   ["reports_charges", "Reports charges", "The provider says what each host cost, and spend is reconciled against it."],
+  ["reports_balance", "Reports its balance", "The provider says what is left in the account; nothing new is rented once it would not cover an hour of what runs there."],
   ["volumes", "Keeps models", "Storage that outlives a host, so a later host can take its models from it instead of downloading them."],
   ["copies", "Copies between hosts", "A new host takes its models from a sibling instead of the hub."],
   ["reports_instance_logs", "Boot logs", "A host that never answered says why."],
@@ -1107,6 +1114,68 @@ function testResults(steps) {
     el("div", {}, el("strong", {}, label[s.step] || s.step), el("div", { class: "muted" }, s.detail)))));
 }
 
+// What is left in a provider account (D188): read from the provider, typed by the operator and
+// counted down by what the pool spends there, or unknown — always said which, and as of when.
+const BALANCE_SOURCE = { provider: "reported by the provider", typed: "set" };
+const shortWhen = (ts) => new Date(ts * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+
+function balanceLine(b, name) {
+  if (!b) return el("span", { class: "muted" }, "—");
+  const button = el("button", { class: "small", onclick: () => balanceDialog(b, name) },
+    b.typed ? "Change" : "Type it");
+  const asked = b.read && b.read.detail ? el("div", { class: "warn-text small-text" }, b.read.detail) : null;
+  if (b.source === "unknown") {
+    return el("div", { class: "balance", "data-balance": b.account },
+      el("span", { class: "muted" }, b.can_read ? "not read yet" : "not known — its provider's API says none"), " ", button,
+      asked, !asked && b.note ? el("div", { class: "muted small-text" }, b.note) : null);
+  }
+  const out = b.estimate <= 0;
+  return el("div", { class: "balance", "data-balance": b.account },
+    el("span", { class: out ? "error" : "" }, `about ${dollars(b.estimate)} left`),
+    el("span", { class: "muted" }, ` — ${dollars(b.amount)} ${BALANCE_SOURCE[b.source]} on ${shortWhen(b.as_of)}, less ${dollars(b.spent_since)} spent here since`),
+    " ", button,
+    el("div", { class: "muted small-text" }, b.source === "typed"
+      ? "An estimate: what anything else spends with the same account is not counted. Type it again after topping up."
+      : "An estimate between reads: the provider is asked every 15 minutes."),
+    asked);
+}
+
+function balanceDialog(b, name) {
+  const { dialog } = providerDialog();
+  const input = el("input", { id: "balance-usd", type: "number", min: "0", step: "0.01", required: true,
+    value: b.typed ? b.typed.usd : "", "aria-describedby": "balance-usd-hint" });
+  const problem = el("p", { class: "error", role: "alert", hidden: true });
+  const form = el("form", { method: "dialog" });
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    const usd = Number(input.value);
+    if (input.value === "" || !Number.isFinite(usd) || usd < 0) { problem.textContent = "A number of dollars, 0 or more."; problem.hidden = false; return; }
+    try {
+      await api.setBalance(b.kind, b.id, usd);
+      dialog.close();
+      await refresh();
+    } catch (error) {
+      problem.textContent = error.message; problem.hidden = false;
+    }
+  };
+  const clear = b.typed ? el("button", { type: "button", onclick: async () => {
+    try { await api.clearBalance(b.kind, b.id); dialog.close(); await refresh(); } catch (error) { problem.textContent = error.message; problem.hidden = false; }
+  } }, "Clear it") : null;
+  fill(form,
+    dialogTitle(`What is left at ${name}`),
+    el("div", { class: "field" }, el("label", { for: "balance-usd" }, "Dollars left in the account now"), input,
+      el("small", { id: "balance-usd-hint", class: "muted" },
+        "As the provider's own page shows it. The pool counts it down by what it spends there from now; at $0 it stops sending there "
+        + (b.kind === "hosted" ? "(Money is back, or a new figure, sends there again)." : "and rents nothing new there; machines already running are not stopped."),
+        " Other uses of the same account are not counted: type it again after topping up.")),
+    problem,
+    el("div", { class: "row wizard-nav" }, el("button", { type: "button", onclick: () => dialog.close() }, "Cancel"), clear,
+      el("button", { class: "primary", type: "submit" }, "Save")));
+  refill(dialog, form);
+  dialog.showModal();
+  input.focus();
+}
+
 function providerCard(p, data) {
   const health = providerHealth(p);
   const c = p.credential || {};
@@ -1137,6 +1206,10 @@ function providerCard(p, data) {
       el("div", { class: "k" }, "credential"), credentialLine(p),
       el("div", { class: "k" }, "search quota"), quotaMeter(p.search_quota),
       el("div", { class: "k" }, "holding"), holdingLine(p),
+      p.balance ? el("div", { class: "k" }, "balance") : null,
+      p.balance ? balanceLine(p.balance, p.display_name || p.connection) : null,
+      p.balance_refusal ? el("div", { class: "k" }, "not renting") : null,
+      p.balance_refusal ? el("div", { class: "error" }, p.balance_refusal) : null,
       p.configured ? el("div", { class: "k" }, "model storage") : null,
       p.configured ? keepModelsControl(p) : null,
       p.search_error ? el("div", { class: "k" }, "last search") : null,
@@ -1698,6 +1771,8 @@ function hostedCard(h, data) {
       el("div", { class: "k" }, "key"), hostedKeyLine(h),
       el("div", { class: "k" }, "in flight"), el("div", {}, `at most ${h.workers} request${h.workers === 1 ? "" : "s"} at once`),
       el("div", { class: "k" }, "spent"), el("div", {}, `${money(h.spend.today)} today · ${money(h.spend.this_month)} this month`),
+      h.balance ? el("div", { class: "k" }, "balance") : null,
+      h.balance ? balanceLine(h.balance, name) : null,
       h.format === "Anthropic" ? el("div", { class: "k" }, "caching") : null,
       h.format === "Anthropic" ? el("div", {}, h.cache_prompts ? "prompts cached for 5 minutes unless a request says otherwise" : "requests sent as they came") : null,
       h.out_of_funds ? el("div", { class: "k" }, "provider said") : null,

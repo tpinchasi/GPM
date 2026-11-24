@@ -211,6 +211,10 @@ class Supervisor:
         from .connections import ProviderAccounts
 
         self.accounts = ProviderAccounts(self)
+        #: What is left in each provider account, read or typed, counted down (D188).
+        from .balances import Balances
+
+        self.balances = Balances(self)
         #: Why renting added to the file while the pool ran could not start, or None (D173).
         self.renting_problem: Optional[str] = None
         if config.rented is not None:
@@ -530,6 +534,7 @@ class Supervisor:
         if self._request_watcher is not None:
             self._request_watcher.cancel()
         await self.directory.aclose()
+        await self.balances.aclose()
         for host in self.hosts.values():
             # Detached, not stopped: with the forwarder (D110) the forwards outlive this
             # process, and the next supervisor finds them on the same ports.
@@ -604,6 +609,12 @@ class Supervisor:
             # are enforced and hosts are torn down below (the security review's finding).
             log.exception("probing rented hosts failed; the pass goes on")
         self._publish_all()
+        try:
+            # After the publish, so a hosted API it would take out is in the table; before renting,
+            # so an account that would not cover a machine rents none this pass (D188).
+            await self.balances.pass_once()
+        except Exception:  # noqa: BLE001 - a balance must never stop the pass that enforces leases
+            log.exception("counting provider balances failed; the pass goes on")
 
         if self.fleet is not None and not self._adoption_pending:
             active = await self.workloads.advance()

@@ -1844,6 +1844,11 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                                           known_connections()),
     )
 
+    # --- what is left in each provider account (D188) ---
+    from .balances_api import register as register_balances
+
+    register_balances(app, supervisor, error=_error)
+
     def _has_section(text: str, name: str) -> bool:
         """Is this block already in the file? A missing one is written whole, once."""
         import re as _re
@@ -2553,13 +2558,18 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         said = counter.out_of_funds if counter else None
         if not supervisor.table.reset_funds(host_id):
             return _error(409, "not_published", f"{host_id} is not in the host table yet; the supervisor publishes it first")
+        # A balance at $0 would take it out again at once: a typed one is cleared, a provider's
+        # asked again (D188).
+        balance = supervisor.balances.funds_restored(host_id)
         supervisor.events.record(
             "hosted_funds_restored",
             f"{host_id}: the operator says its money is back; the router routes to it again"
-            + (f" (its provider had said: {said})" if said else " (the router had not seen it out of money)"),
+            + (f" (its provider had said: {said})" if said else " (the router had not seen it out of money)")
+            + (f"; {balance}" if balance else ""),
             host_id=host_id,
         )
-        return JSONResponse({"host_id": host_id, "was_out_of_funds": said is not None, "provider_said": said})
+        return JSONResponse({"host_id": host_id, "was_out_of_funds": said is not None, "provider_said": said,
+                             "balance": balance})
 
     @app.get("/pool/spending")
     async def spending() -> JSONResponse:
@@ -2620,7 +2630,8 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             counter = counters.get(h.host_id)
             providers.append({"host_id": h.host_id, "state": h.state.value,
                               "out_of_funds": counter.out_of_funds if counter else None,
-                              "out_of_funds_at": counter.out_of_funds_at if counter else None})
+                              "out_of_funds_at": counter.out_of_funds_at if counter else None,
+                              "balance": supervisor.balances.view_of(f"hosted:{h.host_id}")})
         return {
             "day_starts": day, "month_starts": month,
             "hosted": {"today": round(sum(r["today"] for r in by), 6),

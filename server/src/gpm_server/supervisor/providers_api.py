@@ -140,6 +140,9 @@ def register(
             "volumes": sum(1 for record, _ in held if record.startswith("volume:")),
             "held_back": len(fleet.pending_adoption.get(name, [])),
             "holds": len(held),
+            # What is left there (D188), and why nothing new is rented there, if that is so.
+            "balance": supervisor.balances.view_of(f"rented:{name}"),
+            "balance_refusal": fleet.balance_refusal(name, 0.0) if name in fleet.providers else None,
         })
         return view
 
@@ -164,6 +167,10 @@ def register(
         for name in names:
             if name in fleet.providers and (fresh or name not in accounts._accounts):
                 await accounts.account(name, fresh=fresh)
+        if fresh:
+            await supervisor.balances.read_now()  # Check every account asks each balance too (D188)
+        else:
+            await supervisor.balances.count()
         return JSONResponse({
             "connections": [connection_view(name) for name in names],
             "plugins": accounts.plugins(),
