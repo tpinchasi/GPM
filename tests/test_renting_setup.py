@@ -215,6 +215,21 @@ def test_a_pool_not_set_up_rents_nothing(tmp_path):
         stop()
 
 
+def test_a_download_ceiling_may_be_set_with_renting_and_is_checked(tmp_path):
+    supervisor, base, path, stop = start(tmp_path, ACCOUNT_ONLY)
+    try:
+        setup = {"min_disk_gb": 40, "max_all_in_hourly": 0.5, "engine": "ollama", "models": ["chat"]}
+        for wrong in ("lots", -0.01, 11):
+            refused = call(base, "POST", "/pool/renting/setup", json={**setup, "max_download_per_gb": wrong})
+            assert refused.json()["error"] == "bad_setup", wrong
+        done = confirmed(base, "POST", "/pool/renting/setup", {**setup, "max_download_per_gb": 0.02})
+        assert done.status_code == 200, done.text
+        assert yaml.safe_load(path.read_text())["rented"]["offer_policy"]["max_download_per_gb"] == 0.02
+        assert call(base, "GET", "/pool/renting").json()["current"]["max_download_per_gb"] == 0.02
+    finally:
+        stop()
+
+
 def test_ceilings_once_set_are_changed_never_taken_away(tmp_path):
     with_ceilings = ACCOUNT_ONLY + "  offer_policy: { min_disk_gb: 40, max_all_in_hourly: 0.5 }\n  engine: ollama\n"
     current, without = parse_config(with_ceilings), parse_config(ACCOUNT_ONLY)
@@ -272,7 +287,9 @@ def test_rented_capacity_sets_up_renting_offering_only_what_the_engine_can_serve
                     "document.getElementById('confirm-ok').click(); } true")
             page.until("document.querySelectorAll('.tabs a').length > 0", within=30, what="the renting tabs")
         rented = yaml.safe_load(path.read_text())["rented"]
-        assert rented["offer_policy"] == {"min_disk_gb": 40.0, "max_all_in_hourly": 0.5}
+        # The console proposes a download ceiling: unset, a provider's per-GB charge is paid at
+        # whatever the machine asks (found live: $0.28 for one 20 GB model).
+        assert rented["offer_policy"] == {"min_disk_gb": 40.0, "max_all_in_hourly": 0.5, "max_download_per_gb": 0.01}
         assert rented["engine"] == "ollama" and rented["models"] == ["chat"]
     finally:
         stop()

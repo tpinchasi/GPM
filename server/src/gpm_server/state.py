@@ -88,6 +88,11 @@ class RouterState:
         variant = self._by_tag.get(tag)
         return variant.price if variant is not None else None
 
+    def thinking_of(self, tag: str) -> Any:
+        """A catalogued build's thinking default (D187), or None for the engine's own."""
+        variant = self._by_tag.get(tag)
+        return variant.thinking if variant is not None else None
+
     def _learn_builds(self, config: PoolConfig) -> None:
         """What each build does and takes, which builds of each name some host could hold, and
         what each engine serves — read from configuration and the engines already loaded, once

@@ -46,7 +46,18 @@ def setup_values(body: dict) -> tuple[Optional[dict[str, Any]], Optional[str]]:
     models = body.get("models")
     if models is not None and (not isinstance(models, list) or not all(isinstance(m, str) and m for m in models)):
         return None, "models is a list of the pool's model names"
-    return {"min_disk_gb": disk, "max_all_in_hourly": hourly, "engine": engine, "models": models}, None
+    download = body.get("max_download_per_gb")
+    if download is not None:
+        # Optional, as in the file; the console proposes one. A provider that charges by the
+        # gigabyte downloaded charges for every model a machine fetches, at its own price.
+        try:
+            download = float(download)
+        except (TypeError, ValueError):
+            return None, "the download ceiling is dollars per GB, a number"
+        if not 0 <= download <= 10:
+            return None, "the download ceiling is between $0 and $10 per GB"
+    return {"min_disk_gb": disk, "max_all_in_hourly": hourly, "engine": engine, "models": models,
+            "max_download_per_gb": download}, None
 
 
 def register(
@@ -78,6 +89,7 @@ def register(
             "current": {
                 "min_disk_gb": policy.min_disk_gb or None,
                 "max_all_in_hourly": policy.max_all_in_hourly,
+                "max_download_per_gb": policy.max_download_per_gb,
                 "engine": rented.engine,
                 "models": rented.models,
             },
@@ -125,6 +137,8 @@ def register(
         try:
             text = set_values(text, ("rented",), write)
             ceilings = {"min_disk_gb": values["min_disk_gb"], "max_all_in_hourly": values["max_all_in_hourly"]}
+            if values["max_download_per_gb"] is not None:
+                ceilings["max_download_per_gb"] = values["max_download_per_gb"]
             try:
                 text = set_values(text, ("rented", "offer_policy"), ceilings)
             except CannotEdit:
@@ -142,5 +156,6 @@ def register(
         if response.status_code == 200:
             supervisor.events.record("renting_set_up", "renting set up from the console", numbers={
                 "min_disk_gb": values["min_disk_gb"], "max_all_in_hourly": values["max_all_in_hourly"],
-                "engine": values["engine"], "models": write.get("models")})
+                "max_download_per_gb": values["max_download_per_gb"], "engine": values["engine"],
+                "models": write.get("models")})
         return response

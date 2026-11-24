@@ -488,6 +488,18 @@ left untouched — it names the tag that really ran — and the router adds `X-G
   entry has no declaration and is passed through as it would be to a bare engine.
   Holding both builds costs memory; where they do not both fit, that host simply does not take
   schema-constrained requests.
+- **A chat build may say whether it thinks before answering**, `thinking: on | off` (D187), for a
+  request that does not say. Unset, the engine's own default stands. The router adds the engine's
+  own switch to a chat request naming none — Ollama's API `think`; the OpenAI-shaped path
+  `reasoning_effort` (`none`, or `medium` for on), or for vLLM `chat_template_kwargs.enable_thinking`;
+  Anthropic's `thinking` (`disabled`, or `adaptive` for on, on `anthropic-api` alone) — as one
+  member put in after the opening brace, every other byte as the app sent it. A request that says
+  anything of its own (`think`, `reasoning_effort`, `reasoning`, `chat_template_kwargs`,
+  `thinking`) is never changed — checked on the path the request arrived on too, so a field a
+  translation dropped still counts. One build tag under two names has one default. `off` is
+  accepted by Ollama whatever the build; a hosted model that takes no `reasoning_effort` refuses
+  it, and `on` is refused by a build that cannot think — set it where the build is known to take
+  it.
 
 **A hosted build carries its price** (D164): `price: {input, cached_input, output}` in dollars per
 million tokens, `per_minute` for transcription, or `plan: true` — paid by the provider's plan, with

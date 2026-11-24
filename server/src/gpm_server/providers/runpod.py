@@ -59,6 +59,7 @@ from .base import (
     ProviderUnavailable,
     SelfTerminateRequest,
     VolumeInfo,
+    answer_of,
     redacted,
 )
 from .hostscript import SSH_DAEMON
@@ -669,7 +670,7 @@ class RunPodProvider:
         if response.status_code == 400:
             words = self._quiet(_problem(response))
             if _NO_CAPACITY.search(words):
-                raise OfferGone(f"{place}: no capacity now ({words})")
+                raise OfferGone(f"{place}: no capacity now ({words})", response=answer_of(response, self._quiet))
             raise ProviderError(f"POST {path}: the provider refused the request ({words})")
         if response.status_code == 402:
             raise ProviderError(
@@ -680,7 +681,8 @@ class RunPodProvider:
             # skip it and keep going. A credential without write access answers the same way.
             raise OfferGone(
                 f"{place}: this account may not create it "
-                f"({self._quiet(_problem(response))}; a read-only credential is also refused this way)"
+                f"({self._quiet(_problem(response))}; a read-only credential is also refused this way)",
+                response=answer_of(response, self._quiet),
             )
         if response.status_code >= 500:
             raise await self._after_unclear(spec.label, self._fail("POST", path, response))

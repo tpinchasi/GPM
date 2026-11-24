@@ -272,6 +272,17 @@ class Variant(BaseModel):
     #: machine with its own command rather than the image's. Machines of the operator's own run the
     #: image's own entrypoint and never use it.
     start: Optional[list[str]] = Field(default=None, min_length=1, max_length=64)
+    #: Whether a chat request to this build thinks before it answers, when the app does not say
+    #: (D187). Unset: the engine's own default, as before. `off` is accepted by Ollama whatever the
+    #: build; a hosted model that takes no `reasoning_effort` refuses it, and `on` is refused by a
+    #: build that cannot think — set it only where the build is known to take it.
+    thinking: Optional[Literal["on", "off"]] = None
+
+    @model_validator(mode="after")
+    def _thinking_is_a_chat_builds(self) -> "Variant":
+        if self.thinking is not None and "chat" not in self.kinds():
+            raise ValueError(f"{self.tag!r}: `thinking` is a chat build's (D187); this one does not serve chat")
+        return self
 
     @model_validator(mode="after")
     def _a_trained_models_fields_are_its_own(self) -> "Variant":
@@ -2512,8 +2523,16 @@ class PoolConfig(BaseModel):
         """A trained model's build is declared once: the agent is told one set of declarations per
         file, so two catalog entries naming one file must declare it alike."""
         seen: dict[str, tuple[str, Any]] = {}
+        thinks: dict[str, tuple[str, Optional[str]]] = {}
         for name, entry in self.catalog.items():
             for variant in entry.variants:
+                # The router finds a build's thinking default by its tag (D187), so one tag under
+                # two names says one thing — or a request for one would think as the other says.
+                if variant.tag in thinks and thinks[variant.tag][1] != variant.thinking:
+                    raise ValueError(
+                        f"{thinks[variant.tag][0]!r} and {name!r} name the build {variant.tag!r} with different "
+                        "`thinking`; a build has one default — give both the same, or leave it to each request")
+                thinks.setdefault(variant.tag, (name, variant.thinking))
                 if variant.engine not in TRAINED_ENGINES:
                     continue
                 needs = variant.needs or BuildNeeds()

@@ -126,4 +126,4 @@ run, open leases, and read every decision the pool made with the numbers behind 
 | Know what is in v1 and in what order it is built | [roadmap.md](roadmap.md) |
 | Know why something is the way it is | [decisions.md](decisions.md) |
 | Assess the risks | [threat-model.md](threat-model.md) |
-| See it applied to a real codebase | [adopters/aletheia/README.md](adopters/aletheia/README.md) |
+| Write a guide for your own application | [adopters/README.md](adopters/README.md) |

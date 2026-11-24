@@ -332,7 +332,7 @@ of the decision log.
 | `GET /pool/providers` | Every connection: type, enabled, capabilities, icon, credential state (never its value), credit, quota use, hosts and burn; and the installed plug-ins (`fresh=true` asks each account now) |
 | `GET /pool/providers/plugins/{type}` | Load the plug-in an operator chose on Add provider, and how it presents itself |
 | `GET /pool/renting` | Whether renting is set up and what it lacks; the current ceilings, engine and models; for each rented engine, which of the pool's models it has a build of and why each other is left out (D172) |
-| `POST /pool/renting/setup` | Set up renting: `min_disk_gb`, `max_all_in_hourly`, `engine` (vllm, ollama), `models` (where hosts declare their models); `plan_only`; typed again (D172) |
+| `POST /pool/renting/setup` | Set up renting: `min_disk_gb`, `max_all_in_hourly`, `engine` (vllm, ollama), `models` (where hosts declare their models), and optionally `max_download_per_gb` (the console proposes $0.01: unset, a provider's per-GB download charge is paid whatever it is); `plan_only`; typed again (D172) |
 | `POST /pool/providers/test` | Test an unsaved connection, credential included; saves nothing |
 | `POST /pool/providers`, `PATCH /pool/providers/{name}` | Add or change a connection through validate → plan → apply; enabling is retyped like any loosening |
 | `PUT /pool/providers/{name}/credential`, `DELETE …/credential` | Set or replace, or remove, the credential; answers with its state only |

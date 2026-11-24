@@ -45,6 +45,9 @@ class SupervisorChild:
         self.child: Optional[subprocess.Popen] = None
         self.restarts = 0
         self._stopping = threading.Event()
+        #: Held while a child is started and while stop() reads which one to stop, so a restart
+        #: that was about to happen as the router stopped cannot start one nobody stops.
+        self._spawning = threading.Lock()
         self._log_path: Optional[pathlib.Path] = None
         self._thread = threading.Thread(target=self._keep, name="gpm:supervisor-child", daemon=True)
 
@@ -63,7 +66,8 @@ class SupervisorChild:
             output = {"stdout": open(self._log_path, "ab"), "stderr": subprocess.STDOUT}
         try:
             return subprocess.Popen(
-                pool_command("supervise", "-c", self.config_path, "--log-level", self.log_level),
+                pool_command("supervise", "-c", self.config_path, "--log-level", self.log_level,
+                             "--exit-with", str(os.getpid())),
                 stdin=subprocess.DEVNULL, **output, **windowless(),
             )
         finally:
@@ -89,17 +93,21 @@ class SupervisorChild:
             if self._stopping.wait(delay):
                 return
             delay = min(delay * 2, RESTART_MOST_S)
-            try:
-                self.child = self._spawn()
-                self.restarts += 1
-            except OSError as exc:
-                log.error("the supervisor could not be started again: %s", exc)
-                self.child = None
+            with self._spawning:
+                if self._stopping.is_set():
+                    return
+                try:
+                    self.child = self._spawn()
+                    self.restarts += 1
+                except OSError as exc:
+                    log.error("the supervisor could not be started again: %s", exc)
+                    self.child = None
 
     def stop(self, timeout: float = 10.0) -> None:
         """Stop it for good — the router is going — and never start it again."""
-        self._stopping.set()
-        child = self.child
+        with self._spawning:
+            self._stopping.set()
+            child = self.child
         if child is None or child.poll() is not None:
             return
         child.terminate()
@@ -158,13 +166,91 @@ def _serve(args: argparse.Namespace) -> int:
     if not args.router_only:
         child = _supervisor_child(config, args.config, args.log_level)
 
-    try:
+    def serve() -> None:
         app = create_app(config, config_path=args.config)
         uvicorn.run(app, **listener_options(config), log_level=args.log_level)
+
+    if child is None:
+        serve()
+        return 0
+    return _run_then_stop(serve, child.stop)
+
+
+class _Terminated(BaseException):
+    """SIGTERM, raised where it arrived so that what runs after it can run."""
+
+
+def _run_then_stop(run: Any, stop: Any) -> int:
+    """Run `run`, then `stop` — the supervisor — however `run` ends, SIGTERM included.
+
+    uvicorn takes SIGTERM while it serves, shuts down, puts back the handler it found and raises
+    the signal again. Python's default handler then ended the process on the spot, `finally` and
+    all, and the supervisor it started ran on alone, holding the pool's lock, until someone found
+    it. A handler of our own is the one put back: it raises, `stop` runs, and the process then
+    ends by SIGTERM as before — so a service manager reads a stop, not a failure."""
+    import signal
+
+    def leave(signum: int, frame: Any) -> None:
+        raise _Terminated()
+
+    try:
+        signal.signal(signal.SIGTERM, leave)
+    except (ValueError, OSError):  # not the main thread (a test's server), or no such signal
+        pass
+    terminated = False
+    try:
+        run()
+    except _Terminated:
+        terminated = True
     finally:
-        if child is not None:
-            child.stop()
+        stop()
+    if terminated:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.raise_signal(signal.SIGTERM)
     return 0
+
+
+async def _exit_with(pid: int, task: "asyncio.Task[Any]", every_s: float = 2.0) -> None:
+    """Cancel the supervisor once the `gpm serve` that started it is gone.
+
+    A router killed outright (SIGKILL, the OOM killer, a closed terminal's whole group) runs no
+    `finally`, and nothing else would stop its supervisor. On POSIX an orphan is handed to
+    another parent, so a parent id that is no longer `pid` says it. Windows keeps the first
+    parent's id, and may give it to another process: there a handle to the router is opened
+    once, at the start, and asked whether that process — not that number — still runs."""
+    alive = _parent_watch(pid)
+    while True:
+        await asyncio.sleep(every_s)
+        if not alive():
+            logging.getLogger("gpm").error(
+                "the pool's router (pid %s) is gone; the supervisor it started stops too.", pid)
+            task.cancel()
+            return
+
+
+def _parent_watch(pid: int) -> Any:
+    """A check, made once, of whether the process `pid` named at the start still runs."""
+    if os.name != "nt":
+        return lambda: _parent_alive(pid)
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    # SYNCHRONIZE: held for the supervisor's life, so the id cannot be given to another process
+    # while it is watched.
+    handle = kernel32.OpenProcess(0x00100000, False, pid)
+    if not handle:
+        return lambda: False
+    return lambda: kernel32.WaitForSingleObject(handle, 0) == 0x00000102  # WAIT_TIMEOUT: still running
+
+
+def _parent_alive(pid: int) -> bool:
+    """POSIX: is `pid` still this process's parent?"""
+    return os.getppid() == pid
 
 
 def _supervise(args: argparse.Namespace) -> int:
@@ -197,7 +283,14 @@ def _supervise(args: argparse.Namespace) -> int:
                 # stops this process outright (TerminateProcess), and Ctrl-C still raises
                 # KeyboardInterrupt, which ends `asyncio.run` with its cleanup.
                 break
-        await run(config, database, config_path=args.config)
+        watch = None
+        if getattr(args, "exit_with", 0) and task is not None:
+            watch = asyncio.ensure_future(_exit_with(args.exit_with, task))
+        try:
+            await run(config, database, config_path=args.config)
+        finally:
+            if watch is not None:
+                watch.cancel()
 
     try:
         asyncio.run(supervised())
@@ -686,6 +779,8 @@ def main(argv: list[str] | None = None) -> int:
     supervise = subparsers.add_parser("supervise", help="run the supervisor alone")
     supervise.add_argument("--config", "-c", default="pool.yaml")
     supervise.add_argument("--log-level", default="info")
+    supervise.add_argument("--exit-with", type=int, default=0, metavar="PID",
+                           help=argparse.SUPPRESS)  # `gpm serve`'s own pid: stop once it is gone
     supervise.set_defaults(func=_supervise)
 
     forwarder = subparsers.add_parser(

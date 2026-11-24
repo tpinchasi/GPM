@@ -2434,23 +2434,30 @@ class Fleet:
         minutes = self.rented.teardown.avoid_failed_machine_minutes if minutes is None else minutes
         if minutes <= 0:
             return
-        self.avoided[machine_id] = (time.time() + minutes * 60, why)
+        until = time.time() + minutes * 60
+        self.avoided[machine_id] = (until, why)
         self.events.record(
             "machine_avoided",
             f"machine {machine_id} {why}; not bidding on it for {minutes:g} minutes",
-            numbers={"machine": machine_id, "minutes": minutes},
+            numbers={"machine": machine_id, "minutes": minutes, "avoid_until": until, "why": why},
         )
 
     def avoided_now(self) -> dict[str, str]:
         now = time.time()
         if not self._value_avoids_restored:
-            # The rest of the list is forgotten at a restart at the cost of one more try; a machine
-            # given up for bad value would be bought straight back, as the cheapest (D75).
+            # Read back after a restart: a machine given up for bad value would be bought straight
+            # back, as the cheapest (D75), and one whose bid just lost bid on again at once — the
+            # burst of creates that tripped the provider's request limits (D124).
             self._value_avoids_restored = True
             for event in self.events.recent(200, kind="replaced_for_value"):
                 until, machine = event["numbers"].get("avoid_until"), event["numbers"].get("machine")
                 if until and machine and until > now:
                     self.avoided.setdefault(machine, (until, "given up for bad value"))
+            for event in self.events.recent(200, kind="machine_avoided"):
+                numbers = event["numbers"] or {}
+                until, machine = numbers.get("avoid_until"), numbers.get("machine")
+                if isinstance(until, (int, float)) and isinstance(machine, str) and until > now:
+                    self.avoided.setdefault(machine, (until, str(numbers.get("why") or "avoided before a restart")))
         self.avoided = {m: (until, why) for m, (until, why) in self.avoided.items() if until > now}
         skipped = {m: why for m, (_, why) in self.avoided.items()}
         # A machine this pool already rents still appears in the interruptible listing — its
@@ -3089,7 +3096,8 @@ class Fleet:
             )
         return adopted
 
-    async def _left_nothing_behind(self, label: str, lease: Lease, connection: Optional[str] = None) -> bool:
+    async def _left_nothing_behind(self, label: str, lease: Lease, connection: Optional[str] = None,
+                                   found: Optional[list[str]] = None) -> bool:
         """After a bid the provider reported lost: is anything running under its label?
 
         Returns False when something was left and could not be ended, or when the provider
@@ -3109,6 +3117,8 @@ class Fleet:
             return False
         if not stray:
             return True
+        if found is not None:
+            found.extend(instance.instance_id for instance in stray)
 
         ended = []
         for instance in stray:
@@ -4357,8 +4367,16 @@ class Fleet:
                 # next offer while a machine from this one bills is how one lease ends up
                 # paying for three hosts (D43) — so this is checked here, in the pool, and not
                 # left to a plug-in's own discipline. Unprovable means stop, not carry on.
-                if not await self._left_nothing_behind(instance_spec.label, lease, offer.connection):
+                stray: list[str] = []
+                if not await self._left_nothing_behind(instance_spec.label, lease, offer.connection, stray):
                     return None
+                machines_are_machines = getattr(self.provider_for(offer).capabilities, "machine_ids_are_machines", True)
+                if stray and not isinstance(exc, BidLost) and machines_are_machines:
+                    # Refused, yet a machine was made and billing (the D43 pattern, from a provider
+                    # that says "gone" rather than "lost"): the same create would do it again. Not
+                    # where an id names a class of machine (a GPU type in a cloud): that would bar the
+                    # whole class, and those plug-ins give up a misplaced instance themselves.
+                    self.avoid(offer.machine_id, "refused a create yet made an instance")
                 if isinstance(exc, BidLost):
                     # Lost: someone holds the machine above the listed least bid, and the same bid
                     # loses again. Avoided for a while, and this round stops here — firing the next

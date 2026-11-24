@@ -1,573 +1,121 @@
 # GPM — Status and Handoff
 
 > The single place that says where the project stands. **Update it at the end of every working
-> session** (current state, open decisions, session log) so the next session can resume without
-> re-reading everything.
+> session** (current state, next actions, open decisions, one session-log row) so the next session
+> can resume without re-reading everything. What each version carries is in
+> [CHANGELOG.md](CHANGELOG.md); every feature's story is in [docs/stories/](docs/stories/README.md);
+> why things are as they are is in [docs/decisions.md](docs/decisions.md). Earlier versions of this
+> file, with the day-by-day narrative they held, are in git history (cleaned 2026-11-24).
 
-## Current state — 2026-09-24
+## Current state — 2026-11-24
 
-**Phases 1–4 are effectively complete.** The router and SDK, the supervisor with leases and
-renting (proven on a real marketplace for $0.008), the operator console, and the release work:
-renamed to `gpm`, Apache-2.0, documented, linted, CI, and the threat model verified against the
-code. **Only two checklist items remain open, and both are the adopter-file decision the owner
-deferred.** The first commit was made on 2026-09-19 (`100dedf`); nothing has been pushed — the docs and code are working-tree files waiting for the owner to
-review and commit.
+**Released: v0.44.0** (2026-11-24, marked Latest): gpm-server 0.44.0, gpm-client 0.9.0,
+gpm-agent 0.18.1, wheels and `SHA256SUMS` attached and checked after download. Install commands
+in the README point at it. Older releases kept: v0.43.0, v0.42.1, v0.37.4, v0.37.3 and earlier.
 
-The design was drafted, extended through ten rounds of owner requirements, put through a
-critical architecture review (18 findings, every one decided), and then split from one
-1,400-line file into a generic specification plus a first-adopter guide — all on 2026-09-17, in
-the repository of the first adopter (Aletheia, `~/workspace/Aletheia`). It was moved here the
-same day, and the first code was written the same day.
+**What GPM does today:** one endpoint and key for apps, in OpenAI's and Anthropic's formats, over
+the operator's own machines (agents that install and keep current Ollama, whisper.cpp, vLLM and
+ONNX Runtime on macOS, Linux and Windows), fixed remote hosts, hosted model APIs paid per token
+from budgets, and machines rented on Vast, RunPod or Verda under leases with dollar caps.
+Workloads give an app its own key, latency target and budget; trained models (ONNX files and
+container images) are served on `POST /v1/predict`. The console and the control API manage all of
+it. Stories S1, S2 and S4–S16 are built ([docs/stories/README.md](docs/stories/README.md)).
 
-### What runs today
+**In progress (2026-11-24), each on its own branch, none merged yet:**
 
-A router and a client SDK over **statically configured hosts**. Two packages in one `uv`
-workspace: `client/` (`gpm_client`, one dependency: `httpx`) and `server/` (`gpm_server`,
-the router, the Ollama engine adapter and the `pool` command).
+| Branch | What | Decisions |
+|---|---|---|
+| `fix/small-items` | The supervisor stops with its router; a build's thinking default; a download-price ceiling proposed when renting is set up (and set on the laptop pool); RunPod's and Verda's refusals kept whole, avoided machines remembered across a restart, a refused create that made an instance avoids its machine; the adopter-internal files moved out; this file cleaned | D186, D187, D189 |
+| `story/s17-ollama-per-card` | S17: one Ollama server per card on a machine with several | D190–D192 |
+| `story/s18-stats-and-dashboards` | S18: stats kept with retention, a Dashboards screen, named app keys for the shared pool | D193–D197 |
+| `feature/provider-balances` | An account's balance on each provider card, read where the provider reports it, typed and counted down where not; no routing to, or renting on, an account at $0 | D188 |
 
-| Built | Where |
-|---|---|
-| Config: hosts, transports, catalog, secrets from the environment, every rule refused at load | `server/src/gpm_server/config.py` |
-| All three transports: `http`, `https`, and `tunnel` — a supervised SSH local forward that reconnects on the same local port | `server/src/gpm_server/transports/` |
-| Engine plug-in interface (phase-1 subset) + the Ollama adapter | `server/src/gpm_server/engines/` |
-| Routing: strict tiers, least-loaded within a tier, FCFS queue, failover-once | `server/src/gpm_server/router/dispatch.py` |
-| Request path: passthrough, model rewrite only, pool dialect, cancel-on-disconnect | `server/src/gpm_server/router/app.py` |
-| Readiness probe: whole-model-set-resident check, in-process for now | `server/src/gpm_server/router/probe.py` |
-| Request log in SQLite (WAL), written off the request path, no prompt or completion text | `server/src/gpm_server/db.py` |
-| SDK: `pool_transport()` / `PoolClient`, wait-and-retry by default, typed errors | `client/src/gpm_client/` |
-| `gpm serve` (router here, supervisor in its own process) and `gpm status` | `server/src/gpm_server/cli.py` |
-| **Supervisor process**: single-instance lock, control loop, probing, tunnels, publishing the host table | `server/src/gpm_server/supervisor/service.py` |
-| **Provider plug-in interface** with declared capabilities, and the scriptable **fake provider** | `server/src/gpm_server/providers/` |
-| **Leases** with mandatory dollar caps and tighten-only changes; decisions and a spend ledger | `server/src/gpm_server/ledger.py` |
-| **Strategies** as pure functions returning their reasons: rent, offer filter/rank, bid, eviction, tear-down | `server/src/gpm_server/strategies.py` |
-| **The pool's agent on rented hosts (S4, D63/D72)**: packed here as a 3 MB zipapp, pushed over SSH, started on the host's loopback, reached through a second forward; it fetches and holds the model set, loading each model as its own download finishes (**D57**), beats the host's timer, and changes its worker count while it runs (**D56**); a host with no interpreter joins without one | `server/src/gpm_server/agentpkg.py`, `server/src/gpm_server/supervisor/hostagent.py` |
-| **Allocation edited from the console (D74)**: the Rented capacity screen shows and changes the allocation mode, the ramp's settings and per-host worker adjustment, through the file, the plan and the retype rule | `server/src/gpm_server/console/static/app.js`, `PATCH /pool/config/rented` |
-| **The machine history (S3 stage 1, D69)**: what each machine has done for this pool, folded out of the logs it already writes, moving an offer's score with a stated reason — `gpm machines` | `server/src/gpm_server/history.py` |
-| **The simulation** ([docs/simulation.md](docs/simulation.md)): thirteen scenarios running the real router and supervisor against a market that moves — a merge gate in CI beside the unit suite | `tests/simulation/` |
-| **Dynamic allocation (S1, D66)**, off by default: demand is measured — busy workers plus what is waiting, against a target utilisation — and hosts arrive in rounds of 1, then 2, then 4, each waiting for the last to land; the lease becomes the ceiling | `server/src/gpm_server/strategies.py` `decide_ramp`, `Load` |
-| **Automatic worker adjustment (S5, D67/D68)**, off by default: each rented host starts at six, climbs on measured throughput within what its engine was launched to run, and steps down when a model leaves memory, when it is far slower than the pool for the same model, or when its last step up did not pay | `server/src/gpm_server/strategies.py` `decide_workers` |
-| **Buffered delivery (S2, D62)**: responses from hosts that can be taken away are held until whole and replayed as the same frames; a host lost mid-generation costs a re-run, not half an answer | `server/src/gpm_server/router/app.py`, `pool.delivery` |
-| **Renting**: overflow-driven, one at a time, caps re-checked after every strategy, spend reconciled against provider-reported charges, orphan sweep, verified destroy | `server/src/gpm_server/supervisor/renting.py` |
-
-**Tests: 574 pass with no GPU and no cloud account** (`uv run pytest`, ~125 s, against a fake
-engine and a fake provider), and **9 more against a real local Ollama** (`uv run pytest -m integration`), which is
-where the phase-1 exit criterion is actually demonstrated: streaming, tool calls, structured
-output and cancel-on-disconnect behaving the same through the router as direct to the engine,
-including a byte-for-byte comparison wherever the engine is reproducible.
-
-**One gap in the tunnel's testing:** the supervisor is exercised against a stand-in for
-`ssh -N -L` — start, listen, carry traffic, die, come back on the same port — but the `ssh`
-command itself is only asserted option by option. A first run against a real SSH host is worth
-doing before this is relied on; it needs an SSH server, so it is not something the suite can
-bring up for itself.
-
-### Phase 2, stage by stage
-
-| Stage | State |
-|---|---|
-| **2a** Two processes, one database — supervisor owns probing, tunnels and the host table; the router reads it and keeps serving when the supervisor dies | **done** |
-| **2b** Provider interface, fake provider, leases, strategies, renting, money | **done** (core) |
-| **2c** Dead-man timer (armed at creation, run and proven to fire), prepare-a-host, parking with reuse | **done** |
-| **2d** Control API on the supervisor, admin key, hashed key files, CLI verbs, `gpm plan` | **done** |
-| **2e** The interruption drill as one offline suite | **done** |
-| **2f** One live Vast.ai run, capped under $2 | **done** (2026-09-19): bid → instance → timer armed and the pool's key installed by the start-up script → tunnel → model set pulled and pinned by the supervisor → `ready` → a request served through the router from the rented host → **a real, unforced eviction recovered unattended** → `gpm down --all` → account empty. Total cost of the run, both attempts: **$0.008** |
-
-### What the read-only live check found (2026-09-19)
-
-- **Endpoint shapes confirmed** for account and offer search. Credit on the account: $4.18.
-- **A wrong assumption caught before any bid**: on bid-type offers, `dph_base` is the floor
-  again, not the on-demand price. Every "would bid" came out at 0.8 × floor — below the floor,
-  unwinnable. Fixed by joining the on-demand listing by machine id (verified fact recorded), and
-  it produced a rule: a bid the ceilings push below the floor is a refusal, not a bid (D34).
-- With that fixed, the market through a $0.25 ceiling: 100 offers seen, 8 pass. Cheapest
-  acceptable ~$0.18/h on a 64 GB mining card; a known-good RTX 4090 at $0.25/h (clamped by the
-  ceiling from $0.26).
-- **Still unverified, needs an instance**: whether per-instance charges are reported. If not,
-  the provider declares `reports_charges: false` and the cap margin widens to 25% by itself.
-
-### Restarts are safe now
-
-A restarted supervisor lists the provider's instances under the pool's label, **takes back the
-ones the host table says it intended** (bid, machine, start time — so spend keeps counting from
-the real start — lease, hold, park state), re-opens their tunnels, re-verifies readiness rather
-than assuming it, drops rows for instances the provider no longer has, and only then sweeps.
-`gpm restart` therefore keeps rented hosts, as spec §1.1 says it must. Covered by
-`tests/test_adoption.py`, including the case where the lease closed while no supervisor ran.
-
-### Phase 3 — the console
-
-| Stage | State |
-|---|---|
-| **3a** The page at `/ui`, live over server-sent events; Overview, Hosts, Models, Leases, Decisions | **done** |
-| **3b** Configuration: validate → plan → apply, versions and rollback, reload in place | **done** |
-| **3c** Rented capacity: provider, limits, live market preview with unsaved values, Prepare a host | **done** |
-| **3d** Test connection (including the concurrency check), CLI parity verbs | **done** |
-| **3e** Exit criterion | **done** — see below |
-
-The roadmap's exit criterion, demonstrated: **every console action has a CLI verb** making the
-same call (`gpm config get|validate|plan|apply|history|rollback`, `gpm host-test`, plus the
-existing lease/host/market/events/down verbs); **a mistyped ceiling is caught by plan** — live,
-0.25 typed as 25 was reported as "the bid ceiling goes from $0.250 to $25.000/h", flagged as
-needing the value retyped, and `gpm config apply` refused it without `--yes`; **the app key is
-refused** by every control endpoint the console calls.
-
-Also proven live against the local Ollama: applying a model-set change made the running pool
-follow it (host went `ready`, the router served a request), and rollback restored it.
-
-### Phase 4 — Release
-
-| Item | State |
-|---|---|
-| Identifier rename to `gpm` (CLI, packages, `GPM_*`, `X-GPM-*`, `~/.config/gpm/`, label prefix) | **done** (D36) |
-| Licence: Apache-2.0, `LICENSE` + `NOTICE` (copyright ClearViews), DCO in `CONTRIBUTING.md`, dependency licences checked | **done** (D37) |
-| `SECURITY.md`, `CONTRIBUTING.md` | **done** |
-| CI: tests on 3.11–3.13, gitleaks, `pip-audit`, and a job that fails if anything able to reach a real provider enters the default suite | **done** |
-| Secret scan before the first commit | **done** — only test fixtures matched; the account key is in no tracked file |
-| Two packages, `gpm-client` (one dependency) and `gpm-server` | **done** |
-| Code of conduct, issue and PR templates | **done** |
-| Lint (ruff) in CI, and the code clean under it | **done** — a type-check is still to add |
-| Quick start over hosts you already own, renting nothing | **done** — `docs/quickstart.md` |
-| The rented-provider guide (`docs/quickstart-renting.md`) and the plug-in author guide (`docs/writing-a-plugin.md`) | **done** |
-| First-party plug-ins load by entry point, with no privileged path; `CHANGELOG.md`; versions reported at runtime | **done** |
-| The three adopter-internal files | **deferred by the owner**: commit now, decide before going public — which then means publishing from a fresh history |
-| Threat model re-read line by line against the implementation | **done** — `threat-model.md` §6 maps all 19 threats to the code and test that hold them, and `tests/test_threat_model.py` pins the invariants a refactor could silently lose |
-| §2.2 safe defaults re-checked against the code | **done** — all seven ticked, each pointing at its threat-model row |
-
-### Not built yet, on purpose
-
-- The right-hand column of the roadmap's §1 (post-v1), and strategy replay.
-- Worker counts come from configuration only. Capacity profiles, the memory-ceiling formula and
-  evidence-based step-down need hardware inspection, which arrives with test-connection.
-- `enforces_schema` is declared by the operator; nothing measures it yet. The smoke test that
-  would (engine interface `smoke_test`) is phase 2.
-
-## What GPM is, in five lines
-
-1. Apps see **one URL and one API key**; they never know where the GPU runs.
-2. A **pool** holds hosts of three kinds — local, fixed-remote, rented on a bidding marketplace —
-   reached by tunnel, http or https. Capacity is **workers per host**; every host keeps the
-   pool's **whole model set** loaded.
-3. Routing is **strict priority**: local, then fixed, then rented; first come, first served.
-4. A **lease** with a mandatory dollar cap is the only thing that can spend. A **supervisor**
-   process rents, bids, recovers and tears down; a separate **router** process serves requests
-   and keeps serving if the supervisor dies. A **dead-man timer** sits on every rented host.
-5. An **SDK** makes apps wait-and-retry by default; an **operator console** configures hosts and
-   bidding, prepares a rented host with models on request, and shows every decision with its numbers.
-
-Read [docs/overview.md](docs/overview.md) first, then [docs/decisions.md](docs/decisions.md).
+**Running on the owner's laptop:**
+- **`~/gpm-pool`** — a pool from this repository's `main` (router 8100, console 8101), hosts
+  `mac-gemma`, `mac-whisper`, `anthropic` and `ollama-cloud`; restarted 2026-11-23 on gpm-server
+  0.44.0. Started and stopped by its own `start.sh` / `stop.sh`; nothing starts it at login.
+- **SpaceGarage's pool** — gpm-server 0.37.4 pinned by that app (router 8090, console 8091),
+  running again since 2026-11-21. It is not this repository's code; its console lacks everything
+  since 0.37.4.
 
 ## Next actions, in order
 
-**Newest (2026-11-21): S16 built against fakes — S15's open items (D183–D185; gpm-server 0.44.0, gpm-agent 0.18.0), on branch `story/s16-trained-models-rented-and-windows`.** Container builds rented (a declared `start`; private registries' logins kept by registry and handed only to a provider's create call — Vast `image_login`, RunPod registry credentials); a private hub file's read-only token copied to a rented machine over SSH; ONNX Runtime installed by the agent on Windows (sets committed; a real-pip install test on CI's Windows job). Reviewed twice (security, correctness); every finding fixed: a provider's error scrubbed of the registry password, RunPod's credential named by a random key, logins limited to a token's characters and documented as pull-only tokens (a marketplace machine's Docker can capture them), an unreadable store stops renting, the hub endpoint sent with the token, fine-grained write tokens refused, ONNX Runtime told to load CUDA's wheel libraries (`preload_dlls`), one container build per rented model. Not run on real hardware: a Windows PC with CUDA, a rented private image, a rented machine reading a private hub repo.
-
-**Before that (2026-11-21): the stale install error, also across an agent restart (gpm-agent 0.17.2, branch `fix/agent-install-error-after-restart`).** What a failed check wrote is now kept in the install record, not only in memory. Two tests added. Not released. **Also decided by the owner (D183–D185), not built:** container builds rented, private images too (a declared start command; the registry login kept with the provider account and passed in its create call); a private hub file reaches a rented machine with the read-only token copied over SSH into the agent's environment (never the instance spec); the agent installs ONNX Runtime on Windows, processor and NVIDIA.
-
-**Before that (2026-11-21): released as v0.43.0, at the owner's word** — gpm-server 0.43.0, gpm-client 0.9.0, gpm-agent 0.17.1, wheels and `SHA256SUMS` attached; marked Latest. It carries S15 (trained models, PR #98) and the agent's stale-install-error fix (PR #99). Install links in the README, quickstart and SDK docs point at it.
-
-**Before that (2026-11-21): fixed — an engine install kept a failed check's error after a later check succeeded (gpm-agent 0.17.1, branch `fix/agent-stale-install-error`).** Reported from a Windows machine: a lookup of GitHub failed once, the retry found the latest release already running, and the error stayed in `engine.install.error`. Two tests added. Not released; a release would carry it with S15.
-
-**Before that (2026-11-19): S15 built end to end against fakes — trained models (D178–D182; gpm-server 0.43.0, gpm-client 0.9.0, gpm-agent 0.17.0), reviewed twice, on branch `story/s15-trained-models`.** A kind `predict` on `POST /v1/predict`; engines `onnx` (the pool's own ONNX server on ONNX Runtime, installed by the agent from locked sets `tools/onnx-lock` makes — 1.32.0 committed — or run by the owner's Python; inputs prepared and outputs read as declared; batched; a made-up input run as each build loads) and `container` (an image by digest through the Docker Engine API, narrowly; `run_containers: never`); Add model on the Models screen (read the file, Test against it, Add); uploads kept by hash and sent through the agent's seventh verb or relayed once to the operator's hub repository; `containers.enabled` confirmed by the pool's name on every path that writes the file; rented machines for ONNX models (`rented.engine: onnx`, plain Python image). Checked live on this Mac only: the Mac set installed from PyPI with every hash checked, and a prediction served through it on CoreML. **Not built, an owner decision each:** renting for container builds (a provider starts a machine with its own command, and takes no registry login), the hub read token on rented machines (an instance spec carries nothing secret), and ONNX on Windows through the agent's own install (an owner's Python works). **Not run on real hardware:** CUDA, a rented machine, Docker, the hub relay. Next: merge (owner's word given: review before merge), then a release.
-
-**Newest (2026-11-08): rented images kept current (D177); a rented gemma4:31b test with an Ollama burst, run live; hosted prices proposed from the provider, paid by plan; no restart for any change to a provider account; an account's address fixed (D173–D176, gpm-server 0.42.0, branch `story/s14-renting-without-restart`, not committed).** **Live test (owner-approved, $1.50 / 1 h cap):** workload `gemma-test` on `~/gpm-pool` — gemma4:31b on one rented Vast Titan RTX ($0.087/h bid) with Ollama's cloud as its burst ($0.50/day): steady requests answered by the machine, a burst of 6 answered 1 by the machine and 5 by Ollama's cloud ($0.00015); ended, both hosts destroyed and verified; lease spent $0.301 — Vast reported $0.294 for the second host against a $0.016 estimate, most likely its per-GB download of the 20 GB model (`offer_policy.max_download_per_gb` unset). Found on the way: (1) the first host never served — the image named by hand (`ollama/ollama:0.40.15`) did not start Ollama under Vast's SSH mode, and the pool's shipped Ollama image (0.34.2) predated the model → **D177**: the engine's newest official release, checked and dropped by itself, and the pool starts Ollama itself; (2) **the workload's connection hands out `…/v1` but the SDK adds `/v1` itself** — fixed 2026-11-11 in gpm-client 0.8.1; (3) **Gemma 4 on a machine's Ollama thinks by default and spent a 120-token limit on it (empty answer) while Ollama's cloud answered at once** — the test app sends `reasoning_effort: none`; an app cannot tell which answered, so the pool may need to say or set this per model: open. `~/gpm-pool/pool.yaml` now has renting set up (50 GB, $0.60/h, 24 GB cards, old cards excluded) with no image named: D177 is deployed there (both hand-named lines removed; status shows `ollama/ollama:0.40.15`, on trial until a rented host from it serves — not yet rented on it). Rented capacity's Hosts tab now lists every provider account (Vast, RunPod, Verda), not the first one only. **CI**: the nightly run on main (2026-11-09) and PR #91's failed on one test, `test_a_key_replaced_or_removed_takes_effect_without_a_restart` (a 10 s wait for a typed key to reach the router ran out) — never reproduced locally, alone or 24 at once; its wait is now 30 s and a failure says what each side held, so the next one names the cause. Before that,  ("I don't decide the price", "why not grab it from the provider?"): D176 — `gpm_server/hosted_prices.py` proposes each model's price from the provider's `/models` (OpenRouter, Together), its pricing page (Ollama's cloud, `https://ollama.com/pricing`: 25 of the owner's 26 models matched), or LiteLLM's public price list, shown with its source and saved only by the operator; `price: {plan: true}` where the operator says a provider is paid by plan; the owner's first look found "null" twice and a collapsed name field in Models and prices — every `replaceChildren` now goes through `refill()`, which skips a part left out; fields labelled as prices, not limits; threat T38. Three facts it rests on are in Unverified assumptions (LiteLLM's raw URL and provider names, Together's and OpenRouter's fields, Ollama's billing). Tests: `tests/test_hosted_prices.py` (no network: the list's fetch is a fake). Before that: The owner then asked why renames and settings still needed one: D174 builds a changed connection's plug-in again between passes (`ProviderAccounts._rebuild`, `Fleet.rename_connection`), its credential by the rules in force; a rename carries its search use. Then the owner: the URL is a setting that should never change — D175 fixes an account's address once it is added (`ProviderAccounts.refuse_moves`, now also checked before the console writes the file). Still refused: a holding connection's credential source changed (D136); still at a restart: a version-1 plug-in given new settings. Tests: `tests/test_provider_credentials.py` (moved, renamed while holding a host, credential and search use carried). First, The owner added Vast on `~/gpm-pool` after S14 was deployed: saved, but not listed until a restart, which they called a poor solution. Now the supervisor builds the renting machinery as the file gains its `rented` section (`Supervisor._start_renting`, called from `apply_config`), as at a start; the plan no longer says a restart is needed. Renting that cannot start leaves the pool as it was and says why (`renting_refused`, `problem` on the Providers and Rented capacity views), and is tried again at the next change to the file. D171's "renting starts at the next start" and D172's "still a restart" are superseded. Tests: `tests/test_renting_setup.py` (in use at once; a lease that may rent opens once set up; a start that fails and is put right), `tests/test_hosted_providers.py`. `~/gpm-pool` was restarted by hand for Vast meanwhile; Vast is listed there. **Merged as PR #94 (2026-11-11) and released as v0.42.0 at the owner's word** — gpm-server 0.42.0, gpm-client 0.8.0, gpm-agent 0.16.0, wheels and `SHA256SUMS` attached and checked after download; marked Latest; its notes cover 0.38.0–0.42.0. **The v0.40.0 GitHub release was deleted at the owner's word** (its tag kept); v0.37.4 and v0.37.3 kept. **Next:** the account-balance view for hosted APIs (proposed, awaiting the owner); set `offer_policy.max_download_per_gb` in `~/gpm-pool`. Still open: the supervisor child left running when `gpm serve` stops (seen twice today).
-
-**Newest (2026-11-08): S14 built against fakes — a provider account before renting is set up (D172, gpm-server 0.41.0), merged.** The owner, adding Vast.ai on the new Providers screen: why does an account need a disk size and a budget, and the save was refused — rented machines defaulted to vLLM, and the pool's models (Gemma for Ollama, Hebrew Whisper for whisper.cpp) have no vLLM build. Now Add provider writes only the account; a `rented:` section without both ceilings is "not set up" and rents nothing (no renting lease opens, `rent_one` refuses, serving checks wait); Rented capacity shows only **Set up renting** until then — ceilings, engine, and only the models that engine has a build of, the rest listed with why; once set, ceilings can be changed, not removed. Also fixed from the owner's screenshot: the word "null" on Add provider's account step (and in the credential and hosted Settings dialogs) — a part left out was handed to the browser's own `append()`; dialogs now go through `fill()`, which skips it. Tests: `tests/test_renting_setup.py` (API, fleet refusals, plan, browser — the account step included). Full suite: 2693 passed, 2 timing failures under load that pass alone. **Merged and deployed to `~/gpm-pool`** on the owner's word. **Next:** the owner adds Vast on `~/gpm-pool`, restarts, and sets up renting (Ollama, gemma-4-e4b; Whisper stays on the laptop).
-
-**Before that (2026-11-08): released as v0.40.0, at the owner's word** — gpm-server 0.40.0, gpm-client 0.8.0, gpm-agent 0.16.0, wheels and `SHA256SUMS` attached and checked after download; marked Latest; v0.37.4 and v0.37.3 kept (owner: keep the old release). It carries S11–S13 and PR #92.
-
-**Before that (2026-11-08): S13 merged — Providers on the console (gpm-server 0.40.0, PR #91, on a green local suite; not run against a real provider).** The owner, on the new laptop pool: Rented capacity could not be opened (a pool with no `rented:` section hid the very tab that adds a provider), and hosted providers should be added "like VastAI". Built (D171): a **Providers** screen with hosted model APIs beside rented accounts; **Add hosted API** — choose from a list (Anthropic, OpenAI, Groq, Together, Ollama's cloud, OpenRouter, DeepSeek, Fireworks, DeepInfra) or another API of either format, type the key once, test it against `/models` (spends nothing), tick models with the names apps ask for and their prices, save through validate → plan → apply; each build pinned to its API (`requires: [hosted:<id>]`). Keys kept by the supervisor in `provider-credentials/hosted/`, bound to the host's `base_url`, **read by the router** (amends D130/D164; T36), effective without a restart. The hosted budget set there too. A pool that rents nothing adds its first rented account from the console (asking the disk and hourly ceilings and the engine; renting starts at the next start). Found and fixed on the way: no endpoint could add a host and the file editor could not append to a list (`append_list_item`, block style). Tests: `tests/test_hosted_providers.py` (API, router using a typed key, key replaced/removed live, moved address withholds the key, first rented account, a browser run of the whole wizard). `~/gpm-pool` restarted on it: the Anthropic card shows its key from the environment, state ready. Then, from the owner's first look (PR #92, merged): Providers is **one list** — rented accounts and hosted APIs under one **Add provider** whose first step offers both kinds — and Rented capacity's Providers tab is gone; a hosted card's **Settings** changes requests at once (the owner saw "at most 4" with no way to change it) and prompt caching; a dialog-clearing race found and fixed on the way. **Next:** the owner tries Add hosted API from the console; Seen on the restart: stopping `gpm serve` left its supervisor child running (orphaned, holding the pool lock) until killed by PID — worth a look.
-
-**Before that (2026-11-08): S12 checked live against Anthropic and merged (PR #90).** At the owner's word (an Anthropic key added to `env`): nine requests to Claude Haiku 5.5 through a temporary loopback pool, $0.0006 — the cache mark caches (3,328 tokens written, then read), an OpenAI-format request translated to Claude reads the same cache, streams, `count_tokens`, a translated tool call, `x-api-key` and the refusal of `n` all as built; cost matched Anthropic's counts (verified facts). Not yet live: Anthropic-format apps to an OpenAI-format provider, S11's other providers (no keys), Ollama's and vLLM's `/v1/messages`. No release made of 0.38.0/0.39.0, 0.8.0, 0.16.0. **Next:** a release, asked first; live checks of other providers as their keys arrive.
-
-**Before that (2026-11-07): S12 built against fakes — both API formats, to any model (gpm-server 0.39.0).** The owner answered: caching on by default for 5 minutes; untranslatable fields refused unless the app selects the silent option (`X-GPM-Unsupported: drop`, named in `X-GPM-Dropped`); load alone; Anthropic's OpenAI-compatible layer retired; build end to end. Built: `/v1/messages` and `count_tokens` beside `/v1/chat/completions`; the `anthropic-api` engine; vLLM and Ollama pass `/v1/messages` through untouched; two closed translators (requests, answers, streams, usage, errors); the 5-minute cache mark added where a request has none (`cache_prompts: false` on a host turns it off); `price.cache_write` (required on `anthropic-api` builds) and cache reads/writes metered from both formats' usage; the pool's refusals in Anthropic's error shape; `x-api-key` read as the key — and **no longer forwarded to hosts, which it would have been** (found while building). D169, D170; supersedes "never translates between APIs". Tests: `tests/test_both_api_formats.py`.
-
-**Before that (2026-11-07): S11 merged (PR #89, CI green on every job, Windows included); S12 planned.** S11 went out without its live check (no provider key was at hand) and with a known limit written where it matters: Claude through Anthropic's OpenAI-compatible endpoint is never cached. The owner asked for both API formats — OpenAI-format apps reaching anything, Claude included, and apps on Anthropic's SDK — so **S12, "Both API formats"** ([story](docs/stories/S12-both-api-formats.md)) is planned on branch `story/s12-both-api-formats` (not committed): a `/v1/messages` front door beside `/v1/chat/completions`; untouched wherever a host speaks the request's format (Anthropic, vLLM ≥ 0.11.1, Ollama ≥ 0.14.0, Ollama's cloud, OpenRouter, DeepSeek), translated only where none does (OpenAI, Groq), refusing what cannot be carried; Claude only through its own API, caching on by default; metering of cache writes. Provider research recorded in decisions.md's verified facts. **Five questions for the owner** in the story. No release made of 0.38.0 / 0.8.0 / 0.16.0 yet.
-
-**Before that (2026-11-07): S11 stage 4 done — a machine's Ollama never reaches Ollama's cloud (same PR #89, gpm-agent 0.16.0).** The agent's Ollama and a rented machine's run with `OLLAMA_NO_CLOUD=1`; the configuration refuses a `:cloud`/`-cloud` tag on a machine's build (or an uncatalogued model in the set), pointing at a hosted host at `https://ollama.com/v1`; the agent refuses one in a desired set (`cloud_tag`); a cloud model any Ollama lists — one an owner runs signed in — is never taken for one on its disk (D168, built and widened). **Owner, 2026-11-07:** go for stage 5; a raised hosted budget needs no second typing (recorded in D165). **Blocked:** no hosted-provider key is in `env`, `~/.config/gpm` or the shell — the owner adds the ones to check (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `TOGETHER_API_KEY`, `OLLAMA_API_KEY`, `GROQ_API_KEY`, …) to the gitignored `env`. **Then:** stage 5 — a temporary pool on loopback, each provider a hosted host, one chat request each (`max_tokens` 16), budget $1 a day; then the PR out of draft and a release.
-
-**Before that (2026-11-07): S11 stage 3 done — spending on the console, and a provider out of money reset by the operator (same PR #89).** A **Spending** screen (`GET /pool/spending`, `gpm spending`): hosted spend today and this month per workload and provider, every hosted and rented-burst budget against its day's and month's limits. A hosted API whose provider refused for money is marked on the Hosts and Spending screens with what it said, and stays out of routing until the operator presses **Money is back** (`gpm host funds-restored <id>`): the router publishes the mark with its counters, the supervisor the operator's word in the host table, and the router routes to it again on a word newer than the refusal (D164 amended). Tested end to end against the fake provider; the console checked by a real browser run. **Next:** stage 4 (`OLLAMA_NO_CLOUD` on agent-run Ollama, `:cloud` tags refused on machines, D168); stage 5 live, a few cents per provider — **asked first**; then the PR out of draft.
-
-**Before that (2026-11-07): S11 stage 3, third part — workloads served by hosted APIs alone (same PR #89).** A model asked for with `parallel: 0` (always so for a hosted-only model like Claude) is never planned, rented or borrowed for — even while its workload prepares and may borrow — and goes to the hosted APIs on the workload's hosted budget from the first request; it needs a hosted burst a hosted API serves, kept while it runs. A workload whose every model is so rents nothing: no market search, no `max_spend` (refused; the SDK's is now optional), a lease of hours alone that cannot rent, serving from creation, ended by its hours though no fleet pass looks at it. Mixed workloads plan and rent for their machine models only. **Fixed on the way:** a hosted API was counted as holding every catalog build that names no engine (so a hosted burst could pass the check for a model no provider serves). Tests in `tests/test_hosted_alone_workloads.py`; **not run on a real provider.** **Still to build:** spend on the console and an operator reset for a provider out of money; stage 4 (`OLLAMA_NO_CLOUD`); stage 5 live, asked first.
-
-**Before that (2026-11-07): S11 stage 3, second part — each workload's rented burst (same PR #89, gpm-server 0.38.0).** `bursts.rented` (`after_min`, `max_hosts`, a `per_day`/`per_month` budget): once every base host serves and the load — spilled requests included — has stayed above them for `after_min`, the ramp rents up to `max_hosts` beyond the base per group, each only where the burst's budget has an hour of every burst host left; paid from the workload's lease (a derived budget carries the burst; D124 counts a burst host only to its budget). Burst hosts never count as the base (a lost base host is rented again at once), go first when the load falls, and are drained when the budget is reached (less the lease's safety margin) or the burst is taken away. `gpm workload create|policy --rent-…` (policy keeps a burst its flags do not name; `--no-rented`). **D165 amended:** `steady` is the workload's `parallel` at its `latency_s` — no separate host/worker count, which would contradict the latency sizing; a running workload's burst draws on what its lease has left. Fleet-level tests in `tests/test_rented_bursts.py`; **not run on a real provider.** **Still to build:** a workload with no machine (hosted alone; hosted-only models in a workload), spend on the console, an operator reset for a provider out of money; stage 4 (`OLLAMA_NO_CLOUD`); stage 5 live, asked first.
-
-**Before that (2026-11-06): S11 stage 3, first part — each workload's own hosted burst (gpm-server 0.38.0, gpm-client 0.8.0), on draft PR #89.** A workload carries a spending policy: `bursts.hosted` (after `after_s`, a budget per day and/or month, optionally per request), set at creation or while it runs — by its operator (`bursts` on `POST /pool/workloads`, `POST /pool/workloads/{name}/policy`, `gpm workload create|policy --hosted-…`) or by its program through the SDK (`bursts=`, `set_bursts()`, `hosted_budget()`), bounded by the grant's new `hosted_per_day`/`hosted_per_month` and the pool's `provisioning.max_hosted_per_day` (both 0 by default), counted as committed like renting (D125). The router serves a workload's burst from the pool's hosted hosts on its own budget, never as borrowing. A budget now needs a day or a month (D165 amended). SDK replies carry `cost_usd`. **Not built yet:** `steady`, `bursts.rented`, a workload with no machine at all (hosted alone; hosted-only models in a workload), spend on the console — refused in words meanwhile. An operator's change to a workload's hosted budget is not typed twice — confirmed by the owner (2026-11-07).
-
-**Before that (2026-11-06): S11's first build stage done — hosted model APIs routed, metered and budgeted (gpm-server 0.38.0).** The `openai-api` engine and the `hosted` host kind (written with an https transport, `bearer_env` and `workers` — D164 amended); hosted builds priced, hosted-only models kept off machines and out of renting; the router spills after `pool.bursts.hosted.after_s` (at once for a model no machine serves), holds the worst case against the budget (per request, UTC day, UTC month) before sending, asks streams for their usage and removes the extra chunk, charges from the answer's counts, says `X-GPM-Cost-USD` (streams: `X-GPM-Cost-Max-USD`), waits out a busy provider and takes one out of money out of routing; spend is in the request log and `/pool/status` `budgets`. Tested end to end against a fake provider (`tests/test_hosted_apis.py`); full suite green; **not run against a real provider**. Only the shared workload has a hosted burst so far. **Next:** stage 3 — each workload's own spending policy (`steady`, `bursts.hosted`, `bursts.rented`) through the SDK and the grant's hosted ceilings; then the console's spend view and an out-of-money reset; `OLLAMA_NO_CLOUD`; a live check of a few cents per provider, asked first.
-
-**Before that (2026-11-06): S11 decided — hosted model APIs, paid per token from each app's own spending policy (D164–D168).** The owner asked for serverless providers reached with an API key (Ollama's cloud, Together, Claude, OpenAI, …). Decided: a hosted API is a host (`kind: hosted`, one `openai-api` engine for every OpenAI-shaped provider, requests passed through untouched, Anthropic through its OpenAI-compatible endpoint — which Anthropic calls not production-ready, given up knowingly); hardware first, the hosted tier last after a short wait; **each app states its own spending policy** — `steady` capacity on machines, `bursts.hosted` (tokens, after `after_s`) and `bursts.rented` (machines, once a burst lasts `after_min`), each with its own dollar budget, any mix, set through the SDK with its provisioning key within the operator's grant (amends D1 and D117); some models (Claude, GPT) are hosted-only and never rented; the router meters each answer's usage at catalog prices, reserving the worst case before sending (providers' own spend limits lag or are absent); `X-GPM-Cost-USD` on hosted answers; the router holds the hosted keys (T36); a machine's Ollama never reaches Ollama's cloud (`OLLAMA_NO_CLOUD=1`, T37). Research of each provider's documentation is in decisions.md's verified facts. **Releases since 0.37.0**, all with wheels and `SHA256SUMS` for SpaceGarage's Windows installer: v0.37.1 (the pool runs on Windows), v0.37.2 (elevated runs, whisper.cpp's device), v0.37.3 (failing agents retried with backoff), v0.37.4 (the supervisor restarts itself; `supervisor` in `/pool/status`); the GitHub releases 0.1-beta and 0.37.0–0.37.2 deleted at the owner's word (tags kept), 0.37.3 kept while SpaceGarage's `install.bat` pins it. **Next:** S11's build in stages — the `openai-api` engine and the `hosted` kind with metering against a fake hosted API; the spending policy and the grant's hosted ceilings; the console; `OLLAMA_NO_CLOUD`; then a live check of a few cents per provider the owner holds a key for, asked first.
-
-**Newest (2026-11-01): PR #83 (S10) merged to main at the owner's word (`7be6eab`, gpm-server 0.37.0, gpm-agent 0.15.0), and the laptop's GPM uninstalled — nothing of it runs here any more.** The owner will install from latest `main` with an external app that does the installation end to end. Stopped with nothing rented and no lease or workload open: router, supervisor, forwarder, both agents (launchd entries removed), Ollama, whisper-server. Removed: the releases (`~/.local/share/gpm`), the agent's uv tool, the engines directory, agent settings in `~/.config/gpm`, Ollama.app and `~/.ollama` (27 GB of models), whisper.cpp from Homebrew, `~/gpm-whisper-models` and `~/.cache/whisper-models` (8.4 GB). Kept: the repository's own gitignored `env`, `pool.yaml`, `gpm.sqlite3`, `provider-credentials/`; `~/.config/gpm/laptop.admin-keys`, `laptop.app-keys` and `known_hosts`; `~/.cache/huggingface` and ffmpeg, which were not GPM's. Left for the owner: `/usr/local/bin/ollama`, a root-owned link now pointing at nothing (`sudo rm`). SpaceGarage, the external app, has since made its own install under `~/.spacegarage/gpm`. **MLX by default on Apple silicon:** the owner wanted a model to take its MLX build implicitly, and the regular one where none exists. Tested the same night on a temporary Ollama 0.40.13: plain `gemma4:e4b` already pulls an MLX build, and `json_schema` came back clean 10 of 10, so the 2026-09-26 fault did not appear (verified facts). No GPM change for now; whether this holds for other models is an unverified assumption. **Open for SpaceGarage:** its default `max_tokens: 400` can cut structured answers short, since answers took 208–482 tokens in the test and a 300 limit failed 4 of 10; not changed, as another session was working in that repo. **Releases:** the first GitHub releases, at the owner's word: `v0.1-beta`, a pre-release at `7be6eab`, then `v0.37.0` with this entry and a test fix for Python 3.11 (`venv` there adds `setuptools` and its vendored packages, which a test counted as installed); pull requests run only Python 3.12, the weekly run the rest. Source only, nothing on PyPI. Not gone through for them: the first-public-release section of the release checklist, and the three adopter-internal files are in the source archives. The README still says the repository is private. **Next:** the owner's Linux check of S10 stays open, and it needs a second vLLM version's set first; follow-ups as in the entry below.
-
-**Newest (2026-10-30, morning): PR #83 (S10) code-reviewed at the owner's word, and every finding fixed — on `story/s10-vllm-on-owned-machines`, pushed, not merged.** Three reviewers (installer, agent runner, pool) found 4 blockers, ~15 should-fix and ~15 minor; three helpers fixed them in worktrees, each with a test that fails before its fix, merged here. The blockers: the pool's upgrade pass gave up on a vLLM switch after 300 s (a switch takes up to ~36 min) and never checked the version that then ran — now the agent says how long a switch may take (`switch_bound_s`, sized for a failed one) and the pool waits that long (D153); a launcher refusal, a start that started nothing or the 30-minute serve wait still failed the vLLM version itself (D159); `auto` ignored glibc, so RHEL 8 chose vLLM and never installed it (D161). Also: the launcher no longer signals the owner's programs after a reboot (exact argument lists, boot id, process groups); only held models are started (`--models-from`); a crashed vLLM behind the router restarts; the audio check gets no credentials; staging failures back off to 6 h and the disk floor is 4× the wheels; pip reads no config file; D160's restart works without an env file, reads the agent's answer, and decides after the probe (it could restart a serving engine right after a supervisor restart); an operator's restart answers 202 and runs in the background (D162, new); the pool says when its `auto` and the agent's engine disagree. Spec, decisions, threat model, README and changelog updated. Full suite 2538 passed, 1 skipped. **Next:** CI on the push, then the owner's word to merge; the owner tests on a Linux machine of their own (see the entry below); worth a follow-up: `renting.py`'s `_restart_when_downloaded` has the same answer-reading gaps D160 had (P3/P5), and `uv.lock` still names gpm-server 0.36.0 / gpm-agent 0.13.0; whether real vLLM retitles its API server process (`setproctitle`) — the identity check would then signal nothing — is to be seen on the owner's machine.
-
-**Newest (2026-10-30, after midnight): S10 built against fakes — vLLM on the machines the operator owns — on `story/s10-vllm-on-owned-machines` (gpm-server 0.37.0, gpm-agent 0.15.0), not pushed, no PR yet.** Built in three parts, two by helpers in their own worktrees, reviewed and merged here:
-- **The pool** (D160, D161): `engine: auto` on a host — the pool takes its agent's choice from the facts, publishes that engine, holds its builds and says why (`engine_chosen`, the Hosts screen); nothing is held until it has chosen. Refused: `auto` without an agent, a model there without a build for both engines, a pinned `engine_version`, `auto` as the pool's or the rented machines' engine. An owner-installed vLLM with a restart command is started once all its models are on disk (amends D41: not while ready, nothing in flight, once per set).
-- **The agent runs vLLM** (D159): its own launcher as a program with the installed version's `vllm` (`--vllm`, accepted only inside the engines directory), started when every held model is on disk and again when that set changes, stopped by `gpm-agent vllm-stop`; under `auto` it chooses at start (Ampere or newer, the set's driver, a set for its Python) and hands over from the engine it ran before.
-- **The agent installs vLLM** (D157, D158): a private environment per version, filled only from the locked set it carries — pip with `--require-hashes`, wheels only, `--no-deps`, `--isolated`; refused before any fetch on the wrong glibc, card or driver. `tools/vllm-lock` makes the sets (a step in the release checklist); 0.32.0's eight sets (Python 3.11–3.14 × x86_64/aarch64) are 178 kB. Prerequisites: `venv`, a set, the driver; under `auto`, the engine it would choose here.
-- **Found:** vLLM 0.32.0 on PyPI is a **CUDA 13** build (`torch` 2.13.0 → `cuda-toolkit` 13.0.3), so it needs NVIDIA driver **580.65.06** or later, not the 525/575 assumed (verified-facts row; the CUDA 12.9 row corrected).
-- **Fixed in review:** a start where no model served was counted as the version's failure, which on a first install would leave the machine without vLLM until the next release; now each model's failure is said for it and the same set is not retried until it changes or is restarted (D159, amends D153 for vLLM). Also: `auto` takes `engine_version: latest` only (a number could be either engine's), and an `auto` host whose agent does not install engines says so.
-- **Known limits:** nothing has run on real Linux with an NVIDIA card; a version's environment points at the agent's own interpreter, so removing or upgrading that Python (a uv-managed one) breaks the kept versions; under `auto` both engines share one models path (Ollama's); the agent shipped to rented hosts carries the sets unused; the console's JavaScript was not syntax-checked here (no node on this machine — CI runs `node --check`).
-
-**Then:** pushed and opened as PR #83 at the owner's word, merged on green CI. The owner declined a rented live check — a rented container is not an owner's machine (no start with the machine, no `sudo` prerequisites as a user, no card driving a screen) — and will test on a Linux machine with an NVIDIA card of their own once they find one; the agent's README and the story say it has not run on real hardware. **Next:** when the owner has that machine: generate a second version's set first (`tools/vllm-lock` for the release before 0.32.0) so the upgrade and rollback can be checked; then `gpm-agent init --engine auto --install-engines --prerequisites --start-at-login` there, add it as a host, and watch the choice, the install, the start, a chat model, Whisper and a picture. It settles the unverified rows: the driver floor, the disk a version takes, the glibc floors, and `vllm --version` with no card free.
-
-**Newest (2026-10-29, close of day): S10 planned and decided — vLLM on the machines the operator owns (D157–D161), on `story/s10-vllm-on-owned-machines`, not pushed.** The owner's answers:
-- vLLM comes from PyPI, into a private environment per version.
-- Each version installs from a hash-locked set of dependencies that GPM's release generates and the agent carries (`latest` lags vLLM's own releases by a GPM release).
-- vLLM runs whenever the machine is in the pool.
-- It is all one build, including the pool starting an owner-installed vLLM once its models are on disk (D160). Today nothing does, a gap found while planning.
-- `engine: auto` falls back to Ollama where vLLM cannot run every model the host holds: an AMD or Intel card (vLLM's builds for them are not on PyPI), NVIDIA older than compute 7.5, a Mac, Windows (D161).
-
-Story [S10](docs/stories/S10-vllm-on-owned-machines.md); spec in host-agent §2.1, §2.3 and §3, supervisor §3.2, hosts-routing-capacity §4, and T35. **Next:** S10's build: the agent's vLLM source and locked sets, plus the tool that generates the sets; the agent running vLLM; the pool's start and `auto`; prerequisites; then the upgrade pass and the console. A live run on a Linux NVIDIA machine comes last, asked first (~$0.50).
-
-**Newest (2026-10-29, late night): PR #80 merged and deployed as v0.36.1 (gpm-server 0.36.1, gpm-agent 0.14.0); the rented check of speech and pictures passed.** Two reviewers found two blockers in the start-in-turn helper (a blocked SIGTERM inherited by the engines it started; an unreaped engine that died at start holding back the next model) and several should-fixes — all fixed with tests; CI's credential check, failing since S9's tests set `VAST_API_KEY`, fixed too. Live (`media-check-2`, one on-demand RTX PRO 6000 S at $1.425/h, $0.34, destroyed and verified): Gemma 4 E4B started first and served, Whisper started after it answered, as D155 says; a Hebrew sentence came back word for word through the pool from the rented host, a red picture was answered "Red" by Gemma 4 E4B on vLLM, and the workload's key was refused a model outside it. To rent it the pool's `max_all_in_hourly` was lowered from 12 to 2 for the check and put back (file identical to before). Why it was needed: the plan chose a four-card machine at $5.61/h because Gemma 4 E4B had been sized at one answer at a time on the RTX PRO 6000 S — measured only there, 3 s against 60 s — fixed as D156 on `fix/sizing-measured-low` (gpm-server 0.36.2), not yet merged. Also seen: the rental chose a different machine from the plan's — the rental's both-models check already read a measurement as a floor and the plan's did not, which D156 aligns; not fixed: `PATCH /pool/config/rented` says "send `confirm` with the new value" but wants it as the change's `value` (`12.000`); the pool records no time at which each model began serving. **Then:** D156 reviewed (no blockers; the rental's floor rule moved into sizing, so plan and rental now agree), merged (PR #81) and **deployed as v0.36.2** with nothing rented; under the pool's own $12 ceiling the same two-model plan now chooses a single-card RTX PRO 6000 S at $1.49/h (~$0.53) instead of a four-card machine. **Next:** the three small items above; S8 and S9 are done end to end.
-
-**Newest (2026-10-29, night): the live rented check of speech and pictures found four faults, fixed on `fix/rented-start-failures` (gpm-server 0.36.1, gpm-agent 0.14.0, D155), not yet merged or deployed.** Two workloads at the owner's word (about $0.64 in all, every machine destroyed and verified, nothing tested on a rented host): `speech-check` (Whisper + reranker, bid-priced) lost three machines to being outbid in its first minutes; `media-check` (Whisper + Gemma 4 E4B, on demand, $2 cap) lost one machine Vast reported stopped 50 s in, then a second whose Whisper vLLM process died at start with `Engine core initialization failed. See root cause above.` — the cause itself was lost with the machine. Fixed: (1) the agent reports the exception that is the reason, not vLLM's pointer to it; (2) the models on one card start one after another, each once the one before answers (D155) — vLLM v0.29.0 counts a neighbour loading during its own start as its own use (read in its source; that this killed Whisper is still an unverified assumption); (3) the console's host window says a released host is gone instead of blaming an older supervisor; (4) every stop, eviction and lost re-bid keeps what the provider said (`provider_said`), so the next lost machine is explained. Also the same evening, at the owner's word: the laptop moved to the agent-run headless Ollama 0.40.13 (Ollama.app's login job disabled), both agents start with the machine through launchd, and a picture was answered through the pool on the laptop (both Gemma models said "Red"). Observed, not fixed: the laptop agent misses the pool's 10 s question while Ollama loads the 26B model (`agent_unreachable` for ~20 s, twice). **Next:** review, merge and deploy the branch, then one fixed-price rented check of Whisper + Gemma 4 E4B (~$0.55, $2 cap) with a temporary app key — the owner allowed `gpm key create`/`revoke` in `.claude/settings.local.json`.
-
-**Newest (2026-10-29, afternoon): S8 and S9 merged (PRs #77, #78) and deployed as v0.36.0; whisper.cpp serves Hebrew speech on the laptop.** Both were reviewed by seven reviewers in all, every finding fixed with a regression test (see the review comments on #77 and #78). v0.35.0 deployed 12:37, v0.36.0 14:01, nothing rented either time. Live on the laptop: a second agent (`~/.config/gpm/whisper-agent.json`, port 8096, `install_engines`) built whisper.cpp 1.9.5 itself, fetched `ivrit-ai/whisper-large-v3-turbo-ggml/ggml-model.bin` and serves `speech-he` as host `mac-whisper` (8178, one worker) — ready 46 s after it was added; a Hebrew sentence (macOS's own voice) came back word for word through the pool; a translation got `503` as it should. **Evening, at the owner's word:** the laptop moved to the agent-run headless Ollama — the app's login job (`com.ollama.ollama`, its Squirrel launcher) disabled with `launchctl disable`, the app stopped, the agent given `install_engines`; it installed Ollama 0.40.13 (signature checked) beside the models already on disk and runs it on 11434, and the pool's settings (3 in parallel, 3 loaded) were applied from the pool, not by hand. Both agents now start with the machine (`gpm-agent startup add`: launchd agents `gpm-agent-laptop-agent` and `gpm-agent-whisper-agent`); whisper.cpp kept serving while its agent was moved. Both hosts ready in the pool. The old Ollama.app 0.40.11 is still in /Applications, unused. **Waiting on the owner:** S8's live rented check — `gpm workload create speech-check --model speech-he --latency 60 --parallel 1 --model ranker --latency 10 --parallel 1 --placement together --hours 0.25 --kind interruptible --max-spend 1` ($0.17 expected) — needs an app key to send its transcription and rerank through the router, and minting a temporary one was refused to Claude by the auto-mode classifier.
-
-**Newest (2026-10-26): a request naming the model twice or in another letter case is refused (D141), gpm-server 0.34.1.** Found by S8's security review and confirmed on the laptop: Ollama reads JSON keys ignoring case, last one winning, so `{"model": <catalogued>, "MODEL": <any tag on disk>}` passed the pool's check and was served as the other model. Now `model`, `stream`, `response_format` and `format` must appear once, spelled exactly (`400 ambiguous_field`); the model is rewritten where it was read; a body nested too deeply to parse is a `400`, not a crash. Released ahead of S8 at the owner's word — merged (PR #76) and deployed 2026-10-26 14:37 as v0.34.1, nothing rented; the release also carries Verda (0.34.0), inactive with no Verda connection configured and no Verda key given to the supervisor. S8's story work waits in a stash on `story/s8-models-beyond-chat`.
-
-**Newest (2026-10-13): a configuration plan names only what a host's agent will really download, gpm-server 0.33.1 — merged (PR #72) and deployed 2026-10-26 10:29 as v0.33.1, with `certifi` 2026.10.23 (PR #73: PYSEC-2026-4320, a compromised certificate authority trusted by `certifi` before 2026.10.18; found by the dependency audit in CI).** Found while taking the non-MLX 31B builds off the laptop: the plan said the laptop's agent "will download gemma4:31b", which the laptop does not declare. `_machine_changes` resolved the whole model set in the pool's engine; the supervisor gives each host `models_held_by` in `engine_of` (D89, D93), and the plan now does the same. On the live pool, through `gpm config apply`: `gemma4:31b-nvfp4` and `gemma4:31b-mxfp8` taken off the laptop and out of the model set, and the `gemma4:31b-nvfp4` catalog entry removed (validation required both; no request had ever asked for either); the three 31B builds deleted from the laptop's disk — the agent had pulled the two declared ones again after a plain `ollama rm`, so the configuration has to change first. Supervisor and router restarted on it with nothing rented and no lease or workload open; the forwarder and the laptop agent left as they were. **Verda (D140) is merged but not tested live or deployed**: gpm-server 0.34.0, merged to main 2026-10-26; its live check still waits on a Verda account with a little credit, an SSH key and a Cloud API client (one small spot machine, a few minutes, $0.50 cap, asking before renting). **Next:** the owner wants to move on to the next feature before Verda's live check — Shadeform, by D140's order, unless the owner names another.
-
-**Newest (2026-10-08): more providers — Verda, then Shadeform, then Lambda Cloud (D140, the owner's order). Verda's plug-in built, gpm-server 0.34.0 — merged to main 2026-10-26 on top of 0.33.1; not deployed, not checked live.** GPU virtual machines, spot (the provider's price, never bid on) or on demand; the start-up script runs the engine image as the one container that is the host, only its SSH daemon published (port 2222) since every Verda port is open; no dead-man timer, so short leases only; never parked; OS disk deleted with the machine. A provider without a timer now gets the pool's key and the engine's start (it got no start-up script at all). Credential `CLIENT_ID:CLIENT_SECRET`, shown under the console's field (`credential_format`). A security and code review found 14 points, all fixed with tests. 1572 tests pass. **Next:** the live check — the owner needs a Verda account with a little credit, one SSH key added in its console, and a Cloud API client; then one small spot machine for a few minutes under a $0.50 cap, **asking before renting**; four facts to settle are in decisions.md's unverified table. Model volumes on Verda after that. Then Shadeform.
-
-**Newest (2026-10-07): replacing bad-value hosts (D75), gpm-server 0.33.0 — merged (PR #70) and deployed 2026-10-07 21:53 as v0.33.0, with 0.32.1 (PR #69: each provider's search quota named above the market search; `provider-credentials/` gitignored).** With `workers_auto` on, a ready host whose cost per unit of work, measured while serving, stays above 3× the median of its peers (the other hosts serving the same model for the same demand) for 10 minutes is drained and its machine avoided; allocation rents another when the demand needs one. Bounds: settled worker count only, one at a time, at most two a lease, never the last ready host, a lease that covers the replacement. A code review's 8 findings fixed before merging. The live pool now has two provider connections, `vast` and `runpod` (added by the owner from the console); RunPod's credential is in `provider-credentials/` beside the database in the repo root, now gitignored. Supervisor and router restarted with nothing rented and no lease open; the forwarder and the laptop agent left as they were. **Next:** unverified live — no pool with `workers_auto` has run D75 yet; watch the event feed for `replaced_for_value` the first time a workload runs several hosts of one model.
-
-**Newest (2026-10-07): the whole provider feature built — RunPod (D138), keeping models between hosts (D139) and the market across providers (step 4) — gpm-server 0.32.0 and gpm-agent 0.11.0 — merged (PR #67) and deployed 2026-10-07 21:30 as v0.32.0.** Supervisor and router restarted on it with nothing rented, no lease and no workload open; the forwarder and the laptop agent left as they were; the live pool still has only the `vast` connection — RunPod is added from the console's Providers screen when wanted. RunPod was checked live on one pod ($0.023): its pods end themselves (the dead-man timer is on) and SSH comes up. D139: a checkbox per provider account (greyed on Vast, with the reason); a model volume per workload in its first host's data center, filled in the background by one host and copied from — every file checked — by later ones; hosts starting together never wait for it. Step 4: chips per provider and kind, a line per provider, rejections per provider, *would rent*. Security, code and UX reviews done and every finding fixed with a test (the worst: a host's malformed facts could stop the supervisor's pass; a pipe planted in a volume could stall readers; RunPod's GPU class taken for a machine; a host's volume lost at a restart). Console checked in headless Chrome. 1500 tests pass. **Checked live end to end** through a scratch pool ($0.08, nothing left): two RunPod hosts rented, reached, prepared, served and released; a model volume filled by the first and copied by the second in under a second; the workload's end deleted everything, verified. Found and fixed on the way: RunPod gives a pod's SSH address after creating it (now asked again each pass), and an Ollama image there needs `engine_start`. **Next:** replacing bad-value hosts (D75), being built on `feature/replace-bad-value`.
-
-**Newest (2026-10-07): the console keeps its place and its sign-in (D137), gpm-server 0.31.1.** Found by the owner: scrolled down, the page jumped to the top every few seconds (each status update redrew the screen through “Loading…”); and every reload asked for the admin key again. **Next:** the next provider plug-in — RunPod (step 5), on the owner's word.
-
-**Newest (2026-10-07): provider accounts in the console — several providers, step 3 (D130, D134–D136), gpm-server 0.31.0 — merged (PR #63) and deployed 2026-10-07 12:41 as v0.31.0.** Rented capacity → Providers: a card per account (icon, status, credential, quota, holdings, can / cannot), Add provider (choose → name and credential → test → save, showing the plan), Test connection, turn on or off, settings, remove; a credential typed in once, tested, kept in an owner-only file and never shown again. Adding, turning on or off and removing an account apply without a restart; settings and renames at the next one. Reviewed for security, code and UX; every finding fixed with a test. Supervisor and router restarted with nothing rented and no lease open; the live Providers screen shows `vast` with its logo, credential from `VAST_API_KEY`, valid. Nothing changes until a credential is typed in. Provider logos: the owner chose an address on the provider's own site (Vast: `https://vast.ai/icon.png`), loaded with no referrer, a lettermark if it fails. **Open for the owner:** Step 4 (the market across providers) or step 5 (RunPod) next.
-
-**Newest (2026-09-30): several models in one workload (D118), gpm-server 0.27.0 and gpm-client 0.6.0 — merged (PR #49) and deployed 2026-10-01 09:16 as v0.27.0**: supervisor, forwarder and router restarted with nothing rented, no lease and no workload open; the database took the new columns on start; the laptop agent left as it was. One to four models per workload, each with its own latency target and answers at once; the pool prices every model on every host (a fixed share of each per host, carried on each request) against a group of hosts per model, and keeps the cheaper. Architect-reviewed before building, code- and UX-reviewed after, every finding fixed. **Next:** the live check on Vast the owner postponed (D114 split, D116 volume/copy) — and, when a real workload of two models first runs, compare each model's p95 at its share with its target: the split rests on the unverified linear-mixing assumption (decisions.md).
-
-**Built 2026-09-28, not committed, not deployed: workloads (D115) and a new host's models (D116), gpm-server 0.25.0, branch `feature/workloads`.** Built end to end on the owner's word while away: the router (workload keys, `/w/<name>`, eligibility by workload, pool-wide borrowing that yields to the shared workload), the fleet (one unit per demand; hosts whose lease is not open released; a workload's start is a floor; room reserved for starting workloads), sizing at the latency target from the request log, the rental-kind rule, the lifecycle (plan/create/extend/end/rotate), the control API, `gpm workload`, the console's Workloads screen, and warm volumes and sibling copies on the fake provider. Two architecture reviews (the plan, then the code: 10 + 13 findings, all addressed) and a UX review of the screen (all Must/Should items done; a second look requested). **Nothing rented; Vast has no volume or copy support until checked live.** **Next:** the owner reviews; merge, deploy, restart; then a first real workload on the smallest case. **Open for the owner:** (1) ~~decouple a workload's model from the shared set~~ — done 2026-09-29: `workloads_only` catalog entries. (2) SDK-created workloads and client certificates: **built as D117** (gpm-server 0.26.0, gpm-client 0.5.0, gpm-agent 0.10.1), same branch. (3) ~~collapse the form~~ — done 2026-09-29. (4) the live check — D114's two-card split and D116's volume and copy on Vast, one session, ~$0.15–0.40 — postponed by the owner (2026-09-29). Vast's copy call is `PUT /api/v0/commands/copy_direct`, asynchronous with no completion signal; the agent now trusts a model only when its files add up to its marker's size, so a copy's completion is seen safely.
-
-**Newest (2026-09-28): a model split across the cards of one machine (D114), gpm-server 0.24.0 and gpm-agent 0.10.0, on branch `feature/split-across-cards`, rebased onto main after the Profiles tab (D112, 0.22.0) with the router-follows-the-file change renumbered D113 / 0.23.0 — **merged (PRs #44, #45) and deployed 2026-09-28 12:26 as v0.24.0**: supervisor, forwarder and router restarted with nothing rented and no lease open; the laptop agent was left on its older release (the agent change only matters to a vLLM host).** The owner asked how a model larger than any one host's memory can be loaded; of the ways reviewed (layer splitting across hosts, a provider's LAN cluster, one machine with several cards) chose the last. An architecture review of it came first, nine findings, all folded in. Built: `rented.split_across_cards: {profile: N}` (1, 2, 4, 8; owner's choice: per profile, not per model); the search asks for the card a 1/N share needs and whole groups of N cards (`gpus_multiple_of`, and `num_gpus ≥ N` asked of Vast — an explicit exception to D33); the host keeps N; the agent's `POST /engine` carries `cards_per_copy`; `vllm-start` runs a copy per group with `--tensor-parallel-size N`, refusing cards that do not group and heads that do not divide; Ollama and `engine_start` refused at load; the profile editor offers the split. **Next:** (1) the live check the owner agreed to — the cheapest two-card machine, a small model split in two, a few minutes, lease capped at $0.50; **ask before renting**. It settles the NCCL-hang assumption (a hang is not caught as a failed process, D104). (2) Something has asked for `gemma4:31b` about once a second since at least 2026-09-27 17:00, and every request is refused `no_eligible_host` (~3,600 an hour): nothing is rented and the laptop does not hold it. Whichever app it is keeps retrying; find it, or give the pool a host for the 31B. Follow-ups not built: a pool-side heads check before renting; an optional NVLink minimum; `gpm_agent.__version__` still reads 0.2.3 while the package is 0.10.0.
-
-**Newest (2026-09-27): the Profiles tab redone (D112), gpm-server 0.22.0, on branch `ux/profiles-redo` — PR open, not merged, not deployed: the owner is running benchmarks and asked to wait on deploy and restart.** The owner found D111's screens confusing: adding a model (Models → directory) chose the variant first, while a profile chose the model first and the variant in a second step, and the search was hidden. Now every picker offers rows that are a model *and* a variant, added in one click — the pool's own with no search, and a hub search answered as models with their variants side by side; the Models screen is read-only; Machine setup is folded under the same tab. Quantised sizes are read from file listings (the hub's tally read a 4-bit build as 99.5 GB). **Next:** when the owner says the benchmarks are done — merge, tag v0.22.0, deploy, restart supervisor and router (check nothing is rented first).
-
-**Deployed 2026-09-27 09:19: model profiles (D111), gpm-server 0.21.0** — supervisor, router and forwarder restarted on it with nothing rented; the live `pool.yaml` has no profiles yet, so it rents as before.
-
-**Planned (owner, 2026-09-26): settings per engine.** What a card runs at once depends on the
-engine, not only the card: on the same RTX PRO 6000 WS, Ollama topped out at 6–7 workers, while
-vLLM ran 7 for three hours with its KV cache under 20% and never queued — the pool's 7 workers
-were the whole limit, at ~20,000 output tokens a minute. Today a capacity profile matches the
-card (`hardware`, `gpu`), its memory, or a capability, and `rented.workers` is one number, so the
-owner's "16 workers for vLLM" had to be written for every engine (done 2026-09-26: both RTX PRO
-6000 profiles and `rented.workers` at 16; a 2x H100 therefore gets 32). Proposed, not built:
-1. `match.engine` on a capacity profile, so the same card can carry a number per engine;
-2. `rented.workers` given per engine (`workers: { vllm: 16, ollama: 6 }`), a plain number still
-   meaning every engine;
-3. the same question for `context_length` and the queue timeout — the 30 s `queue_timeout` refused
-   about half of a laptop-only chat load on 2026-09-26, while vLLM never came near it.
-To decide: whether a per-engine number is a new block or a map on the existing fields.
-
-**Built 2026-09-27, merged and deployed 2026-09-28 (in v0.24.0): D113, gpm-server 0.23.0** (branch `fix/router-follows-config`). The router follows the configuration file (the model set it reports, app keys, limits) without a restart; a configured host can always be taken out of service, the plan naming the models it leaves with no host in service (supersedes that part of D99; owner's choice: "always allow"); an eviction's event says what really follows and keeps every re-bid reason. All three found live during the 31B NVFP4 benchmark below. 1,053 tests pass, lint clean.
-
-**31B NVFP4 benchmark, 2026-09-27 (`rented-9e670f`, 1x RTX PRO 6000 S, interruptible $0.741/h, 24 workers):** ~40,000 output tokens/min at full load (the 26B's 16-worker run: 37,500), $0.33 per million output tokens at this bid (~$0.58 at the 26B run's $1.41/h), p50/p95/p99 14/35/49 s, ~28 tok/s per stream loaded and ~39 alone, GPU 92–100% with the KV cache under 21% — GPU-bound. 1,588 answers, none failed while it ran. Outbid at 10:28:26: the re-bid was held at the on-demand crossover ($0.982 = 0.7x on-demand) under a floor of $1.20, so it was released; 15 answers cut, and the prepare lease closed with it (D47).
-
-**Deployed 2026-09-26 20:43, live: the forwarder (D110), gpm-server 0.20.0 (PR #41, merged without CI — no Actions credits; 1,021 tests passed locally).** Deploying
-0.19.3 showed a supervisor restart is not hitless while a rented host serves: its SSH forwards
-were its children (9 answers cut, 36 refused over 31 s). Now, with `forwarder.enabled`, `gpm
-forwarder` keeps them, reconciling a `forwards` table the supervisor writes; a supervisor restart
-leaves them up on the same ports and adopted hosts keep `ready`. The owner asked for both
-behaviours on a forwarder restart, as `forwarder.on_restart`: `reattach` (each `ssh` in its own
-session, taken back by the next forwarder only if it is still exactly the recorded process) or
-`close`. Off by default; the owner's `pool.yaml` now has `forwarder: { enabled: true, on_restart:
-reattach }`. Checked live at deploy, with nothing rented: the supervisor started the forwarder
-itself (event `forwarder_started`), both hold their lock rows (`laptop`, `laptop#forwarder`), and a
-forwarder stopped by hand was started again by the supervisor within its 30 s grace. **Still
-unverified until the next rental:** a real `ssh` outliving the forwarder and being taken back, a
-supervisor restart mid-stream cutting nothing, and Linux. Follow-ups: the forwarder inherits the
-supervisor's environment (keys included — unused by it, and `ssh` sends none by default); start
-it with a clean environment. Its log and `forwards/` sit beside the database, now in `.gitignore`. Found alongside and fixed in the same change: the probe set a
-draining host back to `ready` (see the 0.19.3 note below — the "no lease is open" destroy at
-18:15:05 came from that, not from the give-up rule).
-
-**Fixed and deployed 2026-09-26 in gpm-server 0.19.3 (PR #37, owner: "fix and fold"; live 18:08):** a host that leaves
-`ready` after serving — draining at a lease's end, a resize that relaunches its engine, a restart
-from parked, a re-bid after an eviction — was destroyed on the next pass as "not ready after 30
-minutes" and its machine avoided for an hour as "never became ready". Live: at 13:05:28
-`rented-72ea9d` began draining at its lease's time limit and was destroyed one second later,
-cutting four answers mid-stream, and machine 144186 was avoided until 14:05. Now only
-`scheduling`/`preparing` hosts are judged, and the clock restarts on every entry into them; tested
-on all four paths, each test failing on the old code. Still open, noticed alongside: on a bid
-listing whose `dph_total` is below its `min_bid`, the market preview's "all-in" shows the listing's
-price rather than the price at the bid, and "Would pay" means the bid alone for an interruptible
-offer but the total for an on-demand one.
-
-**Newest (2026-09-25, evening): why bids on the H100 pair kept "failing", and gpm-server 0.19.1
-on branch `fix/refused-bid-detail`, not merged or deployed.** Two $1.17 bids on machine 56779 (listed
-`min_bid` $1.07) came back `success: false` **with** a contract and an instance key — Vast's shape
-for an instance that was created and did not start, not a refusal (a refusal carries `error` and
-`msg` and no contract). The listing's `min_bid` is the host's floor (`dph_base`), not the standing
-top bid, so floor plus a $0.10 premium can be created and lose at once on a contested slice; the
-pool then destroys the contract within a second, by design (D43). Built: the created instance is
-read **before** it is destroyed and its state goes into the `bid_failed` event (`created_instance`);
-credential-named fields are replaced before any provider answer is written down. **The two
-`bid_failed` rows from 22:17–22:18 hold an `instance_api_key` in the clear**: both instances are
-destroyed, so the keys are dead, but the rows can be scrubbed if the owner wants. Open: the pool
-has no way to see the standing top bid on a slice, so on a contested machine the operator's lever
-is the premium; a lost-on-creation bid does not put the machine on the avoid list.
-
-**Newest (2026-09-25): an outbid host is noticed at once, bid for again, and released if that
-fails (D109), on branch `fix/outbid-while-loading`, not committed or deployed.** gpm-server
-0.19.0; no configuration change. Next: the owner reviews; merge, deploy and restart; then the
-first outbid under it checks the one new unverified assumption — whether a re-bid at an
-unrentable machine's listed floor wins it back (look for `eviction … rebid` followed by the host
-running, or `rebid_lost` two minutes later).
-
-**Newest (2026-09-25): v0.18.0 is deployed — one number for each setting (D108).** PR #35
-merged after CI passed, tagged, built from the tag, and the supervisor, router and laptop agent
-restarted on it at 18:43 with nothing rented; no errors since. The live `pool.yaml` was migrated
-in the same step (backup in the session scratchpad): `disk_gb`, `model_set_gb` and
-`bidding.bid_ceiling` removed, `max_all_in_hourly` 3.1 → **1.40** as agreed, `min_disk_gb` kept
-at 50 (the three models take 36.7 GB, read from their builds). The live market preview then
-passed the 2x H100 listing that had been refused three times: floor $0.976, bid $1.076, $0.014/h
-of storage for 50 GB, 12 workers. A refused bid
-now keeps the provider's whole answer (`provider_response` in the `bid_failed` event's numbers),
-added at the owner's request before deploying. Still open: a refused bid does not put the
-machine on the avoid list, so the same listing can be chosen again on the next pass.
-
-**Newest (2026-09-24): v0.17.0 is deployed — a machine with several cards now uses all of them
-(D107).** PR #34 merged on the owner's word without waiting for CI (965 tests and lint passed
-locally), tagged, built from the tag, the live `pool.yaml` loaded under it, and the supervisor,
-router and laptop agent restarted on it at 19:44 with nothing rented; no errors since. gpm-agent
-0.9.0, gpm-server 0.17.0. Next: the first multi-card rental checks the one unverified
-fact it rests on — that each vLLM copy, pinned with `CUDA_VISIBLE_DEVICES`, comes up on its own
-card (look for the second card's memory in use and `.cardN.log` files in `.gpm-logs`). Still open
-from it: `workers_auto.max` is a number for the whole host, so with automatic adjustment on, a
-two-card host can start above it.
-
-**Open, to come back to (owner, 2026-09-24): Ollama hosts with several cards.** The rented default
-is now per card for every engine (D107, the owner's choice), but only vLLM runs a copy of each
-model on each card. Ollama keeps **one** loaded instance of a model, on one card whenever it fits,
-and spreads a model across cards only when it does not fit one; several models may land on
-different cards (verified, Ollama FAQ, in decisions.md). So a two-card Ollama host is given twice
-the workers but runs twice the work only when its traffic is spread over models on different
-cards. With mostly one model, the extra workers queue on one card while the other sits idle.
-**The likely fix is the vLLM one:** one Ollama server per card, pinned with
-`CUDA_VISIBLE_DEVICES`, each on its own port, behind the agent's router, which already balances
-copies. To work out: Ollama's pull and hold go through the agent to one server today, so a
-model would have to be held by every server (they can share one models directory). Idle
-unloading and `on_demand` residency (D39) would act on each copy separately. And the pool's
-view of what is resident would need to require every copy. Not urgent while the rented
-engine is vLLM; it matters the first time an Ollama host with more than one card is rented.
-
-0. **v0.14.0 is deployed (2026-09-24): vLLM can be switched on from the console, and a
-   configured host taken out of service or removed from the Hosts screen.** PRs #22 and #23
-   merged, each tagged, built from the tag, checked against the live `pool.yaml`, activated; the
-   supervisor, router and laptop agent all run from the release, with no errors since. **Next:
-   the owner's own sanity test** — one rented vLLM host, raised and used, before any benchmark.
-   Checked in advance without spending: Vast's `vastai/vllm` image has `vllm` at
-   `/usr/local/bin/vllm` (its build history rewrites that file's interpreter), so the launcher
-   finds it; the host's runtime class is `cuda-vllm`. **Still unproven until a real machine:** that
-   Vast's SSH launch mode leaves port 8000 and the card free (its own entry point can start vLLM
-   in other launch modes), and that NVFP4 loads — it needs a Blackwell card.
-
-   Not back yet: **nothing starts the pool after a reboot**.
-
-   **Owner's follow-up after the sanity test: make a host's status read better.** On the first
-   vLLM rental the console said *engine not answering: ReadError* and *waiting for the engine to
-   answer* — true, and no help: it did not say what the pool was doing, what it was waiting for,
-   or that for vLLM the engine is *expected* to be silent until the agent has fetched the weights.
-
-   **Deployed as v0.15.0 (2026-09-24): builds picked from the hub, named vLLM options, and
-   the model directory (D100, D101).** On the Rented capacity editor a vLLM build is now picked
-   from the hub's answer, sorted; **tool calling** and **reasoning** are checkboxes, which the
-   sanity test needs for an agent app (the built-in start had neither) — both now on the
-   **Engine & models** tab of Rented capacity (D102). The Models screen has
-   the **model directory** — Ollama's library and each model's hub builds, cached — to browse
-   and add models from; apps read it at `GET /pool/directory`. It is empty until **Refresh now**
-   is pressed; to keep it fresh on its own, add `directory: { refresh_hours: 24 }` to
-   `pool.yaml` (and `hub_builds: all` to look up every size in the library — a slow sweep, at
-   60 requests a minute). Checked against the live sites read-only: 240 models parsed, and the
-   hub sorting chose the right original for `gemma4:26b` and — after a fix — `qwen3:30b`.
-   **Unverified until a real machine:** that the `gemma4` parsers work with the NVFP4 build.
-
-   **Deployed as v0.16.3 (2026-09-24, running now: supervisor and router from the release,
-   laptop agent at 0.8.1 from v0.16.2 — the agent package is unchanged).** D106: a stop
-   within two minutes of the pool's own re-bid is its restart in flight, not a second
-   eviction — the sixth rental was outbid, re-bid, and then outbid *by the pool itself*
-   sixteen seconds later.
-
-   **Deployed as v0.16.2 (2026-09-24, running now: supervisor, router and laptop agent all
-   from the release; gpm-agent 0.8.1).** PR #31: the agent's restart batch floored at 8,192
-   like the start command (the fifth rental died on the 1,536 the restart wrote), and D105 —
-   one derived state per model in the host detail, an engine silent by design shown as *not
-   started yet*. The restart recipe's router pattern must match `gpm serve -c pool.yaml
-   --router-only` (the `-c` comes first); a pattern without it left the old router running.
-
-   **Deployed as v0.16.1 (2026-09-24, running now: supervisor and router from the release,
-   laptop agent unchanged at 0.8.0).** v0.16.0 carried D104; v0.16.1 fixes the fault v0.16.0
-   introduced — the agent install killed its own shell on Linux, so **no vLLM host rented on
-   v0.16.0 could get an agent** (found on `rented-c17d21`). The restart recipe now waits for the
-   old supervisor to exit before starting the new one: it holds the pool lock while shutting
-   down, and a new one started too soon refuses with *another supervisor holds pool* and leaves
-   no other trace.
-
-   **Three fixes proposed to the owner, not yet approved:** record the provider's full refusal
-   (its `error`, `msg` or body) in the bid-failed event, since `success: false` with no `msg`
-   read only as *refused* five times in a row; avoid a machine after a bid that was refused yet
-   created an instance; and make Finding-tab edits go into the **search profile in force**
-   rather than the pool's own policy, which they silently edited while `cheap tests` was chosen.
-
-1. **The benchmark decides whether any of this was worth building.** Every throughput figure
-   behind the vLLM work is still an estimate. The plan is a same-machine A/B/B′: ollama at 7
-   workers, vLLM at 7, vLLM at its reported maximum, one host, back to back, prefix caching off,
-   aggregate tokens/second only. Roughly $6 on one `1x RTX PRO 6000 WS`. **Pre-registered
-   decision rule: ≥6x the same machine's ollama figure means build on it; 2–6x means correct the
-   claim in [docs/economics.md](docs/economics.md); below 2x means the estimate was wrong and
-   this should not be pursued.** The owner approved building first and measuring after; **the
-   spend is still unasked.** Easiest shape: a second pool with its own config, ports and
-   database beside the live one — the supervisor lock is per pool name, so they cannot collide.
-
-   Still open in the same area:
-   - **The on-machine router (D96) has only met fake upstreams.** Its first real test should be
-     part of the benchmark host, not a separate rental.
-   - **Occupancy is reported but not acted on**: `Engine.occupancy()` returns running, waiting
-     and cache figures, and nothing yet ranks, scales or tears down by them.
-   - **`env` at the repository root holds the provider and admin keys**, put there by the owner
-     so the pool can be restarted without their terminal. Gitignored; never committed.
-
-2. **Open, and the owner's to decide: a lease counts hosts, not workers.** Raised by the owner
-   after D80 — with `workers_auto` on, a host's worker count moves, so a worker-denominated
-   ceiling means a different number of machines from minute to minute, while billing is per
-   host-hour. Designed, not built: three questions are outstanding (what happens to open
-   leases, whether `--workers` is removed outright, and when to deploy a schema change).
-
-3. **Open: D57 only half-delivers.** A model loads as soon as its own download finishes, but
-   the load still blocks the next download, so the network idles during each load. Measuring
-   it honestly needs a couple of rentals, since loading and downloading contend on disk.
-
-4. **Tunnels should outlive the supervisor.** Designed, not built. Rented hosts are reached
-   through SSH tunnels the supervisor owns as child processes, so a supervisor restart makes
-   them unreachable until the new one reopens them (seen live: `503 hosts_unreachable`). The
-   fix is to start `ssh` detached, record pid and port in the host row, leave tunnels up on
-   shutdown and *adopt* them on start — verifying identity (pid alive, our command, same
-   instance) before trusting a listening port, or the router could send prompts to a stranger's
-   machine. Until then: restart the supervisor when nothing is rented, as was done for the
-   2026-09-20 deploy.
-2. **Owner decision, open: the last two agent items.** Install-over-SSH and the agent on rented
-   hosts are not built, and the recommendation is to defer both until `gpm-agent` is on a
-   package index. Rented hosts are prepared by the pool directly, over the tunnel. **Story S4 now plans
-   the agent on rented hosts and reopens this** — it recommends pushing the agent over SSH, which
-   needs no package index.
-3. **Deployed 2026-09-20 21:11** — D54, D55, the own-machine bid guard, the tunnel backoff fix and
-   the 2-minute idle window (D58) are running; restarted in a quiet window with nothing rented.
-   **Open:** the laptop's agent refuses the `LAPTOP_AGENT_KEY` it was started with (403), so
-   model management on the laptop is off until the supervisor is restarted with the right key.
-   Still open from D55: the market preview does not show the headroom running hosts leave under
-   an overall cap, when one is set.
-4. **Replace a host that is bad value (D75). Decided, not built.** The per-host controller
-   shrinks a struggling host and stops at one worker; it will also give it up where its cost
-   per unit of work stays far worse than the pool's median, letting the ordinary allocation
-   path rent the replacement. Bounded: one at a time, never the last ready host, never without
-   a lease whose budget covers a download. **Open for the owner:** the measure is cost per
-   *unit of work* rather than the cost-per-worker he described — counting slots would rate a
-   host with six slow workers above two fast ones, which is the machine this exists to catch.
-5. **Five features, one story each — [docs/stories/](docs/stories/README.md). All five decided;
-   S2 is built, four to go.** **S2 buffered responses — built and merged 2026-09-20** (D62).
-   Next, in order: **S4** the host agent on rented hosts (D63; delivers D56 and D57) · **S1**
-   dynamic allocation with a ramp (D66) · **S5** automatic worker adjustment, starting at six
-   (D67, D68) · **S3** the advisor model, history first (D69, D70). Each feature: full unit and
-   integration tests, then a PR, then merge.
-5. **~~Resizing a rented host on the fly (D56).~~ Done** — `gpm host resize <id> --workers N`;
-   lowering is immediate, raising relaunches the engine through that host's agent.
-
-7. **~~Load each model as it lands (D57).~~ Done** — the agent does it on rented hosts.
-
-8. **The pool's spend estimate leaves out storage and download.** Seen live: the provider
-   reported $1.80 against an estimate of $0.46. Caps enforce on the higher of the two, so it
-   held — but with a provider that reports nothing, the estimate alone would be ~4× low. Also
-   `spend_drift` fires every pass rather than once.
-9. **`gpm serve` does not respawn a supervisor child that exits**; it only logs.
-10. **The simulation is the merge gate.** `uv run pytest -m simulation` runs thirteen whole-pool
-   scenarios against a moving market; CI runs it as its own job on every pull request. It found
-   three faults in a day that the 563-test suite had passed over — see D73 — because each
-   needed a whole pool running for long enough. **Nothing merges on a red CI.**
-11. **The rented image should change.** `pool.yaml` names `ollama/ollama:0.34.2`, which carries no
-   HTTP client and no Python; `vastai/ollama:0.34.2` carries curl, wget and python3 with the same
-   engine binary. The timer no longer depends on it (D71), but the agent (S4) will want the
-   interpreter. **The owner's call**, since it changes what every rental runs.
-12. **Open from live use.** **D64's pause-and-restart has never run against the real provider**:
-   parking, the second limit and the load-driven restart are proven only against the fake. Watch
-   the first live idle. *(The one-off measurement of what each hardware profile can hold is
-   dropped by the owner's choice: S5 answers it continuously, per machine.)*
-13. **CI is green and must stay green.** It had failed on **every** run since 2026-09-19 — three
-   jobs, none of them a code defect: the secret scan lacked the `pull-requests: read` permission
-   it needs to ask which commits a PR holds; the credential guard fired on a *threat-model test
-   asserting the key is absent*; and `pip-audit` was auditing the runner's own system Python
-   (it tripped on a kernel-tracing package that is not on PyPI) instead of this project's locked
-   dependencies. The tests themselves passed on 3.11, 3.12 and 3.13 throughout. **Six pull requests were merged while it was red, which should not happen again: check CI
-   before merging.** With the infrastructure fixed, one genuinely flaky test surfaced on the
-   first green run — the interruption drill relied on three quick requests overlapping, which a
-   fast runner serialises, so the rented host saw none. The local host in that drill now answers
-   slowly enough that the overflow is real.
-14. **Release checklist:** two items open, both the adopter-file decision the owner deferred.
-   Type-checking in CI is deferred. `NOTICE` says "ClearViews" with no legal suffix.
-
-## What is decided (index — the detail is in [docs/decisions.md](docs/decisions.md))
-
-| # | Decision |
-|---|---|
-| D1 | Pool and app are decoupled; the only contract is one URL, one key, the engine API plus a small pool dialect |
-| D2 | Three host kinds; three transports (tunnel / http / https) |
-| D3 | Client SDK; default wait-and-retry when no capacity; max wait configurable |
-| D4 | Strict routing priority: local → fixed-remote → rented |
-| D5 | Session affinity off by default |
-| D6 | Logical model names resolve to the build suited to the host |
-| D7 | Renting / bidding / holding / tear-down are named, configurable strategies |
-| D8 | Operator console, as one more client of the control API |
-| D9 | Capacity is workers per host, by hardware capability |
-| D10 | A lease is the only thing that can spend; dollar caps mandatory |
-| D11 | **Public framework**; Aletheia is only the first adopter |
-| D12 | The first adopter's current GPU scripts are not design inputs |
-| D13 | Mixed model builds within a session: record and measure, don't prevent |
-| D14 | Two processes + SQLite; explicit `stop --release` vs `restart`; no release-on-exit |
-| D15 | Time budget: cancel on disconnect, one capacity-retry layer, SDK-owned timeouts, deadlines |
-| D16 | The pool is the isolation unit with a required API key; separate app and admin keys; multi-pool later |
-| D17 | Host data-trust levels deferred (documented residual risk) |
-| D18 | v1 cut line; owner musts: all three host kinds, full console, dead-man timer |
-| D19 | Dead-man timer uses the provider's instance-scoped credential (verified available) |
-| D20 | Build order: 1 Route, 2 Supervise, 3 Console, 4 Release |
-| D21 | Prepare a rented host on request (join / park / destroy); parked hosts used first |
-| D22 | Catalog-only model resolution; contract stated as engine API + versioned dialect |
-| D23 | Every host holds the pool's whole model set; queue is first come, first served |
-| D24 | Spend reconciled against provider-reported charges; providers driven by HTTP API, not CLI |
-| D25 | Build the router and supervisor rather than adopt (Olla, LiteLLM, SkyPilot, dstack evaluated) |
-| D26 | Docs split generic / adopter; provider-engine-strategy plug-ins; capability-keyed variants; threat model; release checklist |
-| D27 | Repository created as **GPM** ("GPU Hosts Pool Management"), private, 2026-09-17; identifier naming still open |
-| D28 | Three dialect items added while building phase 1: `503 no_eligible_host`, `504 deadline_exceeded`, `X-GPM-Wait-S` |
-| D29 | `enforces_schema` is three-valued — true / false / unstated — so uncatalogued names keep passing through |
-| D30 | The `tunnel` transport drives the `ssh` client as a supervised child process, not an in-process SSH library |
-| D31 | The supervisor runs permanently; it rents nothing without a lease |
-| D32 | Conservative shipped defaults; a lease's dollar cap is mandatory with no default |
-| D33 | Offers are filtered by the pool, not in the provider's query, so every rejection keeps its reason |
-| D34 | A bid the ceilings push below the floor is a refusal, not a bid |
-| D35 | Configuration is versioned by content hash; stale writes refused; reload in place, except the listener |
-| D36 | Identifiers: CLI `gpm`, packages `gpm-client` / `gpm-server`, `GPM_*`, `X-GPM-*`, label `gpm/<pool>/<host>` |
-| D37 | Apache-2.0, copyright ClearViews, DCO rather than a CLA |
-| D38 | First-party plug-ins load by entry point, with no privileged path |
-
-## Before anything here becomes public
-
-**The repository was made public on 2026-10-06, before this was decided.** A scan that day
-(gitleaks over every commit, branch and pull-request ref, and a search of the history for each
-real credential's value) found **no credential anywhere**. The three adopter-internal items below
-are public, in the tree and in history; what to do about them is still the owner's decision —
-removing them from history means rewriting it and force-pushing. They are three adopter-internal items — they describe another private codebase's
-files, measurements, prices and plans (they contain **no credentials**; scanned 2026-09-17):
-
-| Path | Contains | Suggested |
-|---|---|---|
-| `docs/adopters/aletheia/` | The first adopter's code analysis, file-by-file change list, real configuration values, the earlier migration workplan | Move back into the adopter's own repository, leaving a generic "writing an adopter guide" page here |
-| `docs/archive/design-2026-09-17-pre-split.md` | The original design, written in the adopter's terms | Remove, or keep only its framework comparison (§4.4) as a standalone page with its sources |
-| `docs/architecture-review.md` | The review; argues several findings from the adopter's scripts | Keep privately as history, or publish after a pass to genericise it — [docs/decisions.md](docs/decisions.md) already carries every outcome |
-
-If those are removed after being committed, they remain in git history — so if there is any
-doubt, decide **before the first commit**, or plan to publish from a fresh history.
+1. **Review and merge the four branches above**, each with a security and a correctness review,
+   then release **v0.45.0**. Versions and the changelog are set at merge, one branch after another.
+2. **Owner, by hand** (the agent's permission check refused it):
+   `git push origin --delete v0.40.0 v0.42.0` and `git tag -d v0.40.0 v0.42.0` — the two tags
+   whose releases were deleted earlier.
+3. **Owner:** commit `docs/gpm-adoption/` in the Aletheia repository (copied there uncommitted on
+   2026-11-24, D189).
+4. **Live checks, when the owner chooses to spend** (each small and capped): the list under
+   "Not yet run on real hardware or a real provider" below.
+5. **The benchmark** that decides whether the vLLM work paid off: one machine, Ollama at 7 workers
+   against vLLM at 7 and at its own maximum, aggregate tokens a second. About $6. Pre-registered
+   rule: ≥6× Ollama's figure, build on it; 2–6×, correct [docs/economics.md](docs/economics.md);
+   below 2×, the estimate was wrong. **The spend has not been asked for.**
+6. **S3, the advisor model** that picks among offers the rules accept (D70). The machine history
+   it reads is built (D69).
+7. **More providers:** Shadeform, then Lambda Cloud (D140, the owner's order). Verda is built,
+   never rented live.
+8. **Smaller, known:**
+   - A model still loads while the next download waits (D57 half-delivered): the network idles
+     during each load. Measuring it needs a couple of rentals.
+   - The engines' occupancy figures (`Engine.occupancy()`) are reported, and nothing ranks, scales
+     or gives up hosts by them yet.
+   - `spend_drift` is recorded on every pass while the drift lasts, not once (seen on the laptop
+     pool: 29 in one rental).
+   - A type-check in CI is deferred; `NOTICE` names the copyright holder without a legal suffix.
+
+## Open owner decisions
+
+- **The benchmark's spend** (next action 5).
+- **Which live checks to pay for, and when** (below).
+- Nothing else is waiting on the owner. Let go on 2026-11-24: a lease counted in workers rather
+  than hosts (D186).
+
+## Not yet run on real hardware or a real provider
+
+Built and tested against fakes only. Each would be checked on the smallest case first.
+
+- **S16:** a Windows PC with an NVIDIA card installing ONNX Runtime's CUDA set; renting a private
+  container image on Vast or RunPod; a rented machine reading a private hub repository. Whether a
+  provider keeps a registry login after the machine is gone (registry logins should be pull-only
+  tokens).
+- **S15 trained models:** never served on a real machine. Whether CoreML (Mac) and DirectML
+  (Windows) run common exported models without falling back to the processor.
+- **S10 vLLM on an owned Linux machine:** the owner will test on a machine of their own.
+- **Verda:** never rented.
+- **Hosted APIs (S11):** Anthropic checked live (S12); Together, OpenAI, and how Ollama's cloud
+  answers a spent balance, not.
+- **The agent on Windows:** its scheduled task across a crash, the signature check on Ollama's
+  Windows programs, whisper.cpp on an NVIDIA card (an RTX 50-series ran on the processor).
+- **The agent on Linux:** staying up after logout (lingering), building whisper.cpp, AMD cards.
+- **Renting:** pausing an idle machine and restarting it (D64); winning a machine back by bidding
+  again (D109); SSH forwards kept through a supervisor restart with a real `ssh` (D110);
+  machines with several cards (a copy per card D107, a model split across cards D114, one Ollama
+  per card S17); two models sharing a card (D118); a copy from a sibling machine and a kept disk
+  for a quick restart (D116); vLLM's Whisper and reranker settings and its Gemma builds' image
+  input; Gemma's tool calling on its NVFP4 build; the on-machine router (D96) in front of real
+  engines.
+
+The table "Unverified assumptions" in [docs/decisions.md](docs/decisions.md) lists every fact
+these rest on.
+
+## What is decided
+
+Every decision, numbered with why and what was rejected, is in
+[docs/decisions.md](docs/decisions.md) (D1–D189 at this writing; D190–D197 reserved for S17 and
+S18). The specification in [docs/spec/](docs/spec/) says how things are, without the history.
+
+## The adopter-internal files (decided 2026-11-24, D189)
+
+The repository has been public since 2026-10-06; a scan that day found no credential in any
+commit, branch or pull-request ref. The first adopter's guide and workplan, the pre-split design
+and the architecture review left the tree on 2026-11-24 for the adopter's own repository
+(`~/workspace/Aletheia/docs/gpm-adoption/`, uncommitted there). The comparison D25 rests on is kept
+as [docs/build-or-adopt.md](docs/build-or-adopt.md); [docs/adopters/README.md](docs/adopters/README.md)
+says how an adopter guide is written. History was not rewritten: it would not unpublish anything
+and would break every clone, tag and release link.
 
 ## Working agreements carried over
 
@@ -580,22 +128,22 @@ doubt, decide **before the first commit**, or plan to publish from a fresh histo
 - Design arguments are made on generic grounds — what any client, provider and engine need —
   not from one adopter's scripts (D12).
 - Use plain, descriptive names for components; no internal jargon or staging tags.
-- The owner tends to prefer the simpler mechanism when one exists (a pool API key rather than
-  per-request client ids; all models resident rather than policing swaps; record-and-measure
-  rather than prevent). Offer the simple option first.
+- The owner tends to prefer the simpler mechanism when one exists. Offer the simple option first,
+  and say what it gives up.
+- Merge on a green CI; run the full suite locally first (Actions minutes are limited).
+- Before every push: `gitleaks git --log-opts="origin/main..HEAD" --redact`, and read its result.
 
 ## Where the first adopter's side lives
 
-In `~/workspace/Aletheia`: backlog entries `GPU-POOL-01` and `GPU-CLOUD-01` in
-`platform-design/unified/TASKS.md`; the full day's session log in
-`platform-design/unified/progress.md`; the single-host predecessor still in use there is
-`prototypes/per-turn-behavioral-labeling/vast_provision.py`. A stub at
-`~/workspace/Aletheia/gpm/README.md` points here.
+In `~/workspace/Aletheia`: the adoption guide and history in `docs/gpm-adoption/` (since
+2026-11-24); backlog entries `GPU-POOL-01` and `GPU-CLOUD-01` in
+`platform-design/unified/TASKS.md`; a stub at `gpm/README.md` points here.
 
 ## Session log
 
 | Date | What happened |
 |---|---|
+| 2026-11-24 | **v0.44.0 released; STATUS cleaned; the small items, the adopter files and three stories under way.** At the owner's word: vLLM's locked sets regenerated for 0.34.0 and 0.33.0 (gpm-agent 0.18.1, PR #103) and v0.44.0 released, verified after download. The latest pool started again in `~/gpm-pool` beside SpaceGarage's 0.37.4 pool. On `fix/small-items`: the supervisor left running by a SIGTERM to `gpm serve` (uvicorn re-raises the signal after shutdown, and the default handler skipped the `finally`) now stops — and one whose router is killed outright stops itself; a build's thinking default (D187; Ollama 0.40.17 checked by hand); a download ceiling proposed when renting is set up, and $0.01/GB set on the laptop pool (its last rental paid ~$0.014/GB); the three September renting fixes found already shipped, their gaps closed; leases counted in workers let go (D186); the adopter-internal files moved to the adopter's repository (D189). Deleting tags v0.40.0 and v0.42.0 was refused by the agent's permission check — left to the owner. S17 (one Ollama per card), S18 (stats, dashboards, named app keys) and provider balances (D188) built by parallel agents on their own branches. |
 | 2026-11-21 | **S16 built: S15's open items (D183–D185).** At the owner's word ("do however you recommend"): stage 1 ONNX Runtime on Windows (onnx-lock Windows targets, the 1.32.0 sets, Scripts paths, the installer's first own tests, one on CI's Windows job); stage 2 the hub read token on rented machines (over SSH into the agent's environment, never the instance spec); stage 3 rented container builds (`start`, no agent, readiness from health) and private registry logins (credential store, control API, console, Vast and RunPod). Provider facts read from Vast's and RunPod's API references and NVIDIA's release notes; listed as verified or unverified in decisions.md. |
 | 2026-11-21 | **Closed the restart gap in the install-error fix (gpm-agent 0.17.2).** The text a failed install or check wrote is kept in `state.json` as `failure`, so it is taken out after a restart too; an error written since stays. Two tests; the agent suites and lint pass. The owner then decided S15's three open items (D183–D185): rent container builds with private images, the hub read token on rented machines, ONNX Runtime installed on Windows; recorded, not built. |
 | 2026-11-21 | **Released v0.43.0** (gpm-server 0.43.0, gpm-client 0.9.0, gpm-agent 0.17.1) at the owner's word: S15 and PR #99. Install links moved to it first, so the tag carries them. |

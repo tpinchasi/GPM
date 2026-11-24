@@ -840,7 +840,9 @@ function rentingSetup(view) {
   if (view.set_up) return [restart, el("div", { class: "panel" }, el("p", {}, "Renting is set up."))];
   const cur = view.current || {};
   const reach = (engine) => view.engines[engine].can.length;
-  const f = { disk: cur.min_disk_gb ?? "", hourly: cur.max_all_in_hourly ?? "",
+  // A download ceiling is proposed, not required: unset, a provider's per-GB charge for every
+  // model a machine fetches is paid at whatever it asks.
+  const f = { disk: cur.min_disk_gb ?? "", hourly: cur.max_all_in_hourly ?? "", download: cur.max_download_per_gb ?? "0.01",
     engine: cur.engine && view.engines[cur.engine] ? cur.engine : (reach("ollama") > reach("vllm") ? "ollama" : "vllm"),
     models: [...(cur.models || [])] };
   const choose = view.models_per_host === "declared" && !view.profiles;
@@ -875,6 +877,8 @@ function rentingSetup(view) {
     disk.oninput = () => { f.disk = disk.value; };
     const hourly = el("input", { id: "setup-hourly", type: "number", min: "0", step: "0.01", value: f.hourly, required: true });
     hourly.oninput = () => { f.hourly = hourly.value; };
+    const download = el("input", { id: "setup-download", type: "number", min: "0", step: "0.005", value: f.download });
+    download.oninput = () => { f.download = download.value; };
     const engine = el("select", { id: "setup-engine" }, ["vllm", "ollama"].map((e) => el("option", { value: e, selected: f.engine === e || undefined },
       `${e === "vllm" ? "vLLM" : "Ollama"} — ${reach(e)} of the pool's models`)));
     engine.onchange = () => { f.engine = engine.value; say(""); draw(); };
@@ -884,7 +888,9 @@ function rentingSetup(view) {
       if (!(Number(f.disk) >= 1)) return say("Say the disk each machine is rented with, in GB.");
       if (!(Number(f.hourly) > 0)) return say("Say the most one machine may cost an hour, all-in, in dollars.");
       if (choose && !f.models.length) return say("Tick at least one model machines are rented for.");
-      const body = { min_disk_gb: Number(f.disk), max_all_in_hourly: Number(f.hourly), engine: f.engine, ...(choose ? { models: f.models } : {}) };
+      if (f.download !== "" && !(Number(f.download) >= 0)) return say("The download ceiling is dollars per GB — or leave it empty for none.");
+      const body = { min_disk_gb: Number(f.disk), max_all_in_hourly: Number(f.hourly), engine: f.engine,
+        ...(f.download !== "" ? { max_download_per_gb: Number(f.download) } : {}), ...(choose ? { models: f.models } : {}) };
       save.disabled = true;
       try {
         const done = await withRetype((confirm) => api.setUpRenting({ ...body, ...(confirm ? { confirm } : {}) }), "Set up renting?");
@@ -901,6 +907,8 @@ function rentingSetup(view) {
         el("small", { class: "muted" }, "Enough for the models a machine holds; only machines offering this much are considered.")),
       el("div", { class: "field" }, el("label", { for: "setup-hourly" }, "The most one machine may cost an hour, all-in ($)"), hourly,
         el("small", { class: "muted" }, "No bid or rental goes above it.")),
+      el("div", { class: "field" }, el("label", { for: "setup-download" }, "The most a machine's provider may charge per GB downloaded ($)"), download,
+        el("small", { class: "muted" }, "Some providers charge for every gigabyte a machine fetches, at the machine's own price — a 20 GB model at $0.014/GB is $0.28. Leave it empty for no ceiling.")),
       el("div", { class: "field" }, el("label", { for: "setup-engine" }, "Engine on rented machines"), engine),
       modelsField(),
       problem,
@@ -2243,7 +2251,7 @@ const SEARCH_FIELDS = [
   ["offer_policy", "min_disk_gb", "range", "the disk each host is rented with — only machines offering this much are considered", 10, 500, 10],
   ["offer_policy", "max_all_in_hourly", "range", "the most this pool pays per host, per hour, all-in with that disk — bids and re-bids stop here", 0.05, 20, 0.05],
   ["offer_policy", "max_all_in_per_gpu", "range", "and per accelerator — a multi-GPU machine is judged by the card, not the bill", 0, 10, 0.05],
-  ["offer_policy", "max_download_per_gb", "range", "the most it will pay per GB downloaded", 0, 0.5, 0.005],
+  ["offer_policy", "max_download_per_gb", "range", "the most it will pay per GB downloaded — unset, a provider's download charge is paid whatever it is", 0, 0.5, 0.005],
   ["offer_policy", "min_download_mbps", "range", "slower than this and the model set takes too long", 0, 10000, 100],
   ["offer_policy", "min_reliability", "range", "the provider's own score, 0 to 1", 0, 1, 0.01],
   ["offer_policy", "min_driver_version", "text", "the accelerator driver this engine image needs — below it the card sits idle and the CPU serves"],

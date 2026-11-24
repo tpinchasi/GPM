@@ -41,6 +41,7 @@ from ..engines import (
     rewrite_of,
 )
 from ..engines.anthropic import AnthropicHostedEngine
+from ..engines.thinking import says_thinking, with_thinking
 from ..keys import match, verify
 from ..models import HostState
 from ..provisioning_store import HashTaken
@@ -114,6 +115,16 @@ class Identity:
 
     workload: Optional[str] = None
     provisioner: Optional[str] = None
+
+
+def _prepared(engine: Any, path: str, content_type: str, body: bytes, tag: str,
+              thinking: Optional[str]) -> tuple[str, bytes]:
+    """The body as the host gets it: its model named, and the build's thinking default added
+    where the request says nothing of its own (D187)."""
+    content_type, body = rewrite_of(engine, path, content_type, body, tag)
+    if thinking is not None:
+        body = with_thinking(getattr(engine, "name", ""), path, body, thinking)
+    return content_type, body
 
 
 def _identity(state: RouterState, request: Request) -> Optional[Identity]:
@@ -1202,11 +1213,14 @@ def create_app(
                     return _error(400, "bad_request", "unsupported_feature",
                                   f"the request could not be carried to the other API format: {exc}")
                 send_path, send_type = translation.target_path, "application/json"
-            rewrite = (host_engine, send_path, send_type, send_body, assignment.variant.tag)
+            thinking = state.thinking_of(assignment.variant.tag)
+            if thinking is not None and translation is not None and says_thinking(path, body):
+                thinking = None  # the app said, in the format it sent; a dropped field still counts
+            rewrite = (host_engine, send_path, send_type, send_body, assignment.variant.tag, thinking)
             if len(send_body) > _READ_OFF_LOOP_BYTES:
-                forwarded_type, forwarded = await asyncio.to_thread(rewrite_of, *rewrite)
+                forwarded_type, forwarded = await asyncio.to_thread(_prepared, *rewrite)
             else:
-                forwarded_type, forwarded = rewrite_of(*rewrite)
+                forwarded_type, forwarded = _prepared(*rewrite)
             hosted = assignment.host.hosted
             app_asked_usage = True
             upstream_path = send_path

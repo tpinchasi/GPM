@@ -46,7 +46,11 @@ pool asks the agent on every pass; the agent's own backoff decides when an attem
 serve`): after 5 seconds, then twice as long after each stop in a row, up to 5 minutes, and back to
 5 seconds once one has run 10 minutes; each stop is logged with its exit code and, without a
 console, its last words (D163). `GET /pool/status` says whether a supervisor is there — from the
-heartbeat it writes to its lock — however it was started.
+heartbeat it writes to its lock — however it was started. **It stops with that router**: on a stop
+signal the router stops it before exiting (it is not left running, holding the pool's lock), and a
+router that is killed outright, running no shutdown of its own, is noticed by its supervisor within
+seconds (`--exit-with`, the router's process id), which then stops itself. A supervisor started on
+its own (`gpm supervise`) has no such tie.
 
 ### 1.1 What is running is a release, not a tree (D79)
 
@@ -306,7 +310,12 @@ model set. **Parked hosts are tried first** (§8).
    quota (D123); the pool still applies every filter itself, every offer it rejects carries its
    reason, and what the provider was asked is said beside the result — a market that merely
    *looks* empty teaches an operator nothing. A search for a machine already held asks broadly.
-   A bid that loses puts its machine aside for `avoid_lost_bid_minutes` and ends the round (D124).
+   A bid that loses puts its machine aside for `avoid_lost_bid_minutes` and ends the round (D124);
+   a create refused as gone that made an instance anyway (found under its label and destroyed)
+   puts its machine aside for `avoid_failed_machine_minutes`. Every machine put aside is read back
+   from the event log after a restart, until its time is up. A refusal is recorded with the
+   provider's own answer (`provider_response`), credential-named fields redacted, whichever
+   provider gave it.
    A workload whose budget carries none of a round's offers is not searched for again until its
    hosts or its lease change (D126).
    A search that fails is said as such, never as an empty market (D44); one the provider refuses

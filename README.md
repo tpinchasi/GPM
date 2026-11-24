@@ -260,6 +260,5 @@ adopter.
 | [docs/decisions.md](docs/decisions.md) | Every decision, numbered: what, why, what was rejected; verified facts and unverified assumptions |
 | [docs/threat-model.md](docs/threat-model.md) | Assets, actors, threats with mitigations and residual risk, deliberate non-goals |
 | [docs/release-checklist.md](docs/release-checklist.md) | What must be true before the first public commit, and at every release |
-| [docs/architecture-review.md](docs/architecture-review.md) | The critical review of the original single-file design; every finding carries its decision |
-| [docs/adopters/aletheia/](docs/adopters/aletheia/README.md) | First adopter guide — **adopter-internal, see the note in STATUS.md before publishing** |
-| [docs/archive/](docs/archive/design-2026-09-17-pre-split.md) | The pre-split single-file design, kept only so the review's section references resolve — **adopter-internal** |
+| [docs/build-or-adopt.md](docs/build-or-adopt.md) | The comparison with existing routers and orchestrators that GPM was built on (D25) |
+| [docs/adopters/](docs/adopters/README.md) | Writing an adopter guide — kept in the adopter's own repository |
