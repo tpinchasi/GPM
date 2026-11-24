@@ -148,4 +148,7 @@ def test_ollama_is_started_by_the_pool_on_any_image():
     from gpm_server.engines import get_engine
 
     start = get_engine("ollama").default_start_command(port=11434, models_dir="/m", agent_archive="/a", proxy=False)
-    assert "ollama serve" in start and start.rstrip().endswith("&") and "127.0.0.1:11434" in start
+    # The one server, in the background, wherever the launcher of a server per card does not run
+    # (D190): at boot, before the agent's archive is there, and on one card.
+    single = start[start.index(" else ") + len(" else "):]
+    assert "ollama serve" in single and single.rstrip().endswith("& fi") and "127.0.0.1:11434" in single

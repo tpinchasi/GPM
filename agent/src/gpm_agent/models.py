@@ -299,9 +299,13 @@ class ModelWork:
         if not state.get("answers") and not fetches_alone:
             return  # an engine gone quiet says nothing about what it holds: left for the next pass
         loaded = set(state.get("models_loaded", []))
+        # Where one server per card holds the models (D192), a model is loaded only once every one
+        # holds it — but any one that holds it is holding a pin of this agent's, and releasing goes
+        # by those.
+        held_anywhere = loaded | set(state.get("models_loaded_anywhere") or [])
         # A pin does not outlive the engine: a remembered tag that is no longer loaded was
         # unpinned by an engine restart, and is not this agent's to release any more.
-        stale = {tag for tag in self.pinned_by_agent if tag not in loaded and tag not in self.desired.tags}
+        stale = {tag for tag in self.pinned_by_agent if tag not in held_anywhere and tag not in self.desired.tags}
         if stale:
             self.pinned_by_agent -= stale
             self._remember()
@@ -309,7 +313,7 @@ class ModelWork:
         # on_demand, and anything that left the set. Only if loaded — releasing loads.
         for tag in sorted(self.pinned_by_agent):
             if self.desired.residency == "on_demand" or tag not in self.desired.tags:
-                if tag in loaded:
+                if tag in held_anywhere:
                     await self._hold(tag, pinned=False)
                 self.pinned_by_agent.discard(tag)
                 self._remember()

@@ -13,11 +13,12 @@ import shutil
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
+from urllib.parse import urlsplit
 
 import httpx
 
 from . import facts as machine_facts
-from . import modelhub, vllm_state
+from . import modelhub, ollama_cards, vllm_state
 from . import volume as model_volume
 from .whisper_cpp import WhisperCppFacts
 
@@ -56,21 +57,43 @@ class OllamaFacts:
     splits_across_cards = False
 
     def __init__(self, settings: Any = None) -> None:
-        #: Unused here — this engine answers every question about itself over its own API.
-        #: Accepted so that every engine in the registry is built the same way.
+        #: The engine answers every question about itself over its own API; the settings say where
+        #: its models are and its port, by which the servers it runs one per card are found (D190).
         self.settings = settings
         #: Where each tag's blobs came from on this host, by tag (D139), as for vLLM.
         self.sources: dict[str, tuple[model_volume.Report, float]] = {}
 
+    def copies(self) -> list[str]:
+        """The servers this machine runs one per card, by URL — the first is pulled through, each
+        holds every model (D190, D192) — or none, where one server is the engine URL's."""
+        layout = self.layout()
+        return [entry["url"] for entry in layout["servers"]] if layout else []
+
+    def layout(self) -> Optional[dict[str, Any]]:
+        """What whoever runs this machine's Ollama recorded: the cards, a server on each, and why."""
+        models = getattr(self.settings, "models_path", None)
+        try:
+            port = urlsplit(getattr(self.settings, "engine_url", "") or "").port
+        except ValueError:
+            return None
+        if not isinstance(models, str) or not models or port is None:
+            return None
+        return ollama_cards.read_layout(models, port)
+
     async def describe(self, client: httpx.AsyncClient) -> dict[str, Any]:
         """Version, models on disk with sizes, models loaded. An engine that does not answer
-        is reported as not answering — with nothing else claimed about it."""
+        is reported as not answering — with nothing else claimed about it.
+
+        With a server per card (D190) the engine URL is the router, which answers for the machine:
+        a model is loaded only once every server holds it (D192). Beside it, what each server
+        holds, and every model any of them holds — what this agent releases from."""
+        per_card = await self._per_card(client)
         try:
             version = (await client.get("/api/version")).raise_for_status().json().get("version")
             on_disk = (await client.get("/api/tags")).raise_for_status().json().get("models", [])
             loaded = (await client.get("/api/ps")).raise_for_status().json().get("models", [])
         except (httpx.HTTPError, ValueError) as exc:
-            return {"name": self.name, "answers": False, "detail": str(exc) or type(exc).__name__}
+            return {"name": self.name, "answers": False, "detail": str(exc) or type(exc).__name__, **per_card}
         # Never one of Ollama's cloud (D168): an Ollama the owner runs signed in lists them beside
         # its own, and none is on this machine.
         on_disk = [m for m in on_disk if not _from_the_cloud(m)]
@@ -85,7 +108,33 @@ class OllamaFacts:
             ),
             "models_loaded": sorted(m.get("name") for m in loaded if m.get("name")),
             **({"model_sources": _sources_fact(self.sources)} if self.sources else {}),
+            **per_card,
         }
+
+    async def _per_card(self, client: httpx.AsyncClient) -> dict[str, Any]:
+        """`layout` — the cards, how many servers, and why — and `copies`, what each server holds,
+        where this machine's Ollama runs one per card or chose not to; nothing otherwise."""
+        layout = self.layout()
+        if layout is None:
+            return {}
+        said: dict[str, Any] = {"layout": {"cards": layout["cards"], "servers": len(layout["servers"]),
+                                           "why": layout["why"]}}
+        if not layout["servers"]:
+            return said
+        copies, anywhere = [], set()
+        for entry in layout["servers"]:
+            try:
+                listed = (await client.get(f"{entry['url']}/api/ps", timeout=COPY_LOOK_S)).raise_for_status().json()
+                names = sorted(m.get("name") for m in listed.get("models", [])
+                               if not _from_the_cloud(m) and isinstance(m.get("name"), str))
+            except (httpx.HTTPError, ValueError, AttributeError):
+                copies.append({"card": entry["card"], "answers": False})
+                continue
+            anywhere.update(names)
+            copies.append({"card": entry["card"], "answers": True, "models_loaded": names})
+        said["copies"] = copies
+        said["models_loaded_anywhere"] = sorted(anywhere)
+        return said
 
     def launch_environment(
         self, workers: int, models_held: int, context: Optional[int] = None, cards_per_copy: int = 1
@@ -145,7 +194,11 @@ class OllamaFacts:
 
     async def _pull(self, client: httpx.AsyncClient, tag: str) -> AsyncIterator[tuple[int, int]]:
         layers: dict[str, tuple[int, int]] = {}
-        async with client.stream("POST", "/api/pull", json={"model": tag, "stream": True}, timeout=None) as response:
+        # With a server per card, through the first: they share one store, so a model is fetched
+        # once (D190) — and the router in front of them forwards no pull.
+        first = (self.copies() or [""])[0]
+        async with client.stream("POST", f"{first}/api/pull", json={"model": tag, "stream": True},
+                                 timeout=None) as response:
             if response.status_code != 200:
                 raise EngineRefused(f"pull returned {response.status_code}")
             async for line in response.aiter_lines():
@@ -163,7 +216,29 @@ class OllamaFacts:
     async def hold(self, client: httpx.AsyncClient, tag: str, *, pinned: bool) -> None:
         """Pinned: load it and keep it loaded. Not pinned: hand its lifetime back to the engine.
         Either form *loads* the model if it is not loaded, so the caller releases only what is
-        loaded now — releasing a cold model would do the opposite of what was meant."""
+        loaded now — releasing a cold model would do the opposite of what was meant.
+
+        With a server per card, on each (D192): pinned on every one, so the machine holds it only
+        once all do; released only on those that hold it now."""
+        copies = self.copies()
+        if not copies:
+            await self._hold_on(client, "", tag, pinned=pinned)
+            return
+        for url in copies:
+            if not pinned and not await self._loaded_on(client, url, tag):
+                continue
+            await self._hold_on(client, url, tag, pinned=pinned)
+
+    async def _loaded_on(self, client: httpx.AsyncClient, url: str, tag: str) -> bool:
+        """Whether the server at `url` holds `tag` now — True where it cannot say, so a release is
+        tried rather than a pin left behind."""
+        try:
+            listed = (await client.get(f"{url}/api/ps", timeout=COPY_LOOK_S)).raise_for_status().json()
+        except (httpx.HTTPError, ValueError):
+            return True
+        return any(isinstance(m, dict) and m.get("name") == tag for m in listed.get("models", []))
+
+    async def _hold_on(self, client: httpx.AsyncClient, url: str, tag: str, *, pinned: bool) -> None:
         keep_alive: Any = -1 if pinned else "5m"
         body = {"model": tag, "keep_alive": keep_alive}
         # An embedding model refuses `generate` with a 400, so it is held through the endpoint
@@ -172,30 +247,31 @@ class OllamaFacts:
         # a metadata call, and a host must not be condemned for that. Found live — this call
         # inherited the client's ten-second default, timed out while an 18.6GB download ran
         # beside it, and the pool destroyed a healthy host for "could not hold the model set".
-        for path in self._paths_to_try(await self._kind_of(client, tag)):
+        for path in self._paths_to_try(await self._kind_of(client, tag, url)):
             # A **deadline**, not `timeout=None`. Seen live: a machine whose engine had fallen
             # back to the processor took a 26B model past sixteen minutes, the agent waited in
             # this call the whole time, and because the loop is one tag after another the rest
             # of the model set never started. It answered every poll cheerfully while nothing
             # moved. A load that outlasts this is reported as an error the pool can act on.
-            response = await client.post(path, json=body, timeout=LOAD_TIMEOUT_S)
+            response = await client.post(f"{url}{path}", json=body, timeout=LOAD_TIMEOUT_S)
             if response.status_code == 200:
                 return
             # 400 is this engine's way of saying "wrong endpoint for this kind of model"; any
             # other refusal is about the model itself and trying elsewhere would only hide it.
             if response.status_code != 400:
                 break
+        where = f" on its server at {url}" if url else ""
         raise EngineRefused(
-            f"the engine would not {'pin' if pinned else 'release'} {tag}: {response.status_code}"
+            f"the engine would not {'pin' if pinned else 'release'} {tag}{where}: {response.status_code}"
         )
 
-    async def _kind_of(self, client: httpx.AsyncClient, tag: str) -> Optional[str]:
+    async def _kind_of(self, client: httpx.AsyncClient, tag: str, url: str = "") -> Optional[str]:
         """"embedding", "completion", or **None when the engine did not say in time**.
 
         Never fatal: the caller tries both endpoints when it does not know (D84).
         """
         try:
-            shown = await client.post("/api/show", json={"model": tag}, timeout=SHOW_TIMEOUT_S)
+            shown = await client.post(f"{url}/api/show", json={"model": tag}, timeout=SHOW_TIMEOUT_S)
         except httpx.HTTPError:
             return None
         if shown.status_code != 200:
@@ -216,10 +292,15 @@ class OllamaFacts:
         return ("/api/generate", "/api/embed")
 
     async def delete(self, client: httpx.AsyncClient, tag: str) -> None:
-        response = await client.request("DELETE", "/api/delete", json={"model": tag})
+        # Through the first server per card, where there are several: the store is theirs together.
+        first = (self.copies() or [""])[0]
+        response = await client.request("DELETE", f"{first}/api/delete", json={"model": tag})
         if response.status_code != 200:
             raise EngineRefused(f"the engine would not delete {tag}: {response.status_code}")
 
+
+#: One look at one server's loaded models, of several per card (D192): short, as the facts' are.
+COPY_LOOK_S = 3.0
 
 #: The longest a single model may take to load before it is called a failure. Generous — a
 #: large model on a healthy accelerator is a matter of a minute or two — and finite, which is

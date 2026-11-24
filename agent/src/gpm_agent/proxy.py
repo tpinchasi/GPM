@@ -32,6 +32,17 @@ half of them is not what was bought.
 
 Started by the machine's own start-up command, which also starts the engines and writes the map
 of model to upstream. The pool names a model; it never names a port, a path or a command.
+
+**In front of one Ollama server per card** (`--engine ollama`, D190): each upstream is a whole
+Ollama serving every model on the machine's disk, pinned to its own card. A request goes to the
+least busy server, whatever model it names. Ollama's own inference paths are forwarded beside
+the OpenAI- and Anthropic-shaped ones, from a closed list of their own; its management paths —
+pull, delete, create, copy, push, blobs — never are: the agent pulls and holds through each
+server directly. What the pool and the agent *read* through this port is answered for the
+machine as a whole (D192): `/api/version` and `/api/tags` only when every server answers, and
+`/api/ps` listing a model only when every server holds it, each entry the one with the least of
+it on its card, so a copy put on the processor is seen. `/api/show` asks the first server: the
+model's files are the same for all of them.
 """
 
 from __future__ import annotations
@@ -40,8 +51,9 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 from pathlib import Path
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 import httpx
 from starlette.applications import Starlette
@@ -71,6 +83,30 @@ FORWARDED_PATHS = frozenset({
     "/v1/audio/translations",
     "/v1/rerank",
 })
+
+#: Ollama's own paths an engine is asked inference on, and the OpenAI- and Anthropic-shaped ones
+#: it serves too — the only ones forwarded in front of Ollama servers (D190), each by its exact
+#: name. Its others — `/api/pull`, `/api/delete`, `/api/create`, `/api/copy`, `/api/push`,
+#: `/api/blobs/…` — change what is on the machine and are never forwarded. Adding one is a
+#: decision.
+OLLAMA_FORWARDED_PATHS = frozenset({
+    "/api/chat",
+    "/api/generate",
+    "/api/embed",
+    "/api/embeddings",
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+    "/v1/responses",
+    "/v1/messages",
+})
+
+#: The engines this can stand in front of: one process per model (and per copy) — vLLM's shape —
+#: or whole Ollama servers, one per card.
+ENGINES = ("vllm", "ollama")
+
+#: `POST /api/show` asks for a model's details by name: a small body, bounded far below the rest.
+SHOW_BODY_BYTES = 65_536
 
 #: Where the pool's router names the build it chose (D144). Headers starting `X-GPM-` are the
 #: pool's own — the router drops an application's before forwarding — and none goes on to an
@@ -137,6 +173,53 @@ class Upstreams:
         return self.by_model().get(model, []) if model else []
 
 
+#: A server on this machine: `http://127.0.0.1:<port>`, nothing more.
+_LOOPBACK = re.compile(r"http://127\.0\.0\.1:[0-9]{1,5}")
+
+
+class OllamaServers:
+    """The Ollama servers on this machine, one per card, read from the file whoever started them
+    wrote (`ollama_cards`): `{"servers": [{"card": "0", "url": "http://127.0.0.1:11435"}, …]}`.
+    Re-read as it changes, as the model map is. Only loopback addresses with a port are taken:
+    every server runs on this machine."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path).expanduser()
+        self._stamp: Optional[float] = None
+        self._servers: list[tuple[str, str]] = []
+
+    def servers(self) -> list[tuple[str, str]]:
+        """(card, url) for each server, in the order they were started."""
+        try:
+            stamp = self.path.stat().st_mtime
+        except OSError:
+            return self._servers
+        if stamp != self._stamp:
+            self._servers = self._read()
+            self._stamp = stamp
+        return self._servers
+
+    def _read(self) -> list[tuple[str, str]]:
+        try:
+            raw = json.loads(self.path.read_text())
+        except (OSError, ValueError) as exc:
+            log.warning("could not read the servers at %s: %s", self.path, exc)
+            return self._servers
+        listed = raw.get("servers") if isinstance(raw, dict) else None
+        if not isinstance(listed, list):
+            log.warning("the servers file at %s lists no servers", self.path)
+            return self._servers
+        found = []
+        for entry in listed:
+            url = entry.get("url") if isinstance(entry, dict) else None
+            card = entry.get("card") if isinstance(entry, dict) else None
+            if isinstance(url, str) and _LOOPBACK.fullmatch(url) and isinstance(card, str):
+                found.append((card, url))
+            else:
+                log.warning("ignoring a server entry that is not a card and a loopback URL: %.200r", entry)
+        return found
+
+
 def _json_facts(body: bytes) -> tuple[Optional[str], bool]:
     """The model a JSON body names and whether it asks to stream, in one parse. A body that is
     not a JSON object names no model and does not stream."""
@@ -182,7 +265,12 @@ def create_app(
     *,
     client: Optional[httpx.AsyncClient] = None,
     max_body_bytes: int = MAX_BODY_BYTES,
+    engine: str = "vllm",
 ) -> Starlette:
+    """The router. `upstream_map` is the model map (`vllm`), or for `engine="ollama"` the file
+    listing one Ollama server per card (D190)."""
+    if engine not in ENGINES:
+        raise ValueError(f"the router stands in front of {' or '.join(ENGINES)}, not {engine!r}")
     upstreams = Upstreams(upstream_map)
     http = client or httpx.AsyncClient(timeout=INFERENCE_TIMEOUT_S, follow_redirects=False)
     #: Requests this process has open to each copy — how the least busy one is chosen.
@@ -325,6 +413,10 @@ def create_app(
                 )
             return did_not_answer(model, refused)
 
+        return await relayed(candidates, path, body, headers, model)
+
+    async def relayed(candidates: list[str], path: str, body: bytes, headers: dict[str, str],
+                      model: Optional[str]) -> Response:
         # Streaming: the engine's answer is opened before this one is, so its status and type
         # are the ones the client gets — a refusal is not a 200 — and it is closed when the
         # client goes, so an abandoned request stops the work upstream rather than generating
@@ -375,6 +467,9 @@ def create_app(
             if client is None:
                 await http.aclose()
 
+    if engine == "ollama":
+        return Starlette(routes=_ollama_routes(OllamaServers(upstream_map), http, in_flight, relayed, max_body_bytes),
+                         lifespan=lifespan)
     return Starlette(
         routes=[
             Route("/health", health, methods=["GET"]),
@@ -386,15 +481,155 @@ def create_app(
     )
 
 
-def serve(upstream_map: str, host: str = "127.0.0.1", port: int = 8000) -> None:
+def _ollama_routes(
+    servers: OllamaServers, http: httpx.AsyncClient, in_flight: dict[str, int],
+    relayed: Callable[..., Awaitable[Response]], max_body_bytes: int,
+) -> list[Route]:
+    """In front of one Ollama server per card (D190): every server serves every model on the
+    machine's disk, so a request goes to the least busy, and what is read is the machine's."""
+
+    async def each(path: str) -> tuple[list[tuple[str, httpx.Response]], Optional[str]]:
+        """Every server's answer to `GET path`, or what the first that did not answer was."""
+        listed = servers.servers()
+        if not listed:
+            return [], "no Ollama servers are listed here yet"
+        answers = []
+        for card, url in listed:
+            try:
+                answer = await http.get(f"{url}{path}", timeout=HEALTH_TIMEOUT_S)
+            except httpx.HTTPError as exc:
+                log.warning("the Ollama server for card %s at %s did not answer %s: %s", card, url, path, exc)
+                return [], f"the Ollama server for card {card} did not answer"
+            if answer.status_code != 200:
+                return [], f"the Ollama server for card {card} answered {answer.status_code}"
+            answers.append((card, answer))
+        return answers, None
+
+    def unready(why: str) -> JSONResponse:
+        # Ollama's own shape for an error. The card is this machine's own number, never a caller's.
+        return JSONResponse({"error": why}, status_code=503)
+
+    async def version(request: Request) -> Response:
+        """The servers' version — only when every one of them answers, so a machine with a dead
+        copy is not one the pool calls healthy (D192)."""
+        answers, why = await each("/api/version")
+        if why:
+            return unready(why)
+        return Response(answers[0][1].content, media_type="application/json")
+
+    async def health(request: Request) -> Response:
+        _, why = await each("/api/version")
+        return unready(why) if why else Response(status_code=200)
+
+    async def running(request: Request) -> Response:
+        answers, why = await each("/api/version")
+        return unready(why) if why else Response("Ollama is running", media_type="text/plain")
+
+    def entries(answer: httpx.Response) -> list[dict[str, Any]]:
+        try:
+            listed = answer.json().get("models")
+        except (ValueError, AttributeError):
+            return []
+        return [entry for entry in listed if isinstance(entry, dict) and isinstance(entry.get("name"), str)] \
+            if isinstance(listed, list) else []
+
+    async def common(path: str) -> Response:
+        """The models every server lists, each as the server with the least of it on its card
+        lists it: a model one server holds and another does not is not the machine's."""
+        answers, why = await each(path)
+        if why:
+            return unready(why)
+        found: Optional[dict[str, dict[str, Any]]] = None
+        for _, answer in answers:
+            mine = {entry["name"]: entry for entry in entries(answer)}
+            if found is None:
+                found = mine
+                continue
+            kept = {}
+            for name, entry in found.items():
+                if name in mine:
+                    other = mine[name]
+                    least = other if _on_card(other) < _on_card(entry) else entry
+                    kept[name] = least
+            found = kept
+        return JSONResponse({"models": list((found or {}).values())})
+
+    async def tags(request: Request) -> Response:
+        return await common("/api/tags")
+
+    async def loaded(request: Request) -> Response:
+        return await common("/api/ps")
+
+    async def show(request: Request) -> Response:
+        """A model's details, from the first server: every server reads the same files."""
+        body = await _bounded_body(request, SHOW_BODY_BYTES)
+        if body is None:
+            return _refusal(413, "request_too_large", "the request body is over this machine's limit")
+        listed = servers.servers()
+        if not listed:
+            return unready("no Ollama servers are listed here yet")
+        card, url = listed[0]
+        try:
+            answer = await http.post(f"{url}/api/show", content=body,
+                                     headers={"content-type": "application/json"}, timeout=HEALTH_TIMEOUT_S * 6)
+        except httpx.HTTPError as exc:
+            log.warning("the Ollama server for card %s did not answer /api/show: %s", card, exc)
+            return unready(f"the Ollama server for card {card} did not answer")
+        return Response(answer.content, status_code=answer.status_code,
+                        media_type=answer.headers.get("content-type"))
+
+    async def forward(request: Request) -> Response:
+        path = request.scope["path"]
+        if path not in OLLAMA_FORWARDED_PATHS:
+            log.warning("refused a request on a path that is not forwarded: %.200r", path)
+            return _refusal(404, "path_not_served", "this machine forwards inference requests only")
+        body = await _bounded_body(request, max_body_bytes)
+        if body is None:
+            log.warning("refused a request on %s over %d bytes", path, max_body_bytes)
+            return _refusal(413, "request_too_large", "the request body is over this machine's limit")
+        urls = [url for _, url in servers.servers()]
+        if not urls:
+            return _refusal(502, "upstream_unavailable", "the engine for this model did not answer")
+        headers = {
+            name: value for name, value in request.headers.items()
+            if name.lower() not in ("host", "content-length", "connection", "transfer-encoding")
+            and not name.lower().startswith(POOL_HEADER_PREFIX)
+        }
+        # Every server serves every model; the least busy first, stable among ties. Always
+        # relayed as it comes: Ollama's own paths stream unless a request says not to, and an
+        # answer in one piece is relayed whole all the same.
+        candidates = sorted(urls, key=lambda url: in_flight.get(url, 0))
+        return await relayed(candidates, path, body, headers, request.headers.get(MODEL_HEADER))
+
+    return [
+        Route("/", running, methods=["GET"]),
+        Route("/health", health, methods=["GET"]),
+        Route("/api/version", version, methods=["GET"]),
+        Route("/api/tags", tags, methods=["GET"]),
+        Route("/api/ps", loaded, methods=["GET"]),
+        Route("/api/show", show, methods=["POST"]),
+        Route("/{path:path}", forward, methods=["POST"]),
+    ]
+
+
+def _on_card(entry: dict[str, Any]) -> float:
+    """How much of a loaded model is in its card's memory — infinite where the server does not
+    say, so an entry that says is always preferred to one that does not."""
+    value = entry.get("size_vram")
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else float("inf")
+
+
+def serve(upstream_map: str, host: str = "127.0.0.1", port: int = 8000, engine: str = "vllm") -> None:
     """Run it. Loopback by default: the pool reaches this through a forward into the machine,
     so binding anything wider only exposes it (D77)."""
     import uvicorn
 
-    uvicorn.run(create_app(upstream_map), host=host, port=port, log_level="warning")
+    uvicorn.run(create_app(upstream_map, engine=engine), host=host, port=port, log_level="warning")
 
 
 def add_arguments(parser: Any) -> None:
     parser.add_argument("--upstreams", required=True, help="JSON file mapping model name to its engine URL, or a list of them (one per copy)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--engine", choices=ENGINES, default="vllm",
+                        help="what the upstreams are: one process per model (vllm), or one Ollama server per card (ollama)")

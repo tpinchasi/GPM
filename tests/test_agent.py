@@ -169,7 +169,7 @@ def test_the_agent_never_runs_a_shell_or_a_command_it_was_given():
     # command line imports it, and the machine's restart script is what runs that.
     for name in (
         "app.py", "models.py", "engine_control.py", "engines.py", "proxy.py",
-        "installs.py", "ollama_server.py", "whisper_cpp.py", "whisper_build.py", "platform.py",
+        "installs.py", "ollama_server.py", "ollama_cards.py", "whisper_cpp.py", "whisper_build.py", "platform.py",
     ):
         text = (root / name).read_text()
         assert "vllm_launch" not in text, f"{name} reaches the launcher, which can start processes"
@@ -242,7 +242,7 @@ def test_the_agent_never_runs_a_shell_or_a_command_it_was_given():
     # models directory and its port; and an installed Ollama (D150) — the program in a version
     # directory the agent unpacked, and `serve`, built in `serve_argv`.
     # And the ONNX server (S15, D179): an interpreter running the pool's own server file, from `server_argv`.
-    for name, builder in (("whisper_cpp.py", "server_argv"), ("ollama_server.py", "serve_argv"),
+    for name, builder in (("whisper_cpp.py", "server_argv"), ("ollama_server.py", "self._argv"),
                           ("onnx_engine.py", "server_argv")):
         tree = ast.parse((root / name).read_text())
         starts = [
@@ -256,7 +256,23 @@ def test_the_agent_never_runs_a_shell_or_a_command_it_was_given():
             node.value for node in ast.walk(tree)
             if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "argv" for t in node.targets)
         ]
-        assert len(assigned) == 1 and isinstance(assigned[0], ast.Call) and assigned[0].func.id == builder, name
+        assert len(assigned) == 1 and isinstance(assigned[0], ast.Call) and ast.unparse(assigned[0].func) == builder, name
+    # Ollama's server is `serve_argv` unless it is given a builder (D190) — and the one builder
+    # given is the router's in front of a server per card: the agent's own command, `proxy`, and
+    # its fixed options, a file of the agent's and the engine's port.
+    server = ast.parse((root / "ollama_server.py").read_text())
+    kept = [ast.unparse(node.value) for node in ast.walk(server) if isinstance(node, ast.Assign)
+            and any(ast.unparse(t) == "self._argv" for t in node.targets)]
+    assert kept == ["argv or serve_argv"]
+    cards = ast.parse((root / "ollama_cards.py").read_text())
+    given = [keyword.value for keyword in ast.walk(cards) if isinstance(keyword, ast.keyword) and keyword.arg == "argv"]
+    assert [ast.unparse(value) for value in given] == ["argv", "argv"]  # passed on in `_member`, from `_router`
+    built = [node for node in ast.walk(cards) if isinstance(node, ast.FunctionDef) and node.name == "argv"]
+    assert len(built) == 1
+    assert ast.unparse(built[0].body[0]) == (
+        "return [*self._command, 'proxy', '--engine', 'ollama', '--upstreams', upstreams, '--port', str(self.port)]"
+    )
+    assert "host_platform.start(" not in (root / "ollama_cards.py").read_text()
     for name in ("app.py", "models.py", "engines.py", "installs.py", "proxy.py", "engine_control.py", "whisper_build.py",
                  "vllm_server.py"):
         assert "host_platform.start(" not in (root / name).read_text(), f"{name} starts a program"
@@ -1236,7 +1252,8 @@ async def test_a_load_that_never_finishes_is_a_failure_rather_than_a_silent_stal
 
     assert engines.LOAD_TIMEOUT_S and engines.LOAD_TIMEOUT_S < 3600, "a load must have a deadline"
     source = (Path(engines.__file__)).read_text()
-    hold = source[source.index("async def hold"):]
+    # Held on each server where one runs per card (D192): the load itself is `_hold_on`.
+    hold = source[source.index("async def _hold_on"):]
     hold = hold[: hold.index("\n    async def ")]
     # The code, not the prose about it: the comment above the call names the old behaviour.
     code = "\n".join(line for line in hold.splitlines() if not line.strip().startswith("#"))

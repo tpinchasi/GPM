@@ -1628,6 +1628,9 @@ class Supervisor:
         try:
             if await self.fleet.models_from_sibling_pending(host):
                 return  # a copy from a sibling is still coming (D116); the next pass looks again
+            # An Ollama host with several cards runs a server on each once its agent's launcher
+            # is there (D190): started again so, before anything is pulled — once.
+            await self.fleet.start_per_card(host)
             # A host with an agent is fetched by its agent: one pull at a time, each model
             # loaded as its own download finishes (D57). Without one, the pool does it the way
             # it always has, over the engine's own API.

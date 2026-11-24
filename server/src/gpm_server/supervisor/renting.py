@@ -162,6 +162,10 @@ class RentedHost:
     #: takes minutes, and asking again every pass would only ever interrupt it.
     restarted_for: Optional[frozenset] = None
     restart_asked_at: Optional[float] = None
+    #: Whether the pool has asked this host's agent to start its Ollama again, now that the agent's
+    #: launcher is on the machine, as one server per card (D190). Once per host: what the launcher
+    #: chose is in the agent's facts afterwards, and a host adopted with them is not asked again.
+    per_card_asked: bool = False
     #: When the pool last re-bid for this host and asked the provider to start it again. While
     #: that start is in flight the instance still reads "stopped", and read as a fresh
     #: eviction the pool bids against itself (D106).
@@ -2725,6 +2729,58 @@ class Fleet:
                 )
 
         host.restart_task = asyncio.create_task(ask(), name=f"gpm:restart:{host.host_id}")
+
+    def wants_per_card(self, host: RentedHost) -> bool:
+        """Whether this host's Ollama is to be started again as one server per card (D190): an
+        Ollama host with more than one card — as its agent counts them, else as it was bought —
+        whose agent answers and has not said what its launcher chose, started by the pool's own
+        start (not an operator's `engine_start`), and not yet serving. Asked once."""
+        if host.per_card_asked or host.agent is None or not host.agent.manage_models:
+            return False
+        if self.engine_of(host).name != "ollama" or self.rented.engine_start or host.state == "ready":
+            return False
+        facts = host.agent_facts or {}
+        if (facts.get("engine") or {}).get("layout") is not None:
+            host.per_card_asked = True  # its launcher has run: a host adopted after it is not asked again
+            return False
+        accelerators = facts.get("accelerators")
+        if isinstance(accelerators, list) and accelerators:
+            cards = sum(1 for card in accelerators if isinstance(card, dict) and card.get("kind") == "cuda")
+        else:
+            cards = int(getattr(host.offer, "gpus", 1) or 1)
+        return cards > 1
+
+    async def start_per_card(self, host: RentedHost) -> None:
+        """Start a several-card Ollama host's engine again through its agent, before any model is
+        pulled, so that the pool's restart script — at boot without the agent's archive, and so the
+        one server — now finds the launcher and starts an Ollama on each card behind the router
+        (D190), or the one server where the cards or the models do not allow it (D191). With the
+        host's own numbers, as any restart: the workers it was launched for, the set it holds, its
+        context. A restart that fails leaves the one server serving, as before; it is said, and the
+        host prepares on it."""
+        if not self.wants_per_card(host):
+            return
+        host.per_card_asked = True
+        settings: dict[str, int] = agents.wanted_engine_settings(
+            host.launch_workers or host.workers, len(self.tags_for(host)))
+        context = int(self.rented.context_length or 0)
+        if 256 <= context <= 1_048_576:
+            settings["context"] = context
+        self.events.record(
+            "engine_per_card",
+            f"{host.host_id}: its agent is on the machine; starting its Ollama again, as one server per card",
+            host_id=host.host_id,
+            lease_id=host.lease_id,
+        )
+        status, answer = await agents.restart_engine(host.agent, settings, transport=self._agent_transport)
+        if status != 200 or not answer.get("engine_answers"):
+            self.events.record(
+                "engine_per_card_failed",
+                f"{host.host_id}: its Ollama was not started again as one server per card — "
+                f"{str(answer.get('detail') or answer.get('error') or answer.get('restart_output') or status)[-300:]}",
+                host_id=host.host_id,
+                lease_id=host.lease_id,
+            )
 
     async def load_model_set(self, host: RentedHost, engine, client) -> bool:
         """Fetch the set, loading each model as its own download finishes, then check they are
