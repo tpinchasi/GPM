@@ -791,6 +791,9 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
                 ),
                 # How many models one workload may serve (D118): the console's form stops there.
                 "workload_max_models": supervisor.config.workloads.max_models,
+                # The plan chat's model (D204), or None: the console shows the chat only with one.
+                "plan_assistant": ({"model": supervisor.config.console.plan_assistant.model}
+                                   if supervisor.config.console.plan_assistant is not None else None),
                 "catalog": {
                     name: [
                         {
@@ -2188,6 +2191,65 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
             return JSONResponse({"plan": await supervisor.workloads.plan(_workload_request(body))})
 
         return await _workload_call(run)
+
+    def _assistant_or_404() -> Optional[JSONResponse]:
+        if supervisor.config.console.plan_assistant is None:
+            return JSONResponse({"error": "not_found", "detail": "the plan chat is off: set console.plan_assistant.model "
+                                 "to a chat model this pool serves on its own machines"}, status_code=404)
+        return None
+
+    @app.post("/pool/workloads/plan-assistant")
+    async def ask_plan_assistant(request: Request) -> JSONResponse:
+        """The plan chat (S19, D204): a description, and the plan the builder holds, written for
+        a router to answer. It only proposes; nothing here creates or spends."""
+        from ..plan_assistant import MAX_DESCRIPTION, AssistantBusy, AssistantRequests
+
+        refused = _assistant_or_404()
+        if refused is not None:
+            return refused
+        try:
+            body = await request.json()
+        except ValueError:
+            body = None
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "bad_request", "detail": "send {\"description\": ..., \"plan\": ...}"},
+                                status_code=400)
+        description, plan = body.get("description"), body.get("plan")
+        if not isinstance(description, str) or not description.strip() or len(description) > MAX_DESCRIPTION:
+            return JSONResponse({"error": "bad_request", "detail": f"description is text, up to {MAX_DESCRIPTION} "
+                                 "characters"}, status_code=400)
+        if plan is not None and not isinstance(plan, dict):
+            return JSONResponse({"error": "bad_request", "detail": "plan is the serving plan's JSON object"},
+                                status_code=400)
+        try:
+            request_id = await asyncio.to_thread(AssistantRequests(supervisor.db).create, description, plan or None,
+                                                 supervisor.config.console.plan_assistant.timeout_s)
+        except AssistantBusy as exc:
+            return JSONResponse({"error": "busy", "detail": str(exc), "id": exc.request_id}, status_code=409)
+        return JSONResponse({"id": request_id, "model": supervisor.config.console.plan_assistant.model},
+                            status_code=202)
+
+    @app.get("/pool/workloads/plan-assistant/{request_id}")
+    async def read_plan_assistant(request_id: str) -> JSONResponse:
+        """Its state, or its answer — read once: the row is deleted as the answer is given."""
+        from ..plan_assistant import AssistantRequests
+
+        requests = AssistantRequests(supervisor.db)
+        row = await asyncio.to_thread(requests.get, request_id)
+        if row is None:
+            return JSONResponse({"error": "not_found", "detail": "no such chat request (answered and read, or "
+                                 "cancelled)"}, status_code=404)
+        if row["state"] != "answered":
+            return JSONResponse({"id": request_id, "state": row["state"]})
+        await asyncio.to_thread(requests.delete, request_id)
+        return JSONResponse({"id": request_id, "state": "answered", **(row["answer"] or {})})
+
+    @app.delete("/pool/workloads/plan-assistant/{request_id}")
+    async def cancel_plan_assistant(request_id: str) -> JSONResponse:
+        from ..plan_assistant import AssistantRequests
+
+        gone = await asyncio.to_thread(AssistantRequests(supervisor.db).delete, request_id)
+        return JSONResponse({"id": request_id, "cancelled": gone})
 
     @app.get("/pool/schema/serving-plan")
     async def serving_plan_schema() -> JSONResponse:

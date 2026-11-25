@@ -45,6 +45,8 @@ class FakeOllama:
         self.healthy = healthy
         #: Scripted: a host that cannot fetch the model set must not join the pool.
         self.refuse_pull = False
+        #: Scripted: the next chat answers' content, in order, where a test writes them.
+        self.scripted: list[str] = []
         #: Extra capabilities a tag reports from `/api/show` — `vision`, `audio` — as this
         #: version of the engine would (D143). Set by a test; empty means text only.
         self.capabilities: dict[str, list[str]] = {}
@@ -147,6 +149,9 @@ class FakeOllama:
         return body, parsed
 
     def _content_for(self, parsed: dict[str, Any]) -> str:
+        if self.scripted:
+            # Answers a test wrote, in order: what a model would have said.
+            return self.scripted.pop(0)
         if isinstance(parsed.get("format"), dict):
             return '{"answer":"42"}'
         messages = parsed.get("messages") or []

@@ -24,6 +24,8 @@ from .keys import fingerprint, mint
 
 #: An app's name: plain and short. It is shown on the console and kept in every request's row.
 NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
+#: Names the pool counts its own requests under (the plan chat, D204), never an app key's.
+RESERVED = frozenset({"console"})
 
 
 class AppKeyRefused(ValueError):
@@ -58,6 +60,8 @@ class AppKeyStore:
         if not isinstance(app, str) or not NAME.fullmatch(app):
             raise AppKeyRefused("an app's name is lower-case letters, digits, '-' and '_', up to 40, "
                                 "starting with a letter or digit")
+        if app in RESERVED:
+            raise AppKeyRefused(f"{app!r} is the pool's own: the console's plan chat is counted under it")
         key = mint("app")
         now = time.time()
         record = AppKey(f"appkey-{secrets.token_hex(6)}", app, now, None)

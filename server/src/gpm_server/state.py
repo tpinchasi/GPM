@@ -8,6 +8,7 @@ is gone.
 from __future__ import annotations
 
 import dataclasses
+import secrets
 from pathlib import Path
 from typing import Any, Optional
 
@@ -49,6 +50,12 @@ class RouterState:
         }
         self.engine: Engine = self.engines[config.engine]
         self.app_hashes = config.auth.app_hashes()
+        #: The key this router's own plan chat sends its requests with (S19, D204): made here,
+        #: held only in this process's memory, used only over an in-process transport, and read
+        #: as the app `console` — never written anywhere, so nothing outside can send it.
+        self.internal_key = secrets.token_urlsafe(32)
+        #: This router, as the chat's claims name it.
+        self.router_id = f"router-{secrets.token_hex(4)}"
         self.dispatcher = Dispatcher([])
         self.registry = HostRegistry(
             config, HostTable(database), HostCounters(database), self.dispatcher

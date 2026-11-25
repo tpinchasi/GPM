@@ -403,6 +403,20 @@ CREATE TABLE IF NOT EXISTS plan_rules (
     written_at  REAL NOT NULL
 );
 
+-- The console's plan chat (S19, D204): a request the control API writes and the router's watcher
+-- claims (once), answers through its own dispatch, and writes back; deleted once read or
+-- cancelled. One at a time. Nothing else of the chat is kept.
+CREATE TABLE IF NOT EXISTS assistant_requests (
+    id          TEXT PRIMARY KEY,
+    created_at  REAL NOT NULL,
+    description TEXT NOT NULL,
+    plan        TEXT,                   -- JSON: the plan the builder held, to change
+    state       TEXT NOT NULL DEFAULT 'waiting',  -- waiting | claimed | answered
+    claimed_by  TEXT,
+    claimed_at  REAL,
+    answer      TEXT                    -- JSON {plan, readback} or {words, refusals}
+);
+
 -- One row per pool. Exactly one supervisor runs at a time (supervisor.md §1).
 CREATE TABLE IF NOT EXISTS supervisor_lock (
     pool       TEXT PRIMARY KEY,

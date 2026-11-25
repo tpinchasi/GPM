@@ -876,6 +876,27 @@ class PoolSettings(BaseModel):
         return self
 
 
+class PlanAssistantConfig(BaseModel):
+    """The console's plan chat (S19, D204): the model that turns a description into a serving
+    plan. A model this pool serves on its own machines — never hosted-only — whose build can be
+    held to a schema; asked one request at a time, with these bounds."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    max_tokens: int = Field(default=2048, ge=256, le=16384)
+    timeout_s: float = Field(default=120.0, gt=0, le=900)
+
+
+class ConsoleConfig(BaseModel):
+    """The operator console's own settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Unset: the chat is hidden, and the console says how to turn it on.
+    plan_assistant: Optional[PlanAssistantConfig] = None
+
+
 class StatsConfig(BaseModel):
     """Stats kept, and how long the raw logs are (D194, D195). The supervisor folds the request
     log and the spend ledger into hourly tables; the raw rows go after `keep_requests_days`, the
@@ -1700,6 +1721,8 @@ class PoolConfig(BaseModel):
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     #: Stats kept, and how long the raw logs are (D194, D195).
     stats: StatsConfig = Field(default_factory=StatsConfig)
+    #: The console's plan chat (D204).
+    console: ConsoleConfig = Field(default_factory=ConsoleConfig)
     request_log: str = "gpm.sqlite3"
     directory: DirectoryConfig = Field(default_factory=DirectoryConfig)
 
@@ -1746,7 +1769,37 @@ class PoolConfig(BaseModel):
         self._declared_models_are_in_the_set()
         self._hosts_can_serve_what_they_are_asked_for()
         self._every_model_is_held_by_somebody()
+        self._plan_assistant_runs_here()
         return self
+
+    def _plan_assistant_runs_here(self) -> None:
+        """The plan chat's model (D204): one this pool serves on its own machines — a description
+        of the operator's plans never leaves the pool — and a chat build that can be held to a
+        schema."""
+        assistant = self.console.plan_assistant
+        if assistant is None:
+            return
+        name = assistant.model
+        if name not in self.pool.model_set:
+            raise ValueError(f"console.plan_assistant.model {name!r} is not in the pool's model set")
+        if self.hosted_only(name):
+            raise ValueError(f"console.plan_assistant.model {name!r} is served by hosted APIs alone; the chat runs on "
+                             "the pool's own machines, so the operator's description never leaves the pool")
+        entry = self.catalog.get(name)
+        if entry is None:
+            raise ValueError(f"console.plan_assistant.model {name!r} is not catalogued; the chat needs to know its "
+                             "builds can answer chat held to a schema")
+        builds = [v for v in entry.variants if not v.hosted]
+        chat = [v for v in builds if v.serves is None or "chat" in v.serves]
+        if not chat:
+            raise ValueError(f"console.plan_assistant.model {name!r} has no build that answers chat")
+        owned = [h for h in self.hosts if h.kind in ("local", "fixed-remote") and not h.disabled]
+        if not any(name in self.models_held_by(h) for h in owned):
+            raise ValueError(f"console.plan_assistant.model {name!r}: no local or fixed machine of this pool holds it; "
+                             "the chat is sent keep_on owned, so it would never be answered")
+        if chat and all(v.enforces_schema is False for v in chat):
+            raise ValueError(f"console.plan_assistant.model {name!r}: every build of it is known to ignore a schema "
+                             "(enforces_schema: false); the chat needs structured output")
 
     def models_without_a_host_in_service(self) -> list[str]:
         """The models in the set that no host in service holds and no rented host is bought
