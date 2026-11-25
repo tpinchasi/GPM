@@ -48,7 +48,10 @@ _TOP = ("steady", "until_ready", "when_full", "during", "max_min", "defaults", "
 #: A plan's rules (§14.3, D200): a closed list of conditions and effects, at most 16.
 MAX_RULES = 16
 WHEN = ("priority", "keep_on", "between", "days", "spent_over", "evictions")
-THEN = ("use_only", "never_use", "after_s")
+THEN = ("use_only", "never_use", "after_s", "steady")
+#: When a rule's steady switch ends (§14.3): with the window it opened in, or at the end of the
+#: day it began on, in the plan's time zone; with neither, when the rule is no longer in force.
+UNTIL = ("window_end", "end_of_day")
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 #: Conditions the supervisor judges each pass; the rest are a request's, judged by the router.
 PASS_CONDITIONS = ("between", "days", "spent_over", "evictions")
@@ -434,6 +437,7 @@ class Rule:
     name: str
     when: Mapping[str, Any]
     then: Mapping[str, Any]
+    until: Optional[str] = None
 
     @property
     def on_the_pass(self) -> bool:
@@ -445,7 +449,20 @@ class Rule:
         return (self.when.get("priority", priority) == priority and self.when.get("keep_on", keep_on) == keep_on)
 
     def as_dict(self) -> dict[str, Any]:
-        return {"name": self.name, "when": dict(self.when), "then": dict(self.then)}
+        written = {"name": self.name, "when": dict(self.when), "then": dict(self.then)}
+        if self.until is not None:
+            written["until"] = self.until
+        return written
+
+    @property
+    def switch(self) -> Optional[str]:
+        """Where its steady switch moves the workload: `local`, `fixed`, or `rented:<kind>`."""
+        steady = self.then.get("steady")
+        if steady is None:
+            return None
+        if isinstance(steady, str):
+            return steady
+        return f"rented:{steady['rented'].get('kind', 'roi')}"
 
 
 def _tz(raw: Any) -> str:
@@ -533,8 +550,6 @@ def _rules(raw: Any, plan: ServingPlan) -> tuple[Rule, ...]:
         where = f"rules[{index}]"
         if not isinstance(item, dict) or set(item) - {"name", "when", "then", "until"}:
             raise PlanRefused(f"{where} is {{name, when, then}}")
-        if "until" in item:
-            raise PlanRefused(f"{where}.until holds a steady switch, which arrives in a later version of the pool")
         name = item.get("name")
         if not isinstance(name, str) or not name.strip() or len(name) > 60:
             raise PlanRefused(f"{where}.name is a few words naming the rule")
@@ -547,6 +562,9 @@ def _rules(raw: Any, plan: ServingPlan) -> tuple[Rule, ...]:
         if not isinstance(then, dict) or not then:
             raise PlanRefused(f"{where}.then names at least one effect: {', '.join(THEN)}")
         rule = Rule(name=name, when=_when(when, plan, where), then=_then(then, plan, where))
+        if "steady" in rule.then and ("priority" in when or "keep_on" in when):
+            raise PlanRefused(f"{where}: a steady switch is per workload, never per request — its when names a "
+                              "request's option")
         if ("priority" in when or "keep_on" in when) and plan.rented() is not None:
             # A burst is sized from every request's load: one kept from some requests alone would
             # be rented for load it may not serve.
@@ -558,6 +576,15 @@ def _rules(raw: Any, plan: ServingPlan) -> tuple[Rule, ...]:
                 raise PlanRefused(f"{where}: a rule on a request's options cannot keep the rented burst out — it is "
                                   "sized from every request's load; keep it out for all requests (a condition on "
                                   "the pass), or send keep_on owned")
+        until = item.get("until")
+        if until is not None:
+            if "steady" not in rule.then:
+                raise PlanRefused(f"{where}.until holds a steady switch; this rule has none")
+            if until not in UNTIL:
+                raise PlanRefused(f"{where}.until is window_end or end_of_day")
+            if until == "window_end" and "between" not in rule.when:
+                raise PlanRefused(f"{where}.until window_end needs a window: when.between")
+            rule = dataclasses.replace(rule, until=until)
         rules.append(rule)
     return tuple(rules)
 
@@ -612,9 +639,31 @@ def _when(when: dict, plan: ServingPlan, where: str) -> dict[str, Any]:
     return dict(when)
 
 
+def _switch(steady: Any, plan: ServingPlan, where: str) -> None:
+    """A rule's steady switch (§14.3): to the operator's own machines with a reservation, or to
+    rented machines of another kind. Where the workload runs on its rented machines, as created."""
+    if plan.steady != "rented":
+        raise PlanRefused(f"{where}.then.steady: a switch from steady {plan.steady!r} would rent a base the workload "
+                          "was created without; create it on rented machines and switch to local or fixed")
+    if steady in ("local", "fixed"):
+        if not plan.reserve.get(steady):
+            raise PlanRefused(f"{where}.then.steady {steady!r} runs on workers the operator reserves: add "
+                              f"reserve: {{\"{steady}\": <workers>}}")
+        return
+    if isinstance(steady, dict) and set(steady) == {"rented"} and isinstance(steady["rented"], dict):
+        kind = steady["rented"].get("kind")
+        if set(steady["rented"]) - {"kind"} or kind not in RENTED_KINDS:
+            raise PlanRefused(f"{where}.then.steady.rented.kind is one of {', '.join(RENTED_KINDS)}")
+        return
+    if steady == "rented":
+        raise PlanRefused(f"{where}.then.steady: steady is rented already; to change the kind, say "
+                          "{\"rented\": {\"kind\": ...}}")
+    raise PlanRefused(f"{where}.then.steady is \"local\", \"fixed\" or {{\"rented\": {{\"kind\": ...}}}}")
+
+
 def _then(then: dict, plan: ServingPlan, where: str) -> dict[str, Any]:
     if "steady" in then:
-        raise PlanRefused(f"{where}.then.steady: a rule's steady switch arrives in a later version of the pool")
+        _switch(then["steady"], plan, where)
     if "substitute" in then:
         raise PlanRefused(f"{where}.then.substitute: a substitute model arrives in a later version of the pool")
     unknown = sorted(set(then) - set(THEN))
@@ -644,6 +693,41 @@ def _then(then: dict, plan: ServingPlan, where: str) -> dict[str, Any]:
                 raise PlanRefused(f"{where}.then.after_s.{name}: a shorter wait only — from 0 to below its "
                                   f"{longest:g}s")
     return dict(then)
+
+
+def end_of_day(tz: str, now: float) -> float:
+    """The next midnight after `now` in the time zone, as a timestamp."""
+    import datetime
+    from zoneinfo import ZoneInfo
+
+    zone = ZoneInfo(tz)
+    local = datetime.datetime.fromtimestamp(now, zone)
+    tomorrow = (local + datetime.timedelta(days=1)).date()
+    return datetime.datetime(tomorrow.year, tomorrow.month, tomorrow.day, tzinfo=zone).timestamp()
+
+
+def steady_wanted(plan: ServingPlan, armed: frozenset[str], held: Optional[Mapping[str, Any]],
+                  now: float) -> Optional[dict[str, Any]]:
+    """The steady switch in force (§14.3): the last rule in force that switches, or one begun
+    before and held by its `until` — with the window it opened in, or to the end of that day.
+    None: steady is as the plan says. `held` is what the last pass found, which keeps its start."""
+    switching = [r for r in plan.rules if r.switch is not None and r.name in armed]
+    if switching:
+        rule = switching[-1]
+        if held is not None and held.get("rule") == rule.name and held.get("to") == rule.switch:
+            return dict(held)
+        return {"rule": rule.name, "to": rule.switch, "since": now,
+                "until": end_of_day(plan.tz, now) if rule.until == "end_of_day" else None}
+    if held is None:
+        return None
+    rule = next((r for r in plan.rules if r.name == held.get("rule") and r.switch == held.get("to")), None)
+    if rule is None:
+        return None
+    if rule.until == "end_of_day" and held.get("until") is not None and now < held["until"]:
+        return dict(held)
+    if rule.until == "window_end" and in_window(rule.when, plan.tz, now):
+        return dict(held)
+    return None
 
 
 @dataclasses.dataclass(frozen=True)

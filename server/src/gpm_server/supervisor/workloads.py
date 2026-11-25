@@ -33,6 +33,11 @@ class WorkloadRefused(Exception):
     """A workload that cannot be created, extended or ended as asked — said in words."""
 
 
+def kind_matches(kind: str, interruptible: bool) -> bool:
+    """Whether a rented machine is of a workload's kind (`machines=`): `roi` takes either."""
+    return kind == "roi" or (kind == "interruptible") == interruptible
+
+
 def parse_policy(body: dict) -> dict[str, Any]:
     """The spending policy a create or a change carries (D165), checked — `{}` where it carries
     none: `bursts.hosted` and `bursts.rented`. A workload's steady capacity is its `parallel` at
@@ -77,6 +82,34 @@ def parse_policy(body: dict) -> dict[str, Any]:
             raise WorkloadRefused(f"bursts.{name}{'.' + where if where else ''}: {message}") from None
         policy[name] = burst.model_dump(exclude_none=True)
     return policy
+
+
+def _switch_times(rule: Any, hours: float) -> int:
+    """How many times a rule's steady switch can begin within a lease's hours, at most: once per
+    day for a window, an end-of-day hold or a day's spending; once per eviction window; once for
+    the lease's spending; once a month for a month's."""
+    days = math.ceil(hours / 24) + 1
+    bounds = []
+    if "between" in rule.when or rule.until == "end_of_day":
+        bounds.append(days)
+    if "evictions" in rule.when:
+        bounds.append(math.ceil(hours / rule.when["evictions"]["within_h"]) + 1)
+    if "spent_over" in rule.when:
+        spent = rule.when["spent_over"]
+        bounds.append(1 if spent["budget"] == "lease" else days if spent.get("period") == "day"
+                      else math.ceil(hours / (24 * 28)) + 1)
+    return max(1, min(bounds)) if bounds else days
+
+
+def _switches(policy: Optional[Mapping[str, Any]]) -> frozenset[str]:
+    """Where a policy's rules may switch steady (S19 5b): `local`, `fixed`, `rented:<kind>`."""
+    from ..serving_plan import PlanRefused, plan_of
+
+    try:
+        plan = plan_of(policy or {})
+    except PlanRefused:
+        return frozenset()
+    return frozenset(r.switch for r in (plan.rules if plan is not None else ()) if r.switch)
 
 
 def describe_policy(policy: dict[str, Any]) -> str:
@@ -357,8 +390,72 @@ class Workloads:
             plan["models"] = [t.as_dict() for t in req.all_targets]
             plan["hosted_alone"] = list(req.hosted_alone)
             plan["reasons"].append(f"served by hosted APIs alone, no machine: {', '.join(req.hosted_alone)}")
+            return await self._price_switches(machines, plan)
+        return await self._price_switches(req, await self._plan_machines(req))
+
+    async def _price_switches(self, req: WorkloadRequest, plan: dict[str, Any]) -> dict[str, Any]:
+        """A rule's steady switch is paid for before it is allowed (S19 5b, §14.3): checked, and
+        the budget priced at the dearest steady the rules can reach plus the overlap of each
+        switch — both sets of hosts for the time a new one takes to be ready. A derived budget
+        becomes that; a typed one must hold it."""
+        from ..serving_plan import HOST_KINDS, PlanRefused, plan_of
+
+        try:
+            serving = plan_of(req.policy or {})
+        except PlanRefused:
             return plan
-        return await self._plan_machines(req)
+        switches = sorted({r.switch for r in (serving.rules if serving is not None else ()) if r.switch})
+        if not switches or plan.get("refused"):
+            return plan
+        for switch in switches:
+            if switch == f"rented:{req.kind}":
+                raise WorkloadRefused(f"a rule switches steady to {req.kind} machines, which it rents already "
+                                      f"(machines={req.kind})")
+            if switch in HOST_KINDS:
+                kinds = HOST_KINDS[switch]
+                for t in req.on_machines:
+                    if not any(h.kind in kinds and not h.disabled and t.model in self.config.models_held_by(h)
+                               for h in self.config.hosts):
+                        raise WorkloadRefused(f"a rule switches steady to {switch}, and no {switch} machine of this "
+                                              f"pool holds {t.model!r}")
+        # Each switch to rented machines of another kind, both ways, for every time its rule can
+        # begin within the hours: going, the old base bills while the new is prepared; coming
+        # back, the new bills while the old kind is prepared again. The base itself is priced at
+        # the dearest kind for every hour.
+        here_hourly = float(plan.get("hourly_total") or 0.0)
+        here_min = float(plan.get("minutes_to_serve") or 0.0)
+        needed, dearest, overlaps, times = plan["derived_budget"], req.kind, 0.0, 0
+        others: dict[str, dict[str, Any]] = {}
+        for rule in serving.rules:
+            if not (rule.switch or "").startswith("rented:"):
+                continue  # the operator's machines: nothing rented while they serve, nothing to overlap
+            kind = rule.switch.split(":", 1)[1]
+            if kind not in others:
+                other = await self._plan_machines(dataclasses.replace(req, kind=kind, max_spend=None))
+                if other.get("refused"):
+                    raise WorkloadRefused(f"a rule switches steady to {kind} machines, and the market has none to "
+                                          f"serve it: {other['refused']}")
+                others[kind] = other
+                if other["derived_budget"] > needed:
+                    needed, dearest = other["derived_budget"], kind
+            other = others[kind]
+            count = _switch_times(rule, req.hours)
+            times += count
+            overlaps += count * (here_hourly * float(other["minutes_to_serve"])
+                                 + float(other["hourly_total"]) * here_min) / 60
+        needed = round(needed + overlaps, 2)
+        plan["switch_budget"] = {"needed": needed, "dearest": dearest, "switches": switches,
+                                 "overlaps": round(overlaps, 2), "times": times}
+        if needed > plan["derived_budget"]:
+            said = (f"its rules can switch steady to {dearest} machines: priced there for every hour, with both sets of "
+                    f"hosts while each is prepared, both ways, up to {times} time(s) — ${needed:.2f}")
+            plan["reasons"].append(said)
+            plan["derived_budget"] = needed
+            if plan["budget_derived"]:
+                plan["max_spend"] = needed
+            elif req.max_spend is not None and req.max_spend < needed:
+                plan["refused"] = f"{said}, more than the ${req.max_spend:.2f} typed"
+        return plan
 
     def _plan_without_machines(self, req: WorkloadRequest) -> dict[str, Any]:
         """A workload whose every model is served by hosted APIs alone (D165): nothing to search
@@ -982,7 +1079,13 @@ class Workloads:
                                   "plan's when_full")
         if steady_of(policy) != steady_of(workload.policy):
             raise WorkloadRefused(f"workload {name!r} runs on {steady_of(workload.policy)}; where it runs is set when "
-                                  "it is created (a rule's steady switch arrives in a later version of the pool)")
+                                  "it is created (a rule may switch it, with the switch priced then)")
+        added = _switches(policy) - _switches(workload.policy)
+        if added:
+            # A switch is checked and priced into the lease when the workload is created (§14.3).
+            raise WorkloadRefused(f"workload {name!r}: a rule's steady switch is checked and priced when a workload is "
+                                  f"created, and this one was created without a switch to {', '.join(sorted(added))}; "
+                                  "create a workload with that rule")
         self.check_policy(workload.targets, policy)
         self.check_reserve(policy, excluding=name)
         self.store.set_policy(name, policy)
@@ -1064,6 +1167,7 @@ class Workloads:
                 # A program that stopped using its workload ends it — or a crashed one would keep
                 # its floor, and spend its whole budget (D117).
                 self.end(workload.name, f"unused for {(workload.idle_end_minutes or 15):g} minutes")
+        switched = self.store.steady_switches()
         for workload in self.store.active():
             lease = self.supervisor.leases.get(workload.lease_id)
             hosts = self.fleet.hosts_of(workload.name) if self.fleet is not None else []
@@ -1078,6 +1182,8 @@ class Workloads:
                 continue
             ready_groups = [g for g in workload.groups
                             if any(h.state == "ready" for h in hosts if g.holds(h.models))]
+            if (switched.get(workload.name) or {}).get("serving") in ("local", "fixed"):
+                ready_groups = list(workload.groups)  # served on the operator's machines by a rule (5b)
             if workload.state == "preparing" and len(ready_groups) == len(workload.groups):
                 # Serving once every model has a host of its own: until then a model still coming
                 # up borrows where it may (D118).
@@ -1100,6 +1206,7 @@ class Workloads:
         current = self.store.active()
         self._mark_gaps(now, current)
         self._arm_rules(now, current)
+        self._switch_steady(now, current)
         return [w for w in current if w.state in ("preparing", "serving", "ending")]
 
     def _mark_gaps(self, now: float, active: list[Workload]) -> None:
@@ -1113,11 +1220,14 @@ class Workloads:
         from ..serving_plan import PlanRefused, plan_of
 
         marked = self.store.gaps()
+        switched = self.store.steady_switches()
         wanted: set[tuple[str, str]] = set()
         for workload in active:
             policy = workload.policy or {}
             if workload.state != "serving" or "serve" not in policy:
                 continue
+            if (switched.get(workload.name) or {}).get("serving") in ("local", "fixed"):
+                continue  # steady is on the operator's machines by a rule: its rented hosts are meant to go
             try:
                 plan = plan_of(policy)
             except PlanRefused:
@@ -1206,6 +1316,77 @@ class Workloads:
                 self.store.set_armed_rules(name, ())  # ended: none of its rules is in force
         if self.fleet is not None:
             self.fleet.bursts_held_back = suppressed
+
+    def _switch_steady(self, now: float, active: list[Workload]) -> None:
+        """A rule's steady switch, handed over make-before-break (S19 stage 5b, §14.3). Per
+        workload, what its rules want (`want`) and where its steady is served (`serving`, the
+        router's to follow): a switch to the operator's machines is served there once one of that
+        kind holding its models is ready, and the fleet then gives its rented hosts up; a switch to
+        rented machines of another kind — or back from the operator's — keeps serving where it
+        was until the fleet's new base is ready. Written only on a change, with an event."""
+        from ..serving_plan import PlanRefused, plan_of, steady_wanted
+
+        stored = self.store.steady_switches()
+        armed_all = self.store.armed_rules()
+        targets: dict[str, Optional[str]] = {}
+        serving_on: dict[str, Optional[str]] = {}
+        for workload in active:
+            if workload.state not in ("preparing", "serving"):
+                continue
+            try:
+                plan = plan_of(workload.policy or {})
+            except PlanRefused:
+                plan = None
+            before = stored.get(workload.name)
+            switching = plan is not None and any(r.switch for r in plan.rules)
+            if not switching and not before:
+                continue
+            # A switch whose rule was removed hands back as one that ended: make-before-break.
+            want = steady_wanted(plan, armed_all.get(workload.name, frozenset()),
+                                 (before or {}).get("want"), now) if switching else None
+            target = want["to"] if want else None
+            served = (before or {}).get("serving")
+            if target in ("local", "fixed"):
+                serving = target if (served == target or self._own_ready(workload, target)) else served
+            elif served in ("local", "fixed") and not self._rented_base_ready(workload, target):
+                serving = served  # handed back only once its rented base is ready again
+            else:
+                serving = None
+            state = {"want": want, "serving": serving} if (want or serving) else None
+            if state != before:
+                self.store.set_steady_switch(workload.name, state)
+                where = {None: "its rented machines"}.get(serving, f"the operator's {serving} machines")
+                self.supervisor.events.record(
+                    "workload_steady",
+                    f"workload {workload.name}: steady "
+                    + (f"switching to {target} by rule {want['rule']!r}" if want else "back as its plan says")
+                    + f"; serving on {where}",
+                    numbers={"workload": workload.name, "want": want, "serving": serving}, lease_id=workload.lease_id,
+                )
+            targets[workload.name], serving_on[workload.name] = target, serving
+        if self.fleet is not None:
+            self.fleet.steady_targets = targets
+            self.fleet.steady_serving = serving_on
+
+    def _own_ready(self, workload: Workload, source: str) -> bool:
+        """Is a ready host of the operator's of this kind holding every model of the workload?"""
+        from ..serving_plan import HOST_KINDS
+
+        kinds = HOST_KINDS[source]
+        return all(any(h.config.kind in kinds and h.state.value == "ready" and t.model in h.variants
+                       for h in self.supervisor.hosts.values())
+                   for t in workload.targets if t.on_machines)
+
+    def _rented_base_ready(self, workload: Workload, target: Optional[str]) -> bool:
+        """Has each group its planned hosts ready, of the kind steady now rents?"""
+        hosts = self.fleet.hosts_of(workload.name) if self.fleet is not None else []
+        kind = target.split(":", 1)[1] if target else workload.kind
+        for group in workload.groups:
+            ready = [h for h in hosts if group.holds(h.models) and h.state == "ready" and not h.burst
+                     and kind_matches(kind, getattr(h, "interruptible", False))]
+            if len(ready) < group.hosts_at_start:
+                return False
+        return True
 
     def _holds(self, workload: Workload, plan: Any, when: Mapping[str, Any], now: float) -> bool:
         """Whether a rule's conditions on the pass hold now."""

@@ -726,9 +726,20 @@ def create_app(
             covering = not _hosted_alone(name, need.model) and not state.dispatcher.ready_for(need)
         else:
             covering = routing.covering
-        own = not host.hosted and (host.workload == name or (host.workload is None and host.kind in plan.steady_kinds))
+        served = _steady_kinds(name, plan)
+        if not host.hosted and host.workload is None and host.kind in served and served != plan.steady_kinds:
+            return f"steady/{state.registry.steady_serving.get(name)}"  # a rule's switch (S19 5b)
+        own = not host.hosted and (host.workload == name or (host.workload is None and host.kind in served))
         return route_label(plan, hosted=host.hosted, own=own,
                            burst=host.burst, host_kind=host.kind, covering=covering, host_id=host.host_id)
+
+    def _steady_kinds(name: Optional[str], plan: Any) -> frozenset[str]:
+        """The host kinds of the operator's own machines a workload's steady is served on now: a
+        rule's switch (S19 5b), as the supervisor last handed it over, else its plan's."""
+        serving = state.registry.steady_serving.get(name) if name is not None else None
+        if serving in HOST_KINDS:
+            return frozenset(HOST_KINDS[serving])
+        return plan.steady_kinds if plan is not None else frozenset()
 
     def _ready_models(name: str) -> set[str]:
         """The workload's models one of its own ready hosts holds."""
@@ -1299,7 +1310,7 @@ def create_app(
             kept_off=kept,
             reserved=_reserved_for(who.workload) if who.workload is not None else (),
             no_burst=plan_routing.no_burst if plan_routing is not None else False,
-            steady_kinds=plan.steady_kinds if plan is not None else frozenset(),
+            steady_kinds=_steady_kinds(who.workload, plan),
         )
         if plan_routing is not None:
             # Asked again each time the request looks for a worker: a gap the supervisor opens
@@ -1318,6 +1329,7 @@ def create_app(
                     borrow_while_ready=routing.borrow_while_ready, order=routing.order,
                     hosted_ids=routing.hosted_ids, hosted_order=routing.hosted_order,
                     reserved=_reserved_for(plan_workload), no_burst=routing.no_burst,
+                    steady_kinds=_steady_kinds(plan_workload, plan),
                     hosted_moments=tuple(started + w for w in routing.hosted_waits) if after is not None else ())
 
             need = dataclasses.replace(
@@ -1396,7 +1408,7 @@ def create_app(
                 h for h in state.hosts if holds(h) and (
                     (h.hosted and burst is not None)
                     or (not h.hosted and h.workload == who.workload)
-                    or (not h.hosted and h.workload is None and plan is not None and h.kind in plan.steady_kinds)
+                    or (not h.hosted and h.workload is None and h.kind in _steady_kinds(who.workload, plan))
                     or may_borrow_from(h))
             ]
             if reachable and all(removed(h) for h in reachable):
