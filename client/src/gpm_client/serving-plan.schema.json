@@ -247,6 +247,11 @@
                   }
                 ]
               },
+              "substitute": {
+                "enum": [
+                  false
+                ]
+              },
               "use_only": {
                 "items": {
                   "type": "string"
@@ -364,6 +369,30 @@
         "local",
         "fixed"
       ]
+    },
+    "substitute": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "after_s": {
+            "default": 10,
+            "maximum": 3600,
+            "minimum": 0,
+            "type": "number"
+          },
+          "model": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "model"
+        ],
+        "type": "object"
+      },
+      "maxItems": 4,
+      "minItems": 1,
+      "type": "array"
     },
     "tz": {
       "default": "UTC",

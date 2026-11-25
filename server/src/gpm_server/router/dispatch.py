@@ -87,6 +87,10 @@ class Need:
     no_burst: bool = False
     steady_kinds: frozenset[str] = frozenset()
     reserve_now: Optional[Callable[[Host, ResolvedVariant, bool], Optional[Any]]] = None
+    #: Substitute models (S19, D202): (model, the monotonic moment it may answer), in order. A
+    #: request that has waited past one's moment with no worker of its own model free goes to a
+    #: worker of it — through the same eligible hosts its options and plan allow.
+    substitutes: tuple[tuple[str, float], ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -103,6 +107,10 @@ class Assignment:
     model_concurrency: int = 1
     #: What is held against a budget for a hosted answer (D166), settled when it ends.
     hold: Optional[Any] = None
+    #: The model asked for, where a substitute answers (D202), and the substitute that did; None
+    #: where its own model answers.
+    substituted_for: Optional[str] = None
+    substituted_model: Optional[str] = None
 
 
 class NoReadyHost(Exception):
@@ -320,6 +328,13 @@ class Dispatcher:
             for host in self.hosts if host.workload == workload
         )
 
+    @staticmethod
+    def _substitute_needs(need: Need) -> list[tuple[Need, float]]:
+        """The need of each substitute model (D202): the request's own, for that model — the same
+        options, sources, kind and inputs — never itself substituted, and with no per-model cap."""
+        return [(dataclasses.replace(need, model=model, substitutes=(), again=None, cap=None), moment)
+                for model, moment in need.substitutes]
+
     async def acquire(
         self,
         need: Need,
@@ -334,7 +349,9 @@ class Dispatcher:
                     if need.again is not None:
                         need = need.again(need)
                     candidates = self.eligible(need, exclude)
-                    if not candidates:
+                    substitutes = [(sub, self.eligible(sub, exclude), moment)
+                                   for sub, moment in self._substitute_needs(need)]
+                    if not candidates and not any(found for _, found, _ in substitutes):
                         # Judged within the request's own workload: a workload with no ready host
                         # is not "ready but ineligible" because the shared hosts are up, and the
                         # other way round. A workload's request is judged by its own model's hosts.
@@ -344,10 +361,20 @@ class Dispatcher:
                             raise NoEligibleHost()
                         raise NoReadyHost()
 
-                    assignment = self._take_idle(candidates, request_id, need)
+                    assignment = self._take_idle(candidates, request_id, need) if candidates else None
                     if assignment is not None:
                         return assignment
-                    if self._only_hosted_and_unaffordable(candidates, need):
+                    now = time.monotonic()
+                    for sub, found, moment in substitutes:
+                        if found and now >= moment:
+                            taken = self._take_idle(found, request_id, sub)
+                            if taken is not None:
+                                return dataclasses.replace(taken, substituted_for=need.model, substituted_model=sub.model)
+                    # Every way left is a hosted API whose budget is spent — its own model's and
+                    # each substitute's alike: said at once, as before substitutes (D166).
+                    ways = [(found, n) for found, n in ([(candidates, need)]
+                                                         + [(found, sub) for sub, found, _ in substitutes]) if found]
+                    if ways and all(self._only_hosted_and_unaffordable(found, n) for found, n in ways):
                         raise BudgetSpent()
 
                     remaining = deadline - time.monotonic()
@@ -356,14 +383,20 @@ class Dispatcher:
                     # A request that may spill to a hosted API wakes when it may (D165), not only
                     # when a machine's worker frees.
                     wait = remaining
-                    if need.hosted_after is not None and any(h.hosted for h, _ in candidates):
-                        now = time.monotonic()
-                        # ... and when a busy provider's `retry-after` is over.
-                        moments = [need.hosted_after, *need.hosted_moments] + [
-                            h.cooling_until for h, _ in candidates if h.hosted]
-                        later = [moment - now for moment in moments if moment > now]
-                        if later:
-                            wait = min(wait, min(later) + 0.01)
+                    # ... and when a substitute may answer (D202).
+                    later_subs = [moment - now for _, found, moment in substitutes if found and moment > now]
+                    if later_subs:
+                        wait = min(wait, min(later_subs) + 0.01)
+                    # ... for its own model's hosted APIs and each substitute's alike.
+                    for found, n in [(candidates, need)] + [(found, sub) for sub, found, _ in substitutes]:
+                        if n.hosted_after is not None and any(h.hosted for h, _ in found):
+                            now = time.monotonic()
+                            # ... and when a busy provider's `retry-after` is over.
+                            moments = [n.hosted_after, *n.hosted_moments] + [
+                                h.cooling_until for h, _ in found if h.hosted]
+                            later = [moment - now for moment in moments if moment > now]
+                            if later:
+                                wait = min(wait, min(later) + 0.01)
                     self._waiting[request_id] = (need, exclude)
                     try:
                         # Waiters re-acquire the condition lock in the order they began waiting,

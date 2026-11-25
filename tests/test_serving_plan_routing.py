@@ -294,8 +294,10 @@ def test_a_program_names_only_the_sources_its_grant_allows(programs):
             pool_side.workload(BIG, **SPEC, serve={"until_ready": ["local"]})
         with pytest.raises(ValueError, match="bursts or serve, not both"):
             pool_side.workload(BIG, **SPEC, serve={}, bursts={})
-        with pytest.raises(WorkloadRefused, match="a substitute model arrives in a later version"):
+        with pytest.raises(WorkloadRefused, match="serve.substitute is a list of 1 to 4"):
             pool_side.workload(BIG, **SPEC, serve={"substitute": []})
+        with pytest.raises(WorkloadRefused, match="substitute 'elsewhere' is not one of them"):
+            pool_side.workload(BIG, **SPEC, serve={"substitute": [{"model": "elsewhere"}]})
     key = grant(programs, name="office-apps", sources=["rented", "local"])
     with provisioner(programs, key) as pool_side, pool_side.workload(BIG, **SPEC, serve={"until_ready": ["local"]}) as w:
         assert programs.supervisor.workloads.get(w.name).policy["serve"]["until_ready"] == ["local"]

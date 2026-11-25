@@ -1149,6 +1149,30 @@ class Workloads:
                 raise WorkloadRefused(
                     ", ".join(repr(m) for m in alone) + " is served by hosted APIs alone, and the plan's defaults keep "
                     "requests that send no option off hosted APIs: no source could serve them")
+        if plan is not None and plan.substitutes:
+            self._check_substitutes(models, plan)
+
+    def _kinds_of(self, model: str) -> frozenset[str]:
+        entry = self.config.catalog.get(model)
+        if entry is None or not entry.variants:
+            return frozenset({"chat", "embed"})  # an uncatalogued build: chat and embeddings, as every build was
+        return frozenset().union(*(v.kinds() for v in entry.variants))
+
+    def _check_substitutes(self, models: Sequence[str], plan: Any) -> None:
+        """A substitute (§14.5, D202) is a catalogued model of this pool, not one of the workload's
+        own, that does what each of its models does — chat for chat, transcription for
+        transcription — so a request for either can be answered by it."""
+        for model, _ in plan.substitutes:
+            entry = self.config.catalog.get(model)
+            if model not in self.config.pool.model_set and not (entry is not None and entry.workloads_only):
+                raise WorkloadRefused(f"substitute {model!r} is not a model of this pool's catalog")
+            if model in models:
+                raise WorkloadRefused(f"substitute {model!r} is one of the workload's own models")
+            theirs = self._kinds_of(model)
+            for own in models:
+                if not self._kinds_of(own) & theirs:
+                    raise WorkloadRefused(f"substitute {model!r} does none of what {own!r} does "
+                                          f"({', '.join(sorted(self._kinds_of(own)))})")
 
     def check_reserve(self, policy: dict[str, Any], excluding: Optional[str] = None) -> None:
         """Reserved workers stay within `workloads.max_reserved_share` of the operator's own
@@ -1651,8 +1675,10 @@ class Workloads:
         hosts = self.fleet.hosts_of(workload.name) if self.fleet is not None else []
         spent = self.fleet.lease_spend(lease)[0] if (self.fleet is not None and lease is not None) else 0.0
         rows = self.supervisor.db.query(
+            # A substitute's answers are left out (D202): they say nothing of its own model's latency.
             "SELECT latency_ms, model_requested FROM request_log WHERE workload = ? AND outcome = 'ok' "
-            "AND latency_ms IS NOT NULL ORDER BY id DESC LIMIT 2000",
+            "AND latency_ms IS NOT NULL AND (route IS NULL OR route NOT LIKE 'substitute/%') "
+            "ORDER BY id DESC LIMIT 2000",
             (workload.name,),
         )
         several = len(workload.targets) > 1
@@ -1673,7 +1699,8 @@ class Workloads:
                 continue
             mine = [r["latency_ms"] / 1000 for r in self.supervisor.db.query(
                 "SELECT latency_ms FROM request_log WHERE workload = ? AND model_requested = ? AND outcome = 'ok' "
-                "AND latency_ms IS NOT NULL ORDER BY id DESC LIMIT 2000", (workload.name, target.model))] if several \
+                "AND latency_ms IS NOT NULL AND (route IS NULL OR route NOT LIKE 'substitute/%') "
+                "ORDER BY id DESC LIMIT 2000", (workload.name, target.model))] if several \
                 else [r["latency_ms"] / 1000 for r in rows]
             by_model[target.model] = {
                 "count": len(mine), "latency_s": target.latency_s, "parallel": target.parallel,

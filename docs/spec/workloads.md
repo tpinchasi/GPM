@@ -127,7 +127,7 @@ workload decides which hosts are eligible at all.**
   workers are published apart from its own. The moment one host of the workload holding the model is
   ready, borrowing for that model stops and its requests queue on the workload's own hosts: a
   workload that could always borrow would have no reason to be sized.
-- **A serving plan's `until_ready`** (§14, D198, not built yet) generalises borrowing: a workload
+- **A serving plan's `until_ready`** (§14, D198) generalises borrowing: a workload
   that declares one may use it also while an evicted host is replaced and, where the plan says
   so, while a scale-up rents.
 - The shared workload never borrows. Two workloads never see each other's hosts.
@@ -521,8 +521,8 @@ the start (§14.1).
 > and its `until`. **Stage 6 built** (gpm-server 0.52.0, gpm-client 0.12.0): the plan check's
 > readback, timeline and limit, the schema, the CLI's `--serve`, `w.budgets()` and the Now line.
 > **Stage 7 built** (gpm-server 0.53.0): the console's plan builder. **Stage 8 built** (gpm-server
-> 0.54.0): its chat. The rest is refused in words until its stage ships; until then §4 and §13 are what runs for
-> everything else.
+> 0.54.0): its chat. **Stage 9 built** (gpm-server 0.55.0, gpm-client 0.13.0): a substitute
+> model. Every part of the plan is built.
 
 A workload's serving plan, `serve`, says **where its requests go and when**. How much it must
 serve stays in `parallel`, `latency_s`, the kind of machine (`machines=` in the SDK, `kind` in the
@@ -830,6 +830,14 @@ its own model able to take it goes to the first substitute that can.
   other value is `400 unknown_option`.
 - **Where it is counted:** left out of the workload's latency figures, and counted in the
   request log and stats.
+- **As built** (stage 9). The dispatcher tries a substitute once its moment has passed and no
+  worker of the request's own model is free, through the request's own eligible hosts — its
+  options, its plan's sources, its kind and inputs — with no per-model cap; a request whose own
+  model has no eligible host at all waits for the substitute rather than being refused. A rule's
+  `then.substitute: false` keeps the requests it matches from it; `X-GPM-Session` never gets one.
+  The answer is logged with route `substitute/<model>`, which the workload's latency figures
+  leave out; a card's measured latency per build keeps it. A program's substitute is one of its
+  grant's models.
 
 ### 14.6 Seeing a plan, and who may write one (D203)
 
