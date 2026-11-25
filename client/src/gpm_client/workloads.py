@@ -43,6 +43,15 @@ class WorkloadRefused(PoolError):
         super().__init__(detail)
 
 
+def serving_plan_schema() -> dict:
+    """The serving plan's JSON Schema (S19, §14.6), as this package ships it — the same as the
+    pool's `GET /pool/schema/serving-plan`. It describes a plan's shape; the pool's plan check
+    says what a plan means there."""
+    import json
+
+    return json.loads((Path(__file__).resolve().parent / "serving-plan.schema.json").read_text())
+
+
 def _certificate_request() -> tuple[bytes, str]:
     """(the private key as PEM, a signing request as PEM). Only the public key is used by the pool."""
     try:
@@ -89,6 +98,15 @@ class Workload:
         """Its hosted budget and what is left of it today and this month (UTC), or None where it
         has no hosted burst (D165)."""
         return (self.state().get("budgets") or {}).get("hosted")
+
+    def budgets(self) -> dict:
+        """Each of its hosted budgets against its limits, by budget id (S19, §14.2): what each
+        allows and what is left of it today and this month (UTC). A workload made with `bursts`
+        has one, `hosted`; one with no hosted source, none. `hosted_budget()` is their total."""
+        budgets = self.state().get("budgets") or {}
+        if budgets.get("sources"):
+            return dict(budgets["sources"])
+        return {"hosted": budgets["hosted"]} if budgets.get("hosted") else {}
 
     def set_bursts(self, bursts: Mapping[str, Any], timeout_s: float = 120.0) -> dict:
         """Change its spending policy while it runs (D165): `{"hosted": {"after_s": 5,

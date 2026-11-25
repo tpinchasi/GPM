@@ -4724,6 +4724,8 @@ function workloadDetail(w) {
         : `Its first hosts are being rented; until one is ready its requests are refused (no shared host serves ${w.model}).`)
     : w.state === "ending" ? "All its hosts are released; closing." : "No hosts.";
   return el("div", {},
+    // The Now line (S19, §14.6): which role serves, where the next request goes, budgets, rules.
+    w.now && w.now.said ? el("p", { role: "status" }, el("strong", {}, "Now: "), w.now.said) : null,
     el("div", { class: "kv" },
       ...((w.models || []).length > 1 ? [
         el("div", { class: "k" }, "models"),

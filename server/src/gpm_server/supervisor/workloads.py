@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import math
+import statistics
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence
@@ -370,7 +371,120 @@ class Workloads:
                 reserved += max(0, group.hosts_at_start - have)
         return reserved
 
-    async def plan(self, req: WorkloadRequest) -> dict[str, Any]:
+    async def plan(self, req: WorkloadRequest, may_borrow: bool = True) -> dict[str, Any]:
+        """Everything creating it would do, and nothing else: nothing is opened or rented — and
+        its serving plan read back (§14.6, D203): `serving` holds the readback, the timeline, the
+        conditions that can change it, the most it can spend, the warnings and the providers."""
+        plan = await self._plan(req)
+        plan["serving"] = self._serving_view(req, plan, may_borrow)
+        return plan
+
+    def _serving_view(self, req: WorkloadRequest, plan: dict[str, Any], may_borrow: bool = True) -> dict[str, Any]:
+        """The plan check's reading of a serving plan (§14.6): from the plan and facts the pool
+        already has — the card class's measured time to ready (D69), the configured machines and
+        hosted APIs. Nothing here spends or asks the market."""
+        from ..serving_plan import (
+            HOST_KINDS,
+            conditions,
+            from_bursts,
+            most_hosted,
+            option_warnings,
+            plan_of,
+            readback,
+            timeline,
+        )
+
+        serving = plan_of(req.policy or {}) or from_bursts(req.policy or {},
+                                                           may_borrow and self.config.workloads.borrow_share > 0)
+        now = time.time()
+        hosted_alone = len(req.hosted_alone) == len(req.all_targets)
+        rented = serving.steady == "rented" and bool(req.on_machines)
+        ready = self._ready_minutes(plan) if rented and plan.get("groups") else None
+        workers = sum(int(g.get("hosts_at_start") or 0) * int(g.get("workers_per_host") or 0)
+                      for g in plan.get("groups") or [])
+        if serving.steady != "rented":
+            workers = int(serving.reserve.get(serving.steady, 0))
+        phases = timeline(serving, start=now, hours=req.hours, ready_min=ready, hosts=int(plan.get("hosts_at_start") or 0),
+                          workers=workers, hourly=float(plan.get("hourly_total") or 0.0))
+        hosted = most_hosted(serving, now, req.hours)
+        cap = float(plan.get("max_spend") or 0.0)
+        warnings = option_warnings(serving)
+        models = [t.model for t in req.on_machines]
+        # A steady local or fixed source holding none of them is refused before this (check_policy).
+        for source in serving.until_ready:
+            kind = source.type
+            if kind not in ("local", "fixed", "shared") or not models:
+                continue
+            if kind == "shared":
+                holds = [m for m in models if self._shared_holds(m)]
+            else:
+                holds = [m for m in models if any(h.kind in HOST_KINDS[kind] and not h.disabled
+                                                  and m in self.config.models_held_by(h) for h in self.config.hosts)]
+            if not holds:
+                warnings.append(f"{source.name}: no {kind} machine of this pool holds {', '.join(models)} — it serves "
+                                "none of this workload's requests")
+        if ready and serving.until_ready and "start" in serving.during and serving.max_min is not None \
+                and serving.max_min < ready["p90"]:
+            warnings.append(f"max_min {serving.max_min:g} min is shorter than the 90th-percentile time to ready of its "
+                            f"machines ({ready['p90']:g} min, {ready['card']}): the stop-gap may end before they serve")
+        said = readback(serving, kind=req.kind)
+        if hosted_alone:
+            # Every model by hosted APIs alone (D165): nothing is rented, whatever its fields mean.
+            said = [f"Served by hosted APIs alone ({', '.join(req.hosted_alone)}): nothing is rented, and it serves "
+                    "from the start.", *[line for line in said if not line.startswith(("Steady", "Until ready"))]]
+            phases = [p for p in phases if p["phase"] == "serving"]
+            for phase in phases:
+                phase.update({"sources": ["hosted"], "said": "hosted APIs", "workers": 0, "hosts": 0,
+                              "hourly_usd": 0.0})
+        return {
+            "readback": said,
+            "timeline": phases,
+            "tz": serving.tz,
+            "conditions": conditions(serving),
+            "most_it_can_spend": {
+                "lease_cap": round(cap, 2), "hosted": hosted,
+                "total": round(cap + sum(h["most"] for h in hosted), 2),
+                "said": (f"${cap + sum(h['most'] for h in hosted):.2f} at most: the lease's cap ${cap:.2f} (every "
+                         "rented machine, bursts included)"
+                         + "".join(f" + {h['name']} ${h['most']:.2f}" for h in hosted)
+                         + (" (each hosted budget over every UTC day and month its hours touch)" if hosted else "")),
+            },
+            "warnings": warnings,
+            "providers": [h.id for h in self.config.hosts if h.kind == "hosted" and not h.disabled
+                          and any(t.model in self.config.models_held_by(h) for t in req.all_targets)],
+            "plan": serving.as_dict() if serving.max_min is not None else None,
+        }
+
+    def _shared_holds(self, model: str) -> bool:
+        """Whether the shared workload's machines hold a model at all: it is in the pool's set and
+        not kept to workloads."""
+        entry = self.config.catalog.get(model)
+        return model in self.config.pool.model_set and not (entry and entry.workloads_only)
+
+    def _ready_minutes(self, plan: dict[str, Any]) -> dict[str, Any]:
+        """How long its machines take to be ready, minutes: the median and 90th percentile over
+        machines of the first host's card class this pool has rented (D69), else the estimate from
+        the download and the engine's load — the slowest group's."""
+        records = list(self.fleet.machine_history().values()) if self.fleet is not None else []
+        worst: Optional[dict[str, Any]] = None
+        for group in plan["groups"]:
+            card = group["first_host"]["hardware"]
+            seen = sorted(r.minutes_to_ready for r in records if r.hardware == card and r.minutes_to_ready is not None)
+            if seen:
+                median = statistics.median(seen)
+                p90 = seen[max(0, math.ceil(0.9 * len(seen)) - 1)]
+                said = {"median": round(median, 1), "p90": round(p90, 1), "measured": True, "machines": len(seen),
+                        "card": card}
+            else:
+                estimate = float(group["minutes_to_serve"])
+                said = {"median": round(estimate, 1), "p90": round(estimate, 1), "measured": False, "machines": 0,
+                        "card": card}
+            if worst is None or said["p90"] > worst["p90"]:
+                worst = said
+        return worst or {"median": float(plan.get("minutes_to_serve") or 0), "p90": float(plan.get("minutes_to_serve") or 0),
+                         "measured": False, "machines": 0, "card": None}
+
+    async def _plan(self, req: WorkloadRequest) -> dict[str, Any]:
         """Everything creating it would do, and nothing else: nothing is opened or rented.
 
         With several models, both placements are priced from one market search — every host
@@ -818,8 +932,9 @@ class Workloads:
         req = dataclasses.replace(req, policy=policy)
         async with self._creating:
             # Planned inside the lock, so its name check and its caps see every workload created
-            # before it — including one whose plan was awaiting the market a moment ago.
-            plan = await self.plan(req)
+            # before it — including one whose plan was awaiting the market a moment ago. The
+            # readback is the plan check's, not stored with the workload.
+            plan = await self._plan(req)
             if plan["refused"]:
                 raise WorkloadRefused(plan["refused"])
             self.check_policy(req.all_targets, policy or {})
@@ -1388,9 +1503,120 @@ class Workloads:
                 return False
         return True
 
+    def _spent(self, workload: Workload, source: Any, period: str, now: float) -> Optional[float]:
+        """What one of its spending sources has spent this UTC day or month: a hosted source's
+        answers (the request log records the budget each was held against), a rented burst's
+        hosts. None where it cannot be read (no lease or fleet)."""
+        from ..router.budgets import period_starts
+
+        since = period_starts(now)[0 if period == "day" else 1]
+        if source.type == "hosted":
+            if not source.role:
+                # The shorthand's one hosted burst (today's fields): its answers carry no budget id.
+                return float(self.supervisor.db.query(
+                    "SELECT COALESCE(SUM(cost_usd), 0) AS c FROM request_log WHERE workload = ? "
+                    "AND (budget IS NULL OR budget = '') AND ts >= ?", (workload.name, since))[0]["c"])
+            return float(self.supervisor.db.query(
+                "SELECT COALESCE(SUM(cost_usd), 0) AS c FROM request_log WHERE workload = ? AND budget = ? "
+                "AND ts >= ?", (workload.name, source.budget_id, since))[0]["c"])
+        lease = self.supervisor.leases.get(workload.lease_id)
+        if lease is None or self.fleet is None:
+            return None
+        return self.fleet.burst_spend(lease.lease_id, since)
+
+    def now_context(self) -> dict[str, Any]:
+        """What the Now line reads of every workload at once: read once for a list of them."""
+        return {"switches": self.store.steady_switches(), "armed": self.store.armed_rules(), "gaps": self.store.gaps()}
+
+    def now_line(self, workload: Workload, hosts: Sequence[Any],
+                 context: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
+        """The Now line (§14.6, D203): which role serves, where the next request would go, how far
+        preparation is and how long the stop-gap has left, each budget against its limit, and the
+        rules in force — from what the supervisor last wrote for the router."""
+        from ..serving_plan import PlanRefused, from_bursts, plan_of
+
+        if workload.state not in ("preparing", "serving"):
+            return {"said": f"{workload.state.capitalize()}.", "role": None, "next": None, "budgets": [], "rules": []}
+        now = time.time()
+        policy = workload.policy or {}
+        try:
+            plan = plan_of(policy) or from_bursts(policy, bool((workload.plan or {}).get("may_borrow", True))
+                                                  and self.config.workloads.borrow_share > 0)
+        except PlanRefused:
+            return {"said": "its serving plan cannot be read by this supervisor", "role": None, "next": None,
+                    "budgets": [], "rules": []}
+        context = context or self.now_context()
+        switch = context["switches"].get(workload.name) or {}
+        armed = sorted(context["armed"].get(workload.name, frozenset()))
+        gaps = {m: g for (w, m), g in context["gaps"].items() if w == workload.name and now < g[1]}
+        planned = sum(g.hosts_at_start for g in workload.groups)
+        base_ready = len([h for h in hosts if h.state == "ready" and not h.burst])
+        served_on = switch.get("serving") or (plan.steady if plan.steady != "rented" else None)
+        cover = [s.name for s in plan.until_ready]
+        cap = plan.max_min if plan.max_min is not None else None
+        if served_on in ("local", "fixed"):
+            by = f" (rule {switch['want']['rule']!r})" if (switch.get("want") or {}).get("rule") else ""
+            role, next_ = "steady", f"steady/{served_on}"
+            said = f"Steady on the operator's {served_on} machines{by}."
+        elif all(not t.on_machines for t in workload.targets):
+            role, next_, said = "when_full", "hosted", "Served by hosted APIs alone."
+        elif workload.state == "preparing":
+            elapsed = (now - workload.created_at) / 60
+            left_ready = max(0.0, float((workload.plan or {}).get("minutes_to_serve") or 0) - elapsed)
+            ready_part = f"{base_ready} of {planned} rented machine(s) ready (about {left_ready:.0f} min)"
+            if cover and "start" in plan.during and (cap is None or elapsed < cap):
+                left = f"; stop-gap {cap - elapsed:.0f} min left" if cap is not None else ""
+                role, next_ = "until_ready", f"until_ready/{cover[0]}"
+                said = f"Covering until ready: {ready_part}{left}."
+            else:
+                ended = "; its stop-gap has ended" if cover and "start" in plan.during else ""
+                role, next_, said = "steady", "waits for its machines", f"Preparing: {ready_part}{ended}; requests wait."
+        elif gaps and cover:
+            ends = max(g[1] for g in gaps.values())
+            reason = next(iter(gaps.values()))[3]
+            role, next_ = "until_ready", f"until_ready/{cover[0]}"
+            said = (f"Covering a {reason.replace('_', '-')}: {base_ready} of {planned} rented machine(s) ready; "
+                    f"stop-gap {max(0.0, (ends - now) / 60):.0f} min left.")
+        else:
+            role, next_ = "steady", "steady/rented"
+            said = f"Steady: {base_ready} of {planned} rented machine(s) ready."
+            want = switch.get("want") or {}
+            if str(want.get("to", "")).startswith("rented:"):
+                kind = want["to"].split(":", 1)[1]
+                if self._rented_base_ready(workload, want["to"]) and not any(
+                        not kind_matches(kind, getattr(h, "interruptible", False)) for h in hosts if not h.burst):
+                    said = f"Steady on {kind} machines (rule {want['rule']!r}): {base_ready} of {planned} ready."
+                else:
+                    said = (f"Steady switching to {kind} machines (rule {want['rule']!r}); the old serve until the new "
+                            f"are ready. {base_ready} ready.")
+            elif want.get("to") in ("local", "fixed"):
+                said += f" Switching to the operator's {want['to']} machines once one is ready (rule {want['rule']!r})."
+        budgets = []
+        for source in plan.sources():
+            if not source.spends:
+                continue
+            period = "day" if (source.budget or {}).get("per_day") is not None else "month"
+            limit = (source.budget or {}).get(f"per_{period}")
+            used = self._spent(workload, source, period, now)
+            if limit is None or used is None:
+                continue
+            budgets.append({"budget": source.budget_id, "name": source.name, "period": period,
+                            "spent": round(used, 4), "limit": limit})
+        in_force = armed + [r.name for r in plan.rules if not r.on_the_pass]
+        tail = []
+        if next_:
+            tail.append(f"Next request: {next_}.")
+        if budgets:
+            tail.append("; ".join(f"{b['name']} ${b['spent']:.2f} of ${b['limit']:g} "
+                                  + ("today" if b["period"] == "day" else "this month") for b in budgets) + ".")
+        tail.append(f"Rules in force: {', '.join(in_force) if in_force else 'none'}"
+                    + (" (by a request's options: " + ", ".join(r.name for r in plan.rules if not r.on_the_pass) + ")"
+                       if any(not r.on_the_pass for r in plan.rules) else "") + ".")
+        return {"said": " ".join([said, *tail]), "role": role, "next": next_, "budgets": budgets, "rules": in_force,
+                "switch": switch or None}
+
     def _holds(self, workload: Workload, plan: Any, when: Mapping[str, Any], now: float) -> bool:
         """Whether a rule's conditions on the pass hold now."""
-        from ..router.budgets import period_starts
         from ..serving_plan import in_window
 
         if "between" in when and not in_window(when, plan.tz, now):
@@ -1406,16 +1632,8 @@ class Workloads:
             else:
                 source = next(s for s in plan.sources() if s.spends and s.budget_id == spent["budget"])
                 limit = source.budget[f"per_{spent['period']}"]
-                since = period_starts(now)[0 if spent["period"] == "day" else 1]
-                if source.type == "hosted":
-                    used = float(self.supervisor.db.query(
-                        "SELECT COALESCE(SUM(cost_usd), 0) AS c FROM request_log WHERE workload = ? AND budget = ? "
-                        "AND ts >= ?", (workload.name, source.budget_id, since))[0]["c"])
-                else:
-                    if lease is None or self.fleet is None:
-                        return False
-                    used = self.fleet.burst_spend(lease.lease_id, since)
-                if used < spent["share"] * limit:
+                used = self._spent(workload, source, spent["period"], now)
+                if used is None or used < spent["share"] * limit:
                     return False
         if "evictions" in when:
             ev = when["evictions"]
@@ -1426,7 +1644,7 @@ class Workloads:
                 return False
         return True
 
-    def view(self, workload: Workload) -> dict[str, Any]:
+    def view(self, workload: Workload, context: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
         """What the operator sees: the workload, its hosts, its spend against its cap, and how
         its answers compare with its target — never a key."""
         lease = self.supervisor.leases.get(workload.lease_id)
@@ -1473,6 +1691,8 @@ class Workloads:
         return {
             **{k: v for k, v in workload.as_dict().items() if k != "plan"},
             "plan": workload.plan,
+            # Which role serves, where the next request goes, budgets and rules (§14.6).
+            "now": self.now_line(workload, hosts, context),
             # What its hosted burst has spent, against its policy's budget (D165).
             "hosted_spend": self.hosted_spend(workload.name) if workload.policy.get("hosted") else None,
             # What its rented burst's hosts cost, today and this month, and how many it holds (D165).

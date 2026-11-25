@@ -529,12 +529,64 @@ def _hosted_policy(args: argparse.Namespace) -> Optional[dict]:
     return bursts or None
 
 
+def _serve_examples() -> dict:
+    from .serving_plan import EXAMPLES
+
+    return EXAMPLES
+
+
+def _read_serve(source: str) -> dict:
+    """A serving plan from a file, or `-` for standard input; refused in words if it is not JSON."""
+    text = sys.stdin.read() if source == "-" else pathlib.Path(source).read_text()
+    try:
+        serve = json.loads(text)
+    except ValueError as exc:
+        raise SystemExit(f"--serve: not JSON ({exc})") from None
+    if not isinstance(serve, dict):
+        raise SystemExit("--serve: a serving plan is a JSON object")
+    return serve
+
+
+def _say_serving(serving: dict) -> None:
+    """The plan check's readback (§14.6): the plan in words, its timeline, what can change it,
+    the most it can spend and its warnings."""
+    print("\n  serving plan:")
+    for line in serving.get("readback", []):
+        print(f"    {line}")
+    phases = serving.get("timeline") or []
+    if phases:
+        print(f"  timeline ({serving.get('tz', 'UTC')}):")
+        for phase in phases:
+            minutes = phase.get("minutes")
+            took = (f", about {minutes['median']:g} min (90%: {minutes['p90']:g}"
+                    + ("" if minutes.get("measured") else ", estimated") + ")") if minutes else ""
+            workers = f", {phase['workers']} worker(s)" if phase.get("workers") else ""
+            print(f"    {phase['from']}–{phase['to']}  {phase['phase']}: {phase['said']}{workers}{took}, "
+                  f"${phase['hourly_usd']:.2f}/h")
+    for condition in serving.get("conditions", []):
+        print(f"  if {condition['condition']}: {condition['effect']}")
+    most = serving.get("most_it_can_spend")
+    if most:
+        print(f"  most it can spend: {most['said']}")
+    for warning in serving.get("warnings", []):
+        print(f"  warning: {warning}")
+    if serving.get("providers"):
+        print(f"  hosted APIs serving its models (for providers): {', '.join(serving['providers'])}")
+
+
 def _workload(args: argparse.Namespace) -> int:
     name = args.name
+    if getattr(args, "serve_example", None):
+        print(json.dumps(_serve_examples()[args.serve_example], indent=2))
+        return 0
+    serve = _read_serve(args.serve) if getattr(args, "serve", None) else None
     if args.action == "policy":
         if not name:
             print("name the workload", file=sys.stderr)
             return 2
+        if serve is not None:
+            # A plan replaces the whole plan (§14.6), bursts included.
+            return _control(args, "POST", f"/pool/workloads/{name}/policy", {"serve": serve})
         given = _hosted_policy(args) or {}
         if not given and not args.no_hosted and not args.no_rented:
             print("give --hosted-per-day/--hosted-per-month (and --hosted-after, --hosted-per-request), "
@@ -560,8 +612,14 @@ def _workload(args: argparse.Namespace) -> int:
         body = {"name": name, "hours": args.hours, "max_spend": args.max_spend, "profile": args.profile,
                 "kind": args.kind, "placement": args.placement}
         bursts = _hosted_policy(args)
+        if bursts is not None and serve is not None:
+            print("give --serve or the --hosted-…/--rent-… flags, not both: the flags are shorthand for a plan's "
+                  "when_full", file=sys.stderr)
+            return 2
         if bursts is not None:
             body["bursts"] = bursts
+        if serve is not None:
+            body["serve"] = serve
         if len(models) == 1:
             body.update({"model": models[0], "latency_s": latencies[0], "parallel": parallels[0]})
         else:
@@ -572,7 +630,12 @@ def _workload(args: argparse.Namespace) -> int:
             print(answer.get("detail") or json.dumps(answer), file=sys.stderr)
             return 1
         plan = answer["plan"]
-        _say_plan(plan)
+        if args.json:
+            print(json.dumps(answer, indent=2))
+        else:
+            _say_plan(plan)
+            if plan.get("serving"):
+                _say_serving(plan["serving"])
         if args.action == "plan" or plan.get("refused"):
             return 0 if not plan.get("refused") else 1
         confirm = args.confirm_max_spend
@@ -600,7 +663,18 @@ def _workload(args: argparse.Namespace) -> int:
         print("name the workload", file=sys.stderr)
         return 2
     if args.action == "show":
-        return _control(args, "GET", f"/pool/workloads/{name}")
+        if args.json:
+            return _control(args, "GET", f"/pool/workloads/{name}")
+        status, answer = _control_json(args, "GET", f"/pool/workloads/{name}")
+        if status != 200:
+            print(answer.get("detail") or json.dumps(answer), file=sys.stderr)
+            return 1
+        # The Now line on standard error: standard output stays the workload as JSON, as before.
+        now = (answer.get("workload") or {}).get("now") or {}
+        if now.get("said"):
+            print(f"Now: {now['said']}", file=sys.stderr)
+        print(json.dumps(answer, indent=2))
+        return 0
     if args.action == "end":
         return _control(args, "POST", f"/pool/workloads/{name}/end")
     if args.action == "extend":
@@ -907,6 +981,12 @@ def main(argv: list[str] | None = None) -> int:
     workload.add_argument("--rent-per-day", type=float, default=None, help="dollars its burst hosts may cost a UTC day")
     workload.add_argument("--rent-per-month", type=float, default=None, help="dollars its burst hosts may cost a UTC month")
     workload.add_argument("--no-rented", action="store_true", help="for policy: take its rented burst away")
+    # Its serving plan (S19, §14): a JSON file, or - for standard input.
+    workload.add_argument("--serve", default=None, metavar="FILE|-",
+                          help="its serving plan, as JSON: a file, or - to read it from standard input")
+    workload.add_argument("--serve-example", default=None, choices=sorted(_serve_examples()),
+                          help="print a starting serving plan and stop")
+    workload.add_argument("--json", action="store_true", help="plan and show: the answer as data")
     workload.add_argument("--url", default=None)
     workload.set_defaults(func=_workload)
 

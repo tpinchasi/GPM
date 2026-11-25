@@ -1,0 +1,666 @@
+{
+  "$id": "https://gpm.invalid/schema/serving-plan.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Where a workload's requests go and when: steady, until_ready, when_full, in that order (docs/spec/workloads.md \u00a714). The plan check says what a plan means on this pool.",
+  "examples": [
+    {
+      "until_ready": [
+        "shared",
+        {
+          "hosted": {
+            "budget": {
+              "per_day": 10
+            }
+          }
+        }
+      ]
+    },
+    {
+      "until_ready": [
+        "shared"
+      ],
+      "when_full": [
+        {
+          "hosted": {
+            "after_s": 5,
+            "budget": {
+              "per_day": 20
+            }
+          },
+          "name": "hosted-burst"
+        },
+        {
+          "rented": {
+            "after_min": 10,
+            "budget": {
+              "per_day": 40
+            },
+            "max_hosts": 2
+          }
+        }
+      ]
+    },
+    {
+      "defaults": {
+        "keep_on": "owned"
+      },
+      "reserve": {
+        "local": 4
+      },
+      "steady": "local"
+    },
+    {
+      "rules": [
+        {
+          "name": "interactive at once",
+          "then": {
+            "after_s": {
+              "hosted-burst": 0
+            }
+          },
+          "when": {
+            "priority": "interactive"
+          }
+        },
+        {
+          "name": "careful spending",
+          "then": {
+            "never_use": [
+              "hosted-burst"
+            ]
+          },
+          "when": {
+            "spent_over": {
+              "budget": "hosted-burst",
+              "period": "month",
+              "share": 0.8
+            }
+          }
+        }
+      ],
+      "tz": "America/New_York",
+      "until_ready": [
+        "shared",
+        {
+          "hosted": {
+            "budget": {
+              "per_day": 10
+            }
+          },
+          "name": "hosted-cover"
+        }
+      ],
+      "when_full": [
+        {
+          "hosted": {
+            "after_s": 5,
+            "budget": {
+              "per_day": 20,
+              "per_month": 300
+            }
+          },
+          "name": "hosted-burst"
+        }
+      ]
+    },
+    {
+      "rules": [
+        {
+          "name": "on-demand after evictions",
+          "then": {
+            "steady": {
+              "rented": {
+                "kind": "on_demand"
+              }
+            }
+          },
+          "until": "end_of_day",
+          "when": {
+            "evictions": {
+              "count": 3,
+              "within_h": 24
+            }
+          }
+        }
+      ],
+      "tz": "America/New_York",
+      "until_ready": [
+        "shared"
+      ]
+    }
+  ],
+  "properties": {
+    "defaults": {
+      "additionalProperties": false,
+      "properties": {
+        "keep_on": {
+          "enum": [
+            "no_hosted",
+            "owned",
+            "any"
+          ]
+        },
+        "priority": {
+          "enum": [
+            "interactive",
+            "batch"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "during": {
+      "items": {
+        "enum": [
+          "start",
+          "replacement",
+          "scale_up"
+        ]
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "max_min": {
+      "default": 60.0,
+      "maximum": 1440,
+      "minimum": 1,
+      "type": "number"
+    },
+    "reserve": {
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "fixed": {
+          "maximum": 1024,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "local": {
+          "maximum": 1024,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "rules": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "maxLength": 60,
+            "minLength": 1,
+            "type": "string"
+          },
+          "then": {
+            "additionalProperties": false,
+            "minProperties": 1,
+            "properties": {
+              "after_s": {
+                "additionalProperties": {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "minProperties": 1,
+                "type": "object"
+              },
+              "never_use": {
+                "items": {
+                  "type": "string"
+                },
+                "minItems": 1,
+                "type": "array"
+              },
+              "steady": {
+                "oneOf": [
+                  {
+                    "enum": [
+                      "local",
+                      "fixed"
+                    ]
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "rented": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "kind": {
+                            "enum": [
+                              "roi",
+                              "on_demand",
+                              "interruptible"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ],
+                        "type": "object"
+                      }
+                    },
+                    "required": [
+                      "rented"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              },
+              "use_only": {
+                "items": {
+                  "type": "string"
+                },
+                "minItems": 1,
+                "type": "array"
+              }
+            },
+            "type": "object"
+          },
+          "until": {
+            "enum": [
+              "window_end",
+              "end_of_day"
+            ]
+          },
+          "when": {
+            "additionalProperties": false,
+            "minProperties": 1,
+            "properties": {
+              "between": {
+                "pattern": "^[0-2][0-9]:[0-5][0-9]-[0-2][0-9]:[0-5][0-9]$",
+                "type": "string"
+              },
+              "days": {
+                "items": {
+                  "enum": [
+                    "mon",
+                    "tue",
+                    "wed",
+                    "thu",
+                    "fri",
+                    "sat",
+                    "sun"
+                  ]
+                },
+                "minItems": 1,
+                "type": "array",
+                "uniqueItems": true
+              },
+              "evictions": {
+                "additionalProperties": false,
+                "properties": {
+                  "count": {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "within_h": {
+                    "exclusiveMinimum": 0,
+                    "maximum": 168,
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "count",
+                  "within_h"
+                ],
+                "type": "object"
+              },
+              "keep_on": {
+                "enum": [
+                  "no_hosted",
+                  "owned",
+                  "any"
+                ]
+              },
+              "priority": {
+                "enum": [
+                  "interactive",
+                  "batch"
+                ]
+              },
+              "spent_over": {
+                "additionalProperties": false,
+                "properties": {
+                  "budget": {
+                    "type": "string"
+                  },
+                  "period": {
+                    "enum": [
+                      "day",
+                      "month"
+                    ]
+                  },
+                  "share": {
+                    "exclusiveMinimum": 0,
+                    "maximum": 1,
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "budget",
+                  "share"
+                ],
+                "type": "object"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "name",
+          "when",
+          "then"
+        ],
+        "type": "object"
+      },
+      "maxItems": 16,
+      "type": "array"
+    },
+    "steady": {
+      "default": "rented",
+      "enum": [
+        "rented",
+        "local",
+        "fixed"
+      ]
+    },
+    "tz": {
+      "default": "UTC",
+      "description": "an IANA time zone, such as America/New_York",
+      "type": "string"
+    },
+    "until_ready": {
+      "items": {
+        "anyOf": [
+          {
+            "enum": [
+              "local",
+              "fixed",
+              "shared",
+              "hosted"
+            ]
+          },
+          {
+            "description": "the name of a source the plan defines",
+            "type": "string"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "local": {
+                "additionalProperties": false,
+                "maxProperties": 0,
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "name": {
+                "maxLength": 40,
+                "minLength": 1,
+                "pattern": "^[^/]+$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "local"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "fixed": {
+                "additionalProperties": false,
+                "maxProperties": 0,
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "name": {
+                "maxLength": 40,
+                "minLength": 1,
+                "pattern": "^[^/]+$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "fixed"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "maxLength": 40,
+                "minLength": 1,
+                "pattern": "^[^/]+$",
+                "type": "string"
+              },
+              "shared": {
+                "additionalProperties": false,
+                "maxProperties": 0,
+                "type": [
+                  "object",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "shared"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "hosted": {
+                "additionalProperties": false,
+                "properties": {
+                  "after_s": {
+                    "maximum": 3600,
+                    "minimum": 0,
+                    "type": "number"
+                  },
+                  "budget": {
+                    "additionalProperties": false,
+                    "minProperties": 1,
+                    "properties": {
+                      "per_day": {
+                        "exclusiveMinimum": 0,
+                        "type": "number"
+                      },
+                      "per_month": {
+                        "exclusiveMinimum": 0,
+                        "type": "number"
+                      },
+                      "per_request": {
+                        "exclusiveMinimum": 0,
+                        "type": "number"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "providers": {
+                    "items": {
+                      "maxLength": 64,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "maxItems": 16,
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "reserve_max_tokens": {
+                    "minimum": 1,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "budget"
+                ],
+                "type": "object"
+              },
+              "name": {
+                "maxLength": 40,
+                "minLength": 1,
+                "pattern": "^[^/]+$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "hosted"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "type": "array"
+    },
+    "when_full": {
+      "items": {
+        "anyOf": [
+          {
+            "enum": [
+              "hosted",
+              "rented"
+            ]
+          },
+          {
+            "description": "the name of a source the plan defines",
+            "type": "string"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "hosted": {
+                "additionalProperties": false,
+                "properties": {
+                  "after_s": {
+                    "maximum": 3600,
+                    "minimum": 0,
+                    "type": "number"
+                  },
+                  "budget": {
+                    "additionalProperties": false,
+                    "minProperties": 1,
+                    "properties": {
+                      "per_day": {
+                        "exclusiveMinimum": 0,
+                        "type": "number"
+                      },
+                      "per_month": {
+                        "exclusiveMinimum": 0,
+                        "type": "number"
+                      },
+                      "per_request": {
+                        "exclusiveMinimum": 0,
+                        "type": "number"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "providers": {
+                    "items": {
+                      "maxLength": 64,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "maxItems": 16,
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "reserve_max_tokens": {
+                    "minimum": 1,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "budget"
+                ],
+                "type": "object"
+              },
+              "name": {
+                "maxLength": 40,
+                "minLength": 1,
+                "pattern": "^[^/]+$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "hosted"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "maxLength": 40,
+                "minLength": 1,
+                "pattern": "^[^/]+$",
+                "type": "string"
+              },
+              "rented": {
+                "additionalProperties": false,
+                "properties": {
+                  "after_min": {
+                    "maximum": 1440,
+                    "minimum": 0,
+                    "type": "number"
+                  },
+                  "budget": {
+                    "additionalProperties": false,
+                    "minProperties": 1,
+                    "properties": {
+                      "per_day": {
+                        "exclusiveMinimum": 0,
+                        "type": "number"
+                      },
+                      "per_month": {
+                        "exclusiveMinimum": 0,
+                        "type": "number"
+                      },
+                      "per_request": {
+                        "exclusiveMinimum": 0,
+                        "type": "number"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "kind": {
+                    "enum": [
+                      "roi",
+                      "on_demand",
+                      "interruptible"
+                    ]
+                  },
+                  "max_hosts": {
+                    "maximum": 100,
+                    "minimum": 1,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "max_hosts",
+                  "budget"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "rented"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "type": "array"
+    }
+  },
+  "title": "A workload's serving plan (serve)",
+  "type": "object"
+}
