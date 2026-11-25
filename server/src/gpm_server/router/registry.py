@@ -81,6 +81,9 @@ class HostRegistry:
         #: Each workload's plan rules whose conditions on the pass held at the supervisor's last
         #: look (S19, D200), by name.
         self.armed: dict[str, frozenset[str]] = {}
+        #: Where a rule's steady switch has a workload's steady served now (S19 5b): `local` or
+        #: `fixed`; absent, as its plan says.
+        self.steady_serving: dict[str, str] = {}
         #: Provisioning keys (D117), as hash → provisioner, for keys neither revoked nor expired.
         self.provisioning_store = ProvisioningStore(table.db)
         self.provisioners: dict[str, KeyReach] = {}
@@ -146,10 +149,12 @@ class HostRegistry:
             self.app_keys = await asyncio.to_thread(self.app_key_store.usable_hashes)
             self.last_app_key_revision = app_key_revision
         # Every look, not only on a change: a gap opens and a heartbeat moves with nothing else new.
-        gaps, self.supervisor_beat, armed = await asyncio.to_thread(
+        gaps, self.supervisor_beat, armed, switches = await asyncio.to_thread(
             lambda: (self.workload_store.gaps(), self.workload_store.supervisor_heartbeat(self.config.pool.name),
-                     self.workload_store.armed_rules()))
-        if gaps != self.gaps or armed != self.armed:
+                     self.workload_store.armed_rules(), self.workload_store.steady_switches()))
+        serving = {name: s["serving"] for name, s in switches.items() if (s or {}).get("serving")}
+        if gaps != self.gaps or armed != self.armed or serving != self.steady_serving:
+            self.steady_serving = serving
             # Requests already waiting may now use a stop-gap, or no longer may; a rule came into
             # force or left it.
             self.gaps, self.armed = gaps, armed

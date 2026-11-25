@@ -56,7 +56,7 @@ def test_rules_are_read_and_refused_in_words():
                     for i in range(17)], "when_full": [BURST]}, "at most 16 rules"),
         ({"rules": [{"name": "x", "when": {"weather": "rain"}, "then": {"never_use": ["burst"]}}], "when_full": [BURST]},
          "the conditions are"),
-        ({"rules": [{"name": "x", "when": {"priority": "batch"}, "then": {"steady": "local"}}]}, "steady switch arrives"),
+        ({"rules": [{"name": "x", "when": {"priority": "batch"}, "then": {"steady": "local"}}]}, "add reserve"),
         ({"rules": [{"name": "x", "when": {"priority": "batch"}, "then": {"never_use": ["rented"]}}]}, "removes steady"),
         ({"rules": [{"name": "x", "when": {"priority": "batch"}, "then": {"use_only": ["burst"]}}], "when_full": [BURST]},
          "leaves out steady"),

@@ -399,6 +399,7 @@ CREATE TABLE IF NOT EXISTS serving_gaps (
 CREATE TABLE IF NOT EXISTS plan_rules (
     workload    TEXT PRIMARY KEY,
     armed       TEXT NOT NULL DEFAULT '[]',
+    steady      TEXT,                   -- JSON {want, serving}: a rule's steady switch (stage 5b)
     written_at  REAL NOT NULL
 );
 
@@ -525,6 +526,11 @@ _ADDED_COLUMNS = {
         # Its spending policy (D165): `{"hosted": {...}}`, as the app or its operator stated it.
         # NULL: none — it never reaches a hosted API.
         ("policy", "TEXT"),
+    ],
+    "plan_rules": [
+        # A rule's steady switch in force (S19 stage 5b): what the rules want, and where steady is
+        # served while it is handed over make-before-break. NULL: as the plan says.
+        ("steady", "TEXT"),
     ],
     "serving_gaps": [
         # What a gap covers (S19 stage 3): a replacement, or hosts rented for load (`scale_up`).

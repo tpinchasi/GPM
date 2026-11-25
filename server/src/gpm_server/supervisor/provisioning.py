@@ -283,6 +283,10 @@ class Provisioning:
             # Reserving the operator's own machines is the operator's alone (D199).
             raise WorkloadRefused("a program never reserves the operator's machines: reserve and steady local or "
                                   "fixed are the operator's to set")
+        for rule in plan.rules:
+            if rule.switch and rule.switch.startswith("rented:") and rule.switch.split(":", 1)[1] not in grant.kinds:
+                raise WorkloadRefused(f"this key may rent {list(grant.kinds)}; rule {rule.name!r} switches steady to "
+                                      f"{rule.switch.split(':', 1)[1]} machines")
         rented = plan.rented()
         if rented is not None and rented.kind is not None and rented.kind not in grant.kinds:
             # A burst's kind of machine is spending authority like `machines=` (S19 stage 3).

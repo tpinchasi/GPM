@@ -515,6 +515,11 @@ class Fleet:
         #: Workloads whose plan's rules in force keep their rented burst out (S19, D200): it is
         #: not rented, and its hosts drain, as a burst the policy no longer has.
         self.bursts_held_back: set[str] = set()
+        #: A rule's steady switch per workload (S19 stage 5b): what its rules want — `local`,
+        #: `fixed`, `rented:<kind>`, or None for the plan's own — and where steady is served while
+        #: it is handed over. Set by the workloads' pass.
+        self.steady_targets: dict[str, Optional[str]] = {}
+        self.steady_serving: dict[str, Optional[str]] = {}
         #: Workloads' volumes, as the database keeps them (D116).
         self.workload_store = WorkloadStore(leases.db)
         #: What the request log says a class of machine serves at a latency, read at most every
@@ -847,6 +852,7 @@ class Fleet:
         # Read again: a lease the limits just closed must not rent anything below.
         open_leases = self.leases.open_leases()
         await self.enforce_burst_budgets(open_leases)
+        await self.hand_over_steady()
         await self.release_unleased(open_leases, busy or {})
 
         await self.handle_evictions()
@@ -3599,6 +3605,8 @@ class Fleet:
             chosen = self.group_spec(workload, unit.group)
             if lease is None or chosen is None:
                 return
+            if self.steady_targets.get(workload) in ("local", "fixed"):
+                return  # steady switched to the operator's machines: nothing is rented (S19 5b)
             self.widen_while_short(workload, chosen)
             await self._acquire_dynamically(
                 lease, 0, load or Load(busy_workers=0, ready_workers=0, waiting=0), unit=unit,
@@ -3687,7 +3695,10 @@ class Fleet:
         ready = [h for h in live if h.state == "ready"]
         pending = [h for h in live if h.state in ("scheduling", "preparing")]
         rented_workers = sum(h.workers for h in ready)
-        base = [h for h in live if not h.burst]
+        # A workload's base is its hosts of the kind steady rents in force: a rule's switch (S19 5b)
+        # rents a new base of the new kind while the old keeps serving, and gives the old up once
+        # the new is ready (hand_over_steady).
+        base = [h for h in live if not h.burst and (unit.workload is None or self._of_kind_in_force(h))]
         in_burst = [h for h in live if h.burst]
 
         base_ceiling = lease.workers if ceiling is None else ceiling
@@ -4128,6 +4139,48 @@ class Fleet:
 
     # --- a workload's rented burst (D165) ---
 
+    def kind_in_force(self, workload: Optional[str]) -> str:
+        """The kind of machine a workload's steady rents now: a rule's switch's, else `machines=`."""
+        target = self.steady_targets.get(workload) if workload is not None else None
+        if target is not None and target.startswith("rented:"):
+            return target.split(":", 1)[1]
+        spec = self.workloads.get(workload) if workload is not None else None
+        return spec.kind if spec is not None else "roi"
+
+    def _of_kind_in_force(self, host: "RentedHost") -> bool:
+        kind = self.kind_in_force(host.workload)
+        return kind == "roi" or (kind == "interruptible") == bool(host.interruptible)
+
+    async def hand_over_steady(self) -> None:
+        """A rule's steady switch, make-before-break (S19 stage 5b): once the operator's machines
+        serve it, its rented hosts are given up; between rented kinds, a host not of the kind in
+        force is given up as one of that kind is ready in its place — never leaving fewer ready
+        than the group planned — and at once where it is not serving yet. Judged for every
+        workload, not only those a rule switches now: a switch that ended, or whose rule was
+        removed, hands back the same way."""
+        for name, target in self.steady_targets.items():
+            if target in ("local", "fixed") and self.steady_serving.get(name) == target:
+                for host in [h for h in self.hosts_of(name) if h.state != "draining"]:
+                    await self.drain(host, f"workload {name}: steady switched to the operator's {target} machines")
+        for name, spec in list(self.workloads.items()):
+            if name is None or self.steady_targets.get(name) in ("local", "fixed"):
+                continue
+            hosts = [h for h in self.hosts_of(name) if h.state != "draining"]
+            for group in getattr(spec, "groups", ()):
+                mine = [h for h in hosts if group.holds(h.models) and not h.burst]
+                old = [h for h in mine if not self._of_kind_in_force(h)]
+                if not old:
+                    continue
+                kind = self.kind_in_force(name)
+                for host in [h for h in old if h.state in ("scheduling", "preparing")]:
+                    await self.drain(host, f"workload {name}: its steady now rents {kind} machines")
+                ready_old = sorted((h for h in old if h.state == "ready"), key=lambda h: -h.bid_hourly)
+                fresh = [h for h in mine if self._of_kind_in_force(h) and h.state == "ready"]
+                surplus = len(fresh) + len(ready_old) - group.hosts_at_start
+                for host in ready_old[:max(0, min(surplus, len(fresh)))]:
+                    await self.drain(host, f"workload {name}: its steady now rents {kind} machines, and one is ready "
+                                           "in its place")
+
     def burst_kind_of(self, workload: Optional[str]) -> Optional[str]:
         """The kind of machine a workload's burst rents, where its serving plan's rented source
         names one (S19, §14.2): `on_demand`, `interruptible`, or `both` for `roi`. None: the kind
@@ -4142,9 +4195,17 @@ class Fleet:
             rented = parse_serve(raw).rented()
         except PlanRefused:
             return None
-        if rented is None or rented.kind is None:
+        if rented is None:
             return None
-        return {"roi": "both"}.get(rented.kind, rented.kind)
+        if rented.kind is None:
+            # The kind steady rents in force (§14.2): a rule's switch changes it, else machines=.
+            target = self.steady_targets.get(workload)
+            if target is None or not target.startswith("rented:"):
+                return None
+            kind = target.split(":", 1)[1]
+        else:
+            kind = rented.kind
+        return {"roi": "both"}.get(kind, kind)
 
     def rented_burst_of(self, workload: Optional[str]) -> Any:
         """The rented burst a workload's policy carries, or None — parsed once per version of it."""
@@ -4329,7 +4390,7 @@ class Fleet:
             builds = dict(chosen_group.builds)
             cards_per_copy = chosen_group.cards_per_copy
             if kind is None and offer_id is None:
-                kind = {"on_demand": "on_demand", "interruptible": "interruptible"}.get(spec.kind, "both")
+                kind = {"on_demand": "on_demand", "interruptible": "interruptible"}.get(self.kind_in_force(workload), "both")
         else:
             # Which profile and models this machine is bought for, decided before the search: what
             # it will hold sets the least card and disk worth looking at (D94, D111).
@@ -5302,9 +5363,12 @@ class Fleet:
             if host is None or host.released:
                 continue
             if (spec is not None and lease is not None and not host.burst
-                    and len([h for h in ready if not h.burst]) <= spec.hosts_at_start):
+                    and (len([h for h in ready if not h.burst]) <= spec.hosts_at_start
+                         or (self._of_kind_in_force(host) and len(
+                             [h for h in ready if not h.burst and self._of_kind_in_force(h)]) <= spec.hosts_at_start))):
                 # A workload keeps the hosts it starts with for its whole lease: they were
-                # reserved for the run, and reaping one only rents it again next pass (D115).
+                # reserved for the run, and reaping one only rents it again next pass (D115). While
+                # a steady switch hands over (S19 5b), those of the kind in force are the ones kept.
                 continue
             if self.last_host_serving(host):
                 # Taking it would leave a model with nowhere to go, and every request for it

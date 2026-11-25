@@ -411,6 +411,17 @@ class WorkloadStore:
     def close_gap(self, workload: str, model: str) -> None:
         self.db.execute("DELETE FROM serving_gaps WHERE workload = ? AND model = ?", (workload, model))
 
+    def steady_switches(self) -> dict[str, dict[str, Any]]:
+        """Each workload's steady switch, where one is in force or being handed back (stage 5b)."""
+        return {r["workload"]: json.loads(r["steady"])
+                for r in self.db.query("SELECT workload, steady FROM plan_rules WHERE steady IS NOT NULL")}
+
+    def set_steady_switch(self, workload: str, state: Optional[dict[str, Any]]) -> None:
+        self.db.execute(
+            "INSERT INTO plan_rules (workload, steady, written_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(workload) DO UPDATE SET steady = excluded.steady, written_at = excluded.written_at",
+            (workload, json.dumps(state) if state else None, time.time()))
+
     def armed_rules(self) -> dict[str, frozenset[str]]:
         """Each workload's plan rules whose conditions on the pass held at the supervisor's last look."""
         return {r["workload"]: frozenset(json.loads(r["armed"] or "[]"))

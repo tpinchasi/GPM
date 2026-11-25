@@ -517,9 +517,9 @@ the start (§14.1).
 > `providers`, a rented source's `kind`, and covering a scale-up where `during` lists it. **Stage 4
 > built** (gpm-server 0.49.0): reserved workers (`reserve`) and `steady: local|fixed`. **Stage 5
 > built** (gpm-server 0.50.0): rules and `tz`, with every condition and the effects `use_only`,
-> `never_use` and `after_s`; a rule's `steady` switch (and its `until`) follows as stage 5b. The
-> rest is refused in words until its stage ships; until then §4 and §13 are what runs for
-> everything else.
+> `never_use` and `after_s`. **Stage 5b built** (gpm-server 0.51.0): a rule's `steady` switch
+> and its `until`. The rest is refused in words until its stage ships; until then §4 and §13 are
+> what runs for everything else.
 
 A workload's serving plan, `serve`, says **where its requests go and when**. How much it must
 serve stays in `parallel`, `latency_s`, the kind of machine (`machines=` in the SDK, `kind` in the
@@ -726,6 +726,26 @@ takes effect at the first minute after it, and one it repeats, at the first occu
   checked at creation (§2) count it. A switch the caps have no room for when it comes due waits,
   and the Now line says why.
 - **Time windows** take effect at the first pass after their boundary, never before.
+- **A steady switch, as built.** The supervisor writes, per workload, what the rules want and
+  where steady is served (`plan_rules.steady`, a `workload_steady` event on each change); the
+  router follows the second. To the operator's machines: served there once one of that kind
+  holding every model is ready, then the rented hosts are given up and nothing is rented while it
+  lasts (the rented burst included); meanwhile it is serving and no replacement gap opens. To
+  rented machines of another kind: the fleet rents a new base of that kind beside the old, and
+  gives an old host up as each new one is ready in its place — never leaving the group fewer
+  ready than it planned — and an old one still being prepared at once; so a cap with room for one
+  more host still lets the switch finish, a host at a time. While it hands over, the scale-down
+  keeps the hosts of the kind in force. A rented source with no `kind` follows the switch. Back
+  again the same way, whether the rule ended or was removed: a workload served on the operator's
+  machines stays there until its rented base is ready. Only a workload created on rented machines
+  switches; `parallel` in a switch, and a switch from steady `local` or `fixed`, wait for a
+  decision. At creation the switch is checked (a kind it rents already, an own machine holding its
+  models) and priced: the base at the dearest kind any switch reaches for every hour, plus each
+  switch to another rented kind both ways — the old base while the new is prepared, the new while
+  the old kind is prepared again — for every time its rule can begin within the hours (once a day
+  for a window, an end-of-day hold or a day's spending, once per eviction window); a typed budget
+  below it is refused. A switch is set when the workload is created: a policy change may remove
+  one, never add one. A program's switch is held to its grant's `kinds`.
 - **How they are applied.** The supervisor writes, per workload, the rules whose conditions on
   the pass all hold (`plan_rules`), only on a change, with a `workload_rules` event; a rule with
   only conditions on a request's options is never written — the router judges it on every

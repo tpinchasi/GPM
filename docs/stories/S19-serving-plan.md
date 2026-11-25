@@ -261,7 +261,7 @@ After the second architecture and UX reviews (2026-11-25):
    `use_only`, `never_use` and `after_s`.
 5b. **A rule's steady switch**, handed over make-before-break and priced with its overlap — split
    from stage 5 (2026-11-25): it changes what a workload rents, and is built and reviewed on its
-   own.
+   own — **built** (gpm-server 0.51.0).
 6. **The plan check's readback, timeline and limit**, the JSON Schema, the CLI (`--serve`), the
    SDK's `budgets()`, and the Now line.
 7. **The console's plan builder.**
