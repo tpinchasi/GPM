@@ -302,8 +302,8 @@ class Provisioning:
         cached = self._plans.get(key)
         if cached is not None and time.monotonic() - cached[0] < self.config.provisioning.plan_cache_s:
             return cached[1]
-        req, _, _ = self._request(provisioner, body, f"{provisioner.name}-plan")
-        plan = await self.supervisor.workloads.plan(req)
+        req, _, may_borrow = self._request(provisioner, body, f"{provisioner.name}-plan")
+        plan = await self.supervisor.workloads.plan(req, may_borrow=may_borrow)
         plan.pop("name", None)
         plan["within_grant"] = self._budget_refusal(provisioner, req.max_spend or 0.0) is None
         self._plans[key] = (time.monotonic(), plan)

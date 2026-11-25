@@ -263,7 +263,7 @@ After the second architecture and UX reviews (2026-11-25):
    from stage 5 (2026-11-25): it changes what a workload rents, and is built and reviewed on its
    own — **built** (gpm-server 0.51.0).
 6. **The plan check's readback, timeline and limit**, the JSON Schema, the CLI (`--serve`), the
-   SDK's `budgets()`, and the Now line.
+   SDK's `budgets()`, and the Now line — **built** (gpm-server 0.52.0, gpm-client 0.12.0).
 7. **The console's plan builder.**
 8. **The chat.**
 9. **The substitute model.**

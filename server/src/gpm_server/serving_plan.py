@@ -988,6 +988,417 @@ def describe(plan: ServingPlan) -> str:
     return "; ".join(said)
 
 
+# --- reading a plan back (§14.6, D203) ---
+
+
+def _money(budget: Optional[Mapping[str, Any]]) -> str:
+    """A budget in words: "$10 a day and $300 a month"."""
+    if not budget:
+        return "no budget"
+    said = [f"${budget[k]:g} {w}" for k, w in (("per_request", "a request"), ("per_day", "a day"),
+                                                 ("per_month", "a month")) if budget.get(k) is not None]
+    return " and ".join(said)
+
+
+def _source_words(source: Source) -> str:
+    """One source as the readback names it."""
+    if source.type == "hosted":
+        which = f" ({', '.join(source.providers)})" if source.providers else ""
+        wait = f" after {source.after_s:g} s" if source.after_s else " at once"
+        return f"{source.name}: hosted APIs{which}{wait}, within {_money(source.budget)}"
+    if source.type == "rented":
+        kind = f" {source.kind.replace('_', '-')}" if source.kind else ""
+        return (f"{source.name}: up to {source.max_hosts} more{kind} rented machine(s) once it has been full for "
+                f"{source.after_min:g} min, within {_money(source.budget)}")
+    what = {"local": "the operator's local machines", "fixed": "the operator's fixed machines elsewhere",
+            "shared": "any free machine of the shared workload"}[source.type]
+    return what if source.name == source.type else f"{source.name}: {what}"
+
+
+def _during_words(during: tuple[str, ...]) -> str:
+    words = {"start": "start", "replacement": "are replaced after an eviction", "scale_up": "scale up"}
+    said = [words[d] for d in during]
+    return ", ".join(said[:-1]) + (" or " if len(said) > 1 else "") + said[-1]
+
+
+def when_words(when: Mapping[str, Any], tz: str) -> str:
+    """A rule's conditions in words, all of which must hold."""
+    said = []
+    if "priority" in when:
+        said.append(f"a request's priority is {when['priority']}")
+    if "keep_on" in when:
+        said.append(f"a request sends keep_on {when['keep_on']}")
+    if "between" in when:
+        start, end = when["between"].split("-")
+        days = f" on {', '.join(when['days'])}" if "days" in when else ""
+        said.append(f"between {start} and {end}{days} ({tz})")
+    if "spent_over" in when:
+        spent = when["spent_over"]
+        share = f"{spent['share']:.0%}"
+        if spent["budget"] == "lease":
+            said.append(f"the lease has spent {share} of its cap")
+        else:
+            said.append(f"{spent['budget']} has spent {share} of its {spent['period']}'s budget")
+    if "evictions" in when:
+        ev = when["evictions"]
+        said.append(f"{ev['count']} eviction(s) within {ev['within_h']:g} h")
+    return " and ".join(said)
+
+
+def then_words(rule: "Rule") -> str:
+    """A rule's effects in words."""
+    then, said = rule.then, []
+    if "use_only" in then:
+        said.append(f"use only {', '.join(then['use_only'])}")
+    if "never_use" in then:
+        said.append(f"never use {', '.join(then['never_use'])}")
+    for name, seconds in (then.get("after_s") or {}).items():
+        said.append(f"use {name} after {seconds:g} s")
+    if rule.switch is not None:
+        to = rule.switch
+        where = (f"the operator's {to} machines, on its reserved workers" if to in HOST_KINDS
+                 else f"rented {to.split(':', 1)[1].replace('_', '-')} machines")
+        held = {"end_of_day": ", held to the end of the day", "window_end": ", held until its window ends"}.get(
+            rule.until or "", ", until the rule no longer holds")
+        said.append(f"switch steady to {where} (the old serve until the new are ready){held}")
+    return "; ".join(said)
+
+
+def readback(plan: ServingPlan, *, kind: str = "roi") -> list[str]:
+    """The plan in plain words, from one template (§14.6): each role in its order, every role left
+    empty named, then the defaults, reservations and rules."""
+    machines = {"roi": "the cheaper of interruptible and on-demand", "on_demand": "on-demand",
+                "interruptible": "interruptible"}.get(kind, kind)
+    said = [f"Steady: machines rented for it ({machines})." if plan.steady == "rented" else
+            f"Steady: the operator's {plan.steady} machines, on {plan.reserve[plan.steady]} worker(s) reserved for it; "
+            "nothing is rented."]
+    if plan.steady != "rented":
+        said.append("Until ready: not needed — nothing is rented, and it serves from the start.")
+    elif plan.until_ready:
+        limit = f", for at most {plan.max_min:g} min each time" if plan.max_min is not None else ""
+        said.append(f"Until ready — while its machines {_during_words(plan.during)}{limit}: "
+                    + "; then ".join(_source_words(s) for s in plan.until_ready)
+                    + "; then its requests wait.")
+    else:
+        said.append("Until ready: none — while its machines start, its requests wait for them.")
+    if plan.when_full:
+        said.append("When full — every worker of its own busy: " + "; then ".join(_source_words(s) for s in plan.when_full)
+                    + ".")
+    else:
+        said.append("When full: none — its requests queue for a worker of its own.")
+    for kind_, workers in sorted(plan.reserve.items()):
+        if kind_ != plan.steady:
+            said.append(f"Reserved: {workers} {kind_} worker(s), for its stop-gap.")
+    options = {**DEFAULT_OPTIONS, **plan.defaults}
+    by_plan = " (the plan's default)" if plan.defaults else ""
+    said.append(f"A request that sends no options travels as priority {options['priority']}, keep_on "
+                f"{options['keep_on']}{by_plan}.")
+    for rule in plan.rules:
+        said.append(f"Rule {rule.name!r}: when {when_words(rule.when, plan.tz)} — {then_words(rule)}.")
+    if not plan.rules:
+        said.append("Rules: none.")
+    return said
+
+
+def conditions(plan: ServingPlan) -> list[dict[str, Any]]:
+    """What can change where its requests go, each with its effect (§14.6): the plan's own
+    moments, every budget's limit, then each rule."""
+    said: list[dict[str, Any]] = []
+    if plan.steady == "rented":
+        if "replacement" in plan.during and plan.until_ready:
+            effect = "until_ready covers while it is replaced: " + ", then ".join(s.name for s in plan.until_ready)
+        else:
+            effect = "its other machines serve; requests beyond them wait for the replacement"
+        said.append({"condition": "a machine of its own is evicted", "effect": effect, "rule": None})
+        if plan.until_ready and plan.max_min is not None:
+            said.append({"condition": f"the stop-gap has lasted {plan.max_min:g} min",
+                         "effect": "until_ready ends; requests wait for its own machines", "rule": None})
+    said.append({"condition": "every worker of its own is busy",
+                 "effect": ("when_full: " + ", then ".join(s.name for s in plan.when_full)) if plan.when_full
+                 else "requests queue for a worker of its own", "rule": None})
+    for source in plan.sources():
+        if source.spends:
+            said.append({"condition": f"{source.name} reaches its budget ({_money(source.budget)})",
+                         "effect": f"{source.name} is not used until the day or month the limit is for is over",
+                         "rule": None})
+    for rule in plan.rules:
+        said.append({"condition": when_words(rule.when, plan.tz), "effect": then_words(rule), "rule": rule.name})
+    return said
+
+
+def option_warnings(plan: ServingPlan) -> list[str]:
+    """A warning for each request option that reaches different sources here (§14.6): first where
+    the plan's defaults narrow a request that sends none (and an option that lifts them), then each
+    option that keeps a request off more than a request with none, then each rule on a request's
+    options."""
+    said = []
+    defaults = {**DEFAULT_OPTIONS, **plan.defaults}
+    narrowed_by_default = kept_off(defaults["priority"], defaults["keep_on"])
+    if plan.defaults and narrowed_by_default:
+        words = _reach(plan, narrowed_by_default)
+        if words:
+            said.append(f"requests with no options {words} (the plan's defaults: "
+                        f"{', '.join(f'{k} {v}' for k, v in sorted(plan.defaults.items()))})")
+        lifted = [s.name for s in plan.sources() if s.type in narrowed_by_default]
+        if lifted and defaults["keep_on"] != "any":
+            said.append(f"requests with keep_on any lift the plan's default and may use {', '.join(lifted)}")
+    for option, value in (("priority", "batch"), ("keep_on", "no_hosted"), ("keep_on", "owned")):
+        if defaults[option] == value:
+            continue
+        off = kept_off(value if option == "priority" else defaults["priority"],
+                       value if option == "keep_on" else defaults["keep_on"])
+        if off <= narrowed_by_default:
+            continue  # kept off no more than a request with no options already is
+        words = _reach(plan, off)
+        if words:
+            said.append(f"requests with {option} {value} {words}")
+    for rule in plan.rules:
+        if not rule.on_the_pass:
+            said.append(f"requests where {when_words(rule.when, plan.tz)}: rule {rule.name!r} — {then_words(rule)}")
+    return said
+
+
+def _reach(plan: ServingPlan, off: frozenset[str]) -> str:
+    """What a request kept off `off` (hosted, rented) reaches here, in words — as the router
+    decides it; empty where the plan names nothing it is kept off."""
+    if not off:
+        return ""
+    touched = [s for s in plan.sources() if s.type in off]
+    steady_off = plan.steady == "rented" and "rented" in off
+    if not touched and not steady_off:
+        return ""
+    off_words = " and ".join({"hosted": "hosted APIs", "rented": "rented machines"}[o] for o in sorted(off))
+    machines = [s.name + (" (its owned machines only)" if s.type == "shared" and "rented" in off else "")
+                for s in plan.until_ready if s.type not in off]
+    parts = []
+    if steady_off and not machines:
+        return f"keep off {off_words} here: no source of this plan is left to them, and they are refused at once " \
+               "(no_allowed_source)"
+    if plan.steady == "rented":
+        parts.append("while the rented machines start they use " + (", then ".join(machines) + ", then wait"
+                                                                    if machines else "nothing: they wait"))
+    if steady_off:
+        if {"replacement", "scale_up"} & set(plan.during):
+            parts.append("once it serves on its rented machines they are served only while a stop-gap covers (a "
+                         f"{' or '.join(d.replace('_', '-') for d in plan.during if d != 'start')}); otherwise they "
+                         "wait, until the queue's timeout")
+        else:
+            parts.append("once it serves on its rented machines they have no source and are refused "
+                         "(no_allowed_source)")
+    else:
+        burst = [s.name for s in plan.when_full if s.type not in off]
+        parts.append("when full they " + (f"use {', then '.join(burst)}" if burst else "wait for a worker"))
+    return f"keep off {off_words} here: " + "; ".join(parts)
+
+
+def most_hosted(plan: ServingPlan, start: float, hours: float) -> list[dict[str, Any]]:
+    """Each hosted budget's most over every UTC day and month the lease's hours touch (§14.6): a
+    hosted answer is paid from its budget, never from the lease."""
+    from .config import Budget
+
+    return [{"budget": s.budget_id, "name": s.name,
+             "most": round(Budget.model_validate(s.budget).most_over(start, hours), 2)}
+            for s in plan.hosted_sources()]
+
+
+def _window_edges(rule: "Rule", tz: str, start: float, end: float) -> list[float]:
+    """The moments a rule's window opens or closes between `start` and `end`."""
+    import datetime
+    from zoneinfo import ZoneInfo
+
+    zone = ZoneInfo(tz)
+    first = datetime.datetime.fromtimestamp(start, zone).date() - datetime.timedelta(days=1)
+    last = datetime.datetime.fromtimestamp(end, zone).date() + datetime.timedelta(days=1)
+    opens, closes = window_of(rule.when["between"])
+    edges = []
+    day = first
+    while day <= last:
+        for minute in (opens, closes):
+            wall = datetime.datetime(day.year, day.month, day.day, minute // 60, minute % 60, tzinfo=zone)
+            moment = wall.timestamp()
+            back = datetime.datetime.fromtimestamp(moment, zone)
+            if (back.hour, back.minute) != (wall.hour, wall.minute):
+                # A time DST skips takes effect at the first minute after it, as in_window reads it.
+                moment = min(moment, wall.replace(fold=1).timestamp())
+                while datetime.datetime.fromtimestamp(moment, zone).replace(tzinfo=None) < wall.replace(tzinfo=None):
+                    moment += 60
+            if start < moment < end:
+                edges.append(moment)
+        day += datetime.timedelta(days=1)
+    return edges
+
+
+def timeline(plan: ServingPlan, *, start: float, hours: float, ready_min: Optional[Mapping[str, Any]],
+             hosts: int, workers: int, hourly: float) -> list[dict[str, Any]]:
+    """The lease's hours as phases in clock time (§14.6): preparing — its rented machines billed
+    while they start, until_ready covering where it covers the start — then serving, split where a
+    rule's time window opens or closes. A rule with conditions other than a window is not a time:
+    it is in `conditions`."""
+    import datetime
+    from zoneinfo import ZoneInfo
+
+    zone = ZoneInfo(plan.tz)
+
+    def at(ts: float) -> str:
+        return datetime.datetime.fromtimestamp(ts, zone).strftime("%a %H:%M")
+
+    end = start + hours * 3600
+    phases: list[dict[str, Any]] = []
+    serving_from = start
+    rented = plan.steady == "rented"
+    if rented and ready_min:
+        serving_from = min(end, start + float(ready_min["median"]) * 60)
+        covers = "start" in plan.during and plan.until_ready
+        # The stop-gap ends at max_min, whether or not the machines are ready by then.
+        covered_to = serving_from if not covers or plan.max_min is None else min(serving_from, start + plan.max_min * 60)
+        if covers:
+            phases.append({
+                "phase": "preparing", "from_ts": start, "to_ts": covered_to, "from": at(start), "to": at(covered_to),
+                "sources": [s.name for s in plan.until_ready],
+                "said": "until ready: " + ", then ".join(s.name for s in plan.until_ready),
+                "workers": 0, "minutes": dict(ready_min), "hourly_usd": round(hourly, 4), "rules": []})
+        if covered_to < serving_from or not covers:
+            begin = covered_to if covers else start
+            phases.append({
+                "phase": "preparing", "from_ts": begin, "to_ts": serving_from, "from": at(begin),
+                "to": at(serving_from), "sources": [],
+                "said": ("the stop-gap has ended: its requests wait for its machines" if covers
+                         else "its requests wait for its machines"),
+                "workers": 0, "minutes": None if covers else dict(ready_min), "hourly_usd": round(hourly, 4),
+                "rules": []})
+    steady = f"steady/{plan.steady}"
+    burst = [s.name for s in plan.when_full]
+    timed = [r for r in plan.rules if set(r.when) <= {"between", "days"}]
+    edges = sorted({e for r in timed for e in _window_edges(r, plan.tz, serving_from, end)})
+    bounds = [serving_from, *edges, end]
+    for left, right in zip(bounds, bounds[1:], strict=False):
+        if right <= left:
+            continue
+        middle = (left + right) / 2
+        rules = [r.name for r in timed if in_window(r.when, plan.tz, middle)]
+        if phases and phases[-1]["phase"] == "serving" and phases[-1]["rules"] == rules:
+            phases[-1].update({"to_ts": right, "to": at(right)})
+            continue
+        phases.append({
+            "phase": "serving", "from_ts": left, "to_ts": right, "from": at(left), "to": at(right),
+            "sources": [steady, *burst],
+            "said": f"{steady}" + (f"; when full {', then '.join(burst)}" if burst else "")
+                    + (f"; rules in force: {', '.join(rules)}" if rules else ""),
+            "workers": workers, "hosts": hosts if rented else 0, "minutes": None,
+            "hourly_usd": round(hourly, 4) if rented else 0.0, "rules": rules})
+    return phases
+
+
+# --- starting plans and the published schema ---
+
+#: Starting plans, by name, for `gpm workload plan --serve-example <name>`. Each is a plan the
+#: check accepts as written.
+EXAMPLES: dict[str, dict[str, Any]] = {
+    "stop-gap": {"until_ready": ["shared", {"hosted": {"budget": {"per_day": 10}}}]},
+    "bursts": {"until_ready": ["shared"],
+               "when_full": [{"name": "hosted-burst", "hosted": {"after_s": 5, "budget": {"per_day": 20}}},
+                             {"rented": {"after_min": 10, "max_hosts": 2, "budget": {"per_day": 40}}}]},
+    "operators-machines": {"steady": "local", "reserve": {"local": 4}, "defaults": {"keep_on": "owned"}},
+    "careful-spending": {
+        "until_ready": ["shared", {"name": "hosted-cover", "hosted": {"budget": {"per_day": 10}}}],
+        "when_full": [{"name": "hosted-burst", "hosted": {"after_s": 5, "budget": {"per_day": 20, "per_month": 300}}}],
+        "tz": "America/New_York",
+        "rules": [
+            {"name": "interactive at once", "when": {"priority": "interactive"},
+             "then": {"after_s": {"hosted-burst": 0}}},
+            {"name": "careful spending",
+             "when": {"spent_over": {"budget": "hosted-burst", "period": "month", "share": 0.8}},
+             "then": {"never_use": ["hosted-burst"]}},
+        ]},
+    "on-demand-after-evictions": {
+        "until_ready": ["shared"], "tz": "America/New_York",
+        "rules": [{"name": "on-demand after evictions", "when": {"evictions": {"count": 3, "within_h": 24}},
+                   "then": {"steady": {"rented": {"kind": "on_demand"}}}, "until": "end_of_day"}]},
+}
+
+
+def json_schema() -> dict[str, Any]:
+    """The serving plan's JSON Schema (§14.6): what `GET /pool/schema/serving-plan` answers and
+    both packages ship. It describes the shape; the plan check says what a shape means here."""
+    budget = {"type": "object", "additionalProperties": False, "minProperties": 1,
+              "properties": {k: {"type": "number", "exclusiveMinimum": 0}
+                             for k in ("per_request", "per_day", "per_month")}}
+    name = {"type": "string", "minLength": 1, "maxLength": 40, "pattern": "^[^/]+$"}
+    hosted = {"type": "object", "additionalProperties": False, "required": ["budget"], "properties": {
+        "after_s": {"type": "number", "minimum": 0, "maximum": 3600},
+        "budget": budget,
+        "reserve_max_tokens": {"type": "integer", "minimum": 1},
+        "providers": {"type": "array", "maxItems": 16, "uniqueItems": True,
+                      "items": {"type": "string", "minLength": 1, "maxLength": 64}}}}
+    rented = {"type": "object", "additionalProperties": False, "required": ["max_hosts", "budget"], "properties": {
+        "after_min": {"type": "number", "minimum": 0, "maximum": 24 * 60},
+        "max_hosts": {"type": "integer", "minimum": 1, "maximum": 100},
+        "budget": budget,
+        "kind": {"enum": list(RENTED_KINDS)}}}
+    machine = {"type": ["object", "null"], "additionalProperties": False, "maxProperties": 0}
+
+    def source(types: tuple[str, ...]) -> dict[str, Any]:
+        settings = {"local": machine, "fixed": machine, "shared": machine, "hosted": hosted, "rented": rented}
+        # anyOf: a bare word is both a type and a string, and must still pass.
+        return {"anyOf": [
+            {"enum": [t for t in types]},
+            {"type": "string", "description": "the name of a source the plan defines"},
+            *({"type": "object", "additionalProperties": False, "required": [t],
+               "properties": {t: settings[t], "name": name}} for t in types),
+        ]}
+
+    sources = {"type": "array", "items": {"type": "string"}, "minItems": 1}
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://gpm.invalid/schema/serving-plan.json",
+        "title": "A workload's serving plan (serve)",
+        "description": "Where a workload's requests go and when: steady, until_ready, when_full, in that order "
+                       "(docs/spec/workloads.md §14). The plan check says what a plan means on this pool.",
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "steady": {"enum": list(ROLE_TAKES["steady"]), "default": "rented"},
+            "until_ready": {"type": "array", "items": source(ROLE_TAKES["until_ready"])},
+            "during": {"type": "array", "minItems": 1, "items": {"enum": list(DURING)}},
+            "max_min": {"type": "number", "minimum": 1, "maximum": MAX_MAX_MIN, "default": DEFAULT_MAX_MIN},
+            "when_full": {"type": "array", "items": source(ROLE_TAKES["when_full"])},
+            "defaults": {"type": "object", "additionalProperties": False,
+                         "properties": {k: {"enum": list(v)} for k, v in OPTIONS.items()}},
+            "reserve": {"type": "object", "additionalProperties": False, "minProperties": 1,
+                        "properties": {k: {"type": "integer", "minimum": 1, "maximum": MAX_RESERVE}
+                                       for k in HOST_KINDS}},
+            "tz": {"type": "string", "description": "an IANA time zone, such as America/New_York", "default": "UTC"},
+            "rules": {"type": "array", "maxItems": MAX_RULES, "items": {
+                "type": "object", "additionalProperties": False, "required": ["name", "when", "then"],
+                "properties": {
+                    "name": {"type": "string", "minLength": 1, "maxLength": 60},
+                    "when": {"type": "object", "additionalProperties": False, "minProperties": 1, "properties": {
+                        "priority": {"enum": list(OPTIONS["priority"])},
+                        "keep_on": {"enum": list(OPTIONS["keep_on"])},
+                        "between": {"type": "string", "pattern": "^[0-2][0-9]:[0-5][0-9]-[0-2][0-9]:[0-5][0-9]$"},
+                        "days": {"type": "array", "minItems": 1, "uniqueItems": True, "items": {"enum": list(DAYS)}},
+                        "spent_over": {"type": "object", "additionalProperties": False,
+                                       "required": ["budget", "share"], "properties": {
+                                           "budget": {"type": "string"}, "period": {"enum": ["day", "month"]},
+                                           "share": {"type": "number", "exclusiveMinimum": 0, "maximum": 1}}},
+                        "evictions": {"type": "object", "additionalProperties": False,
+                                      "required": ["count", "within_h"], "properties": {
+                                          "count": {"type": "integer", "minimum": 1},
+                                          "within_h": {"type": "number", "exclusiveMinimum": 0, "maximum": 168}}}}},
+                    "then": {"type": "object", "additionalProperties": False, "minProperties": 1, "properties": {
+                        "use_only": sources, "never_use": sources,
+                        "after_s": {"type": "object", "minProperties": 1,
+                                    "additionalProperties": {"type": "number", "minimum": 0}},
+                        "steady": {"oneOf": [{"enum": list(HOST_KINDS)}, {
+                            "type": "object", "additionalProperties": False, "required": ["rented"],
+                            "properties": {"rented": {"type": "object", "additionalProperties": False,
+                                                      "required": ["kind"],
+                                                      "properties": {"kind": {"enum": list(RENTED_KINDS)}}}}}]}}},
+                    "until": {"enum": list(UNTIL)}}}},
+        },
+        "examples": list(EXAMPLES.values()),
+    }
+
+
 # --- how a request may be routed now ---
 
 

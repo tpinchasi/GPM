@@ -24,7 +24,7 @@ from .errors import (
 )
 from .retry import RetryPolicy
 from .transport import AsyncPoolTransport, PoolTransport, async_pool_transport, pool_transport
-from .workloads import Workload, WorkloadProvisioner, WorkloadRefused
+from .workloads import Workload, WorkloadProvisioner, WorkloadRefused, serving_plan_schema
 
 __all__ = [
     "AsyncPoolClient",
@@ -49,6 +49,7 @@ __all__ = [
     "async_pool_transport",
     "image_part",
     "pool_transport",
+    "serving_plan_schema",
 ]
 
 CONTRACT_VERSION = "1"

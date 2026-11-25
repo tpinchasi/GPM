@@ -2189,6 +2189,13 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
 
         return await _workload_call(run)
 
+    @app.get("/pool/schema/serving-plan")
+    async def serving_plan_schema() -> JSONResponse:
+        """The serving plan's JSON Schema (§14.6, D203); both packages ship the same file."""
+        from ..serving_plan import json_schema
+
+        return JSONResponse(json_schema())
+
     @app.post("/pool/workloads")
     async def create_workload(request: Request) -> JSONResponse:
         """Create it: one lease bound to it, and its key, **shown once** in this answer. A budget
@@ -2213,7 +2220,9 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
 
     @app.get("/pool/workloads")
     async def list_workloads() -> JSONResponse:
-        return JSONResponse({"workloads": [supervisor.workloads.view(w) for w in supervisor.workloads.store.all()]})
+        context = supervisor.workloads.now_context()  # read once for every workload's Now line
+        return JSONResponse({"workloads": [supervisor.workloads.view(w, context)
+                                           for w in supervisor.workloads.store.all()]})
 
     @app.get("/pool/workloads/{name}")
     async def show_workload(name: str) -> JSONResponse:

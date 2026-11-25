@@ -518,8 +518,10 @@ the start (§14.1).
 > built** (gpm-server 0.49.0): reserved workers (`reserve`) and `steady: local|fixed`. **Stage 5
 > built** (gpm-server 0.50.0): rules and `tz`, with every condition and the effects `use_only`,
 > `never_use` and `after_s`. **Stage 5b built** (gpm-server 0.51.0): a rule's `steady` switch
-> and its `until`. The rest is refused in words until its stage ships; until then §4 and §13 are
-> what runs for everything else.
+> and its `until`. **Stage 6 built** (gpm-server 0.52.0, gpm-client 0.12.0): the plan check's
+> readback, timeline and limit, the schema, the CLI's `--serve`, `w.budgets()` and the Now line.
+> The rest is refused in words until its stage ships; until then §4 and §13 are what runs for
+> everything else.
 
 A workload's serving plan, `serve`, says **where its requests go and when**. How much it must
 serve stays in `parallel`, `latency_s`, the kind of machine (`machines=` in the SDK, `kind` in the
@@ -870,6 +872,21 @@ The plan check — `POST /pool/workloads/plan` with `serve`, or `gpm workload pl
   rented machines ready (about 6 min; stop-gap 54 min left). Next request: shared. shared 3 of 4
   busy; hosted-cover $2.10 of $10 today. Rules in force: none." A refusal or a long wait names
   the rule behind it.
+- **As built** (stage 6). The plan check answers `plan.serving`: `readback` (sentences),
+  `timeline` (phases with `from`/`to` in the plan's `tz`, `sources`, `workers`, `minutes` —
+  median and 90th percentile over the machines of the first host's card class in the machine
+  record, `measured: false` with the download estimate where there are none — and `hourly_usd`;
+  serving is split where a rule whose only conditions are `between`/`days` opens or closes),
+  `conditions` (`{condition, effect, rule}`), `most_it_can_spend` (`lease_cap`, `hosted` per
+  budget, `total`, `said`), `warnings`, `providers`, and `plan` (the plan as stored, or null for a
+  workload with no `serve`, whose fields are read back as the plan they mean). None of it is
+  stored with the workload. The schema ships as `serving-plan.schema.json` in both packages
+  (`gpm_client.serving_plan_schema()`); `--serve-example` names `stop-gap`, `bursts`,
+  `operators-machines`, `careful-spending` and `on-demand-after-evictions`. `w.budgets()` gives
+  each hosted budget by its id (a workload with `bursts` has one, `hosted`); a rented burst's
+  budget is in the Now line. The Now line is the workload view's `now` (`said`, `role`, `next`,
+  `budgets`, `rules`), read from what the supervisor last wrote for the router; busy workers per
+  source are the router's, and are not in it yet.
 
 ### 14.7 The routing order
 
