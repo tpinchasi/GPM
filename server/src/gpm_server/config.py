@@ -946,6 +946,10 @@ class WorkloadsConfig(BaseModel):
     max_models: int = Field(default=4, ge=1, le=8)
     #: The share of the shared workload's ready workers a workload may borrow while it prepares.
     borrow_share: float = Field(default=0.25, ge=0.0, le=1.0)
+    #: The most of the operator's own workers of each kind (local, fixed-remote) all workloads'
+    #: serving plans may reserve together (S19, §14.2). While fewer are ready, every reservation
+    #: is scaled down pro rata.
+    max_reserved_share: float = Field(default=0.5, ge=0.0, le=1.0)
     #: How long a rotated-out key keeps working, so a running app is switched without a gap.
     rotation_grace_minutes: float = Field(default=30.0, ge=0.0)
     #: A workload's hosts are held to at least this reliability score, whatever the search says.

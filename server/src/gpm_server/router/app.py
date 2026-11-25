@@ -665,6 +665,32 @@ def create_app(
             borrow_share=state.config.workloads.borrow_share if may_borrow else 0.0,
         )
 
+    def _reserved_for(name: str) -> tuple[tuple[str, int], ...]:
+        """The workers of the operator's own machines reserved for a workload now, by host kind
+        (S19, §14.2): its plan's, scaled down pro rata — with every other workload's — wherever
+        reservations together pass `workloads.max_reserved_share` of the ready workers of a kind."""
+        plan = state.plan_for(name)
+        if plan is None or not plan.reserve:
+            return ()
+        share = state.config.workloads.max_reserved_share
+        answer = []
+        for source, wanted in plan.reserve.items():
+            kinds = HOST_KINDS[source]
+            ready = sum(h.total_workers for h in state.hosts if h.workload is None and not h.hosted
+                        and h.kind in kinds and h.state is HostState.READY)
+            asked = 0
+            for other, spec in state.registry.workloads.items():
+                if spec.state not in ("preparing", "serving"):
+                    continue
+                theirs = state.plan_for(other)
+                asked += theirs.reserve.get(source, 0) if theirs is not None else 0
+            room = ready * share
+            # Scaled down pro rata, never to nothing while a whole worker's room is left: a
+            # reservation rounded to 0 would leave a workload running there no worker at all.
+            have = wanted if asked <= room else max(1 if room >= 1 else 0, int(wanted * room / asked))
+            answer += [(kind, have) for kind in kinds]
+        return tuple(answer)
+
     def _budgets_of(name: str) -> dict[str, Any]:
         """A workload's hosted budgets and what is left (D165): its hosted total, and, where its
         serving plan has hosted sources, each source's own (S19, §14.2)."""
@@ -690,7 +716,8 @@ def create_app(
             covering = not _hosted_alone(name, need.model) and not state.dispatcher.ready_for(need)
         else:
             covering = routing.covering
-        return route_label(plan, hosted=host.hosted, own=host.workload == name and not host.hosted,
+        own = not host.hosted and (host.workload == name or (host.workload is None and host.kind in plan.steady_kinds))
+        return route_label(plan, hosted=host.hosted, own=own,
                            burst=host.burst, host_kind=host.kind, covering=covering, host_id=host.host_id)
 
     def _ready_models(name: str) -> set[str]:
@@ -1251,6 +1278,8 @@ def create_app(
             borrow_while_ready=plan_routing.borrow_while_ready if plan_routing is not None else False,
             order=plan_routing.order if plan_routing is not None else (),
             kept_off=kept,
+            reserved=_reserved_for(who.workload) if who.workload is not None else (),
+            steady_kinds=plan.steady_kinds if plan is not None else frozenset(),
         )
         if plan_routing is not None:
             # Asked again each time the request looks for a worker: a gap the supervisor opens
@@ -1268,6 +1297,7 @@ def create_app(
                     may_borrow=routing.may_borrow, borrow_kinds=routing.borrow_kinds,
                     borrow_while_ready=routing.borrow_while_ready, order=routing.order,
                     hosted_ids=routing.hosted_ids, hosted_order=routing.hosted_order,
+                    reserved=_reserved_for(plan_workload),
                     hosted_moments=tuple(started + w for w in routing.hosted_waits) if after is not None else ())
 
             need = dataclasses.replace(
@@ -1341,6 +1371,7 @@ def create_app(
                 h for h in state.hosts if holds(h) and (
                     (h.hosted and burst is not None)
                     or (not h.hosted and h.workload == who.workload)
+                    or (not h.hosted and h.workload is None and plan is not None and h.kind in plan.steady_kinds)
                     or may_borrow_from(h))
             ]
             if reachable and all(removed(h) for h in reachable):

@@ -21,6 +21,9 @@ from typing import Any, Callable, Optional
 from ..catalog import ResolvedVariant, Traits, select_variant
 from ..models import Host, HostState, Worker, WorkerState
 
+#: The plan's word for each kind of the operator's own machine (S19).
+_SOURCE_OF = {"local": "local", "fixed-remote": "fixed"}
+
 
 @dataclasses.dataclass(frozen=True)
 class Need:
@@ -75,6 +78,12 @@ class Need:
     #: Every later moment a plan's hosted source may take the request (each source's own wait):
     #: the request looks again at each, not only at the first (`hosted_after`).
     hosted_moments: tuple[float, ...] = ()
+    #: Workers of the operator's own machines reserved for this workload now, by host kind,
+    #: scaled to what is ready (S19, §14.2): taken before a waiting shared request and beyond
+    #: `borrow_share`. Those of `steady_kinds` are where it runs, its own hosts in all but name;
+    #: the others serve its stop-gap while it covers.
+    reserved: tuple[tuple[str, int], ...] = ()
+    steady_kinds: frozenset[str] = frozenset()
     reserve_now: Optional[Callable[[Host, ResolvedVariant, bool], Optional[Any]]] = None
 
 
@@ -145,6 +154,7 @@ class Dispatcher:
     def eligible(self, need: Need, exclude: frozenset[str] = frozenset()) -> list[tuple[Host, ResolvedVariant]]:
         own: list[tuple[Host, ResolvedVariant]] = []
         shared: list[tuple[Host, ResolvedVariant]] = []
+        reserved: list[tuple[Host, ResolvedVariant]] = []
         for host in self.hosts:
             if host.state is not HostState.READY or host.host_id in exclude:
                 continue
@@ -162,6 +172,17 @@ class Dispatcher:
             # own budget — never as borrowing (D165).
             if not host.hosted and host.workload != need.workload and not (need.workload is not None and host.workload is None):
                 continue  # another workload's host: never
+            if not host.hosted and host.workload is None and need.workload is not None and host.kind in dict(need.reserved):
+                variant = self.variant_for(host, need)
+                if variant is None:
+                    continue
+                if host.kind in need.steady_kinds:
+                    own.append((host, variant))  # where it runs (S19)
+                elif any(s == "shared" or _SOURCE_OF.get(host.kind) == s for s in need.order):
+                    reserved.append((host, variant))  # its stop-gap's reserved workers, while it covers
+                elif need.may_borrow and (need.borrow_kinds is None or host.kind in need.borrow_kinds):
+                    shared.append((host, variant))
+                continue
             if (need.borrow_kinds is not None and not host.hosted and host.workload != need.workload
                     and host.kind not in need.borrow_kinds):
                 continue  # a shared machine of a kind the plan's stop-gap does not name
@@ -170,8 +191,8 @@ class Dispatcher:
                 continue
             (own if host.workload == need.workload or host.hosted else shared).append((host, variant))
         if need.workload is not None and need.may_borrow and (need.borrow_while_ready or not self.ready_for(need)):
-            return own + shared
-        return own
+            return own + reserved + shared
+        return own + reserved
 
     @staticmethod
     def rank(host: Host, need: Need) -> int:
@@ -180,6 +201,8 @@ class Dispatcher:
         Without a plan every host ranks the same, and the tiers alone decide, as always."""
         if not need.order or host.workload == need.workload and not host.hosted:
             return 0
+        if not host.hosted and host.workload is None and host.kind in need.steady_kinds:
+            return 0  # steady on the operator's machines: its own
         for index, source in enumerate(need.order, start=1):
             if source == "hosted" and host.hosted:
                 return index
@@ -198,6 +221,13 @@ class Dispatcher:
         the second is waiting for its hosts — not ineligible on the first group's."""
         if need.workload is None:
             return self.has_ready_host(None)
+        if need.steady_kinds:
+            # Steady on the operator's machines (S19): those are its hosts.
+            return any(
+                h.workload is None and h.kind in need.steady_kinds and h.state is HostState.READY
+                and (need.model in h.variants or need.model in h.literal_variants)
+                for h in self.hosts
+            )
         # Holds the model at all — not "can serve this request": a ready host that lacks the
         # schema or runtime class asked for makes the request ineligible, not the workload
         # unready (app contract: `no_eligible_host`).
@@ -215,7 +245,7 @@ class Dispatcher:
         """Shared workers serving a borrower right now."""
         return sum(
             1 for h in self.hosts if h.workload is None and not h.hosted
-            for w in h.workers if w.borrowed and w.state is WorkerState.BUSY
+            for w in h.workers if w.borrowed and not w.reserved and w.state is WorkerState.BUSY
         )
 
     def borrow_limit(self, share: float) -> int:
@@ -236,9 +266,42 @@ class Dispatcher:
                 return True
         return False
 
+    def reserved_in_use(self, workload: Optional[str], kind: str) -> int:
+        """Workers of the shared workload's hosts of `kind` busy with this workload's requests."""
+        return sum(1 for h in self.hosts if h.workload is None and h.kind == kind
+                   for w in h.workers if not w.is_idle and w.workload == workload)
+
+    def _reservation_waits(self, host: Host) -> bool:
+        """Is a queued workload request waiting for a worker reserved for it on this host's kind?"""
+        for waiting, exclude in self._waiting.values():
+            if waiting.workload is None or host.host_id in exclude:
+                continue
+            reserved = dict(waiting.reserved).get(host.kind, 0)
+            if not reserved or self.reserved_in_use(waiting.workload, host.kind) >= reserved:
+                continue
+            if waiting.engines and host.engine not in waiting.engines:
+                continue
+            if host.kind not in waiting.steady_kinds and not any(
+                    s == "shared" or _SOURCE_OF.get(host.kind) == s for s in waiting.order):
+                continue  # a reservation its stop-gap does not use now
+            if self.variant_for(host, waiting) is not None:
+                return True
+        return False
+
     def _may_take(self, host: Host, need: Need) -> bool:
-        if host.workload == need.workload or host.hosted:
+        if host.hosted:
             return True
+        if need.workload is None and host.workload is None:
+            # The shared workload's own request — after a workload's request waiting for a worker
+            # reserved for it (S19): shared requests use reserved workers only while left idle.
+            return not self._reservation_waits(host)
+        if host.workload == need.workload:
+            return True
+        reserved = dict(need.reserved).get(host.kind, 0)
+        if reserved and self.reserved_in_use(need.workload, host.kind) < reserved:
+            return True  # within its reservation: ahead of shared requests, beyond borrow_share
+        if host.kind in need.steady_kinds:
+            return False  # where it runs, at most what is reserved for it
         # Borrowing: after the shared workload's own requests, and within the share — which is
         # for every borrower together, not each workload's own (D115).
         if self._shared_request_wants(host):
@@ -273,7 +336,7 @@ class Dispatcher:
                         # other way round. A workload's request is judged by its own model's hosts.
                         if need.workload is not None and not self.ready_for(need):
                             raise NoReadyHost()
-                        if self.has_ready_host(need.workload):
+                        if self.has_ready_host(need.workload) or (need.steady_kinds and self.ready_for(need)):
                             raise NoEligibleHost()
                         raise NoReadyHost()
 
@@ -310,7 +373,8 @@ class Dispatcher:
                 # Leaving — served, refused, timed out or cancelled with its client. A shared
                 # request leaving may be the one a borrower was yielding to: wake them to look.
                 left = self._waiting.pop(request_id, None)
-                if left is not None and left[0].workload is None:
+                if left is not None and (left[0].workload is None or left[0].reserved):
+                    # ... or a workload request a shared one held off a reserved worker for.
                     self._condition.notify_all()
 
     def _take_idle(
@@ -366,9 +430,14 @@ class Dispatcher:
             worker.state = WorkerState.BUSY
             worker.request_id = request_id
             worker.borrowed = host.workload != need.workload and not host.hosted
+            # Within its reservation (S19): beyond borrow_share, and not borrowing in the log.
+            worker.reserved = worker.borrowed and self.reserved_in_use(need.workload, host.kind) < dict(
+                need.reserved).get(host.kind, 0)
             worker.model = need.model
+            worker.workload = need.workload
             return Assignment(
-                host=host, worker=worker, variant=variant, borrowed=worker.borrowed, concurrency=host.busy,
+                host=host, worker=worker, variant=variant, borrowed=worker.borrowed and not worker.reserved,
+                concurrency=host.busy,
                 model_concurrency=self.busy_with(host, need.model), hold=hold,
             )
         return None
@@ -389,7 +458,9 @@ class Dispatcher:
             worker.state = WorkerState.IDLE
             worker.request_id = None
             worker.borrowed = False
+            worker.reserved = False
             worker.model = None
+            worker.workload = None
             worker.served += 1
             self._condition.notify_all()
 

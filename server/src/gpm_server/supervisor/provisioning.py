@@ -279,6 +279,10 @@ class Provisioning:
             if not grant.sources:
                 return  # a grant from before plans: its own checks hold the shorthand, as before
             plan = from_bursts(policy, grant.borrows())
+        if plan.reserve or plan.steady != "rented":
+            # Reserving the operator's own machines is the operator's alone (D199).
+            raise WorkloadRefused("a program never reserves the operator's machines: reserve and steady local or "
+                                  "fixed are the operator's to set")
         rented = plan.rented()
         if rented is not None and rented.kind is not None and rented.kind not in grant.kinds:
             # A burst's kind of machine is spending authority like `machines=` (S19 stage 3).
