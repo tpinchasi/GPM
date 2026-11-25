@@ -83,6 +83,8 @@ class Need:
     #: `borrow_share`. Those of `steady_kinds` are where it runs, its own hosts in all but name;
     #: the others serve its stop-gap while it covers.
     reserved: tuple[tuple[str, int], ...] = ()
+    #: A plan's rules in force keep this request off its workload's rented burst hosts (S19).
+    no_burst: bool = False
     steady_kinds: frozenset[str] = frozenset()
     reserve_now: Optional[Callable[[Host, ResolvedVariant, bool], Optional[Any]]] = None
 
@@ -164,6 +166,8 @@ class Dispatcher:
                 continue
             if host.hosted and "hosted" in need.kept_off:
                 continue
+            if need.no_burst and host.burst and host.workload == need.workload:
+                continue  # a burst host its plan's rules keep this request off
             if host.hosted and need.hosted_ids is not None and host.host_id not in need.hosted_ids:
                 continue  # a hosted API none of the plan's sources in force names
             if host.kind.startswith("rented") and "rented" in need.kept_off:

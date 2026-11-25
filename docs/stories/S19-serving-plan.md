@@ -257,8 +257,11 @@ After the second architecture and UX reviews (2026-11-25):
    (gpm-server 0.48.0).
 4. **Reserved workers** on the operator's own machines — **built** (gpm-server 0.49.0), with
    `steady: local|fixed` (no rented burst above it until rules, stage 5).
-5. **Rules**: time windows, budget shares, evictions, steady switches handed over
-   make-before-break and priced with their overlap.
+5. **Rules**: time windows, budget shares, evictions — **built** (gpm-server 0.50.0), with
+   `use_only`, `never_use` and `after_s`.
+5b. **A rule's steady switch**, handed over make-before-break and priced with its overlap — split
+   from stage 5 (2026-11-25): it changes what a workload rents, and is built and reviewed on its
+   own.
 6. **The plan check's readback, timeline and limit**, the JSON Schema, the CLI (`--serve`), the
    SDK's `budgets()`, and the Now line.
 7. **The console's plan builder.**

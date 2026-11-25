@@ -411,6 +411,17 @@ class WorkloadStore:
     def close_gap(self, workload: str, model: str) -> None:
         self.db.execute("DELETE FROM serving_gaps WHERE workload = ? AND model = ?", (workload, model))
 
+    def armed_rules(self) -> dict[str, frozenset[str]]:
+        """Each workload's plan rules whose conditions on the pass held at the supervisor's last look."""
+        return {r["workload"]: frozenset(json.loads(r["armed"] or "[]"))
+                for r in self.db.query("SELECT workload, armed FROM plan_rules")}
+
+    def set_armed_rules(self, workload: str, names: Iterable[str]) -> None:
+        self.db.execute(
+            "INSERT INTO plan_rules (workload, armed, written_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(workload) DO UPDATE SET armed = excluded.armed, written_at = excluded.written_at",
+            (workload, json.dumps(sorted(names)), time.time()))
+
     def supervisor_heartbeat(self, pool: str) -> Optional[float]:
         """When the pool's supervisor last said it was alive and looping, or None."""
         rows = self.db.query("SELECT heartbeat FROM supervisor_lock WHERE pool = ?", (pool,))

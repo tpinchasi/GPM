@@ -515,9 +515,11 @@ the start (§14.1).
 > `defaults` (14.4), `X-GPM-Route`, and stats by priority and by route. **Stage 3 built**
 > (gpm-server 0.48.0): several hosted sources, each with its own budget under one hosted total,
 > `providers`, a rented source's `kind`, and covering a scale-up where `during` lists it. **Stage 4
-> built** (gpm-server 0.49.0): reserved workers (`reserve`) and `steady: local|fixed`. The rest is
-> refused in words until its stage ships; until then §4 and §13 are what runs for everything
-> else.
+> built** (gpm-server 0.49.0): reserved workers (`reserve`) and `steady: local|fixed`. **Stage 5
+> built** (gpm-server 0.50.0): rules and `tz`, with every condition and the effects `use_only`,
+> `never_use` and `after_s`; a rule's `steady` switch (and its `until`) follows as stage 5b. The
+> rest is refused in words until its stage ships; until then §4 and §13 are what runs for
+> everything else.
 
 A workload's serving plan, `serve`, says **where its requests go and when**. How much it must
 serve stays in `parallel`, `latency_s`, the kind of machine (`machines=` in the SDK, `kind` in the
@@ -724,6 +726,26 @@ takes effect at the first minute after it, and one it repeats, at the first occu
   checked at creation (§2) count it. A switch the caps have no room for when it comes due waits,
   and the Now line says why.
 - **Time windows** take effect at the first pass after their boundary, never before.
+- **How they are applied.** The supervisor writes, per workload, the rules whose conditions on
+  the pass all hold (`plan_rules`), only on a change, with a `workload_rules` event; a rule with
+  only conditions on a request's options is never written — the router judges it on every
+  request. For each request the router applies every rule in force whose request conditions
+  match, in order: `use_only` sets intersect, `never_use` sets add, `after_s` takes the shortest;
+  a source a rule keeps out is out of that request's plan entirely (its hold, its wait, its
+  route). Where the rules in force for every request keep the rented burst out, the supervisor
+  rents no burst host and drains those it has, as for a burst the policy no longer has; for a
+  rule on a request's options, the router keeps those requests off the burst hosts. A supervisor
+  that stops leaves the last rules it wrote in force. A request the rules and its options leave
+  no source is `503 no_allowed_source`, naming the rules in force.
+- `spent_over` on a hosted source reads the request log's spend under that budget id; on a rented
+  burst, what its hosts cost; on `lease`, the lease's spend against its cap. `evictions` counts
+  the workload's lease's eviction events within the hours.
+- A rule names a source by its type (every source of it), its name, or its budget id (an unnamed
+  rented burst is `when_full/rented`); an `after_s` shortens every hosted source so called whose
+  wait is longer. **A rule on a request's options cannot keep the rented burst out**, refused in
+  words: the burst is sized from every request's load, so it would be rented for load it may not
+  serve. A model served by hosted APIs alone keeps §13's path, and the rules in force that keep
+  every hosted source out keep it off hosted APIs too.
 
 ### 14.4 Request options (D201)
 
