@@ -201,7 +201,7 @@ def test_a_workload_of_two_models_is_planned_and_created_from_the_console(pool):
         assert "Placement" in page.js("__text()")
         page.js("__set('Budget ($)', '5')")
         page.js("__click('Plan')")
-        page.until("__text().includes('placement')", within=30, what="the plan")
+        page.until("__text().includes('How this was worked out')", within=30, what="the plan")
         text = page.js("__text()")
         assert "together:" in text and "apart:" in text and "expected over" in text, text
         assert "kept:" in text and "(kept)" in text and "in all)" in text

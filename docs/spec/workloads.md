@@ -520,7 +520,7 @@ the start (§14.1).
 > `never_use` and `after_s`. **Stage 5b built** (gpm-server 0.51.0): a rule's `steady` switch
 > and its `until`. **Stage 6 built** (gpm-server 0.52.0, gpm-client 0.12.0): the plan check's
 > readback, timeline and limit, the schema, the CLI's `--serve`, `w.budgets()` and the Now line.
-> The rest is refused in words until its stage ships; until then §4 and §13 are what runs for
+> **Stage 7 built** (gpm-server 0.53.0): the console's plan builder. The rest is refused in words until its stage ships; until then §4 and §13 are what runs for
 > everything else.
 
 A workload's serving plan, `serve`, says **where its requests go and when**. How much it must
