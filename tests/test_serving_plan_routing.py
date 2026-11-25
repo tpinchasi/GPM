@@ -345,12 +345,13 @@ def test_the_supervisor_marks_a_replacement_once_per_shortfall_and_closes_it(pro
         store.set_state(w.name, "serving")
         programs.loop.run(manager.advance())
         gaps = store.gaps()
-        opened, ends, ready = gaps[(w.name, BIG)]
+        opened, ends, ready, reason = gaps[(w.name, BIG)]
+        assert reason == "replacement"
         assert ends == pytest.approx(opened + 30 * 60) and ready == frozenset()
         programs.loop.run(manager.advance())
-        assert store.gaps()[(w.name, BIG)] == (opened, ends, ready), "a pass later, the same gap: never extended"
+        assert store.gaps()[(w.name, BIG)] == (opened, ends, ready, reason), "a pass later, the same gap: never extended"
         covering = programs.supervisor.events.recent(20, kind="workload_covering")
-        assert len(covering) == 1 and "covers for at most 30 min" in covering[0]["summary"]
+        assert len(covering) == 1 and "covers the replacement for at most 30 min" in covering[0]["summary"]
         # Its host ready again: the gap is closed.
         fleet = programs.supervisor.fleet
         hosts_of = fleet.hosts_of

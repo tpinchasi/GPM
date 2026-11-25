@@ -25,7 +25,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import ClientDisconnect
 
 from .. import translate
-from ..config import ConfigError, PoolConfig, load_config
+from ..config import Budget, ConfigError, PoolConfig, load_config
 from ..contract import CONTRACT_VERSION
 from ..db import Database, RequestRecord
 from ..directory import read_directory
@@ -47,7 +47,7 @@ from ..models import HostState
 from ..provisioning_store import HashTaken
 from ..serving_plan import HOST_KINDS, OPTIONS, kept_off, request_options, route_label, why_kept_off
 from ..state import RouterState, open_database
-from .budgets import period_starts
+from .budgets import days_in_month, period_starts
 from .dispatch import Assignment, BudgetSpent, Need, NoEligibleHost, NoReadyHost, QueueTimeout
 
 #: How much of a response's end is held to read the engine's own counts out of it (D67).
@@ -660,9 +660,21 @@ def create_app(
             preparing=workload_state == "preparing", model_ready=model in _ready_models(name),
             created_at=workload.created_at if workload is not None else now, now=now,
             gap_ends_at=gap[1] if gap is not None else None,
+            gap_reason=gap[3] if gap is not None else "replacement",
             fresh=beat is not None and now - beat < max(SUPERVISOR_STALE_S, 3 * state.config.pool.probe_interval_s),
             borrow_share=state.config.workloads.borrow_share if may_borrow else 0.0,
         )
+
+    def _budgets_of(name: str) -> dict[str, Any]:
+        """A workload's hosted budgets and what is left (D165): its hosted total, and, where its
+        serving plan has hosted sources, each source's own (S19, §14.2)."""
+        answer: dict[str, Any] = {"hosted": state.budgets.left(name, getattr(state.hosted_burst_for(name), "budget", None))}
+        plan = state.plan_for(name)
+        if plan is not None and plan.hosted_sources():
+            answer["hosted"] = state.budgets.left(name, plan.hosted_total(days_in_month()))
+            answer["sources"] = {s.budget_id: state.budgets.left(name, s.budget, budget_id=s.budget_id)
+                                 for s in plan.hosted_sources()}
+        return answer
 
     def _route_for(host: Any, need: Need, plan: Any, routing: Any) -> str:
         """`<role>/<source>` for the host that took a request (workloads.md §14.7), by the plan's
@@ -679,7 +691,7 @@ def create_app(
         else:
             covering = routing.covering
         return route_label(plan, hosted=host.hosted, own=host.workload == name and not host.hosted,
-                           burst=host.burst, host_kind=host.kind, covering=covering)
+                           burst=host.burst, host_kind=host.kind, covering=covering, host_id=host.host_id)
 
     def _ready_models(name: str) -> set[str]:
         """The workload's models one of its own ready hosts holds."""
@@ -768,7 +780,7 @@ def create_app(
             "ends_at": workload.ends_at,
             "hosts_ready": sum(1 for h in mine if h.state is HostState.READY), "hosts": len(mine),
             "policy": workload.policy,
-            "budgets": {"hosted": state.budgets.left(name, getattr(state.hosted_burst_for(name), "budget", None))},
+            "budgets": _budgets_of(name),
         }, headers={"X-GPM-Contract": CONTRACT_VERSION})
 
     @app.post("/pool/provisioning/workloads/{name}/policy")
@@ -865,7 +877,7 @@ def create_app(
                 },
                 "delivery": _delivery(),
                 # Its hosted budget and what is left of it (D165).
-                "budgets": {"hosted": state.budgets.left(name, getattr(state.hosted_burst_for(name), "budget", None))},
+                "budgets": _budgets_of(name),
                 "capacity": {
                     "hosts_ready": len(ready),
                     "workers_total": sum(h.total_workers for h in mine),
@@ -1080,7 +1092,7 @@ def create_app(
             chosen, unknown_option = (None, None), str(bad)
         #: What the log keeps of this request beyond each call's own fields: its options, and the
         #: role and source of the host that last took it.
-        logged: dict[str, Optional[str]] = {"priority": chosen[0], "keep_on": chosen[1], "route": None}
+        logged: dict[str, Optional[str]] = {"priority": chosen[0], "keep_on": chosen[1], "route": None, "budget": None}
 
         async def record(outcome: str, **fields: object) -> None:
             await state.log.record(
@@ -1096,6 +1108,7 @@ def create_app(
                     priority=logged["priority"],
                     keep_on=logged["keep_on"],
                     route=logged["route"] if fields.get("host_id") is not None else None,
+                    budget=logged["budget"] if fields.get("cost_usd") else None,
                     **fields,  # type: ignore[arg-type]
                 )
             )
@@ -1155,10 +1168,10 @@ def create_app(
         if burst is not None:
             hosted_after = started + burst.after_s
             if len(body) > _READ_OFF_LOOP_BYTES:
-                most_out = await asyncio.to_thread(_max_tokens, content_type, body)
+                asked_out = await asyncio.to_thread(_max_tokens, content_type, body)
             else:
-                most_out = _max_tokens(content_type, body)
-            most_out = most_out or burst.reserve_max_tokens
+                asked_out = _max_tokens(content_type, body)
+            most_out = asked_out or burst.reserve_max_tokens
             body_size, budget, spender = len(body), burst.budget, who.workload
 
             def reserve(host: Any, variant: Any) -> Any:
@@ -1201,8 +1214,10 @@ def create_app(
             hosted_after, reserve = None, None  # never a hosted API: nothing to wait for, nothing held
         plan_routing = None
         burst_reserve = reserve
-        #: The plan's routing as the dispatcher last judged it — what the route is labelled by.
+        #: The plan's routing as the dispatcher last judged it — what the route is labelled by —
+        #: and the plan's own hold for a hosted answer, once there is one.
         dispatched_by: list[Any] = [None]
+        plan_reserve_now: list[Any] = [None]
         if plan is not None and not _hosted_alone(who.workload, requested):
             plan_routing = _plan_routing(plan, who.workload, requested)
             dispatched_by[0] = plan_routing
@@ -1249,10 +1264,53 @@ def create_app(
                     else started + routing.hosted_after_s
                 return dataclasses.replace(
                     current, hosted_after=after, reserve=burst_reserve if after is not None else None,
+                    reserve_now=plan_reserve_now[0] if after is not None else None,
                     may_borrow=routing.may_borrow, borrow_kinds=routing.borrow_kinds,
-                    borrow_while_ready=routing.borrow_while_ready, order=routing.order)
+                    borrow_while_ready=routing.borrow_while_ready, order=routing.order,
+                    hosted_ids=routing.hosted_ids, hosted_order=routing.hosted_order,
+                    hosted_moments=tuple(started + w for w in routing.hosted_waits) if after is not None else ())
 
-            need = dataclasses.replace(need, again=again)
+            need = dataclasses.replace(
+                need, again=again, hosted_ids=plan_routing.hosted_ids, hosted_order=plan_routing.hosted_order,
+                hosted_moments=tuple(started + w for w in plan_routing.hosted_waits) if hosted_after is not None else ())
+
+            if burst is not None and "hosted" not in kept:
+                # A plan's hosted sources each pay from their own budget, under the workload's one
+                # hosted total (S19, §14.2): the first source of a role in force whose providers
+                # include the host, whose wait is over (or none could serve it otherwise) and
+                # whose budget and the total hold the worst case pays, and is the answer's route.
+                total = plan.hosted_total(days_in_month())
+                budgets_of = {id(s): Budget.model_validate(s.budget) for s in plan.hosted_sources()}
+
+                def reserve_now(host: Any, variant: Any, at_once: bool) -> Any:
+                    price = state.price_of(variant.tag)
+                    routing = dispatched_by[0]
+                    if price is None or routing is None:
+                        return None
+                    moment = time.monotonic()
+                    for role in routing.hosted_roles:
+                        for source in plan.role_hosted(role):
+                            if not source.serves(host.host_id):
+                                continue
+                            if not at_once and moment < started + (source.after_s or 0.0):
+                                continue
+                            held = state.budgets.hold(
+                                spender, budgets_of[id(source)],
+                                # The most a request naming none may generate is what a translation
+                                # writes for it: the largest of the sources' (`burst`'s, compiled).
+                                _worst_case(price, body_size, asked_out or burst.reserve_max_tokens),
+                                budget_id=source.budget_id, total=total, route=f"{role}/{source.name}")
+                            if held is not None:
+                                return held
+                    return None
+
+                plan_reserve_now[0] = reserve_now
+
+                def burst_reserve(host: Any, variant: Any) -> Any:
+                    return reserve_now(host, variant, False)
+
+                if need.hosted_after is not None:
+                    need = dataclasses.replace(need, reserve_now=reserve_now, reserve=burst_reserve)
 
         if kept:
             # Waiting cannot help a request whose options remove every host it could ever reach
@@ -1270,7 +1328,7 @@ def create_app(
                     return False
                 if need.may_borrow and (need.borrow_kinds is None or h.kind in need.borrow_kinds):
                     return True
-                if plan is None or "replacement" not in plan.during or not plan.borrows():
+                if plan is None or not {"replacement", "scale_up"} & set(plan.during) or not plan.borrows():
                     return False
                 spec = state.registry.workloads.get(who.workload)
                 if not (getattr(spec, "plan", None) or {}).get("may_borrow", True) \
@@ -1366,7 +1424,9 @@ def create_app(
                 return _no_capacity("queue_timeout", "every eligible worker stayed busy past the queue limit")
 
             assignment.host.last_request_at = time.time()
-            logged["route"] = _route_for(assignment.host, need, plan, dispatched_by[0])
+            logged["route"] = (assignment.hold.route if assignment.hold is not None and assignment.hold.route
+                               else _route_for(assignment.host, need, plan, dispatched_by[0]))
+            logged["budget"] = assignment.hold.budget_id or None if assignment.hold is not None else None
             concurrency = assignment.concurrency
             model_concurrency = assignment.model_concurrency
             host_engine = state.engine_of(assignment.host)

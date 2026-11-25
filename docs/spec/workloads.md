@@ -512,8 +512,11 @@ the start (§14.1).
 > replacement, `max_min`) and `when_full`, one hosted and one rented source, the shorthand, a
 > program's grant `sources`, and the replacement gaps of the routing order (14.7). **Stage 2
 > built** (gpm-server 0.47.0): the request options `priority` and `keep_on` with a plan's
-> `defaults` (14.4), `X-GPM-Route`, and stats by priority and by route. The rest is refused in
-> words until its stage ships; until then §4 and §13 are what runs for everything else.
+> `defaults` (14.4), `X-GPM-Route`, and stats by priority and by route. **Stage 3 built**
+> (gpm-server 0.48.0): several hosted sources, each with its own budget under one hosted total,
+> `providers`, a rented source's `kind`, and covering a scale-up where `during` lists it. The rest
+> is refused in words until its stage ships; until then §4 and §13 are what runs for everything
+> else.
 
 A workload's serving plan, `serve`, says **where its requests go and when**. How much it must
 serve stays in `parallel`, `latency_s`, the kind of machine (`machines=` in the SDK, `kind` in the
@@ -627,7 +630,14 @@ general).
 - **Budgets.** Every spending source's budget has an id: its name, or `<role>/<type>` for an
   unnamed one (`until_ready/hosted`). The steady rented source is paid from the lease and has no
   budget of its own. Budgets are kept per (workload, budget id, period); the request log records
-  which budget paid. Days and months are UTC, as today (D166).
+  which budget paid (`budget`; empty for a workload without a plan, whose one budget counts
+  everything it spends, and for every row from before budgets had ids — counted in the total).
+  Days and months are UTC, as today (D166). A hosted answer is paid by the first source of a role
+  in force — until_ready's while covered, then when_full's — whose `providers` include the hosted
+  API, whose `after_s` has passed (or at once, where no machine could serve the request), and
+  whose budget and the total both hold its worst case; that source is the answer's route.
+  `GET /pool/status` shows the total under `budgets.hosted` and each source's under
+  `budgets.sources`. Machine sources (`local`, `fixed`, `shared`) are listed at most once a role.
 - **One hosted total.** Besides each source's own budget, the workload's hosted spending in a day
   and in a month is capped at the sum of its hosted sources' budgets for that period, counting
   everything spent in it under any id. A source with no budget for that period counts its
@@ -648,6 +658,13 @@ general).
   waiting behind one counts as the shared workload's load only beyond what its unreserved workers
   can take (supervisor.md §5.1): the shared lease rents for its own demand, never for the
   reservation.
+- **A provider must be a hosted API of the pool that serves one of the workload's models**,
+  refused in words otherwise. A rented source's `kind` is passed to the market search for its
+  burst hosts only; the base keeps the workload's `machines=`. For a program it must be one of
+  its grant's `kinds`, as `machines=` is. A request naming no `max_tokens` is held at the largest
+  `reserve_max_tokens` of the plan's hosted sources (what a translation writes for it), and looks
+  again at each source's wait, not only the first. A plan's `providers` order ranks hosted APIs
+  ahead of their configured priority.
 - **Warnings in the plan check**: a `local`, `fixed` or `shared` source that holds none of the
   workload's models (a `workloads_only` model, say); a `max_min` shorter than the 90th-percentile
   time to ready of the machines it covers ("the stop-gap ends at 60 min; these machines are
@@ -804,7 +821,9 @@ The plan check — `POST /pool/workloads/plan` with `serve`, or `gpm workload pl
 
 - **Written by the supervisor, read by the router.** Each pass, the supervisor writes each plan's
   order, per model and per request option, into SQLite only when it changes, with a version and
-  the end time of any open until_ready gap (its `max_min`). A heartbeat it refreshes every pass
+  the end time of any open until_ready gap (its `max_min`) and what it covers: a `replacement`
+  (base hosts fewer than planned), or a `scale_up` (a host rented for load being prepared while
+  the base is whole), each only where `during` lists it. A heartbeat it refreshes every pass
   gives the orders their `valid_until` (three passes ahead, and never sooner than the 60 seconds
   after which the pool's status calls the supervisor stopped). The router reads both in the
   background, never on a request's path.

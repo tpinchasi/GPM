@@ -3830,7 +3830,8 @@ class Fleet:
                     lease_id=lease.lease_id,
                 )
                 break
-            host = await self.rent_one(lease, list(reasons), workload=unit.workload, group=unit.group, burst=burst)
+            host = await self.rent_one(lease, list(reasons), workload=unit.workload, group=unit.group, burst=burst,
+                                       kind=self.burst_kind_of(unit.workload) if burst else None)
             if host is None:
                 if self.last_budget_bound and burst:
                     # Its burst's budget, or its lease, carries no further burst host: its base is
@@ -4123,6 +4124,24 @@ class Fleet:
         return None
 
     # --- a workload's rented burst (D165) ---
+
+    def burst_kind_of(self, workload: Optional[str]) -> Optional[str]:
+        """The kind of machine a workload's burst rents, where its serving plan's rented source
+        names one (S19, §14.2): `on_demand`, `interruptible`, or `both` for `roi`. None: the kind
+        steady rents in force (the workload's `machines=`), as every host of it does."""
+        spec = self.workloads.get(workload) if workload is not None else None
+        raw = (spec.policy or {}).get("serve") if spec is not None else None
+        if not raw:
+            return None
+        from ..serving_plan import PlanRefused, parse_serve
+
+        try:
+            rented = parse_serve(raw).rented()
+        except PlanRefused:
+            return None
+        if rented is None or rented.kind is None:
+            return None
+        return {"roi": "both"}.get(rented.kind, rented.kind)
 
     def rented_burst_of(self, workload: Optional[str]) -> Any:
         """The rented burst a workload's policy carries, or None — parsed once per version of it."""

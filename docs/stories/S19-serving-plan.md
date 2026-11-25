@@ -253,7 +253,8 @@ After the second architecture and UX reviews (2026-11-25):
    them. The console's dashboards gain no tab for them until the console stage.
 3. **Scale-ups where a plan lists them, and a budget per named source** under one hosted
    total — several hosted sources, `providers`, a rented source's `kind` — with the request log
-   recording which budget paid (today's rows counted under the shorthand's budget).
+   recording which budget paid (today's rows counted under the shorthand's budget) — **built**
+   (gpm-server 0.48.0).
 4. **Reserved workers** on the operator's own machines.
 5. **Rules**: time windows, budget shares, evictions, steady switches handed over
    make-before-break and priced with their overlap.

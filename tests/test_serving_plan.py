@@ -95,11 +95,6 @@ def test_a_plan_that_cannot_be_served_is_refused_in_words(serve, says):
     ({"reserve": {"local": 4}}, "reserved workers arrive"),
     ({"tz": "UTC"}, "comes with its rules"),
     ({"steady": "local"}, "needs workers the operator reserves"),
-    ({"until_ready": ["local"], "during": ["scale_up"]}, "covering a scale-up arrives"),
-    ({"until_ready": [{"hosted": {"providers": ["hosted-a"], "budget": {"per_day": 1}}}]}, "providers arrives"),
-    ({"when_full": [{"rented": {**RENTED, "kind": "on_demand"}}]}, "rented.kind arrives"),
-    ({"until_ready": [{"hosted": {"budget": {"per_day": 1}}}], "when_full": [{"hosted": HOSTED}]},
-     "one hosted source for now"),
 ])
 def test_what_a_later_stage_brings_is_refused_never_accepted_and_ignored(serve, says):
     with pytest.raises(PlanRefused, match=says):
