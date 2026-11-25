@@ -330,6 +330,40 @@ CREATE TABLE IF NOT EXISTS stats_requests_hourly (
     PRIMARY KEY (hour, workload, app, model, host_id, host_kind, provider, kind)
 );
 
+-- Requests per UTC hour by their options and the route that answered them (S19, D201): the same
+-- counts as stats_requests_hourly, folded from the same rows in the same transaction, so `by=priority`
+-- and `by=route` read without changing that table's key. Rows from before 0.47.0 have none here.
+CREATE TABLE IF NOT EXISTS stats_options_hourly (
+    hour            INTEGER NOT NULL,
+    workload        TEXT NOT NULL,
+    app             TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    kind            TEXT NOT NULL,
+    priority        TEXT NOT NULL,          -- '' not recorded (before 0.47.0)
+    keep_on         TEXT NOT NULL,
+    route           TEXT NOT NULL,          -- '' never reached a host
+    requests        INTEGER NOT NULL DEFAULT 0,
+    ok              INTEGER NOT NULL DEFAULT 0,
+    rejected        INTEGER NOT NULL DEFAULT 0,
+    failed          INTEGER NOT NULL DEFAULT 0,
+    cancelled       INTEGER NOT NULL DEFAULT 0,
+    status_4xx      INTEGER NOT NULL DEFAULT 0,
+    status_5xx      INTEGER NOT NULL DEFAULT 0,
+    out_of_funds    INTEGER NOT NULL DEFAULT 0,
+    borrowed        INTEGER NOT NULL DEFAULT 0,
+    tokens_in       INTEGER NOT NULL DEFAULT 0,
+    tokens_out      INTEGER NOT NULL DEFAULT 0,
+    latency_n       INTEGER NOT NULL DEFAULT 0,
+    latency_sum_ms  REAL NOT NULL DEFAULT 0,
+    latency_max_ms  REAL NOT NULL DEFAULT 0,
+    latency_hist    TEXT NOT NULL DEFAULT '[]',
+    busy_ms         REAL NOT NULL DEFAULT 0,
+    queue_n         INTEGER NOT NULL DEFAULT 0,
+    queue_sum_ms    REAL NOT NULL DEFAULT 0,
+    cost_usd        REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (hour, workload, app, model, kind, priority, keep_on, route)
+);
+
 -- What rented machines (and a workload's volumes) cost per UTC hour (D194): the spend ledger's
 -- running totals turned into what each hour added.
 CREATE TABLE IF NOT EXISTS stats_rented_hourly (
@@ -424,6 +458,11 @@ _ADDED_COLUMNS = {
         ("cost_usd", "REAL"),
         # The named app key it came with (D193); NULL: the configured app key, or a workload's.
         ("app", "TEXT"),
+        # Its options, as sent or as its plan's defaults gave them, and the role and source that
+        # answered (S19, D201): `steady/rented`, `until_ready/shared`, ... NULL before them.
+        ("priority", "TEXT"),
+        ("keep_on", "TEXT"),
+        ("route", "TEXT"),
     ],
     "hosts": [
         ("available", "TEXT NOT NULL DEFAULT '[]'"),
@@ -440,6 +479,9 @@ _ADDED_COLUMNS = {
         # again if its provider said otherwise before then. Written by the supervisor alone,
         # and never by the routine publish, which leaves it as it is.
         ("funds_reset_at", "REAL"),
+        # A rented host bought for a workload's burst, not its base (D165): its answers are the
+        # serving plan's when_full, not steady (S19). 0 for every host before it, and every other.
+        ("burst", "INTEGER NOT NULL DEFAULT 0"),
         # A hosted API whose known or estimated balance reached $0 (D188): why, and since when.
         # The router takes it out of routing as if its provider had said so, until it is cleared or
         # an operator's word (funds_reset_at) is newer. Written by the supervisor alone, and never
@@ -588,6 +630,10 @@ class RequestRecord:
     cost_usd: Optional[float] = None
     #: The named app key it came with (D193); None for the configured app key or a workload's key.
     app: Optional[str] = None
+    #: Its options and the role and source that answered (S19, D201).
+    priority: Optional[str] = None
+    keep_on: Optional[str] = None
+    route: Optional[str] = None
 
 
 class RequestLog:
@@ -601,8 +647,8 @@ class RequestLog:
                 ts, request_id, session_id, host_id, worker_id, model_requested,
                 model_served, runtime_class, queue_wait_ms, latency_ms, status_code,
                 outcome, reason, tokens_out, generate_ms, workload, borrowed, concurrency, model_concurrency,
-                kind, request_bytes, tokens_in, cost_usd, app
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                kind, request_bytes, tokens_in, cost_usd, app, priority, keep_on, route
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.ts,
@@ -629,6 +675,9 @@ class RequestLog:
                 record.tokens_in,
                 record.cost_usd,
                 record.app,
+                record.priority,
+                record.keep_on,
+                record.route,
             ),
         )
 
@@ -692,6 +741,8 @@ class HostRow:
     #: Its balance reached $0 (D188): the supervisor's words, and since when.
     balance_out: Optional[str] = None
     balance_out_at: Optional[float] = None
+    #: Bought for a workload's burst, not its base (S19): its answers are when_full's.
+    burst: bool = False
 
 
 def _row_to_host(row: sqlite3.Row) -> HostRow:
@@ -722,6 +773,7 @@ def _row_to_host(row: sqlite3.Row) -> HostRow:
         funds_reset_at=row["funds_reset_at"],
         balance_out=row["balance_out"],
         balance_out_at=row["balance_out_at"],
+        burst=bool(row["burst"]),
     )
 
 
@@ -735,8 +787,8 @@ class HostTable:
             INSERT INTO hosts (
                 host_id, kind, transport_type, priority, dial_url, state, workers,
                 capabilities, variants, resident, available, residency, engine, lease_id,
-                provider_ref, hourly_rate, last_error, updated_at, workload, observed
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                provider_ref, hourly_rate, last_error, updated_at, workload, observed, burst
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(host_id) DO UPDATE SET
                 kind=excluded.kind, transport_type=excluded.transport_type,
                 priority=excluded.priority, dial_url=excluded.dial_url,
@@ -747,7 +799,7 @@ class HostTable:
                 lease_id=excluded.lease_id,
                 provider_ref=excluded.provider_ref, hourly_rate=excluded.hourly_rate,
                 last_error=excluded.last_error, updated_at=excluded.updated_at,
-                workload=excluded.workload, observed=excluded.observed
+                workload=excluded.workload, observed=excluded.observed, burst=excluded.burst
             """,
             (
                 host.host_id,
@@ -770,6 +822,7 @@ class HostTable:
                 time.time(),
                 host.workload,
                 json.dumps({tag: sorted(found) for tag, found in sorted(host.observed.items())}),
+                int(host.burst),
             ),
         )
 

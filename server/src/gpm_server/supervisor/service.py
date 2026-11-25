@@ -1781,6 +1781,7 @@ class Supervisor:
                     provider_ref=self.fleet.published_ref(host),
                     hourly_rate=host.bid_hourly,
                     workload=host.workload,
+                    burst=host.burst,
                 )
             )
         # A row held back at a restart is a host the pool may still hold: kept until its

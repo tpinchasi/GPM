@@ -32,6 +32,15 @@ class PoolRequestError(PoolError):
         super().__init__(f"{status_code} {reason or ''}: {detail or ''}".strip())
 
 
+class PoolOptionNotHonoured(PoolRequestError):
+    """A request option (`priority=`, `keep_on=`) this pool does not list in its status, so the
+    SDK did not send the request: an older pool would ignore the header, and a request meant to
+    stay off hosted APIs must never travel as if it had not asked. Nothing reached the pool."""
+
+    def __init__(self, detail: str):
+        super().__init__(400, "option_not_honoured", detail)
+
+
 class PoolUnavailable(PoolError):
     """No capacity within the time this call was willing to wait.
 

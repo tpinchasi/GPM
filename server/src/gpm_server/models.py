@@ -94,6 +94,8 @@ class Host:
     failures: int = 0
     #: The workload this host serves (D115); None is the shared workload.
     workload: Optional[str] = None
+    #: Bought for the workload's burst, not its base (S19): answers here are when_full's.
+    burst: bool = False
     #: A hosted API's provider said its money has run out (D164): never retried as busy, kept
     #: out of routing until an operator says the money is back. What it said, and when.
     out_of_funds: Optional[str] = None

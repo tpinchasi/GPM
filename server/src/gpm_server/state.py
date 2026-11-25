@@ -64,6 +64,7 @@ class RouterState:
         self._bursts: dict[str, tuple[Any, Any]] = {}
         #: Each workload's serving plan, parsed from the policy it was read with (S19).
         self._plans: dict[str, tuple[Any, Any]] = {}
+        self._shorthands: dict[str, tuple[Any, bool, Any]] = {}
 
     def hosted_burst_for(self, workload: Optional[str]) -> Any:
         """The hosted burst a request's workload may spill to (D165), or None: the shared
@@ -103,6 +104,21 @@ class RouterState:
         except PlanRefused:
             plan = None
         self._plans[workload] = (raw, plan)
+        return plan
+
+    def shorthand_for(self, workload: str) -> Any:
+        """The plan a workload's own fields mean (S19, §14.1), for labelling its answers' routes —
+        made once per version of its policy, never on a request's path more than that."""
+        from .serving_plan import from_bursts
+
+        spec = self.registry.workloads.get(workload)
+        policy = (spec.policy or {}) if spec is not None else {}
+        may_borrow = bool((getattr(spec, "plan", None) or {}).get("may_borrow", True))
+        cached = self._shorthands.get(workload)
+        if cached is not None and cached[0] is policy and cached[1] == may_borrow:
+            return cached[2]
+        plan = from_bursts(policy, may_borrow)
+        self._shorthands[workload] = (policy, may_borrow, plan)
         return plan
 
     def price_of(self, tag: str) -> Any:

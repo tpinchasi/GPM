@@ -2161,9 +2161,12 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         if to - start > 800 * 86400:
             return _error(400, "bad_request", "a view covers at most 800 days")
         by = q.get("by") or None
-        if by not in (None, "app", "model", "host", "provider", "kind"):
-            return _error(400, "bad_request", "by is one of app, model, host, provider, kind")
+        if by not in (None, "app", "model", "host", "provider", "kind", "priority", "keep_on", "route"):
+            return _error(400, "bad_request", "by is one of app, model, host, provider, kind, priority, keep_on, route")
         filters = {name: q.get(name) for name in ("workload", "app", "model", "host", "provider", "kind")}
+        if by in ("priority", "keep_on", "route") and (filters["host"] or filters["provider"]):
+            return _error(400, "bad_request", f"by={by} is counted per request, not per host: drop the host and "
+                                              "provider filters")
 
         def read() -> dict[str, Any]:
             supervisor.stats.roll_up(batches=5)

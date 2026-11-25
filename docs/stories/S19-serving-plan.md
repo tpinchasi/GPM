@@ -246,9 +246,11 @@ After the second architecture and UX reviews (2026-11-25):
    — brought forward from stage 3, so the plan's default `during` works from the first stage. A
    program's grant over sources. One hosted and one rented source. Every field of a later stage
    refused in words.
-2. **The two request options** (`X-GPM-Priority`, `X-GPM-Keep-On`), enforced in the router's
-   choice of eligible hosts. The request log's new columns, stats by priority and by route, and
-   `/pool/status` advertising them.
+2. **The two request options** (`X-GPM-Priority`, `X-GPM-Keep-On`) — **built** (gpm-server
+   0.47.0, gpm-client 0.11.0) — enforced in the router's choice of eligible hosts, with a plan's
+   `defaults`. The request log's new columns, `X-GPM-Route`, stats by priority and by route (a
+   table of their own, so the first stats table keeps its key), and `/pool/status` advertising
+   them. The console's dashboards gain no tab for them until the console stage.
 3. **Scale-ups where a plan lists them, and a budget per named source** under one hosted
    total — several hosted sources, `providers`, a rented source's `kind` — with the request log
    recording which budget paid (today's rows counted under the shorthand's budget).

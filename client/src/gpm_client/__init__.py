@@ -17,6 +17,7 @@ from .client import (
 from .errors import (
     PoolAuthError,
     PoolError,
+    PoolOptionNotHonoured,
     PoolRequestError,
     PoolStreamInterrupted,
     PoolUnavailable,
@@ -32,6 +33,7 @@ __all__ = [
     "PoolClient",
     "Prediction",
     "PoolError",
+    "PoolOptionNotHonoured",
     "PoolRequestError",
     "PoolStreamInterrupted",
     "PoolTransport",

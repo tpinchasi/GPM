@@ -890,6 +890,20 @@ class Workloads:
                 "no hosted API in this pool serves " + ", ".join(repr(m) for m in models)
                 + "; a hosted burst would have nothing to spend on"
             )
+        # A plan's defaults (S19, D201): refused, per model, where no source the plan has could
+        # serve a request that sends nothing.
+        from ..serving_plan import PlanRefused, kept_off, plan_of
+
+        try:
+            plan = plan_of(policy)
+        except PlanRefused:
+            plan = None
+        if plan is not None and plan.defaults:
+            off = kept_off(plan.defaults.get("priority", "interactive"), plan.defaults.get("keep_on", "any"))
+            if alone and "hosted" in off:
+                raise WorkloadRefused(
+                    ", ".join(repr(m) for m in alone) + " is served by hosted APIs alone, and the plan's defaults keep "
+                    "requests that send no option off hosted APIs: no source could serve them")
 
     def set_policy(self, name: str, policy: dict[str, Any], by: str = "the operator") -> Workload:
         """Replace a running workload's spending policy. Takes effect at the router's next look at

@@ -45,6 +45,7 @@ from ..engines.thinking import says_thinking, with_thinking
 from ..keys import match, verify
 from ..models import HostState
 from ..provisioning_store import HashTaken
+from ..serving_plan import HOST_KINDS, OPTIONS, kept_off, request_options, route_label, why_kept_off
 from ..state import RouterState, open_database
 from .budgets import period_starts
 from .dispatch import Assignment, BudgetSpent, Need, NoEligibleHost, NoReadyHost, QueueTimeout
@@ -324,6 +325,7 @@ def _downstream_headers(
     attempts: int = 1,
     cost: Optional[str] = None,
     translation: Any = None,
+    route: Optional[str] = None,
 ) -> dict[str, str]:
     headers = {
         key: value for key, value in upstream.headers.items() if key.lower() not in _DROP_DOWNSTREAM
@@ -342,6 +344,9 @@ def _downstream_headers(
     headers["X-GPM-Contract"] = CONTRACT_VERSION
     headers["X-GPM-Delivery"] = delivery
     headers["X-GPM-Attempts"] = str(attempts)
+    if route is not None:
+        # Which role of the serving plan, and which source, answered (S19, workloads.md §14.7).
+        headers["X-GPM-Route"] = route
     if cost is not None:
         # What a hosted answer cost the app's budget — or, ahead of a stream, the most it may (D165).
         name, value = cost.split("=", 1)
@@ -576,6 +581,8 @@ def create_app(
             {
                 "pool": state.config.pool.name,
                 "contract_version": CONTRACT_VERSION,
+                # The request options this pool honours (S19, D201); an SDK sends no other.
+                "options": {option: list(values) for option, values in OPTIONS.items()},
                 "engine": state.engine.name,
                 "model_set": state.config.pool.model_set,
                 "limits": {
@@ -656,6 +663,23 @@ def create_app(
             fresh=beat is not None and now - beat < max(SUPERVISOR_STALE_S, 3 * state.config.pool.probe_interval_s),
             borrow_share=state.config.workloads.borrow_share if may_borrow else 0.0,
         )
+
+    def _route_for(host: Any, need: Need, plan: Any, routing: Any) -> str:
+        """`<role>/<source>` for the host that took a request (workloads.md §14.7), by the plan's
+        routing the dispatcher used. A workload with no plan is labelled by the plan its fields
+        mean; the shared workload's own machines are `steady/shared`, the pool's hosted burst
+        `when_full/hosted`."""
+        name = need.workload
+        if name is None:
+            return "when_full/hosted" if host.hosted else "steady/shared"
+        if plan is None or routing is None:
+            plan = plan or state.shorthand_for(name)
+            # Today's fields cover only while the workload has no ready host for the model.
+            covering = not _hosted_alone(name, need.model) and not state.dispatcher.ready_for(need)
+        else:
+            covering = routing.covering
+        return route_label(plan, hosted=host.hosted, own=host.workload == name and not host.hosted,
+                           burst=host.burst, host_kind=host.kind, covering=covering)
 
     def _ready_models(name: str) -> set[str]:
         """The workload's models one of its own ready hosts holds."""
@@ -830,6 +854,8 @@ def create_app(
                 "workload": name,
                 "state": workload_state,
                 "contract_version": CONTRACT_VERSION,
+                # The request options this pool honours (S19, D201); an SDK sends no other.
+                "options": {option: list(values) for option, values in OPTIONS.items()},
                 "model_set": list(models),
                 "borrowing": borrowing,
                 "borrowing_models": waiting_for if borrowing else [],
@@ -1042,6 +1068,20 @@ def create_app(
             refused = ("bad_upload", f"the upload could not be read as one clean form: {upload.why}")
         requested = facts.model
 
+        # The request's options (S19, D201): as sent, else its plan's defaults. A value not on
+        # its list is refused below, once the refusal can be logged.
+        plan = state.plan_for(who.workload) if who.workload is not None else None
+        sent_priority = request.headers.get("x-gpm-priority")
+        sent_keep_on = request.headers.get("x-gpm-keep-on")
+        unknown_option: Optional[str] = None
+        try:
+            chosen = request_options(plan, sent_priority, sent_keep_on)
+        except ValueError as bad:
+            chosen, unknown_option = (None, None), str(bad)
+        #: What the log keeps of this request beyond each call's own fields: its options, and the
+        #: role and source of the host that last took it.
+        logged: dict[str, Optional[str]] = {"priority": chosen[0], "keep_on": chosen[1], "route": None}
+
         async def record(outcome: str, **fields: object) -> None:
             await state.log.record(
                 RequestRecord(
@@ -1053,6 +1093,9 @@ def create_app(
                     app=who.app,
                     kind=facts.kind,
                     request_bytes=len(body),
+                    priority=logged["priority"],
+                    keep_on=logged["keep_on"],
+                    route=logged["route"] if fields.get("host_id") is not None else None,
                     **fields,  # type: ignore[arg-type]
                 )
             )
@@ -1068,6 +1111,10 @@ def create_app(
         if refused is not None:
             await record("rejected", status_code=400, reason=refused[0])
             return _error(400, "bad_request", refused[0], refused[1])
+
+        if unknown_option is not None:
+            await record("rejected", status_code=400, reason="unknown_option")
+            return _error(400, "bad_request", "unknown_option", unknown_option)
 
         if requested is None:
             await record("rejected", status_code=400, reason="model_missing")
@@ -1149,12 +1196,18 @@ def create_app(
 
         # A workload's serving plan (S19, D198) says when its stop-gap may be used and how soon a
         # hosted API may take the request. Without one, today's fields decide, as they always did.
-        plan = state.plan_for(who.workload) if who.workload is not None else None
+        kept = kept_off(*chosen)
+        if "hosted" in kept:
+            hosted_after, reserve = None, None  # never a hosted API: nothing to wait for, nothing held
         plan_routing = None
         burst_reserve = reserve
+        #: The plan's routing as the dispatcher last judged it — what the route is labelled by.
+        dispatched_by: list[Any] = [None]
         if plan is not None and not _hosted_alone(who.workload, requested):
             plan_routing = _plan_routing(plan, who.workload, requested)
-            hosted_after = None if (burst is None or plan_routing.hosted_after_s is None) else started + plan_routing.hosted_after_s
+            dispatched_by[0] = plan_routing
+            hosted_after = None if (burst is None or plan_routing.hosted_after_s is None or "hosted" in kept) \
+                else started + plan_routing.hosted_after_s
             if hosted_after is None:
                 reserve = None
 
@@ -1182,6 +1235,7 @@ def create_app(
             borrow_kinds=plan_routing.borrow_kinds if plan_routing is not None else None,
             borrow_while_ready=plan_routing.borrow_while_ready if plan_routing is not None else False,
             order=plan_routing.order if plan_routing is not None else (),
+            kept_off=kept,
         )
         if plan_routing is not None:
             # Asked again each time the request looks for a worker: a gap the supervisor opens
@@ -1190,13 +1244,54 @@ def create_app(
 
             def again(current: Need) -> Need:
                 routing = _plan_routing(plan, plan_workload, requested)
-                after = None if (burst is None or routing.hosted_after_s is None) else started + routing.hosted_after_s
+                dispatched_by[0] = routing
+                after = None if (burst is None or routing.hosted_after_s is None or "hosted" in kept) \
+                    else started + routing.hosted_after_s
                 return dataclasses.replace(
                     current, hosted_after=after, reserve=burst_reserve if after is not None else None,
                     may_borrow=routing.may_borrow, borrow_kinds=routing.borrow_kinds,
                     borrow_while_ready=routing.borrow_while_ready, order=routing.order)
 
             need = dataclasses.replace(need, again=again)
+
+        if kept:
+            # Waiting cannot help a request whose options remove every host it could ever reach
+            # (D201): its workload's own in any state; the shared workload's of a kind it may borrow
+            # now or, by its plan's stop-gap, later (a replacement gap); a hosted API where it has
+            # a hosted burst. Said at once, naming the option.
+            def holds(h: Any) -> bool:
+                return requested in h.variants or requested in h.literal_variants
+
+            def removed(h: Any) -> bool:
+                return (h.hosted and "hosted" in kept) or (h.kind.startswith("rented") and "rented" in kept)
+
+            def may_borrow_from(h: Any) -> bool:
+                if who.workload is None or h.workload is not None or h.hosted:
+                    return False
+                if need.may_borrow and (need.borrow_kinds is None or h.kind in need.borrow_kinds):
+                    return True
+                if plan is None or "replacement" not in plan.during or not plan.borrows():
+                    return False
+                spec = state.registry.workloads.get(who.workload)
+                if not (getattr(spec, "plan", None) or {}).get("may_borrow", True) \
+                        or state.config.workloads.borrow_share <= 0:
+                    return False
+                borrows = plan.borrows()
+                return "shared" in borrows or any(h.kind in HOST_KINDS[b] for b in borrows)
+
+            reachable = [
+                h for h in state.hosts if holds(h) and (
+                    (h.hosted and burst is not None)
+                    or (not h.hosted and h.workload == who.workload)
+                    or may_borrow_from(h))
+            ]
+            if reachable and all(removed(h) for h in reachable):
+                await record("rejected", status_code=503, reason="no_allowed_source")
+                return _error(
+                    503, "no_capacity", "no_allowed_source",
+                    f"{why_kept_off(plan, sent_priority, sent_keep_on, chosen)} leaves no source that serves "
+                    f"{requested!r} here; waiting cannot help. Send other options, or ask the operator",
+                )
 
         request_deadline = _parse_deadline(request.headers.get("x-gpm-deadline"))
         if request_deadline is not None and request_deadline <= time.monotonic():
@@ -1271,6 +1366,7 @@ def create_app(
                 return _no_capacity("queue_timeout", "every eligible worker stayed busy past the queue limit")
 
             assignment.host.last_request_at = time.time()
+            logged["route"] = _route_for(assignment.host, need, plan, dispatched_by[0])
             concurrency = assignment.concurrency
             model_concurrency = assignment.model_concurrency
             host_engine = state.engine_of(assignment.host)
@@ -1399,7 +1495,7 @@ def create_app(
                 return Response(content=translation.error(said) if translation is not None else said,
                                 status_code=upstream.status_code,
                                 headers=_downstream_headers(upstream, assignment, wait_s, "stream", attempts,
-                                                            translation=translation))
+                                                            translation=translation, route=logged["route"]))
 
             delivery = _delivery_for(state, assignment.host.kind, request)
             if hosted:
@@ -1516,7 +1612,7 @@ def create_app(
                 content=content,
                 status_code=upstream.status_code,
                 headers=_downstream_headers(upstream, assignment, wait_s, delivery, attempts, cost_header,
-                                            translation=translation),
+                                            translation=translation, route=logged["route"]),
             )
 
         strip = _UsageFrameFilter(state.engine_of(held.host).is_usage_frame) if (
@@ -1626,7 +1722,7 @@ def create_app(
             stream(),
             status_code=upstream.status_code,
             headers=_downstream_headers(upstream, assignment, wait_s, delivery, attempts, most,
-                                        translation=translation),
+                                        translation=translation, route=logged["route"]),
         )
 
     return app

@@ -215,6 +215,7 @@ class HostRegistry:
             engine=row.engine,
             last_error=row.last_error,
             workload=row.workload,
+            burst=row.burst,
         )
         _follow_balance(built, row)
         return built
@@ -252,6 +253,7 @@ class HostRegistry:
         request refused as "no eligible host" for as long as the router ran.
         """
         host.priority = row.priority
+        host.kind = row.kind
         host.state = HostState(row.state)
         host.resident = row.resident
         host.available = row.available
@@ -259,6 +261,7 @@ class HostRegistry:
         host.engine = row.engine
         host.last_error = row.last_error
         host.workload = row.workload
+        host.burst = row.burst
         host.capabilities = frozenset(row.capabilities)
         variants = _variants(row)
         host.variants = variants
