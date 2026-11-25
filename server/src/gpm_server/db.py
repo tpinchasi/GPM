@@ -388,6 +388,7 @@ CREATE TABLE IF NOT EXISTS serving_gaps (
     opened_at    REAL NOT NULL,
     ends_at      REAL NOT NULL,
     ready_hosts  TEXT NOT NULL DEFAULT '[]',
+    reason       TEXT NOT NULL DEFAULT 'replacement',  -- replacement | scale_up (S19 stage 3)
     PRIMARY KEY (workload, model)
 );
 
@@ -463,6 +464,9 @@ _ADDED_COLUMNS = {
         ("priority", "TEXT"),
         ("keep_on", "TEXT"),
         ("route", "TEXT"),
+        # The budget a hosted answer was paid from (S19, §14.2): a serving plan's source's id; NULL
+        # the one budget of a workload without a plan, and every row from before.
+        ("budget", "TEXT"),
     ],
     "hosts": [
         ("available", "TEXT NOT NULL DEFAULT '[]'"),
@@ -511,6 +515,10 @@ _ADDED_COLUMNS = {
         # Its spending policy (D165): `{"hosted": {...}}`, as the app or its operator stated it.
         # NULL: none — it never reaches a hosted API.
         ("policy", "TEXT"),
+    ],
+    "serving_gaps": [
+        # What a gap covers (S19 stage 3): a replacement, or hosts rented for load (`scale_up`).
+        ("reason", "TEXT NOT NULL DEFAULT 'replacement'"),
     ],
     "workload_volumes": [
         # The group's builds the volume holds (D118); NULL for one made before: the workload's.
@@ -634,6 +642,8 @@ class RequestRecord:
     priority: Optional[str] = None
     keep_on: Optional[str] = None
     route: Optional[str] = None
+    #: The budget a hosted answer was paid from (S19); None: the workload's one budget.
+    budget: Optional[str] = None
 
 
 class RequestLog:
@@ -647,8 +657,8 @@ class RequestLog:
                 ts, request_id, session_id, host_id, worker_id, model_requested,
                 model_served, runtime_class, queue_wait_ms, latency_ms, status_code,
                 outcome, reason, tokens_out, generate_ms, workload, borrowed, concurrency, model_concurrency,
-                kind, request_bytes, tokens_in, cost_usd, app, priority, keep_on, route
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                kind, request_bytes, tokens_in, cost_usd, app, priority, keep_on, route, budget
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.ts,
@@ -678,6 +688,7 @@ class RequestLog:
                 record.priority,
                 record.keep_on,
                 record.route,
+                record.budget,
             ),
         )
 
@@ -702,7 +713,7 @@ class RequestLog:
     def hosted_spend_since(self, since: float) -> list[sqlite3.Row]:
         """Every hosted answer's cost since a moment, by workload (D166)."""
         return self.db.query(
-            "SELECT workload, ts, cost_usd FROM request_log WHERE cost_usd IS NOT NULL AND ts >= ?", (since,)
+            "SELECT workload, ts, cost_usd, budget FROM request_log WHERE cost_usd IS NOT NULL AND ts >= ?", (since,)
         )
 
 

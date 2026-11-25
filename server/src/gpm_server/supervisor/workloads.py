@@ -898,6 +898,19 @@ class Workloads:
             plan = plan_of(policy)
         except PlanRefused:
             plan = None
+        if plan is not None:
+            # A hosted source's providers are hosted hosts of this pool that serve one of its
+            # models (S19, §14.2): a name that is not would be a source that never pays.
+            by_id = {h.id: h for h in hosted}
+            for source in plan.hosted_sources():
+                for provider in source.providers:
+                    host = by_id.get(provider)
+                    if host is None:
+                        raise WorkloadRefused(f"source {source.name}: {provider!r} is not a hosted API of this pool; "
+                                              f"its hosted APIs are {', '.join(sorted(by_id)) or 'none'}")
+                    if not set(self.config.models_held_by(host)) & set(models):
+                        raise WorkloadRefused(f"source {source.name}: {provider!r} serves none of "
+                                              + ", ".join(repr(m) for m in models))
         if plan is not None and plan.defaults:
             off = kept_off(plan.defaults.get("priority", "interactive"), plan.defaults.get("keep_on", "any"))
             if alone and "hosted" in off:
@@ -1032,12 +1045,13 @@ class Workloads:
         return [w for w in current if w.state in ("preparing", "serving", "ending")]
 
     def _mark_gaps(self, now: float, active: list[Workload]) -> None:
-        """Mark each replacement a serving plan covers (S19, D198): while a serving workload's
-        ready hosts of a group, bought for its base and not for a burst, are fewer than the group
-        planned and its lease is open — the fleet replacing what it lost — its models may use the
-        plan's until_ready, from the moment they fell short and for at most the plan's `max_min`.
-        Once per shortfall: a replacement retried keeps the gap it had. Written only on a change;
-        the router ends a gap itself the moment a host not ready as it opened is."""
+        """Mark each gap a serving plan covers (S19, D198), per group of a serving workload with
+        an open lease: a **replacement** while its ready hosts bought for its base are fewer than
+        the group planned — the fleet replacing what it lost — and, where the plan lists
+        `scale_up`, a **scale-up** while a host rented for load above them is being prepared.
+        From the moment it began, for at most the plan's `max_min`, once per shortfall: a
+        replacement retried keeps the gap it had. Written only on a change; the router ends a gap
+        itself the moment a host not ready as it opened is."""
         from ..serving_plan import PlanRefused, plan_of
 
         marked = self.store.gaps()
@@ -1050,29 +1064,39 @@ class Workloads:
                 plan = plan_of(policy)
             except PlanRefused:
                 continue
-            if plan is None or not plan.until_ready or "replacement" not in plan.during or plan.max_min is None:
+            if (plan is None or not plan.until_ready or plan.max_min is None
+                    or not {"replacement", "scale_up"} & set(plan.during)):
                 continue
             lease = self.supervisor.leases.get(workload.lease_id)
             if lease is None or not lease.is_open:
                 continue
             hosts = self.fleet.hosts_of(workload.name) if self.fleet is not None else []
             for group in workload.groups:
-                held = [h for h in hosts if group.holds(h.models) and h.state == "ready"]
-                base = [h for h in held if not getattr(h, "burst", False)]
-                if len(base) >= group.hosts_at_start:
+                mine = [h for h in hosts if group.holds(h.models)]
+                held = [h for h in mine if h.state == "ready"]
+                base = [h for h in held if not h.burst]
+                if len(base) < group.hosts_at_start:
+                    reason = "replacement" if "replacement" in plan.during else None
+                    said = f"{len(base)} of {group.hosts_at_start} host(s) ready"
+                elif "scale_up" in plan.during and any(h.burst and h.state in ("scheduling", "preparing")
+                                                       for h in mine):
+                    reason, said = "scale_up", "a host rented for load is being prepared"
+                else:
+                    reason = None
+                if reason is None:
                     continue
                 for model in group.models:
                     key = (workload.name, model)
                     wanted.add(key)
-                    if key in marked:
+                    if key in marked and marked[key][3] == reason:
                         continue  # once per shortfall: never extended, never re-read
                     ends_at = now + plan.max_min * 60
-                    self.store.open_gap(workload.name, model, now, ends_at, [h.host_id for h in held])
+                    self.store.open_gap(workload.name, model, now, ends_at, [h.host_id for h in held], reason)
                     self.supervisor.events.record(
                         "workload_covering",
-                        f"workload {workload.name}: {len(base)} of {group.hosts_at_start} host(s) ready for "
-                        f"{model}; its plan's until_ready covers for at most {plan.max_min:g} min",
-                        numbers={"workload": workload.name, "model": model, "ends_at": ends_at},
+                        f"workload {workload.name}: {said} for {model}; its plan's until_ready covers the "
+                        f"{reason.replace('_', '-')} for at most {plan.max_min:g} min",
+                        numbers={"workload": workload.name, "model": model, "ends_at": ends_at, "reason": reason},
                         lease_id=workload.lease_id,
                     )
         for key in marked:

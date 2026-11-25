@@ -66,6 +66,16 @@ class Need:
     #: — every rented machine, the workload's own included. Removed here, where every attempt,
     #: retry and failover chooses, so nothing passes around them.
     kept_off: frozenset[str] = frozenset()
+    #: A serving plan's hosted sources' `providers` (S19): the hosted hosts it may use now, or
+    #: None — any. And its hold, told whether no machine could serve the request at all (then a
+    #: source's wait is not waited, D165's rule); `reserve` is the same with that false.
+    hosted_ids: Optional[frozenset[str]] = None
+    #: The order the plan's `providers` list them in: tried first to last, before load decides.
+    hosted_order: tuple[str, ...] = ()
+    #: Every later moment a plan's hosted source may take the request (each source's own wait):
+    #: the request looks again at each, not only at the first (`hosted_after`).
+    hosted_moments: tuple[float, ...] = ()
+    reserve_now: Optional[Callable[[Host, ResolvedVariant, bool], Optional[Any]]] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -144,6 +154,8 @@ class Dispatcher:
                 continue
             if host.hosted and "hosted" in need.kept_off:
                 continue
+            if host.hosted and need.hosted_ids is not None and host.host_id not in need.hosted_ids:
+                continue  # a hosted API none of the plan's sources in force names
             if host.kind.startswith("rented") and "rented" in need.kept_off:
                 continue
             # A hosted API is the pool's, and every workload with a hosted burst reaches it on its
@@ -280,7 +292,8 @@ class Dispatcher:
                     if need.hosted_after is not None and any(h.hosted for h, _ in candidates):
                         now = time.monotonic()
                         # ... and when a busy provider's `retry-after` is over.
-                        moments = [need.hosted_after] + [h.cooling_until for h, _ in candidates if h.hosted]
+                        moments = [need.hosted_after, *need.hosted_moments] + [
+                            h.cooling_until for h, _ in candidates if h.hosted]
                         later = [moment - now for moment in moments if moment > now]
                         if later:
                             wait = min(wait, min(later) + 0.01)
@@ -311,10 +324,17 @@ class Dispatcher:
         spill = need.hosted_after is not None and (not machines or now >= need.hosted_after)
         # A provider that answered busy is not free until its `retry-after` is over.
         candidates = [(h, v) for h, v in candidates if not (h.hosted and h.cooling_until > now)]
-        for rank, priority in sorted({(self.rank(host, need), host.priority) for host, _ in candidates}):
+        # A plan's `providers` order ranks hosted APIs before their configured priority does (S19).
+        listed = {host_id: i for i, host_id in enumerate(need.hosted_order)}
+
+        def listed_at(host: Host) -> int:
+            return listed.get(host.host_id, len(listed)) if host.hosted and listed else 0
+
+        for rank, at, priority in sorted({(self.rank(host, need), listed_at(host), host.priority)
+                                          for host, _ in candidates}):
             tier = [
                 (h, v) for h, v in candidates
-                if h.priority == priority and self.rank(h, need) == rank
+                if h.priority == priority and self.rank(h, need) == rank and listed_at(h) == at
                 and h.idle_worker() is not None and self._may_take(h, need)
                 # A host holding several of the workload's models takes its share of each, and a
                 # request past its model's share waits for one to finish — never refused (D118).
@@ -330,7 +350,10 @@ class Dispatcher:
             else:
                 affordable = []
                 for host, variant in (sorted(tier, key=lambda pair: (pair[0].load, pair[0].host_id)) if spill else []):
-                    hold = need.reserve(host, variant) if need.reserve is not None else None
+                    if need.reserve_now is not None:
+                        hold = need.reserve_now(host, variant, not machines)
+                    else:
+                        hold = need.reserve(host, variant) if need.reserve is not None else None
                     if hold is not None:
                         affordable = [(host, variant)]
                         break

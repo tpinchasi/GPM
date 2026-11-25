@@ -279,6 +279,10 @@ class Provisioning:
             if not grant.sources:
                 return  # a grant from before plans: its own checks hold the shorthand, as before
             plan = from_bursts(policy, grant.borrows())
+        rented = plan.rented()
+        if rented is not None and rented.kind is not None and rented.kind not in grant.kinds:
+            # A burst's kind of machine is spending authority like `machines=` (S19 stage 3).
+            raise WorkloadRefused(f"this key may rent {list(grant.kinds)}, not {rented.kind} machines for its burst")
         used = plan.source_types() if on_machines else {s.type for s in (*plan.until_ready, *plan.when_full)}
         named = sorted(used - set(grant.allowed_sources()))
         if named:

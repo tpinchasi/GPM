@@ -11,7 +11,7 @@ request may be routed now. Nothing here touches the database, the clock or the n
 
 Built in stages (the story's build order). What this stage does not do yet is refused in words,
 never accepted and ignored: rules, a substitute, reserved workers, a steady source other than
-rented machines, covering a scale-up, `providers`, and more than one hosted or rented source.
+rented machines, and more than one rented source.
 """
 
 from __future__ import annotations
@@ -34,6 +34,8 @@ DEFAULT_DURING = ("start", "replacement")
 DEFAULT_MAX_MIN = 60.0
 #: Host kinds each machine source reaches. `shared` is any machine of the shared workload.
 HOST_KINDS = {"local": ("local",), "fixed": ("fixed-remote",)}
+#: The kinds of machine a rented source may name (`machines=`'s words).
+RENTED_KINDS = ("roi", "on_demand", "interruptible")
 #: Fields of the plan a later stage brings; refused in words until then.
 LATER = {
     "rules": "rules arrive in a later version of the pool",
@@ -68,20 +70,41 @@ class Source:
     max_hosts: Optional[int] = None
     budget: Optional[dict[str, Any]] = None
     reserve_max_tokens: Optional[int] = None
+    #: Whether the plan named it; an unnamed one is called by its type, numbered from the second
+    #: of that type in its role (`hosted`, `hosted-2`), and `role` is the role that defines it.
+    named: bool = False
+    role: str = ""
+    #: A hosted source's hosted APIs, by host id, in the order they are tried; empty: every hosted
+    #: host serving the model, in the pool's order.
+    providers: tuple[str, ...] = ()
+    #: A rented source's kind of machine (`roi`, `on_demand`, `interruptible`); None: the kind
+    #: steady rents in force — the workload's `machines=`.
+    kind: Optional[str] = None
 
     @property
     def spends(self) -> bool:
         return self.type in ("hosted", "rented")
 
+    @property
+    def budget_id(self) -> str:
+        """What its budget is kept under (§14.2): its name, or `<role>/<name>` for an unnamed one."""
+        return self.name if self.named else f"{self.role}/{self.name}"
+
+    def serves(self, host_id: str) -> bool:
+        """Whether a hosted host is one of this source's providers."""
+        return not self.providers or host_id in self.providers
+
     def as_dict(self) -> Any:
         """As a plan would write it: a bare type where it carries nothing else."""
         settings = {k: v for k, v in (("after_s", self.after_s), ("after_min", self.after_min),
                                       ("max_hosts", self.max_hosts), ("budget", self.budget),
-                                      ("reserve_max_tokens", self.reserve_max_tokens)) if v is not None}
-        if not settings and self.name == self.type:
+                                      ("reserve_max_tokens", self.reserve_max_tokens),
+                                      ("providers", list(self.providers) or None), ("kind", self.kind))
+                    if v is not None}
+        if not settings and not self.named:
             return self.type
         written: dict[str, Any] = {self.type: settings}
-        if self.name != self.type:
+        if self.named:
             written["name"] = self.name
         return written
 
@@ -117,6 +140,30 @@ class ServingPlan:
     def hosted(self) -> Optional[Source]:
         return next((s for s in (*self.until_ready, *self.when_full) if s.type == "hosted"), None)
 
+    def hosted_sources(self) -> tuple[Source, ...]:
+        """Every hosted source once, in the plan's order (a named one listed in both roles once)."""
+        seen: list[Source] = []
+        for source in (*self.until_ready, *self.when_full):
+            if source.type == "hosted" and not any(source is s for s in seen):
+                seen.append(source)
+        return tuple(seen)
+
+    def hosted_total(self, days_in_month: int = 31) -> dict[str, float]:
+        """The workload's one hosted total (§14.2): per day and per month, the sum of its hosted
+        sources' budgets for that period; a source with no budget for a period counts its month's
+        toward a day, or its day's times the days in the month toward a month."""
+        total: dict[str, float] = {}
+        sources = self.hosted_sources()
+        if not sources:
+            return total
+        day = month = 0.0
+        for source in sources:
+            budget = source.budget or {}
+            per_day, per_month = budget.get("per_day"), budget.get("per_month")
+            day += per_day if per_day is not None else per_month
+            month += per_month if per_month is not None else per_day * days_in_month
+        return {"per_day": round(day, 6), "per_month": round(month, 6)}
+
     def rented(self) -> Optional[Source]:
         return next((s for s in self.when_full if s.type == "rented"), None)
 
@@ -125,6 +172,9 @@ class ServingPlan:
 
     def when_full_hosted(self) -> Optional[Source]:
         return next((s for s in self.when_full if s.type == "hosted"), None)
+
+    def role_hosted(self, role: str) -> tuple[Source, ...]:
+        return tuple(s for s in (self.until_ready if role == "until_ready" else self.when_full) if s.type == "hosted")
 
     def borrows(self) -> tuple[str, ...]:
         """The machine sources until_ready names, in its order."""
@@ -201,14 +251,16 @@ def _source(raw: Any, role: str, index: int) -> Source:
     if kind in ("local", "fixed", "shared"):
         if settings:
             raise PlanRefused(f"{where}: {kind} takes no settings; it is bounded by workloads.borrow_share")
-        return Source(type=kind, name=name or kind)
+        return Source(type=kind, name=name or kind, named=name is not None, role=role)
     if kind == "hosted":
         unknown = sorted(set(settings) - {"after_s", "budget", "reserve_max_tokens", "providers"})
         if unknown:
-            raise PlanRefused(f"{where}.hosted takes after_s, budget and reserve_max_tokens, not {unknown}")
-        if "providers" in settings:
-            raise PlanRefused(f"{where}.hosted.providers arrives in a later version of the pool; "
-                              "until then hosted APIs are tried in the pool's own order")
+            raise PlanRefused(f"{where}.hosted takes after_s, budget, reserve_max_tokens and providers, not {unknown}")
+        providers = settings.get("providers", [])
+        if (not isinstance(providers, list) or len(providers) > 16
+                or any(not isinstance(p, str) or not p or len(p) > 64 for p in providers)
+                or len(set(providers)) != len(providers)):
+            raise PlanRefused(f"{where}.hosted.providers is a list of hosted host ids, each once, at most 16")
         if "budget" not in settings:
             raise PlanRefused(f"{where}.hosted needs a budget: per_day and/or per_month, in dollars")
         default_wait = 5.0 if role == "when_full" else 0.0
@@ -218,14 +270,15 @@ def _source(raw: Any, role: str, index: int) -> Source:
             raise PlanRefused(f"{where}.hosted.reserve_max_tokens is a whole number of at least 1")
         return Source(type="hosted", name=name or "hosted", after_s=after_s,
                       budget=_budget(settings["budget"], f"{where}.hosted", by_the_hour=False),
-                      reserve_max_tokens=tokens)
+                      reserve_max_tokens=tokens, named=name is not None, role=role, providers=tuple(providers))
     # rented, in when_full
     unknown = sorted(set(settings) - {"after_min", "max_hosts", "budget", "kind"})
     if unknown:
-        raise PlanRefused(f"{where}.rented takes after_min, max_hosts and budget, not {unknown}")
-    if "kind" in settings:
-        raise PlanRefused(f"{where}.rented.kind arrives in a later version of the pool; until then it rents the "
-                          "workload's own kind of machine (machines=)")
+        raise PlanRefused(f"{where}.rented takes after_min, max_hosts, budget and kind, not {unknown}")
+    kind = settings.get("kind")
+    if kind is not None and kind not in RENTED_KINDS:
+        raise PlanRefused(f"{where}.rented.kind is one of {', '.join(RENTED_KINDS)}; left out, it rents the kind "
+                          "steady rents (machines=)")
     if "max_hosts" not in settings or "budget" not in settings:
         raise PlanRefused(f"{where}.rented needs max_hosts and a budget")
     max_hosts = settings["max_hosts"]
@@ -233,7 +286,8 @@ def _source(raw: Any, role: str, index: int) -> Source:
         raise PlanRefused(f"{where}.rented.max_hosts is a whole number from 1 to 100")
     return Source(type="rented", name=name or "rented",
                   after_min=_number(settings.get("after_min", 10.0), f"{where}.rented.after_min", high=24 * 60),
-                  max_hosts=max_hosts, budget=_budget(settings["budget"], f"{where}.rented", by_the_hour=True))
+                  max_hosts=max_hosts, budget=_budget(settings["budget"], f"{where}.rented", by_the_hour=True),
+                  named=name is not None, role=role, kind=kind)
 
 
 def _role(raw: Any, role: str, defined: dict[str, Source]) -> tuple[Source, ...]:
@@ -256,7 +310,14 @@ def _role(raw: Any, role: str, defined: dict[str, Source]) -> tuple[Source, ...]
         if isinstance(item, dict) and isinstance(item.get("name"), str) and item["name"] in defined:
             sources.append(defined[item["name"]])  # read once, before the roles: one source by its name
             continue
-        sources.append(_source(item, role, index))
+        source = _source(item, role, index)
+        if not source.named and source.spends:
+            # The second unnamed spending source of a type in a role is `<type>-2`, and so on
+            # (§14.2): each has a budget of its own. A machine source listed twice is refused.
+            count = sum(1 for s in sources if not s.named and s.type == source.type)
+            if count:
+                source = dataclasses.replace(source, name=f"{source.type}-{count + 1}")
+        sources.append(source)
     names = [s.name for s in sources]
     repeated = sorted({n for n in names if names.count(n) > 1})
     if repeated:
@@ -297,16 +358,16 @@ def parse_serve(raw: Any) -> ServingPlan:
     until_ready = _role(raw.get("until_ready"), "until_ready", defined)
     when_full = _role(raw.get("when_full"), "when_full", defined)
 
-    hosted = {id(s) for s in (*until_ready, *when_full) if s.type == "hosted"}
-    if len(hosted) > 1:
-        raise PlanRefused("one hosted source for now — a budget for each of several arrives in a later version of "
-                          "the pool; name it, and list it by its name in the other role to use it in both")
     if len([s for s in when_full if s.type == "rented"]) > 1:
         raise PlanRefused("one rented source in when_full")
     by_name: dict[str, Source] = {}
     for source in (*until_ready, *when_full):
-        if by_name.setdefault(source.name, source) is not source:
+        if source.named and by_name.setdefault(source.name, source) is not source:
             raise PlanRefused(f"two sources are named {source.name!r}; a name is the plan's word for one source")
+    unnamed = {s.name for s in (*until_ready, *when_full) if not s.named}
+    clash = sorted(unnamed & set(by_name))
+    if clash:
+        raise PlanRefused(f"{clash[0]!r} is what an unnamed source is called; name yours something else")
 
     during: tuple[str, ...] = DEFAULT_DURING
     max_min: Optional[float] = DEFAULT_MAX_MIN
@@ -317,8 +378,6 @@ def parse_serve(raw: Any) -> ServingPlan:
         listed = raw["during"]
         if not isinstance(listed, list) or not listed or any(d not in DURING for d in listed):
             raise PlanRefused(f"serve.during lists one or more of {', '.join(DURING)}")
-        if "scale_up" in listed:
-            raise PlanRefused("serve.during: covering a scale-up arrives in a later version of the pool")
         during = tuple(d for d in DURING if d in listed)
     if "max_min" in raw:
         max_min = _number(raw["max_min"], "serve.max_min", low=1, high=MAX_MAX_MIN)
@@ -403,16 +462,20 @@ def why_kept_off(plan: Optional[ServingPlan], priority: Optional[str], keep_on: 
 # --- the route an answer took ---
 
 
-def route_label(plan: ServingPlan, *, hosted: bool, own: bool, burst: bool, host_kind: str, covering: bool) -> str:
+def route_label(plan: ServingPlan, *, hosted: bool, own: bool, burst: bool, host_kind: str, covering: bool,
+                host_id: str = "") -> str:
     """`<role>/<source name>` for an answer (§14.7): the workload's own machine is steady, or
     when_full where it was bought for a burst; a borrowed one is the until_ready source it matched;
     a hosted API is until_ready's while the workload is covered and its until_ready has one, else
     when_full's."""
     if hosted:
-        source = (plan.until_ready_hosted() if covering else None) or plan.when_full_hosted() or plan.hosted()
-        role = "until_ready" if source is not None and any(source is s for s in plan.until_ready) and (
-            covering or plan.when_full_hosted() is None) else "when_full"
-        return f"{role}/{source.name if source is not None else 'hosted'}"
+        # The router labels a hosted answer by the source whose budget held it; this is for one
+        # it could not (a host of no source's providers, which the router never reaches).
+        for role in (("until_ready",) if covering else ()) + ("when_full", "until_ready"):
+            for source in plan.role_hosted(role):
+                if source.serves(host_id):
+                    return f"{role}/{source.name}"
+        return "when_full/hosted"
     if own:
         if burst:
             rented = plan.rented()
@@ -460,11 +523,21 @@ def compile_policy(plan: ServingPlan) -> dict[str, Any]:
         # Only the shorthand has no limit, and it is never stored as a plan (`from_bursts`).
         raise ValueError("a stored plan has a max_min")
     policy: dict[str, Any] = {"serve": plan.as_dict()}
-    hosted = plan.hosted()
-    if hosted is not None:
+    sources = plan.hosted_sources()
+    if sources:
         # The wait a reader of `hosted` alone would use: when_full's, else until_ready's.
-        wait = plan.when_full_hosted().after_s if plan.when_full_hosted() is not None else hosted.after_s
-        policy["hosted"] = {"after_s": wait, "budget": hosted.budget, "reserve_max_tokens": hosted.reserve_max_tokens}
+        waits = [s.after_s for s in plan.role_hosted("when_full")] or [s.after_s for s in sources]
+        if len(sources) == 1:
+            budget = sources[0].budget
+        else:
+            # Several: the one hosted total (a month of 31 days, the most it can be), so a reader
+            # of `hosted` alone still bounds every hosted dollar; per request, the largest any allows.
+            budget = dict(plan.hosted_total(31))
+            each = [s.budget.get("per_request") for s in sources]
+            if all(v is not None for v in each):
+                budget["per_request"] = max(each)
+        policy["hosted"] = {"after_s": min(waits), "budget": budget,
+                            "reserve_max_tokens": max(s.reserve_max_tokens for s in sources)}
     rented = plan.rented()
     if rented is not None:
         policy["rented"] = {"after_min": rented.after_min, "max_hosts": rented.max_hosts, "budget": rented.budget}
@@ -482,9 +555,11 @@ def describe(plan: ServingPlan) -> str:
     def named(source: Source) -> str:
         if source.type == "hosted":
             wait = f" after {source.after_s:g}s" if source.after_s else " at once"
-            return f"{source.name} (hosted APIs{wait}, within {source.budget})"
+            which = f" {', '.join(source.providers)}" if source.providers else ""
+            return f"{source.name} (hosted APIs{which}{wait}, within {source.budget})"
         if source.type == "rented":
-            return (f"{source.name} (up to {source.max_hosts} more rented host(s) once a burst has lasted "
+            kind = f" {source.kind}" if source.kind else ""
+            return (f"{source.name} (up to {source.max_hosts} more{kind} rented host(s) once a burst has lasted "
                     f"{source.after_min:g} min, within {source.budget})")
         return {"local": "local (the pool's own computer)", "fixed": "fixed (the operator's machines elsewhere)",
                 "shared": "shared (any free machine of the pool)"}[source.type] + (
@@ -518,15 +593,26 @@ class Routing:
     hosted_after_s: Optional[float]
     #: The ranking of until_ready's sources while covering, by type; empty when not covering.
     order: tuple[str, ...]
+    #: The roles whose hosted sources may pay for an answer now, in order: until_ready's while
+    #: covering with a fresh supervisor, then when_full's.
+    hosted_roles: tuple[str, ...] = ("when_full",)
+    #: The hosted hosts those sources may use (their `providers`), or None: any hosted host.
+    hosted_ids: Optional[frozenset[str]] = None
+    #: Those providers in the order the sources list them.
+    hosted_order: tuple[str, ...] = ()
+    #: Every hosted source's wait in force, soonest first: the request looks again at each.
+    hosted_waits: tuple[float, ...] = ()
 
 
 def route(plan: ServingPlan, *, preparing: bool, model_ready: bool, created_at: float, now: float,
-          gap_ends_at: Optional[float], fresh: bool, borrow_share: float, short: bool = True) -> Routing:
+          gap_ends_at: Optional[float], fresh: bool, borrow_share: float, short: bool = True,
+          gap_reason: str = "replacement") -> Routing:
     """How a request may go now, by its workload's plan and the facts of the moment:
 
     - `preparing`: the workload has not yet served (its state, as the router reads it);
     - `model_ready`: one of its own ready hosts holds the request's model;
-    - `gap_ends_at`: the end of a replacement gap the supervisor marked for this model, if any;
+    - `gap_ends_at`: the end of a gap the supervisor marked for this model, if any, and
+      `gap_reason` what it covers — `replacement`, or `scale_up` (hosts rented for load);
     - `fresh`: the supervisor's heartbeat is recent. A stale one opens no paid stop-gap and no
       replacement gap: only a start, on sources that spend nothing (§14.7);
     - `short`: no host holding the model has become ready since the supervisor marked the gap. A
@@ -539,7 +625,7 @@ def route(plan: ServingPlan, *, preparing: bool, model_ready: bool, created_at: 
         and (plan.max_min is None or now < created_at + plan.max_min * 60)
     )
     replacing = (
-        "replacement" in plan.during and fresh and short and gap_ends_at is not None and now < gap_ends_at
+        gap_reason in plan.during and fresh and short and gap_ends_at is not None and now < gap_ends_at
     )
     covering = bool(plan.until_ready) and (starting or replacing)
     borrows = plan.borrows() if covering else ()
@@ -548,17 +634,24 @@ def route(plan: ServingPlan, *, preparing: bool, model_ready: bool, created_at: 
         kinds = frozenset(k for b in borrows for k in HOST_KINDS[b])
     may_borrow = bool(borrows) and borrow_share > 0
 
+    # The soonest any hosted source this moment allows may take the request; each source's own
+    # wait is held to when its budget is (the router's reserve).
     waits: list[float] = []
-    cover = plan.until_ready_hosted()
-    if covering and cover is not None and fresh:
-        waits.append(cover.after_s or 0.0)
-    burst = plan.when_full_hosted()
-    if burst is not None:
-        waits.append(burst.after_s if burst.after_s is not None else 5.0)
+    if covering and fresh:
+        waits += [s.after_s or 0.0 for s in plan.role_hosted("until_ready")]
+    waits += [s.after_s if s.after_s is not None else 5.0 for s in plan.role_hosted("when_full")]
     order = plan.order() if covering else ()
     if not fresh:
         order = tuple(t for t in order if t != "hosted")
+    roles = (("until_ready",) if covering and fresh else ()) + ("when_full",)
+    usable = [s for role in roles for s in plan.role_hosted(role)]
+    ids: Optional[frozenset[str]] = None
+    if usable and all(s.providers for s in usable):
+        ids = frozenset(p for s in usable for p in s.providers)
     return Routing(
         covering=covering, may_borrow=may_borrow, borrow_kinds=kinds,
         borrow_while_ready=replacing and may_borrow, hosted_after_s=min(waits) if waits else None, order=order,
+        hosted_roles=roles, hosted_ids=ids,
+        hosted_order=tuple(dict.fromkeys(p for s in usable for p in s.providers)),
+        hosted_waits=tuple(sorted(set(waits))),
     )

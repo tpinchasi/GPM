@@ -76,7 +76,7 @@ class HostRegistry:
         self.last_workload_revision: Optional[float] = None
         #: Replacement gaps the supervisor marked (S19, D198), and its last heartbeat: a plan's
         #: stop-gap is opened only on a recent one (workloads.md §14.7).
-        self.gaps: dict[tuple[str, str], tuple[float, float, frozenset[str]]] = {}
+        self.gaps: dict[tuple[str, str], tuple[float, float, frozenset[str], str]] = {}
         self.supervisor_beat: Optional[float] = None
         #: Provisioning keys (D117), as hash → provisioner, for keys neither revoked nor expired.
         self.provisioning_store = ProvisioningStore(table.db)

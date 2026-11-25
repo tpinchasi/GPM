@@ -376,20 +376,22 @@ class WorkloadStore:
 
     # --- replacement gaps a serving plan covers (S19, D198) ---
 
-    def gaps(self) -> dict[tuple[str, str], tuple[float, float, frozenset[str]]]:
-        """Every open replacement gap: (workload, model) → (opened_at, ends_at, the hosts holding
-        the model that were ready as it opened)."""
+    def gaps(self) -> dict[tuple[str, str], tuple[float, float, frozenset[str], str]]:
+        """Every open gap: (workload, model) → (opened_at, ends_at, the hosts holding the model
+        that were ready as it opened, what it covers — `replacement` or `scale_up`)."""
         return {(r["workload"], r["model"]): (float(r["opened_at"]), float(r["ends_at"]),
-                                              frozenset(json.loads(r["ready_hosts"] or "[]")))
-                for r in self.db.query("SELECT workload, model, opened_at, ends_at, ready_hosts FROM serving_gaps")}
+                                              frozenset(json.loads(r["ready_hosts"] or "[]")),
+                                              r["reason"] or "replacement")
+                for r in self.db.query(
+                    "SELECT workload, model, opened_at, ends_at, ready_hosts, reason FROM serving_gaps")}
 
     def open_gap(self, workload: str, model: str, opened_at: float, ends_at: float,
-                 ready_hosts: Iterable[str] = ()) -> None:
+                 ready_hosts: Iterable[str] = (), reason: str = "replacement") -> None:
         self.db.execute(
-            "INSERT INTO serving_gaps (workload, model, opened_at, ends_at, ready_hosts) VALUES (?, ?, ?, ?, ?) "
+            "INSERT INTO serving_gaps (workload, model, opened_at, ends_at, ready_hosts, reason) VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(workload, model) DO UPDATE SET opened_at = excluded.opened_at, ends_at = excluded.ends_at, "
-            "ready_hosts = excluded.ready_hosts",
-            (workload, model, opened_at, ends_at, json.dumps(sorted(ready_hosts))))
+            "ready_hosts = excluded.ready_hosts, reason = excluded.reason",
+            (workload, model, opened_at, ends_at, json.dumps(sorted(ready_hosts)), reason))
 
     def close_gap(self, workload: str, model: str) -> None:
         self.db.execute("DELETE FROM serving_gaps WHERE workload = ? AND model = ?", (workload, model))
