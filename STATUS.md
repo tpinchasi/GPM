@@ -7,12 +7,21 @@
 > why things are as they are is in [docs/decisions.md](docs/decisions.md). Earlier versions of this
 > file, with the day-by-day narrative they held, are in git history (cleaned 2026-11-24).
 
-## Current state — 2026-11-24
+## Current state — 2026-11-25
 
 **Released: v0.45.0** (2026-11-24, marked Latest, PR #104): gpm-server 0.45.0, gpm-client 0.9.0,
 gpm-agent 0.19.0, wheels and `SHA256SUMS` attached, checked after download and installed from the
 links. Install commands in the README point at it. Older releases kept: v0.44.0, v0.43.0, v0.42.1,
-v0.37.4, v0.37.3 and earlier.
+v0.37.4, v0.37.3 and earlier. The tags v0.40.0 and v0.42.0, whose releases were deleted
+earlier, were deleted on 2026-11-25.
+
+**On `main`, not released: S19, a serving plan per workload** (D198–D204; gpm-server 0.55.0,
+gpm-client 0.13.0): a workload's `serve` — where it runs steadily, what covers its start and
+replacements, what helps when it is full, budgets per source, reserved workers on the operator's
+machines, rules by time, spend and evictions (including a make-before-break switch of where it
+runs), request options and the route that answered, the plan read back before it spends, the
+console's plan builder and plan chat, and a substitute model. Merged from the stacked PRs
+#105–#115; each stage was reviewed by an independent agent before its commit.
 
 **What GPM does today:** one endpoint and key for apps, in OpenAI's and Anthropic's formats, over
 the operator's own machines (agents that install and keep current Ollama, whisper.cpp, vLLM and
@@ -20,7 +29,7 @@ ONNX Runtime on macOS, Linux and Windows), fixed remote hosts, hosted model APIs
 from budgets, and machines rented on Vast, RunPod or Verda under leases with dollar caps.
 Workloads give an app its own key, latency target and budget; trained models (ONNX files and
 container images) are served on `POST /v1/predict`. The console and the control API manage all of
-it. Stories S1, S2 and S4–S18 are built ([docs/stories/README.md](docs/stories/README.md)).
+it. Stories S1, S2 and S4–S19 are built (S19 on `main`, not yet released) ([docs/stories/README.md](docs/stories/README.md)).
 
 **In v0.45.0** (CI green on the pull request; full local suite 2996 passed):
 
@@ -36,45 +45,33 @@ balance is counted down from (a typed balance can be older than the retention).
 
 **Running on the owner's laptop:**
 - **`~/gpm-pool`** — a pool from this repository's `main` (router 8100, console 8101), hosts
-  `mac-gemma`, `mac-whisper`, `anthropic` and `ollama-cloud`; restarted 2026-11-23 on gpm-server
-  0.44.0. Started and stopped by its own `start.sh` / `stop.sh`; nothing starts it at login.
+  `mac-gemma`, `mac-whisper`, `anthropic` and `ollama-cloud`, provider accounts Vast, RunPod and
+  Verda; restarted 2026-11-25 on gpm-server 0.55.0 (S19, not released) with its agents. Started and
+  stopped by its own `start.sh` / `stop.sh`; nothing starts it at login.
 - **SpaceGarage's pool** — gpm-server 0.37.4 pinned by that app (router 8090, console 8091),
   running again since 2026-11-21. It is not this repository's code; its console lacks everything
   since 0.37.4.
 
 ## Next actions, in order
 
-1. **S19, a serving plan per workload** — decided (D198–D204), documented in PR #105 (open).
-   **Stage 1 built and reviewed** on `story/s19-stage1-plan`, stacked on that PR, with its own
-   PR (gpm-server 0.46.0, gpm-client 0.10.0): `serve` with until_ready for the start and for a
-   replacement (marked by the supervisor in `serving_gaps`), `max_min`, `when_full`, the
-   shorthand proven to route as today, a program's grant `sources`, the SDK's `serve=` and
-   `set_serve()`. The owner's word (2026-11-25): "each step do code review and then move to next,
-   continue till the end" — each stage is reviewed, committed with its own stacked PR, and the
-   next begun. **Stage 2 built and reviewed** on `story/s19-stage2-options` (gpm-server 0.47.0,
-   gpm-client 0.11.0): `X-GPM-Priority` / `X-GPM-Keep-On` with a plan's `defaults`,
-   `X-GPM-Route`, `no_allowed_source`, stats by priority, keep_on and route. **Stage 3 built and
-   reviewed** on `story/s19-stage3-budgets` (gpm-server 0.48.0): several hosted sources each with
-   its own budget under one hosted total, `providers`, a rented `kind`, covering a scale-up.
-   **Stage 4 built and reviewed** on `story/s19-stage4-reserve` (gpm-server 0.49.0): reserved
-   workers and `steady: local|fixed`. **Stage 5 built and reviewed** on `story/s19-stage5-rules`
-   (gpm-server 0.50.0): rules and `tz`, every condition, the effects `use_only`, `never_use`,
-   `after_s`. A rule's steady switch was split out as stage 5b (it changes what a workload rents).
-   **Stage 5b built and reviewed** on `story/s19-stage5b-switch` (gpm-server 0.51.0): a rule's
-   steady switch, make-before-break, priced with its overlap. **Stage 6 built** on
-   `story/s19-stage6-readback` (gpm-server 0.52.0, gpm-client 0.12.0): the plan check's readback,
-   timeline, conditions, most it can spend and warnings; the JSON Schema; the CLI's `--serve`,
-   `--json`, `--serve-example`; `w.budgets()`; the Now line. **Stage 7 built** on
-   `story/s19-stage7-builder` (gpm-server 0.53.0): the console's plan builder. **Stage 8 built** on
-   `story/s19-stage8-chat` (gpm-server 0.54.0): the plan chat. **Stage 9 built** on
-   `story/s19-stage9-substitute` (gpm-server 0.55.0, gpm-client 0.13.0): the substitute model. S19
-   is built; next, the owner merges the stacked pull requests in order (#105 to the last)
-   ([docs/stories/S19-serving-plan.md](docs/stories/S19-serving-plan.md)).
-2. **Owner, by hand** (the agent's permission check refused it):
-   `git push origin --delete v0.40.0 v0.42.0` and `git tag -d v0.40.0 v0.42.0` — the two tags
-   whose releases were deleted earlier.
-3. **Owner:** commit `docs/gpm-adoption/` in the Aletheia repository (copied there uncommitted on
-   2026-11-24, D189).
+1. **S19's live integration test, before the release** — proposed to the owner on 2026-11-25,
+   each paid phase waiting for the owner's word: (A, free) the plan check against the machine
+   history, request options, reserved workers on `mac-gemma`, the console's builder, the plan chat
+   on `gemma-4-e4b`; (B, under $0.05) hosted routes and options; (C1, one `gemma4:31b` rental under
+   a $2 lease) the stop-gap on the hosted cloud, the substitute `gemma-4-e4b`, a spend rule, a
+   time-window rule, a priority rule, `when_full`, the timeline against the real preparation; (C2,
+   optional, about $2) a rule's switch to `on_demand`, make-before-break. Evictions stay with the
+   fake provider.
+2. **Release S19, at the owner's word** — merged to `main` on 2026-11-25 (PRs #105–#115, full
+   local suite green on `main`), not yet released: gpm-server 0.55.0, gpm-client 0.13.0,
+   gpm-agent 0.19.0 unchanged. A release would be v0.55.0, its notes covering 0.46.0–0.55.0 from
+   [CHANGELOG.md](CHANGELOG.md). Then restart `~/gpm-pool` on it.
+3. **S19's known small gaps:** the Now line does not yet show each source's busy workers (the
+   router holds them, the supervisor draws the line; D203); a request waiting for a substitute is
+   not seen by reservation yielding (only its own model's need is); `substituted_for` was added
+   before `raw` in the SDK's result dataclasses, so code building them by position must be
+   updated; the Workloads form's model row draws its fields at the far right in headless
+   screenshots (before S19).
 4. **Live checks, when the owner chooses to spend** (each small and capped): the list under
    "Not yet run on real hardware or a real provider" below.
 5. **The benchmark** that decides whether the vLLM work paid off: one machine, Ollama at 7 workers
@@ -180,6 +177,7 @@ In `~/workspace/Aletheia`: the adoption guide and history in `docs/gpm-adoption/
 
 | Date | What happened |
 |---|---|
+| 2026-11-25 | **S19 merged to `main`; the owner's by-hand items done.** At the owner's word ("you do all this"): PRs #105–#115 merged in order, each retargeted to `main` before its merge (merge commits; no branch deleted); `main` checked identical to the stage 9 branch and the full local suite green on it (3138 passed). `~/gpm-pool` restarted on it with its agents (the pre-0.45 supervisor, orphaned by `stop.sh`, stopped by its pid; nothing was rented). A live integration test of S19 proposed (next action 1). Tags v0.40.0 and v0.42.0 deleted locally and on GitHub. In the adopter's repository, `docs/gpm-adoption/` committed on its working branch, nothing else staged, not pushed (D189). The stage worktrees removed. Not released. |
 | 2026-11-25 | **S19 stage 9 built: a substitute model.** `serve.substitute: [{model, after_s}]` (up to 4), a rule's `then.substitute: false`, and `X-GPM-Substitute: never` (anything else `400 unknown_option`; `/pool/status` lists it). The dispatcher, once a substitute's moment has passed and its own model's workers are all taken, takes a worker of the substitute through the request's own eligible hosts (same options, plan sources, kind and inputs; no per-model cap) — a request whose own model has no eligible host waits for one rather than being refused; never with `X-GPM-Session`. The answer carries `X-GPM-Substituted-For` and `X-GPM-Route: substitute/<model>`, logged as that route; the workload's latency figures leave such rows out. Checked at creation: catalogued, not its own model, doing what its models do; a program's substitute is one of its grant's models. SDK `substitute=False` per call or per client, `substituted_for` on every result, a warning once per client. Every S19 stage built: nothing of the plan is refused as later. Reviewed by an independent agent before commit; five findings fixed: `substitute=True` on a call now lifts the client's `False`; a spent hosted budget is said at once where every way left — its own model's and each substitute's — is one; a request waking for a substitute's hosted API (its spill moment, a provider's retry-after); the arrival check counts the hosts holding a substitute; a rule's `then.substitute: false` is judged again on each look, as every rule is. Also brought up to date: the routing spec's §5 and the console spec's rows (no longer marked not built), and the SDK's README (request options, `X-GPM-Route`, `X-GPM-Substituted-For`). 11 new tests |
 | 2026-11-25 | **S19 stage 8 built: the console's plan chat.** `console.plan_assistant` (model, `max_tokens`, `timeout_s`), checked at load: in the model set, not hosted-only, not every build ignoring a schema. The control API writes a description (and the builder's plan) to `assistant_requests`, one at a time (409); a router's watcher claims it in one transaction, asks the model through its own dispatch — an in-process transport and a key made at its start, held only in memory, read as the app `console`, `X-GPM-Keep-On: owned`, the plan's schema as `response_format`, `max_tokens`, a timeout — tries twice (the second told the pool's refusal), and writes back a plan with its readback, the model's words with their refusals, or an error; the answer is read once (deleted), a request cancelled with DELETE (the watcher stops asking), a claim whose router stopped is answered "ask again". The console: a description box, "Asking <model> on this pool…" with Cancel, the proposal put in the builder with Undo, a refused answer opened in the JSON tab with why; with no model, a line saying how to turn it on. The fake engine takes scripted answers. Reviewed by an independent agent before commit; six findings fixed: a cancel or a timeout left the chat's worker busy for good (the in-process call never disconnected, so the router never freed it) — the router now calls its own app with a client that goes away on cancel, freeing the worker as for any client that leaves; a non-ASCII bearer token was a 500 (the internal key is compared as bytes); a request no router took held the chat for ever (one past its timeout is now answered as such, and a 409 names the request in flight, which a reloaded console waits on with Cancel); the console applied an answer read after Cancel, and could not cancel while the request was being sent; the model must be catalogued and held by a local or fixed machine; the app name `console` is the pool's own; a body that is not an object is a 400. 9 new tests |
 | 2026-11-25 | **S19 stage 7 built: the console's plan builder.** A Serving plan section on the Workloads form: four toggles in the form's words (cover start-up and replacements with shared/local/fixed machines and hosted APIs within a budget; when every worker is busy also use hosted APIs or more rented machines; keep requests that say nothing off hosted APIs — the plan's default; at certain hours keep off hosted APIs — a rule with a window and `tz`), Advanced (`max_min`, covering a scale-up; other rules named, edited as JSON), a JSON tab over the same plan (invalid JSON said in words and holds Plan back), Code tabs from a template (SDK with `serve=` as Python, `gpm workload create … --serve -`, curl to the control API) naming what a program's key cannot send. The plan check's readback, timeline, conditions, most it can spend and warnings under the plan (drawn on Plan: the check asks the market). Change serving plan… on a running workload, current and proposed side by side. Not changed: the model row's layout, which draws its fields at the far right in a headless screenshot before this stage too. Reviewed by an independent agent before commit; eleven findings fixed: an existing browser test waited for a word the new toggle label contains; the SDK tab wrote invalid Python with no budget typed; the hours' From and Until overwrote each other; a stale JSON error held Plan back (text that is not a plan yet is now kept, with why, across tabs); a JSON plan of the wrong shape broke the Builder tab; Change serving plan… on a workload with only bursts proposed `{}`, which would have removed them (now its fields written as a plan); toggles wrote plans the pool refuses (a cleared budget limit dropped the others; the hours toggle without a hosted source; dangling names after a role was turned off); the builder re-sorted a JSON plan's order and replaced a custom `during`; the CLI tab could not confirm a proposed budget and lost `placement`; focus was lost on every toggle, and the tabs had no tabpanel or arrow keys; invalid JSON in the change dialog lost the text (asked again with it kept; the dialog is wider). 4 new browser tests |
