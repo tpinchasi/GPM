@@ -293,3 +293,5 @@ table.dash-table th[scope=row] { font-weight: 400; text-transform: none; letter-
 .readback table { margin-top: 6px; }
 @media (max-width: 640px) { .side-by-side { grid-template-columns: 1fr; } }
 dialog:has(.side-by-side) { max-width: min(1000px, 95vw); width: 95vw; }
+.plan-chat { margin: 6px 0 10px; }
+.plan-chat textarea { width: 100%; box-sizing: border-box; font: inherit; }

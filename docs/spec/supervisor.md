@@ -651,6 +651,12 @@ stats:                                         # D194, D195; null keeps for ever
   keep_requests_days: 30                       # request log, decisions, superseded spend rows (7 at least)
   keep_rollups_days: 400                       # the hourly stats the dashboards read
   rollup_interval_s: 60
+
+console:
+  plan_assistant:                              # D204; absent hides the console's plan chat
+    model: "<a chat model of the pool>"        # served on the pool's own machines, never hosted-only
+    max_tokens: 2048                           # 256 to 16384
+    timeout_s: 120
 ```
 
 The numbers are illustrative defaults, not recommendations for any particular hardware.

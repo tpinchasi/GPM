@@ -20,8 +20,8 @@ window.__toggle = (label) => { const box = [...document.querySelectorAll("fields
   .find((i) => i.parentElement.textContent.trim() === label); box.click(); return true; };
 window.__tab = (name) => { [...document.querySelectorAll(".serving-plan [role=tab]")].find((b) => b.textContent === name).click();
   return true; };
-window.__json = () => JSON.parse(document.querySelector(".serving-plan textarea").value);
-window.__setJson = (text) => { const a = document.querySelector(".serving-plan textarea"); a.value = text;
+window.__json = () => JSON.parse(document.querySelector("#sp-json").value);
+window.__setJson = (text) => { const a = document.querySelector("#sp-json"); a.value = text;
   a.dispatchEvent(new Event("input")); return true; };
 true;
 """
@@ -40,6 +40,7 @@ def opened(pool, page, until="__text().includes('Serving plan')"):  # noqa: F811
 def test_a_plan_is_built_with_toggles_edited_as_json_read_back_and_created(pool):  # noqa: F811
     with open_page(f"{pool.control_url}/ui/#workloads") as page:
         opened(pool, page)
+        assert "set console.plan_assistant.model" in page.js("__text()"), "the chat is off, and says how to turn it on"
         page.js("__set('Name', 'night')")
         page.js("__set('Model', 'big')")
         page.js("__set('Answers at once', '2')")
@@ -130,7 +131,7 @@ def test_the_builder_keeps_what_was_typed_and_writes_code_that_runs(pool):  # no
         page.js("__tab('Builder')")
         assert "not a plan yet" in page.js("__text()")
         page.js("__tab('JSON')")
-        assert page.js("document.querySelector('.serving-plan textarea').value") == '{"until_ready": ['
+        assert page.js("document.querySelector('#sp-json').value") == '{"until_ready": ['
         # A plan of the wrong shape is drawn as far as it goes, never a broken tab.
         page.js("""__setJson('{"until_ready": "shared", "rules": {}}')""")
         page.js("__tab('Builder')")

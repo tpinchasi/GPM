@@ -33,6 +33,7 @@ async function call(method, path, body) {
     failure.status = response.status;
     failure.code = payload?.error;  // the pool's own name for what went wrong, where it gives one
     if (payload?.changes) failure.changes = payload.changes;  // a refused plan explains itself
+    failure.body = payload;
     throw failure;
   }
   return payload;
@@ -105,6 +106,10 @@ const api = {
   endWorkload: (name) => call("POST", `/pool/workloads/${encodeURIComponent(name)}/end`),
   rotateWorkloadKey: (name) => call("POST", `/pool/workloads/${encodeURIComponent(name)}/keys`),
   setWorkloadPolicy: (name, body) => call("POST", `/pool/workloads/${encodeURIComponent(name)}/policy`, body),
+  // The plan chat (D204): asked, read back once, or cancelled.
+  askPlanChat: (body) => call("POST", "/pool/workloads/plan-assistant", body),
+  readPlanChat: (id) => call("GET", `/pool/workloads/plan-assistant/${encodeURIComponent(id)}`),
+  cancelPlanChat: (id) => call("DELETE", `/pool/workloads/plan-assistant/${encodeURIComponent(id)}`),
   // Named app keys for the shared pool (D193): a key shown once, only its hash kept.
   apps: () => call("GET", "/pool/apps"),
   createAppKey: (app) => call("POST", "/pool/apps", { app }),
@@ -4240,7 +4245,7 @@ const workloadDraft = {
   name: "", rows: [{ model: "", latency: "30", parallel: "8" }], placement: "auto", hours: "4", budget: "", kind: "roi",
   plan: null, planning: false, error: null, notice: null, shown: null, open: null,
   // Its serving plan (S19, D204): the plan every tab reads and writes, and the tab shown.
-  serve: {}, serveTab: "builder", serveText: null, serveError: null, serveAdvanced: false,
+  serve: {}, serveTab: "builder", serveText: null, serveError: null, serveAdvanced: false, chatText: "",
   rowErrors: {}, timer: null, holder: null,
   // The form folds away once any workload is active, so the table stays in view; it opens on
   // request, and stays open while it holds a draft.
@@ -4385,7 +4390,7 @@ function workloadForm(status) {
       wrap("Budget ($)", input("budget", { type: "number", min: "0.01", step: "0.01", placeholder: "propose one for me" }),
         "its dollar cap; left empty, the plan proposes one"),
       el("label", { class: "field" }, el("span", {}, "Machines"), kindSelect, kindHint)),
-    servingPanel(changed),
+    servingPanel(changed, status),
     el("div", { class: "row" }, planButton, errorHolder),
     d.notice ? el("p", { class: "warn-text", role: "status" }, d.notice) : null,
     planHolder);
@@ -4836,7 +4841,7 @@ function servingCode() {
 
 const SERVE_TABS = [["builder", "Builder"], ["json", "JSON"], ["code", "Code"]];
 
-function servingPanel(changed) {
+function servingPanel(changed, status) {
   const d = workloadDraft;
   const pick = (tab) => {
     // The JSON tab is written again from the plan as it stands — unless it holds text that is
@@ -4855,6 +4860,7 @@ function servingPanel(changed) {
   return el("section", { class: "serving-plan", "aria-label": "Serving plan" },
     el("h3", {}, "Serving plan"),
     el("p", { class: "muted" }, "Where its requests go and when: its own machines, then what covers while they start, then what helps when they are full. Plan to read it back."),
+    planChatPanel(status),
     el("div", { class: "tabs", role: "tablist", "aria-label": "Serving plan as",
       onkeydown: (e) => {
         if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
@@ -4943,6 +4949,107 @@ async function changeServingPlan(button, w) {
       problem.textContent = `Not JSON yet: ${error.message}`;  // asked again, with what was typed
     }
   }
+}
+
+// --- The plan chat (S19 stage 8, D204; threat model T42) ---
+// A description becomes the plan's JSON, by a model the pool serves on its own machines. It only
+// proposes: its plan is shown as a change to the builder, with Undo; Create stays the builder's.
+
+const planChat = { id: null, asking: false, said: null, undo: null, seq: 0, wake: null };
+
+function planChatPanel(status) {
+  const assistant = status && status.plan_assistant;
+  if (!assistant) {
+    return el("p", { class: "muted" },
+      "A chat can write this plan from a description: set console.plan_assistant.model in the pool's configuration "
+      + "to a chat model this pool serves on its own machines.");
+  }
+  const d = workloadDraft;
+  const box = el("textarea", { rows: "3", id: "sp-chat", "aria-label": "Describe the plan",
+    placeholder: "e.g. cover the start with free machines, then hosted APIs up to $10 a day; keep batch requests off hosted APIs",
+    oninput: (e) => { d.chatText = e.target.value; } });
+  box.value = d.chatText || "";
+  const ask = el("button", { class: "small", id: "sp-chat-ask", disabled: planChat.asking,
+    onclick: () => askPlanChat(assistant.model, box.value) }, "Propose a plan");
+  return el("div", { class: "plan-chat" },
+    el("label", { class: "field" }, el("span", {}, `Describe it — ${assistant.model} on this pool writes the plan`), box),
+    el("div", { class: "row", role: "status", "aria-live": "polite" }, ask,
+      planChat.asking ? el("span", {}, `Asking ${assistant.model} on this pool… `,
+        el("button", { class: "small", id: "sp-chat-cancel", onclick: cancelPlanChat }, "Cancel")) : null,
+      planChat.undo ? el("span", {}, planChat.said || "The chat's plan is in the builder. ",
+        el("button", { class: "small", id: "sp-chat-undo", onclick: undoPlanChat }, "Undo")) : null,
+      !planChat.undo && planChat.said ? el("span", { class: "error" }, planChat.said) : null),
+    el("small", { class: "muted" }, "It only proposes: read the plan back with Plan, and Create as always."));
+}
+
+const pause = (ms) => new Promise((resolve) => { planChat.wake = resolve; setTimeout(resolve, ms); });
+
+async function askPlanChat(model, description) {
+  if (!description.trim()) return;
+  const d = workloadDraft;
+  // Each ask has its own number; a Cancel, or a newer ask, makes an older one stop and touch nothing.
+  const mine = ++planChat.seq;
+  const current = () => planChat.seq === mine;
+  planChat.asking = true; planChat.said = null; planChat.undo = null; planChat.id = null;
+  drawWorkloadForm();
+  document.getElementById("sp-chat-cancel")?.focus();
+  try {
+    let id;
+    try {
+      id = (await api.askPlanChat({ description, plan: tidyServe(d.serve) })).id;
+    } catch (error) {
+      // One in flight already — this console's, before a reload: wait on it, with Cancel.
+      if (!(error.status === 409 && error.body && error.body.id)) throw error;
+      id = error.body.id;
+    }
+    if (!current()) { api.cancelPlanChat(id).catch(() => {}); return; }  // cancelled while it was sent
+    planChat.id = id;
+    for (;;) {
+      await pause(700);
+      if (!current()) return;
+      const seen = await api.readPlanChat(id);
+      if (!current()) return;  // cancelled while it was read: its answer is not applied
+      if (seen.state !== "answered") continue;
+      if (seen.plan) {
+        // Shown as a change to the builder, with Undo.
+        planChat.undo = JSON.stringify(d.serve);
+        d.serve = seen.plan; d.serveText = null; d.serveError = null; d.plan = null;
+        planChat.said = `${model} proposed a plan; it is in the builder now. `;
+      } else if (seen.words !== undefined) {
+        // Still refused after two tries: opened in the JSON tab with its refusals.
+        planChat.undo = JSON.stringify(d.serve);
+        d.serveTab = "json"; d.serveText = seen.words;
+        d.serveError = `The pool refused what ${model} wrote: ${(seen.refusals || []).join("; ")}`;
+        planChat.said = `${model}'s answer did not make a plan the pool accepts; it is in the JSON tab with why. `;
+      } else {
+        planChat.said = seen.error || "The chat did not answer.";
+      }
+      break;
+    }
+  } catch (error) {
+    if (!current()) return;
+    planChat.said = error.message;
+  }
+  planChat.asking = false; planChat.id = null;
+  drawWorkloadForm();
+  (document.getElementById("sp-chat-undo") || document.getElementById("sp-chat-ask"))?.focus();
+}
+
+async function cancelPlanChat() {
+  const id = planChat.id;
+  planChat.seq += 1;  // the ask in flight stops, whatever it was waiting on
+  planChat.asking = false; planChat.id = null; planChat.said = "Cancelled.";
+  if (planChat.wake) planChat.wake();
+  if (id) { try { await api.cancelPlanChat(id); } catch { /* gone already */ } }
+  drawWorkloadForm();
+  document.getElementById("sp-chat-ask")?.focus();
+}
+
+function undoPlanChat() {
+  const d = workloadDraft;
+  d.serve = JSON.parse(planChat.undo || "{}"); d.serveText = null; d.serveError = null; d.plan = null;
+  planChat.undo = null; planChat.said = null;
+  drawWorkloadForm();
 }
 
 async function createWorkload(button) {

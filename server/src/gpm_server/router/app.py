@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import dataclasses
 import hashlib
+import hmac
 import json
 import logging
 import time
@@ -24,7 +25,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import ClientDisconnect
 
-from .. import translate
+from .. import plan_assistant, translate
 from ..config import Budget, ConfigError, PoolConfig, load_config
 from ..contract import CONTRACT_VERSION
 from ..db import Database, RequestRecord
@@ -142,6 +143,9 @@ def _identity(state: RouterState, request: Request) -> Optional[Identity]:
             return None
     if verify(token, state.app_hashes):
         return Identity()
+    if hmac.compare_digest(token.encode("utf-8", "surrogateescape"), state.internal_key.encode()):
+        # The router's own plan chat (D204), sent in process: the app `console`.
+        return Identity(app=plan_assistant.APP)
     # A named app key (D193): the shared workload's, exactly as the app key is, with a name.
     app = match(token, state.registry.app_keys)
     if app is not None:
@@ -527,7 +531,8 @@ def create_app(
         await state.registry.refresh()
         # What hosted APIs were paid this month, so a restart forgets nothing spent (D166).
         state.budgets.load(await asyncio.to_thread(state.log.hosted_spend_since, period_starts()[1]))
-        tasks = [asyncio.create_task(state.registry.run_forever(state.config.pool.host_table_poll_s))]
+        tasks = [asyncio.create_task(state.registry.run_forever(state.config.pool.host_table_poll_s)),
+                 asyncio.create_task(_assistant_watch())]
         if config_path is not None:
             tasks.append(asyncio.create_task(follow_config_file(state, Path(config_path))))
         try:
@@ -541,6 +546,113 @@ def create_app(
             await state.aclose()
             if owns_database:
                 database.close()
+
+    async def _assistant_watch(poll_s: float = 0.5) -> None:
+        """The plan chat's watcher (S19, D204): claims a request the control API wrote — once,
+        whichever router claims first — asks the chat's model through this router's own dispatch,
+        and writes the answer back. Cancelled where its row is deleted while it waits; there, and
+        at its timeout, the request it sent is ended as a client that went away is, so its worker
+        and its queue place are given back."""
+        requests = plan_assistant.AssistantRequests(state.db)
+        while True:
+            await asyncio.sleep(poll_s)
+            assistant = state.config.console.plan_assistant
+            if assistant is None:
+                continue
+            try:
+                row = await asyncio.to_thread(requests.claim, state.router_id, assistant.timeout_s)
+                if row is None:
+                    continue
+                gone = asyncio.Event()
+                asking = asyncio.create_task(_ask_assistant(assistant, row, gone))
+                deadline = time.monotonic() + assistant.timeout_s
+                answer: Optional[dict[str, Any]] = None
+                cancelled = False
+                while not asking.done():
+                    await asyncio.wait({asking}, timeout=1.0)
+                    if asking.done():
+                        break
+                    if not await asyncio.to_thread(requests.exists, row["id"]):
+                        cancelled = True  # by the operator: nothing to write
+                    elif time.monotonic() > deadline:
+                        answer = {"error": f"{assistant.model} did not answer within {assistant.timeout_s:g}s"}
+                    else:
+                        continue
+                    gone.set()  # the request ends as a client that left: its worker is freed
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(asking, timeout=30)
+                    break
+                if not cancelled and answer is None:
+                    answer = asking.result() if asking.done() and not asking.cancelled() and asking.exception() is None \
+                        else {"error": "the chat's request failed; ask again"}
+                if answer is not None and not cancelled:
+                    await asyncio.to_thread(requests.answer, row["id"], state.router_id, answer)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # the watcher outlives any one request
+                logging.getLogger(__name__).warning("plan chat: %s", exc)
+
+    async def _call_self(path: str, headers: Mapping[str, str], body: bytes, gone: asyncio.Event) -> tuple[int, bytes]:
+        """One request through this router's own app, in process: its client is this function,
+        which goes away when `gone` is set — so the router frees its worker exactly as for any
+        client that leaves (app contract §5 rule 1)."""
+        scope = {
+            "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST", "scheme": "http",
+            "path": path, "raw_path": path.encode(), "query_string": b"", "root_path": "",
+            "headers": [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers.items()]
+                       + [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())],
+            "client": ("127.0.0.1", 0), "server": ("router.internal", 80),
+        }
+        delivered = False
+
+        async def receive() -> dict[str, Any]:
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            await gone.wait()
+            return {"type": "http.disconnect"}
+
+        status, chunks = 0, []
+
+        async def send(message: Mapping[str, Any]) -> None:
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = int(message["status"])
+            elif message["type"] == "http.response.body":
+                chunks.append(bytes(message.get("body", b"")))
+
+        await app(scope, receive, send)
+        return status, b"".join(chunks)
+
+    async def _ask_assistant(assistant: Any, row: Mapping[str, Any], gone: asyncio.Event) -> dict[str, Any]:
+        """Two tries at a plan the pool accepts: the second is told what the first got wrong."""
+        messages = plan_assistant.messages(row["description"], row.get("plan"))
+        headers = {"Authorization": f"Bearer {state.internal_key}", "X-GPM-Keep-On": "owned",
+                   "X-GPM-Priority": "interactive"}
+        content, refusals = "", []
+        for _ in range(plan_assistant.TRIES):
+            status, raw = await _call_self("/v1/chat/completions", headers, json.dumps({
+                "model": assistant.model, "messages": messages, "max_tokens": assistant.max_tokens,
+                "stream": False, "response_format": plan_assistant.response_format()}).encode(), gone)
+            try:
+                answer = json.loads(raw or b"{}")
+            except ValueError:
+                answer = {}
+            if gone.is_set():
+                return {"error": "cancelled"}
+            if status != 200:
+                detail = (answer.get("detail") if isinstance(answer, dict) else None) or raw[:300].decode("utf-8", "replace")
+                return {"error": f"{assistant.model} on this pool could not answer: {detail}"}
+            choices = (answer.get("choices") if isinstance(answer, dict) else None) or [{}]
+            content = (choices[0].get("message") or {}).get("content") or ""
+            plan, refusals = plan_assistant.read_answer(content)
+            if plan is not None:
+                return plan_assistant.answer_for(plan)
+            messages = [*messages, {"role": "assistant", "content": content},
+                        {"role": "user", "content": "The pool refused that plan: " + "; ".join(refusals)
+                         + ". Answer again with the corrected plan's JSON only."}]
+        return {"words": content, "refusals": refusals}
 
     app = FastAPI(
         title="GPM router",
