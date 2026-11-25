@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import dataclasses
+import logging
 import mimetypes
 import os
 import time
@@ -42,6 +43,9 @@ class Reply:
     #: Which role of the workload's serving plan, and which source, answered (`X-GPM-Route`):
     #: `steady/rented`, `until_ready/shared`, `when_full/hosted`, ...; None from an older pool.
     route: Optional[str] = None
+    #: The model asked for, where the workload's plan let a substitute answer (`X-GPM-Substituted-For`,
+    #: D202); None where the model asked for answered.
+    substituted_for: Optional[str] = None
     raw: dict = dataclasses.field(default_factory=dict, repr=False)
 
 
@@ -56,6 +60,7 @@ class Transcript:
     wait_s: Optional[float] = None
     cost_usd: Optional[float] = None
     route: Optional[str] = None
+    substituted_for: Optional[str] = None
     raw: Union[dict, str] = dataclasses.field(default_factory=dict, repr=False)
 
 
@@ -83,6 +88,7 @@ class Ranking(list):
         wait_s: Optional[float] = None,
         cost_usd: Optional[float] = None,
         route: Optional[str] = None,
+        substituted_for: Optional[str] = None,
         raw: Optional[dict] = None,
     ):
         super().__init__(ranked)
@@ -92,6 +98,7 @@ class Ranking(list):
         self.wait_s = wait_s
         self.cost_usd = cost_usd
         self.route = route
+        self.substituted_for = substituted_for
         self.raw = raw if raw is not None else {}
 
 
@@ -109,6 +116,7 @@ class Prediction:
     #: Which role of the workload's serving plan, and which source, answered (`X-GPM-Route`):
     #: `steady/rented`, `until_ready/shared`, `when_full/hosted`, ...; None from an older pool.
     route: Optional[str] = None
+    substituted_for: Optional[str] = None
     raw: dict = dataclasses.field(default_factory=dict, repr=False)
 
     def __getitem__(self, name: str) -> Any:
@@ -190,6 +198,7 @@ def _facts(response: httpx.Response, model: Optional[str] = None) -> dict[str, A
         "wait_s": _float_or_none(response.headers.get("X-GPM-Wait-S")),
         "cost_usd": _float_or_none(response.headers.get("X-GPM-Cost-USD")),
         "route": response.headers.get("X-GPM-Route"),
+        "substituted_for": response.headers.get("X-GPM-Substituted-For"),
     }
 
 
@@ -385,12 +394,37 @@ def _budget_from_status(data: dict, current: httpx.Timeout) -> Optional[httpx.Ti
 
 #: A request's options and their values (S19, D201; app contract §2): what a call may send.
 OPTIONS = {"priority": ("interactive", "batch"), "keep_on": ("no_hosted", "owned", "any")}
-_OPTION_HEADERS = {"priority": "X-GPM-Priority", "keep_on": "X-GPM-Keep-On"}
+_OPTION_HEADERS = {"priority": "X-GPM-Priority", "keep_on": "X-GPM-Keep-On", "substitute": "X-GPM-Substitute"}
 
 
-def _options(priority: Optional[str], keep_on: Optional[str]) -> dict[str, str]:
-    """The options given, checked here so a misspelt one fails before anything is sent."""
+class _SubstitutionNotice:
+    """Says once per client, in its log, that a substitute model answered (D202): an app reading
+    neither `X-GPM-Substituted-For` nor `reply.substituted_for` still has a trace of it."""
+
+    def __init__(self) -> None:
+        self.said = False
+
+    def seen(self, response: httpx.Response) -> None:
+        asked = response.headers.get("X-GPM-Substituted-For")
+        if asked and not self.said:
+            self.said = True
+            logging.getLogger("gpm_client").warning(
+                "a substitute model answered a request for %r (%s): the workload's serving plan allows it; "
+                "send substitute=False on a call to refuse it", asked, response.headers.get("X-GPM-Served-Model"))
+
+    async def seen_async(self, response: httpx.Response) -> None:
+        self.seen(response)
+
+
+def _options(priority: Optional[str], keep_on: Optional[str], substitute: Optional[bool] = None) -> dict[str, str]:
+    """The options given, checked here so a misspelt one fails before anything is sent.
+    `substitute=False` refuses the substitute model a workload's plan may name (D202)."""
     given = {}
+    if substitute is not None:
+        if not isinstance(substitute, bool):
+            raise ValueError(f"substitute is True or False, not {substitute!r}")
+        if not substitute:
+            given["substitute"] = "never"
     for option, value in (("priority", priority), ("keep_on", keep_on)):
         if value is None:
             continue
@@ -434,11 +468,12 @@ class PoolClient:
         api: str = "openai",
         priority: Optional[str] = None,
         keep_on: Optional[str] = None,
+        substitute: Optional[bool] = None,
     ):
         if api not in DIALECTS:
             raise ValueError(f"api must be one of {sorted(DIALECTS)}, not {api!r}")
         #: The request options every call sends unless it says otherwise (S19, D201).
-        self._options = _options(priority, keep_on)
+        self._options = _options(priority, keep_on, substitute)
         #: The options the pool says it honours, read from its status the first time one is sent.
         self._honoured: Optional[dict] = None
         self.base_url = pool_root(base_url or env_url())
@@ -446,11 +481,13 @@ class PoolClient:
         self._paths = DIALECTS[api]
         self._api = api
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        self._substitution = _SubstitutionNotice()
         self._client = httpx.Client(
             base_url=self.base_url,
             headers=headers,
             transport=transport or pool_transport(retry_policy),
             timeout=timeout,
+            event_hooks={"response": [self._substitution.seen]},
         )
 
     def chat(
@@ -463,6 +500,7 @@ class PoolClient:
         tools: Optional[list[dict]] = None,
         priority: Optional[str] = None,
         keep_on: Optional[str] = None,
+        substitute: Optional[bool] = None,
         **kwargs: Any,
     ) -> Reply:
         body: dict[str, Any] = {"model": model, "messages": messages, "stream": False}
@@ -471,14 +509,14 @@ class PoolClient:
         if tools is not None:
             body["tools"] = tools
         body.update(kwargs)
-        headers = self._headers(session_id, priority, keep_on)
+        headers = self._headers(session_id, priority, keep_on, substitute)
         response = self._client.post(self._paths["chat"], json=body, headers=headers)
         return _reply_from_response(response)
 
     def embed(self, model: str, texts: list[str], *, session_id: Optional[str] = None,
-                    priority: Optional[str] = None, keep_on: Optional[str] = None) -> list[list[float]]:
+                    priority: Optional[str] = None, keep_on: Optional[str] = None, substitute: Optional[bool] = None) -> list[list[float]]:
         body = {"model": model, "input": texts}
-        headers = self._headers(session_id, priority, keep_on)
+        headers = self._headers(session_id, priority, keep_on, substitute)
         response = self._client.post(self._paths["embed"], json=body, headers=headers)
         return _embeddings_of(response.json())
 
@@ -495,6 +533,7 @@ class PoolClient:
         read_timeout_s: Optional[float] = None,
         priority: Optional[str] = None,
         keep_on: Optional[str] = None,
+        substitute: Optional[bool] = None,
     ) -> Transcript:
         """A recording turned into text. `file` is a path, bytes or a binary file object.
 
@@ -507,7 +546,7 @@ class PoolClient:
             model, file, language=language, prompt=prompt,
             response_format=response_format, temperature=temperature,
         )
-        headers = self._headers(session_id, priority, keep_on)
+        headers = self._headers(session_id, priority, keep_on, substitute)
         timeout = _transcribe_timeout(self._client.timeout, read_timeout_s)
         response = self._client.post(_TRANSCRIBE_PATH, headers=headers, timeout=timeout, **upload)
         return _transcript_from_response(response, response_format)
@@ -522,24 +561,28 @@ class PoolClient:
         session_id: Optional[str] = None,
         priority: Optional[str] = None,
         keep_on: Optional[str] = None,
+        substitute: Optional[bool] = None,
     ) -> Ranking:
         """`documents` ranked against `query`, best first, with the facts of the call."""
-        headers = self._headers(session_id, priority, keep_on)
+        headers = self._headers(session_id, priority, keep_on, substitute)
         body = _rerank_body(model, query, documents, top_n)
         response = self._client.post(_RERANK_PATH, json=body, headers=headers)
         return _ranking_from_response(response)
 
     def predict(self, model: str, inputs: dict, *, session_id: Optional[str] = None,
-                      priority: Optional[str] = None, keep_on: Optional[str] = None) -> Prediction:
+                      priority: Optional[str] = None, keep_on: Optional[str] = None, substitute: Optional[bool] = None) -> Prediction:
         """A trained model's answer to `inputs` — named as its build declares them; a picture as
         bytes (D178). `prediction["label"]` reads one output."""
-        headers = self._headers(session_id, priority, keep_on)
+        headers = self._headers(session_id, priority, keep_on, substitute)
         response = self._client.post(_PREDICT_PATH, json=_predict_body(model, inputs), headers=headers)
         return _prediction_from_response(response)
 
-    def _headers(self, session_id: Optional[str], priority: Optional[str], keep_on: Optional[str]) -> dict[str, str]:
+    def _headers(self, session_id: Optional[str], priority: Optional[str], keep_on: Optional[str],
+                 substitute: Optional[bool] = None) -> dict[str, str]:
         headers = {"X-GPM-Session": session_id} if session_id else {}
-        options = {**self._options, **_options(priority, keep_on)}
+        options = {**self._options, **_options(priority, keep_on, substitute)}
+        if substitute is True:
+            options.pop("substitute", None)  # this call allows what the client refuses
         if options:
             honoured = self._honoured
             if honoured is None:
@@ -590,11 +633,12 @@ class AsyncPoolClient:
         api: str = "openai",
         priority: Optional[str] = None,
         keep_on: Optional[str] = None,
+        substitute: Optional[bool] = None,
     ):
         if api not in DIALECTS:
             raise ValueError(f"api must be one of {sorted(DIALECTS)}, not {api!r}")
         #: The request options every call sends unless it says otherwise (S19, D201).
-        self._options = _options(priority, keep_on)
+        self._options = _options(priority, keep_on, substitute)
         #: The options the pool says it honours, read from its status the first time one is sent.
         self._honoured: Optional[dict] = None
         self.base_url = pool_root(base_url or env_url())
@@ -602,11 +646,13 @@ class AsyncPoolClient:
         self._paths = DIALECTS[api]
         self._api = api
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        self._substitution = _SubstitutionNotice()
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             headers=headers,
             transport=transport or async_pool_transport(retry_policy),
             timeout=timeout,
+            event_hooks={"response": [self._substitution.seen_async]},
         )
 
     async def chat(
@@ -619,6 +665,7 @@ class AsyncPoolClient:
         tools: Optional[list[dict]] = None,
         priority: Optional[str] = None,
         keep_on: Optional[str] = None,
+        substitute: Optional[bool] = None,
         **kwargs: Any,
     ) -> Reply:
         body: dict[str, Any] = {"model": model, "messages": messages, "stream": False}
@@ -627,14 +674,14 @@ class AsyncPoolClient:
         if tools is not None:
             body["tools"] = tools
         body.update(kwargs)
-        headers = await self._headers(session_id, priority, keep_on)
+        headers = await self._headers(session_id, priority, keep_on, substitute)
         response = await self._client.post(self._paths["chat"], json=body, headers=headers)
         return _reply_from_response(response)
 
     async def embed(self, model: str, texts: list[str], *, session_id: Optional[str] = None,
-                    priority: Optional[str] = None, keep_on: Optional[str] = None) -> list[list[float]]:
+                    priority: Optional[str] = None, keep_on: Optional[str] = None, substitute: Optional[bool] = None) -> list[list[float]]:
         body = {"model": model, "input": texts}
-        headers = await self._headers(session_id, priority, keep_on)
+        headers = await self._headers(session_id, priority, keep_on, substitute)
         response = await self._client.post(self._paths["embed"], json=body, headers=headers)
         return _embeddings_of(response.json())
 
@@ -651,13 +698,14 @@ class AsyncPoolClient:
         read_timeout_s: Optional[float] = None,
         priority: Optional[str] = None,
         keep_on: Optional[str] = None,
+        substitute: Optional[bool] = None,
     ) -> Transcript:
         """See `PoolClient.transcribe`."""
         upload = _transcription_upload(
             model, file, language=language, prompt=prompt,
             response_format=response_format, temperature=temperature,
         )
-        headers = await self._headers(session_id, priority, keep_on)
+        headers = await self._headers(session_id, priority, keep_on, substitute)
         timeout = _transcribe_timeout(self._client.timeout, read_timeout_s)
         response = await self._client.post(_TRANSCRIBE_PATH, headers=headers, timeout=timeout, **upload)
         return _transcript_from_response(response, response_format)
@@ -672,23 +720,27 @@ class AsyncPoolClient:
         session_id: Optional[str] = None,
         priority: Optional[str] = None,
         keep_on: Optional[str] = None,
+        substitute: Optional[bool] = None,
     ) -> Ranking:
         """See `PoolClient.rerank`."""
-        headers = await self._headers(session_id, priority, keep_on)
+        headers = await self._headers(session_id, priority, keep_on, substitute)
         body = _rerank_body(model, query, documents, top_n)
         response = await self._client.post(_RERANK_PATH, json=body, headers=headers)
         return _ranking_from_response(response)
 
     async def predict(self, model: str, inputs: dict, *, session_id: Optional[str] = None,
-                      priority: Optional[str] = None, keep_on: Optional[str] = None) -> Prediction:
+                      priority: Optional[str] = None, keep_on: Optional[str] = None, substitute: Optional[bool] = None) -> Prediction:
         """See `PoolClient.predict`."""
-        headers = await self._headers(session_id, priority, keep_on)
+        headers = await self._headers(session_id, priority, keep_on, substitute)
         response = await self._client.post(_PREDICT_PATH, json=_predict_body(model, inputs), headers=headers)
         return _prediction_from_response(response)
 
-    async def _headers(self, session_id: Optional[str], priority: Optional[str], keep_on: Optional[str]) -> dict[str, str]:
+    async def _headers(self, session_id: Optional[str], priority: Optional[str], keep_on: Optional[str],
+                 substitute: Optional[bool] = None) -> dict[str, str]:
         headers = {"X-GPM-Session": session_id} if session_id else {}
-        options = {**self._options, **_options(priority, keep_on)}
+        options = {**self._options, **_options(priority, keep_on, substitute)}
+        if substitute is True:
+            options.pop("substitute", None)  # this call allows what the client refuses
         if options:
             honoured = self._honoured
             if honoured is None:

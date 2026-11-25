@@ -46,7 +46,15 @@ from ..engines.thinking import says_thinking, with_thinking
 from ..keys import match, verify
 from ..models import HostState
 from ..provisioning_store import HashTaken
-from ..serving_plan import HOST_KINDS, OPTIONS, kept_off, request_options, route_label, why_kept_off
+from ..serving_plan import (
+    HOST_KINDS,
+    OPTIONS,
+    kept_off,
+    request_options,
+    route_label,
+    substitute_allowed,
+    why_kept_off,
+)
 from ..state import RouterState, open_database
 from .budgets import days_in_month, period_starts
 from .dispatch import Assignment, BudgetSpent, Need, NoEligibleHost, NoReadyHost, QueueTimeout
@@ -342,6 +350,9 @@ def _downstream_headers(
             # Dropped only because the app asked for it (`X-GPM-Unsupported: drop`), and said here.
             headers["X-GPM-Dropped"] = "; ".join(translation.dropped)[:1000]
     headers["X-GPM-Served-Model"] = assignment.variant.tag
+    if assignment.substituted_for is not None:
+        # A substitute model answered (S19, D202): the model the request asked for.
+        headers["X-GPM-Substituted-For"] = assignment.substituted_for
     headers["X-GPM-Host"] = assignment.host.host_id
     headers["X-GPM-Runtime-Class"] = assignment.variant.runtime_class
     headers["X-GPM-Wait-S"] = f"{wait_s:.3f}"
@@ -694,7 +705,7 @@ def create_app(
                 "pool": state.config.pool.name,
                 "contract_version": CONTRACT_VERSION,
                 # The request options this pool honours (S19, D201); an SDK sends no other.
-                "options": {option: list(values) for option, values in OPTIONS.items()},
+                "options": {**{option: list(values) for option, values in OPTIONS.items()}, "substitute": ["never"]},
                 "engine": state.engine.name,
                 "model_set": state.config.pool.model_set,
                 "limits": {
@@ -1027,7 +1038,7 @@ def create_app(
                 "state": workload_state,
                 "contract_version": CONTRACT_VERSION,
                 # The request options this pool honours (S19, D201); an SDK sends no other.
-                "options": {option: list(values) for option, values in OPTIONS.items()},
+                "options": {**{option: list(values) for option, values in OPTIONS.items()}, "substitute": ["never"]},
                 "model_set": list(models),
                 "borrowing": borrowing,
                 "borrowing_models": waiting_for if borrowing else [],
@@ -1250,6 +1261,11 @@ def create_app(
             chosen = request_options(plan, sent_priority, sent_keep_on)
         except ValueError as bad:
             chosen, unknown_option = (None, None), str(bad)
+        try:
+            # `X-GPM-Substitute: never` (S19, D202): this request is answered by its own model or not at all.
+            may_substitute = substitute_allowed(request.headers.get("x-gpm-substitute"))
+        except ValueError as bad:
+            may_substitute, unknown_option = False, unknown_option or str(bad)
         #: What the log keeps of this request beyond each call's own fields: its options, and the
         #: role and source of the host that last took it.
         logged: dict[str, Optional[str]] = {"priority": chosen[0], "keep_on": chosen[1], "route": None, "budget": None}
@@ -1424,6 +1440,24 @@ def create_app(
             no_burst=plan_routing.no_burst if plan_routing is not None else False,
             steady_kinds=_steady_kinds(who.workload, plan),
         )
+        offered: tuple[tuple[str, float], ...] = ()
+        if (plan is not None and plan.substitutes and may_substitute and not session_id
+                and not _hosted_alone(who.workload, requested)):
+            # A substitute model (S19, D202), opted into by the plan: never with session
+            # consistency (D13), never where a rule in force keeps this request from it — judged
+            # again on each look, as every rule is.
+            offered = tuple((model, started + after) for model, after in plan.substitutes)
+        substitute_workload = who.workload
+
+        def substitutes_now() -> tuple[tuple[str, float], ...]:
+            if not offered or not plan.rules:
+                return offered
+            from ..serving_plan import narrowing
+
+            armed = state.registry.armed.get(substitute_workload, frozenset())
+            return () if narrowing(plan, armed, *chosen).no_substitute else offered
+
+        need = dataclasses.replace(need, substitutes=substitutes_now())
         if plan_routing is not None:
             # Asked again each time the request looks for a worker: a gap the supervisor opens
             # while it waits, or one that ends, reaches it too (S19).
@@ -1441,7 +1475,7 @@ def create_app(
                     borrow_while_ready=routing.borrow_while_ready, order=routing.order,
                     hosted_ids=routing.hosted_ids, hosted_order=routing.hosted_order,
                     reserved=_reserved_for(plan_workload), no_burst=routing.no_burst,
-                    steady_kinds=_steady_kinds(plan_workload, plan),
+                    steady_kinds=_steady_kinds(plan_workload, plan), substitutes=substitutes_now(),
                     hosted_moments=tuple(started + w for w in routing.hosted_waits) if after is not None else ())
 
             need = dataclasses.replace(
@@ -1495,8 +1529,11 @@ def create_app(
             # reach (D201): its workload's own in any state; the shared workload's of a kind it may
             # borrow now or, by its plan's stop-gap, later (a replacement gap); a hosted API where
             # it has a hosted burst. Said at once, naming the option or the rule.
+            # Its own model, or a substitute it may be answered by (D202): reached by the same rules.
+            answering = {requested, *(model for model, _ in need.substitutes)}
+
             def holds(h: Any) -> bool:
-                return requested in h.variants or requested in h.literal_variants
+                return any(m in h.variants or m in h.literal_variants for m in answering)
 
             def removed(h: Any) -> bool:
                 return ((h.hosted and ("hosted" in kept or ruled_off_hosted))
@@ -1606,7 +1643,8 @@ def create_app(
                 return _no_capacity("queue_timeout", "every eligible worker stayed busy past the queue limit")
 
             assignment.host.last_request_at = time.time()
-            logged["route"] = (assignment.hold.route if assignment.hold is not None and assignment.hold.route
+            logged["route"] = (f"substitute/{assignment.substituted_model}" if assignment.substituted_for is not None
+                               else assignment.hold.route if assignment.hold is not None and assignment.hold.route
                                else _route_for(assignment.host, need, plan, dispatched_by[0]))
             logged["budget"] = assignment.hold.budget_id or None if assignment.hold is not None else None
             concurrency = assignment.concurrency

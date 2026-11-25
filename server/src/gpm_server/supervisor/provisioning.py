@@ -279,6 +279,10 @@ class Provisioning:
             if not grant.sources:
                 return  # a grant from before plans: its own checks hold the shorthand, as before
             plan = from_bursts(policy, grant.borrows())
+        outside = [m for m, _ in plan.substitutes if m not in grant.models]
+        if outside:
+            # A substitute answers the program's requests: it is one of the models it may use (D202).
+            raise WorkloadRefused(f"this key may use {list(grant.models)}; substitute {outside[0]!r} is not one of them")
         if plan.reserve or plan.steady != "rented":
             # Reserving the operator's own machines is the operator's alone (D199).
             raise WorkloadRefused("a program never reserves the operator's machines: reserve and steady local or "

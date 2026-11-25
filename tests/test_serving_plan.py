@@ -89,12 +89,12 @@ def test_a_plan_that_cannot_be_served_is_refused_in_words(serve, says):
         parse_serve(serve)
 
 
-@pytest.mark.parametrize("serve, says", [
-    ({"substitute": [{"model": "small", "after_s": 20}]}, "a substitute model arrives"),
-])
-def test_what_a_later_stage_brings_is_refused_never_accepted_and_ignored(serve, says):
-    with pytest.raises(PlanRefused, match=says):
-        parse_serve(serve)
+def test_every_stage_is_built_and_an_unknown_field_is_still_refused():
+    from gpm_server.serving_plan import LATER
+
+    assert LATER == {}, "nothing of the plan is left for a later stage"
+    with pytest.raises(PlanRefused, match="not \\['substitutes'\\]"):
+        parse_serve({"substitutes": [{"model": "small"}]})
 
 
 def test_a_create_sends_bursts_or_serve_never_both():

@@ -266,6 +266,6 @@ After the second architecture and UX reviews (2026-11-25):
    SDK's `budgets()`, and the Now line — **built** (gpm-server 0.52.0, gpm-client 0.12.0).
 7. **The console's plan builder** — **built** (gpm-server 0.53.0).
 8. **The chat** — **built** (gpm-server 0.54.0).
-9. **The substitute model.**
+9. **The substitute model** — **built** (gpm-server 0.55.0, gpm-client 0.13.0).
 
 Each stage is tested against the fake provider and fake engines, as every story is.

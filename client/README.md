@@ -562,6 +562,8 @@ Response headers, on every call:
 | `X-GPM-Cost-USD` | On a whole answer from a hosted API: what it cost your budget, in dollars |
 | `X-GPM-Cost-Max-USD` | On a streamed answer from a hosted API: the most it can cost |
 | `X-GPM-Translated`, `X-GPM-Dropped` | On an answer translated between API formats: between which, and what was dropped at your asking |
+| `X-GPM-Route` | Which role of the workload's serving plan answered, and which source: `steady/rented`, `until_ready/shared`, `when_full/hosted-burst`, `substitute/<model>` (`reply.route`) |
+| `X-GPM-Substituted-For` | On an answer from a substitute model the workload's plan allows: the model you asked for (`reply.substituted_for`; the SDK also logs a warning once per client) |
 | `X-GPM-Contract` | The contract version this pool speaks |
 
 `X-GPM-Served-Model` differing from your request is **by design**. If the operator has
@@ -570,9 +572,26 @@ got your request — the Apple-optimised one on a Mac, the standard one on a CUD
 operator has *not* catalogued is passed through literally and is never substituted, and no
 request can ever cause a model to be downloaded or loaded.
 
+## Request options
+
+`PoolClient` and `AsyncPoolClient` take these for every call, and each call may say otherwise;
+the SDK checks them before sending, and refuses one the pool does not list in its status
+(`PoolOptionNotHonoured`, nothing sent).
+
+| Option | Header | Values |
+|---|---|---|
+| `priority=` | `X-GPM-Priority` | `"interactive"` (the default) or `"batch"`, which never reaches a hosted API and never moves ahead in the queue |
+| `keep_on=` | `X-GPM-Keep-On` | `"no_hosted"` (never a hosted API), `"owned"` (only the operator's own machines) or `"any"` (whatever the workload's plan allows, lifting its default) |
+| `substitute=` | `X-GPM-Substitute: never` | `False` refuses a substitute model the workload's plan may name; the request waits for its own model. `True` on a call lifts the client's `False` |
+
+```python
+client = PoolClient(keep_on="no_hosted")
+reply = client.chat("my-model", messages, priority="batch", substitute=False)
+```
+
 ## Optional request headers
 
-Send these yourself on the transport path; `PoolClient` exposes `session_id` only.
+Send these yourself on the transport path; `PoolClient` exposes `session_id` and the options above.
 
 | Header | What it does |
 |---|---|

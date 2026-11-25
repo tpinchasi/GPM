@@ -246,7 +246,8 @@ def test_the_log_and_the_stats_keep_the_options_and_the_route(pool):
 
 def test_the_pools_status_lists_the_options_it_honours(pool):
     status = httpx.get(f"{pool.url}/pool/status", headers={"Authorization": f"Bearer {APP_KEY}"}).json()
-    assert status["options"] == {"priority": ["interactive", "batch"], "keep_on": ["no_hosted", "owned", "any"]}
+    assert status["options"] == {"priority": ["interactive", "batch"], "keep_on": ["no_hosted", "owned", "any"],
+                                 "substitute": ["never"]}
 
 
 # --- the SDK ---

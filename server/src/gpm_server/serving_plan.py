@@ -36,19 +36,22 @@ HOST_KINDS = {"local": ("local",), "fixed": ("fixed-remote",)}
 #: The kinds of machine a rented source may name (`machines=`'s words).
 RENTED_KINDS = ("roi", "on_demand", "interruptible")
 #: Fields of the plan a later stage brings; refused in words until then.
-LATER = {
-    "substitute": "a substitute model arrives in a later version of the pool",
-}
+LATER: dict[str, str] = {}
 #: A request's options (§14.4, D201): each header's values, and the one meant when a request sends
 #: none and its plan names no default.
 OPTIONS = {"priority": ("interactive", "batch"), "keep_on": ("no_hosted", "owned", "any")}
 DEFAULT_OPTIONS = {"priority": "interactive", "keep_on": "any"}
 OPTION_HEADERS = {"priority": "X-GPM-Priority", "keep_on": "X-GPM-Keep-On"}
-_TOP = ("steady", "until_ready", "when_full", "during", "max_min", "defaults", "reserve", "rules", "tz", *LATER)
+_TOP = ("steady", "until_ready", "when_full", "during", "max_min", "defaults", "reserve", "rules", "tz", "substitute",
+        *LATER)
+#: A substitute model (§14.5, D202): at most this many, each after its own wait.
+MAX_SUBSTITUTES = 4
+#: `X-GPM-Substitute`: the one value it takes, refusing a substitute for that request.
+SUBSTITUTE_HEADER = "X-GPM-Substitute"
 #: A plan's rules (§14.3, D200): a closed list of conditions and effects, at most 16.
 MAX_RULES = 16
 WHEN = ("priority", "keep_on", "between", "days", "spent_over", "evictions")
-THEN = ("use_only", "never_use", "after_s", "steady")
+THEN = ("use_only", "never_use", "after_s", "steady", "substitute")
 #: When a rule's steady switch ends (§14.3): with the window it opened in, or at the end of the
 #: day it began on, in the plan's time zone; with neither, when the rule is no longer in force.
 UNTIL = ("window_end", "end_of_day")
@@ -133,6 +136,8 @@ class ServingPlan:
     #: Its rules, in order (§14.3), and the time zone their windows are read in.
     rules: tuple["Rule", ...] = ()
     tz: str = "UTC"
+    #: Substitute models (§14.5): (model, after_s), tried in order once a request has waited.
+    substitutes: tuple[tuple[str, float], ...] = ()
 
     @property
     def steady_kinds(self) -> frozenset[str]:
@@ -157,6 +162,8 @@ class ServingPlan:
             written["rules"] = [r.as_dict() for r in self.rules]
         if self.tz != "UTC":
             written["tz"] = self.tz
+        if self.substitutes:
+            written["substitute"] = [{"model": m, "after_s": a} for m, a in self.substitutes]
         return written
 
     def sources(self) -> tuple[Source, ...]:
@@ -425,8 +432,42 @@ def parse_serve(raw: Any) -> ServingPlan:
                               "pool; when_full may use hosted APIs")
     defaults = _defaults(raw.get("defaults"), owned_steady=steady != "rented")
     plan = ServingPlan(steady=steady, until_ready=until_ready, during=during, max_min=max_min, when_full=when_full,
-                       defaults=defaults, reserve=reserve, tz=_tz(raw.get("tz", "UTC")))
+                       defaults=defaults, reserve=reserve, tz=_tz(raw.get("tz", "UTC")),
+                       substitutes=_substitutes(raw.get("substitute")))
     return dataclasses.replace(plan, rules=_rules(raw.get("rules"), plan))
+
+
+def _substitutes(raw: Any) -> tuple[tuple[str, float], ...]:
+    """`substitute: [{model, after_s}]` (§14.5): which catalogued models may answer in its model's
+    place, each once a request has waited its `after_s`. Whether a model may substitute here is
+    the pool's to check (the supervisor): this reads the shape."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not raw or len(raw) > MAX_SUBSTITUTES:
+        raise PlanRefused(f"serve.substitute is a list of 1 to {MAX_SUBSTITUTES} {{model, after_s}}, tried in order")
+    seen: list[tuple[str, float]] = []
+    for index, item in enumerate(raw):
+        where = f"serve.substitute[{index}]"
+        if not isinstance(item, dict) or set(item) - {"model", "after_s"} or "model" not in item:
+            raise PlanRefused(f"{where} is {{model, after_s}}")
+        model = item["model"]
+        if not isinstance(model, str) or not model or len(model) > 200:
+            raise PlanRefused(f"{where}.model is a catalogued model's name")
+        if any(m == model for m, _ in seen):
+            raise PlanRefused(f"{where}: {model!r} is named twice")
+        seen.append((model, _number(item.get("after_s", 10.0), f"{where}.after_s", high=3600)))
+    return tuple(seen)
+
+
+def substitute_allowed(sent: Optional[str]) -> bool:
+    """Whether a request may be answered by a substitute: unless it sends `X-GPM-Substitute:
+    never`. Another value is refused (ValueError, `unknown_option`): a misspelt refusal never
+    passes as consent."""
+    if sent is None:
+        return True
+    if sent.strip().lower() != "never":
+        raise ValueError(f"{SUBSTITUTE_HEADER} is never")
+    return False
 
 
 # --- rules (§14.3, D200) ---
@@ -665,7 +706,11 @@ def _then(then: dict, plan: ServingPlan, where: str) -> dict[str, Any]:
     if "steady" in then:
         _switch(then["steady"], plan, where)
     if "substitute" in then:
-        raise PlanRefused(f"{where}.then.substitute: a substitute model arrives in a later version of the pool")
+        if then["substitute"] is not False:
+            raise PlanRefused(f"{where}.then.substitute is false: a rule may keep requests from the substitute, "
+                              "never add one")
+        if not plan.substitutes:
+            raise PlanRefused(f"{where}.then.substitute: the plan names no substitute")
     unknown = sorted(set(then) - set(THEN))
     if unknown:
         raise PlanRefused(f"{where}.then: {unknown} — the effects are {', '.join(THEN)}")
@@ -738,6 +783,8 @@ class Narrowing:
     excluded: frozenset[str] = frozenset()
     waits: Mapping[str, float] = dataclasses.field(default_factory=dict)
     by: tuple[str, ...] = ()
+    #: A rule in force keeps the request from the plan's substitute (`then.substitute: false`).
+    no_substitute: bool = False
 
 
 def narrowing(plan: ServingPlan, armed: frozenset[str], priority: str, keep_on: str) -> Narrowing:
@@ -746,10 +793,13 @@ def narrowing(plan: ServingPlan, armed: frozenset[str], priority: str, keep_on: 
     options match its options."""
     every = frozenset(s.budget_id for s in plan.sources())
     allowed, excluded, waits, by = every, set(), {}, []
+    no_substitute = False
     for rule in plan.rules:
         if (rule.on_the_pass and rule.name not in armed) or not rule.matches(priority, keep_on):
             continue
         by.append(rule.name)
+        if rule.then.get("substitute") is False:
+            no_substitute = True
         if "use_only" in rule.then:
             allowed = allowed & source_keys(plan, rule.then["use_only"], rule.name)
         if "never_use" in rule.then:
@@ -759,12 +809,15 @@ def narrowing(plan: ServingPlan, armed: frozenset[str], priority: str, keep_on: 
             for source in plan.hosted_sources():
                 if name in (source.name, source.budget_id) and (source.after_s or 0) > seconds:
                     waits[source.budget_id] = min(seconds, waits.get(source.budget_id, seconds))
-    return Narrowing(excluded=frozenset((every - allowed) | excluded), waits=waits, by=tuple(by))
+    return Narrowing(excluded=frozenset((every - allowed) | excluded), waits=waits, by=tuple(by),
+                     no_substitute=no_substitute)
 
 
 def narrowed(plan: ServingPlan, by: Narrowing) -> ServingPlan:
     """The plan as a request sees it under its rules: the sources they exclude gone, the waits
     they shorten shorter. Budgets keep their ids."""
+    if by.no_substitute:
+        plan = dataclasses.replace(plan, substitutes=())
     if not by.excluded and not by.waits:
         return plan
     kept: dict[int, Optional[Source]] = {}
@@ -800,7 +853,8 @@ def _defaults(raw: Any, owned_steady: bool = False) -> dict[str, str]:
     if not isinstance(raw, dict):
         raise PlanRefused("serve.defaults is an object: {\"priority\": ..., \"keep_on\": ...}")
     if "substitute" in raw:
-        raise PlanRefused("serve.defaults.substitute: a substitute model arrives in a later version of the pool")
+        raise PlanRefused("serve.defaults.substitute: a plan with a substitute uses it; leave substitute out to have "
+                          "none, and a request sends X-GPM-Substitute: never to refuse it")
     unknown = sorted(set(raw) - set(OPTIONS))
     if unknown:
         raise PlanRefused(f"serve.defaults takes priority and keep_on, not {unknown}")
@@ -1052,6 +1106,8 @@ def then_words(rule: "Rule") -> str:
         said.append(f"use only {', '.join(then['use_only'])}")
     if "never_use" in then:
         said.append(f"never use {', '.join(then['never_use'])}")
+    if then.get("substitute") is False:
+        said.append("never answer with the substitute")
     for name, seconds in (then.get("after_s") or {}).items():
         said.append(f"use {name} after {seconds:g} s")
     if rule.switch is not None:
@@ -1086,6 +1142,10 @@ def readback(plan: ServingPlan, *, kind: str = "roi") -> list[str]:
                     + ".")
     else:
         said.append("When full: none — its requests queue for a worker of its own.")
+    if plan.substitutes:
+        said.append("Substitute — a request that has waited with no source of its own model free: "
+                    + "; then ".join(f"{m} after {a:g} s" for m, a in plan.substitutes)
+                    + " (its answer says X-GPM-Substituted-For).")
     for kind_, workers in sorted(plan.reserve.items()):
         if kind_ != plan.steady:
             said.append(f"Reserved: {workers} {kind_} worker(s), for its stop-gap.")
@@ -1121,6 +1181,9 @@ def conditions(plan: ServingPlan) -> list[dict[str, Any]]:
             said.append({"condition": f"{source.name} reaches its budget ({_money(source.budget)})",
                          "effect": f"{source.name} is not used until the day or month the limit is for is over",
                          "rule": None})
+    for model, after in plan.substitutes:
+        said.append({"condition": f"a request has waited {after:g} s with no source of its own model free",
+                     "effect": f"{model} answers it, if a source of the plan holding it is free", "rule": None})
     for rule in plan.rules:
         said.append({"condition": when_words(rule.when, plan.tz), "effect": then_words(rule), "rule": rule.name})
     return said
@@ -1155,6 +1218,9 @@ def option_warnings(plan: ServingPlan) -> list[str]:
     for rule in plan.rules:
         if not rule.on_the_pass:
             said.append(f"requests where {when_words(rule.when, plan.tz)}: rule {rule.name!r} — {then_words(rule)}")
+    if plan.substitutes:
+        said.append(f"requests with {SUBSTITUTE_HEADER}: never wait for their own model; the others may be answered "
+                    f"by {', then '.join(m for m, _ in plan.substitutes)}")
     return said
 
 
@@ -1367,6 +1433,10 @@ def json_schema() -> dict[str, Any]:
                         "properties": {k: {"type": "integer", "minimum": 1, "maximum": MAX_RESERVE}
                                        for k in HOST_KINDS}},
             "tz": {"type": "string", "description": "an IANA time zone, such as America/New_York", "default": "UTC"},
+            "substitute": {"type": "array", "minItems": 1, "maxItems": MAX_SUBSTITUTES, "items": {
+                "type": "object", "additionalProperties": False, "required": ["model"], "properties": {
+                    "model": {"type": "string", "minLength": 1},
+                    "after_s": {"type": "number", "minimum": 0, "maximum": 3600, "default": 10}}}},
             "rules": {"type": "array", "maxItems": MAX_RULES, "items": {
                 "type": "object", "additionalProperties": False, "required": ["name", "when", "then"],
                 "properties": {
@@ -1388,6 +1458,7 @@ def json_schema() -> dict[str, Any]:
                         "use_only": sources, "never_use": sources,
                         "after_s": {"type": "object", "minProperties": 1,
                                     "additionalProperties": {"type": "number", "minimum": 0}},
+                        "substitute": {"enum": [False]},
                         "steady": {"oneOf": [{"enum": list(HOST_KINDS)}, {
                             "type": "object", "additionalProperties": False, "required": ["rented"],
                             "properties": {"rented": {"type": "object", "additionalProperties": False,
