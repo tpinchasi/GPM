@@ -654,7 +654,9 @@ request may only reach that workload's hosts — and, while none of them holding
 is ready (per model, D118), a bounded share of the shared workload's, behind the shared
 workload's own requests. A workload host holding several models takes at most its share of each at
 once (workloads.md §12). Everything below is within
-what the workload allows.
+what the workload allows. A workload's serving plan (workloads.md §14, D198 — not built yet)
+replaces the fixed tiers for its requests with its own order — steady, then `until_ready`, then
+`when_full` — written per model and request option by the supervisor and read by the router.
 
 Strict tiers. A lower tier is touched only when every eligible worker above it is busy.
 
@@ -676,8 +678,10 @@ Per request:
    throughput. **Session affinity is off by default**; `within_tier` and `across_tiers` exist as
    options (post-v1).
 4. All eligible workers busy → queue, **first come, first served**, bounded by the queue
-   timeout. No request classes and no separate lane for short calls: an embedding request waits
-   its turn like any other. No eligible `ready` host at all → `503` with a reason.
+   timeout. No separate lane for short calls: an embedding request waits its turn like any other.
+   A request's options (`X-GPM-Priority`, `X-GPM-Keep-On`, D201 — not built yet) only narrow the
+   eligible hosts and its wait; they never move it ahead in the queue (request priority is not
+   the host field `priority` above). No eligible `ready` host at all → `503` with a reason.
 5. If the chosen host fails before the first response byte, retry **once** on the next eligible
    host in the same order. A failure mid-stream is surfaced unchanged.
 
