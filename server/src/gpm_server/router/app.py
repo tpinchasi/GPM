@@ -629,6 +629,34 @@ def create_app(
         workload = state.registry.workloads.get(name) if name is not None else None
         return workload is not None and model is not None and workload.hosted_alone(model)
 
+    def _plan_routing(plan: Any, name: str, model: str) -> Any:
+        """How a request of this workload may go now, by its plan (S19): the facts of the moment
+        from the router's own snapshot — whether the model has a ready host of the workload's, the
+        replacement gap the supervisor marked, and whether its heartbeat is recent. Cheap and
+        synchronous: it is asked again each time a waiting request looks for a worker."""
+        from ..serving_plan import route
+
+        workload = state.registry.workloads.get(name)
+        workload_state, _ = _workload_now(name)
+        now = time.time()
+        beat = state.registry.supervisor_beat
+        gap = state.registry.gaps.get((name, model))
+        # A replacement gap ends here the moment a host of the workload's holding the model is
+        # ready that was not as the supervisor opened it, without waiting for its next pass.
+        ready = {h.host_id for h in state.hosts if h.workload == name and h.state is HostState.READY
+                 and (model in h.variants or model in h.literal_variants)}
+        # A workload made never to borrow (an operator's choice, or a grant without it) never
+        # borrows through its plan either.
+        may_borrow = bool((getattr(workload, "plan", None) or {}).get("may_borrow", True))
+        return route(
+            plan, short=gap is None or ready <= gap[2],
+            preparing=workload_state == "preparing", model_ready=model in _ready_models(name),
+            created_at=workload.created_at if workload is not None else now, now=now,
+            gap_ends_at=gap[1] if gap is not None else None,
+            fresh=beat is not None and now - beat < max(SUPERVISOR_STALE_S, 3 * state.config.pool.probe_interval_s),
+            borrow_share=state.config.workloads.borrow_share if may_borrow else 0.0,
+        )
+
     def _ready_models(name: str) -> set[str]:
         """The workload's models one of its own ready hosts holds."""
         return {
@@ -736,13 +764,17 @@ def create_app(
             body = json.loads(raw or b"{}")
         except ValueError:
             return _error(400, "bad_request", "not_json", "the body is JSON")
-        if not isinstance(body, dict) or not isinstance(body.get("bursts"), dict):
-            return _error(400, "bad_request", "bursts", "send bursts: {\"hosted\": {...}}, or {} for none")
+        if not isinstance(body, dict) or not (isinstance(body.get("bursts"), dict) or isinstance(body.get("serve"), dict)):
+            return _error(400, "bad_request", "bursts",
+                          "send serve: a serving plan, or bursts: {\"hosted\": {...}} ({} for none)")
+        if "bursts" in body and "serve" in body:
+            return _error(400, "bad_request", "bursts", "send bursts or serve, not both")
         if await asyncio.to_thread(provisioning.pending_of, provisioner):
             return _error(429, "busy", "request_pending", "this key has a request waiting; ask again when it is answered")
         if await asyncio.to_thread(provisioning.asked_since, provisioner, time.time() - 60) >= REQUESTS_PER_MINUTE:
             return _error(429, "busy", "too_many_requests", f"at most {REQUESTS_PER_MINUTE} requests a minute per provisioning key")
-        request_id, _ = await asyncio.to_thread(provisioning.ask, provisioner, "policy", {"bursts": body["bursts"]}, None, name)
+        asked = {"serve": body["serve"]} if isinstance(body.get("serve"), dict) else {"bursts": body["bursts"]}
+        request_id, _ = await asyncio.to_thread(provisioning.ask, provisioner, "policy", asked, None, name)
         return JSONResponse({"request_id": request_id}, status_code=202, headers={"X-GPM-Contract": CONTRACT_VERSION})
 
     @app.post("/pool/provisioning/workloads/{name}/end")
@@ -779,12 +811,19 @@ def create_app(
         mine = [h for h in state.hosts if h.workload == name]
         ready = [h for h in mine if h.state is HostState.READY]
         plan = getattr(state.registry.workloads.get(name), "plan", None) or {}
-        # Per model (D118): a model borrows while none of the workload's ready hosts holds it.
-        waiting_for = [m for m in models if m not in _ready_models(name) and not _hosted_alone(name, m)]
-        borrowing = (
-            workload_state == "preparing" and bool(waiting_for) and state.config.workloads.borrow_share > 0
-            and bool(plan.get("may_borrow", True))
-        )
+        serving_plan = state.plan_for(name)
+        if serving_plan is not None:
+            # By its serving plan (S19): the models its stop-gap may borrow for right now.
+            waiting_for = [m for m in models if not _hosted_alone(name, m)
+                           and _plan_routing(serving_plan, name, m).may_borrow]
+            borrowing = bool(waiting_for)
+        else:
+            # Per model (D118): a model borrows while none of the workload's ready hosts holds it.
+            waiting_for = [m for m in models if m not in _ready_models(name) and not _hosted_alone(name, m)]
+            borrowing = (
+                workload_state == "preparing" and bool(waiting_for) and state.config.workloads.borrow_share > 0
+                and bool(plan.get("may_borrow", True))
+            )
         return JSONResponse(
             {
                 "pool": state.config.pool.name,
@@ -1108,6 +1147,17 @@ def create_app(
                     )
         default_max = burst.reserve_max_tokens if burst is not None else translate.DEFAULT_MAX_TOKENS
 
+        # A workload's serving plan (S19, D198) says when its stop-gap may be used and how soon a
+        # hosted API may take the request. Without one, today's fields decide, as they always did.
+        plan = state.plan_for(who.workload) if who.workload is not None else None
+        plan_routing = None
+        burst_reserve = reserve
+        if plan is not None and not _hosted_alone(who.workload, requested):
+            plan_routing = _plan_routing(plan, who.workload, requested)
+            hosted_after = None if (burst is None or plan_routing.hosted_after_s is None) else started + plan_routing.hosted_after_s
+            if hosted_after is None:
+                reserve = None
+
         need = Need(
             model=requested,
             hosted_after=hosted_after,
@@ -1122,13 +1172,31 @@ def create_app(
             workload=who.workload,
             # Only while the workload prepares: one that could always borrow would never need
             # sizing (D115).
-            may_borrow=(workload_state == "preparing" and state.config.workloads.borrow_share > 0
+            may_borrow=(plan_routing.may_borrow if plan_routing is not None else
+                        workload_state == "preparing" and state.config.workloads.borrow_share > 0
                         and bool((getattr(state.registry.workloads.get(who.workload), "plan", None) or {}).get("may_borrow", True))
                         # A model served by hosted APIs alone never reaches a machine (D165).
                         and not _hosted_alone(who.workload, requested)),
             borrow_share=state.config.workloads.borrow_share,
             cap=_cap_of(who.workload, requested),
+            borrow_kinds=plan_routing.borrow_kinds if plan_routing is not None else None,
+            borrow_while_ready=plan_routing.borrow_while_ready if plan_routing is not None else False,
+            order=plan_routing.order if plan_routing is not None else (),
         )
+        if plan_routing is not None:
+            # Asked again each time the request looks for a worker: a gap the supervisor opens
+            # while it waits, or one that ends, reaches it too (S19).
+            plan_workload = who.workload
+
+            def again(current: Need) -> Need:
+                routing = _plan_routing(plan, plan_workload, requested)
+                after = None if (burst is None or routing.hosted_after_s is None) else started + routing.hosted_after_s
+                return dataclasses.replace(
+                    current, hosted_after=after, reserve=burst_reserve if after is not None else None,
+                    may_borrow=routing.may_borrow, borrow_kinds=routing.borrow_kinds,
+                    borrow_while_ready=routing.borrow_while_ready, order=routing.order)
+
+            need = dataclasses.replace(need, again=again)
 
         request_deadline = _parse_deadline(request.headers.get("x-gpm-deadline"))
         if request_deadline is not None and request_deadline <= time.monotonic():

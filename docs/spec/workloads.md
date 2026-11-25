@@ -508,7 +508,11 @@ the start (§14.1).
 ## 14. The serving plan (D198–D204)
 
 > Decided 2026-11-24 (S19), revised after two rounds of architecture and UX review (the second
-> 2026-11-25); **not built yet**. Until it is, §4 and §13 are what runs.
+> 2026-11-25). **Stage 1 built** (gpm-server 0.46.0): `serve` with `until_ready` (start and
+> replacement, `max_min`) and `when_full`, one hosted and one rented source, the shorthand, a
+> program's grant `sources`, and the replacement gaps of the routing order (14.7). The rest is
+> refused in words until its stage ships; until then §4 and §13 are what runs for everything
+> else.
 
 A workload's serving plan, `serve`, says **where its requests go and when**. How much it must
 serve stays in `parallel`, `latency_s`, the kind of machine (`machines=` in the SDK, `kind` in the
@@ -765,7 +769,9 @@ The plan check — `POST /pool/workloads/plan` with `serve`, or `gpm workload pl
 - **A program's grant** (§11) gains `sources`: which of `local`, `fixed`, `shared`, `rented` and
   `hosted` its plans may name. An existing grant gets what it allows today: `rented`; `shared`
   where it may borrow; `hosted` where its hosted allowance is above 0. A program never reserves.
-  Each source is checked against the grant from the build stage that introduces it.
+  Each source is checked against the grant from the build stage that introduces it, and so is
+  what a workload's `bursts` mean (the shorthand). A grant that may not borrow cannot allow
+  `local`, `fixed` or `shared`; one that names its sources without any of them never borrows.
 - **The SDK** takes `serve=` on `workload()`, and `w.set_serve()` while it runs (a provisioning
   request, answered like a create). `w.set_serve()` on a workload made with `bursts` replaces its
   bursts with the plan; `w.set_bursts()` on a workload with a plan is refused in words.
@@ -784,12 +790,15 @@ The plan check — `POST /pool/workloads/plan` with `serve`, or `gpm workload pl
 - **Written by the supervisor, read by the router.** Each pass, the supervisor writes each plan's
   order, per model and per request option, into SQLite only when it changes, with a version and
   the end time of any open until_ready gap (its `max_min`). A heartbeat it refreshes every pass
-  gives the orders their `valid_until` (three passes ahead). The router reads both in the
+  gives the orders their `valid_until` (three passes ahead, and never sooner than the 60 seconds
+  after which the pool's status calls the supervisor stopped). The router reads both in the
   background, never on a request's path.
 - **Judged live by the router.** The router decides for itself whether each machine is ready,
   whether a worker is free, whether a reservation applies and whether a budget has room. It ends
-  an until_ready gap itself the moment the machines it covered for are ready, or at the gap's end
-  time, without waiting for a pass.
+  an until_ready gap itself the moment a host holding the model is ready that was not as the gap
+  opened (the gap records them), or at the gap's end time, without waiting for a pass. A request
+  already waiting is judged again each time it looks for a worker, so a gap that opens or ends
+  while it waits reaches it.
 - **A stale order fails narrow, and keeps serving.** An order past `valid_until`, or of a version
   the router does not know, is read as: steady and when_full as last written (their budgets are
   the router's own, D166); until_ready only for its sources that spend nothing (`local`, `fixed`,

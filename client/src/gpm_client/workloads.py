@@ -101,6 +101,16 @@ class Workload:
         self.answer = {**self.answer, "policy": answer.get("policy")}
         return answer.get("policy") or {}
 
+    def set_serve(self, serve: Mapping[str, Any], timeout_s: float = 120.0) -> dict:
+        """Replace its serving plan while it runs (S19): the plan sent is the whole plan — name
+        every source it should keep. On a workload made with `bursts`, the plan replaces them.
+        Checked against the provisioning key's grant, as a create is; what it already spent
+        today and this month still counts."""
+        answer = self._provisioner._ask({"serve": dict(serve)}, timeout_s,
+                                        path=f"/pool/provisioning/workloads/{self.name}/policy")
+        self.answer = {**self.answer, "policy": answer.get("policy")}
+        return answer.get("policy") or {}
+
     def wait_until_serving(self, timeout_s: float = 1800.0, poll_s: float = 5.0) -> None:
         """Until it is serving: a host of its own ready for every model it serves (D118).
         Meanwhile a model may already be served on shared hosts, where the pool lets it borrow."""
@@ -203,7 +213,7 @@ class WorkloadProvisioner:
     def _body(model: Optional[str], latency_s: Optional[float], parallel: Optional[int], hours: float,
               max_spend: Optional[float], machines: str, idle_end_minutes: Optional[float],
               models: Optional[Mapping[str, Mapping[str, Any]]] = None, placement: str = "auto",
-              bursts: Optional[Mapping[str, Any]] = None) -> dict:
+              bursts: Optional[Mapping[str, Any]] = None, serve: Optional[Mapping[str, Any]] = None) -> dict:
         """One model — `model`, `latency_s`, `parallel` — or several, each with its own target:
         `models={"chat": {"latency_s": 20, "parallel": 16}, "embed": {...}}` (D118). `parallel`
         0 is a model served by hosted APIs alone, which needs no `latency_s` (D165)."""
@@ -232,24 +242,29 @@ class WorkloadProvisioner:
             body["max_spend"] = max_spend
         if idle_end_minutes is not None:
             body["idle_end_minutes"] = idle_end_minutes
+        if bursts is not None and serve is not None:
+            raise ValueError("send bursts or serve, not both: bursts are shorthand for a serving plan's when_full")
         if bursts is not None:
             body["bursts"] = dict(bursts)
+        if serve is not None:
+            body["serve"] = dict(serve)
         return body
 
     def plan_workload(self, model: Optional[str] = None, *, latency_s: Optional[float] = None,
                       parallel: Optional[int] = None, hours: float, max_spend: Optional[float] = None,
                       models: Optional[Mapping[str, Mapping[str, Any]]] = None, placement: str = "auto",
-                      machines: str = "roi", timeout_s: float = 120.0) -> dict:
+                      machines: str = "roi", bursts: Optional[Mapping[str, Any]] = None,
+                      serve: Optional[Mapping[str, Any]] = None, timeout_s: float = 120.0) -> dict:
         """What creating it would do — its start, its first host, its price. Spends nothing."""
         body = {"kind": "plan", **self._body(model, latency_s, parallel, hours, max_spend, machines, None,
-                                             models, placement)}
+                                             models, placement, bursts, serve)}
         return self._ask(body, timeout_s)["plan"]
 
     def workload(self, model: Optional[str] = None, *, latency_s: Optional[float] = None,
                  parallel: Optional[int] = None, hours: float, max_spend: Optional[float] = None,
                  models: Optional[Mapping[str, Mapping[str, Any]]] = None, placement: str = "auto",
                  machines: str = "roi", idle_end_minutes: Optional[float] = None, certs: bool = False,
-                 bursts: Optional[Mapping[str, Any]] = None,
+                 bursts: Optional[Mapping[str, Any]] = None, serve: Optional[Mapping[str, Any]] = None,
                  wait_until: str = "created", timeout_s: float = 1800.0) -> Workload:
         """Create a workload and hand back a `Workload` bound to it — a context manager that ends
         it on leaving. One model, or several with `models=` — each with its own latency target and
@@ -265,6 +280,12 @@ class WorkloadProvisioner:
         load has stayed above them for `after_min` minutes, paid from `max_spend` — which must
         hold it — within that budget; they are given up first when the load falls.
 
+        `serve=` is a serving plan in place of `bursts` (S19): where its requests go and when —
+        `{"until_ready": ["shared", {"hosted": {"budget": {"per_day": 10}}}]}` covers its start,
+        and a replacement while it serves, with a free machine of the pool, then a hosted API,
+        until its own machines are ready; `"when_full": [...]` is what `bursts` says. A source
+        the key's grant does not allow is refused.
+
         `parallel=0` serves a model by hosted APIs alone — no machine is rented or borrowed for
         it, and it needs a hosted burst; a model no machine can run (a closed model) is always
         asked for this way. A workload whose every model is so rents nothing: it takes no
@@ -274,7 +295,7 @@ class WorkloadProvisioner:
         key = "gpmw_" + secrets.token_hex(32)
         body = {"kind": "create", "key_hash": hashlib.sha256(key.encode()).hexdigest(),
                 **self._body(model, latency_s, parallel, hours, max_spend, machines, idle_end_minutes,
-                             models, placement, bursts)}
+                             models, placement, bursts, serve)}
         private_pem = None
         if certs:
             private_pem, body["csr"] = _certificate_request()

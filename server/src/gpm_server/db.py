@@ -343,6 +343,20 @@ CREATE TABLE IF NOT EXISTS stats_rented_hourly (
     PRIMARY KEY (hour, host_id, lease_id, connection)
 );
 
+-- Written by the supervisor, read by the router (S19, D198): a replacement being prepared for
+-- a workload's model, during which its serving plan's until_ready may be used — from when its
+-- ready hosts fell short, until `ends_at` (its plan's max_min) at the latest. The row is gone
+-- once the shortfall ends. `ready_hosts` (a JSON list) are the workload's hosts holding the model
+-- that were ready as it opened: the router ends the gap itself the moment another one is.
+CREATE TABLE IF NOT EXISTS serving_gaps (
+    workload     TEXT NOT NULL,
+    model        TEXT NOT NULL,
+    opened_at    REAL NOT NULL,
+    ends_at      REAL NOT NULL,
+    ready_hosts  TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (workload, model)
+);
+
 -- One row per pool. Exactly one supervisor runs at a time (supervisor.md §1).
 CREATE TABLE IF NOT EXISTS supervisor_lock (
     pool       TEXT PRIMARY KEY,
