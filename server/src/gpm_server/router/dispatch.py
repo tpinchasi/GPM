@@ -51,6 +51,17 @@ class Need:
     #: Holds the request's worst case against its budget for a hosted build, or returns None
     #: where it does not fit (D166). Called under the dispatch lock.
     reserve: Optional[Callable[[Host, ResolvedVariant], Optional[Any]]] = None
+    #: A serving plan's stop-gap (S19, D198). Which host kinds it may borrow (None: any of the
+    #: shared workload's); whether it borrows even though the workload has a ready host of its
+    #: own for the model — a replacement being prepared; and until_ready's sources in order, by
+    #: type, which rank borrowed machines and a hosted API after the workload's own hosts. Empty:
+    #: no plan, and machines are ranked by their tier alone, as always.
+    borrow_kinds: Optional[frozenset[str]] = None
+    borrow_while_ready: bool = False
+    order: tuple[str, ...] = ()
+    #: The need as it is now, where it can change while the request waits — a serving plan's
+    #: gap opening or ending. Called under the dispatch lock: cheap, and never blocking.
+    again: Optional[Callable[["Need"], "Need"]] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -131,13 +142,31 @@ class Dispatcher:
             # own budget — never as borrowing (D165).
             if not host.hosted and host.workload != need.workload and not (need.workload is not None and host.workload is None):
                 continue  # another workload's host: never
+            if (need.borrow_kinds is not None and not host.hosted and host.workload != need.workload
+                    and host.kind not in need.borrow_kinds):
+                continue  # a shared machine of a kind the plan's stop-gap does not name
             variant = self.variant_for(host, need)
             if variant is None:
                 continue
             (own if host.workload == need.workload or host.hosted else shared).append((host, variant))
-        if need.workload is not None and need.may_borrow and not self.ready_for(need):
+        if need.workload is not None and need.may_borrow and (need.borrow_while_ready or not self.ready_for(need)):
             return own + shared
         return own
+
+    @staticmethod
+    def rank(host: Host, need: Need) -> int:
+        """Where a host stands in a plan's order (S19): the workload's own hosts first, then
+        until_ready's sources as the plan lists them, then anything else (a when_full hosted API).
+        Without a plan every host ranks the same, and the tiers alone decide, as always."""
+        if not need.order or host.workload == need.workload and not host.hosted:
+            return 0
+        for index, source in enumerate(need.order, start=1):
+            if source == "hosted" and host.hosted:
+                return index
+            if not host.hosted and (source == "shared" or (source == "local" and host.kind == "local")
+                                    or (source == "fixed" and host.kind == "fixed-remote")):
+                return index
+        return len(need.order) + 1
 
     def has_ready_host(self, workload: Optional[str]) -> bool:
         return any(h.workload == workload and h.state is HostState.READY for h in self.hosts)
@@ -215,6 +244,8 @@ class Dispatcher:
         async with self._condition:
             try:
                 while True:
+                    if need.again is not None:
+                        need = need.again(need)
                     candidates = self.eligible(need, exclude)
                     if not candidates:
                         # Judged within the request's own workload: a workload with no ready host
@@ -272,10 +303,11 @@ class Dispatcher:
         spill = need.hosted_after is not None and (not machines or now >= need.hosted_after)
         # A provider that answered busy is not free until its `retry-after` is over.
         candidates = [(h, v) for h, v in candidates if not (h.hosted and h.cooling_until > now)]
-        for priority in sorted({host.priority for host, _ in candidates}):
+        for rank, priority in sorted({(self.rank(host, need), host.priority) for host, _ in candidates}):
             tier = [
                 (h, v) for h, v in candidates
-                if h.priority == priority and h.idle_worker() is not None and self._may_take(h, need)
+                if h.priority == priority and self.rank(h, need) == rank
+                and h.idle_worker() is not None and self._may_take(h, need)
                 # A host holding several of the workload's models takes its share of each, and a
                 # request past its model's share waits for one to finish — never refused (D118).
                 and not (need.cap is not None and h.workload == need.workload

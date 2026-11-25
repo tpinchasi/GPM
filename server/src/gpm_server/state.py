@@ -62,6 +62,8 @@ class RouterState:
         self.budgets = HostedBudgets()
         #: Each workload's hosted burst, parsed from the policy it was read with.
         self._bursts: dict[str, tuple[Any, Any]] = {}
+        #: Each workload's serving plan, parsed from the policy it was read with (S19).
+        self._plans: dict[str, tuple[Any, Any]] = {}
 
     def hosted_burst_for(self, workload: Optional[str]) -> Any:
         """The hosted burst a request's workload may spill to (D165), or None: the shared
@@ -82,6 +84,26 @@ class RouterState:
             burst = None  # written by a newer supervisor, or damaged: no spill rather than a guess
         self._bursts[workload] = (raw, burst)
         return burst
+
+    def plan_for(self, workload: Optional[str]) -> Any:
+        """A workload's serving plan (S19), or None where its policy carries none — parsed once
+        per version of the policy. One a newer supervisor wrote that this router cannot read is
+        no plan at all: today's fields route it, and they bound every dollar it may spend."""
+        from .serving_plan import PlanRefused, parse_serve
+
+        spec = self.registry.workloads.get(workload) if workload is not None else None
+        raw = (spec.policy or {}).get("serve") if spec is not None else None
+        if not raw:
+            return None
+        cached = self._plans.get(workload)
+        if cached is not None and cached[0] is raw:
+            return cached[1]
+        try:
+            plan = parse_serve(raw)
+        except PlanRefused:
+            plan = None
+        self._plans[workload] = (raw, plan)
+        return plan
 
     def price_of(self, tag: str) -> Any:
         """A catalogued build's price, where it is a hosted build (D164)."""

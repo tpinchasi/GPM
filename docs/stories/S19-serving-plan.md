@@ -238,17 +238,19 @@ After the second architecture and UX reviews (2026-11-25):
 
 ## Build order
 
-1. **The plan, its shorthand and the SDK's `serve=`.** The plan model and its checks. Today's
-   fields compiled into it, proven by a test that routes every existing policy shape the same
-   before and after, with the supervisor stopped too. The routing order written by the
-   supervisor and read by the router, with its stale fallback. A program's grant over sources,
-   checked for each source from the stage that brings it. Every field of a later stage refused in
-   words until that stage ships.
+1. **The plan, its shorthand and the SDK's `serve=`** — **built** (gpm-server 0.46.0,
+   gpm-client 0.10.0). The plan model and its checks. Today's fields compiled into it, proven by
+   a test that routes every existing policy shape the same, with the supervisor up or stopped.
+   The stop-gap for the start (judged by the router) and for a replacement (marked by the
+   supervisor in `serving_gaps`, read with its heartbeat), with `max_min` and the stale fallback
+   — brought forward from stage 3, so the plan's default `during` works from the first stage. A
+   program's grant over sources. One hosted and one rented source. Every field of a later stage
+   refused in words.
 2. **The two request options** (`X-GPM-Priority`, `X-GPM-Keep-On`), enforced in the router's
    choice of eligible hosts. The request log's new columns, stats by priority and by route, and
    `/pool/status` advertising them.
-3. **The stop-gap beyond the start** — replacements, and scale-ups where a plan lists them,
-   `max_min` — **and a budget per named source** under one hosted total, with the request log
+3. **Scale-ups where a plan lists them, and a budget per named source** under one hosted
+   total — several hosted sources, `providers`, a rented source's `kind` — with the request log
    recording which budget paid (today's rows counted under the shorthand's budget).
 4. **Reserved workers** on the operator's own machines.
 5. **Rules**: time windows, budget shares, evictions, steady switches handed over

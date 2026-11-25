@@ -629,6 +629,8 @@ def _provisioner(args: argparse.Namespace) -> int:
                 "idle_end_minutes": args.idle_end_minutes, "max_idle_end_minutes": args.max_idle_end_minutes,
                 "certs": args.certs, "expires_hours": args.expires_hours,
                 "hosted_per_day": args.hosted_per_day, "hosted_per_month": args.hosted_per_month}
+        if args.sources:
+            body["sources"] = [s.strip() for s in args.sources.split(",") if s.strip()]
         status, answer = _control_json(args, "POST", "/pool/provisioners", body)
         if status != 201:
             print(answer.get("detail") or json.dumps(answer), file=sys.stderr)
@@ -928,6 +930,10 @@ def main(argv: list[str] | None = None) -> int:
                              help="hosted-API dollars its workloads may commit a day, together (0: none)")
     provisioner.add_argument("--hosted-per-month", type=float, default=None,
                              help="hosted-API dollars its workloads may commit a month, together")
+    provisioner.add_argument("--sources", default=None,
+                             help="the sources its serving plans may name, comma-separated, of local, fixed, shared, "
+                                  "rented, hosted (default: rented; shared unless --no-borrow; hosted with "
+                                  "--hosted-per-day)")
     provisioner.add_argument("--end-workloads", action="store_true", help="for revoke: end the workloads it made")
     provisioner.add_argument("--url", default=None)
     provisioner.set_defaults(func=_provisioner)

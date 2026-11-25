@@ -42,18 +42,35 @@ class Grant:
     #: budgets' days, and of their months. 0 a day: none of its workloads reaches a hosted API.
     hosted_per_day: float = 0.0
     hosted_per_month: Optional[float] = None
+    #: Which sources its workloads' serving plans may name (S19, D203): of local, fixed, shared,
+    #: rented and hosted. Empty: what the grant allowed before plans — rented; shared where it may
+    #: borrow; hosted where it has hosted dollars. A program never reserves the operator's machines.
+    sources: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         record = dataclasses.asdict(self)
         record["models"] = list(self.models)
         record["kinds"] = list(self.kinds)
+        record["sources"] = list(self.sources)
         return record
+
+    def allowed_sources(self) -> tuple[str, ...]:
+        """The sources its plans may name: as granted, or what the grant allowed before plans."""
+        if self.sources:
+            return self.sources
+        return tuple(s for s, allowed in (("rented", True), ("shared", self.may_borrow),
+                                          ("hosted", self.hosted_per_day > 0)) if allowed)
+
+    def borrows(self) -> bool:
+        """Whether its workloads may borrow: it may, and its sources (if it names them) include
+        one that borrows. A grant naming only `rented` and `hosted` never borrows."""
+        return self.may_borrow and (not self.sources or any(s in ("shared", "local", "fixed") for s in self.sources))
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "Grant":
         fields = {f.name for f in dataclasses.fields(cls)}
         clean = {k: v for k, v in raw.items() if k in fields}
-        for key in ("models", "kinds"):
+        for key in ("models", "kinds", "sources"):
             if key in clean:
                 clean[key] = tuple(clean[key])
         return cls(**clean)

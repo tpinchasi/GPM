@@ -74,6 +74,10 @@ class HostRegistry:
         self.workloads: dict[str, Workload] = {}
         self.grants: dict[str, KeyGrant] = {}
         self.last_workload_revision: Optional[float] = None
+        #: Replacement gaps the supervisor marked (S19, D198), and its last heartbeat: a plan's
+        #: stop-gap is opened only on a recent one (workloads.md §14.7).
+        self.gaps: dict[tuple[str, str], tuple[float, float, frozenset[str]]] = {}
+        self.supervisor_beat: Optional[float] = None
         #: Provisioning keys (D117), as hash → provisioner, for keys neither revoked nor expired.
         self.provisioning_store = ProvisioningStore(table.db)
         self.provisioners: dict[str, KeyReach] = {}
@@ -138,6 +142,13 @@ class HostRegistry:
         if app_key_revision != self.last_app_key_revision:
             self.app_keys = await asyncio.to_thread(self.app_key_store.usable_hashes)
             self.last_app_key_revision = app_key_revision
+        # Every look, not only on a change: a gap opens and a heartbeat moves with nothing else new.
+        gaps, self.supervisor_beat = await asyncio.to_thread(
+            lambda: (self.workload_store.gaps(), self.workload_store.supervisor_heartbeat(self.config.pool.name)))
+        if gaps != self.gaps:
+            # Requests already waiting may now use a stop-gap, or no longer may.
+            self.gaps = gaps
+            await self.dispatcher.wake()
         revision = await asyncio.to_thread(self.workload_store.revision)
         if revision == self.last_workload_revision:
             return False

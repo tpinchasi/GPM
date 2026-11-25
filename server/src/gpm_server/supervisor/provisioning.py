@@ -86,6 +86,14 @@ class Provisioning:
             if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
                                       or not math.isfinite(value) or value < 0):
                 raise WorkloadRefused(f"{field} is a number of dollars, 0 or more")
+        from ..serving_plan import SOURCE_TYPES
+
+        if not isinstance(grant.sources, tuple) or any(s not in SOURCE_TYPES for s in grant.sources):
+            raise WorkloadRefused(f"sources are some of {', '.join(SOURCE_TYPES)} (S19); empty: what the grant "
+                                  "allowed before serving plans")
+        if not grant.may_borrow and any(s in ("shared", "local", "fixed") for s in grant.sources):
+            raise WorkloadRefused("sources shared, local and fixed are borrowed machines; a grant that may not borrow "
+                                  "cannot allow them")
         fleet = self.supervisor.workloads.fleet
         longest = fleet.max_lease_hours() if fleet is not None else None
         if longest is not None and grant.max_hours > longest:
@@ -165,6 +173,7 @@ class Provisioning:
         if workload is None or workload.provisioner != provisioner.name:
             raise WorkloadRefused("no such workload of this key")
         policy = parse_policy(request.body if isinstance(request.body, dict) else {})
+        self._sources_refusal(provisioner.grant, policy, workload.on_machines)
         refusal = self._hosted_refusal(provisioner, policy, replacing=workload.name)
         if refusal:
             raise WorkloadRefused(refusal)
@@ -252,9 +261,29 @@ class Provisioning:
         idle = grant.idle_end_minutes if idle is None else idle
         if idle > grant.max_idle_end_minutes:
             raise WorkloadRefused(f"an idle cutoff of at most {grant.max_idle_end_minutes:g} minutes")
+        policy = parse_policy(body)
+        self._sources_refusal(grant, policy, any(t.on_machines for t in targets))
         req = WorkloadRequest.of(name, targets, hours, max_spend=spend, kind=kind, placement=placement,
-                                 policy=parse_policy(body))
-        return req, idle, grant.may_borrow
+                                 policy=policy)
+        return req, idle, grant.borrows()
+
+    @staticmethod
+    def _sources_refusal(grant: Any, policy: dict, on_machines: bool = True) -> None:
+        """A workload uses only the sources the key's grant allows (S19, D203): those its serving
+        plan names, or, with none, those today's fields mean (the shorthand). One served by hosted
+        APIs alone rents no steady machines."""
+        from ..serving_plan import from_bursts, plan_of
+
+        plan = plan_of(policy)
+        if plan is None:
+            if not grant.sources:
+                return  # a grant from before plans: its own checks hold the shorthand, as before
+            plan = from_bursts(policy, grant.borrows())
+        used = plan.source_types() if on_machines else {s.type for s in (*plan.until_ready, *plan.when_full)}
+        named = sorted(used - set(grant.allowed_sources()))
+        if named:
+            raise WorkloadRefused(f"this key's grant allows the sources {list(grant.allowed_sources())}, not {named}; "
+                                  "the operator grants more")
 
     async def _plan(self, provisioner: Any, body: dict) -> dict:
         key = (provisioner.name, repr(sorted((k, v) for k, v in body.items() if k not in ("key_hash", "csr"))))

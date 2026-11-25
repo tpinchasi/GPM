@@ -45,6 +45,16 @@ def parse_policy(body: dict) -> dict[str, Any]:
     if "steady" in body:
         raise WorkloadRefused("a workload's steady capacity is its parallel at its latency_s: send those, and "
                               "the pool works out the hosts that meet them")
+    if body.get("serve") is not None:
+        # A serving plan (S19, D198): today's bursts are its shorthand, so the two never mix.
+        from ..serving_plan import PlanRefused, compile_policy, parse_serve
+
+        if body.get("bursts") is not None:
+            raise WorkloadRefused("send bursts or serve, not both: bursts are shorthand for a serving plan's when_full")
+        try:
+            return compile_policy(parse_serve(body["serve"]))
+        except PlanRefused as exc:
+            raise WorkloadRefused(str(exc)) from None
     bursts = body.get("bursts")
     if bursts is None:
         return {}
@@ -71,6 +81,13 @@ def parse_policy(body: dict) -> dict[str, Any]:
 
 def describe_policy(policy: dict[str, Any]) -> str:
     """A policy in words, for the event log."""
+    if policy.get("serve"):
+        from ..serving_plan import PlanRefused, describe, parse_serve
+
+        try:
+            return "serving plan: " + describe(parse_serve(policy["serve"]))
+        except PlanRefused:
+            return "a serving plan this supervisor cannot read"
     said = []
     hosted, rented = policy.get("hosted"), policy.get("rented")
     if hosted:
@@ -880,6 +897,9 @@ class Workloads:
         workload = self.get(name)
         if workload.state not in ("preparing", "serving"):
             raise WorkloadRefused(f"workload {name!r} is {workload.state}; its policy can no longer change")
+        if (workload.policy or {}).get("serve") and not policy.get("serve"):
+            raise WorkloadRefused(f"workload {name!r} has a serving plan; change it with serve — its bursts are the "
+                                  "plan's when_full")
         self.check_policy(workload.targets, policy)
         self.store.set_policy(name, policy)
         self.supervisor.events.record(
@@ -993,7 +1013,57 @@ class Workloads:
                     "workload_ended", f"workload {workload.name}: its last host is gone",
                     numbers={"workload": workload.name}, lease_id=workload.lease_id,
                 )
-        return [w for w in self.store.active() if w.state in ("preparing", "serving", "ending")]
+        current = self.store.active()
+        self._mark_gaps(now, current)
+        return [w for w in current if w.state in ("preparing", "serving", "ending")]
+
+    def _mark_gaps(self, now: float, active: list[Workload]) -> None:
+        """Mark each replacement a serving plan covers (S19, D198): while a serving workload's
+        ready hosts of a group, bought for its base and not for a burst, are fewer than the group
+        planned and its lease is open — the fleet replacing what it lost — its models may use the
+        plan's until_ready, from the moment they fell short and for at most the plan's `max_min`.
+        Once per shortfall: a replacement retried keeps the gap it had. Written only on a change;
+        the router ends a gap itself the moment a host not ready as it opened is."""
+        from ..serving_plan import PlanRefused, plan_of
+
+        marked = self.store.gaps()
+        wanted: set[tuple[str, str]] = set()
+        for workload in active:
+            policy = workload.policy or {}
+            if workload.state != "serving" or "serve" not in policy:
+                continue
+            try:
+                plan = plan_of(policy)
+            except PlanRefused:
+                continue
+            if plan is None or not plan.until_ready or "replacement" not in plan.during or plan.max_min is None:
+                continue
+            lease = self.supervisor.leases.get(workload.lease_id)
+            if lease is None or not lease.is_open:
+                continue
+            hosts = self.fleet.hosts_of(workload.name) if self.fleet is not None else []
+            for group in workload.groups:
+                held = [h for h in hosts if group.holds(h.models) and h.state == "ready"]
+                base = [h for h in held if not getattr(h, "burst", False)]
+                if len(base) >= group.hosts_at_start:
+                    continue
+                for model in group.models:
+                    key = (workload.name, model)
+                    wanted.add(key)
+                    if key in marked:
+                        continue  # once per shortfall: never extended, never re-read
+                    ends_at = now + plan.max_min * 60
+                    self.store.open_gap(workload.name, model, now, ends_at, [h.host_id for h in held])
+                    self.supervisor.events.record(
+                        "workload_covering",
+                        f"workload {workload.name}: {len(base)} of {group.hosts_at_start} host(s) ready for "
+                        f"{model}; its plan's until_ready covers for at most {plan.max_min:g} min",
+                        numbers={"workload": workload.name, "model": model, "ends_at": ends_at},
+                        lease_id=workload.lease_id,
+                    )
+        for key in marked:
+            if key not in wanted:
+                self.store.close_gap(*key)
 
     def view(self, workload: Workload) -> dict[str, Any]:
         """What the operator sees: the workload, its hosts, its spend against its cap, and how
