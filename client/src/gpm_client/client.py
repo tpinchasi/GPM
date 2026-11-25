@@ -20,7 +20,7 @@ from typing import Any, BinaryIO, Iterable, Optional, Union
 import httpx
 
 from .config import env_api_key, env_url, pool_root
-from .errors import PoolUnavailable
+from .errors import PoolOptionNotHonoured, PoolUnavailable
 from .retry import RetryPolicy
 from .transport import async_pool_transport, pool_transport
 
@@ -39,6 +39,9 @@ class Reply:
     #: What a hosted API's answer cost the app's budget, in dollars (`X-GPM-Cost-USD`); None
     #: for an answer from a machine, which is paid for by the hour.
     cost_usd: Optional[float] = None
+    #: Which role of the workload's serving plan, and which source, answered (`X-GPM-Route`):
+    #: `steady/rented`, `until_ready/shared`, `when_full/hosted`, ...; None from an older pool.
+    route: Optional[str] = None
     raw: dict = dataclasses.field(default_factory=dict, repr=False)
 
 
@@ -52,6 +55,7 @@ class Transcript:
     runtime_class: Optional[str] = None
     wait_s: Optional[float] = None
     cost_usd: Optional[float] = None
+    route: Optional[str] = None
     raw: Union[dict, str] = dataclasses.field(default_factory=dict, repr=False)
 
 
@@ -78,6 +82,7 @@ class Ranking(list):
         runtime_class: Optional[str] = None,
         wait_s: Optional[float] = None,
         cost_usd: Optional[float] = None,
+        route: Optional[str] = None,
         raw: Optional[dict] = None,
     ):
         super().__init__(ranked)
@@ -86,6 +91,7 @@ class Ranking(list):
         self.runtime_class = runtime_class
         self.wait_s = wait_s
         self.cost_usd = cost_usd
+        self.route = route
         self.raw = raw if raw is not None else {}
 
 
@@ -100,6 +106,9 @@ class Prediction:
     runtime_class: Optional[str] = None
     wait_s: Optional[float] = None
     cost_usd: Optional[float] = None
+    #: Which role of the workload's serving plan, and which source, answered (`X-GPM-Route`):
+    #: `steady/rented`, `until_ready/shared`, `when_full/hosted`, ...; None from an older pool.
+    route: Optional[str] = None
     raw: dict = dataclasses.field(default_factory=dict, repr=False)
 
     def __getitem__(self, name: str) -> Any:
@@ -180,6 +189,7 @@ def _facts(response: httpx.Response, model: Optional[str] = None) -> dict[str, A
         "runtime_class": response.headers.get("X-GPM-Runtime-Class"),
         "wait_s": _float_or_none(response.headers.get("X-GPM-Wait-S")),
         "cost_usd": _float_or_none(response.headers.get("X-GPM-Cost-USD")),
+        "route": response.headers.get("X-GPM-Route"),
     }
 
 
@@ -373,6 +383,46 @@ def _budget_from_status(data: dict, current: httpx.Timeout) -> Optional[httpx.Ti
     )
 
 
+#: A request's options and their values (S19, D201; app contract §2): what a call may send.
+OPTIONS = {"priority": ("interactive", "batch"), "keep_on": ("no_hosted", "owned", "any")}
+_OPTION_HEADERS = {"priority": "X-GPM-Priority", "keep_on": "X-GPM-Keep-On"}
+
+
+def _options(priority: Optional[str], keep_on: Optional[str]) -> dict[str, str]:
+    """The options given, checked here so a misspelt one fails before anything is sent."""
+    given = {}
+    for option, value in (("priority", priority), ("keep_on", keep_on)):
+        if value is None:
+            continue
+        if value not in OPTIONS[option]:
+            raise ValueError(f"{option} is {', '.join(OPTIONS[option][:-1])} or {OPTIONS[option][-1]}, not {value!r}")
+        given[option] = value
+    return given
+
+
+def _honoured_by(response: httpx.Response) -> dict:
+    """The options a pool lists in its status; none from a pool older than them."""
+    try:
+        data = response.json()
+    except ValueError:
+        return {}
+    options = data.get("options") if isinstance(data, dict) else None
+    return options if isinstance(options, dict) else {}
+
+
+def _option_headers(options: dict[str, str], honoured: dict) -> dict[str, str]:
+    """The headers for `options`, refusing one the pool does not list: an older pool would
+    ignore it, and a request meant to stay off hosted APIs must not travel as if it had not
+    asked."""
+    headers = {}
+    for option, value in options.items():
+        if value not in (honoured.get(option) or ()):
+            raise PoolOptionNotHonoured(f"this pool does not honour {_OPTION_HEADERS[option]}: {value}; it lists no "
+                                        "such option in its status, so the request was not sent")
+        headers[_OPTION_HEADERS[option]] = value
+    return headers
+
+
 class PoolClient:
     def __init__(
         self,
@@ -382,9 +432,15 @@ class PoolClient:
         transport: Optional[httpx.BaseTransport] = None,
         timeout: httpx.Timeout = _DEFAULT_TIMEOUT,
         api: str = "openai",
+        priority: Optional[str] = None,
+        keep_on: Optional[str] = None,
     ):
         if api not in DIALECTS:
             raise ValueError(f"api must be one of {sorted(DIALECTS)}, not {api!r}")
+        #: The request options every call sends unless it says otherwise (S19, D201).
+        self._options = _options(priority, keep_on)
+        #: The options the pool says it honours, read from its status the first time one is sent.
+        self._honoured: Optional[dict] = None
         self.base_url = pool_root(base_url or env_url())
         self.api_key = api_key or env_api_key()
         self._paths = DIALECTS[api]
@@ -405,6 +461,8 @@ class PoolClient:
         format: Any = None,
         session_id: Optional[str] = None,
         tools: Optional[list[dict]] = None,
+        priority: Optional[str] = None,
+        keep_on: Optional[str] = None,
         **kwargs: Any,
     ) -> Reply:
         body: dict[str, Any] = {"model": model, "messages": messages, "stream": False}
@@ -413,13 +471,14 @@ class PoolClient:
         if tools is not None:
             body["tools"] = tools
         body.update(kwargs)
-        headers = {"X-GPM-Session": session_id} if session_id else {}
+        headers = self._headers(session_id, priority, keep_on)
         response = self._client.post(self._paths["chat"], json=body, headers=headers)
         return _reply_from_response(response)
 
-    def embed(self, model: str, texts: list[str], *, session_id: Optional[str] = None) -> list[list[float]]:
+    def embed(self, model: str, texts: list[str], *, session_id: Optional[str] = None,
+                    priority: Optional[str] = None, keep_on: Optional[str] = None) -> list[list[float]]:
         body = {"model": model, "input": texts}
-        headers = {"X-GPM-Session": session_id} if session_id else {}
+        headers = self._headers(session_id, priority, keep_on)
         response = self._client.post(self._paths["embed"], json=body, headers=headers)
         return _embeddings_of(response.json())
 
@@ -434,6 +493,8 @@ class PoolClient:
         temperature: Optional[float] = None,
         session_id: Optional[str] = None,
         read_timeout_s: Optional[float] = None,
+        priority: Optional[str] = None,
+        keep_on: Optional[str] = None,
     ) -> Transcript:
         """A recording turned into text. `file` is a path, bytes or a binary file object.
 
@@ -446,7 +507,7 @@ class PoolClient:
             model, file, language=language, prompt=prompt,
             response_format=response_format, temperature=temperature,
         )
-        headers = {"X-GPM-Session": session_id} if session_id else {}
+        headers = self._headers(session_id, priority, keep_on)
         timeout = _transcribe_timeout(self._client.timeout, read_timeout_s)
         response = self._client.post(_TRANSCRIBE_PATH, headers=headers, timeout=timeout, **upload)
         return _transcript_from_response(response, response_format)
@@ -459,19 +520,34 @@ class PoolClient:
         *,
         top_n: Optional[int] = None,
         session_id: Optional[str] = None,
+        priority: Optional[str] = None,
+        keep_on: Optional[str] = None,
     ) -> Ranking:
         """`documents` ranked against `query`, best first, with the facts of the call."""
-        headers = {"X-GPM-Session": session_id} if session_id else {}
+        headers = self._headers(session_id, priority, keep_on)
         body = _rerank_body(model, query, documents, top_n)
         response = self._client.post(_RERANK_PATH, json=body, headers=headers)
         return _ranking_from_response(response)
 
-    def predict(self, model: str, inputs: dict, *, session_id: Optional[str] = None) -> Prediction:
+    def predict(self, model: str, inputs: dict, *, session_id: Optional[str] = None,
+                      priority: Optional[str] = None, keep_on: Optional[str] = None) -> Prediction:
         """A trained model's answer to `inputs` — named as its build declares them; a picture as
         bytes (D178). `prediction["label"]` reads one output."""
-        headers = {"X-GPM-Session": session_id} if session_id else {}
+        headers = self._headers(session_id, priority, keep_on)
         response = self._client.post(_PREDICT_PATH, json=_predict_body(model, inputs), headers=headers)
         return _prediction_from_response(response)
+
+    def _headers(self, session_id: Optional[str], priority: Optional[str], keep_on: Optional[str]) -> dict[str, str]:
+        headers = {"X-GPM-Session": session_id} if session_id else {}
+        options = {**self._options, **_options(priority, keep_on)}
+        if options:
+            honoured = self._honoured
+            if honoured is None:
+                honoured = _honoured_by(self._client.get("/pool/status"))
+                # Kept only once the pool lists options: one upgraded later is asked again.
+                self._honoured = honoured or None
+            headers.update(_option_headers(options, honoured))
+        return headers
 
     def wait_until_ready(self, timeout: Optional[float] = None) -> None:
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -512,9 +588,15 @@ class AsyncPoolClient:
         transport: Optional[httpx.AsyncBaseTransport] = None,
         timeout: httpx.Timeout = _DEFAULT_TIMEOUT,
         api: str = "openai",
+        priority: Optional[str] = None,
+        keep_on: Optional[str] = None,
     ):
         if api not in DIALECTS:
             raise ValueError(f"api must be one of {sorted(DIALECTS)}, not {api!r}")
+        #: The request options every call sends unless it says otherwise (S19, D201).
+        self._options = _options(priority, keep_on)
+        #: The options the pool says it honours, read from its status the first time one is sent.
+        self._honoured: Optional[dict] = None
         self.base_url = pool_root(base_url or env_url())
         self.api_key = api_key or env_api_key()
         self._paths = DIALECTS[api]
@@ -535,6 +617,8 @@ class AsyncPoolClient:
         format: Any = None,
         session_id: Optional[str] = None,
         tools: Optional[list[dict]] = None,
+        priority: Optional[str] = None,
+        keep_on: Optional[str] = None,
         **kwargs: Any,
     ) -> Reply:
         body: dict[str, Any] = {"model": model, "messages": messages, "stream": False}
@@ -543,13 +627,14 @@ class AsyncPoolClient:
         if tools is not None:
             body["tools"] = tools
         body.update(kwargs)
-        headers = {"X-GPM-Session": session_id} if session_id else {}
+        headers = await self._headers(session_id, priority, keep_on)
         response = await self._client.post(self._paths["chat"], json=body, headers=headers)
         return _reply_from_response(response)
 
-    async def embed(self, model: str, texts: list[str], *, session_id: Optional[str] = None) -> list[list[float]]:
+    async def embed(self, model: str, texts: list[str], *, session_id: Optional[str] = None,
+                    priority: Optional[str] = None, keep_on: Optional[str] = None) -> list[list[float]]:
         body = {"model": model, "input": texts}
-        headers = {"X-GPM-Session": session_id} if session_id else {}
+        headers = await self._headers(session_id, priority, keep_on)
         response = await self._client.post(self._paths["embed"], json=body, headers=headers)
         return _embeddings_of(response.json())
 
@@ -564,13 +649,15 @@ class AsyncPoolClient:
         temperature: Optional[float] = None,
         session_id: Optional[str] = None,
         read_timeout_s: Optional[float] = None,
+        priority: Optional[str] = None,
+        keep_on: Optional[str] = None,
     ) -> Transcript:
         """See `PoolClient.transcribe`."""
         upload = _transcription_upload(
             model, file, language=language, prompt=prompt,
             response_format=response_format, temperature=temperature,
         )
-        headers = {"X-GPM-Session": session_id} if session_id else {}
+        headers = await self._headers(session_id, priority, keep_on)
         timeout = _transcribe_timeout(self._client.timeout, read_timeout_s)
         response = await self._client.post(_TRANSCRIBE_PATH, headers=headers, timeout=timeout, **upload)
         return _transcript_from_response(response, response_format)
@@ -583,18 +670,33 @@ class AsyncPoolClient:
         *,
         top_n: Optional[int] = None,
         session_id: Optional[str] = None,
+        priority: Optional[str] = None,
+        keep_on: Optional[str] = None,
     ) -> Ranking:
         """See `PoolClient.rerank`."""
-        headers = {"X-GPM-Session": session_id} if session_id else {}
+        headers = await self._headers(session_id, priority, keep_on)
         body = _rerank_body(model, query, documents, top_n)
         response = await self._client.post(_RERANK_PATH, json=body, headers=headers)
         return _ranking_from_response(response)
 
-    async def predict(self, model: str, inputs: dict, *, session_id: Optional[str] = None) -> Prediction:
+    async def predict(self, model: str, inputs: dict, *, session_id: Optional[str] = None,
+                      priority: Optional[str] = None, keep_on: Optional[str] = None) -> Prediction:
         """See `PoolClient.predict`."""
-        headers = {"X-GPM-Session": session_id} if session_id else {}
+        headers = await self._headers(session_id, priority, keep_on)
         response = await self._client.post(_PREDICT_PATH, json=_predict_body(model, inputs), headers=headers)
         return _prediction_from_response(response)
+
+    async def _headers(self, session_id: Optional[str], priority: Optional[str], keep_on: Optional[str]) -> dict[str, str]:
+        headers = {"X-GPM-Session": session_id} if session_id else {}
+        options = {**self._options, **_options(priority, keep_on)}
+        if options:
+            honoured = self._honoured
+            if honoured is None:
+                honoured = _honoured_by(await self._client.get("/pool/status"))
+                # Kept only once the pool lists options: one upgraded later is asked again.
+                self._honoured = honoured or None
+            headers.update(_option_headers(options, honoured))
+        return headers
 
     async def wait_until_ready(self, timeout: Optional[float] = None) -> None:
         deadline = None if timeout is None else time.monotonic() + timeout

@@ -62,6 +62,10 @@ class Need:
     #: The need as it is now, where it can change while the request waits — a serving plan's
     #: gap opening or ending. Called under the dispatch lock: cheap, and never blocking.
     again: Optional[Callable[["Need"], "Need"]] = None
+    #: What the request's options keep it off (S19, D201): `hosted` — every hosted API; `rented`
+    #: — every rented machine, the workload's own included. Removed here, where every attempt,
+    #: retry and failover chooses, so nothing passes around them.
+    kept_off: frozenset[str] = frozenset()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -137,6 +141,10 @@ class Dispatcher:
             if host.hosted and (need.hosted_after is None or need.reserve is None or host.out_of_funds is not None):
                 continue  # only within a hosted burst, and never a provider out of money
             if need.engines and host.engine not in need.engines:
+                continue
+            if host.hosted and "hosted" in need.kept_off:
+                continue
+            if host.kind.startswith("rented") and "rented" in need.kept_off:
                 continue
             # A hosted API is the pool's, and every workload with a hosted burst reaches it on its
             # own budget — never as borrowing (D165).

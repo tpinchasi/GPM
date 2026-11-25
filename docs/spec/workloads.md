@@ -510,9 +510,10 @@ the start (§14.1).
 > Decided 2026-11-24 (S19), revised after two rounds of architecture and UX review (the second
 > 2026-11-25). **Stage 1 built** (gpm-server 0.46.0): `serve` with `until_ready` (start and
 > replacement, `max_min`) and `when_full`, one hosted and one rented source, the shorthand, a
-> program's grant `sources`, and the replacement gaps of the routing order (14.7). The rest is
-> refused in words until its stage ships; until then §4 and §13 are what runs for everything
-> else.
+> program's grant `sources`, and the replacement gaps of the routing order (14.7). **Stage 2
+> built** (gpm-server 0.47.0): the request options `priority` and `keep_on` with a plan's
+> `defaults` (14.4), `X-GPM-Route`, and stats by priority and by route. The rest is refused in
+> words until its stage ships; until then §4 and §13 are what runs for everything else.
 
 A workload's serving plan, `serve`, says **where its requests go and when**. How much it must
 serve stays in `parallel`, `latency_s`, the kind of machine (`machines=` in the SDK, `kind` in the
@@ -719,9 +720,23 @@ takes effect at the first minute after it, and one it repeats, at the first occu
   further; only `any` lifts a default, and nothing widens past the plan.
 - **`no_hosted` still reaches rented machines**, whose operators can read what reaches them (T7);
   `owned` does not, though a `fixed` machine is only as private as whoever runs it.
+- **With none sent and no plan default**, a request is `interactive` and `any`.
+- **What "allowed" means.** `no_hosted` and `batch` remove hosted APIs; `owned` removes hosted
+  APIs and every rented machine, the workload's own included. The router looks, as the request
+  arrives, at every host the request could ever reach — its workload's own in any state, the
+  shared workload's of a kind it may borrow now or that its plan's stop-gap could borrow in a
+  replacement, a hosted API where it has a hosted burst — and where hosts exist and the options
+  remove them all, answers `503 no_allowed_source` at once, naming the option, whether it was
+  the plan's default, and whether lifting it alone would help.
+- **A default that could never be served is refused** when the plan is set: `keep_on: owned`
+  while steady is rented machines (until reserved workers arrive), and a default that keeps
+  requests off hosted APIs for a model served by hosted APIs alone.
 - **Logging and stats.** The request log keeps `priority`, `keep_on` and `route`; `GET
-  /pool/stats` takes `by=priority` and `by=route`. `GET /pool/status` lists the options the pool
-  honours, and the SDK refuses to send one a pool does not list.
+  /pool/stats` takes `by=priority`, `by=keep_on` and `by=route`, from an hourly table of their own
+  (`stats_options_hourly`, by workload, app, model and kind; a host or provider filter with them
+  is refused, `400`). `GET /pool/status` lists the options the pool honours, and the SDK refuses
+  to send one a pool does not list (`PoolOptionNotHonoured`, nothing sent; a pool that lists none
+  is asked again on the next call, so an upgrade is seen).
 
 ### 14.5 A substitute model (D202)
 
@@ -808,4 +823,7 @@ The plan check — `POST /pool/workloads/plan` with `serve`, or `gpm workload pl
   that serves.
 - Every answer carries `X-GPM-Route: <role>/<source name>` (`steady/rented`,
   `until_ready/shared`, `when_full/hosted-burst`, `substitute/<model>`); the SDK gives
-  `reply.route`.
+  `reply.route`. A workload with no plan is labelled by the plan its fields mean; a request on the
+  app key alone is `steady/shared` on the shared workload's machines and `when_full/hosted` on
+  the pool's hosted burst. A rented host bought for a burst is `when_full/<its source>`: the
+  supervisor publishes which hosts were (`hosts.burst`).

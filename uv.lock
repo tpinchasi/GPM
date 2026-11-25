@@ -281,7 +281,7 @@ requires-dist = [
 
 [[package]]
 name = "gpm-client"
-version = "0.10.0"
+version = "0.11.0"
 source = { editable = "client" }
 dependencies = [
     { name = "httpx" },
@@ -301,7 +301,7 @@ provides-extras = ["certs"]
 
 [[package]]
 name = "gpm-server"
-version = "0.46.0"
+version = "0.47.0"
 source = { editable = "server" }
 dependencies = [
     { name = "cryptography" },

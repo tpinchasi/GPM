@@ -949,7 +949,8 @@ def main(argv: list[str] | None = None) -> int:
 
     stats_cmd = subparsers.add_parser("stats", help="requests, errors, latency, tokens and cost over a range (D196)")
     stats_cmd.add_argument("--range", default="24h", help="24h, 7d, 30d …")
-    stats_cmd.add_argument("--by", choices=["app", "model", "host", "provider", "kind"], default=None)
+    stats_cmd.add_argument("--by", choices=["app", "model", "host", "provider", "kind", "priority", "keep_on", "route"],
+                           default=None)
     stats_cmd.add_argument("--bucket", choices=["hour", "day"], default=None)
     stats_cmd.add_argument("--url", default=None)
     stats_cmd.set_defaults(func=_stats)

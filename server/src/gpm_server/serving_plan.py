@@ -10,9 +10,8 @@ the plan they mean (the shorthand), and works out — from facts the router hand
 request may be routed now. Nothing here touches the database, the clock or the network.
 
 Built in stages (the story's build order). What this stage does not do yet is refused in words,
-never accepted and ignored: rules, request options and their defaults, a substitute, reserved
-workers, a steady source other than rented machines, covering a scale-up, `providers`, and more
-than one hosted or rented source.
+never accepted and ignored: rules, a substitute, reserved workers, a steady source other than
+rented machines, covering a scale-up, `providers`, and more than one hosted or rented source.
 """
 
 from __future__ import annotations
@@ -38,12 +37,16 @@ HOST_KINDS = {"local": ("local",), "fixed": ("fixed-remote",)}
 #: Fields of the plan a later stage brings; refused in words until then.
 LATER = {
     "rules": "rules arrive in a later version of the pool",
-    "defaults": "request options and their defaults arrive in a later version of the pool",
     "substitute": "a substitute model arrives in a later version of the pool",
     "reserve": "reserved workers arrive in a later version of the pool",
     "tz": "a plan's time zone comes with its rules, in a later version of the pool",
 }
-_TOP = ("steady", "until_ready", "when_full", "during", "max_min", *LATER)
+#: A request's options (§14.4, D201): each header's values, and the one meant when a request sends
+#: none and its plan names no default.
+OPTIONS = {"priority": ("interactive", "batch"), "keep_on": ("no_hosted", "owned", "any")}
+DEFAULT_OPTIONS = {"priority": "interactive", "keep_on": "any"}
+OPTION_HEADERS = {"priority": "X-GPM-Priority", "keep_on": "X-GPM-Keep-On"}
+_TOP = ("steady", "until_ready", "when_full", "during", "max_min", "defaults", *LATER)
 #: A stop-gap's longest gap, minutes: a day. Longer is not a stop-gap.
 MAX_MAX_MIN = 24 * 60
 
@@ -91,6 +94,8 @@ class ServingPlan:
     #: None: no limit — only the shorthand, which is today's borrowing, has none.
     max_min: Optional[float] = DEFAULT_MAX_MIN
     when_full: tuple[Source, ...] = ()
+    #: A request option's value where a request sends none (§14.4).
+    defaults: Mapping[str, str] = dataclasses.field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         written: dict[str, Any] = {"steady": self.steady}
@@ -102,6 +107,8 @@ class ServingPlan:
             # A source until_ready defines is the same source here: written by its name.
             written["when_full"] = [s.name if any(s is u for u in self.until_ready) else s.as_dict()
                                     for s in self.when_full]
+        if self.defaults:
+            written["defaults"] = dict(self.defaults)
         return written
 
     def source_types(self) -> set[str]:
@@ -266,7 +273,7 @@ def parse_serve(raw: Any) -> ServingPlan:
             raise PlanRefused(f"serve.{field}: {why}")
     unknown = sorted(set(raw) - set(_TOP))
     if unknown:
-        raise PlanRefused(f"serve takes steady, until_ready, during, max_min and when_full, not {unknown}")
+        raise PlanRefused(f"serve takes steady, until_ready, during, max_min, when_full and defaults, not {unknown}")
 
     steady = raw.get("steady", "rented")
     if steady != "rented":
@@ -315,7 +322,106 @@ def parse_serve(raw: Any) -> ServingPlan:
         during = tuple(d for d in DURING if d in listed)
     if "max_min" in raw:
         max_min = _number(raw["max_min"], "serve.max_min", low=1, high=MAX_MAX_MIN)
-    return ServingPlan(steady="rented", until_ready=until_ready, during=during, max_min=max_min, when_full=when_full)
+    return ServingPlan(steady="rented", until_ready=until_ready, during=during, max_min=max_min, when_full=when_full,
+                       defaults=_defaults(raw.get("defaults")))
+
+
+def _defaults(raw: Any) -> dict[str, str]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise PlanRefused("serve.defaults is an object: {\"priority\": ..., \"keep_on\": ...}")
+    if "substitute" in raw:
+        raise PlanRefused("serve.defaults.substitute: a substitute model arrives in a later version of the pool")
+    unknown = sorted(set(raw) - set(OPTIONS))
+    if unknown:
+        raise PlanRefused(f"serve.defaults takes priority and keep_on, not {unknown}")
+    for option, value in raw.items():
+        if value not in OPTIONS[option]:
+            raise PlanRefused(f"serve.defaults.{option} is {_listed(OPTIONS[option])}")
+    if raw.get("keep_on") == "owned":
+        # Steady is the workload's rented machines until reserved workers arrive: `owned` by
+        # default would leave a request that sends nothing no source once the workload serves.
+        raise PlanRefused("serve.defaults.keep_on owned keeps every request off the workload's own rented machines, "
+                          "where it runs; it needs a steady source the operator owns (reserved workers), which "
+                          "arrives in a later version of the pool. A request may still send it")
+    return dict(raw)
+
+
+def _listed(values: tuple[str, ...]) -> str:
+    return ", ".join(values[:-1]) + " or " + values[-1]
+
+
+# --- a request's options (§14.4, D201) ---
+
+
+def request_options(plan: Optional[ServingPlan], priority: Optional[str], keep_on: Optional[str]) -> tuple[str, str]:
+    """The options a request travels with: what it sent, else its plan's default, else the first
+    of each list. A value not on its list is refused (ValueError, the router's `unknown_option`):
+    a misspelt option never passes as none."""
+    defaults = plan.defaults if plan is not None else {}
+    chosen = []
+    for option, sent in (("priority", priority), ("keep_on", keep_on)):
+        if sent is not None:
+            sent = sent.strip().lower()
+            if sent not in OPTIONS[option]:
+                raise ValueError(f"{OPTION_HEADERS[option]} is {_listed(OPTIONS[option])}")
+            chosen.append(sent)
+        else:
+            chosen.append(defaults.get(option, DEFAULT_OPTIONS[option]))
+    return chosen[0], chosen[1]
+
+
+def kept_off(priority: str, keep_on: str) -> frozenset[str]:
+    """What the options keep a request off, of `hosted` and `rented`: `batch` and `no_hosted`
+    every hosted API; `owned` those and every rented machine, the workload's own included."""
+    off = set()
+    if priority == "batch" or keep_on in ("no_hosted", "owned"):
+        off.add("hosted")
+    if keep_on == "owned":
+        off.add("rented")
+    return frozenset(off)
+
+
+def why_kept_off(plan: Optional[ServingPlan], priority: Optional[str], keep_on: Optional[str],
+                 chosen: tuple[str, str]) -> str:
+    """The option that left a request nowhere to go, in words: the header, or the plan's default."""
+    parts = []
+    # Lifting one option helps only where the other does not keep the request off as well.
+    both = chosen[0] == "batch" and chosen[1] in ("no_hosted", "owned")
+    for option, sent, value in (("keep_on", keep_on, chosen[1]), ("priority", priority, chosen[0])):
+        if value == DEFAULT_OPTIONS[option]:
+            continue
+        said = f"{OPTION_HEADERS[option]}: {value}"
+        if sent is None:
+            lift = "" if both else f"; send {DEFAULT_OPTIONS[option]} to lift it"
+            said += f" (the plan's default{lift})"
+        parts.append(said)
+    return "; ".join(parts)
+
+
+# --- the route an answer took ---
+
+
+def route_label(plan: ServingPlan, *, hosted: bool, own: bool, burst: bool, host_kind: str, covering: bool) -> str:
+    """`<role>/<source name>` for an answer (§14.7): the workload's own machine is steady, or
+    when_full where it was bought for a burst; a borrowed one is the until_ready source it matched;
+    a hosted API is until_ready's while the workload is covered and its until_ready has one, else
+    when_full's."""
+    if hosted:
+        source = (plan.until_ready_hosted() if covering else None) or plan.when_full_hosted() or plan.hosted()
+        role = "until_ready" if source is not None and any(source is s for s in plan.until_ready) and (
+            covering or plan.when_full_hosted() is None) else "when_full"
+        return f"{role}/{source.name if source is not None else 'hosted'}"
+    if own:
+        if burst:
+            rented = plan.rented()
+            return f"when_full/{rented.name if rented is not None else 'rented'}"
+        return f"steady/{plan.steady}"
+    for source in plan.until_ready:
+        if source.type == "shared" or (source.type in HOST_KINDS and host_kind in HOST_KINDS[source.type]):
+            return f"until_ready/{source.name}"
+    return "until_ready/shared"
 
 
 # --- today's fields as a plan (the shorthand) ---

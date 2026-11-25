@@ -16,8 +16,9 @@ import httpx
 from .errors import PoolAuthError, PoolRequestError, PoolStreamInterrupted, PoolUnavailable
 from .retry import RetryPolicy
 
-#: 503 reasons that no wait will change: the workload has ended (app contract §3).
-FINAL_503 = frozenset({"workload_ended"})
+#: 503 reasons that no wait will change: the workload has ended (app contract §3); the request's
+#: options leave it no source (D201).
+FINAL_503 = frozenset({"workload_ended", "no_allowed_source"})
 
 
 def _parse_503(response: httpx.Response) -> tuple[Optional[str], Optional[float], Optional[str]]:

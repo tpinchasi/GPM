@@ -91,7 +91,6 @@ def test_a_plan_that_cannot_be_served_is_refused_in_words(serve, says):
 
 @pytest.mark.parametrize("serve, says", [
     ({"rules": []}, "rules arrive in a later version"),
-    ({"defaults": {"keep_on": "no_hosted"}}, "request options and their defaults arrive"),
     ({"substitute": [{"model": "small", "after_s": 20}]}, "a substitute model arrives"),
     ({"reserve": {"local": 4}}, "reserved workers arrive"),
     ({"tz": "UTC"}, "comes with its rules"),

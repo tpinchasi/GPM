@@ -72,6 +72,45 @@ _COUNTS = ("requests", "ok", "rejected", "failed", "cancelled", "status_4xx", "s
            "borrowed", "tokens_in", "tokens_out", "latency_n", "latency_sum_ms", "busy_ms", "queue_n",
            "queue_sum_ms", "cost_usd")
 _REQUEST_KEY = ("hour", "workload", "app", "model", "host_id", "host_kind", "provider", "kind")
+_OPTIONS_KEY = ("hour", "workload", "app", "model", "kind", "priority", "keep_on", "route")
+
+
+def _count(row: dict[str, Any], r: Any) -> None:
+    """Add one request-log row to an hourly row's counts."""
+    if r["reason"] == "provider_out_of_funds":
+        row["out_of_funds"] += 1
+    outcome = r["outcome"]
+    if outcome == "redispatched":
+        return  # an attempt sent on elsewhere: its request is counted where it ended
+    status = r["status_code"]
+    row["requests"] += 1
+    if outcome == "ok" and (status is None or status < 400):
+        row["ok"] += 1
+    elif outcome == "rejected":
+        row["rejected"] += 1
+    elif outcome == "cancelled":
+        row["cancelled"] += 1
+    else:
+        row["failed"] += 1
+    if status is not None and 400 <= status < 500:
+        row["status_4xx"] += 1
+    elif status is not None and status >= 500:
+        row["status_5xx"] += 1
+    row["borrowed"] += 1 if r["borrowed"] else 0
+    row["tokens_in"] += int(r["tokens_in"] or 0)
+    row["tokens_out"] += int(r["tokens_out"] or 0)
+    latency = r["latency_ms"]
+    if latency is not None:
+        row["busy_ms"] += float(latency)
+        if outcome == "ok" and (status is None or status < 400):
+            row["latency_n"] += 1
+            row["latency_sum_ms"] += float(latency)
+            row["latency_max_ms"] = max(row["latency_max_ms"], float(latency))
+            row["latency_hist"][bucket_of(float(latency))] += 1
+    if r["queue_wait_ms"] is not None:
+        row["queue_n"] += 1
+        row["queue_sum_ms"] += float(r["queue_wait_ms"])
+    row["cost_usd"] += float(r["cost_usd"] or 0.0)
 
 
 def bucket_of(latency_ms: float) -> int:
@@ -216,71 +255,49 @@ class Stats:
         after = self._mark(_REQUESTS_MARK)
         rows = self.db.query(
             "SELECT id, ts, workload, app, model_requested, host_id, kind, outcome, status_code, reason, borrowed, "
-            "tokens_in, tokens_out, latency_ms, queue_wait_ms, cost_usd FROM request_log WHERE id > ? ORDER BY id LIMIT ?",
+            "tokens_in, tokens_out, latency_ms, queue_wait_ms, cost_usd, priority, keep_on, route "
+            "FROM request_log WHERE id > ? ORDER BY id LIMIT ?",
             (after, batch))
         if not rows:
             return 0
         facts = self._host_facts({r["host_id"] or "" for r in rows})
         folded: dict[tuple, dict[str, Any]] = {}
+        # The same rows by their options and route (S19, D201): a table of their own, so the
+        # first table's key stays as it is.
+        options: dict[tuple, dict[str, Any]] = {}
         for r in rows:
             host_kind, provider = facts.get(r["host_id"] or "", ("", ""))
-            key = (_hour(float(r["ts"])), r["workload"] or "", r["app"] or "", r["model_requested"] or "",
+            hour = _hour(float(r["ts"]))
+            key = (hour, r["workload"] or "", r["app"] or "", r["model_requested"] or "",
                    r["host_id"] or "", host_kind, provider, r["kind"] or "")
-            row = folded.get(key)
-            if row is None:
-                row = folded[key] = {**{name: 0 for name in _COUNTS}, "latency_max_ms": 0.0, "latency_hist": empty_histogram()}
-            if r["reason"] == "provider_out_of_funds":
-                row["out_of_funds"] += 1
-            outcome = r["outcome"]
-            if outcome == "redispatched":
-                continue  # an attempt sent on elsewhere: its request is counted where it ended
-            status = r["status_code"]
-            row["requests"] += 1
-            if outcome == "ok" and (status is None or status < 400):
-                row["ok"] += 1
-            elif outcome == "rejected":
-                row["rejected"] += 1
-            elif outcome == "cancelled":
-                row["cancelled"] += 1
-            else:
-                row["failed"] += 1
-            if status is not None and 400 <= status < 500:
-                row["status_4xx"] += 1
-            elif status is not None and status >= 500:
-                row["status_5xx"] += 1
-            row["borrowed"] += 1 if r["borrowed"] else 0
-            row["tokens_in"] += int(r["tokens_in"] or 0)
-            row["tokens_out"] += int(r["tokens_out"] or 0)
-            latency = r["latency_ms"]
-            if latency is not None:
-                row["busy_ms"] += float(latency)
-                if outcome == "ok" and (status is None or status < 400):
-                    row["latency_n"] += 1
-                    row["latency_sum_ms"] += float(latency)
-                    row["latency_max_ms"] = max(row["latency_max_ms"], float(latency))
-                    row["latency_hist"][bucket_of(float(latency))] += 1
-            if r["queue_wait_ms"] is not None:
-                row["queue_n"] += 1
-                row["queue_sum_ms"] += float(r["queue_wait_ms"])
-            row["cost_usd"] += float(r["cost_usd"] or 0.0)
+            by_options = (hour, r["workload"] or "", r["app"] or "", r["model_requested"] or "", r["kind"] or "",
+                          r["priority"] or "", r["keep_on"] or "", r["route"] or "")
+            for table, k in ((folded, key), (options, by_options)):
+                row = table.get(k)
+                if row is None:
+                    row = table[k] = {**{name: 0 for name in _COUNTS}, "latency_max_ms": 0.0,
+                                      "latency_hist": empty_histogram()}
+                _count(row, r)
         last = int(rows[-1]["id"])
         with self.db.transaction() as conn:
             if self._mark_in(conn, _REQUESTS_MARK) != after:
                 return 0  # another caller folded these first
-            for key, row in folded.items():
-                where = " AND ".join(f"{name} = ?" for name in _REQUEST_KEY)
-                existing = conn.execute(
-                    f"SELECT {', '.join(_COUNTS)}, latency_max_ms, latency_hist FROM stats_requests_hourly WHERE {where}",
-                    key).fetchone()
-                if existing is not None:
-                    for i, name in enumerate(_COUNTS):
-                        row[name] += existing[i]
-                    row["latency_max_ms"] = max(row["latency_max_ms"], existing[len(_COUNTS)])
-                    merge_histograms(row["latency_hist"], json.loads(existing[len(_COUNTS) + 1]))
-                columns = (*_REQUEST_KEY, *_COUNTS, "latency_max_ms", "latency_hist")
-                conn.execute(
-                    f"INSERT OR REPLACE INTO stats_requests_hourly ({', '.join(columns)}) VALUES ({', '.join('?' * len(columns))})",
-                    (*key, *(row[name] for name in _COUNTS), row["latency_max_ms"], json.dumps(row["latency_hist"])))
+            for table, columns_of_key, found in (("stats_requests_hourly", _REQUEST_KEY, folded),
+                                                 ("stats_options_hourly", _OPTIONS_KEY, options)):
+                for key, row in found.items():
+                    where = " AND ".join(f"{name} = ?" for name in columns_of_key)
+                    existing = conn.execute(
+                        f"SELECT {', '.join(_COUNTS)}, latency_max_ms, latency_hist FROM {table} WHERE {where}",
+                        key).fetchone()
+                    if existing is not None:
+                        for i, name in enumerate(_COUNTS):
+                            row[name] += existing[i]
+                        row["latency_max_ms"] = max(row["latency_max_ms"], existing[len(_COUNTS)])
+                        merge_histograms(row["latency_hist"], json.loads(existing[len(_COUNTS) + 1]))
+                    columns = (*columns_of_key, *_COUNTS, "latency_max_ms", "latency_hist")
+                    conn.execute(
+                        f"INSERT OR REPLACE INTO {table} ({', '.join(columns)}) VALUES ({', '.join('?' * len(columns))})",
+                        (*key, *(row[name] for name in _COUNTS), row["latency_max_ms"], json.dumps(row["latency_hist"])))
             self._set_mark(conn, _REQUESTS_MARK, last)
         return len(rows)
 
@@ -381,7 +398,7 @@ class Stats:
                     (spend_folded, cutoff), kept, batch, batches)
             if settings.keep_rollups_days is not None:
                 before = _hour(now - settings.keep_rollups_days * DAY_S)
-                for table in ("stats_requests_hourly", "stats_rented_hourly"):
+                for table in ("stats_requests_hourly", "stats_options_hourly", "stats_rented_hourly"):
                     removed["stats"] += self._delete_behind_cursor(
                         table, f"SELECT rowid AS id FROM {table} WHERE rowid > ? AND hour < ? ORDER BY rowid LIMIT ?",
                         (before,), set(), batch, batches, column="rowid")
@@ -455,7 +472,9 @@ class Stats:
     def query(self, start: float, end: float, bucket: str = "hour", by: Optional[str] = None,
               filters: Optional[dict[str, Optional[str]]] = None) -> dict[str, Any]:
         """Series and totals over `[start, end)`, per `bucket` (`hour` or `day`, UTC), per `by`
-        (`app`, `model`, `host`, `provider`, `kind`, or None for the pool as a whole)."""
+        (`app`, `model`, `host`, `provider`, `kind`, `priority`, `keep_on`, `route`, or None for the
+        pool as a whole). The last three read their own table (S19), which has no host or provider:
+        a host or provider filter on them is refused (ValueError)."""
         step = HOUR_S if bucket == "hour" else DAY_S
         first = int(start // step) * step
         buckets = list(range(first, int(end), step)) or [first]
@@ -470,7 +489,16 @@ class Stats:
         if "host" in filters:
             where.append("host_id = ?")
             params.append(filters["host"])
-        request_rows = self.db.query(f"SELECT * FROM stats_requests_hourly WHERE {' AND '.join(where)}", tuple(params))
+        by_options = by in ("priority", "keep_on", "route")
+        if by_options and any(name in filters for name in ("host", "provider")):
+            raise ValueError(f"by={by} is counted per request, not per host: a host or provider filter does not "
+                             "apply to it")
+        if by_options:
+            where = [w for w in where if not w.startswith(("provider", "host_id"))]
+            params = [first, int(end), *(stored[name] for name in ("workload", "app", "model", "kind") if name in stored)]
+        request_rows = self.db.query(
+            f"SELECT * FROM {'stats_options_hourly' if by_options else 'stats_requests_hourly'} WHERE {' AND '.join(where)}",
+            tuple(params))
 
         # Rented cost is per host: it follows a filter on the workload, host or provider, and no
         # other — a machine's hour is not any one model's, kind's or named app's.
@@ -507,6 +535,15 @@ class Stats:
                 return ("provider", r["host_kind"], r["provider"]), _provider_series(r["host_kind"], r["provider"])
             if by == "kind":
                 return ("kind", r["kind"]), {"key": {"kind": r["kind"] or None}, "label": r["kind"] or "(unknown)"}
+            if by == "priority":
+                return ("priority", r["priority"]), {"key": {"priority": r["priority"] or None},
+                                                     "label": r["priority"] or "(not recorded)"}
+            if by == "keep_on":
+                return ("keep_on", r["keep_on"]), {"key": {"keep_on": r["keep_on"] or None},
+                                                   "label": r["keep_on"] or "(not recorded)"}
+            if by == "route":
+                return ("route", r["route"]), {"key": {"route": r["route"] or None},
+                                               "label": r["route"] or "(no host: refused before one was chosen)"}
             return ("all",), {"key": {}, "label": "the whole pool"}
 
         def series_of_rented(r: Any) -> Optional[tuple[tuple, dict[str, Any]]]:
@@ -523,8 +560,8 @@ class Stats:
                                                 "label": r["host_id"], "type": "rented"}
             if by == "provider":
                 return ("provider", "rented", r["connection"]), _provider_series("rented", r["connection"])
-            if by in ("model", "kind"):
-                return None  # not split by model or kind: in the totals only
+            if by in ("model", "kind", "priority", "keep_on", "route"):
+                return None  # not split by model, kind, option or route: in the totals only
             return ("all",), {"key": {}, "label": "the whole pool"}
 
         series: dict[tuple, dict[str, Any]] = {}
@@ -566,6 +603,10 @@ class Stats:
                          "model or kind")
         elif by in ("model", "kind"):
             notes.append("rented machines' cost is per host, not per model or kind: it is in the totals only")
+        elif by_options:
+            notes.append(f"rented machines' cost is per host, not per {by}: it is in the totals only")
+        if by_options:
+            notes.append(f"requests are split by {by} from gpm-server 0.47.0 on")
         if by == "app":
             notes.append("a named app shares the shared pool's rented hosts with every other shared-pool app: their "
                          "cost is its own line")
