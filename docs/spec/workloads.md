@@ -1,6 +1,7 @@
 # Specification — Workloads
 
-> Status: **built and deployed** (D115, D116, D117; 2026-09-29); **several models per workload
+> Status: **built and deployed** (D115, D116, D117; 2026-09-29); **the serving plan (§14,
+> D198–D204) decided 2026-11-24, not built**; **several models per workload
 > built** (D118, §12; 2026-09-30), against the fake provider. The first
 > provider (Vast) does not yet offer volumes or copies to the pool (§6): both stay off there until
 > checked live. **Keeping models between hosts on a model volume** (D139, §6) is built against the fake provider
@@ -37,7 +38,8 @@ It is always there, and it needs no change to keep working exactly as it did.
 gpm workload plan   research-run --model gemma4:31b --latency 20 --parallel 16 --hours 6   # spends nothing
 gpm workload create research-run --model gemma4:31b --latency 20 --parallel 16 --hours 6 \
                     [--max-spend 25.00 | --confirm-max-spend <the proposed one>] \
-                    [--profile chat-fp8] [--kind roi|on_demand|interruptible]
+                    [--profile chat-fp8] [--kind roi|on_demand|interruptible] \
+                    [--serve <file | ->]                                   # a serving plan, §14
 ```
 
 Also `POST /pool/workloads` with the same fields, admin key only. The command does, and prints,
@@ -125,6 +127,9 @@ workload decides which hosts are eligible at all.**
   workers are published apart from its own. The moment one host of the workload holding the model is
   ready, borrowing for that model stops and its requests queue on the workload's own hosts: a
   workload that could always borrow would have no reason to be sized.
+- **A serving plan's `until_ready`** (§14, D198, not built yet) generalises borrowing: a workload
+  that declares one may use it also while an evicted host is replaced and, where the plan says
+  so, while a scale-up rents.
 - The shared workload never borrows. Two workloads never see each other's hosts.
 - Every request is logged with its workload; the borrowed ones are marked, so the shared
   workload's operator sees what was lent and the workload's owner sees what was borrowed.
@@ -400,7 +405,8 @@ pool.workload(
 
 - **Steady** is the workload's `parallel` at its `latency_s`, as it always was (§2, §5): the pool
   works out the hosts that meet it — two of 24 each, where the card serves 24 within 4 s — and
-  keeps them for the lease. There is no separate `steady` field; one sent is refused in words.
+  keeps them for the lease. There is no separate `steady` field here; one sent is refused in words.
+  (A serving plan's `steady` says where the base runs, never how much: §14.1.)
 - **`bursts.hosted`**: a request that finds no free worker waits `after_s` (default 5) for one, then
   goes to a hosted API (hosts-routing-capacity §5, tier 30) if its budget has room — in dollars per
   request, per day and/or per month, any of them. A model no machine serves goes at once.
@@ -494,3 +500,303 @@ can serve it.
 | `steady` + `rented` | bursts wait for rented machines, as before; no tokens |
 | `hosted` alone (`parallel` 0) | everything to hosted APIs; no machine |
 | `steady` alone | the base, then the queue |
+
+The whole of this section is shorthand for a serving plan (§14, D198): the base is its steady
+source, the bursts its `when_full`, and borrowing then the hosted burst its `until_ready` during
+the start (§14.1).
+
+## 14. The serving plan (D198–D204)
+
+> Decided 2026-11-24 (S19), revised after two rounds of architecture and UX review (the second
+> 2026-11-25); **not built yet**. Until it is, §4 and §13 are what runs.
+
+A workload's serving plan, `serve`, says **where its requests go and when**. How much it must
+serve stays in `parallel`, `latency_s`, the kind of machine (`machines=` in the SDK, `kind` in the
+API: `roi`, the default, may rent interruptible machines; `on_demand` never does) and, for
+several models, `models=` (§12).
+
+```python
+# The stop-gap: rented machines, covered by a free shared machine, then a hosted API, until
+# they serve. `shared` works with today's grants; `local` needs the operator to grant it.
+provisioner.workload("llama-3.3-70b", latency_s=4, parallel=32, hours=24,
+                     max_spend=200,          # machines only; hosted budgets come on top
+                     serve={"until_ready": ["shared", {"hosted": {"budget": {"per_day": 10}}}]})
+```
+
+```python
+# Rented, never interruptible: the kind is the workload's, and every rented source follows it.
+provisioner.workload("llama-3.3-70b", latency_s=4, parallel=32, hours=24, max_spend=300,
+                     machines="on_demand",
+                     serve={"when_full": [{"rented": {"after_min": 10, "max_hosts": 4,
+                                                      "budget": {"per_day": 60}}}]})
+```
+
+```python
+provisioner.workload("llama-3.3-70b", latency_s=4, parallel=32, hours=24, max_spend=300,
+                     machines="interruptible", serve={
+    "until_ready": [
+        "shared",
+        {"name": "hosted-cover", "hosted": {"providers": ["hosted-a", "hosted-b"],
+                                            "budget": {"per_day": 10}}},
+    ],
+    "when_full": [
+        {"name": "hosted-burst", "hosted": {"after_s": 5,
+                                            "budget": {"per_day": 20, "per_month": 300}}},
+        {"name": "rented-burst", "rented": {"after_min": 10, "max_hosts": 4,
+                                            "budget": {"per_day": 60}}},
+    ],
+    "substitute": [{"model": "llama-3.1-8b", "after_s": 20}],
+    "tz": "America/New_York",
+    "rules": [
+        {"name": "interactive at once",
+         "when": {"priority": "interactive"}, "then": {"after_s": {"hosted-burst": 0}}},
+        {"name": "careful spending",
+         "when": {"spent_over": {"budget": "hosted-burst", "period": "month", "share": 0.8}},
+         "then": {"never_use": ["hosted-burst"]}},
+        {"name": "on-demand after evictions",
+         "when": {"evictions": {"count": 3, "within_h": 24}},
+         "then": {"steady": {"rented": {"kind": "on_demand"}}, "until": "end_of_day"}},
+    ],
+})
+```
+
+```sh
+# The operator's own machines first, rented ones only when they are full (operator only).
+gpm workload create night-batch --model llama-3.3-70b --latency 20 --parallel 8 --hours 12 \
+    --serve - <<'EOF'
+{"steady": "local", "reserve": {"local": 8},
+ "when_full": [{"rented": {"after_min": 10, "max_hosts": 2, "budget": {"per_day": 40}}}]}
+EOF
+```
+
+### 14.1 The roles, in one order
+
+A request tries, in order: **steady** → **until_ready** → **when_full** → a **substitute**
+(14.5) → the queue. Within a role, the first source with a free worker takes it. A source's wait
+(`after_s`) counts from the request's arrival, and only while an earlier machine source in the
+order holds the request's model; where none does, the source is tried at once (D165's rule, made
+general).
+
+| Role | Used | Ends |
+|---|---|---|
+| `steady` | Always: where the workload runs, sized by `parallel` and `latency_s` (§2, §5). `rented` (the workload's own rented machines) unless the plan says `"local"` or `"fixed"`, which need a reservation (14.2) | When a rule switches it (14.3) |
+| `until_ready` | Only while a machine of the workload is being prepared, `during` any of `start` and `replacement` (an evicted or failed host being replaced) — both by default — and `scale_up` (hosts rented for load above the ready workers) only where the plan lists it. A gap runs from the moment the ready workers fell short, once per shortfall, not per rental attempt; it lasts at most `max_min` (60). An ordered list | Per model, as soon as the router sees the machines it covered for ready, or at `max_min` |
+| `when_full` | Once steady's workers are all busy, or steady has no ready host and no gap is open. An ordered list: a hosted source after its `after_s` (default 5), a rented one after its `after_min` (§13's rules, unchanged) | As §13 |
+
+| Source type | `steady` | `until_ready` | `when_full` |
+|---|---|---|---|
+| `rented` | yes (the default) | refused: it is what is being prepared | yes |
+| `local`, `fixed` | with a reservation | yes | refused: borrowing past the start (D115) |
+| `shared` | refused | yes | refused: as above |
+| `hosted` | refused | yes | yes |
+
+- **A role left out of a plan is empty**: `serve={"when_full": [...]}` has no stop-gap, and the
+  readback says so ("no stop-gap: you did not set until_ready"). Steady left out is `rented`.
+- **With no `serve` at all**, a workload has the plan its fields mean, and is shown with it:
+  - until_ready is `shared`, where it may borrow, then its hosted burst, `during: [start]`, with
+    no `max_min`;
+  - when_full is its bursts.
+
+  The hosted burst is **one source** in both roles, with one budget (`bursts.hosted`). This is
+  exactly §4 and §13 as they run today, proven by a test that routes every existing policy shape
+  the same before and after. A workload with no `serve` is routed from its own fields by the
+  router, as today, whether or not a routing order exists (14.7).
+- `bursts` and `serve` together are refused, in words.
+- **One plan per workload**, applied to each of its models. A model served by hosted APIs alone
+  (`parallel` 0) keeps §13's path.
+
+### 14.2 Sources
+
+| Source | What | Bounds |
+|---|---|---|
+| `local` | The computer the pool runs on (host kind `local`) | `borrow_share` (§4), or a reservation |
+| `fixed` | Machines the operator declares at a fixed address — their own elsewhere, such as on-prem servers, or a server they lease (host kind `fixed-remote`) | `borrow_share`, or a reservation |
+| `shared` | Any machine of the shared workload — local, fixed or rented: today's borrowing | `borrow_share` |
+| `rented` | Machines rented for the workload. Its `kind` (`roi`, `on_demand`, `interruptible`) where it names one; otherwise **the kind steady rents in force**: the workload's `machines=`, or the kind a rule switched steady to (14.3) | The lease (§5, §8); in `when_full`, `max_hosts` and a budget |
+| `hosted` | The pool's hosted APIs, in the order `providers` gives (hosted host ids); with none, every hosted host serving the model, in the pool's order (hosts-routing-capacity §5). The next is tried on 429 or out of money | Its budget, required: `per_day` and/or `per_month`, and optionally `per_request` (§13) |
+
+- **Names.** A source may carry a `name`: unique in the plan, never a source type's word, never
+  containing `/`. A source with no name is called by its type, numbered from the second of that
+  type in the same role (`hosted`, `hosted-2`). A role may list, by name, a source another role
+  defines: the same source, with the same budget.
+- **Budgets.** Every spending source's budget has an id: its name, or `<role>/<type>` for an
+  unnamed one (`until_ready/hosted`). The steady rented source is paid from the lease and has no
+  budget of its own. Budgets are kept per (workload, budget id, period); the request log records
+  which budget paid. Days and months are UTC, as today (D166).
+- **One hosted total.** Besides each source's own budget, the workload's hosted spending in a day
+  and in a month is capped at the sum of its hosted sources' budgets for that period, counting
+  everything spent in it under any id. A source with no budget for that period counts its
+  `per_month` toward a day, or its `per_day` × the days in the month toward a month. So a plan
+  change that renames or replaces a budget gives nothing back.
+- **A program's committed hosted spend** (§11, D125) is, for a running workload, the larger of
+  the sum of its hosted budgets and what it has spent this period plus what those budgets have
+  left.
+- **Reserved workers** (`reserve: {local: 4}`, or `{fixed: …}`) give the workload the first call
+  on that many of the operator's own machines' workers:
+  - its requests take them before a waiting shared request;
+  - shared requests use them while it leaves them idle;
+  - nothing running is stopped.
+- **Only the operator reserves**, never a program's key. Reservations stay within
+  `workloads.max_reserved_share` (0.5) of the ready workers of each kind, across workloads, and
+  are scaled down pro rata whenever fewer are ready.
+- **A reservation never makes the shared workload rent for another workload.** A shared request
+  waiting behind one counts as the shared workload's load only beyond what its unreserved workers
+  can take (supervisor.md §5.1): the shared lease rents for its own demand, never for the
+  reservation.
+- **Warnings in the plan check**: a `local`, `fixed` or `shared` source that holds none of the
+  workload's models (a `workloads_only` model, say); a `max_min` shorter than the 90th-percentile
+  time to ready of the machines it covers ("the stop-gap ends at 60 min; these machines are
+  usually ready in 75").
+
+### 14.3 Rules
+
+`{"name", "when": {...}, "then": {...}}`, at most 16. The supervisor evaluates them in order on
+every pass. Conditions on a request's options are applied by the router, from the order the
+supervisor wrote. Times are in the plan's `tz` (IANA, default UTC); a time a DST change skips
+takes effect at the first minute after it, and one it repeats, at the first occurrence.
+
+| `when` | |
+|---|---|
+| `priority`, `keep_on` | The request's options (14.4) |
+| `between` | `"HH:MM-HH:MM"` (may cross midnight), optional `days` (`mon`…`sun`) |
+| `spent_over` | `{budget: <budget id> \| lease, period: day \| month, share}`; the budget must have a limit for that period. For the lease, the share of its cap spent |
+| `evictions` | `{count, within_h}`: the workload's rented hosts lost to eviction, bursts included |
+
+| `then` | |
+|---|---|
+| `use_only`, `never_use` | Source names, or source types (`hosted`: every hosted source). They only narrow, and add up across every matching rule |
+| `after_s` | `{<source name>: seconds}`: a shorter wait only |
+| `steady` | Switch to `"local"`, `"fixed"` or `{"rented": {"kind": …}}`, with an optional `parallel`; held `until` `window_end` or `end_of_day`. The last matching rule's switch wins |
+| `substitute: false` | No substitute for matching requests |
+
+- **Refused, in words:**
+  - an effect naming a source or budget the plan does not have;
+  - a longer wait;
+  - a 17th rule;
+  - a condition or effect not listed;
+  - a narrowing that removes the steady source in force without switching it;
+  - a `steady` switch to what steady already is;
+  - a `local` or `fixed` switch without a reservation;
+  - `steady` on a rule whose `when` names a request option (renting is per workload, not per
+    request).
+- **A steady switch is make-before-break.** The new steady source is rented or reserved at once,
+  and the old one keeps serving until the new one is ready. The old hosts then become surplus,
+  given up by the scale-down window and the idle cutoff. D124 counts them only until their
+  expected release.
+- **A switch is paid for before it is allowed.** The lease's `workers` is the largest `parallel`
+  any reachable steady state has. The derived budget (§2 step 4) is priced hour by hour at the
+  dearest state the rules can reach, **plus the overlap** of each reachable switch (both sets of
+  hosts for the 90th-percentile time to ready); a typed budget must hold it, and the pool caps
+  checked at creation (§2) count it. A switch the caps have no room for when it comes due waits,
+  and the Now line says why.
+- **Time windows** take effect at the first pass after their boundary, never before.
+
+### 14.4 Request options (D201)
+
+| Header | SDK | Values |
+|---|---|---|
+| `X-GPM-Priority` | `priority=` | `interactive`, `batch` |
+| `X-GPM-Keep-On` | `keep_on=` | `no_hosted` (never a hosted API); `owned` (only `local` and `fixed`: machines the operator declared, never rented by the hour or hosted); `any` (whatever the plan allows) |
+| `X-GPM-Substitute` | `substitute=` | `never` (14.5) |
+
+- **Request priority** chooses which sources a plan's rules let a request use. **It never moves
+  a request ahead in the queue.** `batch` never reaches a hosted API, and is queued like any
+  other request, never held back.
+- **Defaults, per option.** Each option a request does not send takes the plan's default for that
+  option (`"defaults": {"keep_on": "no_hosted"}`); `PoolClient(priority=…, keep_on=…)` sets them
+  for every call of one client. `keep_on: any` lifts the plan's default and nothing more: never
+  past what the plan allows.
+- **Refusals.** A value not on its list is `400 unknown_option`. A request that no source its
+  options and the plan's rules allow can serve is `503 no_allowed_source`, whose `detail` names
+  the option or rule; waiting cannot help, so the SDK raises `PoolUnavailable` at once.
+- **They hold by construction**, on every workload and on the shared workload. The router
+  removes the hosts they exclude when it chooses eligible hosts, so retries, failover,
+  translation and substitutes all pass through the same check. A plan's rules may narrow
+  further; only `any` lifts a default, and nothing widens past the plan.
+- **`no_hosted` still reaches rented machines**, whose operators can read what reaches them (T7);
+  `owned` does not, though a `fixed` machine is only as private as whoever runs it.
+- **Logging and stats.** The request log keeps `priority`, `keep_on` and `route`; `GET
+  /pool/stats` takes `by=priority` and `by=route`. `GET /pool/status` lists the options the pool
+  honours, and the SDK refuses to send one a pool does not list.
+
+### 14.5 A substitute model (D202)
+
+`substitute: [{model, after_s}]`, opt-in. A request that has waited `after_s` with no source of
+its own model able to take it goes to the first substitute that can.
+
+- **Where it may come from:** only the plan's own sources holding the substitute — a shared
+  machine (within `borrow_share`, as borrowing is), a reserved one, a hosted API, or the
+  workload's own hosts where they hold it — with the request's options and the plan's budgets.
+- **What may substitute:** a catalogued model of the same model kind (chat, transcription …).
+  Never where the request carries what its build does not accept, and never while session
+  consistency (D13) is on.
+- **What the answer says:** it carries `X-GPM-Substituted-For: <model asked for>` and
+  `X-GPM-Route: substitute/<model>`. The SDK gives `reply.substituted_for` and logs a warning once
+  per client.
+- **How an app refuses one:** `substitute=False` on a call, or `X-GPM-Substitute: never`; any
+  other value is `400 unknown_option`.
+- **Where it is counted:** left out of the workload's latency figures, and counted in the
+  request log and stats.
+
+### 14.6 Seeing a plan, and who may write one (D203)
+
+The plan check — `POST /pool/workloads/plan` with `serve`, or `gpm workload plan … --serve
+<file | ->` — answers with:
+
+- **a readback** in plain words, from a fixed template, naming every role left empty;
+- **a timeline** over the lease's hours, in clock time in the plan's `tz`: each phase with its
+  sources, workers, expected minutes (each card class's median and 90th-percentile time to
+  ready, D69) and dollars an hour;
+- **the conditions that can change it**, each with its effect;
+- **the most it can spend**: the lease's cap (`max_spend`, which pays for every rented machine,
+  bursts included) plus every hosted budget over each day and month the lease's hours touch — a
+  24-hour lease that crosses midnight UTC touches two days — as one total;
+- **a warning for each request option that reaches different sources** — "requests with no
+  options keep off hosted APIs here: while the rented machines start they use shared, then
+  wait";
+- the hosted host ids that serve the workload's models, for `providers`;
+- every refusal, in words.
+
+`--json` gives the same as data. `--serve-example <name>` prints a starting plan.
+`gpm workload create … --serve <file | ->` creates one.
+
+- **The JSON Schema** is `GET /pool/schema/serving-plan` (admin key), and ships in both
+  packages.
+- **A program's grant** (§11) gains `sources`: which of `local`, `fixed`, `shared`, `rented` and
+  `hosted` its plans may name. An existing grant gets what it allows today: `rented`; `shared`
+  where it may borrow; `hosted` where its hosted allowance is above 0. A program never reserves.
+  Each source is checked against the grant from the build stage that introduces it.
+- **The SDK** takes `serve=` on `workload()`, and `w.set_serve()` while it runs (a provisioning
+  request, answered like a create). `w.set_serve()` on a workload made with `bursts` replaces its
+  bursts with the plan; `w.set_bursts()` on a workload with a plan is refused in words.
+  `w.budgets()` gives each budget against its limits; `w.hosted_budget()` gives the hosted total.
+- **A change replaces the whole plan**, and the answer says so. It takes effect at the router's
+  next read of the routing order; money already spent still counts (14.2).
+- **The Now line**, on the workload's page and in `gpm workload show`: which role serves, where
+  the next request would go, how far preparation is and how long the stop-gap has left, each
+  budget against its limit, and the rules in force. For example: "Covering until ready: 0 of 2
+  rented machines ready (about 6 min; stop-gap 54 min left). Next request: shared. shared 3 of 4
+  busy; hosted-cover $2.10 of $10 today. Rules in force: none." A refusal or a long wait names
+  the rule behind it.
+
+### 14.7 The routing order
+
+- **Written by the supervisor, read by the router.** Each pass, the supervisor writes each plan's
+  order, per model and per request option, into SQLite only when it changes, with a version and
+  the end time of any open until_ready gap (its `max_min`). A heartbeat it refreshes every pass
+  gives the orders their `valid_until` (three passes ahead). The router reads both in the
+  background, never on a request's path.
+- **Judged live by the router.** The router decides for itself whether each machine is ready,
+  whether a worker is free, whether a reservation applies and whether a budget has room. It ends
+  an until_ready gap itself the moment the machines it covered for are ready, or at the gap's end
+  time, without waiting for a pass.
+- **A stale order fails narrow, and keeps serving.** An order past `valid_until`, or of a version
+  the router does not know, is read as: steady and when_full as last written (their budgets are
+  the router's own, D166); until_ready only for its sources that spend nothing (`local`, `fixed`,
+  `shared`) and only while the workload has no ready host of its own for the model, as borrowing
+  is judged today; every narrowing in force at the last write kept; no steady switch. A pool whose
+  supervisor stopped never opens a paid stop-gap or a new time window, and never stops a workload
+  that serves.
+- Every answer carries `X-GPM-Route: <role>/<source name>` (`steady/rented`,
+  `until_ready/shared`, `when_full/hosted-burst`, `substitute/<model>`); the SDK gives
+  `reply.route`.

@@ -70,6 +70,11 @@ Two differences between the surfaces matter to an app:
 | `X-GPM-Runtime-Class` (request) | Optional | Pins the request to hosts whose served build is of the given class — for runs that must not mix builds |
 | `X-GPM-Delivery`, `X-GPM-Attempts` (response) | Always reported | How the response reached the app — `stream`, `buffered`, or `stream-after-overflow` — and how many hosts were tried (§5.1) |
 | `X-GPM-Delivery: stream` (request) | Optional, if the operator allows | Asks for tokens as they come from a host that can be interrupted, accepting that the stream may break (§5.1) |
+| `X-GPM-Priority` (request) | Optional — **not built yet** (D201, S19) | `interactive` or `batch`; with none, the workload's serving plan's default. It chooses which sources the plan's rules let the request use; **it never moves a request ahead in the queue**. **`batch` never reaches a hosted API**, and is queued like any other request, never held back (workloads.md §14.4). Another value is `400 unknown_option` |
+| `X-GPM-Keep-On` (request) | Optional — **not built yet** (D201) | `no_hosted` — never a hosted API; `owned` — only the machines the operator declared (`local`, `fixed`), never rented by the hour or hosted; `any` — whatever the plan allows, lifting the plan's default and nothing more. With none, the plan's default for this option. **Holds whatever a plan says**, on every workload. `no_hosted` still reaches rented machines, whose operators can read what reaches them. Another value is `400 unknown_option` |
+| `X-GPM-Route` (response) | Always reported, once S19 is built | Which role of the workload's serving plan and which source answered: `steady/rented`, `until_ready/shared`, `when_full/hosted-burst`, `substitute/<model>`. A source is shown by its name, or, unnamed, by its type (`hosted-2` for the second in a role) (workloads.md §14.2) |
+| `X-GPM-Substitute` (request) | Optional — **not built yet** (D202) | `never`: refuses the substitute model the workload's plan may name; the request waits or is refused instead. Another value is `400 unknown_option` |
+| `X-GPM-Substituted-For` (response) | On an answer from a substitute model (D202) | The model the request asked for. `X-GPM-Served-Model` names the one that answered; the body is that engine's, untouched |
 
 ### Beyond chat: what a request asks for, and what it may carry (D142–D144, D149)
 
@@ -136,6 +141,7 @@ It is served from a cached copy, never by asking a third party while the app wai
 | `400` | `bad_upload` | An upload the pool could not read as one clean form, one naming the model twice, or a request with more than one `Content-Type` header | raise `PoolRequestError` |
 | `400` | `content_encoding` | The request has a `Content-Encoding` other than identity; the pool reads only uncompressed bodies (D144) | raise `PoolRequestError` |
 | `400` | `unsupported_feature` | The request must be translated to the other API format (D169) and carries what that format cannot — named in `detail`; on Anthropic's paths in that format's error shape | raise `PoolRequestError`; send `X-GPM-Unsupported: drop` to have it dropped instead |
+| `400` | `unknown_option` | `X-GPM-Priority`, `X-GPM-Keep-On` or `X-GPM-Substitute` names a value not on its list — refused rather than treated as none, so a misspelt option never passes (D201) | raise `PoolRequestError` |
 | `413` | `request_too_large` | The body is over `pool.max_request_mb`; refused before it is read | raise `PoolRequestError` |
 | `404` | `unknown_path` | The path is not an inference path of any engine this pool runs (§2: only those exact paths are forwarded). A path some engine serves, but none this pool runs, is `400 kind_not_served` instead | raise `PoolRequestError` |
 | `404` | `model_not_in_pool` | The model is not in this pool's declared set; it will not be loaded on demand | raise `PoolRequestError` |
@@ -149,6 +155,7 @@ It is served from a cached copy, never by asking a third party while the app wai
 | `503` | `host_lost` | The host serving this was taken away before any of the response reached you; nothing partial was sent (§5.1) | wait and retry |
 | `503` | `uploads_full` | The pool is holding as many request bytes as it allows (`pool.max_held_request_mb`) | wait and retry |
 | `503` | `hosted_budget_spent` | Only a hosted API could take the request now, and the budget it is paid from — the pool's shared one, or the workload's — has no room left for its worst case (D166); a machine freeing serves it | wait and retry |
+| `503` | `no_allowed_source` | No source that the request's options (or the plan's defaults) and the plan's rules allow serves this model in this workload — a `batch` request for a model only hosted APIs serve, say. `detail` names the option or rule. Waiting cannot help (D201; not built yet) | **fail fast** with `PoolUnavailable`; send other options or ask the operator |
 | `504` | `deadline_exceeded` | The request's `X-GPM-Deadline` passed before it could be served | **fail fast** — the app already said the answer would be useless |
 | `504` | `generation_timeout` | The whole request was sent, and the engine did not answer within the pool's read time (`pool.upstream_read_timeout_s`) — a long recording, say. Not a host failure: it is not re-run on another host | **fail fast** — sending it again would take as long again |
 
@@ -234,7 +241,7 @@ Every field is overridable per call, per client, or by environment variable, in 
 
 | Situation | Default |
 |---|---|
-| `503` other than `no_lease` | Retry. Wait `Retry-After` if present, else exponential back-off 2 s → 60 s with jitter |
+| `503` other than `no_lease` (and, once S19 is built, `no_allowed_source`) | Retry. Wait `Retry-After` if present, else exponential back-off 2 s → 60 s with jitter |
 | Transport error before any response byte, other than a read timeout | Retry, same back-off |
 | Read timeout: the request was sent and no answer came within the read time | **Not retried** — `PoolRequestError`, status 504, reason `read_timeout`. The pool may still be working on it; sending it again would run it twice (D144) |
 | Failure **mid-stream**, after output was delivered | **Not retried** — `PoolStreamInterrupted`. The app has consumed partial output; only it can decide to redo the call |
