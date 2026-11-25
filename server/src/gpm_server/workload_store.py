@@ -26,6 +26,14 @@ ANSWERING = ("preparing", "serving")
 #: than "unknown key"; after that they drop out of what the router compares against.
 ENDED_KEYS_KEPT_S = 7 * 24 * 3600
 
+def steady_of(policy: Optional[dict]) -> str:
+    """Where a workload's serving plan says it runs: `rented` (the default, and every workload
+    without a plan), `local` or `fixed` (S19)."""
+    serve = (policy or {}).get("serve")
+    steady = serve.get("steady", "rented") if isinstance(serve, dict) else "rented"
+    return steady if steady in ("local", "fixed") else "rented"
+
+
 @dataclasses.dataclass(frozen=True)
 class ModelTarget:
     """One model a workload serves, with its own target (D118): the whole answer's p95 within
@@ -130,7 +138,7 @@ class Workload:
     def __post_init__(self) -> None:
         if not self.targets:
             object.__setattr__(self, "targets", (ModelTarget(self.model, self.latency_s, self.parallel),))
-        if not self.groups and any(t.on_machines for t in self.targets):
+        if not self.groups and any(t.on_machines for t in self.targets) and self.rents_base:
             # A workload made before D118 is one group of its one model. One whose models are all
             # served by hosted APIs alone has none: nothing of it runs on a machine (D165).
             object.__setattr__(self, "groups", (Group(
@@ -154,9 +162,16 @@ class Workload:
         return target is not None and not target.on_machines
 
     @property
+    def rents_base(self) -> bool:
+        """Whether its steady is machines rented for it — the default — rather than workers the
+        operator reserved on their own (S19, a plan's `steady: local|fixed`)."""
+        return steady_of(self.policy) == "rented"
+
+    @property
     def on_machines(self) -> bool:
-        """Whether any of its models runs on a machine: one that does not rents nothing."""
-        return any(t.on_machines for t in self.targets)
+        """Whether it rents machines for any of its models: one served by hosted APIs alone, or on
+        the operator's reserved workers, rents nothing."""
+        return any(t.on_machines for t in self.targets) and self.rents_base
 
     def cap(self, model: str) -> Optional[int]:
         """The most answers of `model` one host of its group takes at once, where it shares the

@@ -48,6 +48,11 @@ class Worker:
     #: The model it is answering, while busy: a host holding several models of one workload
     #: takes at most its share of each (D118).
     model: Optional[str] = None
+    #: The workload whose request it is answering, while busy: a reservation counts its own (S19).
+    workload: Optional[str] = None
+    #: Lent within a reservation (S19): still not the shared workload's load (`borrowed`), but
+    #: outside `borrow_share`, which bounds borrowing alone.
+    reserved: bool = False
 
     @property
     def is_idle(self) -> bool:

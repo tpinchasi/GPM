@@ -23,7 +23,7 @@ from .. import workloads as math_
 from ..catalog import variants_for_host
 from ..ledger import LeaseRefused
 from ..strategies import rank_offers
-from ..workload_store import Group, ModelTarget, Workload, WorkloadStore
+from ..workload_store import Group, ModelTarget, Workload, WorkloadStore, steady_of
 
 if TYPE_CHECKING:
     from .service import Supervisor
@@ -140,7 +140,10 @@ class WorkloadRequest:
 
     @property
     def on_machines(self) -> tuple[ModelTarget, ...]:
-        """Its models that run on machines; the rest are served by hosted APIs alone (D165)."""
+        """Its models that run on machines rented for it; the rest are served by hosted APIs
+        alone (D165), and none where it runs on workers the operator reserved (S19)."""
+        if steady_of(self.policy) != "rented":
+            return ()
         return tuple(t for t in self.all_targets if t.on_machines)
 
     @property
@@ -305,8 +308,21 @@ class Workloads:
         if req.max_spend is not None and not (math.isfinite(req.max_spend) and req.max_spend > 0):
             raise WorkloadRefused("a dollar cap must be above zero")
         if not req.on_machines and req.max_spend is not None:
-            raise WorkloadRefused("it rents no machine — every model is served by hosted APIs alone — so it has "
-                                  "no max_spend: its hosted burst's budget is what it spends")
+            why = ("it runs on the operator's machines, on workers reserved for it"
+                   if steady_of(req.policy) != "rented" else "every model is served by hosted APIs alone")
+            raise WorkloadRefused(f"it rents no machine — {why} — so it has no max_spend: its hosted burst's "
+                                  "budget is what it spends")
+        steady = steady_of(req.policy)
+        if steady != "rented":
+            # Its machines are the operator's own of that kind: one must hold each model it runs.
+            from ..serving_plan import HOST_KINDS
+
+            kinds = HOST_KINDS[steady]
+            for t in req.all_targets:
+                if t.on_machines and not any(h.kind in kinds and not h.disabled and t.model in self.config.models_held_by(h)
+                                             for h in self.config.hosts):
+                    raise WorkloadRefused(f"{t.model!r}: no {steady} machine of this pool holds it, so steady {steady} "
+                                          "would never serve it")
 
     def _reserved_hosts(self) -> int:
         """Hosts other workloads still mean to rent: their start, less what they have — per group
@@ -330,6 +346,7 @@ class Workloads:
         self._check_request(req)
         # What creating it would refuse, the plan says: a policy its models cannot be served under.
         self.check_policy(req.all_targets, req.policy or {})
+        self.check_reserve(req.policy or {}, excluding=req.name)
         if not req.on_machines:
             return self._plan_without_machines(req)
         if req.hosted_alone:
@@ -357,8 +374,11 @@ class Workloads:
             "workers_per_host": 0, "workers_measured": False, "sizing": [], "hosts_at_start": 0,
             "first_host": None, "minutes_to_serve": 0, "max_spend": 0.0, "budget_derived": False,
             "derived_budget": 0.0, "hourly_total": 0.0, "borrow_while_starting": False, "borrow_by_model": {},
-            "reasons": ["served by hosted APIs alone: nothing is rented, and it serves from the start, "
-                        "paid from its hosted burst's budget"],
+            "reasons": (["served by hosted APIs alone: nothing is rented, and it serves from the start, "
+                         "paid from its hosted burst's budget"] if req.hosted_alone and len(req.hosted_alone) == len(
+                             req.all_targets) else
+                        [f"runs on the operator's {steady_of(req.policy)} machines, on the workers reserved for it: "
+                         "nothing is rented, and it serves from the start"]),
             "refused": (f"{len(open_now)} workloads are running, at the pool's limit of {most}"
                         if len(open_now) >= most else None),
         }
@@ -918,6 +938,39 @@ class Workloads:
                     ", ".join(repr(m) for m in alone) + " is served by hosted APIs alone, and the plan's defaults keep "
                     "requests that send no option off hosted APIs: no source could serve them")
 
+    def check_reserve(self, policy: dict[str, Any], excluding: Optional[str] = None) -> None:
+        """Reserved workers stay within `workloads.max_reserved_share` of the operator's own
+        workers of each kind, across every running workload (S19, §14.2): counted from the
+        configured hosts, so a reservation is possible on the day the machines are all up. While
+        fewer are ready the router scales every reservation down pro rata."""
+        from ..serving_plan import HOST_KINDS, PlanRefused, plan_of
+
+        try:
+            plan = plan_of(policy)
+        except PlanRefused:
+            return
+        if plan is None or not plan.reserve:
+            return
+        share = self.config.workloads.max_reserved_share
+        for source, wanted in plan.reserve.items():
+            kinds = HOST_KINDS[source]
+            workers = sum(h.workers for h in self.config.hosts if h.kind in kinds and not h.disabled)
+            taken = 0
+            for other in self.store.active():
+                if other.name == excluding or other.state not in ("preparing", "serving"):
+                    continue
+                try:
+                    theirs = plan_of(other.policy or {})
+                except PlanRefused:
+                    continue
+                taken += (theirs.reserve.get(source, 0) if theirs is not None else 0)
+            room = int(workers * share) - taken
+            if wanted > room:
+                raise WorkloadRefused(
+                    f"reserve.{source}: {wanted} worker(s) asked, {max(0, room)} left — reservations stay within "
+                    f"{share:.0%} of the pool's {workers} {source} worker(s) (workloads.max_reserved_share), "
+                    f"{taken} already reserved")
+
     def set_policy(self, name: str, policy: dict[str, Any], by: str = "the operator") -> Workload:
         """Replace a running workload's spending policy. Takes effect at the router's next look at
         the workload table; what it already spent today and this month still counts."""
@@ -927,7 +980,11 @@ class Workloads:
         if (workload.policy or {}).get("serve") and not policy.get("serve"):
             raise WorkloadRefused(f"workload {name!r} has a serving plan; change it with serve — its bursts are the "
                                   "plan's when_full")
+        if steady_of(policy) != steady_of(workload.policy):
+            raise WorkloadRefused(f"workload {name!r} runs on {steady_of(workload.policy)}; where it runs is set when "
+                                  "it is created (a rule's steady switch arrives in a later version of the pool)")
         self.check_policy(workload.targets, policy)
+        self.check_reserve(policy, excluding=name)
         self.store.set_policy(name, policy)
         self.supervisor.events.record(
             "workload_policy",

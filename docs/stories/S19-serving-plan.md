@@ -255,7 +255,8 @@ After the second architecture and UX reviews (2026-11-25):
    total — several hosted sources, `providers`, a rented source's `kind` — with the request log
    recording which budget paid (today's rows counted under the shorthand's budget) — **built**
    (gpm-server 0.48.0).
-4. **Reserved workers** on the operator's own machines.
+4. **Reserved workers** on the operator's own machines — **built** (gpm-server 0.49.0), with
+   `steady: local|fixed` (no rented burst above it until rules, stage 5).
 5. **Rules**: time windows, budget shares, evictions, steady switches handed over
    make-before-break and priced with their overlap.
 6. **The plan check's readback, timeline and limit**, the JSON Schema, the CLI (`--serve`), the

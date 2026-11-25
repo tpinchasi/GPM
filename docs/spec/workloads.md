@@ -514,8 +514,9 @@ the start (§14.1).
 > built** (gpm-server 0.47.0): the request options `priority` and `keep_on` with a plan's
 > `defaults` (14.4), `X-GPM-Route`, and stats by priority and by route. **Stage 3 built**
 > (gpm-server 0.48.0): several hosted sources, each with its own budget under one hosted total,
-> `providers`, a rented source's `kind`, and covering a scale-up where `during` lists it. The rest
-> is refused in words until its stage ships; until then §4 and §13 are what runs for everything
+> `providers`, a rented source's `kind`, and covering a scale-up where `during` lists it. **Stage 4
+> built** (gpm-server 0.49.0): reserved workers (`reserve`) and `steady: local|fixed`. The rest is
+> refused in words until its stage ships; until then §4 and §13 are what runs for everything
 > else.
 
 A workload's serving plan, `serve`, says **where its requests go and when**. How much it must
@@ -651,9 +652,20 @@ general).
   - its requests take them before a waiting shared request;
   - shared requests use them while it leaves them idle;
   - nothing running is stopped.
+- **Steady on the operator's machines.** `steady: "local"` (or `"fixed"`) needs a reservation
+  of that kind, and runs the workload there, renting nothing: it serves from the start, its
+  lease opens no rentals, and its requests take at most its reserved workers, waiting beyond
+  them (never borrowing past them). Until rules arrive (stage 5) such a plan has no until_ready
+  (nothing rented is being prepared) and no rented burst; when_full may use hosted APIs. Where
+  a workload runs is set at creation: a policy change that would move it is refused.
+- **Reserved workers in a stop-gap.** A reservation of a kind until_ready lists (or `shared`)
+  is used while the workload is covered, within the reservation and ahead of shared requests;
+  past it, borrowing's rules apply.
 - **Only the operator reserves**, never a program's key. Reservations stay within
   `workloads.max_reserved_share` (0.5) of the ready workers of each kind, across workloads, and
-  are scaled down pro rata whenever fewer are ready.
+  are scaled down pro rata whenever fewer are ready. At creation the cap is counted against the
+  configured workers of that kind (so a reservation can be made before every machine is up);
+  the router scales by the ready ones on every request.
 - **A reservation never makes the shared workload rent for another workload.** A shared request
   waiting behind one counts as the shared workload's load only beyond what its unreserved workers
   can take (supervisor.md §5.1): the shared lease rents for its own demand, never for the

@@ -10,8 +10,7 @@ the plan they mean (the shorthand), and works out — from facts the router hand
 request may be routed now. Nothing here touches the database, the clock or the network.
 
 Built in stages (the story's build order). What this stage does not do yet is refused in words,
-never accepted and ignored: rules, a substitute, reserved workers, a steady source other than
-rented machines, and more than one rented source.
+never accepted and ignored: rules, a substitute, and more than one rented source.
 """
 
 from __future__ import annotations
@@ -24,7 +23,7 @@ SOURCE_TYPES = ("local", "fixed", "shared", "rented", "hosted")
 #: Which source types each role takes (workloads.md §14.1). Rented machines are what until_ready
 #: covers for; borrowing never outlasts the start (D115); hosted APIs are never where a workload runs.
 ROLE_TAKES = {
-    "steady": ("rented",),
+    "steady": ("rented", "local", "fixed"),
     "until_ready": ("local", "fixed", "shared", "hosted"),
     "when_full": ("hosted", "rented"),
 }
@@ -40,7 +39,6 @@ RENTED_KINDS = ("roi", "on_demand", "interruptible")
 LATER = {
     "rules": "rules arrive in a later version of the pool",
     "substitute": "a substitute model arrives in a later version of the pool",
-    "reserve": "reserved workers arrive in a later version of the pool",
     "tz": "a plan's time zone comes with its rules, in a later version of the pool",
 }
 #: A request's options (§14.4, D201): each header's values, and the one meant when a request sends
@@ -48,7 +46,9 @@ LATER = {
 OPTIONS = {"priority": ("interactive", "batch"), "keep_on": ("no_hosted", "owned", "any")}
 DEFAULT_OPTIONS = {"priority": "interactive", "keep_on": "any"}
 OPTION_HEADERS = {"priority": "X-GPM-Priority", "keep_on": "X-GPM-Keep-On"}
-_TOP = ("steady", "until_ready", "when_full", "during", "max_min", "defaults", *LATER)
+_TOP = ("steady", "until_ready", "when_full", "during", "max_min", "defaults", "reserve", *LATER)
+#: The most workers one plan may reserve of a kind (`reserve: {local: n}`).
+MAX_RESERVE = 1024
 #: A stop-gap's longest gap, minutes: a day. Longer is not a stop-gap.
 MAX_MAX_MIN = 24 * 60
 
@@ -119,6 +119,14 @@ class ServingPlan:
     when_full: tuple[Source, ...] = ()
     #: A request option's value where a request sends none (§14.4).
     defaults: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    #: Workers of the operator's own machines this workload has the first call on, by source
+    #: type (`local`, `fixed`) — the operator's alone to set (§14.2).
+    reserve: Mapping[str, int] = dataclasses.field(default_factory=dict)
+
+    @property
+    def steady_kinds(self) -> frozenset[str]:
+        """The host kinds steady runs on where it is the operator's machines; empty: rented."""
+        return frozenset(HOST_KINDS.get(self.steady, ()))
 
     def as_dict(self) -> dict[str, Any]:
         written: dict[str, Any] = {"steady": self.steady}
@@ -132,6 +140,8 @@ class ServingPlan:
                                     for s in self.when_full]
         if self.defaults:
             written["defaults"] = dict(self.defaults)
+        if self.reserve:
+            written["reserve"] = dict(self.reserve)
         return written
 
     def source_types(self) -> set[str]:
@@ -337,12 +347,13 @@ def parse_serve(raw: Any) -> ServingPlan:
         raise PlanRefused(f"serve takes steady, until_ready, during, max_min, when_full and defaults, not {unknown}")
 
     steady = raw.get("steady", "rented")
-    if steady != "rented":
-        if steady in ("local", "fixed"):
-            raise PlanRefused(f"serve.steady {steady!r} needs workers the operator reserves, which arrive in a later "
-                              "version of the pool; until then a workload runs on machines rented for it")
-        raise PlanRefused("serve.steady is \"rented\": the workload's own rented machines, sized by parallel and "
-                          "latency_s")
+    if steady not in ROLE_TAKES["steady"]:
+        raise PlanRefused("serve.steady is \"rented\" (the workload's own rented machines, the default), \"local\" "
+                          "or \"fixed\" (the operator's own machines, with workers reserved for it)")
+    reserve = _reserve(raw.get("reserve"))
+    if steady != "rented" and not reserve.get(steady):
+        raise PlanRefused(f"serve.steady {steady!r} runs on workers the operator reserves for it: add "
+                          f"reserve: {{\"{steady}\": <workers>}}")
 
     # Named sources first, from both roles: either role may list, by its name, one the other defines.
     defined: dict[str, Source] = {}
@@ -381,11 +392,33 @@ def parse_serve(raw: Any) -> ServingPlan:
         during = tuple(d for d in DURING if d in listed)
     if "max_min" in raw:
         max_min = _number(raw["max_min"], "serve.max_min", low=1, high=MAX_MAX_MIN)
-    return ServingPlan(steady="rented", until_ready=until_ready, during=during, max_min=max_min, when_full=when_full,
-                       defaults=_defaults(raw.get("defaults")))
+    if steady != "rented":
+        if until_ready:
+            raise PlanRefused(f"until_ready covers while the workload's rented machines are prepared; with steady "
+                              f"{steady!r} nothing is rented, so there is nothing to cover")
+        if any(s.type == "rented" for s in when_full):
+            raise PlanRefused(f"a rented burst above steady {steady!r} arrives with rules, in a later version of the "
+                              "pool; when_full may use hosted APIs")
+    defaults = _defaults(raw.get("defaults"), owned_steady=steady != "rented")
+    return ServingPlan(steady=steady, until_ready=until_ready, during=during, max_min=max_min, when_full=when_full,
+                       defaults=defaults, reserve=reserve)
 
 
-def _defaults(raw: Any) -> dict[str, str]:
+def _reserve(raw: Any) -> dict[str, int]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or not raw:
+        raise PlanRefused("serve.reserve is an object of workers by source: {\"local\": 4} and/or {\"fixed\": 8}")
+    unknown = sorted(set(raw) - set(HOST_KINDS))
+    if unknown:
+        raise PlanRefused(f"serve.reserve takes local and fixed — the operator's own machines — not {unknown}")
+    for kind, workers in raw.items():
+        if isinstance(workers, bool) or not isinstance(workers, int) or not 1 <= workers <= MAX_RESERVE:
+            raise PlanRefused(f"serve.reserve.{kind} is a whole number of workers from 1 to {MAX_RESERVE}")
+    return dict(raw)
+
+
+def _defaults(raw: Any, owned_steady: bool = False) -> dict[str, str]:
     if raw is None:
         return {}
     if not isinstance(raw, dict):
@@ -398,12 +431,12 @@ def _defaults(raw: Any) -> dict[str, str]:
     for option, value in raw.items():
         if value not in OPTIONS[option]:
             raise PlanRefused(f"serve.defaults.{option} is {_listed(OPTIONS[option])}")
-    if raw.get("keep_on") == "owned":
-        # Steady is the workload's rented machines until reserved workers arrive: `owned` by
-        # default would leave a request that sends nothing no source once the workload serves.
+    if raw.get("keep_on") == "owned" and not owned_steady:
+        # Steady on rented machines: `owned` by default would leave a request that sends nothing
+        # no source once the workload serves.
         raise PlanRefused("serve.defaults.keep_on owned keeps every request off the workload's own rented machines, "
-                          "where it runs; it needs a steady source the operator owns (reserved workers), which "
-                          "arrives in a later version of the pool. A request may still send it")
+                          "where it runs; it needs steady local or fixed (workers the operator reserves). A request "
+                          "may still send it")
     return dict(raw)
 
 
@@ -565,7 +598,11 @@ def describe(plan: ServingPlan) -> str:
                 "shared": "shared (any free machine of the pool)"}[source.type] + (
                     f" as {source.name}" if source.name != source.type else "")
 
-    said = ["steady on machines rented for it"]
+    said = ["steady on machines rented for it" if plan.steady == "rented" else
+            f"steady on the operator's {plan.steady} machines, {plan.reserve[plan.steady]} worker(s) reserved"]
+    for kind, workers in sorted(plan.reserve.items()):
+        if kind != plan.steady:
+            said.append(f"{workers} {kind} worker(s) reserved for its stop-gap")
     if plan.until_ready:
         limit = f", for at most {plan.max_min:g} min each time" if plan.max_min is not None else ""
         said.append(f"until ready ({' and '.join(plan.during)}{limit}): " + ", then ".join(named(s) for s in plan.until_ready))
