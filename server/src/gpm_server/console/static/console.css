@@ -277,3 +277,19 @@ table.dash-table th[scope=row] { font-weight: 400; text-transform: none; letter-
   header#top { flex-wrap: wrap; gap: 8px 16px; }
   .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
+
+/* The serving plan builder (S19, D204). */
+.serving-plan { margin: 12px 0; }
+.serving-plan .tabs { border-bottom: 1px solid var(--line); margin-bottom: 8px; }
+.serving-plan .tabs button.active { font-weight: 600; background: var(--panel); }
+.builder fieldset.toggle { border: 1px solid var(--line); border-radius: 6px; margin: 6px 0; padding: 6px 10px; }
+.builder fieldset.toggle legend { padding: 0 4px; }
+.field.check { flex-direction: row; align-items: center; gap: 4px; }
+.serving-plan textarea, .side-by-side textarea { width: 100%; box-sizing: border-box; }
+.side-by-side { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.side-by-side pre { white-space: pre-wrap; max-height: 22rem; overflow: auto; }
+.code-block pre { white-space: pre-wrap; overflow-x: auto; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 6px; padding: 8px; }
+.readback table { margin-top: 6px; }
+@media (max-width: 640px) { .side-by-side { grid-template-columns: 1fr; } }
+dialog:has(.side-by-side) { max-width: min(1000px, 95vw); width: 95vw; }

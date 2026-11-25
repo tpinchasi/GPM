@@ -104,6 +104,7 @@ const api = {
   extendWorkload: (name, body) => call("POST", `/pool/workloads/${encodeURIComponent(name)}/extend`, body),
   endWorkload: (name) => call("POST", `/pool/workloads/${encodeURIComponent(name)}/end`),
   rotateWorkloadKey: (name) => call("POST", `/pool/workloads/${encodeURIComponent(name)}/keys`),
+  setWorkloadPolicy: (name, body) => call("POST", `/pool/workloads/${encodeURIComponent(name)}/policy`, body),
   // Named app keys for the shared pool (D193): a key shown once, only its hash kept.
   apps: () => call("GET", "/pool/apps"),
   createAppKey: (app) => call("POST", "/pool/apps", { app }),
@@ -4238,6 +4239,8 @@ const workloadDraft = {
   // One row per model, each with its own target (D118).
   name: "", rows: [{ model: "", latency: "30", parallel: "8" }], placement: "auto", hours: "4", budget: "", kind: "roi",
   plan: null, planning: false, error: null, notice: null, shown: null, open: null,
+  // Its serving plan (S19, D204): the plan every tab reads and writes, and the tab shown.
+  serve: {}, serveTab: "builder", serveText: null, serveError: null, serveAdvanced: false,
   rowErrors: {}, timer: null, holder: null,
   // The form folds away once any workload is active, so the table stays in view; it opens on
   // request, and stays open while it holds a draft.
@@ -4274,6 +4277,8 @@ function workloadBody() {
     body.placement = d.placement;
   }
   if (d.budget.trim() !== "") body.max_spend = Number(d.budget.replace(/^\$/, ""));
+  const serve = tidyServe(d.serve);
+  if (Object.keys(serve).length) body.serve = serve;
   return body;
 }
 
@@ -4305,9 +4310,9 @@ function workloadForm(status) {
       select.setAttribute("aria-invalid", d.rows.some((r, j) => j !== i && r.model === d.rows[i].model) ? "true" : "false");
     });
     dupNote.textContent = twice() ? "Each model once: pick another for the repeated row." : "";
-    planButton.disabled = d.planning || !nameOk() || twice();
+    planButton.disabled = d.planning || !nameOk() || twice() || Boolean(d.serveError);
     planButton.textContent = d.planning ? "Working it out…" : "Plan";
-    planButton.title = !nameOk() ? "Name it first" : twice() ? "Each model once" : "";
+    planButton.title = !nameOk() ? "Name it first" : twice() ? "Each model once" : d.serveError ? "Fix the serving plan's JSON first" : "";
     nameCheck.textContent = d.name && !nameOk() ? "lower-case letters, digits and -, not starting with rented-" : "";
     refill(planHolder, ...(d.plan ? [workloadPlanView(d.plan)] : []));
     errorHolder.textContent = d.error || "";
@@ -4380,6 +4385,7 @@ function workloadForm(status) {
       wrap("Budget ($)", input("budget", { type: "number", min: "0.01", step: "0.01", placeholder: "propose one for me" }),
         "its dollar cap; left empty, the plan proposes one"),
       el("label", { class: "field" }, el("span", {}, "Machines"), kindSelect, kindHint)),
+    servingPanel(changed),
     el("div", { class: "row" }, planButton, errorHolder),
     d.notice ? el("p", { class: "warn-text", role: "status" }, d.notice) : null,
     planHolder);
@@ -4409,7 +4415,8 @@ function workloadPlanView(plan) {
     const counts = Object.entries(plan.rejected_by_reason || {}).slice(0, 4).map(([why, n]) => `${n} ${why}`);
     return el("div", { class: "plan refused", tabindex: "-1" }, el("strong", {}, "Cannot start: "), plan.refused,
       counts.length ? el("p", {}, "Machines turned away: ", counts.join(", "), ". See ",
-        el("a", { href: "#rented/finding" }, "Rented capacity → Finding machines"), ".") : null);
+        el("a", { href: "#rented/finding" }, "Rented capacity → Finding machines"), ".") : null,
+      servingReadback(plan.serving));
   }
   const first = plan.first_host;
   const hosts = plan.hosts_at_start;
@@ -4494,8 +4501,448 @@ function workloadPlanView(plan) {
       el("ul", {}, ...(plan.reasons || []).map((line) => el("li", {}, line)),
         ...(plan.sizing || []).map((line) => el("li", {}, line)),
         ...(first.reasons || []).map((line) => el("li", {}, line)))),
+    servingReadback(plan.serving),
     plan.refused ? el("p", { class: "error" }, el("strong", {}, "Cannot start: "), plan.refused) : null,
     el("div", { class: "row" }, createButton));
+}
+
+// --- The serving plan builder (S19 stage 7, D204; workloads.md §14) ---
+// Four toggles in the form's own words, Advanced, a JSON tab that edits both ways, and code
+// filled from a template with the plan as it stands — never written by a model. The plan itself
+// (`workloadDraft.serve`) is what every tab reads and writes; the plan check says what it means.
+// The builder changes only what its toggles name: a plan written as JSON keeps its order, its
+// other sources and its rules.
+
+const COVER_MACHINES = [
+  ["shared", "free machines of the shared workload"],
+  ["local", "the operator's local machines"],
+  ["fixed", "the operator's fixed machines elsewhere"],
+];
+// The rule the "at certain hours" toggle writes, found again by its name.
+const HOURS_RULE = "at certain hours";
+const SOURCE_WORDS = ["local", "fixed", "shared", "rented", "hosted"];
+
+const sourceType = (s) => (typeof s === "string" ? s : Object.keys(s || {}).find((k) => k !== "name"));
+const sourceSettings = (s) => (typeof s === "string" ? {} : (s[sourceType(s)] || {}));
+const asList = (value) => (Array.isArray(value) ? value : []);
+
+// The plan with empty roles, defaults and rules left out: what is sent and shown.
+function tidyServe(serve) {
+  const out = {};
+  for (const [key, value] of Object.entries(serve || {})) {
+    if (Array.isArray(value) && !value.length) continue;
+    if (value && typeof value === "object" && !Array.isArray(value) && !Object.keys(value).length) continue;
+    if (value === "" || value === null || value === undefined) continue;
+    out[key] = value;
+  }
+  // during and max_min say when until_ready is used: without it they are refused.
+  if (!out.until_ready) { delete out.during; delete out.max_min; }
+  return out;
+}
+
+function servePart(role, type) {
+  return asList(workloadDraft.serve[role]).find((s) => sourceType(s) === type);
+}
+
+// Add or take away the one source of a type the builder manages, leaving the rest as written:
+// a machine goes before the role's first hosted API (the order requests try them in), anything
+// else at the end.
+function setServePart(role, type, value) {
+  const serve = workloadDraft.serve;
+  const list = [...asList(serve[role])];
+  const at = list.findIndex((s) => sourceType(s) === type);
+  if (!value) {
+    if (at >= 0) list.splice(at, 1);
+  } else if (at >= 0) {
+    list[at] = value;
+  } else {
+    const hosted = list.findIndex((s) => sourceType(s) === "hosted");
+    const machine = ["shared", "local", "fixed"].includes(type);
+    list.splice(machine && hosted >= 0 ? hosted : list.length, 0, value);
+  }
+  serve[role] = list;
+  pruneDangling(serve);
+}
+
+// A role's word for a source another role defined by name is dropped with that source; so is the
+// hours rule once no hosted source is left for it to keep requests off.
+function pruneDangling(serve) {
+  const defined = new Set([...asList(serve.until_ready), ...asList(serve.when_full)]
+    .filter((s) => s && typeof s === "object" && s.name).map((s) => s.name));
+  for (const role of ["until_ready", "when_full"]) {
+    if (Array.isArray(serve[role])) {
+      serve[role] = serve[role].filter((s) => typeof s !== "string" || SOURCE_WORDS.includes(s) || defined.has(s));
+    }
+  }
+  if (hoursRule() && !hostedNames(serve).length) setHoursRule(null);
+}
+
+function hostedNames(serve) {
+  return [...asList(serve.until_ready), ...asList(serve.when_full)]
+    .filter((s) => sourceType(s) === "hosted").map((s) => (typeof s === "object" && s.name) || "hosted");
+}
+
+function hoursRule() {
+  return asList(workloadDraft.serve.rules).find((r) => r && r.name === HOURS_RULE
+    && r.when && typeof r.when.between === "string" && r.when.between.includes("-"));
+}
+
+function setHoursRule(rule) {
+  const rules = asList(workloadDraft.serve.rules).filter((r) => !(r && r.name === HOURS_RULE));
+  if (rule) rules.push(rule);
+  workloadDraft.serve.rules = rules;
+}
+
+// A budget's one limit set or cleared; its other limits are kept as written.
+function setBudget(settings, key, value) {
+  const budget = { ...(settings.budget || {}) };
+  if (value === null) delete budget[key]; else budget[key] = value;
+  settings.budget = budget;
+}
+
+// A number field bound to one setting of a source; empty leaves it out.
+function numberSetting(label, value, onValue, attrs = {}) {
+  const input = el("input", { type: "number", step: "any", min: "0.01", value: value ?? "", ...attrs,
+    oninput: (e) => onValue(e.target.value === "" ? null : Number(e.target.value)) });
+  return el("label", { class: "field" }, el("span", {}, label), input);
+}
+
+// Redrawn whole, the form keeps the control that had the focus.
+function redrawKeepingFocus() {
+  const id = document.activeElement && document.activeElement.id;
+  drawWorkloadForm();
+  if (id) document.getElementById(id)?.focus();
+}
+
+function servingBuilder(changed) {
+  const d = workloadDraft;
+  const serve = d.serve;
+  const redraw = () => { changed(); redrawKeepingFocus(); };
+  const toggle = (key, label, on, onChange, ...body) => el("fieldset", { class: "toggle" },
+    el("legend", {}, el("label", {}, el("input", { type: "checkbox", id: `sp-${key}`, ...(on ? { checked: true } : {}),
+      onchange: (e) => { onChange(e.target.checked); redraw(); } }), ` ${label}`)),
+    on ? el("div", { class: "form-grid" }, ...body) : null);
+  const check = (key, words, on, onChange) => el("label", { class: "field check" },
+    el("input", { type: "checkbox", id: `sp-${key}`, ...(on ? { checked: true } : {}),
+      onchange: (e) => { onChange(e.target.checked); redraw(); } }),
+    el("span", {}, ` ${words}`));
+
+  // 1. Cover start-up and replacements with…
+  const coverHosted = servePart("until_ready", "hosted");
+  const cover = toggle("cover", "Cover start-up and replacements with…", asList(serve.until_ready).length > 0,
+    (on) => { serve.until_ready = on ? ["shared"] : []; pruneDangling(serve); },
+    ...COVER_MACHINES.map(([type, words]) => check(`cover-${type}`, words, Boolean(servePart("until_ready", type)),
+      (on) => setServePart("until_ready", type, on ? type : null))),
+    check("cover-hosted", "hosted APIs, within a budget", Boolean(coverHosted),
+      (on) => setServePart("until_ready", "hosted", on ? { name: "hosted-cover", hosted: { budget: { per_day: 10 } } } : null)),
+    coverHosted ? numberSetting("Hosted, $ a day", sourceSettings(coverHosted).budget?.per_day,
+      (v) => { setBudget(sourceSettings(coverHosted), "per_day", v); changed(); }) : null);
+
+  // 2. When full, also use…
+  const fullHosted = servePart("when_full", "hosted");
+  const fullRented = servePart("when_full", "rented");
+  const full = toggle("full", "When every worker is busy, also use…", asList(serve.when_full).length > 0,
+    (on) => { serve.when_full = on ? [{ name: "hosted-burst", hosted: { after_s: 5, budget: { per_day: 20 } } }] : [];
+      pruneDangling(serve); },
+    check("full-hosted", "hosted APIs", Boolean(fullHosted),
+      (on) => setServePart("when_full", "hosted", on ? { name: "hosted-burst", hosted: { after_s: 5, budget: { per_day: 20 } } } : null)),
+    fullHosted ? numberSetting("…after waiting (s)", sourceSettings(fullHosted).after_s,
+      (v) => { if (v === null) delete sourceSettings(fullHosted).after_s; else sourceSettings(fullHosted).after_s = v; changed(); },
+      { min: "0" }) : null,
+    fullHosted ? numberSetting("Hosted, $ a day", sourceSettings(fullHosted).budget?.per_day,
+      (v) => { setBudget(sourceSettings(fullHosted), "per_day", v); changed(); }) : null,
+    check("full-rented", "more rented machines", Boolean(fullRented),
+      (on) => setServePart("when_full", "rented", on ? { rented: { after_min: 10, max_hosts: 2, budget: { per_day: 40 } } } : null)),
+    fullRented ? numberSetting("…after it has been full (min)", sourceSettings(fullRented).after_min,
+      (v) => { if (v === null) delete sourceSettings(fullRented).after_min; else sourceSettings(fullRented).after_min = v; changed(); },
+      { min: "0" }) : null,
+    fullRented ? numberSetting("At most, more hosts", sourceSettings(fullRented).max_hosts,
+      (v) => { if (v === null) delete sourceSettings(fullRented).max_hosts; else sourceSettings(fullRented).max_hosts = Math.max(1, Math.round(v)); changed(); },
+      { step: "1", min: "1" }) : null,
+    fullRented ? numberSetting("Rented, $ a day", sourceSettings(fullRented).budget?.per_day,
+      (v) => { setBudget(sourceSettings(fullRented), "per_day", v); changed(); }) : null);
+
+  // 3. Keep some requests off hosted APIs…
+  const keepOff = (serve.defaults || {}).keep_on === "no_hosted";
+  const keep = toggle("keep", "Keep requests that say nothing off hosted APIs", keepOff,
+    (on) => {
+      const rest = { ...(serve.defaults || {}) };
+      if (on) rest.keep_on = "no_hosted"; else delete rest.keep_on;
+      serve.defaults = rest;
+    },
+    el("p", { class: "muted" }, "A request may still send X-GPM-Keep-On: any (or keep_on=\"any\" in the SDK) to use them."));
+
+  // 4. At certain hours… — only where there is a hosted source to keep requests off.
+  const hours = hoursRule();
+  const hosted = hostedNames(serve);
+  const setBetween = (i, value) => {
+    const rule = hoursRule();
+    const parts = rule.when.between.split("-");
+    parts[i] = value;
+    rule.when.between = parts.join("-"); changed();
+  };
+  const between = hours ? hours.when.between.split("-") : [];
+  const hoursBody = hours ? [
+    el("label", { class: "field" }, el("span", {}, "From"),
+      el("input", { type: "time", id: "sp-hours-from", value: between[0], oninput: (e) => setBetween(0, e.target.value) })),
+    el("label", { class: "field" }, el("span", {}, "Until"),
+      el("input", { type: "time", id: "sp-hours-until", value: between[1], oninput: (e) => setBetween(1, e.target.value) })),
+    el("label", { class: "field" }, el("span", {}, "Time zone"),
+      el("input", { type: "text", id: "sp-hours-tz", value: serve.tz || "UTC", placeholder: "America/New_York",
+        oninput: (e) => { serve.tz = e.target.value.trim() || undefined; changed(); } })),
+  ] : [];
+  const atHours = toggle("hours", "At certain hours, keep off hosted APIs", Boolean(hours),
+    (on) => setHoursRule(on ? { name: HOURS_RULE, when: { between: "22:00-06:00" }, then: { never_use: ["hosted"] } } : null),
+    ...hoursBody);
+  if (!hours && !hosted.length) {
+    atHours.querySelector("input").disabled = true;
+    atHours.append(el("small", { class: "muted" }, "Add hosted APIs above first: this keeps requests off them."));
+  }
+
+  // Advanced: how long a stop-gap may last, covering scale-ups, and every other rule (as JSON).
+  const during = asList(serve.during).length ? asList(serve.during) : ["start", "replacement"];
+  const otherRules = asList(serve.rules).filter((r) => !(r && r.name === HOURS_RULE));
+  const advanced = el("details", { class: "advanced", ...(d.serveAdvanced ? { open: true } : {}),
+    ontoggle: (e) => { d.serveAdvanced = e.target.open; } },
+    el("summary", {}, "Advanced"),
+    el("div", { class: "form-grid" },
+      numberSetting("Stop-gap at most (min)", serve.max_min ?? "", (v) => {
+        if (v === null) delete serve.max_min; else serve.max_min = v; changed(); }, { min: "1", placeholder: "60" }),
+      check("scale-up", "cover a scale-up too, while its machine is prepared", during.includes("scale_up"), (on) => {
+        const kept = during.filter((m) => m !== "scale_up");
+        serve.during = on ? [...kept, "scale_up"] : kept;
+        if (serve.during.join() === "start,replacement") delete serve.during;
+      })),
+    el("p", { class: "muted" }, otherRules.length
+      ? `${otherRules.length} more rule${otherRules.length === 1 ? "" : "s"}: ${otherRules.map((r) => (r && r.name) || "unnamed").join(", ")} — edit them in the JSON tab.`
+      : "Rules on spending, evictions and a request's options, and a switch of where it runs, are written in the JSON tab."));
+
+  return el("div", { class: "builder" },
+    d.serveError ? el("p", { class: "warn-text", role: "status" },
+      "The JSON tab holds text that is not a plan yet; the builder shows the last plan that was.") : null,
+    cover, full, keep, atHours, advanced);
+}
+
+const JSON_NOTE = "Edits here are the builder's too; the plan check says what the plan means.";
+
+function servingJson(changed) {
+  const d = workloadDraft;
+  if (d.serveText === null) d.serveText = JSON.stringify(tidyServe(d.serve), null, 2);
+  const note = el("small", { class: d.serveError ? "error" : "muted", role: "status", id: "sp-json-note" },
+    d.serveError || JSON_NOTE);
+  const area = el("textarea", { class: "mono", rows: "16", spellcheck: "false", id: "sp-json",
+    "aria-label": "The serving plan, as JSON", "aria-describedby": "sp-json-note",
+    oninput: (e) => {
+      d.serveText = e.target.value;
+      try {
+        const parsed = e.target.value.trim() ? JSON.parse(e.target.value) : {};
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("a serving plan is a JSON object");
+        d.serve = parsed; d.serveError = null;
+      } catch (error) {
+        d.serveError = `Not a plan yet: ${error.message}`;
+      }
+      note.className = d.serveError ? "error" : "muted";
+      note.textContent = d.serveError || JSON_NOTE;
+      changed(true);
+    } });
+  area.value = d.serveText;
+  return el("div", {}, area, note);
+}
+
+// A JSON value written as Python.
+function asPython(value, indent = 0) {
+  const pad = " ".repeat(indent);
+  if (value === null || value === undefined) return "None";
+  if (value === true) return "True";
+  if (value === false) return "False";
+  if (typeof value === "number") return String(value);
+  if (typeof value === "string") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    if (!value.length) return "[]";
+    return `[\n${value.map((v) => `${pad}    ${asPython(v, indent + 4)}`).join(",\n")},\n${pad}]`;
+  }
+  const keys = Object.keys(value);
+  if (!keys.length) return "{}";
+  return `{\n${keys.map((k) => `${pad}    ${JSON.stringify(k)}: ${asPython(value[k], indent + 4)}`).join(",\n")},\n${pad}}`;
+}
+
+// What only the operator may send (§14.2): a program's key is refused it.
+function operatorOnly(serve) {
+  const said = [];
+  if (serve.reserve) said.push("reserve");
+  if (serve.steady === "local" || serve.steady === "fixed") said.push(`steady ${serve.steady}`);
+  for (const role of ["until_ready", "when_full"]) {
+    for (const s of asList(serve[role])) {
+      if (sourceType(s) === "local" || sourceType(s) === "fixed") said.push(`${sourceType(s)} (unless its grant's sources allow it)`);
+    }
+  }
+  return [...new Set(said)];
+}
+
+function servingCode() {
+  const d = workloadDraft;
+  const body = workloadBody();
+  const serve = tidyServe(d.serve);
+  const name = body.name || "my-workload";
+  const only = operatorOnly(serve);
+  const targets = body.models || [{ model: body.model, latency_s: body.latency_s, parallel: body.parallel }];
+  const several = targets.length > 1;
+  const models = several
+    ? `models={${targets.map((t) => `${JSON.stringify(t.model)}: {"latency_s": ${t.latency_s}, "parallel": ${t.parallel}}`).join(", ")}},\n    `
+      + `placement=${JSON.stringify(body.placement || "auto")},\n    `
+    : `${JSON.stringify(targets[0].model)}, latency_s=${targets[0].latency_s}, parallel=${targets[0].parallel},\n    `;
+  const spend = body.max_spend !== undefined
+    ? `max_spend=${body.max_spend},`
+    : "max_spend=None,  # a program must say what it will spend: type a budget in the form";
+  const sdk = [
+    "from gpm_client import WorkloadProvisioner",
+    "",
+    "# A program's provisioning key, from GPM_PROVISIONING_KEY; the pool's URL from GPM_URL.",
+    ...(only.length ? [`# A program's key cannot send ${only.join(", ")}: the operator's alone. Create it as an operator.`] : []),
+    "provisioner = WorkloadProvisioner()",
+    `workload = provisioner.workload(\n    ${models}hours=${body.hours}, machines=${JSON.stringify(body.kind || "roi")},\n`
+      + `    ${spend}\n    serve=${asPython(serve, 4)},\n)`,
+  ].join("\n");
+  const flags = targets.map((t) => `--model ${t.model} --latency ${t.latency_s} --parallel ${t.parallel}`).join(" ");
+  const confirm = body.max_spend !== undefined ? ""
+    : d.plan && d.plan.max_spend !== undefined ? ` --confirm-max-spend ${d.plan.max_spend.toFixed(2)}` : null;
+  const cli = [
+    ...(confirm === null ? ["# No budget typed: Plan first, then this line carries the proposed budget to confirm."] : []),
+    `gpm workload create ${name} ${flags} --hours ${body.hours}`
+      + (body.max_spend !== undefined ? ` --max-spend ${body.max_spend}` : confirm || "")
+      + (several ? ` --placement ${body.placement || "auto"}` : "")
+      + (body.kind && body.kind !== "roi" ? ` --kind ${body.kind}` : "") + " \\",
+    "    --serve - <<'EOF'",
+    JSON.stringify(serve, null, 2),
+    "EOF",
+  ].join("\n");
+  const http = [
+    "# The control API, with the operator's admin key; a budget not typed is sent back as confirm_max_spend.",
+    "curl -sS -X POST \"$GPM_CONTROL_URL/pool/workloads\" -H \"Authorization: Bearer $GPM_ADMIN_KEY\" \\",
+    "    -H 'Content-Type: application/json' -d @- <<'EOF'",
+    JSON.stringify({ ...body, name, serve }, null, 2),
+    "EOF",
+  ].join("\n");
+  const block = (title, text) => el("div", { class: "code-block" },
+    el("div", { class: "row" }, el("strong", {}, title),
+      el("button", { class: "small", onclick: async (e) => {
+        try { await navigator.clipboard.writeText(text); e.target.textContent = "Copied"; } catch { e.target.textContent = "Select and copy"; }
+      } }, "Copy")),
+    el("pre", { class: "mono" }, text));
+  return el("div", {},
+    el("p", { class: "muted" }, "Filled from a template with the plan as it stands; nothing here is written by a model."),
+    block("SDK — for a program", sdk), block("Command line — for an operator", cli), block("HTTP — for an operator", http));
+}
+
+const SERVE_TABS = [["builder", "Builder"], ["json", "JSON"], ["code", "Code"]];
+
+function servingPanel(changed) {
+  const d = workloadDraft;
+  const pick = (tab) => {
+    // The JSON tab is written again from the plan as it stands — unless it holds text that is
+    // not a plan yet, which is kept, with its error, for the operator to finish.
+    if (tab === "json" && !d.serveError) d.serveText = null;
+    d.serveTab = tab;
+    drawWorkloadForm();
+    document.getElementById(`sp-tab-${tab}`)?.focus();
+  };
+  let body;
+  try {
+    body = d.serveTab === "json" ? servingJson(changed) : d.serveTab === "code" ? servingCode() : servingBuilder(changed);
+  } catch {
+    body = el("p", { class: "warn-text", role: "status" }, "This plan is beyond the builder: edit it in the JSON tab.");
+  }
+  return el("section", { class: "serving-plan", "aria-label": "Serving plan" },
+    el("h3", {}, "Serving plan"),
+    el("p", { class: "muted" }, "Where its requests go and when: its own machines, then what covers while they start, then what helps when they are full. Plan to read it back."),
+    el("div", { class: "tabs", role: "tablist", "aria-label": "Serving plan as",
+      onkeydown: (e) => {
+        if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+        const at = SERVE_TABS.findIndex(([tab]) => tab === d.serveTab);
+        pick(SERVE_TABS[(at + (e.key === "ArrowRight" ? 1 : SERVE_TABS.length - 1)) % SERVE_TABS.length][0]);
+      } },
+    ...SERVE_TABS.map(([tab, text]) => el("button", {
+      role: "tab", id: `sp-tab-${tab}`, class: "small" + (d.serveTab === tab ? " active" : ""),
+      "aria-selected": d.serveTab === tab ? "true" : "false", "aria-controls": "sp-panel",
+      tabindex: d.serveTab === tab ? "0" : "-1", onclick: () => pick(tab) }, text))),
+    el("div", { role: "tabpanel", id: "sp-panel", "aria-labelledby": `sp-tab-${d.serveTab}` }, body));
+}
+
+// The plan check's reading of the plan (§14.6), under the plan.
+function servingReadback(serving) {
+  if (!serving) return null;
+  const most = serving.most_it_can_spend || {};
+  return el("div", { class: "readback" },
+    el("h3", {}, "What it will do"),
+    el("ul", {}, ...(serving.readback || []).map((line) => el("li", {}, line))),
+    (serving.timeline || []).length ? el("table", {},
+      el("caption", {}, `Timeline (${serving.tz || "UTC"})`),
+      el("thead", {}, el("tr", {}, ...["From", "Until", "Phase", "Where requests go", "Workers", "Per hour"].map((h) => el("th", {}, h)))),
+      el("tbody", {}, ...serving.timeline.map((p) => el("tr", {},
+        el("td", {}, p.from), el("td", {}, p.to), el("td", {}, p.phase),
+        el("td", {}, p.said, p.minutes ? el("div", { class: "muted" },
+          `about ${p.minutes.median} min (90%: ${p.minutes.p90})${p.minutes.measured ? "" : ", estimated"}`) : null),
+        el("td", { class: "num" }, String(p.workers || 0)), el("td", { class: "num" }, rate(p.hourly_usd)))))) : null,
+    (serving.conditions || []).length ? el("details", {}, el("summary", {}, "What can change it"),
+      el("ul", {}, ...serving.conditions.map((c) => el("li", {}, `If ${c.condition}: ${c.effect}`
+        + (c.rule ? ` (rule ${c.rule})` : ""))))) : null,
+    most.said ? el("p", {}, el("strong", {}, "Most it can spend: "), most.said) : null,
+    ...(serving.warnings || []).map((w) => el("p", { class: "warn-text" }, `Note: ${w}`)),
+    (serving.providers || []).length ? el("p", { class: "muted" },
+      `Hosted APIs serving its models (for providers): ${serving.providers.join(", ")}`) : null);
+}
+
+// A workload with no plan, its fields written as the plan they mean (workloads.md §14.1): its
+// bursts as when_full, its borrowing while it starts and its hosted burst as until_ready.
+function planOfFields(w) {
+  const policy = w.policy || {};
+  const plan = {};
+  const hosted = policy.hosted ? { name: "hosted-burst", hosted: { ...policy.hosted } } : null;
+  const until = [];
+  if ((w.plan || {}).may_borrow !== false) until.push("shared");
+  if (hosted) until.push("hosted-burst");
+  if (until.length) { plan.until_ready = until; plan.during = ["start"]; }
+  const full = [];
+  if (hosted) full.push(hosted);
+  if (policy.rented) full.push({ rented: { ...policy.rented } });
+  if (full.length) plan.when_full = full;
+  // A source is defined where it is first listed: until_ready names the hosted burst by name.
+  if (hosted && until.includes("hosted-burst")) {
+    plan.until_ready = until.map((s) => (s === "hosted-burst" ? hosted : s));
+    plan.when_full = full.map((s) => (s === hosted ? "hosted-burst" : s));
+  }
+  return plan;
+}
+
+// A running workload's plan changed, current and proposed side by side (D204).
+async function changeServingPlan(button, w) {
+  const current = (w.policy || {}).serve || null;
+  const proposed = el("textarea", { class: "mono", rows: "16", spellcheck: "false", "aria-label": "Proposed serving plan, as JSON" });
+  proposed.value = JSON.stringify(current || planOfFields(w), null, 2);
+  const problem = el("p", { class: "error", role: "status" });
+  for (;;) {
+    const ok = await confirmAction({
+      title: `Change the serving plan of ${w.name}?`,
+      body: el("div", {},
+        el("div", { class: "side-by-side" },
+          el("div", {}, el("strong", {}, "Current"),
+            el("pre", { class: "mono" }, current ? JSON.stringify(current, null, 2)
+              : "No plan: its fields, written as a plan on the right. A plan replaces its bursts.")),
+          el("div", {}, el("strong", {}, "Proposed"), proposed)),
+        problem,
+        el("p", { class: "muted" }, "The proposed plan replaces the whole plan. It takes effect within seconds; today's spend still counts.")),
+      okLabel: "Change serving plan",
+    });
+    if (!ok) return;
+    try {
+      const serve = JSON.parse(proposed.value);
+      if (!serve || typeof serve !== "object" || Array.isArray(serve)) throw new Error("a serving plan is a JSON object");
+      workloadAction(button, w, () => api.setWorkloadPolicy(w.name, { serve }));
+      return;
+    } catch (error) {
+      problem.textContent = `Not JSON yet: ${error.message}`;  // asked again, with what was typed
+    }
+  }
 }
 
 async function createWorkload(button) {
@@ -4520,7 +4967,8 @@ async function createWorkload(button) {
     d.shown = { name: body.name, model: targets.map((t) => t.model).join(", "), connection: made.connection, rotated: false,
                 endsAt: made.workload.ends_at, targets };
     Object.assign(d, { name: "", budget: "", plan: null, error: null, notice: null, formOpen: false,
-      rows: [{ model: "", latency: "30", parallel: "8" }], placement: "auto" });
+      rows: [{ model: "", latency: "30", parallel: "8" }], placement: "auto",
+      serve: {}, serveTab: "builder", serveText: null, serveError: null });
   } catch (error) {
     if (plan.budget_derived && /derived one is/.test(error.message)) {
       // The market moved between the plan and now: plan again and say so, rather than dead-end.
@@ -4691,6 +5139,7 @@ function workloadActions(w) {
   return el("div", { class: "row" },
     el("button", { class: "small", onclick: (e) => extendWorkload(e.target, w) }, "Extend…"),
     el("button", { class: "small", onclick: (e) => rotateWorkloadKey(e.target, w) }, "New key…"),
+    el("button", { class: "small", onclick: (e) => changeServingPlan(e.target, w) }, "Change serving plan…"),
     el("button", { class: "small danger", onclick: (e) => endWorkload(e.target, w) }, "End…"));
 }
 

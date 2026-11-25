@@ -264,7 +264,7 @@ After the second architecture and UX reviews (2026-11-25):
    own — **built** (gpm-server 0.51.0).
 6. **The plan check's readback, timeline and limit**, the JSON Schema, the CLI (`--serve`), the
    SDK's `budgets()`, and the Now line — **built** (gpm-server 0.52.0, gpm-client 0.12.0).
-7. **The console's plan builder.**
+7. **The console's plan builder** — **built** (gpm-server 0.53.0).
 8. **The chat.**
 9. **The substitute model.**
 
