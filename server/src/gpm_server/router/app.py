@@ -636,13 +636,17 @@ def create_app(
         workload = state.registry.workloads.get(name) if name is not None else None
         return workload is not None and model is not None and workload.hosted_alone(model)
 
-    def _plan_routing(plan: Any, name: str, model: str) -> Any:
+    def _plan_routing(plan: Any, name: str, model: str, options: tuple[str, str] = ("interactive", "any")) -> Any:
         """How a request of this workload may go now, by its plan (S19): the facts of the moment
         from the router's own snapshot — whether the model has a ready host of the workload's, the
         replacement gap the supervisor marked, and whether its heartbeat is recent. Cheap and
         synchronous: it is asked again each time a waiting request looks for a worker."""
-        from ..serving_plan import route
+        from ..serving_plan import narrowed, narrowing, route
 
+        # Its rules in force for this request (S19, D200): those on the pass the supervisor last
+        # found true, and those on its options. A stale supervisor's last word stands.
+        rules = narrowing(plan, state.registry.armed.get(name, frozenset()), *options) if plan.rules else None
+        seen = narrowed(plan, rules) if rules is not None else plan
         workload = state.registry.workloads.get(name)
         workload_state, _ = _workload_now(name)
         now = time.time()
@@ -655,8 +659,8 @@ def create_app(
         # A workload made never to borrow (an operator's choice, or a grant without it) never
         # borrows through its plan either.
         may_borrow = bool((getattr(workload, "plan", None) or {}).get("may_borrow", True))
-        return route(
-            plan, short=gap is None or ready <= gap[2],
+        routing = route(
+            seen, short=gap is None or ready <= gap[2],
             preparing=workload_state == "preparing", model_ready=model in _ready_models(name),
             created_at=workload.created_at if workload is not None else now, now=now,
             gap_ends_at=gap[1] if gap is not None else None,
@@ -664,6 +668,10 @@ def create_app(
             fresh=beat is not None and now - beat < max(SUPERVISOR_STALE_S, 3 * state.config.pool.probe_interval_s),
             borrow_share=state.config.workloads.borrow_share if may_borrow else 0.0,
         )
+        if rules is None:
+            return routing
+        return dataclasses.replace(routing, no_burst=plan.rented() is not None and seen.rented() is None,
+                                   rules=rules.by)
 
     def _reserved_for(name: str) -> tuple[tuple[str, int], ...]:
         """The workers of the operator's own machines reserved for a workload now, by host kind
@@ -710,6 +718,8 @@ def create_app(
         name = need.workload
         if name is None:
             return "when_full/hosted" if host.hosted else "steady/shared"
+        if routing is not None and routing.plan is not None:
+            plan = routing.plan  # as this request saw it, under its rules
         if plan is None or routing is None:
             plan = plan or state.shorthand_for(name)
             # Today's fields cover only while the workload has no ready host for the model.
@@ -1237,6 +1247,15 @@ def create_app(
         # A workload's serving plan (S19, D198) says when its stop-gap may be used and how soon a
         # hosted API may take the request. Without one, today's fields decide, as they always did.
         kept = kept_off(*chosen)
+        alone_rules: tuple[str, ...] = ()
+        if plan is not None and plan.rules and _hosted_alone(who.workload, requested):
+            # A model served by hosted APIs alone keeps §13's path (D165), and its plan's rules in
+            # force still hold: those that keep every hosted source out keep it off them (S19).
+            from ..serving_plan import narrowed, narrowing
+
+            in_force = narrowing(plan, state.registry.armed.get(who.workload, frozenset()), *chosen)
+            if in_force.by and not narrowed(plan, in_force).hosted_sources():
+                kept, alone_rules = kept | {"hosted"}, in_force.by
         if "hosted" in kept:
             hosted_after, reserve = None, None  # never a hosted API: nothing to wait for, nothing held
         plan_routing = None
@@ -1246,7 +1265,7 @@ def create_app(
         dispatched_by: list[Any] = [None]
         plan_reserve_now: list[Any] = [None]
         if plan is not None and not _hosted_alone(who.workload, requested):
-            plan_routing = _plan_routing(plan, who.workload, requested)
+            plan_routing = _plan_routing(plan, who.workload, requested, chosen)
             dispatched_by[0] = plan_routing
             hosted_after = None if (burst is None or plan_routing.hosted_after_s is None or "hosted" in kept) \
                 else started + plan_routing.hosted_after_s
@@ -1279,6 +1298,7 @@ def create_app(
             order=plan_routing.order if plan_routing is not None else (),
             kept_off=kept,
             reserved=_reserved_for(who.workload) if who.workload is not None else (),
+            no_burst=plan_routing.no_burst if plan_routing is not None else False,
             steady_kinds=plan.steady_kinds if plan is not None else frozenset(),
         )
         if plan_routing is not None:
@@ -1287,7 +1307,7 @@ def create_app(
             plan_workload = who.workload
 
             def again(current: Need) -> Need:
-                routing = _plan_routing(plan, plan_workload, requested)
+                routing = _plan_routing(plan, plan_workload, requested, chosen)
                 dispatched_by[0] = routing
                 after = None if (burst is None or routing.hosted_after_s is None or "hosted" in kept) \
                     else started + routing.hosted_after_s
@@ -1297,7 +1317,7 @@ def create_app(
                     may_borrow=routing.may_borrow, borrow_kinds=routing.borrow_kinds,
                     borrow_while_ready=routing.borrow_while_ready, order=routing.order,
                     hosted_ids=routing.hosted_ids, hosted_order=routing.hosted_order,
-                    reserved=_reserved_for(plan_workload),
+                    reserved=_reserved_for(plan_workload), no_burst=routing.no_burst,
                     hosted_moments=tuple(started + w for w in routing.hosted_waits) if after is not None else ())
 
             need = dataclasses.replace(
@@ -1310,7 +1330,7 @@ def create_app(
                 # include the host, whose wait is over (or none could serve it otherwise) and
                 # whose budget and the total hold the worst case pays, and is the answer's route.
                 total = plan.hosted_total(days_in_month())
-                budgets_of = {id(s): Budget.model_validate(s.budget) for s in plan.hosted_sources()}
+                budgets_of = {s.budget_id: Budget.model_validate(s.budget) for s in plan.hosted_sources()}
 
                 def reserve_now(host: Any, variant: Any, at_once: bool) -> Any:
                     price = state.price_of(variant.tag)
@@ -1319,13 +1339,13 @@ def create_app(
                         return None
                     moment = time.monotonic()
                     for role in routing.hosted_roles:
-                        for source in plan.role_hosted(role):
+                        for source in (routing.plan or plan).role_hosted(role):
                             if not source.serves(host.host_id):
                                 continue
                             if not at_once and moment < started + (source.after_s or 0.0):
                                 continue
                             held = state.budgets.hold(
-                                spender, budgets_of[id(source)],
+                                spender, budgets_of[source.budget_id],
                                 # The most a request naming none may generate is what a translation
                                 # writes for it: the largest of the sources' (`burst`'s, compiled).
                                 _worst_case(price, body_size, asked_out or burst.reserve_max_tokens),
@@ -1342,16 +1362,21 @@ def create_app(
                 if need.hosted_after is not None:
                     need = dataclasses.replace(need, reserve_now=reserve_now, reserve=burst_reserve)
 
-        if kept:
-            # Waiting cannot help a request whose options remove every host it could ever reach
-            # (D201): its workload's own in any state; the shared workload's of a kind it may borrow
-            # now or, by its plan's stop-gap, later (a replacement gap); a hosted API where it has
-            # a hosted burst. Said at once, naming the option.
+        ruled = plan_routing.rules if plan_routing is not None else alone_rules
+        # The rules in force that keep this request off every hosted source (S19, D200).
+        ruled_off_hosted = bool(alone_rules) or (plan_routing is not None and bool(plan_routing.rules)
+                                                  and not (plan_routing.plan or plan).hosted_sources())
+        if kept or ruled_off_hosted:
+            # Waiting cannot help a request whose options or rules remove every host it could ever
+            # reach (D201): its workload's own in any state; the shared workload's of a kind it may
+            # borrow now or, by its plan's stop-gap, later (a replacement gap); a hosted API where
+            # it has a hosted burst. Said at once, naming the option or the rule.
             def holds(h: Any) -> bool:
                 return requested in h.variants or requested in h.literal_variants
 
             def removed(h: Any) -> bool:
-                return (h.hosted and "hosted" in kept) or (h.kind.startswith("rented") and "rented" in kept)
+                return ((h.hosted and ("hosted" in kept or ruled_off_hosted))
+                        or (h.kind.startswith("rented") and "rented" in kept))
 
             def may_borrow_from(h: Any) -> bool:
                 if who.workload is None or h.workload is not None or h.hosted:
@@ -1364,7 +1389,7 @@ def create_app(
                 if not (getattr(spec, "plan", None) or {}).get("may_borrow", True) \
                         or state.config.workloads.borrow_share <= 0:
                     return False
-                borrows = plan.borrows()
+                borrows = (plan_routing.plan if plan_routing is not None and plan_routing.plan is not None else plan).borrows()
                 return "shared" in borrows or any(h.kind in HOST_KINDS[b] for b in borrows)
 
             reachable = [
@@ -1378,8 +1403,10 @@ def create_app(
                 await record("rejected", status_code=503, reason="no_allowed_source")
                 return _error(
                     503, "no_capacity", "no_allowed_source",
-                    f"{why_kept_off(plan, sent_priority, sent_keep_on, chosen)} leaves no source that serves "
-                    f"{requested!r} here; waiting cannot help. Send other options, or ask the operator",
+                    "; ".join([w for w in (why_kept_off(plan, sent_priority, sent_keep_on, chosen),
+                                           ("the plan's rules in force: " + ", ".join(ruled)) if ruled else "") if w])
+                    + f" leaves no source that serves {requested!r} here; waiting cannot help. Send other options, "
+                    "or ask the operator",
                 )
 
         request_deadline = _parse_deadline(request.headers.get("x-gpm-deadline"))

@@ -17,7 +17,7 @@ import dataclasses
 import math
 import time
 import uuid
-from typing import TYPE_CHECKING, Any, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence
 
 from .. import workloads as math_
 from ..catalog import variants_for_host
@@ -1099,6 +1099,7 @@ class Workloads:
                 )
         current = self.store.active()
         self._mark_gaps(now, current)
+        self._arm_rules(now, current)
         return [w for w in current if w.state in ("preparing", "serving", "ending")]
 
     def _mark_gaps(self, now: float, active: list[Workload]) -> None:
@@ -1159,6 +1160,90 @@ class Workloads:
         for key in marked:
             if key not in wanted:
                 self.store.close_gap(*key)
+
+    def _arm_rules(self, now: float, active: list[Workload]) -> None:
+        """Judge the conditions on the pass of every running workload's plan rules — a time
+        window in the plan's time zone, a budget's spend, evictions — and write the rules whose
+        conditions all hold, by name, where that changed (S19, D200). A rule with no such
+        condition is the router's alone to judge. A window takes effect at the first pass after
+        its boundary, never before."""
+        from ..serving_plan import PlanRefused, narrowed, narrowing, plan_of
+
+        stored = self.store.armed_rules()
+        suppressed: set[str] = set()
+        for workload in active:
+            if workload.state not in ("preparing", "serving"):
+                continue
+            try:
+                plan = plan_of(workload.policy or {})
+            except PlanRefused:
+                plan = None
+            if plan is None or not plan.rules:
+                if stored.get(workload.name):
+                    self.store.set_armed_rules(workload.name, ())
+                continue
+            armed = frozenset(r.name for r in plan.rules if r.on_the_pass and self._holds(workload, plan, r.when, now))
+            if armed != stored.get(workload.name, frozenset()):
+                self.store.set_armed_rules(workload.name, armed)
+                began, ended = sorted(armed - stored.get(workload.name, frozenset())), sorted(
+                    stored.get(workload.name, frozenset()) - armed)
+                self.supervisor.events.record(
+                    "workload_rules",
+                    f"workload {workload.name}: "
+                    + "; ".join([f"rule {n!r} in force" for n in began] + [f"rule {n!r} no longer" for n in ended]),
+                    numbers={"workload": workload.name, "armed": sorted(armed)}, lease_id=workload.lease_id,
+                )
+            # A rented burst the rules in force for every request keep out is not rented (and its
+            # hosts drain, as a burst its policy no longer has).
+            every = [r for r in plan.rules if not ("priority" in r.when or "keep_on" in r.when)]
+            plain = dataclasses.replace(plan, rules=tuple(every))
+            seen = narrowed(plan, narrowing(plain, armed, "interactive", "any"))
+            if plan.rented() is not None and seen.rented() is None:
+                suppressed.add(workload.name)
+        running = {w.name for w in active if w.state in ("preparing", "serving")}
+        for name in stored:
+            if name not in running and stored[name]:
+                self.store.set_armed_rules(name, ())  # ended: none of its rules is in force
+        if self.fleet is not None:
+            self.fleet.bursts_held_back = suppressed
+
+    def _holds(self, workload: Workload, plan: Any, when: Mapping[str, Any], now: float) -> bool:
+        """Whether a rule's conditions on the pass hold now."""
+        from ..router.budgets import period_starts
+        from ..serving_plan import in_window
+
+        if "between" in when and not in_window(when, plan.tz, now):
+            return False
+        if "spent_over" in when:
+            spent = when["spent_over"]
+            lease = self.supervisor.leases.get(workload.lease_id)
+            if spent["budget"] == "lease":
+                if lease is None or not lease.max_spend or self.fleet is None:
+                    return False
+                if self.fleet.lease_spend(lease)[0] < spent["share"] * lease.max_spend:
+                    return False
+            else:
+                source = next(s for s in plan.sources() if s.spends and s.budget_id == spent["budget"])
+                limit = source.budget[f"per_{spent['period']}"]
+                since = period_starts(now)[0 if spent["period"] == "day" else 1]
+                if source.type == "hosted":
+                    used = float(self.supervisor.db.query(
+                        "SELECT COALESCE(SUM(cost_usd), 0) AS c FROM request_log WHERE workload = ? AND budget = ? "
+                        "AND ts >= ?", (workload.name, source.budget_id, since))[0]["c"])
+                else:
+                    if lease is None or self.fleet is None:
+                        return False
+                    used = self.fleet.burst_spend(lease.lease_id, since)
+                if used < spent["share"] * limit:
+                    return False
+        if "evictions" in when:
+            ev = when["evictions"]
+            count = int(self.supervisor.db.query(
+                "SELECT COUNT(*) AS n FROM events WHERE kind = 'eviction' AND lease_id = ? AND ts >= ?",
+                (workload.lease_id, now - ev["within_h"] * 3600))[0]["n"])
+            if count < ev["count"]:
+                return False
+        return True
 
     def view(self, workload: Workload) -> dict[str, Any]:
         """What the operator sees: the workload, its hosts, its spend against its cap, and how

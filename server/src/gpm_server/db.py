@@ -392,6 +392,16 @@ CREATE TABLE IF NOT EXISTS serving_gaps (
     PRIMARY KEY (workload, model)
 );
 
+-- Written by the supervisor, read by the router (S19, D200): the rules of a workload's serving
+-- plan whose conditions on the pass (a time window, a spend, evictions) held at its last look, by
+-- name, as a JSON list. A rule with conditions on a request's options alone is not listed: the
+-- router judges those itself. Written only on a change.
+CREATE TABLE IF NOT EXISTS plan_rules (
+    workload    TEXT PRIMARY KEY,
+    armed       TEXT NOT NULL DEFAULT '[]',
+    written_at  REAL NOT NULL
+);
+
 -- One row per pool. Exactly one supervisor runs at a time (supervisor.md §1).
 CREATE TABLE IF NOT EXISTS supervisor_lock (
     pool       TEXT PRIMARY KEY,

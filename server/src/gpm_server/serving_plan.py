@@ -37,16 +37,21 @@ HOST_KINDS = {"local": ("local",), "fixed": ("fixed-remote",)}
 RENTED_KINDS = ("roi", "on_demand", "interruptible")
 #: Fields of the plan a later stage brings; refused in words until then.
 LATER = {
-    "rules": "rules arrive in a later version of the pool",
     "substitute": "a substitute model arrives in a later version of the pool",
-    "tz": "a plan's time zone comes with its rules, in a later version of the pool",
 }
 #: A request's options (§14.4, D201): each header's values, and the one meant when a request sends
 #: none and its plan names no default.
 OPTIONS = {"priority": ("interactive", "batch"), "keep_on": ("no_hosted", "owned", "any")}
 DEFAULT_OPTIONS = {"priority": "interactive", "keep_on": "any"}
 OPTION_HEADERS = {"priority": "X-GPM-Priority", "keep_on": "X-GPM-Keep-On"}
-_TOP = ("steady", "until_ready", "when_full", "during", "max_min", "defaults", "reserve", *LATER)
+_TOP = ("steady", "until_ready", "when_full", "during", "max_min", "defaults", "reserve", "rules", "tz", *LATER)
+#: A plan's rules (§14.3, D200): a closed list of conditions and effects, at most 16.
+MAX_RULES = 16
+WHEN = ("priority", "keep_on", "between", "days", "spent_over", "evictions")
+THEN = ("use_only", "never_use", "after_s")
+DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+#: Conditions the supervisor judges each pass; the rest are a request's, judged by the router.
+PASS_CONDITIONS = ("between", "days", "spent_over", "evictions")
 #: The most workers one plan may reserve of a kind (`reserve: {local: n}`).
 MAX_RESERVE = 1024
 #: A stop-gap's longest gap, minutes: a day. Longer is not a stop-gap.
@@ -122,6 +127,9 @@ class ServingPlan:
     #: Workers of the operator's own machines this workload has the first call on, by source
     #: type (`local`, `fixed`) — the operator's alone to set (§14.2).
     reserve: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    #: Its rules, in order (§14.3), and the time zone their windows are read in.
+    rules: tuple["Rule", ...] = ()
+    tz: str = "UTC"
 
     @property
     def steady_kinds(self) -> frozenset[str]:
@@ -142,7 +150,19 @@ class ServingPlan:
             written["defaults"] = dict(self.defaults)
         if self.reserve:
             written["reserve"] = dict(self.reserve)
+        if self.rules:
+            written["rules"] = [r.as_dict() for r in self.rules]
+        if self.tz != "UTC":
+            written["tz"] = self.tz
         return written
+
+    def sources(self) -> tuple[Source, ...]:
+        """Every source of its roles once (a named one listed in both roles once)."""
+        seen: list[Source] = []
+        for source in (*self.until_ready, *self.when_full):
+            if not any(source is s for s in seen):
+                seen.append(source)
+        return tuple(seen)
 
     def source_types(self) -> set[str]:
         return {self.steady, *(s.type for s in self.until_ready), *(s.type for s in self.when_full)}
@@ -344,7 +364,8 @@ def parse_serve(raw: Any) -> ServingPlan:
             raise PlanRefused(f"serve.{field}: {why}")
     unknown = sorted(set(raw) - set(_TOP))
     if unknown:
-        raise PlanRefused(f"serve takes steady, until_ready, during, max_min, when_full and defaults, not {unknown}")
+        raise PlanRefused(f"serve takes steady, until_ready, during, max_min, when_full, defaults, reserve, rules "
+                          f"and tz, not {unknown}")
 
     steady = raw.get("steady", "rented")
     if steady not in ROLE_TAKES["steady"]:
@@ -400,8 +421,279 @@ def parse_serve(raw: Any) -> ServingPlan:
             raise PlanRefused(f"a rented burst above steady {steady!r} arrives with rules, in a later version of the "
                               "pool; when_full may use hosted APIs")
     defaults = _defaults(raw.get("defaults"), owned_steady=steady != "rented")
-    return ServingPlan(steady=steady, until_ready=until_ready, during=during, max_min=max_min, when_full=when_full,
-                       defaults=defaults, reserve=reserve)
+    plan = ServingPlan(steady=steady, until_ready=until_ready, during=during, max_min=max_min, when_full=when_full,
+                       defaults=defaults, reserve=reserve, tz=_tz(raw.get("tz", "UTC")))
+    return dataclasses.replace(plan, rules=_rules(raw.get("rules"), plan))
+
+
+# --- rules (§14.3, D200) ---
+
+
+@dataclasses.dataclass(frozen=True)
+class Rule:
+    name: str
+    when: Mapping[str, Any]
+    then: Mapping[str, Any]
+
+    @property
+    def on_the_pass(self) -> bool:
+        """Whether a condition of it is the supervisor's to judge (a time, a spend, evictions);
+        one judged on a request's options alone is in force whenever they match."""
+        return any(k in self.when for k in PASS_CONDITIONS)
+
+    def matches(self, priority: str, keep_on: str) -> bool:
+        return (self.when.get("priority", priority) == priority and self.when.get("keep_on", keep_on) == keep_on)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "when": dict(self.when), "then": dict(self.then)}
+
+
+def _tz(raw: Any) -> str:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    if not isinstance(raw, str) or not raw:
+        raise PlanRefused("serve.tz is an IANA time zone, such as America/New_York")
+    try:
+        ZoneInfo(raw)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise PlanRefused(f"serve.tz {raw!r} is not an IANA time zone, such as America/New_York") from None
+    return raw
+
+
+def _hhmm(text: str) -> int:
+    hours, minutes = text.split(":")
+    if len(hours) != 2 or len(minutes) != 2 or not (hours + minutes).isdigit():
+        raise ValueError(text)
+    value = int(hours) * 60 + int(minutes)
+    if int(hours) > 23 or int(minutes) > 59:
+        raise ValueError(text)
+    return value
+
+
+def window_of(between: str) -> tuple[int, int]:
+    """`"HH:MM-HH:MM"` as minutes of the day, start and end; the end may be before the start (the
+    window crosses midnight)."""
+    start, end = between.split("-")
+    return _hhmm(start), _hhmm(end)
+
+
+def in_window(when: Mapping[str, Any], tz: str, now: float) -> bool:
+    """Whether `now` is inside a rule's `between` (and `days`), read in the plan's time zone. A
+    time a DST change skips takes effect at the first minute after it (the clock is past it); in
+    an hour DST repeats, every boundary took effect at its first occurrence, so the repeat is read
+    as its last minute."""
+    import datetime
+    from zoneinfo import ZoneInfo
+
+    zone = ZoneInfo(tz)
+    local = datetime.datetime.fromtimestamp(now, zone)
+    if local.fold:
+        probe = now
+        while datetime.datetime.fromtimestamp(probe, zone).fold:
+            probe += 60
+        local = datetime.datetime.fromtimestamp(probe - 60, zone).replace(fold=0)
+    minute = local.hour * 60 + local.minute
+    start, end = window_of(when["between"])
+    inside = (start <= minute < end) if start < end else (minute >= start or minute < end)
+    if not inside:
+        return False
+    if "days" in when:
+        # The day the window opened: yesterday, past midnight.
+        opened = local.date() - (datetime.timedelta(days=1) if start > end and minute < end else datetime.timedelta())
+        if DAYS[opened.weekday()] not in when["days"]:
+            return False
+    return True
+
+
+def source_keys(plan: ServingPlan, words: Any, where: str) -> frozenset[str]:
+    """The sources a rule's words name, by their budget ids: a type names every source of it, a
+    name the one so called. A word naming nothing in the plan is refused."""
+    if not isinstance(words, list) or not words or any(not isinstance(w, str) for w in words):
+        raise PlanRefused(f"{where} is a list of source names or types")
+    keys: set[str] = set()
+    for word in words:
+        # A type names every source of it; a name, or a budget id (`when_full/rented`), the one.
+        found = [s for s in plan.sources()
+                 if (s.type == word if word in SOURCE_TYPES else word in (s.name, s.budget_id))]
+        if not found and not (word in SOURCE_TYPES and word == plan.steady):
+            raise PlanRefused(f"{where}: {word!r} is no source of this plan")
+        keys.update(s.budget_id for s in found)
+    return frozenset(keys)
+
+
+def _rules(raw: Any, plan: ServingPlan) -> tuple[Rule, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise PlanRefused("serve.rules is a list of {name, when, then}, tried in order")
+    if len(raw) > MAX_RULES:
+        raise PlanRefused(f"serve.rules: at most {MAX_RULES} rules, not {len(raw)}")
+    rules: list[Rule] = []
+    for index, item in enumerate(raw):
+        where = f"rules[{index}]"
+        if not isinstance(item, dict) or set(item) - {"name", "when", "then", "until"}:
+            raise PlanRefused(f"{where} is {{name, when, then}}")
+        if "until" in item:
+            raise PlanRefused(f"{where}.until holds a steady switch, which arrives in a later version of the pool")
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip() or len(name) > 60:
+            raise PlanRefused(f"{where}.name is a few words naming the rule")
+        if any(r.name == name for r in rules):
+            raise PlanRefused(f"{where}: two rules are named {name!r}")
+        where = f"rule {name!r}"
+        when, then = item.get("when"), item.get("then")
+        if not isinstance(when, dict) or not when:
+            raise PlanRefused(f"{where}.when names at least one condition: {', '.join(WHEN)}")
+        if not isinstance(then, dict) or not then:
+            raise PlanRefused(f"{where}.then names at least one effect: {', '.join(THEN)}")
+        rule = Rule(name=name, when=_when(when, plan, where), then=_then(then, plan, where))
+        if ("priority" in when or "keep_on" in when) and plan.rented() is not None:
+            # A burst is sized from every request's load: one kept from some requests alone would
+            # be rented for load it may not serve.
+            only = rule.then.get("use_only")
+            never = rule.then.get("never_use")
+            out = (source_keys(plan, never, where) if never else frozenset()) | (
+                frozenset(s.budget_id for s in plan.sources()) - source_keys(plan, only, where) if only else frozenset())
+            if plan.rented().budget_id in out:
+                raise PlanRefused(f"{where}: a rule on a request's options cannot keep the rented burst out — it is "
+                                  "sized from every request's load; keep it out for all requests (a condition on "
+                                  "the pass), or send keep_on owned")
+        rules.append(rule)
+    return tuple(rules)
+
+
+def _when(when: dict, plan: ServingPlan, where: str) -> dict[str, Any]:
+    unknown = sorted(set(when) - set(WHEN))
+    if unknown:
+        raise PlanRefused(f"{where}.when: {unknown} — the conditions are {', '.join(WHEN)}")
+    for option in ("priority", "keep_on"):
+        if option in when and when[option] not in OPTIONS[option]:
+            raise PlanRefused(f"{where}.when.{option} is {_listed(OPTIONS[option])}")
+    if "days" in when and "between" not in when:
+        raise PlanRefused(f"{where}.when.days goes with between")
+    if "between" in when:
+        try:
+            start, end = window_of(when["between"]) if isinstance(when["between"], str) else (None, None)
+        except ValueError:
+            start = end = None
+        if start is None or start == end:
+            raise PlanRefused(f"{where}.when.between is \"HH:MM-HH:MM\" (it may cross midnight), two different times")
+    if "days" in when:
+        days = when["days"]
+        if not isinstance(days, list) or not days or any(d not in DAYS for d in days) or len(set(days)) != len(days):
+            raise PlanRefused(f"{where}.when.days lists days, each once: {', '.join(DAYS)}")
+    if "spent_over" in when:
+        spent = when["spent_over"]
+        if not isinstance(spent, dict) or set(spent) - {"budget", "period", "share"} or "budget" not in spent:
+            raise PlanRefused(f"{where}.when.spent_over is {{budget: <budget id> | lease, period: day | month, share}}")
+        share = spent.get("share")
+        if isinstance(share, bool) or not isinstance(share, (int, float)) or not 0 < share <= 1:
+            raise PlanRefused(f"{where}.when.spent_over.share is a share of the budget, above 0 and at most 1")
+        if spent["budget"] != "lease":
+            period = spent.get("period")
+            if period not in ("day", "month"):
+                raise PlanRefused(f"{where}.when.spent_over.period is day or month")
+            source = next((s for s in plan.sources() if s.spends and s.budget_id == spent["budget"]), None)
+            if source is None:
+                ids = [s.budget_id for s in plan.sources() if s.spends]
+                raise PlanRefused(f"{where}.when.spent_over.budget {spent['budget']!r} is no budget of this plan; its "
+                                  f"budgets are {', '.join(ids + ['lease'])}")
+            if (source.budget or {}).get(f"per_{period}") is None:
+                raise PlanRefused(f"{where}.when.spent_over: budget {spent['budget']!r} has no per_{period} limit")
+        elif plan.steady != "rented":
+            raise PlanRefused(f"{where}.when.spent_over.budget lease: steady {plan.steady!r} rents nothing")
+    if "evictions" in when:
+        ev = when["evictions"]
+        count, within = (ev.get("count"), ev.get("within_h")) if isinstance(ev, dict) else (None, None)
+        if (isinstance(count, bool) or not isinstance(count, int) or count < 1 or isinstance(within, bool)
+                or not isinstance(within, (int, float)) or not 0 < within <= 24 * 7 or set(ev) - {"count", "within_h"}):
+            raise PlanRefused(f"{where}.when.evictions is {{count: a whole number of at least 1, within_h: hours up to "
+                              "168}")
+    return dict(when)
+
+
+def _then(then: dict, plan: ServingPlan, where: str) -> dict[str, Any]:
+    if "steady" in then:
+        raise PlanRefused(f"{where}.then.steady: a rule's steady switch arrives in a later version of the pool")
+    if "substitute" in then:
+        raise PlanRefused(f"{where}.then.substitute: a substitute model arrives in a later version of the pool")
+    unknown = sorted(set(then) - set(THEN))
+    if unknown:
+        raise PlanRefused(f"{where}.then: {unknown} — the effects are {', '.join(THEN)}")
+    if "use_only" in then:
+        source_keys(plan, then["use_only"], f"{where}.then.use_only")
+        if plan.steady not in then["use_only"]:
+            raise PlanRefused(f"{where}.then.use_only leaves out steady ({plan.steady}), where the workload runs; list "
+                              "it, or narrow with never_use")
+    if "never_use" in then:
+        source_keys(plan, then["never_use"], f"{where}.then.never_use")
+        if plan.steady in then["never_use"]:
+            raise PlanRefused(f"{where}.then.never_use removes steady ({plan.steady}), where the workload runs; name "
+                              "the source you mean by its name or budget id (an unnamed rented burst is "
+                              "when_full/rented)")
+    if "after_s" in then:
+        waits = then["after_s"]
+        if not isinstance(waits, dict) or not waits:
+            raise PlanRefused(f"{where}.then.after_s is {{<hosted source name>: seconds}}")
+        for name, seconds in waits.items():
+            named = [s for s in plan.hosted_sources() if name in (s.name, s.budget_id)]
+            if not named:
+                raise PlanRefused(f"{where}.then.after_s: {name!r} is no hosted source of this plan")
+            longest = max(s.after_s or 0 for s in named)
+            if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 0 <= seconds < longest:
+                raise PlanRefused(f"{where}.then.after_s.{name}: a shorter wait only — from 0 to below its "
+                                  f"{longest:g}s")
+    return dict(then)
+
+
+@dataclasses.dataclass(frozen=True)
+class Narrowing:
+    """What the rules in force do to one request (§14.3): sources it may not use, by budget id,
+    and shorter waits. They only narrow, and add up across every matching rule."""
+
+    excluded: frozenset[str] = frozenset()
+    waits: Mapping[str, float] = dataclasses.field(default_factory=dict)
+    by: tuple[str, ...] = ()
+
+
+def narrowing(plan: ServingPlan, armed: frozenset[str], priority: str, keep_on: str) -> Narrowing:
+    """The rules in force for a request: each whose conditions on the pass the supervisor last
+    found true (`armed`, by name) — or that has none — and whose conditions on a request's
+    options match its options."""
+    every = frozenset(s.budget_id for s in plan.sources())
+    allowed, excluded, waits, by = every, set(), {}, []
+    for rule in plan.rules:
+        if (rule.on_the_pass and rule.name not in armed) or not rule.matches(priority, keep_on):
+            continue
+        by.append(rule.name)
+        if "use_only" in rule.then:
+            allowed = allowed & source_keys(plan, rule.then["use_only"], rule.name)
+        if "never_use" in rule.then:
+            excluded |= source_keys(plan, rule.then["never_use"], rule.name)
+        for name, seconds in (rule.then.get("after_s") or {}).items():
+            # Every hosted source so called (an unnamed one may be in both roles) whose wait is longer.
+            for source in plan.hosted_sources():
+                if name in (source.name, source.budget_id) and (source.after_s or 0) > seconds:
+                    waits[source.budget_id] = min(seconds, waits.get(source.budget_id, seconds))
+    return Narrowing(excluded=frozenset((every - allowed) | excluded), waits=waits, by=tuple(by))
+
+
+def narrowed(plan: ServingPlan, by: Narrowing) -> ServingPlan:
+    """The plan as a request sees it under its rules: the sources they exclude gone, the waits
+    they shorten shorter. Budgets keep their ids."""
+    if not by.excluded and not by.waits:
+        return plan
+    kept: dict[int, Optional[Source]] = {}
+    for source in plan.sources():
+        if source.budget_id in by.excluded:
+            kept[id(source)] = None
+        elif source.budget_id in by.waits:
+            kept[id(source)] = dataclasses.replace(source, after_s=by.waits[source.budget_id])
+        else:
+            kept[id(source)] = source
+    def role(sources: tuple[Source, ...]) -> tuple[Source, ...]:
+        return tuple(kept[id(s)] for s in sources if kept[id(s)] is not None)
+    return dataclasses.replace(plan, until_ready=role(plan.until_ready), when_full=role(plan.when_full))
 
 
 def _reserve(raw: Any) -> dict[str, int]:
@@ -639,6 +931,12 @@ class Routing:
     hosted_order: tuple[str, ...] = ()
     #: Every hosted source's wait in force, soonest first: the request looks again at each.
     hosted_waits: tuple[float, ...] = ()
+    #: The plan as this request sees it under its rules (`narrowed`), which its hosted holds and
+    #: route labels read; whether those rules keep it off the workload's rented burst hosts; and
+    #: the rules that applied, by name.
+    plan: Optional["ServingPlan"] = None
+    no_burst: bool = False
+    rules: tuple[str, ...] = ()
 
 
 def route(plan: ServingPlan, *, preparing: bool, model_ready: bool, created_at: float, now: float,
@@ -691,4 +989,5 @@ def route(plan: ServingPlan, *, preparing: bool, model_ready: bool, created_at: 
         hosted_roles=roles, hosted_ids=ids,
         hosted_order=tuple(dict.fromkeys(p for s in usable for p in s.providers)),
         hosted_waits=tuple(sorted(set(waits))),
+        plan=plan,
     )

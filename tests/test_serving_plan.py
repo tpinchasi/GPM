@@ -90,9 +90,7 @@ def test_a_plan_that_cannot_be_served_is_refused_in_words(serve, says):
 
 
 @pytest.mark.parametrize("serve, says", [
-    ({"rules": []}, "rules arrive in a later version"),
     ({"substitute": [{"model": "small", "after_s": 20}]}, "a substitute model arrives"),
-    ({"tz": "UTC"}, "comes with its rules"),
 ])
 def test_what_a_later_stage_brings_is_refused_never_accepted_and_ignored(serve, says):
     with pytest.raises(PlanRefused, match=says):

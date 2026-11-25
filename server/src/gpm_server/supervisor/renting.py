@@ -512,6 +512,9 @@ class Fleet:
         self.units: dict[tuple, Unit] = {(None, None): Unit()}
         #: The workloads that are not over, as the supervisor read them this pass.
         self.workloads: dict[str, Any] = {}
+        #: Workloads whose plan's rules in force keep their rented burst out (S19, D200): it is
+        #: not rented, and its hosts drain, as a burst the policy no longer has.
+        self.bursts_held_back: set[str] = set()
         #: Workloads' volumes, as the database keeps them (D116).
         self.workload_store = WorkloadStore(leases.db)
         #: What the request log says a class of machine serves at a latency, read at most every
@@ -4147,7 +4150,7 @@ class Fleet:
         """The rented burst a workload's policy carries, or None — parsed once per version of it."""
         spec = self.workloads.get(workload) if workload is not None else None
         raw = (spec.policy or {}).get("rented") if spec is not None else None
-        if not raw:
+        if not raw or workload in self.bursts_held_back:
             return None
         cached = self._bursts.get(workload)
         if cached is not None and cached[0] is raw:
@@ -4211,7 +4214,8 @@ class Fleet:
             burst = self.rented_burst_of(name)
             why = None
             if burst is None:
-                why = "its policy no longer has a rented burst"
+                why = ("a rule of its serving plan in force keeps its rented burst out" if name in self.bursts_held_back
+                       else "its policy no longer has a rented burst")
             else:
                 spent = self.burst_spent(lease.lease_id)
                 for limit, period, words in ((burst.budget.per_day, "today", "a day"),

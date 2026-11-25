@@ -78,6 +78,9 @@ class HostRegistry:
         #: stop-gap is opened only on a recent one (workloads.md §14.7).
         self.gaps: dict[tuple[str, str], tuple[float, float, frozenset[str], str]] = {}
         self.supervisor_beat: Optional[float] = None
+        #: Each workload's plan rules whose conditions on the pass held at the supervisor's last
+        #: look (S19, D200), by name.
+        self.armed: dict[str, frozenset[str]] = {}
         #: Provisioning keys (D117), as hash → provisioner, for keys neither revoked nor expired.
         self.provisioning_store = ProvisioningStore(table.db)
         self.provisioners: dict[str, KeyReach] = {}
@@ -143,11 +146,13 @@ class HostRegistry:
             self.app_keys = await asyncio.to_thread(self.app_key_store.usable_hashes)
             self.last_app_key_revision = app_key_revision
         # Every look, not only on a change: a gap opens and a heartbeat moves with nothing else new.
-        gaps, self.supervisor_beat = await asyncio.to_thread(
-            lambda: (self.workload_store.gaps(), self.workload_store.supervisor_heartbeat(self.config.pool.name)))
-        if gaps != self.gaps:
-            # Requests already waiting may now use a stop-gap, or no longer may.
-            self.gaps = gaps
+        gaps, self.supervisor_beat, armed = await asyncio.to_thread(
+            lambda: (self.workload_store.gaps(), self.workload_store.supervisor_heartbeat(self.config.pool.name),
+                     self.workload_store.armed_rules()))
+        if gaps != self.gaps or armed != self.armed:
+            # Requests already waiting may now use a stop-gap, or no longer may; a rule came into
+            # force or left it.
+            self.gaps, self.armed = gaps, armed
             await self.dispatcher.wake()
         revision = await asyncio.to_thread(self.workload_store.revision)
         if revision == self.last_workload_revision:
