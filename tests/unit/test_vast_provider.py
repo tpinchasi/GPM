@@ -735,6 +735,44 @@ async def test_a_spent_quota_is_read_from_the_providers_own_refusal():
     assert refusal["limit"] == 20000 and refusal["remaining"] == 0 and refusal["retry_after_s"] == 44237
 
 
+async def test_each_listing_asks_for_the_best_25_by_throughput_per_dollar():
+    """Every row is spent from the day's quota (D121); a listing returned its cap of 100 on a
+    broad policy, unsorted, of which the pool rented one (D206). Checked live 2026-11-26: the
+    provider sorts on `dlperf_per_dphtotal` and honours the limit."""
+    seen = []
+
+    def handler(request):
+        body = json.loads(request.read())
+        seen.append(body)
+        return httpx.Response(200, json={"offers": [OFFER] if body["type"] == "bid" else [ON_DEMAND]})
+
+    await provider(handler).search_offers(OfferQuery(interruptible=True, on_demand=True))
+    listings = [b for b in seen if "machine_id" not in b]
+    assert [b["type"] for b in listings] == ["bid", "on-demand"]
+    for body in listings:
+        assert body["limit"] == 25
+        assert body["order"] == [["dlperf_per_dphtotal", "desc"]]
+
+
+async def test_a_smaller_limit_asked_is_kept_and_a_larger_one_is_capped_by_the_setting():
+    seen = []
+
+    def handler(request):
+        seen.append(json.loads(request.read()))
+        return httpx.Response(200, json={"offers": []})
+
+    client = httpx.AsyncClient(base_url="https://console.vast.ai", transport=httpx.MockTransport(handler))
+    await VastProvider(client=client).search_offers(OfferQuery(limit=1))
+    await VastProvider(client=client, offers_per_listing=60).search_offers(OfferQuery(limit=100))
+    assert [b["limit"] for b in seen] == [1, 60]
+
+
+@pytest.mark.parametrize("bad", [0, -1, 1001, 2.5, "25", True])
+def test_offers_per_listing_must_be_a_sensible_whole_number(bad):
+    with pytest.raises(ValueError, match="offers_per_listing"):
+        VastProvider(offers_per_listing=bad)
+
+
 async def test_a_private_images_login_goes_in_vasts_own_field_and_nowhere_else():
     """D183: `image_login`, in the create call alone; a refusal's answer, if it echoed it, is redacted."""
     from gpm_server.providers.base import redacted

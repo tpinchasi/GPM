@@ -108,7 +108,10 @@ use counted before is carried into the per-connection counter once, under that n
 
 - **Searching** asks every enabled connection at once. Each has its own back-off, its own
   rate-limit handling and its own daily quota counter. A connection that errors or is out of
-  quota is reported beside the results, and the others are still used.
+  quota is reported beside the results, and the others are still used. The same question asked
+  of a connection again within 30 seconds is answered from its last search, unless the question
+  is a price about to be bid on; a rental tried there forgets it (D206). Vast asks each listing
+  for its best 25 offers by `dlperf_per_dphtotal` (setting `offers_per_listing`, 1–1000).
 - **Every operation on a host goes to the host's own connection**: create, bid, start, stop,
   destroy, status, connection details, charges and the dead-man timer.
 - **The stray-instance sweep and crash recovery** list instances on every connection, enabled

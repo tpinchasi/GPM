@@ -328,6 +328,9 @@ class SearchState:
     refusal: Optional[str] = None
     #: Why its last search came back empty, when it was not the market's doing.
     error: Optional[str] = None
+    #: The last search that answered: when, what was asked, and what came back (D206). The same
+    #: question within `OFFER_REUSE_S` is answered from it, not asked again.
+    kept: Optional[tuple[float, OfferQuery, list[Offer]]] = None
 
 
 class ConnectionEvents:
@@ -366,6 +369,11 @@ def legacy_connection(db: Any, current: str) -> str:
 
 #: How long the market is not asked again after the provider says it is asked too often (D119).
 OFFER_RATE_LIMIT_WAIT_S = 60.0
+#: How long one search's answer stands for the same question on the same connection (D206). A
+#: workload's create asks the same market several times in seconds — the plan shown, the plan
+#: made, the rental — and a provider may bill every row of each. The market barely moves in this
+#: time, and an offer taken meanwhile fails its create as it always could (`OfferGone`).
+OFFER_REUSE_S = 30.0
 
 
 def describe_query(query: OfferQuery) -> list[str]:
@@ -594,6 +602,8 @@ class Fleet:
         #: Each connection's searching: its back-off after "too many requests", the provider's own
         #: words for it, and why its last search came back empty (D119, D129).
         self.searching: dict[str, SearchState] = {name: SearchState() for name in self.providers}
+        #: How long a search's answer stands for the same question (D206); 0 asks every time.
+        self.offer_reuse_s = OFFER_REUSE_S
         #: Connections not rented through while a change to them could not be applied (D174).
         self.paused: set[str] = set()
         #: What is known or estimated to be left in each account, by connection, in dollars (D188):
@@ -2980,7 +2990,7 @@ class Fleet:
                 # not cover (D188). Decided before the market is asked, and said once in a while.
                 self._say_balance_refusal(account, f"{host.host_id} stays parked: {broke}", lease, host.host_id)
                 continue
-            offers = await self._offers(connections=[host.connection_name])
+            offers = await self._offers(connections=[host.connection_name], fresh=True)
             same_machine = next((o for o in offers if self._at(o) == self._at(host.offer)
                                  and o.interruptible == host.offer.interruptible
                                  and o.bidding == host.offer.bidding), None)
@@ -3483,7 +3493,7 @@ class Fleet:
                 await self.destroy(host, "outbid, and the re-bid did not win it back")
                 continue
 
-            offers = await self._offers()
+            offers = await self._offers(fresh=True)
             same_machine = next((o for o in offers if self._at(o) == self._at(host.offer) and o.bidding), None)
             if not host.offer.bidding:
                 same_machine = None  # a spot host taken back is replaced: there is no bid to win it with
@@ -4614,6 +4624,9 @@ class Fleet:
                 onstart=self.deadman_onstart(for_this_host, offer.connection),
                 volume=self._volume_for(spec, offer, here, for_this_host, builds) if spec is not None else None,
             )
+            # Whatever this create does to the offer — takes it, or finds it gone — the last
+            # search's answer there no longer stands (D206).
+            self.forget_offers(offer.connection or self.connection)
             try:
                 # No price on an on-demand rental: the provider's listed rate is what is paid. A spot
                 # rental is told the most the pool pays, which a provider that takes a maximum price
@@ -5607,8 +5620,12 @@ class Fleet:
         }
 
     async def _offers(self, policy: Optional[OfferPolicy] = None, kinds: Optional[str] = None,
-                      connections: Optional[Sequence[str]] = None) -> list[Offer]:
+                      connections: Optional[Sequence[str]] = None, fresh: bool = False) -> list[Offer]:
         """Ask the market — every enabled connection at once, or the ones named — then filter here.
+
+        The same question asked of the same connection within `offer_reuse_s` is answered from
+        its last search (D206); `fresh` asks the provider regardless — for a price the pool is
+        about to bid on, such as winning back the machine a host was just outbid on.
 
         With a `policy`, the filters it implies are also asked of each provider (D123): every
         offer a search returns counts against the provider's daily quota, so what the pool would
@@ -5625,7 +5642,7 @@ class Fleet:
         bids, fixed = self._KINDS[kinds or self.rented.mode]
         query = self.query_for(policy, bids, fixed)
         self.last_query_filters = describe_query(query)
-        found = await asyncio.gather(*(self._search_one(name, query) for name in names))
+        found = await asyncio.gather(*(self._search_one(name, query, fresh) for name in names))
         failed = [n for n in names if self.searching[n].error]
         if names and len(failed) == len(names):
             # Nobody answered: an empty list here is indistinguishable from a market with
@@ -5641,14 +5658,21 @@ class Fleet:
         return [dataclasses.replace(offer.priced_for(disk_gb), connection=name)
                 for name, offers in zip(names, found, strict=True) for offer in offers]
 
-    async def _search_one(self, name: str, query: OfferQuery) -> list[Offer]:
+    async def _search_one(self, name: str, query: OfferQuery, fresh: bool = False) -> list[Offer]:
         state = self.searching.setdefault(name, SearchState())
         now = time.monotonic()
+        if not fresh and state.kept is not None:
+            at, asked, answer = state.kept
+            if asked == query and now - at < self.offer_reuse_s:
+                return list(answer)
         if now < state.retry_at:
             # The reason is the provider's, said once; only the remaining wait moves. Nesting
             # this produced "… — not asking again for 60s — not asking again for 44s" live.
             state.error = f"{state.refusal or 'the provider refused'} — not asking again for {state.retry_at - now:.0f}s"
             return []
+        # Asked again: whatever this search answers — or fails with — replaces what was kept, so a
+        # kept answer is never handed out beside the error of a later search.
+        state.kept = None
         try:
             offers = await self._counted(self.providers[name].search_offers(query), name)
         except ProviderRateLimited as exc:
@@ -5670,7 +5694,15 @@ class Fleet:
             state.error = f"the provider plug-in failed: {type(exc).__name__}: {exc}"
             return []
         state.backoff_s, state.retry_at, state.error = 0.0, 0.0, None
+        state.kept = (now, query, list(offers)) if self.offer_reuse_s > 0 else None
         return offers
+
+    def forget_offers(self, name: str) -> None:
+        """What was found on this connection no longer stands (D206): a rental was just tried
+        there, so the offer it took — or found gone — is not offered again from memory."""
+        state = self.searching.get(name)
+        if state is not None:
+            state.kept = None
 
     def _lease_view(self, lease: Optional[Lease]) -> Optional[LeaseView]:
         if lease is None:

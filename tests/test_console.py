@@ -1274,6 +1274,7 @@ async def test_the_days_search_quota_is_counted_and_kept_across_a_restart(consol
 
     supervisor, url, _, loop = console
     fleet = supervisor.fleet
+    fleet.offer_reuse_s = 0  # each search here is the market now, not the last 30 s's answer (D206)
     provider = fleet.provider
     assert fleet.search_quota() is None, "a provider with no quota shows none"
     pending = {"rows": 0, "refusal": None}
@@ -1317,6 +1318,7 @@ def test_the_market_is_searched_only_when_a_request_asks_by_name(console):
     the change kept searching every two minutes, and spent the day's quota each morning."""
     supervisor, url, _, loop = console
     asked = []
+    supervisor.fleet.offer_reuse_s = 0  # each search here is the market now, not the last 30 s's answer (D206)
     real = supervisor.fleet.provider.search_offers
 
     async def counted(query):
