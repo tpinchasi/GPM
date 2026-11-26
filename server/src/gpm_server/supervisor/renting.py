@@ -28,6 +28,7 @@ from .. import agentpkg, history
 from .. import workloads as workload_math
 from ..config import BiddingConfig, OfferPolicy, PoolConfig, RentedConfig, TransportConfig
 from ..deadman import heartbeat_command, onstart_script
+from ..directory import build_memory_gb, record_measurements
 from ..engines import get_engine
 from ..engines.base import PullResult
 from ..history import adjustment as history_adjustment
@@ -49,7 +50,6 @@ from ..providers.base import (
     VolumeSpec,
     redacted,
 )
-from ..directory import build_memory_gb, record_measurements
 from ..sizing import Needs, needs_for
 from ..stats import MEASURED_ROWS
 from ..strategies import (
