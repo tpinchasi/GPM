@@ -118,8 +118,15 @@ class VastProvider:
         base_url: str = _BASE_URL,
         timeout: float = 30.0,
         client: Optional[httpx.AsyncClient] = None,
+        offers_per_listing: int = 25,
         **_: Any,
     ):
+        if not isinstance(offers_per_listing, int) or isinstance(offers_per_listing, bool) \
+                or not 1 <= offers_per_listing <= 1000:
+            raise ValueError("offers_per_listing must be a whole number from 1 to 1000")
+        #: The most offers one listing asks for (D206), best throughput per dollar first. Each is
+        #: a row of the daily quota; a bid search spends up to this again on its on-demand prices.
+        self.offers_per_listing = offers_per_listing
         self.api_key_env = api_key_env
         self.base_url = base_url
         #: The credential the supervisor handed in (D134); until it does, the environment's, as
@@ -290,7 +297,12 @@ class VastProvider:
         return self._to_offer(entry, await self._on_demand_prices([entry]))
 
     async def _listing(self, kind: str, query: OfferQuery) -> list[dict[str, Any]]:
-        body: dict[str, Any] = {"limit": query.limit, "type": kind, "rentable": {"eq": True}}
+        # The best offers first, by the provider's own throughput per dollar — the measure the
+        # pool's score is built on (`dlperf` over the price) — and only as many as the pool
+        # needs to rank (D206): every row returned is spent from the day's quota (D121), and an
+        # unsorted listing at the cap is the market's first rows in whatever order it keeps.
+        body: dict[str, Any] = {"limit": min(query.limit, self.offers_per_listing), "type": kind,
+                                "rentable": {"eq": True}, "order": [["dlperf_per_dphtotal", "desc"]]}
         if query.verified_only:
             body["verified"] = {"eq": True}
         if query.min_gpu_memory_gb:

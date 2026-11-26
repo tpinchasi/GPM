@@ -462,6 +462,7 @@ def test_a_group_short_of_its_hosts_runs_more_of_each_card_until_they_come(pool)
     two, and served 20 of each model where its two cards held 24 — the shares spread the targets
     over hosts that never came. While short, each host takes more; back to the plan when they come."""
     fleet = pool.supervisor.fleet
+    fleet.offer_reuse_s = 0  # each search here is the market now, not the last 30 s's answer (D206)
     pool.supervisor.config.rented.workers = 8
     fleet.provider.offers = [default_offer("o-0", "m-0", min_bid_hourly=0.20)]
     create(pool, request("together", (CHAT, 30, 6), (EMBED, 5, 6)))

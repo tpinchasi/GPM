@@ -102,6 +102,7 @@ async def test_one_connection_failing_leaves_the_others_offers_and_says_why(db):
     providers = market()
     providers["bids"].unavailable = True
     fleet = make_fleet(db, providers, mode="cheaper")
+    fleet.offer_reuse_s = 0  # each search here is the market now, not the last 30 s's answer (D206)
     offers = await fleet._offers()
     assert {o.connection for o in offers} == {"spot", "fixed"}
     assert fleet.searching["bids"].error and fleet.last_offer_error is None

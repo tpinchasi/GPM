@@ -343,6 +343,11 @@ model set. **Parked hosts are tried first** (§8).
    quota (D123); the pool still applies every filter itself, every offer it rejects carries its
    reason, and what the provider was asked is said beside the result — a market that merely
    *looks* empty teaches an operator nothing. A search for a machine already held asks broadly.
+   A provider billed by the row returns only the best few by its own throughput per dollar —
+   Vast 25 per listing, `offers_per_listing` in its settings — and the same question asked of
+   the same connection within 30 seconds is answered from the last search (D206). A rental tried
+   on a connection forgets its last answer there; winning back or restarting a machine already
+   held asks the market fresh.
    A bid that loses puts its machine aside for `avoid_lost_bid_minutes` and ends the round (D124);
    a create refused as gone that made an instance anyway (found under its label and destroyed)
    puts its machine aside for `avoid_failed_machine_minutes`. Every machine put aside is read back

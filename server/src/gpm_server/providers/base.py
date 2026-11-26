@@ -379,6 +379,9 @@ class OfferQuery:
     min_disk_gb: float = 0.0
     max_all_in_hourly: Optional[float] = None
     verified_only: bool = False
+    #: The most offers to return per listing. A provider that bills searches by the row may cap
+    #: it lower by a setting of its own, and should then return the best first by its own
+    #: throughput per dollar, as the pool ranks (D206) — never the first rows in whatever order.
     limit: int = 100
     #: Which rentals to look at: interruptible ones to bid for, non-interruptible ones at the
     #: listed price, or both and let ranking choose.
