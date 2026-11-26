@@ -1663,8 +1663,14 @@ class DirectoryConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     #: How often the supervisor refreshes it on its own. 0: only when the operator asks, from
-    #: the console — the pool makes no outbound request nobody asked for.
+    #: the console — the pool crawls no one's site unasked.
     refresh_hours: float = Field(default=0.0, ge=0)
+    #: Read the published size of each build in the pool's model set whose size this file does
+    #: not state (D207): one Ollama tags page or one hub file listing per model, cached, read
+    #: again weekly. On by default — the models are the operator's own choice, and a machine
+    #: cannot be sized for a model of unknown size. Off: sizes only from this file, a refresh,
+    #: or what hosts measured.
+    look_up_sizes: bool = True
     #: Read Ollama's library (its pages; there is no listing to ask for).
     ollama_library: bool = True
     #: Whose vLLM builds a refresh looks up on the model hub: the pool's own models, every size

@@ -8,6 +8,10 @@ The memory rule is the one the machine's launcher applies before starting anythi
 (`gpm_agent.vllm_launch.memory_plan`): each model is given its weights with a tenth over for
 loading them, plus a cache reserve, all within the launcher's share of the card. Kept in step by
 a test rather than an import: the agent is a separate package that ships to rented machines.
+
+Where a machine has held the very build (its digest) and its engine said what it took in memory,
+that figure replaces the estimate for that model (D207): an estimate is what the pool goes by
+until it has seen the build run.
 """
 
 from __future__ import annotations
@@ -53,7 +57,8 @@ class Needs:
         }
 
 
-def needs_for(sizes: Mapping[str, Optional[float]], cards_per_copy: int = 1) -> Needs:
+def needs_for(sizes: Mapping[str, Optional[float]], cards_per_copy: int = 1,
+              measured: Optional[Mapping[str, Optional[float]]] = None) -> Needs:
     """From each model's build size in GB (None where unknown), what a machine must have.
 
     Per card, because a machine with several cards runs a copy of the set on each card (D107),
@@ -61,6 +66,10 @@ def needs_for(sizes: Mapping[str, Optional[float]], cards_per_copy: int = 1) -> 
     weights and a cache reserve of its own (D114). Rounded up to a whole gigabyte: this becomes
     a search filter, and a filter a hair under what is needed lets through the one machine that
     cannot start. The disk holds each model once, however it is split.
+
+    `measured`: what a model was seen to take loaded, in GB, by model — its weights, cache and
+    working space as its engine reported them (D207). It stands in for that model's estimate,
+    split across a copy's cards like the weights, and still within the engines' share of a card.
     """
     known = {model: float(size) for model, size in sizes.items() if size}
     unknown = sorted(model for model, size in sizes.items() if not size)
@@ -68,7 +77,12 @@ def needs_for(sizes: Mapping[str, Optional[float]], cards_per_copy: int = 1) -> 
         return Needs(card_memory_gb=0.0, disk_gb=0.0, weights_gb=0.0, unknown=unknown,
                      cards_per_copy=cards_per_copy)
     weights = sum(known.values())
-    memory = (weights * WEIGHT_OVERHEAD / cards_per_copy + CACHE_RESERVE_GB * len(known)) / TOTAL_MEMORY_SHARE
+    seen = {model: float(gb) for model, gb in (measured or {}).items() if gb and model in known}
+    estimated = [size for model, size in known.items() if model not in seen]
+    memory = (
+        sum(seen.values()) / cards_per_copy
+        + sum(estimated) * WEIGHT_OVERHEAD / cards_per_copy + CACHE_RESERVE_GB * len(estimated)
+    ) / TOTAL_MEMORY_SHARE
     disk = weights * DISK_OVERHEAD + DISK_HEADROOM_GB
     return Needs(
         card_memory_gb=float(math.ceil(memory)),

@@ -104,10 +104,20 @@ class OllamaFacts:
             "answers": True,
             "version": version,
             "models_on_disk": sorted(
-                ({"tag": m.get("name"), "size_bytes": m.get("size")} for m in on_disk if m.get("name")),
+                ({"tag": m.get("name"), "size_bytes": m.get("size"), "digest": m.get("digest")}
+                 for m in on_disk if m.get("name")),
                 key=lambda m: m["tag"],
             ),
             "models_loaded": sorted(m.get("name") for m in loaded if m.get("name")),
+            # What each loaded model takes in memory, as the engine says — weights, cache and
+            # working space at the context it was loaded with. The pool keeps it by digest and
+            # sizes the next machine for that build from it (D207).
+            "models_loaded_sizes": sorted(
+                ({"tag": m.get("name"), "digest": m.get("digest"), "size_bytes": m.get("size"),
+                  "vram_bytes": m.get("size_vram"), "context": m.get("context_length")}
+                 for m in loaded if m.get("name")),
+                key=lambda m: m["tag"],
+            ),
             **({"model_sources": _sources_fact(self.sources)} if self.sources else {}),
             **per_card,
         }
