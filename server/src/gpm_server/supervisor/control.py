@@ -550,7 +550,7 @@ def create_control_app(supervisor: Supervisor, config: PoolConfig) -> FastAPI:
         for name, models in rented.model_profiles.items():
             sizes = fleet.build_sizes(list(models), models) if fleet is not None else {}
             cards = rented.cards_per_copy(name)
-            needs = needs_for(sizes, cards) if fleet is not None else None
+            needs = needs_for(sizes, cards, fleet.build_memory(list(models), models)) if fleet is not None else None
             view.append({
                 "name": name,
                 "rented": name in rented.rent_profiles,

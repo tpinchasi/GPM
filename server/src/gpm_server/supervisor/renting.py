@@ -49,6 +49,7 @@ from ..providers.base import (
     VolumeSpec,
     redacted,
 )
+from ..directory import build_memory_gb, record_measurements
 from ..sizing import Needs, needs_for
 from ..stats import MEASURED_ROWS
 from ..strategies import (
@@ -1410,7 +1411,13 @@ class Fleet:
         self, models: Sequence[str], builds: Optional[dict[str, str]] = None, cards_per_copy: int = 1
     ) -> Needs:
         """The least card, cards and disk a machine holding these builds needs (D111, D114)."""
-        return needs_for(self.build_sizes(models, builds), cards_per_copy)
+        return needs_for(self.build_sizes(models, builds), cards_per_copy, self.build_memory(models, builds))
+
+    def build_memory(self, models: Sequence[str], builds: Optional[dict[str, str]] = None) -> dict[str, Optional[float]]:
+        """What each model's build was seen to take loaded on a machine that held it (D207), or
+        None where none has — the estimate from its size is used for those."""
+        chosen = self.builds_of(models, builds)
+        return build_memory_gb(self.leases.db, chosen) if chosen else {}
 
     def policy_for(
         self, models: Sequence[str], builds: Optional[dict[str, str]] = None,
@@ -2049,6 +2056,10 @@ class Fleet:
         if view.reachable:
             host.agent_facts = view.facts
             host.agent_detail = None
+            try:
+                record_measurements(self.leases.db, (view.facts or {}).get("engine"), host.host_id)
+            except Exception:  # noqa: BLE001 — what a host says must never stop a pass
+                log.exception("%s: what its engine said about its builds' sizes could not be kept", host.host_id)
             try:
                 self._volume_news(host)
             except Exception:  # noqa: BLE001 — what a host says must never stop a pass
@@ -2803,7 +2814,7 @@ class Fleet:
             card_gb = min(memory) / 1e9
         else:
             card_gb = float(getattr(host.offer, "gpu_memory_gb", 0.0) or 0.0)
-        needs = needs_for(sizes, 1)
+        needs = needs_for(sizes, 1, self.build_memory(self.models_of(host), host.builds or None))
         if needs.card_memory_gb > card_gb:
             return False, (f"its models need {needs.card_memory_gb:.0f} GB of a card and its smallest has "
                            f"{card_gb:.0f} GB")

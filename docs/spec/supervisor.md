@@ -381,8 +381,22 @@ model set. **Parked hosts are tried first** (§8).
    would be rented with — `min_disk_gb` of the search in force, which is also the least a machine
    must offer and the disk the rental asks for — so the all-in compared is the all-in billed. The
    models' size is not typed: it is read from the sizes of the builds the next host will fetch —
-   the catalog's `size_gb` where the file states it, otherwise as the model directory measured
-   them. A build nobody has measured is named, not counted.
+   the catalog's `size_gb` where the file states it, otherwise what a host measured that very
+   build (its digest) to take on disk, otherwise its published size. A build nobody has measured
+   is named, not counted.
+
+   **The pool's own builds' sizes are looked up, and measured where they run (D207).** For every
+   build in the model set whose size the file does not state, the supervisor reads that build's
+   own page: one Ollama tags page per model, or one hub repository's file listing. Cached, read
+   again weekly (`hub_max_age_hours`), and after a failure not for six hours while the supervisor
+   runs; never for a hosted build, a name Ollama's library does not list, a file inside a hub
+   repository or a build uploaded to the pool; off with `directory.look_up_sizes: false`.
+   The whole directory is still refreshed only when `refresh_hours` says. Each host agent reports
+   every build's digest and, where loaded, what its engine says it takes in memory. The pool
+   keeps one row per build and digest (`build_measurements`), with the most memory any host was
+   seen to take for it. A measured memory figure replaces
+   the estimate for that model in the card memory below. Where the library shows another digest
+   for the tag (pushed again), the measurement is set aside until a host holds the new build.
 
    **What the next host holds sets the least card and disk searched for (D111).** The pool
    decides what the next machine is bought as — which model profile, holding which builds —

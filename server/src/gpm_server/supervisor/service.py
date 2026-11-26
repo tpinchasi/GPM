@@ -38,7 +38,7 @@ from ..config import (
 )
 from ..configplan import ConfigStore
 from ..db import Database, HostCounters, HostRow, HostTable, SupervisorLock
-from ..directory import Directory
+from ..directory import Directory, record_measurements
 from ..engines import Engine, get_engine
 from ..ledger import EventLog, LeaseStore, SpendLedger
 from ..models import RENTED_KINDS, HostState
@@ -548,6 +548,8 @@ class Supervisor:
                 log.exception("control loop pass failed")
             # In the background: a refresh reads hundreds of pages and must never hold a pass.
             self.directory.maybe_start()
+            # The pool's own builds' sizes (D207): a page per model, when one has none.
+            self.directory.maybe_look_up_sizes()
 
     async def aclose(self) -> None:
         self._stopping = True
@@ -1072,6 +1074,14 @@ class Supervisor:
                 idle[host_id] = max(0.0, now - max(counter.last_request_at, host.ready_at))
         return idle
 
+    def _keep_measurements(self, host_id: str, facts: Optional[dict]) -> None:
+        """What the host's engine says each build it holds takes, kept by digest (D207) — what
+        the next machine for that build is sized from."""
+        try:
+            record_measurements(self.db, (facts or {}).get("engine"), host_id)
+        except Exception:  # noqa: BLE001 — what a host says must never stop a pass
+            log.exception("%s: what its engine said about its builds' sizes could not be kept", host_id)
+
     async def _ask_agent(self, host: SupervisedHost) -> None:
         """Before the probe, so a platform the agent found decides which build the probe looks
         for. A silent agent changes nothing: the host is judged by its engine, as ever."""
@@ -1081,6 +1091,8 @@ class Supervisor:
         was_reachable = host.agent.reachable if host.agent else None
         models_before = host.agent.models if host.agent else None
         host.agent = await agents.ask(host.agent_endpoint, transport=self._agent_transport)
+        if host.agent.reachable:
+            self._keep_measurements(host.host_id, host.agent.facts)
         if host.agent.reachable is not was_reachable:
             self.events.record(
                 "agent_reachable" if host.agent.reachable else "agent_unreachable",

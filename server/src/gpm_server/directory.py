@@ -12,6 +12,13 @@ Two sources, because the pool runs two kinds of engine:
   operator chooses that, and for anything the operator looks up. Slowly — at a stated number of
   requests a minute — because it is someone else's service.
 
+Beside the refresh, which crawls and is off unless the operator sets how often: the **sizes of
+the pool's own builds** (D207). For every build in the pool's model set whose size the catalog
+does not state, the supervisor reads just that build's page — one Ollama tags page, or one hub
+file listing — on its own, cached, and again weekly to see a tag pushed again. And what a host's
+engine reports a build took, on disk and loaded, is kept by digest (`build_measurements`): it is
+the size the pool goes by next time, and a new digest of the same tag is measured again.
+
 The supervisor refreshes; both processes read. The router serves the cached copy to apps without
 a single outbound request (D101): nothing slow reaches a process that carries inference traffic.
 Nothing here spends, pulls or loads — a directory entry is information until the operator adds
@@ -46,10 +53,48 @@ OLLAMA_CONCURRENCY = 4
 OLLAMA, HUB = "ollama", "hub"
 #: One hub repository's exact weights, read from its file listing when a variant is chosen (D111).
 HUB_SIZE = "hub-size"
+#: One Ollama model's tags page, read for the sizes of the pool's own builds (D207) — kept apart
+#: from the refresh's copy of the library, which a refresh replaces whole.
+OLLAMA_TAGS = "ollama-tags"
+#: How long a build whose size could not be read waits before it is asked again.
+SIZE_RETRY_S = 6 * 3600
+#: How often the supervisor checks whether any of the pool's builds has no size.
+SIZES_CHECK_S = 60.0
+
+#: A name in Ollama's own library: one word, no owner. `owner/model` and `hf.co/...` are not
+#: listed there, so nothing is looked up for them; a host that holds one measures it.
+_LIBRARY_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def ollama_site() -> str:
     return (os.environ.get("GPM_OLLAMA_SITE") or DEFAULT_OLLAMA_SITE).rstrip("/")
+
+
+def library_name(tag: str) -> Optional[tuple[str, str]]:
+    """An Ollama build's model and tag in the library (`gemma4:31b` → `gemma4`, `31b`; a bare
+    name is its `latest`), or None for a name the library does not list."""
+    name, _, version = tag.partition(":")
+    if not _LIBRARY_NAME.match(name) or "/" in version:
+        return None
+    return name, version or "latest"
+
+
+def _full_tag(tag: str) -> str:
+    """A build's name as Ollama itself reports it: a name with no tag of its own — `gemma4`,
+    `owner/model`, `hf.co/org/repo` — is its `latest`."""
+    return tag if ":" in tag.rsplit("/", 1)[-1] else f"{tag}:latest"
+
+
+def _hub_repo(tag: str) -> bool:
+    """A hub repository's own name, `owner/name` — not a file inside one (`owner/repo/x.bin`),
+    nor a build uploaded to the pool's own store (`upload/<sha256>`), which is never sent out."""
+    owner, _, name = tag.partition("/")
+    return bool(owner and name) and "/" not in name and ":" not in tag and owner != "upload" \
+        and hubbuilds.valid_search(tag)
+
+
+def _bare_digest(digest: Any) -> str:
+    return str(digest or "").removeprefix("sha256:").lower()
 
 
 # --- reading Ollama's pages ---
@@ -255,35 +300,150 @@ def read_directory(database: Database, query: Optional[str] = None,
     return {"refreshed": store.runs(), "models": models, "looked_up_elsewhere": elsewhere}
 
 
-def build_sizes_gb(database: Database, builds: dict[str, str]) -> dict[str, Optional[float]]:
-    """Each build's size on disk, by the model it is a build of — or None where the directory
-    has not measured it (D108). `builds` maps a pool model to the tag its engine fetches.
+def _published_tags(store: "DirectoryStore") -> dict[str, dict[str, Any]]:
+    """Every Ollama tag the directory has read, by its full name — from a refresh of the library
+    or from the pool's own builds' pages (D207), the more recently read where both have it."""
+    found: dict[str, tuple[dict[str, Any], float]] = {}
+    for source in (OLLAMA, OLLAMA_TAGS):
+        for entry, fetched_at in store.all(source).values():
+            for tag in entry.get("tags", []) or []:
+                name = tag.get("name")
+                if name and (name not in found or fetched_at > found[name][1]):
+                    found[name] = (tag, fetched_at)
+    return {name: tag for name, (tag, _) in found.items()}
 
-    Read from what the directory already holds: a hub build's weight files, as listed when the
-    pool's builds were looked up, and an Ollama tag's size from its library page. Nothing is
-    fetched here; a build never looked up is unknown, and said to be.
+
+def _measurements(database: Database) -> dict[str, list[dict[str, Any]]]:
+    """Every measurement, by tag, newest first (D207)."""
+    found: dict[str, list[dict[str, Any]]] = {}
+    for row in database.query("SELECT * FROM build_measurements ORDER BY measured_at DESC"):
+        found.setdefault(row["tag"], []).append(dict(row))
+    return found
+
+
+def _measured(rows: Optional[list[dict[str, Any]]], published: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """The measurement of the build published now. Where the library shows the tag's digest,
+    only that digest's: another is a build the tag no longer names (pushed again since), and the
+    new one is to be measured. Where it shows none, the most recently measured digest."""
+    if not rows:
+        return None
+    shown = _bare_digest((published or {}).get("digest"))
+    if not shown:
+        return rows[0]
+    return next((r for r in rows if _bare_digest(r.get("digest")).startswith(shown)), None)
+
+
+def build_sizes_gb(database: Database, builds: dict[str, str]) -> dict[str, Optional[float]]:
+    """Each build's size on disk, by the model it is a build of — or None where nothing has
+    measured it (D108). `builds` maps a pool model to the tag its engine fetches.
+
+    Read from what is already held: a hub build's weight files, as listed when the pool's
+    builds were looked up; what a host measured the build's files to be, by digest (D207); an
+    Ollama tag's size from its library page; one repository's exact listing. Nothing is
+    fetched here; a build never looked up or held is unknown, and said to be.
     """
+    size_of = sizer(database)
+    return {model: size_of(model, tag) for model, tag in builds.items()}
+
+
+def sizer(database: Database) -> Callable[[str, str], Optional[float]]:
+    """`build_sizes_gb` for one build at a time, with what the pool holds read once."""
     store = DirectoryStore(database)
     hub = store.all(HUB)
-    library_tags = {
-        tag.get("name"): tag.get("size_gb")
-        for entry, _ in store.all(OLLAMA).values() for tag in entry.get("tags", [])
-    }
-    sizes: dict[str, Optional[float]] = {}
-    for model, tag in builds.items():
+    published = _published_tags(store)
+    measured = _measurements(database)
+
+    def size_of(model: str, tag: str) -> Optional[float]:
         found: Optional[float] = None
         looked_up = hub.get(model)
         if looked_up:
             found = next(
                 (b.get("size_gb") for b in looked_up[0].get("builds", []) if b.get("repo") == tag), None
             )
+        shown = published.get(_full_tag(tag)) or published.get(tag)
+        seen = _measured(measured.get(_full_tag(tag)) or measured.get(tag), shown)
+        if found is None and seen:
+            found = seen.get("disk_gb")
         if found is None:
-            found = library_tags.get(tag)
+            found = (shown or {}).get("size_gb")
         if found is None:
-            measured = store.get(HUB_SIZE, tag)
-            found = measured[0].get("size_gb") if measured else None
-        sizes[model] = float(found) if found else None
-    return sizes
+            exact = store.get(HUB_SIZE, tag)
+            found = exact[0].get("size_gb") if exact else None
+        return float(found) if found else None
+
+    return size_of
+
+
+def build_memory_gb(database: Database, builds: dict[str, str]) -> dict[str, Optional[float]]:
+    """What each build was seen to take loaded, by model — weights, cache and working space, as
+    the engine of a host that held that very build reported it (D207) — or None where no host
+    has, or the tag has been pushed again since."""
+    published = _published_tags(DirectoryStore(database))
+    measured = _measurements(database)
+    found: dict[str, Optional[float]] = {}
+    for model, tag in builds.items():
+        shown = published.get(_full_tag(tag)) or published.get(tag)
+        seen = _measured(measured.get(_full_tag(tag)) or measured.get(tag), shown)
+        memory = seen.get("memory_gb") if seen else None
+        found[model] = float(memory) if memory else None
+    return found
+
+
+def _gb(value: Any) -> Optional[float]:
+    return round(value / 1e9, 3) if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def record_measurements(database: Database, engine: Any, host_id: Optional[str]) -> int:
+    """Keep what a host's engine says about each build it holds (D207): its digest, its files'
+    size and, where loaded, what it takes in memory and at what context. One row per build and
+    digest, written only when something in it changed. Where hosts hold the same build at
+    different contexts or cards, the most memory any was seen to take is kept: the figure a
+    machine is sized from, and one that does not swing between hosts on every pass. Returns how
+    many rows were written.
+
+    `engine` is the engine part of what the host's agent reports; one that names no digests
+    (an older agent, or an engine that keeps none) leaves nothing to keep.
+    """
+    if not isinstance(engine, dict) or not engine.get("answers"):
+        return 0
+    name = str(engine.get("name") or "")
+    loaded = {
+        m.get("tag"): m for m in engine.get("models_loaded_sizes") or []
+        if isinstance(m, dict) and isinstance(m.get("tag"), str)
+    }
+    written = 0
+    for held in engine.get("models_on_disk") or []:
+        if not isinstance(held, dict):
+            continue
+        tag, digest = held.get("tag"), held.get("digest")
+        if not isinstance(tag, str) or not tag or not isinstance(digest, str) or not digest:
+            continue
+        tag = _full_tag(tag)
+        disk = _gb(held.get("size_bytes"))
+        running = loaded.get(tag) or loaded.get(held.get("tag")) or {}
+        same = _bare_digest(running.get("digest") or digest) == _bare_digest(digest)
+        memory = _gb(running.get("size_bytes")) if running and same else None
+        context = running.get("context") if running and same and isinstance(running.get("context"), int) else None
+        rows = database.query(
+            "SELECT disk_gb, memory_gb, context FROM build_measurements WHERE engine = ? AND tag = ? AND digest = ?",
+            (name, tag, digest),
+        )
+        if rows:
+            was = rows[0]
+            # A build not loaded right now, or seen taking less elsewhere, keeps the most it took.
+            if memory is None or (was["memory_gb"] or 0) >= memory:
+                memory, context = was["memory_gb"], was["context"]
+            if (was["disk_gb"], was["memory_gb"], was["context"]) == (disk, memory, context):
+                continue
+        database.execute(
+            "INSERT INTO build_measurements (engine, tag, digest, disk_gb, memory_gb, context, host_id, measured_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(engine, tag, digest) DO UPDATE SET "
+            "disk_gb = excluded.disk_gb, memory_gb = excluded.memory_gb, context = excluded.context, "
+            "host_id = excluded.host_id, measured_at = excluded.measured_at",
+            (name, tag, digest, disk, memory, context, host_id, time.time()),
+        )
+        written += 1
+    return written
 
 
 # --- refreshing (the supervisor only) ---
@@ -327,6 +487,13 @@ class Directory:
         self._task: Optional[asyncio.Task] = None
         self._hub_gate = asyncio.Lock()
         self._last_hub_request = 0.0
+        #: The lookup of the pool's own builds' sizes (D207), apart from a refresh.
+        self._sizes_task: Optional[asyncio.Task] = None
+        self._sizes_checked_at = 0.0
+        #: A build whose size could not be read, and when: not asked again for SIZE_RETRY_S while
+        #: this supervisor runs.
+        self._size_failed: dict[str, float] = {}
+        self._closed = False
 
     @property
     def running(self) -> bool:
@@ -502,10 +669,136 @@ class Directory:
         if self.due():
             self.start()
 
-    async def aclose(self) -> None:
-        if self._task is not None and not self._task.done():
-            self._task.cancel()
+    # -- the sizes of the pool's own builds (D207) --
+
+    def size_lookups(self) -> list[tuple[str, str]]:
+        """What to read for the sizes of the pool's own builds: `("ollama", model)` for an Ollama
+        model's tags page, `("hub", repo)` for one repository's file listing.
+
+        Only builds whose size the catalog does not state. An Ollama build's page is read when
+        neither this lookup nor a refresh of the library has read it in `hub_max_age_hours` —
+        which is also how a tag pushed again is seen: its digest changes. A hub build's listing
+        is read once, when nothing the pool holds knows its size. Never a hosted build, which
+        has nothing to download, nor one that failed to read in the last SIZE_RETRY_S.
+        """
+        config = self._settings()
+        settings = config.directory
+        if not getattr(settings, "look_up_sizes", True):
+            return []
+        from .catalog import Variant
+        from .engines import EngineNotFound, get_engine
+
+        max_age = float(settings.hub_max_age_hours) * 3600
+        now = time.time()
+        models = list(config.pool.model_set)
+        if config.rented is not None and config.rented.models:
+            models += [m for m in config.rented.models if m not in models]
+        wanted: list[tuple[str, str]] = []
+        hub_builds: list[tuple[str, str]] = []  # (model, repo), sized together below
+        for model in models:
+            entry = config.catalog.get(model)
+            for variant in (entry.variants if entry else [Variant(tag=model)]):
+                if variant.size_gb or any(r.startswith("hosted:") for r in variant.requires):
+                    continue
+                kind: Optional[str] = None
+                if variant.engine:
+                    try:
+                        engine = get_engine(variant.engine)
+                    except EngineNotFound:
+                        continue
+                    if getattr(engine, "builds_on_hub", False):
+                        kind = "hub"
+                    elif variant.engine == "ollama":
+                        kind = "ollama"
+                elif library_name(variant.tag):
+                    kind = "ollama"
+                else:
+                    kind = "hub"
+                if kind == "ollama" and library_name(variant.tag):
+                    name = library_name(variant.tag)[0]
+                    if ("ollama", name) in wanted or now - self._size_failed.get(f"ollama:{name}", 0.0) < SIZE_RETRY_S:
+                        continue
+                    # Read recently, by this lookup or by a refresh of the whole library.
+                    read = [r for r in (self.store.get(OLLAMA_TAGS, name), self.store.get(OLLAMA, name)) if r]
+                    if any(now - fetched_at < max_age for _, fetched_at in read):
+                        continue
+                    wanted.append(("ollama", name))
+                elif kind == "hub" and _hub_repo(variant.tag):
+                    if now - self._size_failed.get(f"hub:{variant.tag}", 0.0) < SIZE_RETRY_S:
+                        continue
+                    if self.store.get(HUB_SIZE, variant.tag) is None:
+                        hub_builds.append((model, variant.tag))
+        if hub_builds:
+            # One read of what the pool holds for them all: a build something already sizes is
+            # not asked for.
+            size_of = sizer(self.store.db)
+            for model, repo in hub_builds:
+                if not size_of(model, repo) and ("hub", repo) not in wanted:
+                    wanted.append(("hub", repo))
+        return wanted
+
+    async def read_tags_page(self, name: str) -> list[LibraryTag]:
+        """One Ollama model's tags page, kept under OLLAMA_TAGS (D207). A page that cannot be
+        read keeps what was read before."""
+        async with self._client(ollama_site()) as client:
+            page = await client.get(f"/library/{name}/tags")
+            page.raise_for_status()
+            tags = parse_tags(name, page.text)
+        self.store.put(OLLAMA_TAGS, name, {"tags": [asdict(t) for t in tags]})
+        return tags
+
+    async def look_up_sizes(self) -> int:
+        """Read what `size_lookups` names, one after another; returns how many were read."""
+        done = 0
+        for kind, name in self.size_lookups():
+            key = f"{kind}:{name}"
             try:
-                await self._task
-            except (asyncio.CancelledError, Exception):
-                pass
+                if kind == "ollama":
+                    await self.read_tags_page(name)
+                    found = True
+                else:
+                    found = await self.exact_size(name) is not None
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — any failure waits its hours, not a minute
+                log.info("directory: the size of %s could not be read: %s", name, exc)
+                found = False
+            if found:
+                self._size_failed.pop(key, None)
+                done += 1
+            else:
+                self._size_failed[key] = time.time()
+        return done
+
+    def maybe_look_up_sizes(self) -> bool:
+        """Start the lookup in the background when one of the pool's builds wants it — checked
+        once a minute, never while one is running. True when one was started."""
+        if self._closed or (self._sizes_task is not None and not self._sizes_task.done()):
+            return False
+        if time.monotonic() - self._sizes_checked_at < SIZES_CHECK_S and self._sizes_checked_at:
+            return False
+        self._sizes_checked_at = time.monotonic()
+        try:
+            if not self.size_lookups():
+                return False
+        except Exception:  # noqa: BLE001 — a pass must never stop over a lookup
+            log.exception("directory: the pool's builds could not be checked for sizes")
+            return False
+        self._sizes_task = asyncio.create_task(self._sizes_guarded(), name="gpm:directory-sizes")
+        return True
+
+    async def _sizes_guarded(self) -> None:
+        try:
+            await self.look_up_sizes()
+        except Exception:  # a lookup must never take the supervisor down
+            log.exception("directory: looking up the sizes of the pool's builds failed")
+
+    async def aclose(self) -> None:
+        self._closed = True
+        for task in (self._task, self._sizes_task):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass

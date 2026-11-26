@@ -174,6 +174,22 @@ CREATE TABLE IF NOT EXISTS directory_refresh (
     last_success  REAL
 );
 
+-- What a build was measured to take on a machine that held it (D207), one row per build and
+-- digest: the same tag pushed again is a new digest, measured again. `disk_gb` is its files;
+-- `memory_gb` what the engine said it took loaded — weights, cache and working space — at
+-- `context` tokens. The supervisor writes it from what host agents report; both processes read.
+CREATE TABLE IF NOT EXISTS build_measurements (
+    engine       TEXT NOT NULL,
+    tag          TEXT NOT NULL,
+    digest       TEXT NOT NULL,
+    disk_gb      REAL,
+    memory_gb    REAL,
+    context      INTEGER,
+    host_id      TEXT,
+    measured_at  REAL NOT NULL,
+    PRIMARY KEY (engine, tag, digest)
+);
+
 -- The SSH forwards the supervisor wants kept up, and how the forwarder is keeping them (D110).
 -- The supervisor writes a row and removes it when the host is released; the forwarder reads
 -- them, runs one `ssh -N -L` per row on the row's fixed local port, and writes back how each
